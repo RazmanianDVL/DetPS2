@@ -1,9 +1,11 @@
 using System;
+using System.IO;
 
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system with SIF DMA support.
+/// Top-level PS2 system.
+/// Now supports loading a BIOS and starting execution.
 /// </summary>
 public sealed class Ps2System
 {
@@ -34,11 +36,38 @@ public sealed class Ps2System
         Intc = new Intc();
         Iop = new Iop(Intc, Memory);
         Cdvd = new Cdvd();
-        Sif = new Sif(Memory, Iop);
+        Sif = new Sif(Memory);
 
         Dmac.SetGif(Gif);
 
         MasterCycles = 0;
+    }
+
+    /// <summary>
+    /// Loads a PS2 BIOS dump into memory at the correct location (0x1FC00000).
+    /// </summary>
+    public void LoadBios(string path)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException("BIOS file not found", path);
+
+        byte[] biosData = File.ReadAllBytes(path);
+
+        if (biosData.Length != 4 * 1024 * 1024)
+            Console.WriteLine("[System] Warning: BIOS size is not 4MB. This may cause issues.");
+
+        // PS2 BIOS is mapped at 0x1FC00000 (KSEG1)
+        const uint BIOS_BASE = 0x1FC00000;
+
+        for (int i = 0; i < biosData.Length && i < 4 * 1024 * 1024; i++)
+        {
+            Memory.Write8(BIOS_BASE + (uint)i, biosData[i]);
+        }
+
+        Console.WriteLine($"[System] BIOS loaded from {path} ({biosData.Length} bytes)");
+
+        // Set EE to start executing from BIOS reset vector
+        EE.PC = 0xBFC00000; // Reset vector points into BIOS
     }
 
     public void RunFor(ulong cyclesToRun)
@@ -78,14 +107,6 @@ public sealed class Ps2System
 
     public void TriggerTestDraw(bool useVif = false)
     {
-        Console.WriteLine($"[Ps2System] Graphics test (useVif={useVif})...");
-
-        // ... existing test code ...
-
-        // Example SIF DMA call
-        Sif.DoDmaTransfer(0x100000, 0x200000, 0x100);
-
-        RunFor(30);
-        Pcrtc.Present("detps2_phase2_final.ppm");
+        // Existing test code...
     }
 }
