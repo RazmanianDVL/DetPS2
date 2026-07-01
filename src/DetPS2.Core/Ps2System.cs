@@ -4,15 +4,17 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Now includes early Phase 3 components: Intc + Iop.
+/// Phase 2 now includes VIF (PATH3) and PCRTC for complete graphics pipeline.
 /// </summary>
 public sealed class Ps2System
 {
     public SystemMemory Memory { get; }
     public EmotionEngine EE { get; }
     public Dmac Dmac { get; }
+    public Vif Vif { get; }
     public Gif Gif { get; }
     public Gs Gs { get; }
+    public Pcrtc Pcrtc { get; }
     public Intc Intc { get; }
     public Iop Iop { get; }
 
@@ -26,6 +28,8 @@ public sealed class Ps2System
         Dmac = new Dmac(Memory);
         Gs = new Gs(Memory);
         Gif = new Gif(Gs);
+        Vif = new Vif(Gs, Gif);
+        Pcrtc = new Pcrtc(Gs);
         Intc = new Intc();
         Iop = new Iop(Intc);
 
@@ -44,8 +48,10 @@ public sealed class Ps2System
             MasterCycles += (ulong)cyclesTaken;
 
             Dmac.Step(1);
+            Vif.Step(1);
             Gif.Step(1);
             Gs.Step(1);
+            Pcrtc.Step(1);
             Intc.Step(1);
             Iop.Step(1);
         }
@@ -59,8 +65,10 @@ public sealed class Ps2System
             MasterCycles += (ulong)cyclesTaken;
 
             Dmac.Step(1);
+            Vif.Step(1);
             Gif.Step(1);
             Gs.Step(1);
+            Pcrtc.Step(1);
             Intc.Step(1);
             Iop.Step(1);
         }
@@ -71,15 +79,17 @@ public sealed class Ps2System
         MasterCycles = 0;
         EE.Reset();
         Dmac.Reset();
+        Vif.Reset();
         Gif.Reset();
         Gs.Reset();
+        Pcrtc.Reset();
         Intc.Reset();
         Iop.Reset();
     }
 
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Sending commands (PRIM dispatch + Phase 3 components active)...");
+        Console.WriteLine("[Ps2System] Full Phase 2 pipeline test (VIF + GIF + GS + PCRTC)...");
 
         ulong baseAddr = 0x100000;
 
@@ -102,6 +112,9 @@ public sealed class Ps2System
 
         RunFor(30);
 
-        Console.WriteLine("[Ps2System] Pipeline complete.");
+        // Use PCRTC to present the final frame
+        Pcrtc.Present("detps2_phase2_final.ppm");
+
+        Console.WriteLine("[Ps2System] Phase 2 pipeline complete.");
     }
 }
