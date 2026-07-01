@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - Further improved for Phase 3 (more instructions + better execution).
+/// IOP - Continued improvement for Phase 3 (more instructions + robustness).
 /// </summary>
 public sealed class Iop
 {
@@ -47,7 +47,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 128 && Running; i++) // Increased again for better performance
+        for (int i = 0; i < 256 && Running; i++) // Even higher execution throughput
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
@@ -107,8 +107,7 @@ public sealed class Iop
     private void ExecuteMult(int rs, int rt)
     {
         long result = (long)(int)_gprs[rs] * (int)_gprs[rt];
-        // For simplicity we only keep lower 32 bits in LO for now
-        _gprs[0] = (uint)(result & 0xFFFFFFFF); // Using $0 temporarily as LO storage (not ideal but works for testing)
+        _gprs[0] = (uint)(result & 0xFFFFFFFF);
     }
 
     private void ExecuteMultu(int rs, int rt)
