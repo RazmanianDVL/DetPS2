@@ -3,11 +3,8 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// DMA Controller (DMAC) for the Emotion Engine.
-/// This is the start of Phase 2.
-/// 
-/// The DMAC is critical because almost all large data transfers on the PS2
-/// (to GS, VIF, IPU, etc.) go through DMA channels.
+/// DMA Controller (DMAC) - Improved implementation for Phase 2.
+/// Supports Normal and basic Chain mode.
 /// </summary>
 public sealed class Dmac
 {
@@ -21,35 +18,34 @@ public sealed class Dmac
 
     public void Reset()
     {
-        // TODO: Reset all channel state
+        for (int i = 0; i < _channels.Length; i++)
+        {
+            _channels[i] = new ChannelState();
+        }
     }
-
-    // ============================================================
-    // DMA Channel Definitions
-    // ============================================================
 
     public enum Channel
     {
         VIF0 = 0,
         VIF1 = 1,
-        GIF  = 2,
+        GIF = 2,
         IPU_FROM = 3,
-        IPU_TO   = 4,
-        SIF0 = 5,   // EE -> IOP
-        SIF1 = 6,   // IOP -> EE
+        IPU_TO = 4,
+        SIF0 = 5,
+        SIF1 = 6,
         SIF2 = 7,
         SPR_FROM = 8,
-        SPR_TO   = 9
+        SPR_TO = 9
     }
 
-    // Basic channel state (we'll expand this)
     private class ChannelState
     {
-        public uint MADR;   // Memory Address
-        public uint QWC;    // QuadWord Count
-        public uint CHCR;   // Channel Control
-        public uint TADR;   // Tag Address (for chain mode)
+        public uint MADR;
+        public uint QWC;
+        public uint CHCR;
+        public uint TADR;
         public bool Active;
+        public int Mode; // 0 = Normal, 1 = Chain, 2 = Interleave
     }
 
     private readonly ChannelState[] _channels = new ChannelState[10];
@@ -60,68 +56,98 @@ public sealed class Dmac
             _channels[i] = new ChannelState();
     }
 
-    // ============================================================
-    // Public API
-    // ============================================================
-
-    /// <summary>
-    /// Starts a DMA transfer on the given channel.
-    /// For now this is a stub that just marks the channel active.
-    /// Real implementation will read CHCR, MADR, QWC, etc.
-    /// </summary>
+    // Start a DMA transfer (called when CHCR STR bit is set)
     public void StartTransfer(Channel channel)
     {
         var ch = _channels[(int)channel];
         ch.Active = true;
 
-        // TODO: Read CHCR bits to determine mode (Normal / Chain / Interleave)
-        // TODO: Perform actual data transfer based on mode
+        // Decode CHCR for mode
+        ch.Mode = (int)((ch.CHCR >> 2) & 0x3); // bits 2-3 usually
 
-        Console.WriteLine($"[DMAC] Started transfer on channel {channel}");
+        Console.WriteLine($"[DMAC] Starting {channel} (Mode={(DmaMode)ch.Mode})");
     }
 
-    /// <summary>
-    /// Steps the DMAC forward by some number of cycles.
-    /// This is where actual data movement should happen.
-    /// </summary>
+    public enum DmaMode
+    {
+        Normal = 0,
+        Chain = 1,
+        Interleave = 2
+    }
+
     public void Step(ulong cycles)
     {
         for (int i = 0; i < _channels.Length; i++)
         {
             var ch = _channels[i];
-            if (!ch.Active) continue;
+            if (!ch.Active || ch.QWC == 0) continue;
 
-            // TODO: Perform actual DMA work here
-            // - Read from MADR / TADR
-            // - Write to destination
-            // - Handle chain tags
-            // - Update QWC, MADR, etc.
+            if (ch.Mode == (int)DmaMode.Normal)
+            {
+                DoNormalTransfer((Channel)i, ch);
+            }
+            else if (ch.Mode == (int)DmaMode.Chain)
+            {
+                DoChainTransfer((Channel)i, ch);
+            }
 
-            // For now we just deactivate after one "step"
-            ch.Active = false;
-            Console.WriteLine($"[DMAC] Channel { (Channel)i } transfer completed (stub)");
+            if (ch.QWC == 0)
+            {
+                ch.Active = false;
+                Console.WriteLine($"[DMAC] { (Channel)i } transfer finished");
+            }
         }
     }
 
-    // ============================================================
-    // Register Access (to be expanded)
-    // ============================================================
-
-    public uint ReadRegister(uint address)
+    private void DoNormalTransfer(Channel channel, ChannelState ch)
     {
-        // TODO: Implement proper register reads for MADR, QWC, CHCR, etc.
-        return 0;
+        // Simple normal mode: transfer QWC quadwords from MADR
+        uint qwToTransfer = Math.Min(ch.QWC, 16); // limit per step for simulation
+
+        for (uint i = 0; i < qwToTransfer; i++)
+        {
+            // In real hardware this would be 128-bit transfers
+            // For now we just advance pointers
+            ch.MADR += 16;
+            ch.QWC--;
+        }
+
+        // TODO: Actually read/write data using _memory
     }
 
+    private void DoChainTransfer(Channel channel, ChannelState ch)
+    {
+        if (ch.QWC == 0 && ch.TADR != 0)
+        {
+            // Read DMA tag from TADR
+            uint tagLow = _memory.Read32(ch.TADR);
+            uint tagHigh = _memory.Read32(ch.TADR + 4);
+
+            uint qwc = tagLow & 0xFFFF;
+            uint tagId = (tagLow >> 28) & 0x7;
+            uint addr = tagHigh & 0x7FFFFFFF;
+
+            ch.QWC = qwc;
+            ch.MADR = addr;
+
+            Console.WriteLine($"[DMAC] Chain tag: ID={tagId}, QWC={qwc}, ADDR=0x{addr:X8}");
+
+            // Advance TADR for next tag (simplified)
+            ch.TADR += 16;
+
+            // TODO: Handle different tag types (REFE, CNT, NEXT, REF, CALL, RET, etc.)
+        }
+
+        if (ch.QWC > 0)
+        {
+            DoNormalTransfer(channel, ch);
+        }
+    }
+
+    // Register access stubs
+    public uint ReadRegister(uint address) => 0;
     public void WriteRegister(uint address, uint value)
     {
-        // TODO: Decode address and update the correct channel register
-        // Example: CHCR, MADR, QWC, TADR, etc.
+        // TODO: Proper decoding of channel registers
     }
-
-    // ============================================================
-    // Future: Chain Mode Support
-    // ============================================================
-    // We will add proper DMA tag parsing here later:
-    // - REFE, CNT, NEXT, REF, CALL, RET, etc.
 }
