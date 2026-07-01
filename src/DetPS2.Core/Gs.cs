@@ -1,23 +1,18 @@
 using System;
+using System.IO;
 
 namespace DetPS2.Core;
 
 /// <summary>
-/// Graphics Synthesizer (GS) with a simple software framebuffer.
-/// This is the beginning of actual pixel output.
+/// Graphics Synthesizer with software framebuffer and image export.
 /// </summary>
 public sealed class Gs
 {
     public SystemMemory Memory { get; }
 
-    // Simple software framebuffer (ARGB8888)
-    // Using a 1D array for simplicity. Resolution is arbitrary for now.
     private const int FB_WIDTH = 640;
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
-
-    private uint _frameBufferBase;
-    private uint _zBufferBase;
 
     public Gs(SystemMemory memory)
     {
@@ -27,54 +22,75 @@ public sealed class Gs
     public void Reset()
     {
         Array.Clear(_framebuffer, 0, _framebuffer.Length);
-        _frameBufferBase = 0;
-        _zBufferBase = 0;
     }
 
     public void ReceiveCommandList(uint address, uint qwc)
     {
-        Console.WriteLine($"[GS] Processing {qwc} quadwords of GS commands");
-
-        // For early testing, just draw something whenever we receive data
         DrawTestPattern();
     }
 
-    /// <summary>
-    /// Draws a simple test pattern directly into the software framebuffer.
-    /// This is the first step toward real rendering.
-    /// </summary>
     public void DrawTestPattern()
     {
-        Console.WriteLine("[GS] Drawing test pattern into software framebuffer...");
+        Console.WriteLine("[GS] Drawing improved test pattern...");
 
-        // Draw a simple gradient / colored rectangle
-        for (int y = 100; y < 200; y++)
+        // Draw a nice gradient background
+        for (int y = 0; y < FB_HEIGHT; y++)
         {
-            for (int x = 100; x < 400; x++)
+            for (int x = 0; x < FB_WIDTH; x++)
             {
                 int index = y * FB_WIDTH + x;
 
-                // Simple color: Red-ish gradient
-                byte r = (byte)((x - 100) * 255 / 300);
-                byte g = 0;
-                byte b = (byte)((y - 100) * 255 / 100);
-                byte a = 255;
+                byte r = (byte)(x * 255 / FB_WIDTH);
+                byte g = (byte)(y * 255 / FB_HEIGHT);
+                byte b = (byte)(((x + y) / 2) * 255 / ((FB_WIDTH + FB_HEIGHT) / 2));
 
-                _framebuffer[index] = (uint)((a << 24) | (r << 16) | (g << 8) | b);
+                _framebuffer[index] = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
             }
         }
 
-        Console.WriteLine("[GS] Test pattern drawn. Framebuffer now contains pixels.");
+        // Draw a bright rectangle in the middle
+        for (int y = 150; y < 300; y++)
+        {
+            for (int x = 200; x < 440; x++)
+            {
+                int index = y * FB_WIDTH + x;
+                _framebuffer[index] = 0xFFFF00FF; // Magenta
+            }
+        }
+
+        Console.WriteLine("[GS] Test pattern complete. Framebuffer ready.");
     }
 
     /// <summary>
-    /// Returns a copy of the current framebuffer (for later display).
+    /// Saves the current framebuffer as a PPM image (portable, no dependencies).
     /// </summary>
-    public uint[] GetFramebuffer()
+    public void SaveFramebufferAsPPM(string filename)
     {
-        return (uint[])_framebuffer.Clone();
+        using var writer = new StreamWriter(filename);
+
+        writer.WriteLine("P3");
+        writer.WriteLine($"{FB_WIDTH} {FB_HEIGHT}");
+        writer.WriteLine("255");
+
+        for (int y = 0; y < FB_HEIGHT; y++)
+        {
+            for (int x = 0; x < FB_WIDTH; x++)
+            {
+                int index = y * FB_WIDTH + x;
+                uint pixel = _framebuffer[index];
+
+                byte r = (byte)((pixel >> 16) & 0xFF);
+                byte g = (byte)((pixel >> 8) & 0xFF);
+                byte b = (byte)(pixel & 0xFF);
+
+                writer.WriteLine($"{r} {g} {b}");
+            }
+        }
+
+        Console.WriteLine($"[GS] Framebuffer saved to {filename}");
     }
 
+    public uint[] GetFramebuffer() => (uint[])_framebuffer.Clone();
     public int FramebufferWidth => FB_WIDTH;
     public int FramebufferHeight => FB_HEIGHT;
 
