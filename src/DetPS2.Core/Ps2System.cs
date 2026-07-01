@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system with improved boot/BIOS loading for Phase 3.
+/// Top-level PS2 system with Save State support (Phase 4).
 /// </summary>
 public sealed class Ps2System
 {
@@ -42,22 +42,22 @@ public sealed class Ps2System
         MasterCycles = 0;
     }
 
+    public byte[] SaveState() => SaveState.Save(this);
+    public bool LoadState(byte[] data) => SaveState.Load(this, data);
+
     public void LoadBios(string path)
     {
         if (!File.Exists(path))
             throw new FileNotFoundException("BIOS file not found", path);
 
         byte[] biosData = File.ReadAllBytes(path);
-
         const uint BIOS_BASE = 0x1FC00000;
+
         for (int i = 0; i < biosData.Length && i < 4 * 1024 * 1024; i++)
         {
             Memory.Write8(BIOS_BASE + (uint)i, biosData[i]);
         }
 
-        Console.WriteLine($"[System] BIOS loaded ({biosData.Length} bytes)");
-
-        // Set reset vector
         EE.PC = 0xBFC00000;
     }
 
