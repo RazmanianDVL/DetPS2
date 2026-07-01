@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - Phase 3. Adding more real instructions.
+/// IOP - Phase 3/4. Added GetGpr/SetGpr for save states.
 /// </summary>
 public sealed class Iop
 {
@@ -34,6 +34,9 @@ public sealed class Iop
         SifMbxToEE = 0;
         Running = true;
     }
+
+    public uint GetGpr(int index) => _gprs[index & 0x1F];
+    public void SetGpr(int index, uint value) { if ((index & 0x1F) != 0) _gprs[index & 0x1F] = value; }
 
     public void WriteSifMailboxFromEE(uint value)
     {
