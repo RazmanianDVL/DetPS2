@@ -4,37 +4,35 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// SIF (Sub-system Interface) - Phase 3
-/// Basic DMA support between EE and IOP.
+/// Improved with actual memory transfer support.
 /// </summary>
 public sealed class Sif
 {
-    private readonly SystemMemory _memory;
-    private readonly Iop _iop;
+    private readonly SystemMemory _eeMemory;
+    private readonly SystemMemory _iopMemory; // For future separate IOP memory
 
-    public Sif(SystemMemory memory, Iop iop)
+    public Sif(SystemMemory eeMemory)
     {
-        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
-        _iop = iop ?? throw new ArgumentNullException(nameof(iop));
+        _eeMemory = eeMemory ?? throw new ArgumentNullException(nameof(eeMemory));
+        _iopMemory = eeMemory; // Currently sharing until we have separate IOP memory
     }
 
     public void Reset() { }
 
     /// <summary>
-    /// Very simplified SIF DMA transfer from EE to IOP memory space.
-    /// In reality this is much more complex with tags, etc.
+    /// Performs an actual memory copy from EE to IOP address space.
     /// </summary>
     public void DoDmaTransfer(uint eeAddr, uint iopAddr, uint size)
     {
-        Console.WriteLine($"[SIF] DMA transfer EE:0x{eeAddr:X} -> IOP:0x{iopAddr:X} size=0x{size:X}");
+        Console.WriteLine($"[SIF] DMA EE:0x{eeAddr:X} -> IOP:0x{iopAddr:X} size=0x{size:X}");
 
         for (uint i = 0; i < size; i += 4)
         {
-            uint value = _memory.Read32(eeAddr + i);
-            // For now we just log - real implementation would write to IOP memory space
-            // _iop.WriteMemory(iopAddr + i, value);
+            uint value = _eeMemory.Read32(eeAddr + i);
+            _iopMemory.Write32(iopAddr + i, value);
         }
 
-        Console.WriteLine("[SIF] DMA transfer complete (simplified)");
+        Console.WriteLine("[SIF] DMA transfer complete");
     }
 
     public void Step(ulong cycles) { }
