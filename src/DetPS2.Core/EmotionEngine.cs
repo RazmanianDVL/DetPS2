@@ -124,12 +124,9 @@ public sealed class EmotionEngine
             case 0x50:
             case 0x60:
             case 0x61:
-                _gprs[2].Lo = 0;
-                break;
-
-            case 0x70: // sceSifGetSreg (alt)
-            case 0x71: // sceSifSetSreg (alt)
-            case 0x80: // sceSifGetSreg (more)
+            case 0x70:
+            case 0x71:
+            case 0x80:
                 _gprs[2].Lo = 0;
                 break;
 
