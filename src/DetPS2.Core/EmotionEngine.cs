@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3 with further expanded HLE syscalls.
+/// Emotion Engine - Phase 3/4 with more HLE syscalls.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -97,7 +97,6 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // ==================== Further Expanded HLE Syscalls ====================
     private int ExecuteSyscall(uint opcode, ref ulong nextPC)
     {
         COP0_EPC = PC;
@@ -107,11 +106,7 @@ public sealed class EmotionEngine
 
         switch (syscallNumber)
         {
-            case 0x01:
-                HleSifInitialized = true;
-                _gprs[2].Lo = 0;
-                break;
-
+            case 0x01: HleSifInitialized = true; _gprs[2].Lo = 0; break;
             case 0x02:
             case 0x03:
             case 0x04:
@@ -127,13 +122,10 @@ public sealed class EmotionEngine
             case 0x70:
             case 0x71:
             case 0x80:
-                _gprs[2].Lo = 0;
-                break;
-
+                _gprs[2].Lo = 0; break;
             default:
                 Console.WriteLine($"[EE HLE] Syscall 0x{syscallNumber:X}");
-                _gprs[2].Lo = 0;
-                break;
+                _gprs[2].Lo = 0; break;
         }
 
         nextPC = 0x80000180;
@@ -141,7 +133,6 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // Abbreviated other methods
     private int ExecuteRegimm(uint opcode, ref ulong nextPC) => 1;
     private int ExecuteJ(uint opcode, ref ulong nextPC) => 1;
     private int ExecuteJal(uint opcode, ref ulong nextPC) => 1;
