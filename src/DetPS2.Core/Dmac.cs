@@ -4,9 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// DMA Controller (DMAC) - Phase 2/3
-/// Supports major channels + chain mode.
-/// Now has a basic but usable register interface (CHCR, MADR, QWC, TADR per channel).
-/// This removes the need for reflection in tests and moves us toward accurate hardware modeling.
+/// Supports major channels + chain mode + register interface.
 /// </summary>
 public sealed class Dmac
 {
@@ -46,6 +44,7 @@ public sealed class Dmac
         public uint TADR;
         public bool Active;
         public int Mode;
+        public uint OriginalQWC; // Track original transfer size for notifications
     }
 
     private readonly ChannelState[] _channels = new ChannelState[10];
@@ -55,8 +54,9 @@ public sealed class Dmac
         var ch = _channels[(int)channel];
         ch.Active = true;
         ch.Mode = (int)((ch.CHCR >> 2) & 0x3);
+        ch.OriginalQWC = ch.QWC; // Remember size at start
 
-        Console.WriteLine($"[DMAC] Starting transfer on {channel} (Mode={ch.Mode})");
+        Console.WriteLine($"[DMAC] Starting transfer on {channel} (Mode={ch.Mode}, QWC={ch.QWC})");
     }
 
     public void Step(ulong cycles)
@@ -77,7 +77,8 @@ public sealed class Dmac
 
                 if ((Channel)i == Channel.GIF && _gif != null)
                 {
-                    _gif.ReceivePath3Data(ch.MADR, ch.QWC);
+                    // Pass the original transfer size instead of the now-zero QWC
+                    _gif.ReceivePath3Data(ch.MADR, ch.OriginalQWC);
                 }
 
                 Console.WriteLine($"[DMAC] {(Channel)i} transfer finished");
@@ -102,6 +103,7 @@ public sealed class Dmac
             ch.QWC = tagLow & 0xFFFF;
             uint tagId = (tagLow >> 28) & 0x7;
             ch.MADR = tagHigh & 0x7FFFFFFF;
+            ch.OriginalQWC = ch.QWC;
 
             Console.WriteLine($"[DMAC] Chain tag ID={tagId}, QWC={ch.QWC}");
             ch.TADR += 16;
@@ -111,17 +113,16 @@ public sealed class Dmac
             DoNormalTransfer(channel, ch);
     }
 
-    // ==================== Register Interface (new for Phase 2/3) ====================
+    // ==================== Register Interface ====================
 
     public uint ReadRegister(uint address)
     {
-        // Simplified mapping for the most important per-channel registers
         int channel = GetChannelFromAddress(address);
         if (channel < 0) return 0;
 
         var ch = _channels[channel];
+        uint reg = (address >> 4) & 0xF;
 
-        uint reg = (address >> 4) & 0xF; // rough
         return reg switch
         {
             0x0 => ch.MADR,
@@ -138,7 +139,6 @@ public sealed class Dmac
         if (channel < 0) return;
 
         var ch = _channels[channel];
-
         uint reg = (address >> 4) & 0xF;
 
         switch (reg)
@@ -147,7 +147,7 @@ public sealed class Dmac
             case 0x1: ch.QWC = value; break;
             case 0x2:
                 ch.CHCR = value;
-                if ((value & 0x100) != 0) // start bit set
+                if ((value & 0x100) != 0)
                 {
                     StartTransfer((Channel)channel);
                 }
@@ -158,12 +158,9 @@ public sealed class Dmac
 
     private int GetChannelFromAddress(uint address)
     {
-        // Very simplified address decoding for GIF channel (0x1000_8000 area is common)
-        // Real hardware has specific base addresses per channel.
         if (address >= 0x10008000 && address < 0x10009000)
             return (int)Channel.GIF;
 
-        // Fallback: treat low bits as channel index for test flexibility
         return (int)((address >> 8) & 0xF) % 10;
     }
 }
