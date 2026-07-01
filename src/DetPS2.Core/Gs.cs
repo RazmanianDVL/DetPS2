@@ -5,7 +5,8 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Graphics Synthesizer - Phase 2/3
-/// Supports multiple primitives + basic texture sampling stub.
+/// Supports triangle, line, and quad primitives with PRIM-based dispatch.
+/// Texture sampling is a stub for future use.
 /// </summary>
 public sealed class Gs
 {
@@ -18,7 +19,7 @@ public sealed class Gs
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
-    // Simple texture state (stub for Phase 2/3)
+    // Texture state (stub)
     private uint _texBase = 0;
     private int _texWidth = 64;
     private int _texHeight = 64;
@@ -36,25 +37,22 @@ public sealed class Gs
         _currentRgbaq = 0xFFFFFFFF;
     }
 
+    /// <summary>
+    /// Called by GIF after parsing a command list.
+    /// Currently dispatches based on the last SetPrim() value.
+    /// In a more advanced version this would parse actual GS packets from memory.
+    /// </summary>
     public void ReceiveCommandList(uint address, uint qwc)
     {
         uint primType = _currentPrim & 0x7;
 
         switch (primType)
         {
-            case 1:
-                DrawLine(200, 200, 400, 300, _currentRgbaq);
-                break;
+            case 1: DrawLine(200, 200, 400, 300, _currentRgbaq); break;
             case 3:
-            case 4:
-                DrawTestTriangle();
-                break;
-            case 5:
-                DrawQuad(250, 180, 180, 120, _currentRgbaq);
-                break;
-            default:
-                DrawTestTriangle();
-                break;
+            case 4: DrawTestTriangle(); break;
+            case 5: DrawQuad(250, 180, 180, 120, _currentRgbaq); break;
+            default: DrawTestTriangle(); break;
         }
     }
 
@@ -70,23 +68,22 @@ public sealed class Gs
         Console.WriteLine($"[GS] RGBAQ = 0x{rgbaq:X8}");
     }
 
+    /// <summary>
+    /// Vertex data handler. Currently a stub for future primitive assembly.
+    /// </summary>
     public void DrawVertex(uint xyz)
     {
-        // Future: collect vertices for more advanced primitive assembly
+        // TODO: Collect vertices for proper primitive assembly
     }
 
-    // ==================== Texture Sampling Stub ====================
+    // ==================== Texture Sampling (Stub) ====================
 
     public uint SampleTexture(int u, int v)
     {
-        // Very simple nearest-neighbor sampling from a fake texture region
-        // In a real implementation this would read from GS VRAM / texture memory
         int tu = u % _texWidth;
         int tv = v % _texHeight;
-
-        // Generate a simple checkerboard pattern for demo purposes
         bool checker = ((tu / 8) + (tv / 8)) % 2 == 0;
-        return checker ? 0xFFFF00FF : 0xFF00FFFF; // magenta / cyan
+        return checker ? 0xFFFF00FF : 0xFF00FFFF;
     }
 
     public void SetTexture(uint baseAddr, int width, int height)
@@ -94,10 +91,9 @@ public sealed class Gs
         _texBase = baseAddr;
         _texWidth = width;
         _texHeight = height;
-        Console.WriteLine($"[GS] Texture set @ 0x{baseAddr:X} ({width}x{height})");
     }
 
-    // ==================== Primitive Drawing ====================
+    // ==================== Drawing Primitives ====================
 
     public void DrawTestTriangle()
     {
@@ -118,15 +114,13 @@ public sealed class Gs
         while (true)
         {
             if (x0 >= 0 && x0 < FB_WIDTH && y0 >= 0 && y0 < FB_HEIGHT)
-            {
                 _framebuffer[y0 * FB_WIDTH + x0] = color;
-            }
 
             if (x0 == x1 && y0 == y1) break;
 
             int e2 = 2 * err;
             if (e2 > -dy) { err -= dy; x0 += sx; }
-            if (e2 < dx)  { err += dx; y0 += sy; }
+            if (e2 < dx) { err += dx; y0 += sy; }
         }
 
         Console.WriteLine("[GS] Drew line.");
@@ -158,9 +152,7 @@ public sealed class Gs
             for (int x = Math.Max(0, minX); x <= Math.Min(FB_WIDTH - 1, maxX); x++)
             {
                 if (PointInTriangle(x, y, v0, v1, v2))
-                {
                     _framebuffer[y * FB_WIDTH + x] = v0.c;
-                }
             }
         }
 
