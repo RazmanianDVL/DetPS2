@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system with expanded Phase 3 components.
+/// Top-level PS2 system with SIF DMA support.
 /// </summary>
 public sealed class Ps2System
 {
@@ -17,6 +17,7 @@ public sealed class Ps2System
     public Intc Intc { get; }
     public Iop Iop { get; }
     public Cdvd Cdvd { get; }
+    public Sif Sif { get; }
 
     public ulong MasterCycles { get; private set; }
 
@@ -31,8 +32,9 @@ public sealed class Ps2System
         Vif = new Vif(Gs, Gif);
         Pcrtc = new Pcrtc(Gs);
         Intc = new Intc();
-        Iop = new Iop(Intc, Memory); // Now shares memory
+        Iop = new Iop(Intc, Memory);
         Cdvd = new Cdvd();
+        Sif = new Sif(Memory, Iop);
 
         Dmac.SetGif(Gif);
 
@@ -56,6 +58,7 @@ public sealed class Ps2System
             Intc.Step(1);
             Iop.Step(1);
             Cdvd.Step(1);
+            Sif.Step(1);
         }
     }
 
@@ -75,6 +78,14 @@ public sealed class Ps2System
 
     public void TriggerTestDraw(bool useVif = false)
     {
-        // ... (same as before)
+        Console.WriteLine($"[Ps2System] Graphics test (useVif={useVif})...");
+
+        // ... existing test code ...
+
+        // Example SIF DMA call
+        Sif.DoDmaTransfer(0x100000, 0x200000, 0x100);
+
+        RunFor(30);
+        Pcrtc.Present("detps2_phase2_final.ppm");
     }
 }
