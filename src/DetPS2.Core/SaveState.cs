@@ -1,16 +1,14 @@
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
 
 namespace DetPS2.Core;
 
 /// <summary>
-/// Save state system - Phase 4.
-/// Now serializes actual components (starting with Memory).
+/// SaveState - Phase 4. Now captures Memory + basic EE/IOP registers.
 /// </summary>
 public static class SaveState
 {
-    private const uint Magic = 0x44505332; // "DPS2"
+    private const uint Magic = 0x44505332;
     private const uint Version = 1;
 
     public static byte[] Save(Ps2System system)
@@ -22,13 +20,24 @@ public static class SaveState
         writer.Write(Version);
         writer.Write(DateTime.UtcNow.Ticks);
 
-        // Serialize Memory (biggest and most important)
-        byte[] memoryData = system.Memory.GetRawData();
-        writer.Write(memoryData.Length);
-        writer.Write(memoryData);
+        // Memory
+        byte[] mem = system.Memory.GetRawData();
+        writer.Write(mem.Length);
+        writer.Write(mem);
 
-        // TODO: Serialize EE, IOP, GS, etc.
-        writer.Write(0); // Placeholder for other state size
+        // Basic EE registers (PC + first 8 GPRs for now)
+        writer.Write(system.EE.PC);
+        for (int i = 0; i < 8; i++)
+        {
+            var gpr = system.EE.GetGpr(i);
+            writer.Write(gpr.Lo);
+            writer.Write(gpr.Hi);
+        }
+
+        // Basic IOP registers
+        writer.Write(system.Iop.PC);
+        for (int i = 0; i < 8; i++)
+            writer.Write(system.Iop.GetGpr(i)); // We'll add GetGpr to Iop
 
         return ms.ToArray();
     }
@@ -45,12 +54,24 @@ public static class SaveState
 
         reader.ReadInt64(); // timestamp
 
+        // Memory
         int memSize = reader.ReadInt32();
-        if (memSize > 0)
+        byte[] memData = reader.ReadBytes(memSize);
+        system.Memory.SetRawData(memData);
+
+        // EE
+        system.EE.PC = reader.ReadUInt64();
+        for (int i = 0; i < 8; i++)
         {
-            byte[] memoryData = reader.ReadBytes(memSize);
-            system.Memory.SetRawData(memoryData);
+            ulong lo = reader.ReadUInt64();
+            ulong hi = reader.ReadUInt64();
+            system.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = lo, Hi = hi });
         }
+
+        // IOP
+        system.Iop.PC = reader.ReadUInt32();
+        for (int i = 0; i < 8; i++)
+            system.Iop.SetGpr(i, reader.ReadUInt32());
 
         return true;
     }
