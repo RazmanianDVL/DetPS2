@@ -1,31 +1,20 @@
 using System;
 using DetPS2.Core;
 
-Console.WriteLine("=== DetPS2 Phase 2 Test ===");
+Console.WriteLine("=== DetPS2 Phase 2 - Pixels on Screen Test ===");
 
 var system = new Ps2System();
 
 // Run some CPU cycles
-system.RunFor(100);
+system.RunFor(200);
 
-// Trigger a test draw through the graphics pipeline
+// Trigger graphics pipeline
 system.TriggerTestDraw();
 
-// Check if we have pixels in the framebuffer
-var fb = system.Gs.GetFramebuffer();
-bool hasPixels = false;
-foreach (var pixel in fb)
-{
-    if (pixel != 0)
-    {
-        hasPixels = true;
-        break;
-    }
-}
+// Save the framebuffer as an image
+string outputPath = "detps2_test_output.ppm";
+system.Gs.SaveFramebufferAsPPM(outputPath);
 
-Console.WriteLine(hasPixels 
-    ? "[SUCCESS] Framebuffer contains pixels! Phase 2 pipeline is producing output."
-    : "[INFO] No pixels yet.");
-
-Console.WriteLine($"Framebuffer size: {system.Gs.FramebufferWidth}x{system.Gs.FramebufferHeight}");
+Console.WriteLine($"\n[RESULT] Image saved to: {outputPath}");
+Console.WriteLine("You can open this .ppm file with most image viewers or convert it.");
 Console.WriteLine("\n=== Phase 2 test complete ===");
