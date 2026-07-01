@@ -4,17 +4,15 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Input/Output Processor (IOP) - Phase 3
-/// Now includes a basic R3000A-style CPU interpreter skeleton.
+/// Expanded R3000A interpreter with more instructions.
 /// </summary>
 public sealed class Iop
 {
     public Intc Intc { get; }
 
-    // CPU State
     public uint PC { get; set; } = 0xBFC00000;
     private readonly uint[] _gprs = new uint[32];
 
-    // SIF
     public uint SifMbxFromEE { get; private set; }
     public uint SifMbxToEE { get; private set; }
 
@@ -51,7 +49,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 4 && Running; i++)
+        for (int i = 0; i < 8 && Running; i++) // Increased to 8 instructions per step
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
@@ -65,20 +63,17 @@ public sealed class Iop
 
         switch (primary)
         {
-            case 0x00:
-                ExecuteSpecial(opcode);
-                break;
-            case 0x0D:
-                ExecuteOri(opcode);
-                break;
-            case 0x23:
-                ExecuteLw(opcode);
-                break;
-            case 0x2B:
-                ExecuteSw(opcode);
-                break;
-            default:
-                break;
+            case 0x00: ExecuteSpecial(opcode); break;
+            case 0x01: ExecuteRegimm(opcode); break;
+            case 0x02: ExecuteJ(opcode); break;
+            case 0x03: ExecuteJal(opcode); break;
+            case 0x04: ExecuteBeq(opcode); break;
+            case 0x05: ExecuteBne(opcode); break;
+            case 0x0D: ExecuteOri(opcode); break;
+            case 0x0F: ExecuteLui(opcode); break;
+            case 0x23: ExecuteLw(opcode); break;
+            case 0x2B: ExecuteSw(opcode); break;
+            default: break;
         }
     }
 
@@ -88,16 +83,78 @@ public sealed class Iop
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 11) & 0x1F;
+        uint sa = (opcode >> 6) & 0x1F;
 
         switch (function)
         {
+            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;           // SLL
+            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;           // SRL
+            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break; // SRA
+            case 0x08: PC = _gprs[rs] - 4; break;                                 // JR
             case 0x20:
-            case 0x21:
-                if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt];
-                break;
-            case 0x08:
-                PC = _gprs[rs] - 4;
-                break;
+            case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break; // ADD/ADDU
+            case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;      // SUBU
+            case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;      // AND
+            case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;      // OR
+            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break; // SLT
+        }
+    }
+
+    private void ExecuteRegimm(uint opcode)
+    {
+        uint rt = (opcode >> 16) & 0x1F;
+        int val = (int)_gprs[(opcode >> 21) & 0x1F];
+        short offset = (short)(opcode & 0xFFFF);
+
+        bool take = false;
+        if (rt == 0x00) take = val < 0;   // BLTZ
+        if (rt == 0x01) take = val >= 0;  // BGEZ
+
+        if (take)
+        {
+            PC += (uint)((int)offset << 2);
+            PC -= 4;
+        }
+    }
+
+    private void ExecuteJ(uint opcode)
+    {
+        uint target = opcode & 0x03FFFFFF;
+        PC = (PC & 0xF0000000) | (target << 2);
+        PC -= 4;
+    }
+
+    private void ExecuteJal(uint opcode)
+    {
+        _gprs[31] = PC + 8;
+        uint target = opcode & 0x03FFFFFF;
+        PC = (PC & 0xF0000000) | (target << 2);
+        PC -= 4;
+    }
+
+    private void ExecuteBeq(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
+
+        if (_gprs[rs] == _gprs[rt])
+        {
+            PC += (uint)((int)offset << 2);
+            PC -= 4;
+        }
+    }
+
+    private void ExecuteBne(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
+
+        if (_gprs[rs] != _gprs[rt])
+        {
+            PC += (uint)((int)offset << 2);
+            PC -= 4;
         }
     }
 
@@ -107,6 +164,13 @@ public sealed class Iop
         uint rt = (opcode >> 16) & 0x1F;
         ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) _gprs[rt] = _gprs[rs] | imm;
+    }
+
+    private void ExecuteLui(uint opcode)
+    {
+        uint rt = (opcode >> 16) & 0x1F;
+        ushort imm = (ushort)(opcode & 0xFFFF);
+        if (rt != 0) _gprs[rt] = (uint)imm << 16;
     }
 
     private void ExecuteLw(uint opcode)
