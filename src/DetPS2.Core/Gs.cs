@@ -5,7 +5,8 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Graphics Synthesizer - Phase 2/3
-/// Supports triangle, line, and basic quad primitives driven by GIF.
+/// Supports triangle, line, and quad primitives.
+/// Now dispatches based on current PRIM value.
 /// </summary>
 public sealed class Gs
 {
@@ -15,6 +16,7 @@ public sealed class Gs
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
 
+    private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
     public Gs(SystemMemory memory)
@@ -26,19 +28,39 @@ public sealed class Gs
     public void Reset()
     {
         Array.Clear(_framebuffer, 0, _framebuffer.Length);
+        _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
     }
 
     public void ReceiveCommandList(uint address, uint qwc)
     {
-        // For the current test we draw the triangle.
-        // In future this will dispatch based on PRIM type.
-        DrawTestTriangle();
+        // Dispatch based on current PRIM (set by GIF)
+        uint primType = _currentPrim & 0x7; // PRIM[2:0] = primitive type
+
+        switch (primType)
+        {
+            case 0: // Point (not implemented yet)
+            case 1: // Line
+                DrawLine(200, 200, 400, 300, _currentRgbaq);
+                break;
+            case 2: // Line strip (simplified)
+            case 3: // Triangle
+                DrawTestTriangle();
+                break;
+            case 4: // Triangle strip/fan (simplified)
+            case 5: // Quad / Sprite
+                DrawQuad(250, 180, 180, 120, _currentRgbaq);
+                break;
+            default:
+                DrawTestTriangle(); // fallback
+                break;
+        }
     }
 
     public void SetPrim(uint prim)
     {
-        Console.WriteLine($"[GS] PRIM = 0x{prim:X}");
+        _currentPrim = prim;
+        Console.WriteLine($"[GS] PRIM = 0x{prim:X} (type={(prim & 0x7)})");
     }
 
     public void SetRGBAQ(uint rgbaq)
@@ -49,11 +71,10 @@ public sealed class Gs
 
     public void DrawVertex(uint xyz)
     {
-        // For triangle test - we still use the 3-vertex path
-        // (extended primitive support added below)
+        // Vertex data can be collected here in a future more advanced version
     }
 
-    // ==================== Primitive Drawing ====================
+    // ==================== Primitive Implementations ====================
 
     public void DrawTestTriangle()
     {
@@ -65,7 +86,6 @@ public sealed class Gs
 
     public void DrawLine(int x0, int y0, int x1, int y1, uint color)
     {
-        // Simple Bresenham line (deterministic, integer only)
         int dx = Math.Abs(x1 - x0);
         int dy = Math.Abs(y1 - y0);
         int sx = x0 < x1 ? 1 : -1;
@@ -91,7 +111,6 @@ public sealed class Gs
 
     public void DrawQuad(int x, int y, int w, int h, uint color)
     {
-        // Simple filled rectangle (quad)
         for (int yy = y; yy < y + h && yy < FB_HEIGHT; yy++)
         {
             for (int xx = x; xx < x + w && xx < FB_WIDTH; xx++)
