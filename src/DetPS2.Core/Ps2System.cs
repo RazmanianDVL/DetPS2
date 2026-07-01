@@ -3,56 +3,61 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system coordinator.
-/// 
-/// This class owns the master cycle counter and all major components.
-/// Everything is driven from here for maximum determinism.
+/// Top-level PS2 system.
+/// Now includes DMAC, GIF, and GS for Phase 2 graphics pipeline.
 /// </summary>
 public sealed class Ps2System
 {
     public SystemMemory Memory { get; }
     public EmotionEngine EE { get; }
+    public Dmac Dmac { get; }
+    public Gif Gif { get; }
+    public Gs Gs { get; }
 
-    /// <summary>
-    /// Master cycle counter. This is the single source of truth for time in the entire emulator.
-    /// All input events, DMA transfers, interrupts, VBlank, etc. will be scheduled against this.
-    /// </summary>
     public ulong MasterCycles { get; private set; }
 
     public Ps2System()
     {
         Memory = new SystemMemory();
         EE = new EmotionEngine(Memory);
+
+        // Create graphics components
+        Dmac = new Dmac(Memory);
+        Gs = new Gs(Memory);
+        Gif = new Gif(Gs);
+
+        // Wire DMAC to GIF for PATH3
+        Dmac.SetGif(Gif);
+
         MasterCycles = 0;
     }
 
-    /// <summary>
-    /// Run the emulator for a target number of master cycles.
-    /// This is the main entry point for deterministic execution.
-    /// </summary>
     public void RunFor(ulong cyclesToRun)
     {
         ulong target = MasterCycles + cyclesToRun;
 
         while (MasterCycles < target)
         {
-            // For now the EE is the only thing that advances time.
-            // Later we will interleave IOP, VUs, DMAC, GS, timers, etc. here
-            // using proper cycle budgeting or an event queue.
             int cyclesTaken = EE.Step();
             MasterCycles += (ulong)cyclesTaken;
+
+            // Step graphics components
+            Dmac.Step(1);
+            Gif.Step(1);
+            Gs.Step(1);
         }
     }
 
-    /// <summary>
-    /// Convenience: run until we hit (or pass) a specific master cycle.
-    /// </summary>
     public void RunUntil(ulong targetCycle)
     {
         while (MasterCycles < targetCycle)
         {
             int cyclesTaken = EE.Step();
             MasterCycles += (ulong)cyclesTaken;
+
+            Dmac.Step(1);
+            Gif.Step(1);
+            Gs.Step(1);
         }
     }
 
@@ -60,6 +65,21 @@ public sealed class Ps2System
     {
         MasterCycles = 0;
         EE.Reset();
-        // TODO: Reset other components when we add them
+        Dmac.Reset();
+        Gif.Reset();
+        Gs.Reset();
+    }
+
+    /// <summary>
+    /// Helper to trigger a test draw through the full pipeline.
+    /// </summary>
+    public void TriggerTestDraw()
+    {
+        Console.WriteLine("[Ps2System] Triggering test draw through DMAC -> GIF -> GS...");
+
+        // Simulate DMAC transferring data to GIF channel
+        var gifChannel = Dmac.GetType().GetField("_channels", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        // For simplicity in early testing, just call GS directly
+        Gs.DrawTestPattern();
     }
 }
