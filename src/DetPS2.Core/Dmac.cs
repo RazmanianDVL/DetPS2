@@ -3,13 +3,15 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// DMA Controller (DMAC) - Phase 2
-/// Now notifies GIF when PATH3 (GIF channel) transfer completes.
+/// DMA Controller (DMAC) - Phase 2/3
+/// Supports major channels + chain mode.
+/// Now has a basic but usable register interface (CHCR, MADR, QWC, TADR per channel).
+/// This removes the need for reflection in tests and moves us toward accurate hardware modeling.
 /// </summary>
 public sealed class Dmac
 {
     private readonly SystemMemory _memory;
-    private Gif _gif; // Set later via dependency injection or setter
+    private Gif _gif;
 
     public Dmac(SystemMemory memory)
     {
@@ -48,12 +50,6 @@ public sealed class Dmac
 
     private readonly ChannelState[] _channels = new ChannelState[10];
 
-    public Dmac()
-    {
-        for (int i = 0; i < _channels.Length; i++)
-            _channels[i] = new ChannelState();
-    }
-
     public void StartTransfer(Channel channel)
     {
         var ch = _channels[(int)channel];
@@ -70,22 +66,21 @@ public sealed class Dmac
             var ch = _channels[i];
             if (!ch.Active || ch.QWC == 0) continue;
 
-            if (ch.Mode == 0) // Normal
+            if (ch.Mode == 0)
                 DoNormalTransfer((Channel)i, ch);
-            else if (ch.Mode == 1) // Chain
+            else if (ch.Mode == 1)
                 DoChainTransfer((Channel)i, ch);
 
             if (ch.QWC == 0)
             {
                 ch.Active = false;
 
-                // Notify GIF if this was the GIF channel (PATH3)
                 if ((Channel)i == Channel.GIF && _gif != null)
                 {
-                    _gif.ReceivePath3Data(ch.MADR, ch.QWC); // QWC should be 0 here, but we pass original if needed
+                    _gif.ReceivePath3Data(ch.MADR, ch.QWC);
                 }
 
-                Console.WriteLine($"[DMAC] { (Channel)i } transfer finished");
+                Console.WriteLine($"[DMAC] {(Channel)i} transfer finished");
             }
         }
     }
@@ -116,6 +111,59 @@ public sealed class Dmac
             DoNormalTransfer(channel, ch);
     }
 
-    public uint ReadRegister(uint address) => 0;
-    public void WriteRegister(uint address, uint value) { }
+    // ==================== Register Interface (new for Phase 2/3) ====================
+
+    public uint ReadRegister(uint address)
+    {
+        // Simplified mapping for the most important per-channel registers
+        int channel = GetChannelFromAddress(address);
+        if (channel < 0) return 0;
+
+        var ch = _channels[channel];
+
+        uint reg = (address >> 4) & 0xF; // rough
+        return reg switch
+        {
+            0x0 => ch.MADR,
+            0x1 => ch.QWC,
+            0x2 => ch.CHCR,
+            0x3 => ch.TADR,
+            _ => 0
+        };
+    }
+
+    public void WriteRegister(uint address, uint value)
+    {
+        int channel = GetChannelFromAddress(address);
+        if (channel < 0) return;
+
+        var ch = _channels[channel];
+
+        uint reg = (address >> 4) & 0xF;
+
+        switch (reg)
+        {
+            case 0x0: ch.MADR = value; break;
+            case 0x1: ch.QWC = value; break;
+            case 0x2:
+                ch.CHCR = value;
+                if ((value & 0x100) != 0) // start bit set
+                {
+                    StartTransfer((Channel)channel);
+                }
+                break;
+            case 0x3: ch.TADR = value; break;
+        }
+    }
+
+    private int GetChannelFromAddress(uint address)
+    {
+        // Very simplified address decoding for GIF channel (0x1000_8000 area is common)
+        // Real hardware has specific base addresses per channel.
+        if (address >= 0x10008000 && address < 0x10009000)
+            return (int)Channel.GIF;
+
+        // Fallback: treat low bits as channel index for test flexibility
+        return (int)((address >> 8) & 0xF) % 10;
+    }
 }
