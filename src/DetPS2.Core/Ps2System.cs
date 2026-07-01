@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Phase 2 pipeline now produces real drawn geometry from properly sequenced GIF commands.
+/// Uses clean DMAC register interface (no more reflection).
 /// </summary>
 public sealed class Ps2System
 {
@@ -68,45 +68,35 @@ public sealed class Ps2System
     }
 
     /// <summary>
-    /// Writes a clean GIFtag + data that the improved Gif parser expects:
-    /// PRIM, RGBAQ, Vertex1, Vertex2, Vertex3.
-    /// This produces a real drawn triangle via the full pipeline.
+    /// Demonstrates the full pipeline using the new clean DMAC register interface.
     /// </summary>
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Sending clean GIF command stream through DMAC...");
+        Console.WriteLine("[Ps2System] Sending drawing commands via clean DMAC register writes...");
 
         ulong baseAddr = 0x100000;
 
-        // GIFtag: NLOOP=5 (PRIM + RGBAQ + 3 vertices)
+        // GIFtag + data (same as before)
         Memory.Write32(baseAddr + 0,  0x00008005);
         Memory.Write32(baseAddr + 4,  0);
         Memory.Write32(baseAddr + 8,  0);
         Memory.Write32(baseAddr + 12, 0);
 
-        // Data quadwords (sequential as expected by Gif parser)
         Memory.Write32(baseAddr + 16,  0x00000001); // PRIM
-        Memory.Write32(baseAddr + 32,  0xFF00FFFF); // RGBAQ (magenta)
-        Memory.Write32(baseAddr + 48,  0x0000C800); // Vertex 1
-        Memory.Write32(baseAddr + 64,  0x0001B800); // Vertex 2
-        Memory.Write32(baseAddr + 80,  0x00014000); // Vertex 3
+        Memory.Write32(baseAddr + 32,  0xFF00FFFF); // RGBAQ
+        Memory.Write32(baseAddr + 48,  0x0000C800); // V1
+        Memory.Write32(baseAddr + 64,  0x0001B800); // V2
+        Memory.Write32(baseAddr + 80,  0x00014000); // V3
 
-        // Start DMAC transfer on GIF channel
-        Dmac.StartTransfer(Dmac.Channel.GIF);
+        // Use the new clean register interface instead of reflection
+        uint gifChBase = 0x10008000; // approximate GIF channel base
 
-        // Temporary: set transfer state (will be replaced by real register writes)
-        var chField = typeof(Dmac).GetField("_channels", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        if (chField != null)
-        {
-            var channels = (Array)chField.GetValue(Dmac);
-            var ch = channels.GetValue((int)Dmac.Channel.GIF);
-            ch.GetType().GetField("MADR")?.SetValue(ch, (uint)baseAddr);
-            ch.GetType().GetField("QWC")?.SetValue(ch, (uint)6);
-            ch.GetType().GetField("Active")?.SetValue(ch, true);
-        }
+        Dmac.WriteRegister(gifChBase + 0x00, (uint)baseAddr); // MADR
+        Dmac.WriteRegister(gifChBase + 0x10, 6);              // QWC
+        Dmac.WriteRegister(gifChBase + 0x20, 0x101);          // CHCR with start bit
 
         RunFor(25);
 
-        Console.WriteLine("[Ps2System] Pipeline finished. Real triangle drawn from GIF commands.");
+        Console.WriteLine("[Ps2System] Pipeline complete using real register interface.");
     }
 }
