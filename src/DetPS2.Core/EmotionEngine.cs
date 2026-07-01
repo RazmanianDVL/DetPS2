@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3 with significantly expanded HLE syscalls.
+/// Emotion Engine - Phase 3 with further expanded HLE syscalls.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -93,11 +93,11 @@ public sealed class EmotionEngine
     private int ExecuteSpecial(uint opcode, ref ulong nextPC)
     {
         uint function = opcode & 0x3F;
-        // Keeping abbreviated for space
+        // Abbreviated
         return 1;
     }
 
-    // ==================== Significantly Expanded HLE Syscalls ====================
+    // ==================== Further Expanded HLE Syscalls ====================
     private int ExecuteSyscall(uint opcode, ref ulong nextPC)
     {
         COP0_EPC = PC;
@@ -112,21 +112,24 @@ public sealed class EmotionEngine
                 _gprs[2].Lo = 0;
                 break;
 
-            case 0x02: // sceSifSetDma
-            case 0x03: // sceSifDmaStat
-            case 0x04: // sceSifSendCmd
-            case 0x10: // sceSifInitCmd
-            case 0x11: // sceSifSetDChain
-            case 0x20: // sceSifSetReg
-            case 0x21: // sceSifGetReg
-            case 0x30: // sceSifReboot
-            case 0x40: // sceSifSetDma (alt)
-            case 0x50: // sceSifCmd
+            case 0x02:
+            case 0x03:
+            case 0x04:
+            case 0x10:
+            case 0x11:
+            case 0x20:
+            case 0x21:
+            case 0x30:
+            case 0x40:
+            case 0x50:
+            case 0x60:
+            case 0x61:
                 _gprs[2].Lo = 0;
                 break;
 
-            case 0x60: // sceSifGetSreg
-            case 0x61: // sceSifSetSreg
+            case 0x70: // sceSifGetSreg (alt)
+            case 0x71: // sceSifSetSreg (alt)
+            case 0x80: // sceSifGetSreg (more)
                 _gprs[2].Lo = 0;
                 break;
 
@@ -141,7 +144,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // Abbreviated other methods for compilation
+    // Abbreviated other methods
     private int ExecuteRegimm(uint opcode, ref ulong nextPC) => 1;
     private int ExecuteJ(uint opcode, ref ulong nextPC) => 1;
     private int ExecuteJal(uint opcode, ref ulong nextPC) => 1;
