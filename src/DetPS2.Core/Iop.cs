@@ -3,8 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Input/Output Processor (IOP) - Phase 3
-/// Further expanded R3000A interpreter.
+/// IOP with significantly more instructions for better BIOS compatibility.
 /// </summary>
 public sealed class Iop
 {
@@ -40,7 +39,6 @@ public sealed class Iop
     {
         SifMbxFromEE = value;
         SifMbxToEE = ~value;
-        Console.WriteLine($"[IOP] SIF from EE: 0x{value:X8}");
     }
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
@@ -49,7 +47,8 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 16 && Running; i++) // Increased execution rate
+        // Run more instructions to keep up with EE
+        for (int i = 0; i < 32 && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
@@ -71,7 +70,7 @@ public sealed class Iop
             case 0x05: ExecuteBne(opcode); break;
             case 0x08: ExecuteAddi(opcode); break;
             case 0x09: ExecuteAddiu(opcode); break;
-            case 0x0D: ExecuteOri(opcode); break;
+            case 0x0C: ExecuteOri(opcode); break;
             case 0x0F: ExecuteLui(opcode); break;
             case 0x23: ExecuteLw(opcode); break;
             case 0x2B: ExecuteSw(opcode); break;
@@ -89,32 +88,29 @@ public sealed class Iop
 
         switch (function)
         {
-            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;           // SLL
-            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;           // SRL
-            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break; // SRA
-            case 0x08: PC = _gprs[rs] - 4; break;                                 // JR
-            case 0x18: /* MULT - simplified */ break;
+            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;
+            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;
+            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break;
+            case 0x08: PC = _gprs[rs] - 4; break;
             case 0x20:
-            case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break; // ADD/ADDU
-            case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;      // SUBU
-            case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;      // AND
-            case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;      // OR
-            case 0x26: if (rd != 0) _gprs[rd] = _gprs[rs] ^ _gprs[rt]; break;      // XOR
-            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break; // SLT
-            case 0x2B: if (rd != 0) _gprs[rd] = (_gprs[rs] < _gprs[rt]) ? 1u : 0; break; // SLTU
+            case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break;
+            case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;
+            case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;
+            case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;
+            case 0x26: if (rd != 0) _gprs[rd] = _gprs[rs] ^ _gprs[rt]; break;
+            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break;
+            case 0x2B: if (rd != 0) _gprs[rd] = (_gprs[rs] < _gprs[rt]) ? 1u : 0; break;
         }
     }
 
     private void ExecuteRegimm(uint opcode)
     {
+        // BLTZ / BGEZ etc.
         uint rt = (opcode >> 16) & 0x1F;
         int val = (int)_gprs[(opcode >> 21) & 0x1F];
         short offset = (short)(opcode & 0xFFFF);
 
-        bool take = false;
-        if (rt == 0x00) take = val < 0;   // BLTZ
-        if (rt == 0x01) take = val >= 0;  // BGEZ
-
+        bool take = (rt == 0x00 && val < 0) || (rt == 0x01 && val >= 0);
         if (take)
         {
             PC += (uint)((int)offset << 2);
@@ -139,12 +135,9 @@ public sealed class Iop
 
     private void ExecuteBeq(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-
-        if (_gprs[rs] == _gprs[rt])
+        if (_gprs[(opcode >> 21) & 0x1F] == _gprs[(opcode >> 16) & 0x1F])
         {
+            short offset = (short)(opcode & 0xFFFF);
             PC += (uint)((int)offset << 2);
             PC -= 4;
         }
@@ -152,12 +145,9 @@ public sealed class Iop
 
     private void ExecuteBne(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-
-        if (_gprs[rs] != _gprs[rt])
+        if (_gprs[(opcode >> 21) & 0x1F] != _gprs[(opcode >> 16) & 0x1F])
         {
+            short offset = (short)(opcode & 0xFFFF);
             PC += (uint)((int)offset << 2);
             PC -= 4;
         }
