@@ -6,7 +6,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Emotion Engine (R5900) CPU core.
-/// Phase 1 nearing completion.
+/// Phase 1 - Delay slot timing corrected.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -14,9 +14,9 @@ public sealed class EmotionEngine
 
     public ulong PC { get; set; } = 0xBFC00000;
 
-    private bool _inDelaySlot;
-    private ulong _branchTarget;
-    private bool _branchTaken;
+    // Delay slot state
+    private bool _branchPending;
+    private ulong _pendingBranchTarget;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct Gpr128
@@ -50,13 +50,19 @@ public sealed class EmotionEngine
         COP0_EPC = 0;
         LO = 0;
         HI = 0;
-        _inDelaySlot = false;
-        _branchTaken = false;
+        _branchPending = false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Step()
     {
+        // Apply pending branch from previous instruction (this executes the delay slot first)
+        if (_branchPending)
+        {
+            PC = _pendingBranchTarget;
+            _branchPending = false;
+        }
+
         ulong currentPC = PC;
         uint opcode = _memory.Read32(currentPC);
         ulong nextPC = currentPC + 4;
@@ -89,17 +95,16 @@ public sealed class EmotionEngine
             _ => HandleUnknown(opcode, currentPC)
         };
 
-        if (_inDelaySlot)
+        // If this instruction was a branch, schedule it for after the next instruction
+        if (_branchPending) // the branch handlers set this
         {
-            if (_branchTaken)
-            {
-                nextPC = _branchTarget;
-            }
-            _inDelaySlot = false;
-            _branchTaken = false;
+            // nextPC will be overridden on the next Step()
+        }
+        else
+        {
+            PC = nextPC;
         }
 
-        PC = nextPC;
         return cycles;
     }
 
@@ -124,11 +129,15 @@ public sealed class EmotionEngine
             0x02 => ExecuteSrl(rd, rt, sa),
             0x03 => ExecuteSra(rd, rt, sa),
             0x0C => ExecuteSyscall(opcode, ref nextPC),
-            0x18 => ExecuteMult(rs, rt),      // MULT
-            0x19 => ExecuteMultu(rs, rt),     // MULTU
-            0x1A => ExecuteDiv(rs, rt),       // DIV
-            0x1B => ExecuteDivu(rs, rt),      // DIVU
-            0x20 => ExecuteAdd(rd, rs, rt),
+            0x18 => ExecuteMult(rs, rt),
+            0x19 => ExecuteMultu(rs, rt),
+            0x1A => ExecuteDiv(rs, rt),
+            0x1B => ExecuteDivu(rs, rt),
+            0x10 => ExecuteMfhi(rd),
+            0x12 => ExecuteMflo(rd),
+            0x11 => ExecuteMthi(rs),
+            0x13 => ExecuteMtlo(rs),
+            0x20 => ExecuteAddu(rd, rs, rt),
             0x21 => ExecuteAddu(rd, rs, rt),
             0x23 => ExecuteSubu(rd, rs, rt),
             0x24 => ExecuteAnd(rd, rs, rt),
@@ -137,10 +146,6 @@ public sealed class EmotionEngine
             0x27 => ExecuteNor(rd, rs, rt),
             0x2A => ExecuteSlt(rd, rs, rt),
             0x2B => ExecuteSltu(rd, rs, rt),
-            0x12 => ExecuteMflo(rd),          // MFLO
-            0x10 => ExecuteMfhi(rd),          // MFHI
-            0x13 => ExecuteMtlo(rs),          // MTLO
-            0x11 => ExecuteMthi(rs),          // MTHI
             _ => HandleUnknown(opcode, PC)
         };
     }
@@ -149,11 +154,11 @@ public sealed class EmotionEngine
     {
         COP0_EPC = PC;
         COP0_Cause = (8 << 2);
-        nextPC = 0x80000180;
+        nextPC = 0x80000180; // Simplified
         return 1;
     }
 
-    // ==================== MULTIPLY / DIVIDE ====================
+    // ==================== MULT / DIV ====================
     private int ExecuteMult(int rs, int rt)
     {
         long a = (long)_gprs[rs].Lo;
@@ -166,9 +171,7 @@ public sealed class EmotionEngine
 
     private int ExecuteMultu(int rs, int rt)
     {
-        ulong a = _gprs[rs].Lo;
-        ulong b = _gprs[rt].Lo;
-        ulong result = a * b;  // This will overflow naturally for 64-bit result
+        ulong result = _gprs[rs].Lo * _gprs[rt].Lo;
         LO = result & 0xFFFFFFFF;
         HI = (result >> 32) & 0xFFFFFFFF;
         return 1;
@@ -183,12 +186,6 @@ public sealed class EmotionEngine
             LO = (ulong)(a / b);
             HI = (ulong)(a % b);
         }
-        else
-        {
-            // Division by zero behavior (undefined on real hardware, simplified here)
-            LO = 0;
-            HI = 0;
-        }
         return 1;
     }
 
@@ -201,48 +198,24 @@ public sealed class EmotionEngine
             LO = a / b;
             HI = a % b;
         }
-        else
-        {
-            LO = 0;
-            HI = 0;
-        }
         return 1;
     }
 
-    private int ExecuteMfhi(int rd)
-    {
-        if (rd != 0) _gprs[rd].Lo = HI;
-        return 1;
-    }
-
-    private int ExecuteMflo(int rd)
-    {
-        if (rd != 0) _gprs[rd].Lo = LO;
-        return 1;
-    }
-
-    private int ExecuteMthi(int rs)
-    {
-        HI = _gprs[rs].Lo;
-        return 1;
-    }
-
-    private int ExecuteMtlo(int rs)
-    {
-        LO = _gprs[rs].Lo;
-        return 1;
-    }
+    private int ExecuteMfhi(int rd) { if (rd != 0) _gprs[rd].Lo = HI; return 1; }
+    private int ExecuteMflo(int rd) { if (rd != 0) _gprs[rd].Lo = LO; return 1; }
+    private int ExecuteMthi(int rs) { HI = _gprs[rs].Lo; return 1; }
+    private int ExecuteMtlo(int rs) { LO = _gprs[rs].Lo; return 1; }
 
     // ==================== SHIFTS ====================
     private int ExecuteSll(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = _gprs[rt].Lo << sa; _gprs[rd].Hi = 0; } return 1; }
     private int ExecuteSrl(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = _gprs[rt].Lo >> sa; _gprs[rd].Hi = 0; } return 1; }
     private int ExecuteSra(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = (ulong)((long)_gprs[rt].Lo >> sa); _gprs[rd].Hi = 0; } return 1; }
 
-    // ==================== ARITHMETIC ====================
+    // ==================== ARITHMETIC & LOGIC ====================
     private int ExecuteAddu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo + _gprs[rt].Lo; return 1; }
     private int ExecuteSubu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo - _gprs[rt].Lo; return 1; }
     private int ExecuteAnd(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo & _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi & _gprs[rt].Hi; } return 1; }
-    private int ExecuteOr(int rd, int rs, int rt)  { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo | _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi | _gprs[rt].Hi; } return 1; }
+    private int ExecuteOr(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo | _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi | _gprs[rt].Hi; } return 1; }
     private int ExecuteXor(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo ^ _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi ^ _gprs[rt].Hi; } return 1; }
     private int ExecuteNor(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = ~(_gprs[rs].Lo | _gprs[rt].Lo); _gprs[rd].Hi = ~(_gprs[rs].Hi | _gprs[rt].Hi); } return 1; }
     private int ExecuteSlt(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = ((long)_gprs[rs].Lo < (long)_gprs[rt].Lo) ? 1UL : 0; return 1; }
@@ -252,11 +225,11 @@ public sealed class EmotionEngine
     private int ExecuteRegimm(uint opcode, ref ulong nextPC)
     {
         uint rt = (opcode >> 16) & 0x1F;
-        long value = (long)_gprs[(opcode >> 21) & 0x1F].Lo;
+        long val = (long)_gprs[(opcode >> 21) & 0x1F].Lo;
         return rt switch
         {
-            0x00 => TakeBranchIf(opcode, value < 0, ref nextPC),
-            0x01 => TakeBranchIf(opcode, value >= 0, ref nextPC),
+            0x00 => ScheduleBranchIf(opcode, val < 0, ref nextPC),
+            0x01 => ScheduleBranchIf(opcode, val >= 0, ref nextPC),
             _ => HandleUnknown(opcode, PC)
         };
     }
@@ -265,9 +238,8 @@ public sealed class EmotionEngine
     private int ExecuteJ(uint opcode, ref ulong nextPC)
     {
         uint target = opcode & 0x03FFFFFF;
-        _branchTarget = (PC & 0xF0000000) | (target << 2);
-        _branchTaken = true;
-        _inDelaySlot = true;
+        _pendingBranchTarget = (PC & 0xF0000000) | (target << 2);
+        _branchPending = true;
         return 1;
     }
 
@@ -275,27 +247,25 @@ public sealed class EmotionEngine
     {
         _gprs[31].Lo = PC + 8;
         uint target = opcode & 0x03FFFFFF;
-        _branchTarget = (PC & 0xF0000000) | (target << 2);
-        _branchTaken = true;
-        _inDelaySlot = true;
+        _pendingBranchTarget = (PC & 0xF0000000) | (target << 2);
+        _branchPending = true;
         return 1;
     }
 
     // ==================== BRANCHES ====================
-    private int ExecuteBeq(uint opcode, ref ulong nextPC) => TakeBranchIf(opcode, _gprs[(opcode >> 21) & 0x1F].Lo == _gprs[(opcode >> 16) & 0x1F].Lo, ref nextPC);
-    private int ExecuteBne(uint opcode, ref ulong nextPC) => TakeBranchIf(opcode, _gprs[(opcode >> 21) & 0x1F].Lo != _gprs[(opcode >> 16) & 0x1F].Lo, ref nextPC);
-    private int ExecuteBlez(uint opcode, ref ulong nextPC) => TakeBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo <= 0, ref nextPC);
-    private int ExecuteBgtz(uint opcode, ref ulong nextPC) => TakeBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo > 0, ref nextPC);
+    private int ExecuteBeq(uint opcode, ref ulong nextPC) => ScheduleBranchIf(opcode, _gprs[(opcode >> 21) & 0x1F].Lo == _gprs[(opcode >> 16) & 0x1F].Lo, ref nextPC);
+    private int ExecuteBne(uint opcode, ref ulong nextPC) => ScheduleBranchIf(opcode, _gprs[(opcode >> 21) & 0x1F].Lo != _gprs[(opcode >> 16) & 0x1F].Lo, ref nextPC);
+    private int ExecuteBlez(uint opcode, ref ulong nextPC) => ScheduleBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo <= 0, ref nextPC);
+    private int ExecuteBgtz(uint opcode, ref ulong nextPC) => ScheduleBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo > 0, ref nextPC);
 
-    private int TakeBranchIf(uint opcode, bool condition, ref ulong nextPC)
+    private int ScheduleBranchIf(uint opcode, bool condition, ref ulong nextPC)
     {
         if (condition)
         {
             short offset = (short)(opcode & 0xFFFF);
-            _branchTarget = PC + (ulong)((long)offset << 2) + 4;
-            _branchTaken = true;
+            _pendingBranchTarget = PC + (ulong)((long)offset << 2) + 4;
+            _branchPending = true;
         }
-        _inDelaySlot = true;
         return 1;
     }
 
