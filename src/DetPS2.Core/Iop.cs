@@ -3,17 +3,19 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Input/Output Processor (IOP) - Early Phase 3 skeleton.
-/// Provides basic SIF mailbox communication with EE.
-/// Very minimal for now.
+/// Input/Output Processor (IOP) - Phase 3
+/// Expanded skeleton with improved SIF mailbox and basic structure for future IOP CPU core.
 /// </summary>
 public sealed class Iop
 {
     public Intc Intc { get; }
 
-    // Very simple SIF mailbox (EE <-> IOP communication)
+    // SIF Mailbox (EE <-> IOP communication)
     public uint SifMbxFromEE { get; private set; }
     public uint SifMbxToEE { get; private set; }
+
+    // Simple status
+    public bool Running { get; private set; } = true;
 
     public Iop(Intc intc)
     {
@@ -25,21 +27,37 @@ public sealed class Iop
     {
         SifMbxFromEE = 0;
         SifMbxToEE = 0;
+        Running = true;
     }
 
-    public void WriteSifMailbox(uint value)
+    /// <summary>
+    /// EE writes to IOP mailbox.
+    /// </summary>
+    public void WriteSifMailboxFromEE(uint value)
     {
         SifMbxFromEE = value;
-        Console.WriteLine($"[IOP] SIF mailbox write from EE: 0x{value:X8}");
+        Console.WriteLine($"[IOP] Received from EE via SIF: 0x{value:X8}");
+
+        // Simple echo for testing
+        SifMbxToEE = value ^ 0xFFFFFFFF;
     }
 
-    public uint ReadSifMailbox()
+    /// <summary>
+    /// EE reads from IOP mailbox.
+    /// </summary>
+    public uint ReadSifMailboxToEE()
     {
         return SifMbxToEE;
     }
 
     public void Step(ulong cycles)
     {
-        // Future: IOP CPU core, DMA, CDVD, etc.
+        // Future: IOP R3000A CPU core, DMA, CDVD, etc.
+        if (!Running) return;
+    }
+
+    public void Stop()
+    {
+        Running = false;
     }
 }
