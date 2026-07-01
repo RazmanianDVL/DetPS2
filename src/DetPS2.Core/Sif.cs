@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SIF - More realistic and functional for Phase 3.
+/// SIF - More realistic implementation for Phase 3.
 /// </summary>
 public sealed class Sif
 {
