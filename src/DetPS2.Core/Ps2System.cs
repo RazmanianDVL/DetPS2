@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Phase 2 now includes VIF (PATH3) and PCRTC for complete graphics pipeline.
+/// Phase 2 complete. Phase 3 components (Intc + Iop) integrated.
 /// </summary>
 public sealed class Ps2System
 {
@@ -87,9 +87,9 @@ public sealed class Ps2System
         Iop.Reset();
     }
 
-    public void TriggerTestDraw()
+    public void TriggerTestDraw(bool useVif = false)
     {
-        Console.WriteLine("[Ps2System] Full Phase 2 pipeline test (VIF + GIF + GS + PCRTC)...");
+        Console.WriteLine($"[Ps2System] Test draw (useVif={useVif})...");
 
         ulong baseAddr = 0x100000;
 
@@ -110,11 +110,15 @@ public sealed class Ps2System
         Dmac.WriteRegister(gifChBase + 0x10, 6);
         Dmac.WriteRegister(gifChBase + 0x20, 0x101);
 
+        if (useVif)
+        {
+            // Demonstrate Vif path
+            Vif.ProcessPath3(baseAddr, 6);
+        }
+
         RunFor(30);
 
-        // Use PCRTC to present the final frame
         Pcrtc.Present("detps2_phase2_final.ppm");
-
-        Console.WriteLine("[Ps2System] Phase 2 pipeline complete.");
+        Console.WriteLine("[Ps2System] Done.");
     }
 }
