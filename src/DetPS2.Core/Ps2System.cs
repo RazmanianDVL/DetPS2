@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Demonstrates PRIM-based primitive dispatch in GS.
+/// Now includes early Phase 3 components: Intc + Iop.
 /// </summary>
 public sealed class Ps2System
 {
@@ -14,6 +14,7 @@ public sealed class Ps2System
     public Gif Gif { get; }
     public Gs Gs { get; }
     public Intc Intc { get; }
+    public Iop Iop { get; }
 
     public ulong MasterCycles { get; private set; }
 
@@ -26,6 +27,7 @@ public sealed class Ps2System
         Gs = new Gs(Memory);
         Gif = new Gif(Gs);
         Intc = new Intc();
+        Iop = new Iop(Intc);
 
         Dmac.SetGif(Gif);
 
@@ -45,6 +47,7 @@ public sealed class Ps2System
             Gif.Step(1);
             Gs.Step(1);
             Intc.Step(1);
+            Iop.Step(1);
         }
     }
 
@@ -59,6 +62,7 @@ public sealed class Ps2System
             Gif.Step(1);
             Gs.Step(1);
             Intc.Step(1);
+            Iop.Step(1);
         }
     }
 
@@ -70,11 +74,12 @@ public sealed class Ps2System
         Gif.Reset();
         Gs.Reset();
         Intc.Reset();
+        Iop.Reset();
     }
 
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Sending commands - GS will dispatch based on PRIM type...");
+        Console.WriteLine("[Ps2System] Sending commands (PRIM dispatch + Phase 3 components active)...");
 
         ulong baseAddr = 0x100000;
 
@@ -83,8 +88,8 @@ public sealed class Ps2System
         Memory.Write32(baseAddr + 8,  0);
         Memory.Write32(baseAddr + 12, 0);
 
-        Memory.Write32(baseAddr + 16,  0x00000005); // PRIM = 5 (Quad/Sprite) for demo
-        Memory.Write32(baseAddr + 32,  0xFF00FFFF); // RGBAQ
+        Memory.Write32(baseAddr + 16,  0x00000005); // PRIM = Quad
+        Memory.Write32(baseAddr + 32,  0xFF00FFFF);
         Memory.Write32(baseAddr + 48,  0x0000C800);
         Memory.Write32(baseAddr + 64,  0x0001B800);
         Memory.Write32(baseAddr + 80,  0x00014000);
@@ -95,8 +100,8 @@ public sealed class Ps2System
         Dmac.WriteRegister(gifChBase + 0x10, 6);
         Dmac.WriteRegister(gifChBase + 0x20, 0x101);
 
-        RunFor(25);
+        RunFor(30);
 
-        Console.WriteLine("[Ps2System] Done. Check PPM for the dispatched primitive (quad in this test).");
+        Console.WriteLine("[Ps2System] Pipeline complete.");
     }
 }
