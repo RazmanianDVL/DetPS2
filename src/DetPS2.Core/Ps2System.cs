@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Now includes early Phase 3 component: Intc.
+/// Demonstrates PRIM-based primitive dispatch in GS.
 /// </summary>
 public sealed class Ps2System
 {
@@ -13,7 +13,7 @@ public sealed class Ps2System
     public Dmac Dmac { get; }
     public Gif Gif { get; }
     public Gs Gs { get; }
-    public Intc Intc { get; }   // Early Phase 3
+    public Intc Intc { get; }
 
     public ulong MasterCycles { get; private set; }
 
@@ -44,7 +44,7 @@ public sealed class Ps2System
             Dmac.Step(1);
             Gif.Step(1);
             Gs.Step(1);
-            Intc.Step(1);   // Phase 3 component
+            Intc.Step(1);
         }
     }
 
@@ -74,7 +74,7 @@ public sealed class Ps2System
 
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Sending drawing commands via clean DMAC register writes...");
+        Console.WriteLine("[Ps2System] Sending commands - GS will dispatch based on PRIM type...");
 
         ulong baseAddr = 0x100000;
 
@@ -83,8 +83,8 @@ public sealed class Ps2System
         Memory.Write32(baseAddr + 8,  0);
         Memory.Write32(baseAddr + 12, 0);
 
-        Memory.Write32(baseAddr + 16,  0x00000001);
-        Memory.Write32(baseAddr + 32,  0xFF00FFFF);
+        Memory.Write32(baseAddr + 16,  0x00000005); // PRIM = 5 (Quad/Sprite) for demo
+        Memory.Write32(baseAddr + 32,  0xFF00FFFF); // RGBAQ
         Memory.Write32(baseAddr + 48,  0x0000C800);
         Memory.Write32(baseAddr + 64,  0x0001B800);
         Memory.Write32(baseAddr + 80,  0x00014000);
@@ -97,6 +97,6 @@ public sealed class Ps2System
 
         RunFor(25);
 
-        Console.WriteLine("[Ps2System] Pipeline complete using real register interface.");
+        Console.WriteLine("[Ps2System] Done. Check PPM for the dispatched primitive (quad in this test).");
     }
 }
