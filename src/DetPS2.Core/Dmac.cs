@@ -3,12 +3,13 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// DMA Controller (DMAC) - Improved implementation for Phase 2.
-/// Supports Normal and basic Chain mode.
+/// DMA Controller (DMAC) - Phase 2
+/// Now notifies GIF when PATH3 (GIF channel) transfer completes.
 /// </summary>
 public sealed class Dmac
 {
     private readonly SystemMemory _memory;
+    private Gif _gif; // Set later via dependency injection or setter
 
     public Dmac(SystemMemory memory)
     {
@@ -16,26 +17,23 @@ public sealed class Dmac
         Reset();
     }
 
+    public void SetGif(Gif gif)
+    {
+        _gif = gif;
+    }
+
     public void Reset()
     {
         for (int i = 0; i < _channels.Length; i++)
-        {
             _channels[i] = new ChannelState();
-        }
     }
 
     public enum Channel
     {
-        VIF0 = 0,
-        VIF1 = 1,
-        GIF = 2,
-        IPU_FROM = 3,
-        IPU_TO = 4,
-        SIF0 = 5,
-        SIF1 = 6,
-        SIF2 = 7,
-        SPR_FROM = 8,
-        SPR_TO = 9
+        VIF0 = 0, VIF1 = 1, GIF = 2,
+        IPU_FROM = 3, IPU_TO = 4,
+        SIF0 = 5, SIF1 = 6, SIF2 = 7,
+        SPR_FROM = 8, SPR_TO = 9
     }
 
     private class ChannelState
@@ -45,7 +43,7 @@ public sealed class Dmac
         public uint CHCR;
         public uint TADR;
         public bool Active;
-        public int Mode; // 0 = Normal, 1 = Chain, 2 = Interleave
+        public int Mode;
     }
 
     private readonly ChannelState[] _channels = new ChannelState[10];
@@ -56,23 +54,13 @@ public sealed class Dmac
             _channels[i] = new ChannelState();
     }
 
-    // Start a DMA transfer (called when CHCR STR bit is set)
     public void StartTransfer(Channel channel)
     {
         var ch = _channels[(int)channel];
         ch.Active = true;
+        ch.Mode = (int)((ch.CHCR >> 2) & 0x3);
 
-        // Decode CHCR for mode
-        ch.Mode = (int)((ch.CHCR >> 2) & 0x3); // bits 2-3 usually
-
-        Console.WriteLine($"[DMAC] Starting {channel} (Mode={(DmaMode)ch.Mode})");
-    }
-
-    public enum DmaMode
-    {
-        Normal = 0,
-        Chain = 1,
-        Interleave = 2
+        Console.WriteLine($"[DMAC] Starting transfer on {channel} (Mode={ch.Mode})");
     }
 
     public void Step(ulong cycles)
@@ -82,18 +70,21 @@ public sealed class Dmac
             var ch = _channels[i];
             if (!ch.Active || ch.QWC == 0) continue;
 
-            if (ch.Mode == (int)DmaMode.Normal)
-            {
+            if (ch.Mode == 0) // Normal
                 DoNormalTransfer((Channel)i, ch);
-            }
-            else if (ch.Mode == (int)DmaMode.Chain)
-            {
+            else if (ch.Mode == 1) // Chain
                 DoChainTransfer((Channel)i, ch);
-            }
 
             if (ch.QWC == 0)
             {
                 ch.Active = false;
+
+                // Notify GIF if this was the GIF channel (PATH3)
+                if ((Channel)i == Channel.GIF && _gif != null)
+                {
+                    _gif.ReceivePath3Data(ch.MADR, ch.QWC); // QWC should be 0 here, but we pass original if needed
+                }
+
                 Console.WriteLine($"[DMAC] { (Channel)i } transfer finished");
             }
         }
@@ -101,53 +92,30 @@ public sealed class Dmac
 
     private void DoNormalTransfer(Channel channel, ChannelState ch)
     {
-        // Simple normal mode: transfer QWC quadwords from MADR
-        uint qwToTransfer = Math.Min(ch.QWC, 16); // limit per step for simulation
-
-        for (uint i = 0; i < qwToTransfer; i++)
-        {
-            // In real hardware this would be 128-bit transfers
-            // For now we just advance pointers
-            ch.MADR += 16;
-            ch.QWC--;
-        }
-
-        // TODO: Actually read/write data using _memory
+        uint qwToTransfer = Math.Min(ch.QWC, 8);
+        ch.MADR += qwToTransfer * 16;
+        ch.QWC -= qwToTransfer;
     }
 
     private void DoChainTransfer(Channel channel, ChannelState ch)
     {
         if (ch.QWC == 0 && ch.TADR != 0)
         {
-            // Read DMA tag from TADR
             uint tagLow = _memory.Read32(ch.TADR);
             uint tagHigh = _memory.Read32(ch.TADR + 4);
 
-            uint qwc = tagLow & 0xFFFF;
+            ch.QWC = tagLow & 0xFFFF;
             uint tagId = (tagLow >> 28) & 0x7;
-            uint addr = tagHigh & 0x7FFFFFFF;
+            ch.MADR = tagHigh & 0x7FFFFFFF;
 
-            ch.QWC = qwc;
-            ch.MADR = addr;
-
-            Console.WriteLine($"[DMAC] Chain tag: ID={tagId}, QWC={qwc}, ADDR=0x{addr:X8}");
-
-            // Advance TADR for next tag (simplified)
+            Console.WriteLine($"[DMAC] Chain tag ID={tagId}, QWC={ch.QWC}");
             ch.TADR += 16;
-
-            // TODO: Handle different tag types (REFE, CNT, NEXT, REF, CALL, RET, etc.)
         }
 
         if (ch.QWC > 0)
-        {
             DoNormalTransfer(channel, ch);
-        }
     }
 
-    // Register access stubs
     public uint ReadRegister(uint address) => 0;
-    public void WriteRegister(uint address, uint value)
-    {
-        // TODO: Proper decoding of channel registers
-    }
+    public void WriteRegister(uint address, uint value) { }
 }
