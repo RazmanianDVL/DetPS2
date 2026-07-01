@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine (R5900) CPU core - Phase 1 work in progress.
-/// Focus: More instructions, proper branch delay slots, and basic exception handling.
+/// Emotion Engine (R5900) CPU core.
+/// Phase 1 nearing completion.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -14,7 +14,6 @@ public sealed class EmotionEngine
 
     public ulong PC { get; set; } = 0xBFC00000;
 
-    // Delay slot support
     private bool _inDelaySlot;
     private ulong _branchTarget;
     private bool _branchTaken;
@@ -60,8 +59,6 @@ public sealed class EmotionEngine
     {
         ulong currentPC = PC;
         uint opcode = _memory.Read32(currentPC);
-
-        // Default next PC
         ulong nextPC = currentPC + 4;
 
         uint primary = (opcode >> 26) & 0x3F;
@@ -92,7 +89,6 @@ public sealed class EmotionEngine
             _ => HandleUnknown(opcode, currentPC)
         };
 
-        // Handle delay slot
         if (_inDelaySlot)
         {
             if (_branchTaken)
@@ -127,7 +123,11 @@ public sealed class EmotionEngine
             0x00 => ExecuteSll(rd, rt, sa),
             0x02 => ExecuteSrl(rd, rt, sa),
             0x03 => ExecuteSra(rd, rt, sa),
-            0x0C => ExecuteSyscall(opcode, ref nextPC),   // SYSCALL
+            0x0C => ExecuteSyscall(opcode, ref nextPC),
+            0x18 => ExecuteMult(rs, rt),      // MULT
+            0x19 => ExecuteMultu(rs, rt),     // MULTU
+            0x1A => ExecuteDiv(rs, rt),       // DIV
+            0x1B => ExecuteDivu(rs, rt),      // DIVU
             0x20 => ExecuteAdd(rd, rs, rt),
             0x21 => ExecuteAddu(rd, rs, rt),
             0x23 => ExecuteSubu(rd, rs, rt),
@@ -137,24 +137,108 @@ public sealed class EmotionEngine
             0x27 => ExecuteNor(rd, rs, rt),
             0x2A => ExecuteSlt(rd, rs, rt),
             0x2B => ExecuteSltu(rd, rs, rt),
+            0x12 => ExecuteMflo(rd),          // MFLO
+            0x10 => ExecuteMfhi(rd),          // MFHI
+            0x13 => ExecuteMtlo(rs),          // MTLO
+            0x11 => ExecuteMthi(rs),          // MTHI
             _ => HandleUnknown(opcode, PC)
         };
     }
 
     private int ExecuteSyscall(uint opcode, ref ulong nextPC)
     {
-        // Basic syscall handling for Phase 1
-        COP0_EPC = PC;                    // EPC points to the instruction after the syscall in real hardware (simplified)
-        COP0_Cause = (8 << 2);            // ExcCode = Sys (8)
-        // Jump to exception vector (simplified - real PS2 uses different vectors based on BEV)
+        COP0_EPC = PC;
+        COP0_Cause = (8 << 2);
         nextPC = 0x80000180;
         return 1;
     }
 
+    // ==================== MULTIPLY / DIVIDE ====================
+    private int ExecuteMult(int rs, int rt)
+    {
+        long a = (long)_gprs[rs].Lo;
+        long b = (long)_gprs[rt].Lo;
+        long result = a * b;
+        LO = (ulong)(result & 0xFFFFFFFF);
+        HI = (ulong)((result >> 32) & 0xFFFFFFFF);
+        return 1;
+    }
+
+    private int ExecuteMultu(int rs, int rt)
+    {
+        ulong a = _gprs[rs].Lo;
+        ulong b = _gprs[rt].Lo;
+        ulong result = a * b;  // This will overflow naturally for 64-bit result
+        LO = result & 0xFFFFFFFF;
+        HI = (result >> 32) & 0xFFFFFFFF;
+        return 1;
+    }
+
+    private int ExecuteDiv(int rs, int rt)
+    {
+        long a = (long)_gprs[rs].Lo;
+        long b = (long)_gprs[rt].Lo;
+        if (b != 0)
+        {
+            LO = (ulong)(a / b);
+            HI = (ulong)(a % b);
+        }
+        else
+        {
+            // Division by zero behavior (undefined on real hardware, simplified here)
+            LO = 0;
+            HI = 0;
+        }
+        return 1;
+    }
+
+    private int ExecuteDivu(int rs, int rt)
+    {
+        ulong a = _gprs[rs].Lo;
+        ulong b = _gprs[rt].Lo;
+        if (b != 0)
+        {
+            LO = a / b;
+            HI = a % b;
+        }
+        else
+        {
+            LO = 0;
+            HI = 0;
+        }
+        return 1;
+    }
+
+    private int ExecuteMfhi(int rd)
+    {
+        if (rd != 0) _gprs[rd].Lo = HI;
+        return 1;
+    }
+
+    private int ExecuteMflo(int rd)
+    {
+        if (rd != 0) _gprs[rd].Lo = LO;
+        return 1;
+    }
+
+    private int ExecuteMthi(int rs)
+    {
+        HI = _gprs[rs].Lo;
+        return 1;
+    }
+
+    private int ExecuteMtlo(int rs)
+    {
+        LO = _gprs[rs].Lo;
+        return 1;
+    }
+
+    // ==================== SHIFTS ====================
     private int ExecuteSll(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = _gprs[rt].Lo << sa; _gprs[rd].Hi = 0; } return 1; }
     private int ExecuteSrl(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = _gprs[rt].Lo >> sa; _gprs[rd].Hi = 0; } return 1; }
     private int ExecuteSra(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = (ulong)((long)_gprs[rt].Lo >> sa); _gprs[rd].Hi = 0; } return 1; }
 
+    // ==================== ARITHMETIC ====================
     private int ExecuteAddu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo + _gprs[rt].Lo; return 1; }
     private int ExecuteSubu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo - _gprs[rt].Lo; return 1; }
     private int ExecuteAnd(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo & _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi & _gprs[rt].Hi; } return 1; }
@@ -168,10 +252,11 @@ public sealed class EmotionEngine
     private int ExecuteRegimm(uint opcode, ref ulong nextPC)
     {
         uint rt = (opcode >> 16) & 0x1F;
+        long value = (long)_gprs[(opcode >> 21) & 0x1F].Lo;
         return rt switch
         {
-            0x00 => TakeBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo < 0, ref nextPC),
-            0x01 => TakeBranchIf(opcode, (long)_gprs[(opcode >> 21) & 0x1F].Lo >= 0, ref nextPC),
+            0x00 => TakeBranchIf(opcode, value < 0, ref nextPC),
+            0x01 => TakeBranchIf(opcode, value >= 0, ref nextPC),
             _ => HandleUnknown(opcode, PC)
         };
     }
@@ -188,7 +273,7 @@ public sealed class EmotionEngine
 
     private int ExecuteJal(uint opcode, ref ulong nextPC)
     {
-        _gprs[31].Lo = PC + 8; // return address (after delay slot)
+        _gprs[31].Lo = PC + 8;
         uint target = opcode & 0x03FFFFFF;
         _branchTarget = (PC & 0xF0000000) | (target << 2);
         _branchTaken = true;
@@ -214,7 +299,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // ==================== IMMEDIATE ARITHMETIC ====================
+    // ==================== IMMEDIATE ====================
     private int ExecuteAddi(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
@@ -268,7 +353,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // ==================== LOADS & STORES ====================
+    // ==================== LOADS ====================
     private int ExecuteLb(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
@@ -321,6 +406,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
+    // ==================== STORES ====================
     private int ExecuteSb(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
