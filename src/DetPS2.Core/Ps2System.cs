@@ -4,8 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system.
-/// Now supports loading a BIOS and starting execution.
+/// Top-level PS2 system with improved boot/BIOS loading for Phase 3.
 /// </summary>
 public sealed class Ps2System
 {
@@ -43,9 +42,6 @@ public sealed class Ps2System
         MasterCycles = 0;
     }
 
-    /// <summary>
-    /// Loads a PS2 BIOS dump into memory at the correct location (0x1FC00000).
-    /// </summary>
     public void LoadBios(string path)
     {
         if (!File.Exists(path))
@@ -53,21 +49,16 @@ public sealed class Ps2System
 
         byte[] biosData = File.ReadAllBytes(path);
 
-        if (biosData.Length != 4 * 1024 * 1024)
-            Console.WriteLine("[System] Warning: BIOS size is not 4MB. This may cause issues.");
-
-        // PS2 BIOS is mapped at 0x1FC00000 (KSEG1)
         const uint BIOS_BASE = 0x1FC00000;
-
         for (int i = 0; i < biosData.Length && i < 4 * 1024 * 1024; i++)
         {
             Memory.Write8(BIOS_BASE + (uint)i, biosData[i]);
         }
 
-        Console.WriteLine($"[System] BIOS loaded from {path} ({biosData.Length} bytes)");
+        Console.WriteLine($"[System] BIOS loaded ({biosData.Length} bytes)");
 
-        // Set EE to start executing from BIOS reset vector
-        EE.PC = 0xBFC00000; // Reset vector points into BIOS
+        // Set reset vector
+        EE.PC = 0xBFC00000;
     }
 
     public void RunFor(ulong cyclesToRun)
@@ -103,10 +94,5 @@ public sealed class Ps2System
         Intc.Reset();
         Iop.Reset();
         Cdvd.Reset();
-    }
-
-    public void TriggerTestDraw(bool useVif = false)
-    {
-        // Existing test code...
     }
 }
