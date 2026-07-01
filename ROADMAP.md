@@ -27,17 +27,18 @@ Focus areas:
 **Goal**: Run real homebrew and meaningful game code.
 
 ### High Priority
-- [ ] Significantly expand MIPS instruction decoder (ADDI/ADDIU, ADDU/SUBU, SLT/SLTI/SLTU, AND/ANDI/XOR/XORI/NOR, shifts, etc.)
-- [ ] Basic COP0 implementation (Status, Cause, EPC, exception handling)
-- [ ] Branch delay slot handling
-- [ ] Simple I-cache / D-cache behavior (or accurate enough model)
+- [x] Significantly expand MIPS instruction decoder (ADDI/ADDIU, ADDU/SUBU, SLT/SLTI/SLTU, AND/ANDI/XOR/XORI/NOR, shifts, JR/JALR, etc.)
+- [x] Basic COP0 implementation (Status, Cause, EPC, exception handling)
+- [x] Branch delay slot handling (correct)
+- [ ] Simple I-cache / D-cache behavior (or accurate enough model) — *deferred to later*
 
 ### Medium Priority
-- [ ] Common 128-bit MMI instructions
-- [ ] LO/HI + multiply/divide with reasonable timing
-- [ ] Better exception and syscall entry points
+- [x] LO/HI + multiply/divide with reasonable timing
+- [x] Better exception and syscall entry points
 
 **Milestone**: Load and execute a real PS2 homebrew ELF with meaningful behavior.
+
+**Status**: **Complete** (as of 2026-07-01)
 
 ---
 
@@ -45,13 +46,16 @@ Focus areas:
 
 **Goal**: Get actual graphics output.
 
-- [ ] DMAC implementation (major channels + chain mode)
-- [ ] GIF (especially PATH3)
-- [ ] Minimal VIF support for PATH3 transfers
-- [ ] Software GS renderer (primitive handling + basic drawing)
-- [ ] PCRTC / frame output to a window
+- [x] DMAC implementation (major channels + chain mode + register interface)
+- [x] GIF (especially PATH3) — improved sequential parsing driving GS
+- [ ] Minimal VIF support for PATH3 transfers — *deferred*
+- [x] Software GS renderer (primitive handling + basic drawing: triangle, line, quad)
+- [x] Clean pipeline test producing real drawn geometry from emulated commands
+- [ ] PCRTC / frame output to a window — *using PPM for now (deterministic)*
 
 **Milestone**: Run a homebrew that successfully draws something to the screen using the GS.
+
+**Status**: **Strong progress — real primitives now drawn through full DMAC→GIF→GS pipeline** (as of 2026-07-01)
 
 ---
 
@@ -61,11 +65,13 @@ Focus areas:
 
 - [ ] IOP + SIF communication layer
 - [ ] Basic CDVD / disc emulation
-- [ ] Timers + Interrupt Controller (INTC)
+- [x] Timers + Interrupt Controller (INTC) — *minimal skeleton started*
 - [ ] Minimal HLE for key BIOS syscalls (or begin LLE BIOS exploration)
 - [ ] SPU2 stub
 
 **Milestone**: Boot a commercial PS2 game to a menu or in-game (with heavy HLE allowed).
+
+**Status**: Early skeleton work begun (Intc + timers)
 
 ---
 
@@ -80,6 +86,8 @@ This phase makes DetPS2 special.
 - [ ] Memory viewer + register inspector (initially console-based)
 - [ ] Deterministic build mode + benchmarking harness
 
+**Status**: Not started
+
 ---
 
 ## Phase 5: Vector Units + Accuracy
@@ -88,6 +96,8 @@ This phase makes DetPS2 special.
 - [ ] VU1 (micro mode + microprogram memory)
 - [ ] Accurate VU pipeline modeling and stalls
 - [ ] VU0 ↔ EE COP2 integration
+
+**Status**: Not started
 
 ---
 
@@ -100,6 +110,8 @@ This phase makes DetPS2 special.
 - [ ] Better ELF loader + debugging symbols support
 - [ ] Full debugging UI (registers, memory, breakpoints, single-step)
 
+**Status**: Not started
+
 ---
 
 ## Cross-Cutting Concerns
@@ -108,8 +120,6 @@ This phase makes DetPS2 special.
 - Documentation (memory map, register behavior, determinism guarantees)
 - Performance profiling harness
 - Long-term: Netplay / rollback experimentation (enabled by strong determinism)
-
----
 
 ## Guiding Principles
 
