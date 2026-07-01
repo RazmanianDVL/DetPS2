@@ -4,8 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Phase 2: Full DMAC -> GIF -> GS pipeline exercised in the test.
-/// Master cycle counter drives everything for determinism.
+/// Phase 2: Full DMAC -> GIF -> GS pipeline with real primitive drawing.
 /// </summary>
 public sealed class Ps2System
 {
@@ -69,35 +68,35 @@ public sealed class Ps2System
     }
 
     /// <summary>
-    /// Phase 2 test: Sets up a minimal valid GIFtag in memory and triggers
-    /// a real DMAC transfer on the GIF channel (PATH3). This exercises the
-    /// full pipeline instead of a direct shortcut.
+    /// Phase 2 test: Writes a more complete GIFtag (with PRIM, RGBAQ, XYZ)
+    /// and triggers real DMAC transfer. The new Gif/GS code will draw an actual triangle.
     /// </summary>
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Triggering real DMAC -> GIF -> GS pipeline...");
+        Console.WriteLine("[Ps2System] Triggering real DMAC -> GIF -> GS with primitive data...");
 
-        // Simple test GIFtag at a known address in RDRAM (0x100000 for example)
-        // GIFtag format (simplified for test):
-        //   NLOOP = 1 (one primitive), EOP = 1, Format = PACKED (0)
-        //   Then some PRIM + RGBAQ + XYZ2 data (we'll let GS handle drawing for now)
         ulong tagAddr = 0x100000;
 
-        // Write a minimal GIFtag (128-bit / 16 bytes)
-        // For this test we use a tag that triggers DrawTestPattern in GS
-        // In future this will be real primitive data
-        Memory.Write32(tagAddr, 0x00008001);     // NLOOP=1, EOP=1 (rough)
-        Memory.Write32(tagAddr + 4, 0x00000000); // PRIM etc.
+        // GIFtag (NLOOP=3 so we can send PRIM + RGBAQ + XYZ + XYZ + XYZ roughly)
+        Memory.Write32(tagAddr, 0x00008003);     // NLOOP=3, EOP=1 (simplified)
+        Memory.Write32(tagAddr + 4, 0x00000000);
         Memory.Write32(tagAddr + 8, 0x00000000);
         Memory.Write32(tagAddr + 12, 0x00000000);
 
-        // Configure DMAC GIF channel (channel 2) for a normal transfer
-        // In a real implementation we would write CHCR, MADR, QWC via registers.
-        // For this early test we directly start a transfer of 1 quadword.
-        Dmac.StartTransfer(Dmac.Channel.GIF);  // This sets Active + Mode
+        // Data following the tag (very rough layout for Phase 2 test)
+        // Word 0: PRIM (low byte)
+        Memory.Write32(tagAddr + 16, 0x00000001); // PRIM marker
+        // Word 1: RGBAQ (magenta-ish)
+        Memory.Write32(tagAddr + 32, 0xFF00FFFF);
+        // Vertices (XYZ rough)
+        Memory.Write32(tagAddr + 48, 0x0000C800); // vertex 1
+        Memory.Write32(tagAddr + 64, 0x0001B800); // vertex 2
+        Memory.Write32(tagAddr + 80, 0x00014000); // vertex 3 (rough scaling)
 
-        // Manually set the transfer parameters (in real code this comes from register writes)
-        // We use reflection here only for the test harness - later we'll add proper register interface
+        // Trigger DMAC GIF channel
+        Dmac.StartTransfer(Dmac.Channel.GIF);
+
+        // Set transfer params via reflection (temporary until we add real register interface)
         var chField = typeof(Dmac).GetField("_channels", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         if (chField != null)
         {
@@ -108,14 +107,13 @@ public sealed class Ps2System
             var activeField = gifCh.GetType().GetField("Active");
 
             if (madrField != null) madrField.SetValue(gifCh, (uint)tagAddr);
-            if (qwcField != null) qwcField.SetValue(gifCh, (uint)1);
+            if (qwcField != null) qwcField.SetValue(gifCh, (uint)6); // tag + data
             if (activeField != null) activeField.SetValue(gifCh, true);
         }
 
-        // Run a few cycles so DMAC/GIF/GS can process
-        RunFor(10);
+        // Run enough cycles for the pipeline to process
+        RunFor(20);
 
-        // The GIF should have called Gs.ReceiveCommandList which currently draws the test pattern
-        Console.WriteLine("[Ps2System] Pipeline step complete. Framebuffer should now contain test pattern.");
+        Console.WriteLine("[Ps2System] Pipeline complete. Real primitive should be in framebuffer.");
     }
 }
