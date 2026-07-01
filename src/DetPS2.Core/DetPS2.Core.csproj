@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Determinism & Performance friendly settings -->
+    <TieredCompilation>false</TieredCompilation>
+    <TieredPGO>false</TieredPGO>
+    <PublishAot Condition="'$(Configuration)' == 'Release'">true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StripSymbols>true</StripSymbols>
+
+    <!-- Strong determinism hints -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- For later: Silk.NET for windowing/input when we get to graphics -->
+    <!-- <PackageReference Include="Silk.NET" Version="2.22.0" /> -->
+  </ItemGroup>
+
+</Project>
