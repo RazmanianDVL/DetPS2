@@ -19,30 +19,28 @@
 
 **Current Progress**:
 - [x] Timers + Interrupt Controller (Intc)
-- [x] IOP with many real instructions + high execution capability
-- [x] SIF with functional DMA, commands, and status
-- [x] Significantly expanded HLE syscalls (many SIF and early boot calls)
-- [x] CDVD completed as a proper stub with many commands
+- [x] IOP with many real instructions
+- [x] SIF with functional DMA and command support
+- [x] Significantly expanded HLE syscalls
+- [x] CDVD completed as a proper stub
 - [x] Improved BIOS loading and boot flow
 
-**Remaining Work**:
-- [ ] More HLE syscalls for broader BIOS compatibility
-- [ ] Additional IOP instructions + basic exception handling
-- [ ] SIF DMA chaining / tag support
+**Remaining**:
+- [ ] More HLE syscalls + basic exception handling
+- [ ] SIF DMA chaining improvements
 
-**Milestone**: Be able to load and execute basic homebrew or early BIOS code with heavy HLE.
+**Status**: Strong progress. Approaching readiness for Phase 4.
 
-**Status**: Strong progress. Approaching readiness to begin Phase 4.
+## Phase 4: Determinism & Tooling (Started)
 
-## Phase 4: Determinism & Tooling
-
-- [ ] Multi-component scheduler
-- [ ] Save states (MemoryMarshal + structs)
+- [x] Initial SaveState foundation created (header + versioned format, designed for future compression/netplay)
+- [ ] Full component serialization (Memory, EE, IOP, GS, etc.)
+- [ ] Multi-component scheduler improvements
 - [ ] Input recording / TAS support
-- [ ] Execution tracer (Tracer.cs already exists)
+- [ ] Execution tracer improvements
 - [ ] Memory/register viewer
 
-**Status**: Not started (ready once Phase 3 is solid)
+**Status**: Foundation started. Save states designed with netplay in mind.
 
 ---
 
