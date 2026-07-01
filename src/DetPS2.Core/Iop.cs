@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Input/Output Processor (IOP) - Phase 3
-/// Now shares memory with the main system and has expanded instruction set.
+/// Further expanded R3000A interpreter.
 /// </summary>
 public sealed class Iop
 {
@@ -49,7 +49,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 8 && Running; i++)
+        for (int i = 0; i < 16 && Running; i++) // Increased execution rate
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
@@ -69,6 +69,8 @@ public sealed class Iop
             case 0x03: ExecuteJal(opcode); break;
             case 0x04: ExecuteBeq(opcode); break;
             case 0x05: ExecuteBne(opcode); break;
+            case 0x08: ExecuteAddi(opcode); break;
+            case 0x09: ExecuteAddiu(opcode); break;
             case 0x0D: ExecuteOri(opcode); break;
             case 0x0F: ExecuteLui(opcode); break;
             case 0x23: ExecuteLw(opcode); break;
@@ -87,16 +89,19 @@ public sealed class Iop
 
         switch (function)
         {
-            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;
-            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;
-            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break;
-            case 0x08: PC = _gprs[rs] - 4; break;
+            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;           // SLL
+            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;           // SRL
+            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break; // SRA
+            case 0x08: PC = _gprs[rs] - 4; break;                                 // JR
+            case 0x18: /* MULT - simplified */ break;
             case 0x20:
-            case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break;
-            case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;
-            case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;
-            case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;
-            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break;
+            case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break; // ADD/ADDU
+            case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;      // SUBU
+            case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;      // AND
+            case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;      // OR
+            case 0x26: if (rd != 0) _gprs[rd] = _gprs[rs] ^ _gprs[rt]; break;      // XOR
+            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break; // SLT
+            case 0x2B: if (rd != 0) _gprs[rd] = (_gprs[rs] < _gprs[rt]) ? 1u : 0; break; // SLTU
         }
     }
 
@@ -107,8 +112,8 @@ public sealed class Iop
         short offset = (short)(opcode & 0xFFFF);
 
         bool take = false;
-        if (rt == 0x00) take = val < 0;
-        if (rt == 0x01) take = val >= 0;
+        if (rt == 0x00) take = val < 0;   // BLTZ
+        if (rt == 0x01) take = val >= 0;  // BGEZ
 
         if (take)
         {
@@ -156,6 +161,22 @@ public sealed class Iop
             PC += (uint)((int)offset << 2);
             PC -= 4;
         }
+    }
+
+    private void ExecuteAddi(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
+        if (rt != 0) _gprs[rt] = _gprs[rs] + (uint)imm;
+    }
+
+    private void ExecuteAddiu(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
+        if (rt != 0) _gprs[rt] = _gprs[rs] + (uint)imm;
     }
 
     private void ExecuteOri(uint opcode)
