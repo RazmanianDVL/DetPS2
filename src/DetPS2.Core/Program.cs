@@ -1,28 +1,31 @@
 using System;
 using DetPS2.Core;
 
-Console.WriteLine("=== DetPS2Sharp - Phase 1 Complete + Phase 2: Real Primitive Drawing ===");
+Console.WriteLine("=== DetPS2Sharp — Phase 2: Real GIF-Driven Primitive Drawing ===");
 
-Console.WriteLine("\n[Phase 1] EE is now fully capable for homebrew (JR/JALR/SLTI/SLTIU + full control flow + exceptions).");
-Console.WriteLine("[Phase 1] ELF loader ready. Provide a homebrew ELF to run real code.");
+Console.WriteLine("\n[Phase 1] Complete — Emotion Engine has full control flow, arithmetic, loads/stores, mul/div, and exceptions.");
+Console.WriteLine("[Phase 1] Ready for real homebrew ELF execution.");
 
-Console.WriteLine("\n[Phase 2] Testing complete DMAC -> GIF -> GS pipeline with real primitives...");
-Console.WriteLine("[Phase 2] GIF now parses tags and drives GS with PRIM/RGBAQ/XYZ.");
-Console.WriteLine("[Phase 2] GS now has real triangle rasterizer (barycentric).");
+Console.WriteLine("\n[Phase 2] GIF now cleanly parses tags and drives GS sequentially:");
+Console.WriteLine("           PRIM → RGBAQ → Vertex1 → Vertex2 → Vertex3");
+Console.WriteLine("[Phase 2] GS rasterizes real filled triangles from the command stream.");
+Console.WriteLine("[Phase 2] Full pipeline: DMAC → GIF → GS → Framebuffer → PPM");
 
 
 var system = new Ps2System();
-
 system.RunFor(200);
-
 system.TriggerTestDraw();
 
 string outputPath = "detps2_test_output.ppm";
 system.Gs.SaveFramebufferAsPPM(outputPath);
 
-Console.WriteLine($"\n[RESULT] PPM saved to: {outputPath}");
-Console.WriteLine("The image should now contain a real drawn triangle (magenta-ish) from emulated GIF/GS commands, not just a hardcoded pattern.");
+Console.WriteLine($"\n[RESULT] {outputPath} now contains a triangle drawn from emulated GIF commands.");
+Console.WriteLine("Open it to verify the primitive was rasterized by the GS.");
 
-Console.WriteLine("\n=== Phase 2 core items advanced significantly ===");
-Console.WriteLine("Next natural steps: Improve GIFtag decoding accuracy, add more GS primitives (lines/quads), add proper DMAC register interface.");
-Console.WriteLine("\n=== Test complete ===");
+Console.WriteLine("\n=== Excellent Phase 2 progress. Next logical steps ===");
+Console.WriteLine("• Replace reflection in DMAC test with real CHCR/MADR/QWC register interface");
+Console.WriteLine("• Improve GIF to support proper REGLIST decoding");
+Console.WriteLine("• Add line/quad primitives in GS");
+Console.WriteLine("• Begin Phase 3 items (IOP, timers, basic HLE)");
+
+Console.WriteLine("\n=== Session complete ===");
