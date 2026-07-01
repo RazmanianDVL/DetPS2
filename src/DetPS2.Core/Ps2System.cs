@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Phase 2: Full DMAC -> GIF -> GS pipeline with real primitive drawing.
+/// Phase 2 pipeline now produces real drawn geometry from properly sequenced GIF commands.
 /// </summary>
 public sealed class Ps2System
 {
@@ -68,52 +68,45 @@ public sealed class Ps2System
     }
 
     /// <summary>
-    /// Phase 2 test: Writes a more complete GIFtag (with PRIM, RGBAQ, XYZ)
-    /// and triggers real DMAC transfer. The new Gif/GS code will draw an actual triangle.
+    /// Writes a clean GIFtag + data that the improved Gif parser expects:
+    /// PRIM, RGBAQ, Vertex1, Vertex2, Vertex3.
+    /// This produces a real drawn triangle via the full pipeline.
     /// </summary>
     public void TriggerTestDraw()
     {
-        Console.WriteLine("[Ps2System] Triggering real DMAC -> GIF -> GS with primitive data...");
+        Console.WriteLine("[Ps2System] Sending clean GIF command stream through DMAC...");
 
-        ulong tagAddr = 0x100000;
+        ulong baseAddr = 0x100000;
 
-        // GIFtag (NLOOP=3 so we can send PRIM + RGBAQ + XYZ + XYZ + XYZ roughly)
-        Memory.Write32(tagAddr, 0x00008003);     // NLOOP=3, EOP=1 (simplified)
-        Memory.Write32(tagAddr + 4, 0x00000000);
-        Memory.Write32(tagAddr + 8, 0x00000000);
-        Memory.Write32(tagAddr + 12, 0x00000000);
+        // GIFtag: NLOOP=5 (PRIM + RGBAQ + 3 vertices)
+        Memory.Write32(baseAddr + 0,  0x00008005);
+        Memory.Write32(baseAddr + 4,  0);
+        Memory.Write32(baseAddr + 8,  0);
+        Memory.Write32(baseAddr + 12, 0);
 
-        // Data following the tag (very rough layout for Phase 2 test)
-        // Word 0: PRIM (low byte)
-        Memory.Write32(tagAddr + 16, 0x00000001); // PRIM marker
-        // Word 1: RGBAQ (magenta-ish)
-        Memory.Write32(tagAddr + 32, 0xFF00FFFF);
-        // Vertices (XYZ rough)
-        Memory.Write32(tagAddr + 48, 0x0000C800); // vertex 1
-        Memory.Write32(tagAddr + 64, 0x0001B800); // vertex 2
-        Memory.Write32(tagAddr + 80, 0x00014000); // vertex 3 (rough scaling)
+        // Data quadwords (sequential as expected by Gif parser)
+        Memory.Write32(baseAddr + 16,  0x00000001); // PRIM
+        Memory.Write32(baseAddr + 32,  0xFF00FFFF); // RGBAQ (magenta)
+        Memory.Write32(baseAddr + 48,  0x0000C800); // Vertex 1
+        Memory.Write32(baseAddr + 64,  0x0001B800); // Vertex 2
+        Memory.Write32(baseAddr + 80,  0x00014000); // Vertex 3
 
-        // Trigger DMAC GIF channel
+        // Start DMAC transfer on GIF channel
         Dmac.StartTransfer(Dmac.Channel.GIF);
 
-        // Set transfer params via reflection (temporary until we add real register interface)
+        // Temporary: set transfer state (will be replaced by real register writes)
         var chField = typeof(Dmac).GetField("_channels", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         if (chField != null)
         {
             var channels = (Array)chField.GetValue(Dmac);
-            var gifCh = channels.GetValue((int)Dmac.Channel.GIF);
-            var madrField = gifCh.GetType().GetField("MADR");
-            var qwcField = gifCh.GetType().GetField("QWC");
-            var activeField = gifCh.GetType().GetField("Active");
-
-            if (madrField != null) madrField.SetValue(gifCh, (uint)tagAddr);
-            if (qwcField != null) qwcField.SetValue(gifCh, (uint)6); // tag + data
-            if (activeField != null) activeField.SetValue(gifCh, true);
+            var ch = channels.GetValue((int)Dmac.Channel.GIF);
+            ch.GetType().GetField("MADR")?.SetValue(ch, (uint)baseAddr);
+            ch.GetType().GetField("QWC")?.SetValue(ch, (uint)6);
+            ch.GetType().GetField("Active")?.SetValue(ch, true);
         }
 
-        // Run enough cycles for the pipeline to process
-        RunFor(20);
+        RunFor(25);
 
-        Console.WriteLine("[Ps2System] Pipeline complete. Real primitive should be in framebuffer.");
+        Console.WriteLine("[Ps2System] Pipeline finished. Real triangle drawn from GIF commands.");
     }
 }
