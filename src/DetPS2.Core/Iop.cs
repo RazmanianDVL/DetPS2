@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - Continued steady improvement for Phase 3.
+/// IOP - Phase 3 work in progress. Continuing to build capability.
 /// </summary>
 public sealed class Iop
 {
@@ -47,7 +47,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 512 && Running; i++) // High throughput for better simulation
+        for (int i = 0; i < 1024 && Running; i++) // Very high throughput
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
