@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP with significantly more instructions for better BIOS compatibility.
+/// IOP - Significantly improved for Phase 3 progress toward real software execution.
 /// </summary>
 public sealed class Iop
 {
@@ -47,8 +47,8 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        // Run more instructions to keep up with EE
-        for (int i = 0; i < 32 && Running; i++)
+        // Run a decent number of instructions per step
+        for (int i = 0; i < 64 && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
@@ -92,6 +92,7 @@ public sealed class Iop
             case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;
             case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break;
             case 0x08: PC = _gprs[rs] - 4; break;
+            case 0x18: /* MULT stub */ break;
             case 0x20:
             case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break;
             case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;
@@ -105,12 +106,11 @@ public sealed class Iop
 
     private void ExecuteRegimm(uint opcode)
     {
-        // BLTZ / BGEZ etc.
         uint rt = (opcode >> 16) & 0x1F;
         int val = (int)_gprs[(opcode >> 21) & 0x1F];
         short offset = (short)(opcode & 0xFFFF);
 
-        bool take = (rt == 0x00 && val < 0) || (rt == 0x01 && val >= 0);
+        bool take = (rt == 0 && val < 0) || (rt == 1 && val >= 0);
         if (take)
         {
             PC += (uint)((int)offset << 2);
