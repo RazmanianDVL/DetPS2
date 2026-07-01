@@ -1,29 +1,28 @@
 using System;
 using DetPS2.Core;
 
-Console.WriteLine("=== DetPS2 - Phase 1 Complete + Phase 2 Graphics Pipeline Test ===");
+Console.WriteLine("=== DetPS2Sharp - Phase 1 Complete + Phase 2: Real Primitive Drawing ===");
 
-Console.WriteLine("\n[Phase 1] Emotion Engine is now capable of running real homebrew code.");
-Console.WriteLine("[Phase 1] Added: JR, JALR, SLTI, SLTIU + improved syscall/exception entry.");
-Console.WriteLine("[Phase 1] Branch delay slot, mul/div, loads/stores, branches, jumps all present.");
+Console.WriteLine("\n[Phase 1] EE is now fully capable for homebrew (JR/JALR/SLTI/SLTIU + full control flow + exceptions).");
+Console.WriteLine("[Phase 1] ELF loader ready. Provide a homebrew ELF to run real code.");
 
-Console.WriteLine("\n[Phase 2] Testing full DMAC -> GIF -> GS pipeline with real transfer...");
+Console.WriteLine("\n[Phase 2] Testing complete DMAC -> GIF -> GS pipeline with real primitives...");
+Console.WriteLine("[Phase 2] GIF now parses tags and drives GS with PRIM/RGBAQ/XYZ.");
+Console.WriteLine("[Phase 2] GS now has real triangle rasterizer (barycentric).");
+
 
 var system = new Ps2System();
 
-// Run some CPU cycles (Phase 1 work)
 system.RunFor(200);
 
-// Trigger the improved graphics test (now uses real DMAC/GIF path)
 system.TriggerTestDraw();
 
-// Save the framebuffer as an image
 string outputPath = "detps2_test_output.ppm";
 system.Gs.SaveFramebufferAsPPM(outputPath);
 
-Console.WriteLine($"\n[RESULT] Image saved to: {outputPath}");
-Console.WriteLine("Open the .ppm to see the gradient + magenta rectangle drawn via the pipeline.");
+Console.WriteLine($"\n[RESULT] PPM saved to: {outputPath}");
+Console.WriteLine("The image should now contain a real drawn triangle (magenta-ish) from emulated GIF/GS commands, not just a hardcoded pattern.");
 
-Console.WriteLine("\n=== Next: Provide a real homebrew ELF to test Phase 1 execution ===");
-Console.WriteLine("=== Or expand GIFtag parsing in Gif.cs for real primitive drawing ===");
+Console.WriteLine("\n=== Phase 2 core items advanced significantly ===");
+Console.WriteLine("Next natural steps: Improve GIFtag decoding accuracy, add more GS primitives (lines/quads), add proper DMAC register interface.");
 Console.WriteLine("\n=== Test complete ===");
