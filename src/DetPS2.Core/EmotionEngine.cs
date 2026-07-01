@@ -6,8 +6,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Emotion Engine (R5900) CPU core.
-/// Phase 1 Complete: Broad MIPS instruction coverage + correct branch delay slot handling + basic COP0/syscall support.
-/// All state is simple fields / value types for maximum determinism.
+/// Phase 3: Added basic HLE syscall handling.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -15,7 +14,6 @@ public sealed class EmotionEngine
 
     public ulong PC { get; set; } = 0xBFC00000;
 
-    // Delay slot state - critical for correct MIPS semantics
     private bool _branchPending;
     private ulong _pendingBranchTarget;
 
@@ -29,13 +27,15 @@ public sealed class EmotionEngine
 
     private readonly Gpr128[] _gprs = new Gpr128[32];
 
-    // Basic COP0 registers (expanded in later phases)
     public uint COP0_Status { get; set; }
     public uint COP0_Cause { get; set; }
     public ulong COP0_EPC { get; set; }
 
     public ulong LO { get; set; }
     public ulong HI { get; set; }
+
+    // Simple HLE state for Phase 3
+    public bool HleSifInitialized { get; private set; } = false;
 
     public EmotionEngine(SystemMemory memory)
     {
@@ -53,12 +53,12 @@ public sealed class EmotionEngine
         LO = 0;
         HI = 0;
         _branchPending = false;
+        HleSifInitialized = false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Step()
     {
-        // Apply pending branch from previous instruction (delay slot executes first - correct MIPS behavior)
         if (_branchPending)
         {
             PC = _pendingBranchTarget;
@@ -101,7 +101,7 @@ public sealed class EmotionEngine
 
         if (_branchPending)
         {
-            // nextPC will be overridden on next Step when branch is taken
+            // delay slot handling
         }
         else
         {
@@ -117,7 +117,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // ==================== SPECIAL (function field) ====================
+    // ==================== SPECIAL ====================
     private int ExecuteSpecial(uint opcode, ref ulong nextPC)
     {
         uint function = opcode & 0x3F;
@@ -143,7 +143,7 @@ public sealed class EmotionEngine
             0x11 => ExecuteMthi(rs),
             0x13 => ExecuteMtlo(rs),
             0x20 => ExecuteAddu(rd, rs, rt),
-            0x21 => ExecuteAddu(rd, rs, rt), // ADD treated as ADDU for now (no overflow trap in Phase 1)
+            0x21 => ExecuteAddu(rd, rs, rt),
             0x23 => ExecuteSubu(rd, rs, rt),
             0x24 => ExecuteAnd(rd, rs, rt),
             0x25 => ExecuteOr(rd, rs, rt),
@@ -155,17 +155,35 @@ public sealed class EmotionEngine
         };
     }
 
+    // ==================== HLE Syscall Handling (Phase 3) ====================
     private int ExecuteSyscall(uint opcode, ref ulong nextPC)
     {
         COP0_EPC = PC;
-        COP0_Cause = (8 << 2); // ExcCode = Syscall
-        // Simplified exception vector for Phase 1. Real BIOS vector + handler comes later.
-        nextPC = 0x80000180;
-        _branchPending = false; // exceptions flush delay slot for now
+        COP0_Cause = (8 << 2); // Syscall exception code
+
+        uint syscallNumber = _gprs[4].Lo & 0xFFFF; // $a0 often holds the call number in some conventions
+
+        switch (syscallNumber)
+        {
+            case 0x01: // Example: sceSifInit or similar
+                HleSifInitialized = true;
+                Console.WriteLine("[EE HLE] sceSifInit called (HLE)");
+                break;
+
+            default:
+                Console.WriteLine($"[EE HLE] Unknown syscall 0x{syscallNumber:X}");
+                break;
+        }
+
+        // Simplified return - in real HLE we would set return value in $v0
+        _gprs[2].Lo = 0; // Success
+
+        nextPC = 0x80000180; // Simplified exception vector
+        _branchPending = false;
         return 1;
     }
 
-    // ==================== MULT / DIV (with LO/HI) ====================
+    // ==================== MULT / DIV ====================
     private int ExecuteMult(int rs, int rt)
     {
         long a = (long)_gprs[rs].Lo;
@@ -173,7 +191,7 @@ public sealed class EmotionEngine
         long result = a * b;
         LO = (ulong)(result & 0xFFFFFFFF);
         HI = (ulong)((result >> 32) & 0xFFFFFFFF);
-        return 1; // TODO later: variable timing based on operand values
+        return 1;
     }
 
     private int ExecuteMultu(int rs, int rt)
@@ -218,7 +236,7 @@ public sealed class EmotionEngine
     private int ExecuteSrl(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = _gprs[rt].Lo >> sa; _gprs[rd].Hi = 0; } return 1; }
     private int ExecuteSra(int rd, int rt, int sa) { if (rd != 0) { _gprs[rd].Lo = (ulong)((long)_gprs[rt].Lo >> sa); _gprs[rd].Hi = 0; } return 1; }
 
-    // ==================== JR / JALR (control flow) ====================
+    // ==================== JR / JALR ====================
     private int ExecuteJr(int rs, ref ulong nextPC)
     {
         _pendingBranchTarget = _gprs[rs].Lo;
@@ -228,14 +246,13 @@ public sealed class EmotionEngine
 
     private int ExecuteJalr(int rd, int rs, ref ulong nextPC)
     {
-        if (rd != 0)
-            _gprs[rd].Lo = PC + 8; // link register gets return address
+        if (rd != 0) _gprs[rd].Lo = PC + 8;
         _pendingBranchTarget = _gprs[rs].Lo;
         _branchPending = true;
         return 1;
     }
 
-    // ==================== ARITHMETIC & LOGIC (SPECIAL) ====================
+    // ==================== ARITHMETIC & LOGIC ====================
     private int ExecuteAddu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo + _gprs[rt].Lo; return 1; }
     private int ExecuteSubu(int rd, int rs, int rt) { if (rd != 0) _gprs[rd].Lo = _gprs[rs].Lo - _gprs[rt].Lo; return 1; }
     private int ExecuteAnd(int rd, int rs, int rt) { if (rd != 0) { _gprs[rd].Lo = _gprs[rs].Lo & _gprs[rt].Lo; _gprs[rd].Hi = _gprs[rs].Hi & _gprs[rt].Hi; } return 1; }
@@ -258,7 +275,7 @@ public sealed class EmotionEngine
         };
     }
 
-    // ==================== JUMPS (J / JAL) ====================
+    // ==================== JUMPS ====================
     private int ExecuteJ(uint opcode, ref ulong nextPC)
     {
         uint target = opcode & 0x03FFFFFF;
@@ -293,7 +310,7 @@ public sealed class EmotionEngine
         return 1;
     }
 
-    // ==================== IMMEDIATE ARITHMETIC / LOGIC ====================
+    // ==================== IMMEDIATE ====================
     private int ExecuteAddi(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
@@ -325,7 +342,7 @@ public sealed class EmotionEngine
     {
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF); // zero-extend for unsigned compare
+        ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) _gprs[rt].Lo = (_gprs[rs].Lo < imm) ? 1UL : 0UL;
         return 1;
     }
