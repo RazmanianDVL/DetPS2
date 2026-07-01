@@ -5,8 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Graphics Synthesizer - Phase 2/3
-/// Supports triangle, line, and quad primitives.
-/// Now dispatches based on current PRIM value.
+/// Supports multiple primitives + basic texture sampling stub.
 /// </summary>
 public sealed class Gs
 {
@@ -18,6 +17,11 @@ public sealed class Gs
 
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
+
+    // Simple texture state (stub for Phase 2/3)
+    private uint _texBase = 0;
+    private int _texWidth = 64;
+    private int _texHeight = 64;
 
     public Gs(SystemMemory memory)
     {
@@ -34,25 +38,22 @@ public sealed class Gs
 
     public void ReceiveCommandList(uint address, uint qwc)
     {
-        // Dispatch based on current PRIM (set by GIF)
-        uint primType = _currentPrim & 0x7; // PRIM[2:0] = primitive type
+        uint primType = _currentPrim & 0x7;
 
         switch (primType)
         {
-            case 0: // Point (not implemented yet)
-            case 1: // Line
+            case 1:
                 DrawLine(200, 200, 400, 300, _currentRgbaq);
                 break;
-            case 2: // Line strip (simplified)
-            case 3: // Triangle
+            case 3:
+            case 4:
                 DrawTestTriangle();
                 break;
-            case 4: // Triangle strip/fan (simplified)
-            case 5: // Quad / Sprite
+            case 5:
                 DrawQuad(250, 180, 180, 120, _currentRgbaq);
                 break;
             default:
-                DrawTestTriangle(); // fallback
+                DrawTestTriangle();
                 break;
         }
     }
@@ -60,7 +61,7 @@ public sealed class Gs
     public void SetPrim(uint prim)
     {
         _currentPrim = prim;
-        Console.WriteLine($"[GS] PRIM = 0x{prim:X} (type={(prim & 0x7)})");
+        Console.WriteLine($"[GS] PRIM = 0x{prim:X}");
     }
 
     public void SetRGBAQ(uint rgbaq)
@@ -71,10 +72,32 @@ public sealed class Gs
 
     public void DrawVertex(uint xyz)
     {
-        // Vertex data can be collected here in a future more advanced version
+        // Future: collect vertices for more advanced primitive assembly
     }
 
-    // ==================== Primitive Implementations ====================
+    // ==================== Texture Sampling Stub ====================
+
+    public uint SampleTexture(int u, int v)
+    {
+        // Very simple nearest-neighbor sampling from a fake texture region
+        // In a real implementation this would read from GS VRAM / texture memory
+        int tu = u % _texWidth;
+        int tv = v % _texHeight;
+
+        // Generate a simple checkerboard pattern for demo purposes
+        bool checker = ((tu / 8) + (tv / 8)) % 2 == 0;
+        return checker ? 0xFFFF00FF : 0xFF00FFFF; // magenta / cyan
+    }
+
+    public void SetTexture(uint baseAddr, int width, int height)
+    {
+        _texBase = baseAddr;
+        _texWidth = width;
+        _texHeight = height;
+        Console.WriteLine($"[GS] Texture set @ 0x{baseAddr:X} ({width}x{height})");
+    }
+
+    // ==================== Primitive Drawing ====================
 
     public void DrawTestTriangle()
     {
@@ -106,7 +129,7 @@ public sealed class Gs
             if (e2 < dx)  { err += dx; y0 += sy; }
         }
 
-        Console.WriteLine("[GS] Drew line primitive.");
+        Console.WriteLine("[GS] Drew line.");
     }
 
     public void DrawQuad(int x, int y, int w, int h, uint color)
@@ -120,7 +143,7 @@ public sealed class Gs
             }
         }
 
-        Console.WriteLine("[GS] Drew quad (rectangle) primitive.");
+        Console.WriteLine("[GS] Drew quad.");
     }
 
     private void DrawFilledTriangle((int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
@@ -141,7 +164,7 @@ public sealed class Gs
             }
         }
 
-        Console.WriteLine("[GS] Drew triangle primitive.");
+        Console.WriteLine("[GS] Drew triangle.");
     }
 
     private bool PointInTriangle(int px, int py, (int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
