@@ -3,8 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Graphics Interface (GIF) - Basic GIFtag parsing added.
-/// Receives data from DMAC (PATH3) and will eventually forward to GS.
+/// Graphics Interface (GIF) - Improved GIFtag parsing.
 /// </summary>
 public sealed class Gif
 {
@@ -17,31 +16,44 @@ public sealed class Gif
 
     public void Reset() { }
 
-    /// <summary>
-    /// Called by DMAC when PATH3 data is ready.
-    /// This version does very basic GIFtag parsing.
-    /// </summary>
     public void ReceivePath3Data(uint address, uint qwc)
     {
-        Console.WriteLine($"[GIF] PATH3 data received: {qwc} quadwords from 0x{address:X8}");
+        Console.WriteLine($"[GIF] PATH3 transfer: {qwc} quadwords");
 
-        // Very basic loop over possible GIFtags (each tag is 1 quadword = 16 bytes)
-        for (uint i = 0; i < qwc; i++)
+        uint currentQwc = qwc;
+        uint currentAddr = address;
+
+        while (currentQwc > 0)
         {
-            uint tagAddr = address + (i * 16);
+            // Read GIFtag (first 128 bits / 16 bytes)
+            uint nloop = _gs.Memory?.Read32(currentAddr) ?? 0;
+            uint prim = _gs.Memory?.Read32(currentAddr + 4) ?? 0;
 
-            // Read first 64 bits of GIFtag (simplified)
-            uint nloop = _gs.Memory?.Read32(tagAddr) ?? 0; // placeholder
-            uint eop = (nloop >> 15) & 1;
+            uint nloopCount = nloop & 0x7FFF;
+            bool eop = (nloop & (1 << 15)) != 0;
+            uint primValue = prim & 0x7FF; // PRIM register value
+            uint format = (nloop >> 26) & 0x3; // 0=PACKED, 1=REGLIST, 2=IMAGE
 
-            Console.WriteLine($"[GIF] GIFtag: NLOOP={nloop & 0x7FFF}, EOP={eop}");
+            Console.WriteLine($"[GIF] Tag: NLOOP={nloopCount}, EOP={eop}, Format={format}, PRIM=0x{primValue:X}");
 
-            if (eop != 0)
+            // Skip the tag itself
+            currentAddr += 16;
+            currentQwc--;
+
+            // Very rough: skip the data for now (we'll parse it properly later)
+            uint dataQwc = nloopCount; // rough estimate
+            currentAddr += dataQwc * 16;
+            currentQwc -= dataQwc;
+
+            if (eop)
+                break;
+
+            if (currentQwc == 0)
                 break;
         }
 
-        // TODO: Actually parse and send primitives to GS
-        _gs.ReceiveGifData(address, qwc);
+        // Forward whatever we have to GS
+        _gs.ReceiveCommandList(address, qwc);
     }
 
     public void Step(ulong cycles) { }
