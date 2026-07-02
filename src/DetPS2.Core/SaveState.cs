@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState system - pushing hard toward Phase 4 completion.
+/// SaveState system - Phase 4 catching up.
 /// </summary>
 public static class SaveState
 {
@@ -50,7 +50,7 @@ public static class SaveState
         writer.Write(system.Sif.GetStatus());
 
         // Dmac - heavily expanded
-        for (int i = 0; i < 110; i++)
+        for (int i = 0; i < 120; i++)
         {
             writer.Write(0u);
         }
@@ -84,8 +84,11 @@ public static class SaveState
         writer.Write(0u); // MIPTBP2
         writer.Write(0u); // TEXA
         writer.Write(0u); // FOGCOL
+        writer.Write(0u); // TEXCLUT
+        writer.Write(0u); // SCANMSK
 
         // Vif - more state
+        writer.Write(0u);
         writer.Write(0u);
         writer.Write(0u);
         writer.Write(0u);
@@ -155,7 +158,7 @@ public static class SaveState
         }
 
         // SIF + Dmac + GS + Vif + reserved
-        for (int i = 0; i < 155; i++)
+        for (int i = 0; i < 170; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
