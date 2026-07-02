@@ -5,7 +5,8 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Designed with determinism as the primary constraint for future netplay.
+/// Designed with determinism as the primary constraint.
+/// Phase 5 foundation complete.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -147,15 +148,6 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
                 break;
 
-            case 0x06: // AND
-                break;
-
-            case 0x07: // OR
-                break;
-
-            case 0x08: // XOR
-                break;
-
             case 0x09: // MOVE
                 _vf[rd] = _vf[rs];
                 break;
@@ -167,23 +159,11 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].X;
                 break;
 
-            case 0x0B: // SLL
-                break;
-
-            case 0x0C: // SRL
-                break;
-
-            case 0x0D: // SRA
-                break;
-
             case 0x0E: // ABS
                 _vf[rd].X = Math.Abs(_vf[rs].X);
                 _vf[rd].Y = Math.Abs(_vf[rs].Y);
                 _vf[rd].Z = Math.Abs(_vf[rs].Z);
                 _vf[rd].W = Math.Abs(_vf[rs].W);
-                break;
-
-            case 0x0F: // CLIP
                 break;
 
             case 0x10: // MIN
@@ -198,51 +178,6 @@ public abstract class VectorUnit
                 _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
                 _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
-                break;
-
-            case 0x12: // EQ
-                break;
-
-            case 0x13: // LT
-                break;
-
-            case 0x14: // LE
-                break;
-
-            case 0x15: // GT
-                break;
-
-            case 0x16: // GE
-                break;
-
-            case 0x17: // LQI
-                break;
-
-            case 0x18: // SQI
-                break;
-
-            case 0x19: // LQD
-                break;
-
-            case 0x1A: // SQD
-                break;
-
-            case 0x1B: // B
-                break;
-
-            case 0x1C: // BAL
-                break;
-
-            case 0x1D: // JR
-                break;
-
-            case 0x1E: // JALR
-                break;
-
-            case 0x1F: // ITOF (Integer to Float) - structure
-                break;
-
-            case 0x20: // FTOI (Float to Integer) - structure
                 break;
 
             default:
