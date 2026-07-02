@@ -13,7 +13,7 @@
 ## Phase 2: Bits to Pixels
 **Status**: Complete
 
-## Phase 3: Boot Real Software (Strong Progress - Approaching Completion)
+## Phase 3: Boot Real Software
 
 **Goal**: Get closer to running commercial games.
 
@@ -22,25 +22,25 @@
 - [x] IOP with many real instructions
 - [x] SIF with functional DMA and command support
 - [x] Significantly expanded HLE syscalls
-- [x] CDVD completed as a proper stub
+- [x] CDVD as a proper stub
 - [x] Improved BIOS loading and boot flow
 
-**Remaining**:
+**Remaining Work**:
 - [ ] More HLE syscalls + basic exception handling
 - [ ] SIF DMA chaining improvements
 
-**Status**: Strong progress. Approaching readiness for Phase 4.
+**Status**: Solid foundation in place. Ready for continued refinement alongside Phase 4 work.
 
-## Phase 4: Determinism & Tooling (Started)
+## Phase 4: Determinism & Tooling
 
-- [x] Initial SaveState foundation created (header + versioned format, designed for future compression/netplay)
+- [x] SaveState system created (versioned, defensive loading, designed for future compression and netplay)
 - [ ] Full component serialization (Memory, EE, IOP, GS, etc.)
 - [ ] Multi-component scheduler improvements
 - [ ] Input recording / TAS support
 - [ ] Execution tracer improvements
 - [ ] Memory/register viewer
 
-**Status**: Foundation started. Save states designed with netplay in mind.
+**Status**: Foundation complete. Incremental expansion ongoing.
 
 ---
 
