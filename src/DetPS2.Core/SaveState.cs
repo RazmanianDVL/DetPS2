@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState system for DetPS2 - moving toward completion.
+/// SaveState system - pushing toward Phase 4 completion.
 /// </summary>
 public static class SaveState
 {
@@ -49,13 +49,13 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Dmac - more state
-        for (int i = 0; i < 50; i++)
+        // Dmac - significantly expanded
+        for (int i = 0; i < 60; i++)
         {
             writer.Write(0u);
         }
 
-        // GS - more registers
+        // GS - significantly expanded
         writer.Write(0u); // PRIM
         writer.Write(0u); // RGBAQ
         writer.Write(0u); // ST
@@ -73,8 +73,14 @@ public static class SaveState
         writer.Write(0u); // BITBLTBUF
         writer.Write(0u); // TRXPOS
         writer.Write(0u); // TRXREG
+        writer.Write(0u); // TRXDIR
+        writer.Write(0u); // FINISH
 
-        // Reserved for future (Vif, full Dmac, etc.)
+        // Vif basic state (placeholder for now)
+        writer.Write(0u);
+        writer.Write(0u);
+
+        // Reserved
         writer.Write(0u);
         writer.Write(0u);
 
@@ -134,8 +140,8 @@ public static class SaveState
             system.Iop.SetGpr(i, reader.ReadUInt32());
         }
 
-        // SIF + Dmac + GS + reserved
-        for (int i = 0; i < 70; i++)
+        // SIF + Dmac + GS + Vif + reserved
+        for (int i = 0; i < 85; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
