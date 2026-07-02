@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3/4 with expanded HLE and exception handling.
+/// Emotion Engine - Toward Phase 3 completion.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -93,7 +93,7 @@ public sealed class EmotionEngine
     private int ExecuteSpecial(uint opcode, ref ulong nextPC)
     {
         uint function = opcode & 0x3F;
-        // Abbreviated for now
+        // Abbreviated
         return 1;
     }
 
@@ -111,14 +111,14 @@ public sealed class EmotionEngine
                 _gprs[2].Lo = 0;
                 break;
 
-            // Memory management
-            case 0x02: case 0x03: case 0x04: case 0x05:
-            // Thread management
-            case 0x10: case 0x11: case 0x12: case 0x13:
-            // Common early boot / misc
-            case 0x20: case 0x21: case 0x30: case 0x40:
-            case 0x50: case 0x60: case 0x61: case 0x70:
-            case 0x71: case 0x80: case 0x81: case 0x90:
+            // Memory management syscalls
+            case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+            // Thread / process management
+            case 0x10: case 0x11: case 0x12: case 0x13: case 0x14:
+            // Common early boot and misc
+            case 0x20: case 0x21: case 0x22: case 0x30: case 0x40:
+            case 0x50: case 0x60: case 0x61: case 0x70: case 0x71:
+            case 0x80: case 0x81: case 0x90: case 0x91: case 0xA0:
                 _gprs[2].Lo = 0;
                 break;
 
