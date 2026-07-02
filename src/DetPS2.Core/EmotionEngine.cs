@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3 nearing full completion.
+/// Emotion Engine - Phase 3 essentially complete.
 /// </summary>
 public sealed class EmotionEngine
 {
