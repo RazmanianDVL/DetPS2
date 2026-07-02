@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - continued instruction expansion.
+/// Phase 6 - floating point improvements started.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -105,18 +105,18 @@ public abstract class VectorUnit
         switch (function)
         {
             case 0x00: // ADD
-                _vf[rd].X = _vf[rs].X + _vf[rt].X;
-                _vf[rd].Y = _vf[rs].Y + _vf[rt].Y;
-                _vf[rd].Z = _vf[rs].Z + _vf[rt].Z;
-                _vf[rd].W = _vf[rs].W + _vf[rt].W;
+                _vf[rd].X = SafeAdd(_vf[rs].X, _vf[rt].X);
+                _vf[rd].Y = SafeAdd(_vf[rs].Y, _vf[rt].Y);
+                _vf[rd].Z = SafeAdd(_vf[rs].Z, _vf[rt].Z);
+                _vf[rd].W = SafeAdd(_vf[rs].W, _vf[rt].W);
                 break;
 
             case 0x01: // ADDI
                 float imm = (short)(opcode & 0xFFFF);
-                _vf[rt].X = _vf[rs].X + imm;
-                _vf[rt].Y = _vf[rs].Y + imm;
-                _vf[rt].Z = _vf[rs].Z + imm;
-                _vf[rt].W = _vf[rs].W + imm;
+                _vf[rt].X = SafeAdd(_vf[rs].X, imm);
+                _vf[rt].Y = SafeAdd(_vf[rs].Y, imm);
+                _vf[rt].Z = SafeAdd(_vf[rs].Z, imm);
+                _vf[rt].W = SafeAdd(_vf[rs].W, imm);
                 break;
 
             case 0x02: // SUB
@@ -218,6 +218,15 @@ public abstract class VectorUnit
             default:
                 break;
         }
+    }
+
+    /// <summary>
+    /// Controlled addition for future determinism improvements.
+    /// Currently just does normal addition.
+    /// </summary>
+    protected float SafeAdd(float a, float b)
+    {
+        return a + b;
     }
 
     public virtual void SaveState(System.IO.BinaryWriter writer)
