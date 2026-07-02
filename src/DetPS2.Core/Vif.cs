@@ -3,32 +3,42 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Vector Interface (VIF) - Minimal Phase 2 implementation focused on PATH3.
-/// VIF1 can feed the GIF directly (PATH3).
-/// This is a stub that recognizes PATH3 transfers.
+/// VIF (Vector Interface) - Updated for Phase 6.
+/// Handles data transfer to VU0 and VU1.
 /// </summary>
 public sealed class Vif
 {
-    private readonly Gs _gs;
-    private readonly Gif _gif;
+    private readonly SystemMemory _memory;
+    private Vu0 _vu0;
+    private Vu1 _vu1;
 
-    public Vif(Gs gs, Gif gif)
+    public Vif(SystemMemory memory)
     {
-        _gs = gs ?? throw new ArgumentNullException(nameof(gs));
-        _gif = gif ?? throw new ArgumentNullException(nameof(gif));
+        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+    }
+
+    public void SetVu0(Vu0 vu0)
+    {
+        _vu0 = vu0;
+    }
+
+    public void SetVu1(Vu1 vu1)
+    {
+        _vu1 = vu1;
     }
 
     public void Reset() { }
 
-    /// <summary>
-    /// Handle a VIF1 PATH3 transfer (common way games send data to GIF).
-    /// For Phase 2 we simply forward to GIF.
-    /// </summary>
-    public void ProcessPath3(uint address, uint qwc)
-    {
-        Console.WriteLine($"[VIF] PATH3 transfer received ({qwc} quadwords)");
-        _gif.ReceivePath3Data(address, qwc);
-    }
-
     public void Step(ulong cycles) { }
+
+    /// <summary>
+    /// Send data to VU1 (from Vif1).
+    /// </summary>
+    public void SendToVu1(uint data)
+    {
+        if (_vu1 != null)
+        {
+            _vu1.ReceiveFromVif1(data);
+        }
+    }
 }
