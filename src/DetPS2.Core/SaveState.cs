@@ -50,7 +50,7 @@ public static class SaveState
         writer.Write(system.Sif.GetStatus());
 
         // Dmac - more state
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 24; i++)
         {
             writer.Write(0u);
         }
@@ -116,7 +116,7 @@ public static class SaveState
         }
 
         // SIF + Dmac + reserved
-        for (int i = 0; i < 25; i++)
+        for (int i = 0; i < 29; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
