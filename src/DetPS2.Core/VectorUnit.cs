@@ -5,8 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Designed with determinism as the primary constraint.
-/// Phase 5 foundation complete.
+/// Phase 6 - expanding instruction set and accuracy.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -178,6 +177,15 @@ public abstract class VectorUnit
                 _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
                 _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
+                break;
+
+            case 0x12: // EQ (compare)
+                break;
+
+            case 0x13: // LT
+                break;
+
+            case 0x14: // LE
                 break;
 
             default:
