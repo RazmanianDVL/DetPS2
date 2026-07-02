@@ -194,8 +194,8 @@ public abstract class VectorUnit
             case 0x16: // GE
                 break;
 
-            case 0x17: // AND (bitwise on float bits - simplified)
-                // Treat as integer for determinism
+            case 0x17: // AND (simplified bitwise)
+                // For determinism we can treat floats as int bits later
                 break;
 
             case 0x18: // OR
