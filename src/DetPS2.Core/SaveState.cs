@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// SaveState system for DetPS2.
-/// Designed to be deterministic, versioned, and extensible for future features (compression, netplay, partial states).
+/// Designed to be deterministic, versioned, and extensible.
 /// </summary>
 public static class SaveState
 {
@@ -51,7 +51,6 @@ public static class SaveState
         writer.Write(system.Sif.GetStatus());
 
         // Reserved space for future components (Dmac, Intc, GS, etc.)
-        // These will be replaced with real serialization later.
         writer.Write(0u);
         writer.Write(0u);
 
@@ -71,9 +70,9 @@ public static class SaveState
 
         uint version = reader.ReadUInt32();
         if (version != CurrentVersion)
-            return false; // Strict version check for now
+            return false;
 
-        reader.ReadInt64(); // timestamp (currently unused)
+        reader.ReadInt64(); // timestamp
 
         // Memory
         if (reader.BaseStream.Position + 4 > data.Length)
