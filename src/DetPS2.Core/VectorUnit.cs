@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - continued instruction expansion.
+/// Phase 6 progress.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -194,13 +194,19 @@ public abstract class VectorUnit
             case 0x16: // GE
                 break;
 
-            case 0x17: // Logical AND (placeholder)
+            case 0x17: // AND
                 break;
 
-            case 0x18: // Logical OR (placeholder)
+            case 0x18: // OR
                 break;
 
-            case 0x19: // Logical XOR (placeholder)
+            case 0x19: // XOR
+                break;
+
+            case 0x1A: // SLL (shift left logical)
+                break;
+
+            case 0x1B: // SRL (shift right logical)
                 break;
 
             default:
@@ -215,7 +221,7 @@ public abstract class VectorUnit
             writer.Write(_vf[i].X);
             writer.Write(_vf[i].Y);
             writer.Write(_vf[i].Z);
-            writer.Write(_vf[i].W);
+            writer.Write(_vf[i].W;
         }
         writer.Write(ACC.X);
         writer.Write(ACC.Y);
