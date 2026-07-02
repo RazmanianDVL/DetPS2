@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState - Phase 4. Capturing even more state (Dmac, Intc, basic GS).
+/// SaveState - Phase 4. Continuing to expand captured state.
 /// </summary>
 public static class SaveState
 {
@@ -49,11 +49,11 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Basic Dmac state (placeholder for now)
-        writer.Write(0u); // TODO: Real DMAC state
+        // Dmac placeholder
+        writer.Write(0u);
 
-        // Basic Intc state (placeholder)
-        writer.Write(0u); // TODO: Real INTC state
+        // Intc placeholder
+        writer.Write(0u);
 
         return ms.ToArray();
     }
@@ -94,12 +94,10 @@ public static class SaveState
         for (int i = 0; i < 32; i++)
             system.Iop.SetGpr(i, reader.ReadUInt32());
 
-        // SIF (basic)
+        // SIF / Dmac / Intc placeholders
         reader.ReadUInt32();
         reader.ReadUInt32();
         reader.ReadUInt32();
-
-        // Dmac / Intc placeholders
         reader.ReadUInt32();
         reader.ReadUInt32();
 
