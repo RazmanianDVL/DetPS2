@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - floating point handling foundation started.
+/// Phase 6 - continued instruction expansion.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -212,18 +212,12 @@ public abstract class VectorUnit
             case 0x1C: // SRA
                 break;
 
+            case 0x1D: // CLIP
+                break;
+
             default:
                 break;
         }
-    }
-
-    /// <summary>
-    /// Placeholder for future floating-point accuracy improvements.
-    /// This will be expanded in Phase 6 for better determinism.
-    /// </summary>
-    protected float SafeAdd(float a, float b)
-    {
-        return a + b; // TODO: Add controlled FP handling
     }
 
     public virtual void SaveState(System.IO.BinaryWriter writer)
