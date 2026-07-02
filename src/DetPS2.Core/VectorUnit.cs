@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Designed with determinism as the primary constraint.
+/// Designed with determinism as the primary constraint for future netplay.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -80,10 +80,30 @@ public abstract class VectorUnit
 
     protected virtual void ExecuteInstruction(uint opcode)
     {
+        // Upper 6 bits = primary opcode for many VU instructions
+        uint primary = (opcode >> 26) & 0x3F;
         uint function = opcode & 0x3F;
+
         uint rs = (opcode >> 11) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 6) & 0x1F;
+        uint sa = (opcode >> 21) & 0x1F;
+
+        switch (primary)
+        {
+            case 0x00: // SPECIAL-like
+                HandleSpecial(opcode, rs, rt, rd, sa);
+                break;
+
+            default:
+                // Other upper opcode groups (will expand)
+                break;
+        }
+    }
+
+    private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd, uint sa)
+    {
+        uint function = opcode & 0x3F;
 
         switch (function)
         {
@@ -130,8 +150,7 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
                 break;
 
-            case 0x06: // AND (component-wise on float bits - simplified for determinism)
-                // Treat as integer bitwise for determinism
+            case 0x06: // AND (bitwise)
                 break;
 
             case 0x07: // OR
@@ -142,6 +161,22 @@ public abstract class VectorUnit
 
             case 0x09: // MOVE
                 _vf[rd] = _vf[rs];
+                break;
+
+            case 0x0A: // MR32 (rotate)
+                _vf[rd].X = _vf[rs].Y;
+                _vf[rd].Y = _vf[rs].Z;
+                _vf[rd].Z = _vf[rs].W;
+                _vf[rd].W = _vf[rs].X;
+                break;
+
+            case 0x0B: // SLL
+                break;
+
+            case 0x0C: // SRL
+                break;
+
+            case 0x0D: // SRA
                 break;
 
             default:
