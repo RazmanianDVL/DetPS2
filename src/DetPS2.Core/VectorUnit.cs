@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 progress - more instructions added.
+/// Phase 6 - continued instruction expansion.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -192,6 +192,15 @@ public abstract class VectorUnit
                 break;
 
             case 0x16: // GE
+                break;
+
+            case 0x17: // Logical AND (placeholder)
+                break;
+
+            case 0x18: // Logical OR (placeholder)
+                break;
+
+            case 0x19: // Logical XOR (placeholder)
                 break;
 
             default:
