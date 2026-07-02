@@ -50,18 +50,21 @@ public static class SaveState
         writer.Write(system.Sif.GetStatus());
 
         // Dmac - expanded
-        for (int i = 0; i < 30; i++)
+        for (int i = 0; i < 36; i++)
         {
             writer.Write(0u);
         }
 
-        // GS basic state
+        // GS state - more registers
         writer.Write(0u); // PRIM
         writer.Write(0u); // RGBAQ
         writer.Write(0u); // ST
         writer.Write(0u); // UV
         writer.Write(0u); // XYZ2
         writer.Write(0u); // XYZ3
+        writer.Write(0u); // FOG
+        writer.Write(0u); // TEX0
+        writer.Write(0u); // TEX1
 
         // Reserved
         writer.Write(0u);
@@ -124,7 +127,7 @@ public static class SaveState
         }
 
         // SIF + Dmac + GS + reserved
-        for (int i = 0; i < 40; i++)
+        for (int i = 0; i < 50; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
