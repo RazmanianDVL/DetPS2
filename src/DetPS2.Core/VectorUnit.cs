@@ -200,20 +200,31 @@ public abstract class VectorUnit
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
                 break;
 
-            case 0x12: // EQ (compare equal)
-                // Set MAC flags based on comparison
+            case 0x12: // EQ
                 break;
 
-            case 0x13: // LT (less than)
+            case 0x13: // LT
                 break;
 
-            case 0x14: // LE (less or equal)
+            case 0x14: // LE
                 break;
 
             case 0x15: // GT
                 break;
 
             case 0x16: // GE
+                break;
+
+            case 0x17: // LQI (Load Quadword with Increment)
+                break;
+
+            case 0x18: // SQI (Store Quadword with Increment)
+                break;
+
+            case 0x19: // LQD (Load Quadword with Decrement)
+                break;
+
+            case 0x1A: // SQD (Store Quadword with Decrement)
                 break;
 
             default:
