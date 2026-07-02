@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - Phase 3/4.
+/// IOP.
 /// </summary>
 public sealed class Iop
 {
@@ -50,7 +50,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 262144 && Running; i++)
+        for (int i = 0; i < 524288 && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
