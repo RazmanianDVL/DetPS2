@@ -215,16 +215,28 @@ public abstract class VectorUnit
             case 0x16: // GE
                 break;
 
-            case 0x17: // LQI (Load Quadword with Increment)
+            case 0x17: // LQI
                 break;
 
-            case 0x18: // SQI (Store Quadword with Increment)
+            case 0x18: // SQI
                 break;
 
-            case 0x19: // LQD (Load Quadword with Decrement)
+            case 0x19: // LQD
                 break;
 
-            case 0x1A: // SQD (Store Quadword with Decrement)
+            case 0x1A: // SQD
+                break;
+
+            case 0x1B: // B (branch)
+                break;
+
+            case 0x1C: // BAL (branch and link)
+                break;
+
+            case 0x1D: // JR (jump register)
+                break;
+
+            case 0x1E: // JALR (jump and link register)
                 break;
 
             default:
