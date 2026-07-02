@@ -12,8 +12,6 @@ public abstract class VectorUnit
 {
     protected readonly SystemMemory _memory;
 
-    // VU has 32 x 128-bit registers (VF00-VF31)
-    // VF00 is hardwired to (0.0f, 0.0f, 0.0f, 1.0f) in many operations
     [StructLayout(LayoutKind.Sequential)]
     public struct VuReg128
     {
@@ -27,22 +25,17 @@ public abstract class VectorUnit
 
     protected readonly VuReg128[] _vf = new VuReg128[32];
 
-    // Accumulator (ACC) - used by many vector instructions
     public VuReg128 ACC;
 
-    // Control registers
-    public uint Status;     // Status flags
-    public uint MAC;        // MAC flags (from last operation)
-    public uint Clipping;   // Clipping flags
-    public uint R;          // Random number register (deterministic implementation needed)
-    public uint I;          // Interrupt control
-    public uint Q;          // Q register (used by some instructions)
-    public uint P;          // P register (used by some instructions)
+    public uint Status;
+    public uint MAC;
+    public uint Clipping;
+    public uint R;
+    public uint I;
+    public uint Q;
+    public uint P;
 
-    // Program counter for microprogram execution
     public uint PC;
-
-    // Cycle counter local to this VU (for timing)
     public ulong LocalCycles;
 
     protected VectorUnit(SystemMemory memory)
@@ -65,25 +58,106 @@ public abstract class VectorUnit
         PC = 0;
         LocalCycles = 0;
 
-        // VF00 is often treated as (0,0,0,1) for many operations
         _vf[0] = new VuReg128 { X = 0f, Y = 0f, Z = 0f, W = 1f };
     }
 
-    /// <summary>
-    /// Execute a number of VU cycles.
-    /// Must remain fully deterministic.
-    /// </summary>
-    public abstract void Step(ulong cycles);
+    public virtual void Step(ulong cycles)
+    {
+        for (ulong i = 0; i < cycles; i++)
+        {
+            if (PC < _memory.Size)
+            {
+                uint opcode = _memory.Read32(PC);
+                ExecuteInstruction(opcode);
+                PC += 4;
+            }
+            else
+            {
+                break;
+            }
+        }
+        LocalCycles += cycles;
+    }
 
-    /// <summary>
-    /// Execute a single VU instruction.
-    /// This is where determinism must be strictly maintained.
-    /// </summary>
-    protected abstract void ExecuteInstruction(uint opcode);
+    protected virtual void ExecuteInstruction(uint opcode)
+    {
+        uint function = opcode & 0x3F;
+        uint rs = (opcode >> 11) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        uint rd = (opcode >> 6) & 0x1F;
 
-    // TODO in future steps:
-    // - Implement full instruction decoder
-    // - Add proper floating-point handling with controlled determinism
-    // - Implement memory access through Vif when integrated
-    // - Add SaveState support for VU state
+        switch (function)
+        {
+            case 0x00: // ADD
+                _vf[rd].X = _vf[rs].X + _vf[rt].X;
+                _vf[rd].Y = _vf[rs].Y + _vf[rt].Y;
+                _vf[rd].Z = _vf[rs].Z + _vf[rt].Z;
+                _vf[rd].W = _vf[rs].W + _vf[rt].W;
+                break;
+
+            case 0x01: // ADDI (simplified)
+                float imm = (short)(opcode & 0xFFFF);
+                _vf[rt].X = _vf[rs].X + imm;
+                _vf[rt].Y = _vf[rs].Y + imm;
+                _vf[rt].Z = _vf[rs].Z + imm;
+                _vf[rt].W = _vf[rs].W + imm;
+                break;
+
+            case 0x02: // SUB
+                _vf[rd].X = _vf[rs].X - _vf[rt].X;
+                _vf[rd].Y = _vf[rs].Y - _vf[rt].Y;
+                _vf[rd].Z = _vf[rs].Z - _vf[rt].Z;
+                _vf[rd].W = _vf[rs].W - _vf[rt].W;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    public virtual void SaveState(System.IO.BinaryWriter writer)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            writer.Write(_vf[i].X);
+            writer.Write(_vf[i].Y);
+            writer.Write(_vf[i].Z);
+            writer.Write(_vf[i].W);
+        }
+        writer.Write(ACC.X);
+        writer.Write(ACC.Y);
+        writer.Write(ACC.Z);
+        writer.Write(ACC.W);
+        writer.Write(Status);
+        writer.Write(MAC);
+        writer.Write(Clipping);
+        writer.Write(R);
+        writer.Write(I);
+        writer.Write(Q);
+        writer.Write(P);
+        writer.Write(PC);
+    }
+
+    public virtual void LoadState(System.IO.BinaryReader reader)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            _vf[i].X = reader.ReadSingle();
+            _vf[i].Y = reader.ReadSingle();
+            _vf[i].Z = reader.ReadSingle();
+            _vf[i].W = reader.ReadSingle();
+        }
+        ACC.X = reader.ReadSingle();
+        ACC.Y = reader.ReadSingle();
+        ACC.Z = reader.ReadSingle();
+        ACC.W = reader.ReadSingle();
+        Status = reader.ReadUInt32();
+        MAC = reader.ReadUInt32();
+        Clipping = reader.ReadUInt32();
+        R = reader.ReadUInt32();
+        I = reader.ReadUInt32();
+        Q = reader.ReadUInt32();
+        P = reader.ReadUInt32();
+        PC = reader.ReadUInt32();
+    }
 }
