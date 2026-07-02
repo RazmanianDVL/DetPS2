@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState - Phase 4. Capturing more complete state.
+/// SaveState - Phase 4. Capturing more state (COP0, LO/HI, SIF).
 /// </summary>
 public static class SaveState
 {
@@ -25,7 +25,7 @@ public static class SaveState
         writer.Write(mem.Length);
         writer.Write(mem);
 
-        // EE - PC + all 32 GPRs
+        // EE full state
         writer.Write(system.EE.PC);
         for (int i = 0; i < 32; i++)
         {
@@ -33,11 +33,21 @@ public static class SaveState
             writer.Write(gpr.Lo);
             writer.Write(gpr.Hi);
         }
+        writer.Write(system.EE.LO);
+        writer.Write(system.EE.HI);
+        writer.Write(system.EE.COP0_Status);
+        writer.Write(system.EE.COP0_Cause);
+        writer.Write(system.EE.COP0_EPC);
 
-        // IOP - PC + all 32 GPRs
+        // IOP full state
         writer.Write(system.Iop.PC);
         for (int i = 0; i < 32; i++)
             writer.Write(system.Iop.GetGpr(i));
+
+        // SIF basic state
+        writer.Write(system.Sif.DmaBusy ? 1u : 0u);
+        writer.Write(system.Sif.LastCommand);
+        writer.Write(system.Sif.GetStatus());
 
         return ms.ToArray();
     }
@@ -67,11 +77,21 @@ public static class SaveState
             ulong hi = reader.ReadUInt64();
             system.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = lo, Hi = hi });
         }
+        system.EE.LO = reader.ReadUInt64();
+        system.EE.HI = reader.ReadUInt64();
+        system.EE.COP0_Status = reader.ReadUInt32();
+        system.EE.COP0_Cause = reader.ReadUInt32();
+        system.EE.COP0_EPC = reader.ReadUInt64();
 
         // IOP
         system.Iop.PC = reader.ReadUInt32();
         for (int i = 0; i < 32; i++)
             system.Iop.SetGpr(i, reader.ReadUInt32());
+
+        // SIF (read but not fully restored yet)
+        reader.ReadUInt32(); // DmaBusy
+        reader.ReadUInt32(); // LastCommand
+        reader.ReadUInt32(); // Status
 
         return true;
     }
