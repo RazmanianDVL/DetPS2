@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3 very close to completion.
+/// Emotion Engine - Phase 3 extremely close to completion.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -112,13 +112,13 @@ public sealed class EmotionEngine
                 break;
 
             // Memory management
-            case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09:
+            case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A:
             // Thread / process management
-            case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16:
+            case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
             // Common early boot and misc
-            case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x30: case 0x40:
+            case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x30: case 0x40:
             case 0x50: case 0x60: case 0x61: case 0x70: case 0x71:
-            case 0x80: case 0x81: case 0x90: case 0x91: case 0xA0: case 0xA1: case 0xB0:
+            case 0x80: case 0x81: case 0x90: case 0x91: case 0xA0: case 0xA1: case 0xB0: case 0xB1:
                 _gprs[2].Lo = 0;
                 break;
 
