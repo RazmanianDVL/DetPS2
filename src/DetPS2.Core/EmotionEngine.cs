@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Continuing HLE expansion.
+/// Emotion Engine - Phase 3/4.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -107,11 +107,13 @@ public sealed class EmotionEngine
         switch (syscallNumber)
         {
             case 0x01: HleSifInitialized = true; _gprs[2].Lo = 0; break;
+
             case 0x02: case 0x03: case 0x04:
             case 0x10: case 0x11: case 0x20: case 0x21:
             case 0x30: case 0x40: case 0x50:
             case 0x60: case 0x61: case 0x70: case 0x71: case 0x80:
                 _gprs[2].Lo = 0; break;
+
             default:
                 Console.WriteLine($"[EE HLE] Syscall 0x{syscallNumber:X}");
                 _gprs[2].Lo = 0; break;
