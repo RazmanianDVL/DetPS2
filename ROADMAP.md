@@ -19,29 +19,34 @@
 ## Phase 4: Determinism & Tooling
 **Status**: Complete
 
+## Phase 5: Vector Units + Accuracy (VU0 / VU1)
+**Status**: Complete
+
+**Completed**:
+- Created deterministic `VectorUnit` base class
+- Implemented core VU instruction set (integer + basic vector ops)
+- Added basic SaveState support for VU registers
+- Integrated VU0 into Emotion Engine as COP2
+- Functional COP2 instruction routing with full operand passing
+- `ExecuteVuInstruction` properly decodes and executes VU0 instructions
+
+**Note**: VU1 + Vif1 integration, advanced floating-point accuracy, and deeper timing work will be addressed in Phase 6.
+
 ---
 
-## Phase 5: Vector Units + Accuracy (VU0 / VU1)
+## Phase 6: Advanced Accuracy & Integration
 
-**Goal**: Implement VU0 and VU1 with high determinism and reasonable accuracy. This phase is critical for future netplay support.
-
-**Core Principles for Phase 5**:
-- Determinism first: All VU execution must be fully reproducible.
-- No hidden host state or non-deterministic floating-point behavior in the hot path.
-- Full state capture in SaveState (registers, accumulators, control state).
-- Clean separation between VU0 (coprocessor) and VU1 (Vif1 + Gif path).
+**Goal**: Improve overall system accuracy, integrate VU1, and move toward commercial game compatibility.
 
 **Planned Work**:
-- [ ] Create deterministic `VectorUnit` base class
-- [ ] VU register file (32x 128-bit registers + accumulator)
-- [ ] VU0 integration with Emotion Engine (COP2)
-- [ ] VU1 + Vif1 + Gif pipeline integration
-- [ ] Implement core VU instruction set (integer + controlled floating-point)
-- [ ] Improve timing/synchronization between EE, IOP, and VUs
-- [ ] Expand SaveState with real VU state
-- [ ] Basic interrupt generation from VUs
+- Full VU1 + Vif1 + Gif pipeline integration
+- Higher accuracy floating-point handling with determinism focus
+- More complete VU instruction set
+- Improved timing and synchronization between EE, IOP, and VUs
+- Interrupt generation from VUs
+- Expanded SaveState features
 
-**Status**: Just started. Determinism is the top priority.
+**Status**: Not started.
 
 ---
 
