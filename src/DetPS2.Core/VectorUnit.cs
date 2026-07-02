@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - continued instruction expansion.
+/// Phase 6 - floating point handling improvements.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -215,10 +215,10 @@ public abstract class VectorUnit
             case 0x1D: // CLIP
                 break;
 
-            case 0x1E: // ITOF0 (placeholder)
+            case 0x1E: // ITOF0
                 break;
 
-            case 0x1F: // FTOI0 (placeholder)
+            case 0x1F: // FTOI0
                 break;
 
             default:
@@ -226,6 +226,10 @@ public abstract class VectorUnit
         }
     }
 
+    /// <summary>
+    /// Controlled floating-point addition.
+    /// Currently just normal addition. Will be expanded for determinism.
+    /// </summary>
     protected float SafeAdd(float a, float b)
     {
         return a + b;
