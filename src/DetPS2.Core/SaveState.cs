@@ -49,13 +49,21 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Dmac - more state
-        for (int i = 0; i < 24; i++)
+        // Dmac - expanded
+        for (int i = 0; i < 30; i++)
         {
             writer.Write(0u);
         }
 
-        // Reserved for GS / Vif / other components
+        // GS basic state
+        writer.Write(0u); // PRIM
+        writer.Write(0u); // RGBAQ
+        writer.Write(0u); // ST
+        writer.Write(0u); // UV
+        writer.Write(0u); // XYZ2
+        writer.Write(0u); // XYZ3
+
+        // Reserved
         writer.Write(0u);
         writer.Write(0u);
 
@@ -115,8 +123,8 @@ public static class SaveState
             system.Iop.SetGpr(i, reader.ReadUInt32());
         }
 
-        // SIF + Dmac + reserved
-        for (int i = 0; i < 29; i++)
+        // SIF + Dmac + GS + reserved
+        for (int i = 0; i < 40; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
