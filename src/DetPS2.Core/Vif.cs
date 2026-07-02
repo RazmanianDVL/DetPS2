@@ -3,8 +3,8 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// VIF (Vector Interface) - Updated for Phase 6.
-/// Handles data transfer to VU0 and VU1.
+/// VIF (Vector Interface) - Phase 6 progress.
+/// Basic data transfer support for VU1.
 /// </summary>
 public sealed class Vif
 {
@@ -32,13 +32,21 @@ public sealed class Vif
     public void Step(ulong cycles) { }
 
     /// <summary>
-    /// Send data to VU1 (from Vif1).
+    /// Send a quadword of data to VU1.
+    /// This is a simplified version for early Phase 6.
     /// </summary>
-    public void SendToVu1(uint data)
+    public void SendQuadwordToVu1(uint address)
     {
-        if (_vu1 != null)
-        {
-            _vu1.ReceiveFromVif1(data);
-        }
+        if (_vu1 == null) return;
+
+        // Read 4 words (one quadword) from memory
+        uint w0 = _memory.Read32(address);
+        uint w1 = _memory.Read32(address + 4);
+        uint w2 = _memory.Read32(address + 8);
+        uint w3 = _memory.Read32(address + 12);
+
+        // For now we just forward the first word as a signal
+        // Real implementation will unpack and feed properly
+        _vu1.ReceiveFromVif1(w0);
     }
 }
