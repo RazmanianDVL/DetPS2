@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - expanding instruction set and accuracy.
+/// Phase 6 progress - more instructions added.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -179,13 +179,19 @@ public abstract class VectorUnit
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
                 break;
 
-            case 0x12: // EQ (compare)
+            case 0x12: // EQ
                 break;
 
             case 0x13: // LT
                 break;
 
             case 0x14: // LE
+                break;
+
+            case 0x15: // GT
+                break;
+
+            case 0x16: // GE
                 break;
 
             default:
