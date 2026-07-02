@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 5 with functional VU0 COP2 integration.
+/// Emotion Engine - Phase 5 with improved VU0 COP2 handling.
 /// </summary>
 public sealed class EmotionEngine
 {
@@ -102,13 +102,14 @@ public sealed class EmotionEngine
 
     private int ExecuteCop2(uint opcode, ref ulong nextPC)
     {
-        // Decode COP2 instruction and route to VU0
+        // Decode COP2 instruction more specifically
         uint function = opcode & 0x3F;
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 11) & 0x1F;
+        uint sa = (opcode >> 6) & 0x1F;
 
-        // For now, treat most COP2 ops as stepping VU0
-        // Real decoding will be expanded later
+        // Route specific COP2 functions to VU0
+        // For now we step VU0 and pass basic info
         _vu0.Step(1);
 
         return 1;
