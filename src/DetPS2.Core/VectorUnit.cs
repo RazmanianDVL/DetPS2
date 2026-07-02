@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Designed with determinism as the primary constraint for future netplay.
+/// Designed with determinism as the primary constraint.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -80,28 +80,25 @@ public abstract class VectorUnit
 
     protected virtual void ExecuteInstruction(uint opcode)
     {
-        // Upper 6 bits = primary opcode for many VU instructions
         uint primary = (opcode >> 26) & 0x3F;
         uint function = opcode & 0x3F;
 
         uint rs = (opcode >> 11) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 6) & 0x1F;
-        uint sa = (opcode >> 21) & 0x1F;
 
         switch (primary)
         {
-            case 0x00: // SPECIAL-like
-                HandleSpecial(opcode, rs, rt, rd, sa);
+            case 0x00:
+                HandleSpecial(opcode, rs, rt, rd);
                 break;
 
             default:
-                // Other upper opcode groups (will expand)
                 break;
         }
     }
 
-    private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd, uint sa)
+    private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd)
     {
         uint function = opcode & 0x3F;
 
@@ -150,7 +147,7 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
                 break;
 
-            case 0x06: // AND (bitwise)
+            case 0x06: // AND
                 break;
 
             case 0x07: // OR
@@ -163,7 +160,7 @@ public abstract class VectorUnit
                 _vf[rd] = _vf[rs];
                 break;
 
-            case 0x0A: // MR32 (rotate)
+            case 0x0A: // MR32
                 _vf[rd].X = _vf[rs].Y;
                 _vf[rd].Y = _vf[rs].Z;
                 _vf[rd].Z = _vf[rs].W;
@@ -177,6 +174,30 @@ public abstract class VectorUnit
                 break;
 
             case 0x0D: // SRA
+                break;
+
+            case 0x0E: // ABS
+                _vf[rd].X = Math.Abs(_vf[rs].X);
+                _vf[rd].Y = Math.Abs(_vf[rs].Y);
+                _vf[rd].Z = Math.Abs(_vf[rs].Z);
+                _vf[rd].W = Math.Abs(_vf[rs].W);
+                break;
+
+            case 0x0F: // CLIP (simplified)
+                break;
+
+            case 0x10: // MIN
+                _vf[rd].X = Math.Min(_vf[rs].X, _vf[rt].X);
+                _vf[rd].Y = Math.Min(_vf[rs].Y, _vf[rt].Y);
+                _vf[rd].Z = Math.Min(_vf[rs].Z, _vf[rt].Z);
+                _vf[rd].W = Math.Min(_vf[rs].W, _vf[rt].W);
+                break;
+
+            case 0x11: // MAX
+                _vf[rd].X = Math.Max(_vf[rs].X, _vf[rt].X);
+                _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
+                _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
+                _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
                 break;
 
             default:
