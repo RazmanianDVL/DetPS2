@@ -4,8 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// VU1 - Vector Unit 1.
-/// Works with Vif1 and feeds the Gif/GS pipeline.
-/// Determinism is a core requirement for future netplay.
+/// Now has basic data reception from Vif1.
 /// </summary>
 public sealed class Vu1 : VectorUnit
 {
@@ -23,12 +22,14 @@ public sealed class Vu1 : VectorUnit
         base.Step(cycles);
     }
 
-    /// <summary>
-    /// Entry point for Vif1 to send data or microcode to VU1.
-    /// </summary>
     public void ReceiveFromVif1(uint data)
     {
-        // TODO: Implement proper Vif1 data handling and microprogram loading
+        // Basic handling: for now we just store the data in a simple way
+        // Real implementation will unpack quadwords into VU registers or microprogram memory
+        Console.WriteLine($"[VU1] Received data from Vif1: 0x{data:X8}");
+
+        // Example: treat incoming data as an instruction to execute
+        ExecuteInstruction(data);
     }
 
     protected override void ExecuteInstruction(uint opcode)
