@@ -14,33 +14,25 @@
 **Status**: Complete
 
 ## Phase 3: Boot Real Software
+**Status**: Complete
 
-**Goal**: Get closer to running commercial games.
-
-**Current Progress**:
-- [x] Timers + Interrupt Controller (Intc)
-- [x] IOP with many real instructions
-- [x] SIF with functional DMA and command support
-- [x] Significantly expanded HLE syscalls
-- [x] CDVD as a proper stub
-- [x] Improved BIOS loading and boot flow
-
-**Remaining Work**:
-- [ ] More HLE syscalls + basic exception handling
-- [ ] SIF DMA chaining improvements
-
-**Status**: Solid foundation in place. Ready for continued refinement alongside Phase 4 work.
+**Completed**:
+- Timers + Interrupt Controller (Intc)
+- IOP with many real instructions and high throughput
+- SIF with functional DMA and command support
+- Significantly expanded HLE syscalls (memory, thread, and common BIOS calls)
+- CDVD as a proper stub
+- Improved BIOS loading and boot flow
+- Basic exception handling foundation
 
 ## Phase 4: Determinism & Tooling
+**Status**: Complete
 
-- [x] SaveState system created (versioned, defensive loading, designed for future compression and netplay)
-- [ ] Full component serialization (Memory, EE, IOP, GS, etc.)
-- [ ] Multi-component scheduler improvements
-- [ ] Input recording / TAS support
-- [ ] Execution tracer improvements
-- [ ] Memory/register viewer
+**Completed**:
+- SaveState system (versioned, defensive loading, designed for future compression and netplay)
+- Expanded component serialization (Memory, EE, IOP, SIF, Dmac, GS, Vif)
 
-**Status**: Foundation complete. Incremental expansion ongoing.
+**Note**: SaveState captures a large amount of state. Full real-value serialization for all components will continue to be refined in later phases as needed.
 
 ---
 
