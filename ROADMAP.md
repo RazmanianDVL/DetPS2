@@ -16,23 +16,32 @@
 ## Phase 3: Boot Real Software
 **Status**: Complete
 
-**Completed**:
-- Timers + Interrupt Controller (Intc)
-- IOP with many real instructions and high throughput
-- SIF with functional DMA and command support
-- Significantly expanded HLE syscalls (memory, thread, and common BIOS calls)
-- CDVD as a proper stub
-- Improved BIOS loading and boot flow
-- Basic exception handling foundation
-
 ## Phase 4: Determinism & Tooling
 **Status**: Complete
 
-**Completed**:
-- SaveState system (versioned, defensive loading, designed for future compression and netplay)
-- Expanded component serialization (Memory, EE, IOP, SIF, Dmac, GS, Vif)
+---
 
-**Note**: SaveState captures a large amount of state. Full real-value serialization for all components will continue to be refined in later phases as needed.
+## Phase 5: Vector Units + Accuracy (VU0 / VU1)
+
+**Goal**: Implement VU0 and VU1 with high determinism and reasonable accuracy. This phase is critical for future netplay support.
+
+**Core Principles for Phase 5**:
+- Determinism first: All VU execution must be fully reproducible.
+- No hidden host state or non-deterministic floating-point behavior in the hot path.
+- Full state capture in SaveState (registers, accumulators, control state).
+- Clean separation between VU0 (coprocessor) and VU1 (Vif1 + Gif path).
+
+**Planned Work**:
+- [ ] Create deterministic `VectorUnit` base class
+- [ ] VU register file (32x 128-bit registers + accumulator)
+- [ ] VU0 integration with Emotion Engine (COP2)
+- [ ] VU1 + Vif1 + Gif pipeline integration
+- [ ] Implement core VU instruction set (integer + controlled floating-point)
+- [ ] Improve timing/synchronization between EE, IOP, and VUs
+- [ ] Expand SaveState with real VU state
+- [ ] Basic interrupt generation from VUs
+
+**Status**: Just started. Determinism is the top priority.
 
 ---
 
