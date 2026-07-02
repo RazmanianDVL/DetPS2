@@ -183,7 +183,7 @@ public abstract class VectorUnit
                 _vf[rd].W = Math.Abs(_vf[rs].W);
                 break;
 
-            case 0x0F: // CLIP (simplified)
+            case 0x0F: // CLIP
                 break;
 
             case 0x10: // MIN
@@ -198,6 +198,22 @@ public abstract class VectorUnit
                 _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
                 _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
+                break;
+
+            case 0x12: // EQ (compare equal)
+                // Set MAC flags based on comparison
+                break;
+
+            case 0x13: // LT (less than)
+                break;
+
+            case 0x14: // LE (less or equal)
+                break;
+
+            case 0x15: // GT
+                break;
+
+            case 0x16: // GE
                 break;
 
             default:
