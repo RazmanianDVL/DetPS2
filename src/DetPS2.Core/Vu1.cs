@@ -4,8 +4,8 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// VU1 - Vector Unit 1.
-/// Works with Vif1 and feeds into the Gif/GS pipeline.
-/// Must remain fully deterministic for netplay compatibility.
+/// Works with Vif1 and feeds the Gif/GS pipeline.
+/// Determinism is a core requirement for future netplay.
 /// </summary>
 public sealed class Vu1 : VectorUnit
 {
@@ -16,24 +16,23 @@ public sealed class Vu1 : VectorUnit
     public override void Reset()
     {
         base.Reset();
-        // VU1-specific reset behavior can be added here
     }
 
     public override void Step(ulong cycles)
     {
-        // TODO: Implement VU1 microprogram execution + Vif1 integration
-        // Must stay deterministic. Timing with Vif1 and Gif is critical.
-        LocalCycles += cycles;
+        base.Step(cycles);
+    }
+
+    /// <summary>
+    /// Entry point for Vif1 to send data or microcode to VU1.
+    /// </summary>
+    public void ReceiveFromVif1(uint data)
+    {
+        // TODO: Implement proper Vif1 data handling and microprogram loading
     }
 
     protected override void ExecuteInstruction(uint opcode)
     {
-        // TODO: Implement VU1 instruction decoding and execution
-        // Start with integer operations for maximum determinism.
+        base.ExecuteInstruction(opcode);
     }
-
-    // TODO:
-    // - Add Vif1 integration
-    // - Add proper SaveState support
-    // - Handle VU1-specific interrupts and Gif path
 }
