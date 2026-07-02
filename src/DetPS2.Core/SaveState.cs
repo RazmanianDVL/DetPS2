@@ -4,12 +4,13 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState - Phase 4. Continuing to expand captured state.
+/// SaveState system for DetPS2.
+/// Designed to be deterministic, versioned, and extensible for future features (compression, netplay, partial states).
 /// </summary>
 public static class SaveState
 {
-    private const uint Magic = 0x44505332;
-    private const uint Version = 1;
+    private const uint Magic = 0x44505332; // "DPS2"
+    private const uint CurrentVersion = 1;
 
     public static byte[] Save(Ps2System system)
     {
@@ -17,7 +18,7 @@ public static class SaveState
         using var writer = new BinaryWriter(ms);
 
         writer.Write(Magic);
-        writer.Write(Version);
+        writer.Write(CurrentVersion);
         writer.Write(DateTime.UtcNow.Ticks);
 
         // Memory
@@ -49,7 +50,8 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Dmac / Intc placeholders (for future expansion)
+        // Reserved space for future components (Dmac, Intc, GS, etc.)
+        // These will be replaced with real serialization later.
         writer.Write(0u);
         writer.Write(0u);
 
@@ -58,48 +60,73 @@ public static class SaveState
 
     public static bool Load(Ps2System system, byte[] data)
     {
-        if (data == null || data.Length < 16) return false;
+        if (data == null || data.Length < 16)
+            return false;
 
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms);
 
-        if (reader.ReadUInt32() != Magic) return false;
-        if (reader.ReadUInt32() != Version) return false;
+        if (reader.ReadUInt32() != Magic)
+            return false;
 
-        reader.ReadInt64(); // timestamp
+        uint version = reader.ReadUInt32();
+        if (version != CurrentVersion)
+            return false; // Strict version check for now
+
+        reader.ReadInt64(); // timestamp (currently unused)
 
         // Memory
+        if (reader.BaseStream.Position + 4 > data.Length)
+            return false;
+
         int memSize = reader.ReadInt32();
+        if (reader.BaseStream.Position + memSize > data.Length)
+            return false;
+
         byte[] memData = reader.ReadBytes(memSize);
         system.Memory.SetRawData(memData);
 
         // EE
+        if (reader.BaseStream.Position + 8 > data.Length) return false;
         system.EE.PC = reader.ReadUInt64();
+
         for (int i = 0; i < 32; i++)
         {
+            if (reader.BaseStream.Position + 16 > data.Length) return false;
             ulong lo = reader.ReadUInt64();
             ulong hi = reader.ReadUInt64();
             system.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = lo, Hi = hi });
         }
+
+        if (reader.BaseStream.Position + 8 > data.Length) return false;
         system.EE.LO = reader.ReadUInt64();
         system.EE.HI = reader.ReadUInt64();
+
+        if (reader.BaseStream.Position + 4 > data.Length) return false;
         system.EE.COP0_Status = reader.ReadUInt32();
+
+        if (reader.BaseStream.Position + 4 > data.Length) return false;
         system.EE.COP0_Cause = reader.ReadUInt32();
+
+        if (reader.BaseStream.Position + 8 > data.Length) return false;
         system.EE.COP0_EPC = reader.ReadUInt64();
 
         // IOP
+        if (reader.BaseStream.Position + 4 > data.Length) return false;
         system.Iop.PC = reader.ReadUInt32();
+
         for (int i = 0; i < 32; i++)
+        {
+            if (reader.BaseStream.Position + 4 > data.Length) return false;
             system.Iop.SetGpr(i, reader.ReadUInt32());
+        }
 
-        // SIF
-        reader.ReadUInt32(); // DmaBusy
-        reader.ReadUInt32(); // LastCommand
-        reader.ReadUInt32(); // Status
-
-        // Dmac / Intc placeholders
-        reader.ReadUInt32();
-        reader.ReadUInt32();
+        // SIF + reserved fields
+        for (int i = 0; i < 5; i++)
+        {
+            if (reader.BaseStream.Position + 4 > data.Length) return false;
+            reader.ReadUInt32();
+        }
 
         return true;
     }
