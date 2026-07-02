@@ -49,13 +49,13 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Dmac - expanded placeholder
-        for (int i = 0; i < 16; i++)
+        // Dmac - more state
+        for (int i = 0; i < 20; i++)
         {
             writer.Write(0u);
         }
 
-        // Reserved for GS / Vif / full components
+        // Reserved for GS / Vif / other components
         writer.Write(0u);
         writer.Write(0u);
 
@@ -116,7 +116,7 @@ public static class SaveState
         }
 
         // SIF + Dmac + reserved
-        for (int i = 0; i < 21; i++)
+        for (int i = 0; i < 25; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
