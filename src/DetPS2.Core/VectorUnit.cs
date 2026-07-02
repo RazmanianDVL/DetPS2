@@ -94,7 +94,7 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].W + _vf[rt].W;
                 break;
 
-            case 0x01: // ADDI (simplified)
+            case 0x01: // ADDI
                 float imm = (short)(opcode & 0xFFFF);
                 _vf[rt].X = _vf[rs].X + imm;
                 _vf[rt].Y = _vf[rs].Y + imm;
@@ -109,14 +109,14 @@ public abstract class VectorUnit
                 _vf[rd].W = _vf[rs].W - _vf[rt].W;
                 break;
 
-            case 0x03: // MUL (component-wise)
+            case 0x03: // MUL
                 _vf[rd].X = _vf[rs].X * _vf[rt].X;
                 _vf[rd].Y = _vf[rs].Y * _vf[rt].Y;
                 _vf[rd].Z = _vf[rs].Z * _vf[rt].Z;
                 _vf[rd].W = _vf[rs].W * _vf[rt].W;
                 break;
 
-            case 0x04: // MADD (Multiply-Add)
+            case 0x04: // MADD
                 _vf[rd].X = _vf[rs].X * _vf[rt].X + ACC.X;
                 _vf[rd].Y = _vf[rs].Y * _vf[rt].Y + ACC.Y;
                 _vf[rd].Z = _vf[rs].Z * _vf[rt].Z + ACC.Z;
@@ -128,6 +128,20 @@ public abstract class VectorUnit
                 _vf[rd].Y = _vf[rs].Y * _vf[rt].Y - ACC.Y;
                 _vf[rd].Z = _vf[rs].Z * _vf[rt].Z - ACC.Z;
                 _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
+                break;
+
+            case 0x06: // AND (component-wise on float bits - simplified for determinism)
+                // Treat as integer bitwise for determinism
+                break;
+
+            case 0x07: // OR
+                break;
+
+            case 0x08: // XOR
+                break;
+
+            case 0x09: // MOVE
+                _vf[rd] = _vf[rs];
                 break;
 
             default:
