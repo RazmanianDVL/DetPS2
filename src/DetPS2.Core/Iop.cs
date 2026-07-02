@@ -50,7 +50,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 1048576 && Running; i++)
+        for (int i = 0; i < 2097152 && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
