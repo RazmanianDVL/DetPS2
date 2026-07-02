@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Designed with determinism as the primary constraint.
+/// Designed with determinism as the primary constraint for future netplay.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -227,16 +227,22 @@ public abstract class VectorUnit
             case 0x1A: // SQD
                 break;
 
-            case 0x1B: // B (branch)
+            case 0x1B: // B
                 break;
 
-            case 0x1C: // BAL (branch and link)
+            case 0x1C: // BAL
                 break;
 
-            case 0x1D: // JR (jump register)
+            case 0x1D: // JR
                 break;
 
-            case 0x1E: // JALR (jump and link register)
+            case 0x1E: // JALR
+                break;
+
+            case 0x1F: // ITOF (Integer to Float) - structure
+                break;
+
+            case 0x20: // FTOI (Float to Integer) - structure
                 break;
 
             default:
