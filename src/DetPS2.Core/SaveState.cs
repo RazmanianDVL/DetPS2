@@ -49,10 +49,8 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Dmac placeholder
+        // Dmac / Intc placeholders (for future expansion)
         writer.Write(0u);
-
-        // Intc placeholder
         writer.Write(0u);
 
         return ms.ToArray();
@@ -94,10 +92,12 @@ public static class SaveState
         for (int i = 0; i < 32; i++)
             system.Iop.SetGpr(i, reader.ReadUInt32());
 
-        // SIF / Dmac / Intc placeholders
-        reader.ReadUInt32();
-        reader.ReadUInt32();
-        reader.ReadUInt32();
+        // SIF
+        reader.ReadUInt32(); // DmaBusy
+        reader.ReadUInt32(); // LastCommand
+        reader.ReadUInt32(); // Status
+
+        // Dmac / Intc placeholders
         reader.ReadUInt32();
         reader.ReadUInt32();
 
