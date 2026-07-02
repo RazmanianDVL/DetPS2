@@ -5,11 +5,12 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine - Phase 3 complete.
+/// Emotion Engine - Phase 5 with VU0 COP2 integration started.
 /// </summary>
 public sealed class EmotionEngine
 {
     private readonly SystemMemory _memory;
+    private readonly Vu0 _vu0;
 
     public ulong PC { get; set; } = 0xBFC00000;
     private bool _branchPending;
@@ -37,6 +38,7 @@ public sealed class EmotionEngine
     public EmotionEngine(SystemMemory memory)
     {
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        _vu0 = new Vu0(memory);
         Reset();
     }
 
@@ -51,6 +53,7 @@ public sealed class EmotionEngine
         HI = 0;
         _branchPending = false;
         HleSifInitialized = false;
+        _vu0.Reset();
     }
 
     public int Step()
@@ -77,6 +80,7 @@ public sealed class EmotionEngine
             0x08 => ExecuteAddi(opcode),
             0x09 => ExecuteAddiu(opcode),
             0x0C => ExecuteSyscall(opcode, ref nextPC),
+            0x12 => ExecuteCop2(opcode, ref nextPC), // COP2 (VU0)
             _ => HandleUnknown(opcode, currentPC)
         };
 
@@ -93,7 +97,18 @@ public sealed class EmotionEngine
     private int ExecuteSpecial(uint opcode, ref ulong nextPC)
     {
         uint function = opcode & 0x3F;
-        // Abbreviated
+        // Abbreviated for now
+        return 1;
+    }
+
+    private int ExecuteCop2(uint opcode, ref ulong nextPC)
+    {
+        // Basic COP2 handling - routes to VU0
+        uint function = opcode & 0x3F;
+
+        // For now, just step VU0 a small amount as a placeholder
+        _vu0.Step(1);
+
         return 1;
     }
 
@@ -111,11 +126,8 @@ public sealed class EmotionEngine
                 _gprs[2].Lo = 0;
                 break;
 
-            // Memory management
             case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C:
-            // Thread / process management
             case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x19:
-            // Common early boot and misc
             case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x30: case 0x40:
             case 0x50: case 0x60: case 0x61: case 0x70: case 0x71:
             case 0x80: case 0x81: case 0x90: case 0x91: case 0xA0: case 0xA1: case 0xB0: case 0xB1: case 0xC0: case 0xC1:
@@ -147,4 +159,6 @@ public sealed class EmotionEngine
 
     public Gpr128 GetGpr(int index) => _gprs[index & 0x1F];
     public void SetGpr(int index, Gpr128 value) { if (index != 0) _gprs[index & 0x1F] = value; }
+
+    public Vu0 GetVu0() => _vu0;
 }
