@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 foundation nearly complete.
+/// Phase 6 foundation complete.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -210,15 +210,6 @@ public abstract class VectorUnit
                 break;
 
             case 0x1C: // SRA
-                break;
-
-            case 0x1D: // CLIP
-                break;
-
-            case 0x1E: // ITOF0
-                break;
-
-            case 0x1F: // FTOI0
                 break;
 
             case 0x1D: // CLIP
