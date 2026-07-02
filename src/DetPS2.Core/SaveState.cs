@@ -4,7 +4,7 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SaveState - Phase 4. Now captures Memory + basic EE/IOP registers.
+/// SaveState - Phase 4. Capturing more complete state.
 /// </summary>
 public static class SaveState
 {
@@ -25,19 +25,19 @@ public static class SaveState
         writer.Write(mem.Length);
         writer.Write(mem);
 
-        // Basic EE registers (PC + first 8 GPRs for now)
+        // EE - PC + all 32 GPRs
         writer.Write(system.EE.PC);
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 32; i++)
         {
             var gpr = system.EE.GetGpr(i);
             writer.Write(gpr.Lo);
             writer.Write(gpr.Hi);
         }
 
-        // Basic IOP registers
+        // IOP - PC + all 32 GPRs
         writer.Write(system.Iop.PC);
-        for (int i = 0; i < 8; i++)
-            writer.Write(system.Iop.GetGpr(i)); // We'll add GetGpr to Iop
+        for (int i = 0; i < 32; i++)
+            writer.Write(system.Iop.GetGpr(i));
 
         return ms.ToArray();
     }
@@ -61,7 +61,7 @@ public static class SaveState
 
         // EE
         system.EE.PC = reader.ReadUInt64();
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 32; i++)
         {
             ulong lo = reader.ReadUInt64();
             ulong hi = reader.ReadUInt64();
@@ -70,7 +70,7 @@ public static class SaveState
 
         // IOP
         system.Iop.PC = reader.ReadUInt32();
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 32; i++)
             system.Iop.SetGpr(i, reader.ReadUInt32());
 
         return true;
