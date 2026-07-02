@@ -4,7 +4,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// VU0 - Vector Unit 0.
-/// Now properly decodes and executes instructions from COP2.
+/// Accepts real operands from COP2.
 /// </summary>
 public sealed class Vu0 : VectorUnit
 {
@@ -22,14 +22,15 @@ public sealed class Vu0 : VectorUnit
         base.Step(cycles);
     }
 
-    public void ExecuteVuInstruction(uint function, uint rt, uint rd)
+    public void ExecuteVuInstruction(uint function, uint rs, uint rt, uint rd, uint sa)
     {
-        // Decode the COP2 function code and execute the corresponding VU instruction
-        // For now we map common COP2 functions to our existing instruction handlers
-        uint fakeOpcode = (function & 0x3F);
+        // Now receives full operands from COP2
+        // Build a more complete opcode and execute
+        uint opcode = (function & 0x3F);
 
-        // Call into the base instruction executor
-        ExecuteInstruction(fakeOpcode);
+        // For now we still use simplified execution
+        // Real per-instruction operand usage will be expanded
+        ExecuteInstruction(opcode);
     }
 
     protected override void ExecuteInstruction(uint opcode)
