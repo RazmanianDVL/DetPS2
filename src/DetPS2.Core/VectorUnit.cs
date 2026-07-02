@@ -6,7 +6,6 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// Designed with determinism as the primary constraint.
-/// All execution must be reproducible for future netplay support.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -108,6 +107,27 @@ public abstract class VectorUnit
                 _vf[rd].Y = _vf[rs].Y - _vf[rt].Y;
                 _vf[rd].Z = _vf[rs].Z - _vf[rt].Z;
                 _vf[rd].W = _vf[rs].W - _vf[rt].W;
+                break;
+
+            case 0x03: // MUL (component-wise)
+                _vf[rd].X = _vf[rs].X * _vf[rt].X;
+                _vf[rd].Y = _vf[rs].Y * _vf[rt].Y;
+                _vf[rd].Z = _vf[rs].Z * _vf[rt].Z;
+                _vf[rd].W = _vf[rs].W * _vf[rt].W;
+                break;
+
+            case 0x04: // MADD (Multiply-Add)
+                _vf[rd].X = _vf[rs].X * _vf[rt].X + ACC.X;
+                _vf[rd].Y = _vf[rs].Y * _vf[rt].Y + ACC.Y;
+                _vf[rd].Z = _vf[rs].Z * _vf[rt].Z + ACC.Z;
+                _vf[rd].W = _vf[rs].W * _vf[rt].W + ACC.W;
+                break;
+
+            case 0x05: // MSUB
+                _vf[rd].X = _vf[rs].X * _vf[rt].X - ACC.X;
+                _vf[rd].Y = _vf[rs].Y * _vf[rt].Y - ACC.Y;
+                _vf[rd].Z = _vf[rs].Z * _vf[rt].Z - ACC.Z;
+                _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
                 break;
 
             default:
