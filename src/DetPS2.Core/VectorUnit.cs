@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - continued instruction expansion.
+/// Phase 6 - substantial instruction expansion.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -194,8 +194,7 @@ public abstract class VectorUnit
             case 0x16: // GE
                 break;
 
-            case 0x17: // AND (simplified bitwise)
-                // For determinism we can treat floats as int bits later
+            case 0x17: // AND
                 break;
 
             case 0x18: // OR
@@ -220,6 +219,12 @@ public abstract class VectorUnit
                 break;
 
             case 0x1F: // FTOI0
+                break;
+
+            case 0x20: // ADDI (vector immediate - simplified)
+                break;
+
+            case 0x21: // SUBI (simplified)
                 break;
 
             default:
