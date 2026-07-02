@@ -3,7 +3,7 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - More real instructions added.
+/// IOP - More real instructions.
 /// </summary>
 public sealed class Iop
 {
@@ -50,7 +50,7 @@ public sealed class Iop
     {
         if (!Running) return;
 
-        for (int i = 0; i < 16384 && Running; i++)
+        for (int i = 0; i < 32768 && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
