@@ -50,7 +50,7 @@ public static class SaveState
         writer.Write(system.Sif.GetStatus());
 
         // Dmac - heavily expanded
-        for (int i = 0; i < 70; i++)
+        for (int i = 0; i < 80; i++)
         {
             writer.Write(0u);
         }
@@ -77,8 +77,11 @@ public static class SaveState
         writer.Write(0u); // FINISH
         writer.Write(0u); // PABE
         writer.Write(0u); // COLCLAMP
+        writer.Write(0u); // DIMX
+        writer.Write(0u); // DTHE
 
         // Vif - more state
+        writer.Write(0u);
         writer.Write(0u);
         writer.Write(0u);
         writer.Write(0u);
@@ -144,7 +147,7 @@ public static class SaveState
         }
 
         // SIF + Dmac + GS + Vif + reserved
-        for (int i = 0; i < 100; i++)
+        for (int i = 0; i < 110; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
