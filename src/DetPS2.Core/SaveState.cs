@@ -5,11 +5,10 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// SaveState system for DetPS2.
-/// Designed to be deterministic, versioned, and extensible.
 /// </summary>
 public static class SaveState
 {
-    private const uint Magic = 0x44505332; // "DPS2"
+    private const uint Magic = 0x44505332;
     private const uint CurrentVersion = 1;
 
     public static byte[] Save(Ps2System system)
@@ -50,7 +49,14 @@ public static class SaveState
         writer.Write(system.Sif.LastCommand);
         writer.Write(system.Sif.GetStatus());
 
-        // Reserved space for future components (Dmac, Intc, GS, etc.)
+        // Dmac basic state (first 4 channels control registers)
+        for (int i = 0; i < 4; i++)
+        {
+            // Placeholder for real DMAC channel state
+            writer.Write(0u);
+        }
+
+        // Reserved for future (GS, Vif, full Dmac, etc.)
         writer.Write(0u);
         writer.Write(0u);
 
@@ -59,28 +65,20 @@ public static class SaveState
 
     public static bool Load(Ps2System system, byte[] data)
     {
-        if (data == null || data.Length < 16)
-            return false;
+        if (data == null || data.Length < 16) return false;
 
         using var ms = new MemoryStream(data);
         using var reader = new BinaryReader(ms);
 
-        if (reader.ReadUInt32() != Magic)
-            return false;
-
-        uint version = reader.ReadUInt32();
-        if (version != CurrentVersion)
-            return false;
+        if (reader.ReadUInt32() != Magic) return false;
+        if (reader.ReadUInt32() != CurrentVersion) return false;
 
         reader.ReadInt64(); // timestamp
 
         // Memory
-        if (reader.BaseStream.Position + 4 > data.Length)
-            return false;
-
+        if (reader.BaseStream.Position + 4 > data.Length) return false;
         int memSize = reader.ReadInt32();
-        if (reader.BaseStream.Position + memSize > data.Length)
-            return false;
+        if (reader.BaseStream.Position + memSize > data.Length) return false;
 
         byte[] memData = reader.ReadBytes(memSize);
         system.Memory.SetRawData(memData);
@@ -103,10 +101,8 @@ public static class SaveState
 
         if (reader.BaseStream.Position + 4 > data.Length) return false;
         system.EE.COP0_Status = reader.ReadUInt32();
-
         if (reader.BaseStream.Position + 4 > data.Length) return false;
         system.EE.COP0_Cause = reader.ReadUInt32();
-
         if (reader.BaseStream.Position + 8 > data.Length) return false;
         system.EE.COP0_EPC = reader.ReadUInt64();
 
@@ -120,8 +116,8 @@ public static class SaveState
             system.Iop.SetGpr(i, reader.ReadUInt32());
         }
 
-        // SIF + reserved fields
-        for (int i = 0; i < 5; i++)
+        // SIF + Dmac + reserved
+        for (int i = 0; i < 9; i++)
         {
             if (reader.BaseStream.Position + 4 > data.Length) return false;
             reader.ReadUInt32();
