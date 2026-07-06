@@ -2,39 +2,74 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="DetPS2.Desktop.MainWindow"
         Title="DetPS2Sharp — Deterministic PS2 Emulator"
-        Width="900" Height="700"
-        MinWidth="800" MinHeight="600">
+        Width="960" Height="720"
+        MinWidth="800" MinHeight="600"
+        KeyBindings="{Binding KeyBindings}">
 
-    <Grid RowDefinitions="Auto,*,Auto">
-        <!-- Top Menu / Toolbar -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6" Margin="8">
-            <Button Content="Load BIOS" Click="OnLoadBiosClick" />
-            <Button Content="Load ELF" Click="OnLoadElfClick" />
-            <Separator Width="1" Margin="4,0" />
-            <Button Content="Run" Click="OnRunClick" />
-            <Button Content="Pause" Click="OnPauseClick" />
-            <Button Content="Step 1M cycles" Click="OnStepClick" />
-            <Button Content="Reset" Click="OnResetClick" />
-            <Separator Width="1" Margin="4,0" />
-            <Button Content="Test Draw" Click="OnTestDrawClick" />
-            <Button Content="Save State" Click="OnSaveStateClick" />
-            <Button Content="Load State" Click="OnLoadStateClick" />
+    <Grid RowDefinitions="Auto,Auto,*,Auto">
+        <!-- Menu Bar -->
+        <Menu Grid.Row="0" Background="{DynamicResource MenuBackground}">
+            <MenuItem Header="_File">
+                <MenuItem Header="Load _BIOS..." Click="OnLoadBiosClick" HotKey="Ctrl+B" />
+                <MenuItem Header="Load _ELF..." Click="OnLoadElfClick" HotKey="Ctrl+E" />
+                <Separator />
+                <MenuItem Header="_Save State..." Click="OnSaveStateClick" HotKey="Ctrl+S" />
+                <MenuItem Header="_Load State..." Click="OnLoadStateClick" HotKey="Ctrl+L" />
+                <Separator />
+                <MenuItem Header="E_xit" Click="OnExitClick" HotKey="Alt+F4" />
+            </MenuItem>
+
+            <MenuItem Header="_Emulation">
+                <MenuItem Header="_Run" Click="OnRunClick" HotKey="F5" />
+                <MenuItem Header="_Pause" Click="OnPauseClick" HotKey="F6" />
+                <MenuItem Header="_Reset" Click="OnResetClick" HotKey="F9" />
+                <Separator />
+                <MenuItem Header="Step _1M cycles" Click="OnStepClick" HotKey="F10" />
+                <MenuItem Header="Render _Test Scene" Click="OnTestDrawClick" HotKey="F11" />
+            </MenuItem>
+
+            <MenuItem Header="_View">
+                <MenuItem Header="Reset _Framebuffer View" Click="OnResetFramebufferViewClick" />
+            </MenuItem>
+
+            <MenuItem Header="_Help">
+                <MenuItem Header="_About DetPS2Sharp..." Click="OnAboutClick" />
+            </MenuItem>
+        </Menu>
+
+        <!-- Toolbar -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="4" Margin="8,4">
+            <Button Content="Load BIOS" Click="OnLoadBiosClick" ToolTip.Tip="Ctrl+B" />
+            <Button Content="Load ELF" Click="OnLoadElfClick" ToolTip.Tip="Ctrl+E" />
+            <Separator Width="1" Margin="4,2" />
+            <Button Content="▶ Run" Click="OnRunClick" ToolTip.Tip="F5" />
+            <Button Content="⏸ Pause" Click="OnPauseClick" ToolTip.Tip="F6" />
+            <Button Content="⟲ Reset" Click="OnResetClick" ToolTip.Tip="F9" />
+            <Button Content="Step" Click="OnStepClick" ToolTip.Tip="F10" />
+            <Separator Width="1" Margin="4,2" />
+            <Button Content="🎨 Test Scene" Click="OnTestDrawClick" ToolTip.Tip="F11" />
+            <Button Content="💾 Save State" Click="OnSaveStateClick" ToolTip.Tip="Ctrl+S" />
+            <Button Content="📂 Load State" Click="OnLoadStateClick" ToolTip.Tip="Ctrl+L" />
         </StackPanel>
 
         <!-- Main Display Area -->
-        <Border Grid.Row="1" BorderBrush="Gray" BorderThickness="1" Margin="8" Background="Black">
+        <Border Grid.Row="2" BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
+                CornerRadius="4">
             <Image x:Name="FramebufferImage"
                    Stretch="Uniform"
                    HorizontalAlignment="Center"
-                   VerticalAlignment="Center" />
+                   VerticalAlignment="Center"
+                   Margin="4" />
         </Border>
 
         <!-- Status Bar -->
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12" Margin="8,4">
-            <TextBlock x:Name="StatusText" Text="Ready - Load BIOS or ELF to begin" />
-            <TextBlock x:Name="CyclesText" Text="Master Cycles: 0" />
-            <TextBlock x:Name="FpsText" Text="FPS: --" />
-        </StackPanel>
+        <Border Grid.Row="3" Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" Padding="8,4">
+            <StackPanel Orientation="Horizontal" Spacing="16">
+                <TextBlock x:Name="StatusText" Text="Ready" VerticalAlignment="Center" />
+                <TextBlock x:Name="CyclesText" Text="Master Cycles: 0" VerticalAlignment="Center" />
+                <TextBlock x:Name="FpsText" Text="~60 updates/sec" VerticalAlignment="Center" />
+            </StackPanel>
+        </Border>
     </Grid>
 
 </Window>
