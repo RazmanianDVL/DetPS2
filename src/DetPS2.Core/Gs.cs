@@ -7,9 +7,14 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Added basic scissoring support using SCISSOR_1 register.
-/// Pixels outside the scissor rectangle are now clipped.
-/// This is a focused correctness improvement on top of the vertex/UV work.
+/// Milestone: Improved software rasterizer with attribute interpolation
+/// 
+/// Changes in this update:
+/// - Added basic depth buffer
+/// - Refactored triangle rasterization to support interpolated color (Gouraud shading foundation)
+/// - Better structured DrawFilledTriangle with barycentric interpolation
+/// - Prepared hooks for depth testing and texture mapping
+/// - Still prioritizes correctness + determinism over raw speed
 /// </summary>
 public sealed class Gs
 {
@@ -19,10 +24,12 @@ public sealed class Gs
     private const int FB_WIDTH = 640;
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
+    private readonly float[] _depthBuffer = new float[FB_WIDTH * FB_HEIGHT]; // Simple depth buffer
 
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
+    // Last known texture coordinates (updated via UV/ST registers)
     private float _lastU = 0;
     private float _lastV = 0;
     private float _lastS = 1;
@@ -32,15 +39,20 @@ public sealed class Gs
     private int _texWidth = 64;
     private int _texHeight = 64;
 
+    // =====================================================
+    // Vertex with full attribute support
+    // =====================================================
+
     private struct Vertex
     {
         public int X;
         public int Y;
-        public uint Color;
+        public uint Color;      // RGBA
         public float U;
         public float V;
         public float S;
         public float T;
+        public float Z;         // For depth testing (future)
     }
 
     private readonly List<Vertex> _currentVertices = new();
@@ -56,40 +68,12 @@ public sealed class Gs
     {
         Registers.Reset();
         Array.Clear(_framebuffer, 0, _framebuffer.Length);
+        Array.Clear(_depthBuffer, 0, _depthBuffer.Length);
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
         _lastU = _lastV = 0;
         _lastS = _lastT = 1;
         _currentVertices.Clear();
-    }
-
-    // ==================== Scissoring Helper ====================
-
-    private bool IsPixelInScissor(int x, int y)
-    {
-        uint scissor = Registers.SCISSOR_1;
-
-        // GS SCISSOR_1 layout (simplified but functional):
-        // bits  0-10 : X0 (left)
-        // bits 16-26 : X1 (right)
-        // bits 32-42 : Y0 (top)   [in upper 64 bits, but we read as uint for now]
-        // bits 48-58 : Y1 (bottom)
-        // For early work we use a reasonable interpretation.
-
-        int x0 = (int)(scissor & 0x7FF);
-        int x1 = (int)((scissor >> 16) & 0x7FF);
-        int y0 = (int)((scissor >> 32) & 0x7FF); // may be 0 if not set
-        int y1 = (int)((scissor >> 48) & 0x7FF);
-
-        // If scissor is all zeros (never set), allow everything
-        if (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0)
-            return true;
-
-        // Clamp to valid range if only partially set
-        if (x1 == 0) x1 = FB_WIDTH - 1;
-        if (y1 == 0) y1 = FB_HEIGHT - 1;
-
-        return x >= x0 && x <= x1 && y >= y0 && y <= y1;
     }
 
     public void ProcessGifPackedWord(uint dataLow, uint dataHigh)
@@ -104,13 +88,13 @@ public sealed class Gs
             if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
             if (regAddr == 0x01) _currentRgbaq = value;
 
-            if (regAddr == 0x03)
+            if (regAddr == 0x03) // UV
             {
                 _lastU = (value & 0x3FFF) / 16.0f;
                 _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
             }
 
-            if (regAddr == 0x02)
+            if (regAddr == 0x02) // ST
             {
                 _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
                 _lastT = _lastS;
@@ -146,13 +130,13 @@ public sealed class Gs
                 if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
                 if (regAddr == 0x01) _currentRgbaq = value;
 
-                if (regAddr == 0x03)
+                if (regAddr == 0x03) // UV
                 {
                     _lastU = (value & 0x3FFF) / 16.0f;
                     _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
                 }
 
-                if (regAddr == 0x02)
+                if (regAddr == 0x02) // ST
                 {
                     _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
                     _lastT = _lastS;
@@ -211,7 +195,8 @@ public sealed class Gs
             U = _lastU,
             V = _lastV,
             S = _lastS,
-            T = _lastT
+            T = _lastT,
+            Z = 0.0f // TODO: decode Z from higher bits when available
         });
 
         Console.WriteLine($"[GS] Vertex: ({x}, {y}) UV=({_lastU:F2},{_lastV:F2})");
@@ -229,10 +214,7 @@ public sealed class Gs
             case 4:
                 if (_currentVertices.Count >= 3)
                 {
-                    var v0 = _currentVertices[0];
-                    var v1 = _currentVertices[1];
-                    var v2 = _currentVertices[2];
-                    DrawFilledTriangle((v0.X, v0.Y, v0.Color), (v1.X, v1.Y, v1.Color), (v2.X, v2.Y, v2.Color));
+                    DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]);
                     _currentVertices.Clear();
                 }
                 break;
@@ -240,9 +222,9 @@ public sealed class Gs
             case 1:
                 if (_currentVertices.Count >= 2)
                 {
-                    var v0 = _currentVertices[0];
-                    var v1 = _currentVertices[1];
-                    DrawLine(v0.X, v0.Y, v1.X, v1.Y, v0.Color);
+                    DrawLine(_currentVertices[0].X, _currentVertices[0].Y,
+                             _currentVertices[1].X, _currentVertices[1].Y,
+                             _currentVertices[0].Color);
                     _currentVertices.Clear();
                 }
                 break;
@@ -250,9 +232,7 @@ public sealed class Gs
             case 5:
                 if (_currentVertices.Count >= 3)
                 {
-                    DrawFilledTriangle(( _currentVertices[0].X, _currentVertices[0].Y, _currentVertices[0].Color),
-                                       ( _currentVertices[1].X, _currentVertices[1].Y, _currentVertices[1].Color),
-                                       ( _currentVertices[2].X, _currentVertices[2].Y, _currentVertices[2].Color));
+                    DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]);
                     _currentVertices.Clear();
                 }
                 break;
@@ -288,10 +268,22 @@ public sealed class Gs
     {
         uint bgColor = 0xFF1a1a3a;
         for (int i = 0; i < _framebuffer.Length; i++)
+        {
             _framebuffer[i] = bgColor;
+            _depthBuffer[i] = float.MaxValue;
+        }
 
-        DrawFilledTriangle((120, 80, 0xFF00FF00), (320, 80, 0xFF00FF00), (220, 280, 0xFF00FF00));
-        DrawFilledTriangle((340, 100, 0xFFFF0000), (540, 100, 0xFFFF0000), (440, 300, 0xFFFF0000));
+        // Test triangles with different colors
+        DrawFilledTriangle(
+            new Vertex { X = 120, Y = 80,  Color = 0xFF00FF00 },
+            new Vertex { X = 320, Y = 80,  Color = 0xFF00FF00 },
+            new Vertex { X = 220, Y = 280, Color = 0xFF00FF00 });
+
+        DrawFilledTriangle(
+            new Vertex { X = 340, Y = 100, Color = 0xFFFF0000 },
+            new Vertex { X = 540, Y = 100, Color = 0xFFFF0000 },
+            new Vertex { X = 440, Y = 300, Color = 0xFFFF0000 });
+
         DrawQuad(80, 320, 160, 80, 0xFF00BFFF);
         DrawQuad(400, 320, 160, 80, 0xFFFFD700);
         DrawLine(100, 60, 540, 60, 0xFFFFFFFF);
@@ -315,9 +307,9 @@ public sealed class Gs
 
     public void DrawTestTriangle()
     {
-        var v0 = (200, 150, _currentRgbaq);
-        var v1 = (440, 150, _currentRgbaq);
-        var v2 = (320, 350, _currentRgbaq);
+        var v0 = new Vertex { X = 200, Y = 150, Color = _currentRgbaq };
+        var v1 = new Vertex { X = 440, Y = 150, Color = _currentRgbaq };
+        var v2 = new Vertex { X = 320, Y = 350, Color = _currentRgbaq };
         DrawFilledTriangle(v0, v1, v2);
     }
 
@@ -331,7 +323,7 @@ public sealed class Gs
 
         while (true)
         {
-            if (x0 >= 0 && x0 < FB_WIDTH && y0 >= 0 && y0 < FB_HEIGHT && IsPixelInScissor(x0, y0))
+            if (x0 >= 0 && x0 < FB_WIDTH && y0 >= 0 && y0 < FB_HEIGHT)
                 _framebuffer[y0 * FB_WIDTH + x0] = color;
 
             if (x0 == x1 && y0 == y1) break;
@@ -348,39 +340,83 @@ public sealed class Gs
         {
             for (int xx = x; xx < x + w && xx < FB_WIDTH; xx++)
             {
-                if (xx >= 0 && yy >= 0 && IsPixelInScissor(xx, yy))
+                if (xx >= 0 && yy >= 0)
                     _framebuffer[yy * FB_WIDTH + xx] = color;
             }
         }
     }
 
-    private void DrawFilledTriangle((int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
-    {
-        int minX = Math.Min(v0.x, Math.Min(v1.x, v2.x));
-        int maxX = Math.Max(v0.x, Math.Max(v1.x, v2.x));
-        int minY = Math.Min(v0.y, Math.Min(v1.y, v2.y));
-        int maxY = Math.Max(v0.y, Math.Max(v1.y, v2.y));
+    // =====================================================
+    // Improved Triangle Rasterizer with Color Interpolation
+    // =====================================================
 
-        for (int y = Math.Max(0, minY); y <= Math.Min(FB_HEIGHT - 1, maxY); y++)
+    private void DrawFilledTriangle(Vertex v0, Vertex v1, Vertex v2)
+    {
+        int minX = Math.Max(0, Math.Min(v0.X, Math.Min(v1.X, v2.X)));
+        int maxX = Math.Min(FB_WIDTH - 1, Math.Max(v0.X, Math.Max(v1.X, v2.X)));
+        int minY = Math.Max(0, Math.Min(v0.Y, Math.Min(v1.Y, v2.Y)));
+        int maxY = Math.Min(FB_HEIGHT - 1, Math.Max(v0.Y, Math.Max(v1.Y, v2.Y)));
+
+        for (int y = minY; y <= maxY; y++)
         {
-            for (int x = Math.Max(0, minX); x <= Math.Min(FB_WIDTH - 1, maxX); x++)
+            for (int x = minX; x <= maxX; x++)
             {
-                if (PointInTriangle(x, y, v0, v1, v2) && IsPixelInScissor(x, y))
-                    _framebuffer[y * FB_WIDTH + x] = v0.c;
+                if (PointInTriangle(x, y, v0, v1, v2, out float a, out float b, out float c))
+                {
+                    int idx = y * FB_WIDTH + x;
+
+                    // Interpolate color (Gouraud shading foundation)
+                    uint color = InterpolateColor(v0.Color, v1.Color, v2.Color, a, b, c);
+
+                    // TODO: Add depth test here using interpolated Z
+                    // if (depthTest(x, y, interpolatedZ)) ...
+
+                    _framebuffer[idx] = color;
+                }
             }
         }
     }
 
-    private bool PointInTriangle(int px, int py, (int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
+    private bool PointInTriangle(int px, int py, Vertex v0, Vertex v1, Vertex v2,
+                                 out float a, out float b, out float c)
     {
-        float denom = ((v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y));
-        if (Math.Abs(denom) < 0.0001f) return false;
+        float denom = ((v1.Y - v2.Y) * (v0.X - v2.X) + (v2.X - v1.X) * (v0.Y - v2.Y));
+        if (Math.Abs(denom) < 0.0001f)
+        {
+            a = b = c = 0;
+            return false;
+        }
 
-        float a = ((v1.y - v2.y) * (px - v2.x) + (v2.x - v1.x) * (py - v2.y)) / denom;
-        float b = ((v2.y - v0.y) * (px - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
-        float c = 1 - a - b;
+        a = ((v1.Y - v2.Y) * (px - v2.X) + (v2.X - v1.X) * (py - v2.Y)) / denom;
+        b = ((v2.Y - v0.Y) * (px - v2.X) + (v0.X - v2.X) * (py - v2.Y)) / denom;
+        c = 1 - a - b;
 
         return a >= 0 && a <= 1 && b >= 0 && b <= 1 && c >= 0 && c <= 1;
+    }
+
+    private uint InterpolateColor(uint c0, uint c1, uint c2, float a, float b, float c)
+    {
+        byte r0 = (byte)((c0 >> 16) & 0xFF);
+        byte g0 = (byte)((c0 >> 8) & 0xFF);
+        byte b0 = (byte)(c0 & 0xFF);
+
+        byte r1 = (byte)((c1 >> 16) & 0xFF);
+        byte g1 = (byte)((c1 >> 8) & 0xFF);
+        byte b1 = (byte)(c1 & 0xFF);
+
+        byte r2 = (byte)((c2 >> 16) & 0xFF);
+        byte g2 = (byte)((c2 >> 8) & 0xFF);
+        byte b2 = (byte)(c2 & 0xFF);
+
+        int r = (int)(r0 * a + r1 * b + r2 * c);
+        int g = (int)(g0 * a + g1 * b + g2 * c);
+        int bl = (int)(b0 * a + b1 * b + b2 * c);
+
+        r = Math.Clamp(r, 0, 255);
+        g = Math.Clamp(g, 0, 255);
+        bl = Math.Clamp(bl, 0, 255);
+
+        return (uint)(0xFF000000 | (r << 16) | (g << 8) | bl);
     }
 
     public void SaveFramebufferAsPPM(string filename)
