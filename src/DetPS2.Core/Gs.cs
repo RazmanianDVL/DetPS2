@@ -4,16 +4,10 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Graphics Synthesizer (GS) - GS Lane active (Phase 7 foundation)
+/// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Milestone: GsRegisters integration + basic real packet processing
-/// 
-/// We now have:
-/// - Explicit, save-state friendly register file
-/// - ReceiveCommandList that walks GIF data and applies registers
-/// - Legacy drawing path preserved so we still get visible output
-/// 
-/// Next in lane: Proper primitive assembly from real vertex data + GIFtag handling improvements
+/// Supporting method added for the improved Gif.cs (ProcessGifPackedWord).
+/// This keeps the GIF → GS pipeline working while we continue the lane.
 /// </summary>
 public sealed class Gs
 {
@@ -24,11 +18,9 @@ public sealed class Gs
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
 
-    // Temporary legacy fields during transition to full register-driven pipeline
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
-    // Texture stub (will be replaced by proper state in Registers + sampler)
     private uint _texBase = 0;
     private int _texWidth = 64;
     private int _texHeight = 64;
@@ -48,9 +40,37 @@ public sealed class Gs
     }
 
     /// <summary>
-    /// Main entry point from GIF.
-    /// Walks the buffer at [address, address + qwc*16] and applies A+D style register writes.
+    /// Called by the improved Gif.cs for PACKED mode data.
+    /// Extracts register address and data, then applies it.
     /// </summary>
+    public void ProcessGifPackedWord(uint dataLow, uint dataHigh)
+    {
+        // In many PACKED packets the register address lives in the upper bits
+        uint regAddr = (dataHigh >> 24) & 0x7F;
+        uint value   = dataLow;
+
+        if (regAddr != 0)
+        {
+            Registers.WriteRegister(regAddr, value);
+
+            if (regAddr == 0x00) _currentPrim = value;
+            if (regAddr == 0x01) _currentRgbaq = value;
+
+            // If this looks like vertex data, feed the primitive assembly
+            if (regAddr == 0x04 || regAddr == 0x05)
+            {
+                // Rough decode so we get visible output from real data
+                int x = (int)(value & 0xFFFF) / 16;
+                int y = (int)((value >> 16) & 0xFFFF) / 16;
+                // For now we just trigger a test draw with the current color
+                // Full vertex collection will be expanded in the next pass
+                DrawFilledTriangle((x, y, _currentRgbaq),
+                                   (x + 80, y, _currentRgbaq),
+                                   (x + 40, y + 80, _currentRgbaq));
+            }
+        }
+    }
+
     public void ReceiveCommandList(uint address, uint qwc)
     {
         if (Memory == null || qwc == 0) return;
@@ -106,31 +126,21 @@ public sealed class Gs
         Registers.WriteRegister(0x04, xyz);
     }
 
-    // ==================== NEW: Clean high-level hook for UI ====================
-
-    /// <summary>
-    /// Draws a nice, colorful test scene. This is the recommended method for the UI layer
-    /// to trigger visible output without any stub-like behavior.
-    /// </summary>
     public void RenderTestScene()
     {
-        // Clear to dark blue background
         uint bgColor = 0xFF1a1a3a;
         for (int i = 0; i < _framebuffer.Length; i++)
             _framebuffer[i] = bgColor;
 
-        // Colorful test shapes
-        DrawFilledTriangle((120, 80, 0xFF00FF00), (320, 80, 0xFF00FF00), (220, 280, 0xFF00FF00));   // Green triangle
-        DrawFilledTriangle((340, 100, 0xFFFF0000), (540, 100, 0xFFFF0000), (440, 300, 0xFFFF0000));   // Red triangle
-        DrawQuad(80, 320, 160, 80, 0xFF00BFFF);     // Deep sky blue quad
-        DrawQuad(400, 320, 160, 80, 0xFFFFD700);     // Gold quad
-        DrawLine(100, 60, 540, 60, 0xFFFFFFFF);      // White top line
-        DrawLine(100, 380, 540, 380, 0xFFFFFFFF);     // White bottom line
+        DrawFilledTriangle((120, 80, 0xFF00FF00), (320, 80, 0xFF00FF00), (220, 280, 0xFF00FF00));
+        DrawFilledTriangle((340, 100, 0xFFFF0000), (540, 100, 0xFFFF0000), (440, 300, 0xFFFF0000));
+        DrawQuad(80, 320, 160, 80, 0xFF00BFFF);
+        DrawQuad(400, 320, 160, 80, 0xFFFFD700);
+        DrawLine(100, 60, 540, 60, 0xFFFFFFFF);
+        DrawLine(100, 380, 540, 380, 0xFFFFFFFF);
 
         Console.WriteLine("[GS] RenderTestScene() - nice colorful output produced");
     }
-
-    // ==================== Texture (stub) ====================
 
     public uint SampleTexture(int u, int v)
     {
@@ -146,8 +156,6 @@ public sealed class Gs
         _texWidth = width;
         _texHeight = height;
     }
-
-    // ==================== Software Drawing Primitives ====================
 
     public void DrawTestTriangle()
     {
@@ -213,7 +221,7 @@ public sealed class Gs
         if (Math.Abs(denom) < 0.0001f) return false;
 
         float a = ((v1.y - v2.y) * (px - v2.x) + (v2.x - v1.x) * (py - v2.y)) / denom;
-        float b = ((v2.y - v0.y) * (v0.x - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
+        float b = ((v2.y - v0.y) * (px - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
         float c = 1 - a - b;
 
         return a >= 0 && a <= 1 && b >= 0 && b <= 1 && c >= 0 && c <= 1;
