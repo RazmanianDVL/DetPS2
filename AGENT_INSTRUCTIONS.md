@@ -94,6 +94,11 @@ The team has done excellent work locking in the foundation. The next priority is
 - Stand by.
 - Be ready to help verify IOP/SIF behavior after SaveState work is done.
 
+**[STANDING BY - VERIFICATION SUPPORT]**
+- `Iop.cs` and `Sif.cs` are fully contract-compliant.
+- Ready to investigate and fix any IOP or SIF related issues that appear during Charlie’s build and determinism verification runs.
+- No active development until Phase 6.1 is closed.
+
 ---
 
 ### Echo – UI Developer
