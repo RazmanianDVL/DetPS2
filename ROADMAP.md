@@ -37,7 +37,8 @@
 - Improved COP2 routing in `EmotionEngine`
 - Created foundational `Scheduler.cs` + `ISchedulable` interface
 - Rebuilt `Intc.cs` with clean foundational structure and InterruptSource enum
-- Created foundational `Vif1.cs` structure (data transfer + VifCode entry points)
+- Created foundational `Vif1.cs` structure
+- Created foundational `GsPipeline.cs` for GS rendering flow
 - Strong determinism focus maintained
 - SaveState support
 
@@ -45,7 +46,7 @@
 - Complete remaining VU instructions
 - Higher accuracy floating-point handling with determinism focus
 - Improved timing and synchronization between EE, IOP, and VUs (using Scheduler foundation)
-- Full Vif1 data unpacking and microcode handling (on top of new Vif1 foundation)
+- Full Vif1 data unpacking and microcode handling
 - Interrupt integration with Emotion Engine (COP0)
 - Expanded SaveState features
 
