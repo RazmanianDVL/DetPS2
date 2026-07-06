@@ -6,12 +6,38 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Foxtrot (Vector Units) - Phase 6.1 Integration Lockdown focus.
+/// Phase 6.2 Focus: Deeper timing accuracy and stall behavior documentation.
 /// 
-/// Standing Orders:
-/// - Align Step() signature with ISchedulable contract: int Step(ulong maxCycles)
-/// - Do NOT expand instruction set yet
-/// - Document future timing/stall needs
+/// Current State:
+/// - Step() signature is correct (int Step(ulong maxCycles)).
+/// - Basic branch delay slot handling exists via _branchPending.
+/// - No real stall modeling yet (always consumes requested cycles if possible).
+/// 
+/// Key Timing Challenges for VU:
+/// 1. VU0 is tightly coupled to the EE via COP2. Many COP2 instructions have specific
+///    timing and interlock requirements with the main CPU pipeline.
+/// 2. VU1 receives data primarily through VIF1. VIF unpack and data transfer timing
+///    directly affects when VU1 can execute.
+/// 3. EFU (Elementary Function Unit) instructions (DIV, SQRT, RSQRT, etc.) have
+///    multi-cycle latency. The VU should stall while EFU is busy.
+/// 4. Load/Store instructions to VU memory have timing characteristics that can cause
+///    stalls, especially when conflicting with ongoing VIF DMA.
+/// 5. Upper and Lower instruction pairing has specific rules. Some combinations
+///    have different execution latencies.
+/// 
+/// High-Impact Instructions for Timing Accuracy (Priority Order):
+/// - EFU instructions (0x1D, 0x2E, 0x2F in function field): Multi-cycle, should stall.
+/// - Load/Store (primary 0x01 / 0x02): Memory access timing + possible VIF conflicts.
+/// - COP2 move instructions (handled in Vu0 via EmotionEngine): Interlock with EE pipeline.
+/// - Branch instructions: Branch delay slot + possible interlock behavior.
+/// - MADD/MSUB and multiply-accumulate operations: Often used in tight loops, sensitive to stalls.
+/// 
+/// Future Requirements:
+/// - Add explicit stall tracking (_stallCyclesRemaining or stall source flags).
+/// - Make Step() return early when a stall condition is active.
+/// - Expose stall information to Scheduler so it can potentially fast-forward or prioritize other components
+///   (e.g. let EE run while VU1 is stalled on VIF data).
+/// - Model EFU busy cycles accurately (different latencies for DIV vs SQRT vs RSQRT).
 /// </summary>
 public abstract class VectorUnit
 {
@@ -57,20 +83,17 @@ public abstract class VectorUnit
     /// Executes up to maxCycles worth of work.
     /// Returns the number of cycles actually consumed.
     /// 
-    /// FUTURE TIMING / STALL BEHAVIOR (Foxtrot):
+    /// Current Behavior (Phase 6.2):
+    /// - Simplified: Always attempts to execute as many instructions as possible
+    ///   up to maxCycles.
+    /// - Branch delay is modeled via pending branch flag.
+    /// - No real stall modeling yet.
     /// 
-    /// In later phases, this method must become cycle-accurate and respect VU stalls.
-    /// The VU can stall for several reasons:
-    ///   - Waiting for data from VIF (VIF1 → VU1 path is especially important)
-    ///   - Waiting for COP2 move instructions from the EE (VU0)
-    ///   - Internal pipeline stalls (e.g. EFU busy, load/store conflicts)
-    ///   - Branch delay / interlock conditions
-    /// 
-    /// When stalled, Step() should return fewer cycles than requested and leave
-    /// the PC / internal state unchanged until the stall condition clears.
-    /// 
-    /// TODO: Track stall sources explicitly (e.g. _stallUntilCycle or stall flags)
-    ///       so the Scheduler can potentially fast-forward or prioritize other components.
+    /// Phase 6.2+ Requirements:
+    /// - When a stall condition exists (EFU busy, waiting on VIF data, COP2 interlock),
+    ///   this method should consume fewer cycles and return early.
+    /// - The Scheduler should be able to use the returned cycle count for better
+    ///   component interleaving.
     /// </summary>
     public virtual int Step(ulong maxCycles)
     {
