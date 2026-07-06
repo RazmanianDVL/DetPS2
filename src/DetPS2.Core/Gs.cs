@@ -7,9 +7,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Added basic alpha blending support.
-/// The rasterizer now blends the new pixel with the existing framebuffer
-/// using a simple source-over style blend (common for many PS2 effects).
+/// Phase 6.1 Integration: Standardized Step(ulong) to ISchedulable contract.
+/// Rendering features are present but deprioritized until integration lockdown is complete.
 /// </summary>
 public sealed class Gs
 {
@@ -332,8 +331,7 @@ public sealed class Gs
 
                     uint finalColor = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
 
-                    // Basic alpha blending (source over)
-                    if (Registers.ALPHA_1 != 0) // simple check if blending is "enabled"
+                    if (Registers.ALPHA_1 != 0)
                     {
                         uint dst = _framebuffer[idx];
                         finalColor = Blend(finalColor, dst);
@@ -348,7 +346,6 @@ public sealed class Gs
 
     private uint Blend(uint src, uint dst)
     {
-        // Simple "source alpha" blend (very common)
         byte srcA = (byte)((src >> 24) & 0xFF);
         if (srcA == 0) return dst;
         if (srcA == 255) return src;
@@ -438,5 +435,14 @@ public sealed class Gs
     public int FramebufferWidth => FB_WIDTH;
     public int FramebufferHeight => FB_HEIGHT;
 
-    public void Step(ulong cycles) { }
+    /// <summary>
+    /// ISchedulable contract implementation.
+    /// Returns how many cycles were processed (currently reports 1 as GS is not cycle-accurate yet).
+    /// </summary>
+    public int Step(ulong maxCycles)
+    {
+        // GS is currently not cycle-accurate.
+        // For Phase 6.1 we simply report that we consumed 1 cycle slice.
+        return 1;
+    }
 }
