@@ -6,14 +6,13 @@ namespace DetPS2.Core;
 /// <summary>
 /// Emotion Engine (R5900) - MIPS III based CPU with 128-bit GPRs.
 /// 
-/// Current Milestone: Expanded interpreter with delay slot support + common instructions.
+/// Milestone 2: More complete instruction set + fixed delay slot + load/store improvements.
 /// 
-/// Key architectural decisions:
-/// - 128-bit GPRs stored as Gpr128 (Lo/Hi) to match real hardware and SaveState expectations.
-/// - Most integer ops currently operate on .Lo (lower 64 bits). Full 128-bit MMI will come later.
-/// - Branch delay slots are handled correctly (delay slot instruction executes before branch target).
-/// - Step() executes one instruction (+ delay slot when applicable) and returns cycles consumed.
-/// - Designed to be deterministic and easy to extend.
+/// Key decisions:
+/// - Still focusing on .Lo for most ops (full 128-bit later).
+/// - Delay slots now correctly execute the following instruction before branching.
+/// - Added many commonly used instructions for homebrew compatibility.
+/// - Clean switch structure with no duplicate cases.
 /// </summary>
 public sealed class EmotionEngine : ISchedulable
 {
@@ -34,12 +33,10 @@ public sealed class EmotionEngine : ISchedulable
     public ulong LO { get; set; }
     public ulong HI { get; set; }
 
-    // COP0 (minimal set for now)
     public uint COP0_Status { get; set; }
     public uint COP0_Cause { get; set; }
     public ulong COP0_EPC { get; set; }
 
-    // Delay slot state
     private bool _inDelaySlot;
     private ulong _delaySlotTarget;
 
@@ -71,10 +68,6 @@ public sealed class EmotionEngine : ISchedulable
             _gprs[reg] = value;
     }
 
-    /// <summary>
-    /// Executes one instruction (plus delay slot if applicable).
-    /// Returns approximate cycles consumed.
-    /// </summary>
     public int Step()
     {
         uint opcode = _memory.Read32(PC);
@@ -84,13 +77,11 @@ public sealed class EmotionEngine : ISchedulable
 
         if (tookBranch)
         {
-            // Execute delay slot instruction
             uint delayOpcode = _memory.Read32(PC + 4);
-            ExecuteInstruction(delayOpcode); // delay slot shouldn't take another branch in most cases
-
+            ExecuteInstruction(delayOpcode);
             PC = _delaySlotTarget;
             _inDelaySlot = false;
-            cycles += 1; // delay slot cost (can be refined)
+            cycles += 1;
         }
         else
         {
@@ -100,9 +91,6 @@ public sealed class EmotionEngine : ISchedulable
         return cycles;
     }
 
-    /// <summary>
-    /// Returns true if this instruction caused a branch (so caller knows to execute delay slot).
-    /// </summary>
     private bool ExecuteInstruction(uint opcode)
     {
         uint primary = (opcode >> 26) & 0x3F;
@@ -125,6 +113,7 @@ public sealed class EmotionEngine : ISchedulable
             case 0x0D: ExecuteXori(opcode); break;
             case 0x0E: ExecuteAndi(opcode); break;
             case 0x0F: ExecuteLui(opcode); break;
+
             case 0x20: ExecuteLb(opcode); break;
             case 0x21: ExecuteLh(opcode); break;
             case 0x23: ExecuteLw(opcode); break;
@@ -133,18 +122,15 @@ public sealed class EmotionEngine : ISchedulable
             case 0x28: ExecuteSb(opcode); break;
             case 0x29: ExecuteSh(opcode); break;
             case 0x2B: ExecuteSw(opcode); break;
-            case 0x0C: /* SYSCALL */ HandleSyscall(opcode); break;
 
             default:
-                // Unknown opcode - log during development if needed
-                // Console.WriteLine($"[EE] Unknown primary opcode 0x{primary:X2} at PC=0x{PC:X}");
                 break;
         }
 
-        return false; // no branch taken
+        return false;
     }
 
-    // ==================== SPECIAL ====================
+    // ==================== SPECIAL (0x00) ====================
     private bool ExecuteSpecial(uint opcode)
     {
         uint function = opcode & 0x3F;
@@ -167,6 +153,18 @@ public sealed class EmotionEngine : ISchedulable
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)sa) });
                 break;
 
+            case 0x04: // SLLV
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)(GetGpr(rs).Lo & 0x1F) });
+                break;
+
+            case 0x06: // SRLV
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F) });
+                break;
+
+            case 0x07: // SRAV
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F)) });
+                break;
+
             case 0x08: // JR
                 _delaySlotTarget = GetGpr(rs).Lo;
                 return true;
@@ -176,12 +174,21 @@ public sealed class EmotionEngine : ISchedulable
                 _delaySlotTarget = GetGpr(rs).Lo;
                 return true;
 
+            case 0x0A: // MOVZ
+                if (GetGpr(rt).Lo == 0 && rd != 0)
+                    SetGpr(rd, GetGpr(rs));
+                break;
+
+            case 0x0B: // MOVN
+                if (GetGpr(rt).Lo != 0 && rd != 0)
+                    SetGpr(rd, GetGpr(rs));
+                break;
+
             case 0x0C: // SYSCALL
                 HandleSyscall(opcode);
                 break;
 
             case 0x0D: // BREAK
-                // Can be used for debugging
                 break;
 
             case 0x10: // MFHI
@@ -200,8 +207,7 @@ public sealed class EmotionEngine : ISchedulable
                 LO = GetGpr(rs).Lo;
                 break;
 
-            case 0x18: // MULT
-            case 0x19: // MULTU
+            case 0x18: case 0x19: // MULT / MULTU
                 {
                     long a = (long)GetGpr(rs).Lo;
                     long b = (long)GetGpr(rt).Lo;
@@ -211,8 +217,7 @@ public sealed class EmotionEngine : ISchedulable
                 }
                 break;
 
-            case 0x1A: // DIV
-            case 0x1B: // DIVU
+            case 0x1A: case 0x1B: // DIV / DIVU
                 {
                     long a = (long)GetGpr(rs).Lo;
                     long b = (long)GetGpr(rt).Lo;
@@ -256,7 +261,7 @@ public sealed class EmotionEngine : ISchedulable
         return false;
     }
 
-    // ==================== REGIMM ====================
+    // ==================== REGIMM (0x01) ====================
     private bool ExecuteRegimm(uint opcode)
     {
         uint rt = (opcode >> 16) & 0x1F;
@@ -266,17 +271,13 @@ public sealed class EmotionEngine : ISchedulable
 
         switch (rt)
         {
-            case 0: // BLTZ
-                if ((long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; }
-                break;
-            case 1: // BGEZ
-                if ((long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; }
-                break;
+            case 0: if ((long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; } break; // BLTZ
+            case 1: if ((long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; } break; // BGEZ
         }
         return false;
     }
 
-    // ==================== Jumps & Branches ====================
+    // ==================== J / JAL ====================
     private bool ExecuteJ(uint opcode)
     {
         uint target = opcode & 0x03FFFFFF;
@@ -292,12 +293,12 @@ public sealed class EmotionEngine : ISchedulable
         return true;
     }
 
+    // ==================== Branches ====================
     private bool ExecuteBeq(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
-
         if (GetGpr(rs).Lo == GetGpr(rt).Lo)
         {
             _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
@@ -311,7 +312,6 @@ public sealed class EmotionEngine : ISchedulable
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
-
         if (GetGpr(rs).Lo != GetGpr(rt).Lo)
         {
             _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
@@ -324,11 +324,7 @@ public sealed class EmotionEngine : ISchedulable
     {
         uint rs = (opcode >> 21) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
-        if ((long)GetGpr(rs).Lo <= 0)
-        {
-            _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
-            return true;
-        }
+        if ((long)GetGpr(rs).Lo <= 0) { _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2); return true; }
         return false;
     }
 
@@ -336,16 +332,19 @@ public sealed class EmotionEngine : ISchedulable
     {
         uint rs = (opcode >> 21) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
-        if ((long)GetGpr(rs).Lo > 0)
-        {
-            _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
-            return true;
-        }
+        if ((long)GetGpr(rs).Lo > 0) { _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2); return true; }
         return false;
     }
 
-    // ==================== Immediate ops ====================
-    private void ExecuteAddi(uint opcode) { /* can add overflow check later */ ExecuteAddiu(opcode); }
+    // ==================== Immediate Arithmetic ====================
+    private void ExecuteAddi(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo + (ulong)imm });
+    }
+
     private void ExecuteAddiu(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
@@ -401,15 +400,15 @@ public sealed class EmotionEngine : ISchedulable
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)imm << 16 });
     }
 
-    // ==================== Load/Store ====================
+    // ==================== Load / Store ====================
     private void ExecuteLb(uint opcode)
     {
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        sbyte value = (sbyte)_memory.Read8(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)value });
+        sbyte val = (sbyte)_memory.Read8(addr);
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)val });
     }
 
     private void ExecuteLbu(uint opcode)
@@ -418,12 +417,29 @@ public sealed class EmotionEngine : ISchedulable
         uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        byte value = _memory.Read8(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = value });
+        byte val = _memory.Read8(addr);
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
     }
 
-    private void ExecuteLh(uint opcode) { /* similar to Lw but 16-bit */ }
-    private void ExecuteLhu(uint opcode) { /* similar */ }
+    private void ExecuteLh(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)offset;
+        short val = (short)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)val });
+    }
+
+    private void ExecuteLhu(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)offset;
+        ushort val = (ushort)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
+    }
 
     private void ExecuteLw(uint opcode)
     {
@@ -431,8 +447,8 @@ public sealed class EmotionEngine : ISchedulable
         uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        uint value = _memory.Read32(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = value });
+        uint val = _memory.Read32(addr);
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
     }
 
     private void ExecuteSb(uint opcode)
@@ -444,7 +460,16 @@ public sealed class EmotionEngine : ISchedulable
         _memory.Write8(addr, (byte)GetGpr(rt).Lo);
     }
 
-    private void ExecuteSh(uint opcode) { /* similar */ }
+    private void ExecuteSh(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)offset;
+        ushort val = (ushort)GetGpr(rt).Lo;
+        _memory.Write8(addr, (byte)val);
+        _memory.Write8(addr + 1, (byte)(val >> 8));
+    }
 
     private void ExecuteSw(uint opcode)
     {
@@ -455,11 +480,8 @@ public sealed class EmotionEngine : ISchedulable
         _memory.Write32(addr, (uint)GetGpr(rt).Lo);
     }
 
-    // ==================== System Calls ====================
     private void HandleSyscall(uint opcode)
     {
-        // TODO: Implement minimal HLE syscalls here later (e.g. for homebrew)
-        // For now we just continue execution.
-        // You can add logging or a breakpoint hook here during development.
+        // Future HLE syscall handling goes here
     }
 }
