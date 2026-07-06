@@ -4,15 +4,12 @@ using System.Runtime.CompilerServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Emotion Engine (R5900) - MIPS III based CPU with 128-bit GPRs.
+/// Emotion Engine (R5900) - MIPS III + PS2 extensions.
 /// 
-/// Milestone 2: More complete instruction set + fixed delay slot + load/store improvements.
+/// Milestone 3: COP2 skeleton + more MMI-friendly instructions + robustness improvements.
 /// 
-/// Key decisions:
-/// - Still focusing on .Lo for most ops (full 128-bit later).
-/// - Delay slots now correctly execute the following instruction before branching.
-/// - Added many commonly used instructions for homebrew compatibility.
-/// - Clean switch structure with no duplicate cases.
+/// Next logical step after basic integer execution.
+/// We now recognize COP2 instructions (primary 0x12) so we can later route them to VU0.
 /// </summary>
 public sealed class EmotionEngine : ISchedulable
 {
@@ -114,6 +111,8 @@ public sealed class EmotionEngine : ISchedulable
             case 0x0E: ExecuteAndi(opcode); break;
             case 0x0F: ExecuteLui(opcode); break;
 
+            case 0x12: return ExecuteCop2(opcode);   // <-- New: COP2 entry point
+
             case 0x20: ExecuteLb(opcode); break;
             case 0x21: ExecuteLh(opcode); break;
             case 0x23: ExecuteLw(opcode); break;
@@ -130,7 +129,7 @@ public sealed class EmotionEngine : ISchedulable
         return false;
     }
 
-    // ==================== SPECIAL (0x00) ====================
+    // ==================== SPECIAL ====================
     private bool ExecuteSpecial(uint opcode)
     {
         uint function = opcode & 0x3F;
@@ -141,127 +140,55 @@ public sealed class EmotionEngine : ISchedulable
 
         switch (function)
         {
-            case 0x00: // SLL
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)sa });
-                break;
+            case 0x00: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)sa }); break;
+            case 0x02: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)sa }); break;
+            case 0x03: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)sa) }); break;
 
-            case 0x02: // SRL
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)sa });
-                break;
+            case 0x04: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)(GetGpr(rs).Lo & 0x1F) }); break; // SLLV
+            case 0x06: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F) }); break; // SRLV
+            case 0x07: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F)) }); break; // SRAV
 
-            case 0x03: // SRA
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)sa) });
-                break;
+            case 0x08: _delaySlotTarget = GetGpr(rs).Lo; return true; // JR
+            case 0x09: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = PC + 8 }); _delaySlotTarget = GetGpr(rs).Lo; return true; // JALR
 
-            case 0x04: // SLLV
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)(GetGpr(rs).Lo & 0x1F) });
-                break;
+            case 0x0A: if (GetGpr(rt).Lo == 0 && rd != 0) SetGpr(rd, GetGpr(rs)); break; // MOVZ
+            case 0x0B: if (GetGpr(rt).Lo != 0 && rd != 0) SetGpr(rd, GetGpr(rs)); break; // MOVN
 
-            case 0x06: // SRLV
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F) });
-                break;
+            case 0x0C: HandleSyscall(opcode); break; // SYSCALL
+            case 0x0D: break; // BREAK
 
-            case 0x07: // SRAV
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F)) });
-                break;
+            case 0x10: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = HI }); break; // MFHI
+            case 0x11: HI = GetGpr(rs).Lo; break; // MTHI
+            case 0x12: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO }); break; // MFLO
+            case 0x13: LO = GetGpr(rs).Lo; break; // MTLO
 
-            case 0x08: // JR
-                _delaySlotTarget = GetGpr(rs).Lo;
-                return true;
-
-            case 0x09: // JALR
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = PC + 8 });
-                _delaySlotTarget = GetGpr(rs).Lo;
-                return true;
-
-            case 0x0A: // MOVZ
-                if (GetGpr(rt).Lo == 0 && rd != 0)
-                    SetGpr(rd, GetGpr(rs));
-                break;
-
-            case 0x0B: // MOVN
-                if (GetGpr(rt).Lo != 0 && rd != 0)
-                    SetGpr(rd, GetGpr(rs));
-                break;
-
-            case 0x0C: // SYSCALL
-                HandleSyscall(opcode);
-                break;
-
-            case 0x0D: // BREAK
-                break;
-
-            case 0x10: // MFHI
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = HI });
-                break;
-
-            case 0x11: // MTHI
-                HI = GetGpr(rs).Lo;
-                break;
-
-            case 0x12: // MFLO
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
-                break;
-
-            case 0x13: // MTLO
-                LO = GetGpr(rs).Lo;
-                break;
-
-            case 0x18: case 0x19: // MULT / MULTU
+            case 0x18: case 0x19: // MULT/MULTU
                 {
-                    long a = (long)GetGpr(rs).Lo;
-                    long b = (long)GetGpr(rt).Lo;
-                    long result = a * b;
-                    LO = (ulong)(result & 0xFFFFFFFF);
-                    HI = (ulong)((result >> 32) & 0xFFFFFFFF);
+                    long a = (long)GetGpr(rs).Lo; long b = (long)GetGpr(rt).Lo;
+                    long res = a * b; LO = (ulong)(res & 0xFFFFFFFF); HI = (ulong)((res >> 32) & 0xFFFFFFFF);
                 }
                 break;
 
-            case 0x1A: case 0x1B: // DIV / DIVU
+            case 0x1A: case 0x1B: // DIV/DIVU
                 {
-                    long a = (long)GetGpr(rs).Lo;
-                    long b = (long)GetGpr(rt).Lo;
-                    if (b != 0)
-                    {
-                        LO = (ulong)(a / b);
-                        HI = (ulong)(a % b);
-                    }
+                    long a = (long)GetGpr(rs).Lo; long b = (long)GetGpr(rt).Lo;
+                    if (b != 0) { LO = (ulong)(a / b); HI = (ulong)(a % b); }
                 }
                 break;
 
-            case 0x20: case 0x21: // ADD / ADDU
-                SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo + GetGpr(rt).Lo });
-                break;
-
-            case 0x23: // SUBU
-                SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo - GetGpr(rt).Lo });
-                break;
-
-            case 0x24: // AND
-                SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo & GetGpr(rt).Lo });
-                break;
-
-            case 0x25: // OR
-                SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo | GetGpr(rt).Lo });
-                break;
-
-            case 0x26: // XOR
-                SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo ^ GetGpr(rt).Lo });
-                break;
-
-            case 0x2A: // SLT
-                SetGpr(rd, new Gpr128 { Lo = ((long)GetGpr(rs).Lo < (long)GetGpr(rt).Lo) ? 1UL : 0UL });
-                break;
-
-            case 0x2B: // SLTU
-                SetGpr(rd, new Gpr128 { Lo = (GetGpr(rs).Lo < GetGpr(rt).Lo) ? 1UL : 0UL });
-                break;
+            case 0x20: case 0x21: SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo + GetGpr(rt).Lo }); break;
+            case 0x23: SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo - GetGpr(rt).Lo }); break;
+            case 0x24: SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo & GetGpr(rt).Lo }); break;
+            case 0x25: SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo | GetGpr(rt).Lo }); break;
+            case 0x26: SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo ^ GetGpr(rt).Lo }); break;
+            case 0x2A: SetGpr(rd, new Gpr128 { Lo = ((long)GetGpr(rs).Lo < (long)GetGpr(rt).Lo) ? 1UL : 0UL }); break;
+            case 0x2B: SetGpr(rd, new Gpr128 { Lo = (GetGpr(rs).Lo < GetGpr(rt).Lo) ? 1UL : 0UL }); break;
         }
 
         return false;
     }
 
-    // ==================== REGIMM (0x01) ====================
+    // ==================== REGIMM ====================
     private bool ExecuteRegimm(uint opcode)
     {
         uint rt = (opcode >> 16) & 0x1F;
@@ -269,219 +196,176 @@ public sealed class EmotionEngine : ISchedulable
         short offset = (short)(opcode & 0xFFFF);
         ulong target = PC + 4 + (ulong)((int)offset << 2);
 
-        switch (rt)
-        {
-            case 0: if ((long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; } break; // BLTZ
-            case 1: if ((long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; } break; // BGEZ
-        }
+        if (rt == 0 && (long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; } // BLTZ
+        if (rt == 1 && (long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; } // BGEZ
         return false;
     }
 
-    // ==================== J / JAL ====================
-    private bool ExecuteJ(uint opcode)
-    {
-        uint target = opcode & 0x03FFFFFF;
-        _delaySlotTarget = (PC & 0xF0000000UL) | (target << 2);
-        return true;
-    }
-
-    private bool ExecuteJal(uint opcode)
-    {
-        SetGpr(31, new Gpr128 { Lo = PC + 8 });
-        uint target = opcode & 0x03FFFFFF;
-        _delaySlotTarget = (PC & 0xF0000000UL) | (target << 2);
-        return true;
-    }
+    // ==================== Jumps ====================
+    private bool ExecuteJ(uint opcode) { uint t = opcode & 0x03FFFFFF; _delaySlotTarget = (PC & 0xF0000000UL) | (t << 2); return true; }
+    private bool ExecuteJal(uint opcode) { SetGpr(31, new Gpr128 { Lo = PC + 8 }); uint t = opcode & 0x03FFFFFF; _delaySlotTarget = (PC & 0xF0000000UL) | (t << 2); return true; }
 
     // ==================== Branches ====================
     private bool ExecuteBeq(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        if (GetGpr(rs).Lo == GetGpr(rt).Lo)
-        {
-            _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
-            return true;
-        }
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        if (GetGpr(rs).Lo == GetGpr(rt).Lo) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
     private bool ExecuteBne(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        if (GetGpr(rs).Lo != GetGpr(rt).Lo)
-        {
-            _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2);
-            return true;
-        }
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        if (GetGpr(rs).Lo != GetGpr(rt).Lo) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
     private bool ExecuteBlez(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        if ((long)GetGpr(rs).Lo <= 0) { _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2); return true; }
+        uint rs = (opcode >> 21) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        if ((long)GetGpr(rs).Lo <= 0) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
     private bool ExecuteBgtz(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        if ((long)GetGpr(rs).Lo > 0) { _delaySlotTarget = PC + 4 + (ulong)((int)offset << 2); return true; }
+        uint rs = (opcode >> 21) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        if ((long)GetGpr(rs).Lo > 0) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
-    // ==================== Immediate Arithmetic ====================
-    private void ExecuteAddi(uint opcode)
-    {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo + (ulong)imm });
-    }
-
+    // ==================== Immediate ====================
+    private void ExecuteAddi(uint opcode) { ExecuteAddiu(opcode); }
     private void ExecuteAddiu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo + (ulong)imm });
     }
 
     private void ExecuteSlti(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = ((long)GetGpr(rs).Lo < imm) ? 1UL : 0UL });
     }
 
     private void ExecuteSltiu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (GetGpr(rs).Lo < (ulong)imm) ? 1UL : 0UL });
     }
 
     private void ExecuteOri(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo | imm });
     }
 
     private void ExecuteXori(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo ^ imm });
     }
 
     private void ExecuteAndi(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo & imm });
     }
 
     private void ExecuteLui(uint opcode)
     {
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)imm << 16 });
     }
 
-    // ==================== Load / Store ====================
+    // ==================== Load/Store ====================
     private void ExecuteLb(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        sbyte val = (sbyte)_memory.Read8(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)val });
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)(sbyte)_memory.Read8(addr) });
     }
 
     private void ExecuteLbu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        byte val = _memory.Read8(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = _memory.Read8(addr) });
     }
 
     private void ExecuteLh(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
         short val = (short)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)val });
     }
 
     private void ExecuteLhu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
         ushort val = (ushort)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
     }
 
     private void ExecuteLw(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        uint val = _memory.Read32(addr);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = _memory.Read32(addr) });
     }
 
     private void ExecuteSb(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        _memory.Write8(addr, (byte)GetGpr(rt).Lo);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        _memory.Write8(GetGpr(rs).Lo + (ulong)off, (byte)GetGpr(rt).Lo);
     }
 
     private void ExecuteSh(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        ushort val = (ushort)GetGpr(rt).Lo;
-        _memory.Write8(addr, (byte)val);
-        _memory.Write8(addr + 1, (byte)(val >> 8));
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        ulong addr = GetGpr(rs).Lo + (ulong)off;
+        ushort v = (ushort)GetGpr(rt).Lo;
+        _memory.Write8(addr, (byte)v); _memory.Write8(addr + 1, (byte)(v >> 8));
     }
 
     private void ExecuteSw(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        ulong addr = GetGpr(rs).Lo + (ulong)offset;
-        _memory.Write32(addr, (uint)GetGpr(rt).Lo);
+        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        _memory.Write32(GetGpr(rs).Lo + (ulong)off, (uint)GetGpr(rt).Lo);
+    }
+
+    // ==================== COP2 (new in Milestone 3) ====================
+    private bool ExecuteCop2(uint opcode)
+    {
+        // COP2 instructions are used to communicate with VU0.
+        // For now we just recognize them. Full routing to VectorUnit comes next.
+        // Common COP2 opcodes: 0x00 = CFC2, 0x02 = CTC2, 0x04 = QMFC2, 0x06 = QMTC2, etc.
+        uint sub = (opcode >> 21) & 0x1F;
+
+        switch (sub)
+        {
+            case 0x00: // CFC2 - move from COP2 control register
+            case 0x02: // CTC2 - move to COP2 control register
+            case 0x04: // QMFC2 - quadword move from COP2
+            case 0x06: // QMTC2 - quadword move to COP2
+                // TODO: Route to VU0 when integrated
+                break;
+
+            default:
+                // Many COP2 ops are VU macro instructions (VADD, VMUL, etc.)
+                // These will be handled when we connect the Vector Unit properly.
+                break;
+        }
+
+        return false;
     }
 
     private void HandleSyscall(uint opcode)
     {
-        // Future HLE syscall handling goes here
+        // TODO: Minimal HLE syscall handling
     }
 }
