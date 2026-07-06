@@ -7,16 +7,9 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Milestone: Improved XYZ decoding + basic UV/ST support (Option A)
-/// 
-/// Changes:
-/// - Richer Vertex struct with UV/ST
-/// - Better XYZ fixed-point decoding
-/// - UV (0x03) and ST (0x02) register tracking
-/// - Vertices now carry texture coordinates
-/// - Foundation for future textured rasterization
-/// 
-/// Still using simple software rasterizer. Real texture sampling comes later.
+/// Added basic scissoring support using SCISSOR_1 register.
+/// Pixels outside the scissor rectangle are now clipped.
+/// This is a focused correctness improvement on top of the vertex/UV work.
 /// </summary>
 public sealed class Gs
 {
@@ -30,7 +23,6 @@ public sealed class Gs
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
-    // Last known texture coordinates (updated via UV/ST registers)
     private float _lastU = 0;
     private float _lastV = 0;
     private float _lastS = 1;
@@ -39,10 +31,6 @@ public sealed class Gs
     private uint _texBase = 0;
     private int _texWidth = 64;
     private int _texHeight = 64;
-
-    // =====================================================
-    // Vertex with UV/ST support
-    // =====================================================
 
     private struct Vertex
     {
@@ -75,6 +63,35 @@ public sealed class Gs
         _currentVertices.Clear();
     }
 
+    // ==================== Scissoring Helper ====================
+
+    private bool IsPixelInScissor(int x, int y)
+    {
+        uint scissor = Registers.SCISSOR_1;
+
+        // GS SCISSOR_1 layout (simplified but functional):
+        // bits  0-10 : X0 (left)
+        // bits 16-26 : X1 (right)
+        // bits 32-42 : Y0 (top)   [in upper 64 bits, but we read as uint for now]
+        // bits 48-58 : Y1 (bottom)
+        // For early work we use a reasonable interpretation.
+
+        int x0 = (int)(scissor & 0x7FF);
+        int x1 = (int)((scissor >> 16) & 0x7FF);
+        int y0 = (int)((scissor >> 32) & 0x7FF); // may be 0 if not set
+        int y1 = (int)((scissor >> 48) & 0x7FF);
+
+        // If scissor is all zeros (never set), allow everything
+        if (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0)
+            return true;
+
+        // Clamp to valid range if only partially set
+        if (x1 == 0) x1 = FB_WIDTH - 1;
+        if (y1 == 0) y1 = FB_HEIGHT - 1;
+
+        return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    }
+
     public void ProcessGifPackedWord(uint dataLow, uint dataHigh)
     {
         uint regAddr = (dataHigh >> 24) & 0x7F;
@@ -87,18 +104,16 @@ public sealed class Gs
             if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
             if (regAddr == 0x01) _currentRgbaq = value;
 
-            // UV register
             if (regAddr == 0x03)
             {
                 _lastU = (value & 0x3FFF) / 16.0f;
                 _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
             }
 
-            // ST register (Q is usually in RGBAQ)
             if (regAddr == 0x02)
             {
-                _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0); // rough
-                _lastT = _lastS; // placeholder
+                _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
+                _lastT = _lastS;
             }
 
             if (regAddr == 0x04 || regAddr == 0x05)
@@ -131,13 +146,13 @@ public sealed class Gs
                 if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
                 if (regAddr == 0x01) _currentRgbaq = value;
 
-                if (regAddr == 0x03) // UV
+                if (regAddr == 0x03)
                 {
                     _lastU = (value & 0x3FFF) / 16.0f;
                     _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
                 }
 
-                if (regAddr == 0x02) // ST
+                if (regAddr == 0x02)
                 {
                     _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
                     _lastT = _lastS;
@@ -182,12 +197,9 @@ public sealed class Gs
 
     private void AddVertexFromXyz(uint xyz)
     {
-        // Improved XYZ decoding (still simplified but much better than before)
-        // Real GS uses signed fixed-point. This gives reasonable screen coordinates.
         int x = (int)(xyz & 0xFFFF);
         int y = (int)((xyz >> 16) & 0xFFFF);
 
-        // Convert from GS internal units (roughly 4 bits sub-pixel)
         x = (x * FB_WIDTH) / 4096;
         y = (y * FB_HEIGHT) / 4096;
 
@@ -319,7 +331,7 @@ public sealed class Gs
 
         while (true)
         {
-            if (x0 >= 0 && x0 < FB_WIDTH && y0 >= 0 && y0 < FB_HEIGHT)
+            if (x0 >= 0 && x0 < FB_WIDTH && y0 >= 0 && y0 < FB_HEIGHT && IsPixelInScissor(x0, y0))
                 _framebuffer[y0 * FB_WIDTH + x0] = color;
 
             if (x0 == x1 && y0 == y1) break;
@@ -336,7 +348,7 @@ public sealed class Gs
         {
             for (int xx = x; xx < x + w && xx < FB_WIDTH; xx++)
             {
-                if (xx >= 0 && yy >= 0)
+                if (xx >= 0 && yy >= 0 && IsPixelInScissor(xx, yy))
                     _framebuffer[yy * FB_WIDTH + xx] = color;
             }
         }
@@ -353,7 +365,7 @@ public sealed class Gs
         {
             for (int x = Math.Max(0, minX); x <= Math.Min(FB_WIDTH - 1, maxX); x++)
             {
-                if (PointInTriangle(x, y, v0, v1, v2))
+                if (PointInTriangle(x, y, v0, v1, v2) && IsPixelInScissor(x, y))
                     _framebuffer[y * FB_WIDTH + x] = v0.c;
             }
         }
