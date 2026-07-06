@@ -41,6 +41,7 @@
 - Created foundational `GsPipeline.cs`
 - Created foundational `Timer.cs` class
 - Created foundational `MmioBus.cs` for centralized MMIO handling
+- Created foundational `VifUnpacker.cs`
 - Integrated Scheduler foundation into `Ps2System`
 - Strong determinism focus maintained
 - SaveState support
@@ -49,7 +50,7 @@
 - Complete remaining VU instructions
 - Higher accuracy floating-point handling with determinism focus
 - Improved timing and synchronization between EE, IOP, and VUs (using Scheduler foundation)
-- Full Vif1 data unpacking and microcode handling
+- Full Vif1 data unpacking and microcode handling (on top of VifUnpacker foundation)
 - Interrupt integration with Emotion Engine (COP0) + Timers
 - Expanded SaveState features
 
