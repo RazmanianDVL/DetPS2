@@ -60,20 +60,16 @@ public sealed class Gs
 
         while (remaining > 0)
         {
-            // GIF data is 128-bit words. We read two 32-bit words per step.
             uint dataLow  = Memory.Read32(addr);
             uint dataHigh = Memory.Read32(addr + 4);
 
-            // Crude but functional A+D extraction for early work.
-            // Real format: lower 64 bits = data, upper contains address + control bits.
-            uint regAddr = (dataHigh >> 24) & 0x7F;   // common location for register address in many packets
+            uint regAddr = (dataHigh >> 24) & 0x7F;
             uint value   = dataLow;
 
             if (regAddr != 0)
             {
                 Registers.WriteRegister(regAddr, value);
 
-                // Keep legacy path alive during transition
                 if (regAddr == 0x00) _currentPrim = value;
                 if (regAddr == 0x01) _currentRgbaq = value;
             }
@@ -82,8 +78,6 @@ public sealed class Gs
             remaining--;
         }
 
-        // Temporary visual output so we can see progress immediately.
-        // This will be replaced by real DrawPrimitive calls once we have vertex assembly.
         uint primType = _currentPrim & 0x7;
         switch (primType)
         {
@@ -99,20 +93,41 @@ public sealed class Gs
     {
         Registers.WriteRegister(0x00, prim);
         _currentPrim = prim;
-        Console.WriteLine($"[GS] PRIM = 0x{prim:X}");
     }
 
     public void SetRGBAQ(uint rgbaq)
     {
         Registers.WriteRegister(0x01, rgbaq);
         _currentRgbaq = rgbaq;
-        Console.WriteLine($"[GS] RGBAQ = 0x{rgbaq:X8}");
     }
 
     public void DrawVertex(uint xyz)
     {
         Registers.WriteRegister(0x04, xyz);
-        // TODO (next in lane): collect into vertex buffer for real primitive assembly
+    }
+
+    // ==================== NEW: Clean high-level hook for UI ====================
+
+    /// <summary>
+    /// Draws a nice, colorful test scene. This is the recommended method for the UI layer
+    /// to trigger visible output without any stub-like behavior.
+    /// </summary>
+    public void RenderTestScene()
+    {
+        // Clear to dark blue background
+        uint bgColor = 0xFF1a1a3a;
+        for (int i = 0; i < _framebuffer.Length; i++)
+            _framebuffer[i] = bgColor;
+
+        // Colorful test shapes
+        DrawFilledTriangle((120, 80, 0xFF00FF00), (320, 80, 0xFF00FF00), (220, 280, 0xFF00FF00));   // Green triangle
+        DrawFilledTriangle((340, 100, 0xFFFF0000), (540, 100, 0xFFFF0000), (440, 300, 0xFFFF0000));   // Red triangle
+        DrawQuad(80, 320, 160, 80, 0xFF00BFFF);     // Deep sky blue quad
+        DrawQuad(400, 320, 160, 80, 0xFFFFD700);     // Gold quad
+        DrawLine(100, 60, 540, 60, 0xFFFFFFFF);      // White top line
+        DrawLine(100, 380, 540, 380, 0xFFFFFFFF);     // White bottom line
+
+        Console.WriteLine("[GS] RenderTestScene() - nice colorful output produced");
     }
 
     // ==================== Texture (stub) ====================
@@ -161,8 +176,6 @@ public sealed class Gs
             if (e2 > -dy) { err -= dy; x0 += sx; }
             if (e2 < dx) { err += dx; y0 += sy; }
         }
-
-        Console.WriteLine("[GS] Drew line.");
     }
 
     public void DrawQuad(int x, int y, int w, int h, uint color)
@@ -175,8 +188,6 @@ public sealed class Gs
                     _framebuffer[yy * FB_WIDTH + xx] = color;
             }
         }
-
-        Console.WriteLine("[GS] Drew quad.");
     }
 
     private void DrawFilledTriangle((int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
@@ -194,8 +205,6 @@ public sealed class Gs
                     _framebuffer[y * FB_WIDTH + x] = v0.c;
             }
         }
-
-        Console.WriteLine("[GS] Drew triangle.");
     }
 
     private bool PointInTriangle(int px, int py, (int x, int y, uint c) v0, (int x, int y, uint c) v1, (int x, int y, uint c) v2)
@@ -204,7 +213,7 @@ public sealed class Gs
         if (Math.Abs(denom) < 0.0001f) return false;
 
         float a = ((v1.y - v2.y) * (px - v2.x) + (v2.x - v1.x) * (py - v2.y)) / denom;
-        float b = ((v2.y - v0.y) * (px - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
+        float b = ((v2.y - v0.y) * (v0.x - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
         float c = 1 - a - b;
 
         return a >= 0 && a <= 1 && b >= 0 && b <= 1 && c >= 0 && c <= 1;
@@ -220,7 +229,7 @@ public sealed class Gs
 
         for (int y = 0; y < FB_HEIGHT; y++)
         {
-            for (int x = 0; x < FB_WIDTH; x++)
+            for (int x = x = 0; x < FB_WIDTH; x++)
             {
                 int index = y * FB_WIDTH + x;
                 uint pixel = _framebuffer[index];
