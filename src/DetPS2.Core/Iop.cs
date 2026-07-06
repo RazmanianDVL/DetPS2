@@ -4,6 +4,9 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// IOP - Phase 3/4 with expanded instruction set.
+/// 
+/// [6.2] Added basic SIF interrupt generation on mailbox write.
+/// This provides the first real IOP → EE synchronization point.
 /// </summary>
 public sealed class Iop
 {
@@ -42,6 +45,10 @@ public sealed class Iop
     {
         SifMbxFromEE = value;
         SifMbxToEE = ~value;
+
+        // [6.2] Basic SIF interrupt generation
+        // This signals the EE that new SIF data/command is available.
+        Intc?.Raise(Intc.InterruptSource.Sif);
     }
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
