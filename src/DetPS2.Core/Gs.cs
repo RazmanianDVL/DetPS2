@@ -7,9 +7,9 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Implemented actual depth testing using the depth buffer.
-/// Triangles now respect Z values (interpolated across the primitive).
-/// This completes the depth buffer work that was prepared earlier.
+/// Added basic alpha blending support.
+/// The rasterizer now blends the new pixel with the existing framebuffer
+/// using a simple source-over style blend (common for many PS2 effects).
 /// </summary>
 public sealed class Gs
 {
@@ -308,22 +308,16 @@ public sealed class Gs
                 {
                     int idx = y * FB_WIDTH + x;
 
-                    // Interpolate Z for depth test
                     float z = v0.Z * a + v1.Z * b + v2.Z * c;
-
-                    // Depth test (simple less-than)
                     if (z > _depthBuffer[idx]) continue;
 
-                    // Interpolate color
                     uint color = InterpolateColor(v0.Color, v1.Color, v2.Color, a, b, c);
 
-                    // Interpolate UV and sample texture
                     float iu = v0.U * a + v1.U * b + v2.U * c;
                     float iv = v0.V * a + v1.V * b + v2.V * c;
 
                     uint texColor = SampleTexture(iu, iv);
 
-                    // Modulate texture with vertex color
                     byte tr = (byte)((texColor >> 16) & 0xFF);
                     byte tg = (byte)((texColor >> 8) & 0xFF);
                     byte tb = (byte)(texColor & 0xFF);
@@ -336,11 +330,45 @@ public sealed class Gs
                     byte g = (byte)((tg * cg) / 255);
                     byte b = (byte)((tb * cb) / 255);
 
-                    _framebuffer[idx] = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
-                    _depthBuffer[idx] = z; // update depth buffer
+                    uint finalColor = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
+
+                    // Basic alpha blending (source over)
+                    if (Registers.ALPHA_1 != 0) // simple check if blending is "enabled"
+                    {
+                        uint dst = _framebuffer[idx];
+                        finalColor = Blend(finalColor, dst);
+                    }
+
+                    _framebuffer[idx] = finalColor;
+                    _depthBuffer[idx] = z;
                 }
             }
         }
+    }
+
+    private uint Blend(uint src, uint dst)
+    {
+        // Simple "source alpha" blend (very common)
+        byte srcA = (byte)((src >> 24) & 0xFF);
+        if (srcA == 0) return dst;
+        if (srcA == 255) return src;
+
+        float alpha = srcA / 255.0f;
+        float invAlpha = 1.0f - alpha;
+
+        byte sr = (byte)((src >> 16) & 0xFF);
+        byte sg = (byte)((src >> 8) & 0xFF);
+        byte sb = (byte)(src & 0xFF);
+
+        byte dr = (byte)((dst >> 16) & 0xFF);
+        byte dg = (byte)((dst >> 8) & 0xFF);
+        byte db = (byte)(dst & 0xFF);
+
+        byte r = (byte)(sr * alpha + dr * invAlpha);
+        byte g = (byte)(sg * alpha + dg * invAlpha);
+        byte b = (byte)(sb * alpha + db * invAlpha);
+
+        return (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
     }
 
     private bool PointInTriangle(int px, int py, Vertex v0, Vertex v1, Vertex v2, out float a, out float b, out float c)
