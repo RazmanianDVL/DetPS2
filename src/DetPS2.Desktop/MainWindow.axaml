@@ -3,8 +3,7 @@
         x:Class="DetPS2.Desktop.MainWindow"
         Title="DetPS2Sharp — Deterministic PS2 Emulator"
         Width="960" Height="720"
-        MinWidth="800" MinHeight="600"
-        KeyBindings="{Binding KeyBindings}">
+        MinWidth="800" MinHeight="600">
 
     <Grid RowDefinitions="Auto,Auto,*,Auto">
         <!-- Menu Bar -->
@@ -38,7 +37,7 @@
         </Menu>
 
         <!-- Toolbar -->
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="4" Margin="8,4">
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="8,4">
             <Button Content="Load BIOS" Click="OnLoadBiosClick" ToolTip.Tip="Ctrl+B" />
             <Button Content="Load ELF" Click="OnLoadElfClick" ToolTip.Tip="Ctrl+E" />
             <Separator Width="1" Margin="4,2" />
@@ -50,6 +49,19 @@
             <Button Content="🎨 Test Scene" Click="OnTestDrawClick" ToolTip.Tip="F11" />
             <Button Content="💾 Save State" Click="OnSaveStateClick" ToolTip.Tip="Ctrl+S" />
             <Button Content="📂 Load State" Click="OnLoadStateClick" ToolTip.Tip="Ctrl+L" />
+
+            <Separator Width="1" Margin="6,2" />
+
+            <!-- Emulation Speed Control -->
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="4">
+                <TextBlock Text="Speed:" VerticalAlignment="Center" Margin="0,0,4,0" />
+                <ComboBox x:Name="SpeedCombo" Width="110" SelectedIndex="1" SelectionChanged="OnSpeedChanged">
+                    <ComboBoxItem Content="Slow" />
+                    <ComboBoxItem Content="Normal" />
+                    <ComboBoxItem Content="Fast" />
+                    <ComboBoxItem Content="Unlimited" />
+                </ComboBox>
+            </StackPanel>
         </StackPanel>
 
         <!-- Main Display Area -->
