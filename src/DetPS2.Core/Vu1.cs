@@ -5,16 +5,15 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// VU1 - Vector Unit 1.
-/// Improved Vif1 data handling with quadword awareness.
+/// Phase 6 solid state.
+/// Receives quadword data from VIF1 and executes instructions.
 /// </summary>
 public sealed class Vu1 : VectorUnit
 {
     private readonly Queue<uint> _incomingData = new Queue<uint>();
     private uint _currentQuadwordWordCount = 0;
 
-    public Vu1(SystemMemory memory) : base(memory)
-    {
-    }
+    public Vu1(SystemMemory memory) : base(memory) { }
 
     public override void Reset()
     {
@@ -25,7 +24,7 @@ public sealed class Vu1 : VectorUnit
 
     public override void Step(ulong cycles)
     {
-        // Process buffered data from Vif1
+        // Process any pending data from VIF1
         while (_incomingData.Count > 0)
         {
             uint data = _incomingData.Dequeue();
@@ -33,24 +32,16 @@ public sealed class Vu1 : VectorUnit
             _currentQuadwordWordCount++;
 
             if (_currentQuadwordWordCount >= 4)
-            {
                 _currentQuadwordWordCount = 0;
-                // A full quadword has been received
-            }
         }
 
         base.Step(cycles);
     }
 
-    public void ReceiveFromVif1(uint data)
-    {
-        _incomingData.Enqueue(data);
-    }
+    public void ReceiveFromVif1(uint data) => _incomingData.Enqueue(data);
 
     public uint GetNextIncomingData()
-    {
-        return _incomingData.Count > 0 ? _incomingData.Dequeue() : 0;
-    }
+        => _incomingData.Count > 0 ? _incomingData.Dequeue() : 0u;
 
     protected override void ExecuteInstruction(uint opcode)
     {
