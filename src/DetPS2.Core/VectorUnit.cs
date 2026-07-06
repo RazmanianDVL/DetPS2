@@ -57,8 +57,20 @@ public abstract class VectorUnit
     /// Executes up to maxCycles worth of work.
     /// Returns the number of cycles actually consumed.
     /// 
-    /// TODO (Foxtrot): Future versions should respect VU stalls and return fewer cycles
-    /// when the VU is stalled waiting on data from VIF or the EE.
+    /// FUTURE TIMING / STALL BEHAVIOR (Foxtrot):
+    /// 
+    /// In later phases, this method must become cycle-accurate and respect VU stalls.
+    /// The VU can stall for several reasons:
+    ///   - Waiting for data from VIF (VIF1 → VU1 path is especially important)
+    ///   - Waiting for COP2 move instructions from the EE (VU0)
+    ///   - Internal pipeline stalls (e.g. EFU busy, load/store conflicts)
+    ///   - Branch delay / interlock conditions
+    /// 
+    /// When stalled, Step() should return fewer cycles than requested and leave
+    /// the PC / internal state unchanged until the stall condition clears.
+    /// 
+    /// TODO: Track stall sources explicitly (e.g. _stallUntilCycle or stall flags)
+    ///       so the Scheduler can potentially fast-forward or prioritize other components.
     /// </summary>
     public virtual int Step(ulong maxCycles)
     {
