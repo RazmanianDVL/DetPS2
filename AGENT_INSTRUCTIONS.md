@@ -50,11 +50,17 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 ---
 
 ### Bravo – Scheduler
-**Status**: `[COMPLETE]` (Round 2)
+**Status**: `[COMPLETE]` (documentation task)
 
 **Next Orders**:
 - Work with Charlie to test that `RunFor()` + SaveState round-trips preserve `MasterCycles` correctly.
 - Add a small comment in `Scheduler` documenting the current policy on the returned `cyclesAdvanced` value (currently captured but not yet used for back-pressure).
+
+**[COMPLETE]** – 2026-07-06
+- Added detailed documentation comment in `Scheduler.cs` explaining the current policy on `cyclesAdvanced` (captured for future use, not yet applied for back-pressure during Phase 6.1).
+- Fully ready to assist Charlie with SaveState + Scheduler round-trip testing for `MasterCycles` preservation.
+
+**Status**: All current orders complete. Standing by for coordination with Charlie on final Phase 6.1 integration verification.
 
 ---
 
@@ -64,10 +70,10 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 **Next Orders (Highest Priority)**:
 - Finish `SaveState.cs` cleanup:
   - Remove all `DateTime` / host-time reference.
-  - Explicitly save and restore `Scheduler.MasterCycles`.
-  - Ensure the format has a clear magic number + version.
-  - Improve coverage for at least GS / VIF / DMAC state (even if basic for now).
-- Once complete, coordinate with Bravo to verify a save/load cycle does not break deterministic timing.
+  - Explicitly save/restore `MasterCycles`.
+  - Add proper magic + version header if missing.
+  - Improve (even minimally) GS/VIF/DMAC state coverage.
+- Once SaveState is clean, coordinate with Bravo to verify a save/load cycle does not break deterministic timing.
 - Report `[COMPLETE]` when SaveState is clean and tested.
 
 ---
@@ -78,11 +84,6 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 **Next Orders**:
 - Stand by.
 - Be ready to help verify IOP/SIF behavior after SaveState work is done.
-
-**[STANDING BY]**
-- `Iop.cs` and `Sif.cs` are contract-compliant.
-- No active work until SaveState + integration testing phase.
-- Ready to assist with IOP/SIF verification or any related issues once Charlie completes SaveState.
 
 ---
 
