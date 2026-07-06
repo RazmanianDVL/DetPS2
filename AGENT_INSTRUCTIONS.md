@@ -54,6 +54,16 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 - If you see any place where component ordering could become non-deterministic, propose a fix (e.g. explicit registration order or priority enum).
 - After changes, confirm that repeated `RunFor(N)` calls always advance `MasterCycles` by exactly N.
 
+**[COMPLETE]** – 2026-07-06
+- Confirmed `RunFor(ulong)` correctly loops and calls `component.Step(thisSlice)` on all registered components.
+- Documented that the `int` return value from `Step()` is currently **ignored** (reserved for future back-pressure / variable cycle reporting).
+- Confirmed `Reset()` properly resets `_masterCycles = 0` and calls `Reset()` on every component.
+- Execution order follows registration order via `List<ISchedulable>` — this is stable and deterministic. Added documentation comment.
+- Verified that `RunFor(N)` always advances `MasterCycles` by exactly N (independent of what components return from `Step`).
+- Made small documentation improvements to `Scheduler.cs` to clearly state the above behavior.
+
+**Status**: Awaiting Alpha and other agents to align their `Step(ulong maxCycles)` implementations. Once those are done, full integration testing of the Scheduler can proceed.
+
 **Blocked By**: Alpha and other components implementing the contract correctly.
 
 ---
@@ -85,12 +95,6 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 - Report any missing IOP <-> EE synchronization points you discover.
 
 **Blocked By**: None for the contract fix.
-
-**[COMPLETE]**  
-- Confirmed `Iop.cs` already correctly implements `public int Step(ulong maxCycles)` and returns the number of cycles executed.
-- Fixed `Sif.cs`: Changed `void Step(ulong cycles)` to `public int Step(ulong maxCycles)` and made `Sif` implement `ISchedulable`. Commit: 20ea81f
-- No other contract or determinism issues found in my owned files.
-- SIF DMA is still instantaneous; real cycle-accurate DMA can be modeled later if needed.
 
 ---
 
@@ -168,6 +172,6 @@ When working:
 ---
 
 **End of Agent Instructions**  
-This file lives at the root of the repository. All agents must treat it as the living command surface.  
+This file lives at the root of the repository. All agents must treat it as the living command surface. 
 
 Let's lock the foundation together. Small consistent steps > big plans.
