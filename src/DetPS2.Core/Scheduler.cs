@@ -11,6 +11,13 @@ namespace DetPS2.Core;
 /// - Dramatically reduces overhead while staying fully deterministic.
 /// - Master cycle counter remains the single source of truth.
 /// - Tunable slice size for performance vs granularity.
+/// 
+/// Execution order: Components are stepped in the order they were registered via Register().
+/// This order is stable and deterministic.
+/// 
+/// Step return value: Currently ignored by the scheduler. It is reserved for future
+/// back-pressure / variable cycle consumption tracking once more components report
+/// accurate cycle counts.
 /// </summary>
 public sealed class Scheduler
 {
@@ -46,6 +53,7 @@ public sealed class Scheduler
 
             foreach (var component in _components)
             {
+                // Note: return value is currently ignored (see class docs)
                 component.Step(thisSlice);
             }
 
