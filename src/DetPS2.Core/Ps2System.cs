@@ -4,9 +4,10 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Top-level PS2 system with Save State support (Phase 4).
+/// Top-level PS2 system.
+/// Now uses the foundational Scheduler for deterministic stepping.
 /// </summary>
-public sealed class Ps2System
+public sealed class Ps2System : ISchedulable
 {
     public SystemMemory Memory { get; }
     public EmotionEngine EE { get; }
@@ -20,7 +21,9 @@ public sealed class Ps2System
     public Cdvd Cdvd { get; }
     public Sif Sif { get; }
 
-    public ulong MasterCycles { get; private set; }
+    public Scheduler Scheduler { get; }
+
+    public ulong MasterCycles => Scheduler.MasterCycles;
 
     public Ps2System()
     {
@@ -30,7 +33,7 @@ public sealed class Ps2System
         Dmac = new Dmac(Memory);
         Gs = new Gs(Memory);
         Gif = new Gif(Gs);
-        Vif = new Vif(Gs, Gif);
+        Vif = new Vif(Memory);
         Pcrtc = new Pcrtc(Gs);
         Intc = new Intc();
         Iop = new Iop(Intc, Memory);
@@ -39,7 +42,23 @@ public sealed class Ps2System
 
         Dmac.SetGif(Gif);
 
-        MasterCycles = 0;
+        Scheduler = new Scheduler();
+        RegisterComponents();
+    }
+
+    private void RegisterComponents()
+    {
+        Scheduler.Register(this);           // Ps2System itself
+        Scheduler.Register(EE);
+        Scheduler.Register(Dmac);
+        Scheduler.Register(Vif);
+        Scheduler.Register(Gif);
+        Scheduler.Register(Gs);
+        Scheduler.Register(Pcrtc);
+        Scheduler.Register(Intc);
+        Scheduler.Register(Iop);
+        Scheduler.Register(Cdvd);
+        Scheduler.Register(Sif);
     }
 
     public byte[] SaveState() => SaveState.Save(this);
@@ -63,36 +82,30 @@ public sealed class Ps2System
 
     public void RunFor(ulong cyclesToRun)
     {
-        ulong target = MasterCycles + cyclesToRun;
-
-        while (MasterCycles < target)
-        {
-            int cyclesTaken = EE.Step();
-            MasterCycles += (ulong)cyclesTaken;
-
-            Dmac.Step(1);
-            Vif.Step(1);
-            Gif.Step(1);
-            Gs.Step(1);
-            Pcrtc.Step(1);
-            Intc.Step(1);
-            Iop.Step(1);
-            Cdvd.Step(1);
-            Sif.Step(1);
-        }
+        Scheduler.RunFor(cyclesToRun);
     }
 
     public void Reset()
     {
-        MasterCycles = 0;
-        EE.Reset();
-        Dmac.Reset();
-        Vif.Reset();
-        Gif.Reset();
-        Gs.Reset();
-        Pcrtc.Reset();
-        Intc.Reset();
-        Iop.Reset();
-        Cdvd.Reset();
+        Scheduler.Reset();
+    }
+
+    // ISchedulable implementation
+    public int Step()
+    {
+        // For now, do a simple combined step.
+        // Future versions can do more sophisticated per-component cycle accounting.
+        int cycles = EE.Step();
+        Dmac.Step(1);
+        Vif.Step(1);
+        Gif.Step(1);
+        Gs.Step(1);
+        Pcrtc.Step(1);
+        Intc.Step(1);
+        Iop.Step(1);
+        Cdvd.Step(1);
+        Sif.Step(1);
+
+        return cycles;
     }
 }
