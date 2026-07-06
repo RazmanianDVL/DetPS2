@@ -40,6 +40,7 @@
 - Created foundational `Vif1.cs` structure
 - Created foundational `GsPipeline.cs`
 - Created foundational `Timer.cs` class
+- Created foundational `MmioBus.cs` for centralized MMIO handling
 - Integrated Scheduler foundation into `Ps2System`
 - Strong determinism focus maintained
 - SaveState support
