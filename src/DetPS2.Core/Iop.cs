@@ -46,16 +46,19 @@ public sealed class Iop
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
 
-    public void Step(ulong cycles)
+    public int Step(ulong maxCycles)
     {
-        if (!Running) return;
+        if (!Running) return 0;
 
-        for (int i = 0; i < 100000000 && Running; i++)
+        ulong executed = 0;
+        for (ulong i = 0; i < maxCycles && Running; i++)
         {
             uint opcode = _memory.Read32(PC);
             ExecuteInstruction(opcode);
             PC += 4;
+            executed++;
         }
+        return (int)executed;
     }
 
     private void ExecuteInstruction(uint opcode)
