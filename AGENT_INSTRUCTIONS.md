@@ -40,6 +40,13 @@ We are shifting from pure analysis into **small, targeted improvements** while c
 - Review Delta’s SIF interrupt proposal and George’s GIF/GS costing idea. Give a short recommendation on implementation order and risk.
 - Continue improving SaveState robustness as gaps are discovered during testing.
 
+**[6.2][COMPLETE]** Expanded smoke test suite with 3 new deterministic scenarios:
+- `Determinism_MasterCycles`
+- `SaveState_MasterCyclesRoundTrip`
+- `Reset_MasterCycles`
+
+**Next**: Will review Delta & George proposals and provide recommendation on implementation order/risk.
+
 ### Bravo – Scheduler
 **Next Orders**:
 - Review the findings from Delta and George.
