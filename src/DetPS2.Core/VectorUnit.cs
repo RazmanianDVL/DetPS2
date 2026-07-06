@@ -6,8 +6,10 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Continuing toward full completeness.
-/// Current focus: Complete EFU (DIV, SQRT, RSQRT) + basic load/store support + field mask correctness.
+/// Focused on making the Vector Units actually work.
+/// - Functional branch handling
+/// - Working load/store operations
+/// - Continued EFU and field mask correctness
 /// </summary>
 public abstract class VectorUnit
 {
@@ -28,6 +30,8 @@ public abstract class VectorUnit
     public ulong LocalCycles;
 
     private uint _currentFieldMask = 0xF;
+    private bool _branchPending;
+    private uint _pendingBranchTarget;
 
     protected VectorUnit(SystemMemory memory)
     {
@@ -44,12 +48,20 @@ public abstract class VectorUnit
         LocalCycles = 0;
         _vf[0] = new VuReg128 { X = 0f, Y = 0f, Z = 0f, W = 1f };
         _currentFieldMask = 0xF;
+        _branchPending = false;
+        _pendingBranchTarget = 0;
     }
 
     public virtual void Step(ulong cycles)
     {
         for (ulong i = 0; i < cycles; i++)
         {
+            if (_branchPending)
+            {
+                PC = _pendingBranchTarget;
+                _branchPending = false;
+            }
+
             if (PC < 16 * 1024)
             {
                 uint opcode = _memory.Read32(PC);
@@ -75,8 +87,8 @@ public abstract class VectorUnit
 
         if (primary == 0x00)
             HandleSpecial(opcode, rs, rt, rd, function);
-        else if (primary == 0x01 || primary == 0x02)
-            HandleLoadStore(opcode, primary); // Basic load/store path
+        else
+            HandleLoadStore(opcode, primary);
     }
 
     private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd, uint function)
@@ -105,7 +117,7 @@ public abstract class VectorUnit
 
             case 0x1D: HandleEfu(opcode, rs, rt, rd); break;
 
-            case 0x0C: HandleBranch(opcode); break;
+            case 0x0C: HandleBranch(opcode, rs); break;
 
             default: break;
         }
@@ -113,23 +125,45 @@ public abstract class VectorUnit
 
     private void HandleLoadStore(uint opcode, uint primary)
     {
-        // Basic VU load/store support (LQI, SQI, LQD, SQD, etc.)
-        // For now we treat them as no-ops or simple memory access
         uint rs = (opcode >> 11) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
+        short offset = (short)(opcode & 0xFFFF);
 
-        if (primary == 0x01) // Example: Load path
+        uint addr = (uint)(_vf[rs].X) + (uint)offset; // Simplified addressing
+
+        if (primary == 0x01) // Load
         {
-            // Placeholder - real implementation would read from VU memory
+            uint value = _memory.Read32(addr);
+            // Load into VF register (simplified)
+            if (rt < 32)
+            {
+                _vf[rt].X = BitConverter.Int32BitsToSingle((int)value);
+            }
         }
-        else if (primary == 0x02) // Store path
+        else if (primary == 0x02) // Store
         {
-            // Placeholder
+            uint value = (uint)BitConverter.SingleToInt32Bits(_vf[rt].X);
+            _memory.Write32(addr, value);
         }
     }
 
-    // === Field-aware helpers (respect _currentFieldMask) ===
+    private void HandleBranch(uint opcode, uint rs)
+    {
+        // Basic branch support
+        short offset = (short)(opcode & 0xFFFF);
+        uint target = (uint)(PC + (offset << 2));
 
+        // Simple condition (can be expanded)
+        bool take = _vf[rs].X != 0;
+
+        if (take)
+        {
+            _pendingBranchTarget = target;
+            _branchPending = true;
+        }
+    }
+
+    // Field-aware helpers (same as previous)
     private void ApplyArith(uint rs, uint rt, uint rd, Func<float, float, float> op)
     {
         if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = op(_vf[rs].X, _vf[rt].X);
@@ -254,38 +288,20 @@ public abstract class VectorUnit
     {
         float a = _vf[rs].X;
         float b = _vf[rt].X;
-
         float result = 0f;
 
-        // Complete EFU core
         switch (opcode & 0x3F)
         {
-            case 0x1D: // DIV
-                result = (b != 0f) ? a / b : 0f;
-                break;
-
-            case 0x2E: // SQRT (example encoding)
-                result = (float)Math.Sqrt(Math.Abs(a));
-                break;
-
-            case 0x2F: // RSQRT (example encoding)
-                result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f;
-                break;
-
-            default:
-                result = a;
-                break;
+            case 0x1D: result = (b != 0f) ? a / b : 0f; break;           // DIV
+            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break;    // SQRT
+            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break; // RSQRT
+            default: result = a; break;
         }
 
         if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = result;
         if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = result;
         if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = result;
         if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = result;
-    }
-
-    private void HandleBranch(uint opcode)
-    {
-        // TODO: Full branch target + link support
     }
 
     private static int SingleToInt32Bits(float v) => BitConverter.SingleToInt32Bits(v);
