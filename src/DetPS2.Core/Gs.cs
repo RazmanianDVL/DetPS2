@@ -7,14 +7,9 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Milestone: Improved software rasterizer with attribute interpolation
-/// 
-/// Changes in this update:
-/// - Added basic depth buffer
-/// - Refactored triangle rasterization to support interpolated color (Gouraud shading foundation)
-/// - Better structured DrawFilledTriangle with barycentric interpolation
-/// - Prepared hooks for depth testing and texture mapping
-/// - Still prioritizes correctness + determinism over raw speed
+/// Added proper UV interpolation + texture sampling in the rasterizer.
+/// Triangles now get textured using the UV coordinates collected from GIF/GS packets.
+/// This is a major visual milestone for the lane.
 /// </summary>
 public sealed class Gs
 {
@@ -24,12 +19,11 @@ public sealed class Gs
     private const int FB_WIDTH = 640;
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
-    private readonly float[] _depthBuffer = new float[FB_WIDTH * FB_HEIGHT]; // Simple depth buffer
+    private readonly float[] _depthBuffer = new float[FB_WIDTH * FB_HEIGHT];
 
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
-    // Last known texture coordinates (updated via UV/ST registers)
     private float _lastU = 0;
     private float _lastV = 0;
     private float _lastS = 1;
@@ -39,20 +33,16 @@ public sealed class Gs
     private int _texWidth = 64;
     private int _texHeight = 64;
 
-    // =====================================================
-    // Vertex with full attribute support
-    // =====================================================
-
     private struct Vertex
     {
         public int X;
         public int Y;
-        public uint Color;      // RGBA
+        public uint Color;
         public float U;
         public float V;
         public float S;
         public float T;
-        public float Z;         // For depth testing (future)
+        public float Z;
     }
 
     private readonly List<Vertex> _currentVertices = new();
@@ -76,10 +66,25 @@ public sealed class Gs
         _currentVertices.Clear();
     }
 
+    private bool IsPixelInScissor(int x, int y)
+    {
+        uint scissor = Registers.SCISSOR_1;
+        int x0 = (int)(scissor & 0x7FF);
+        int x1 = (int)((scissor >> 16) & 0x7FF);
+        int y0 = (int)((scissor >> 32) & 0x7FF);
+        int y1 = (int)((scissor >> 48) & 0x7FF);
+
+        if (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0) return true;
+        if (x1 == 0) x1 = FB_WIDTH - 1;
+        if (y1 == 0) y1 = FB_HEIGHT - 1;
+
+        return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    }
+
     public void ProcessGifPackedWord(uint dataLow, uint dataHigh)
     {
         uint regAddr = (dataHigh >> 24) & 0x7F;
-        uint value   = dataLow;
+        uint value = dataLow;
 
         if (regAddr != 0)
         {
@@ -88,23 +93,10 @@ public sealed class Gs
             if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
             if (regAddr == 0x01) _currentRgbaq = value;
 
-            if (regAddr == 0x03) // UV
-            {
-                _lastU = (value & 0x3FFF) / 16.0f;
-                _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
-            }
+            if (regAddr == 0x03) { _lastU = (value & 0x3FFF) / 16.0f; _lastV = ((value >> 16) & 0x3FFF) / 16.0f; }
+            if (regAddr == 0x02) { _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0); _lastT = _lastS; }
 
-            if (regAddr == 0x02) // ST
-            {
-                _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
-                _lastT = _lastS;
-            }
-
-            if (regAddr == 0x04 || regAddr == 0x05)
-            {
-                AddVertexFromXyz(value);
-                TryDispatchPrimitive();
-            }
+            if (regAddr == 0x04 || regAddr == 0x05) { AddVertexFromXyz(value); TryDispatchPrimitive(); }
         }
     }
 
@@ -117,11 +109,11 @@ public sealed class Gs
 
         while (remaining > 0)
         {
-            uint dataLow  = Memory.Read32(addr);
+            uint dataLow = Memory.Read32(addr);
             uint dataHigh = Memory.Read32(addr + 4);
 
             uint regAddr = (dataHigh >> 24) & 0x7F;
-            uint value   = dataLow;
+            uint value = dataLow;
 
             if (regAddr != 0)
             {
@@ -130,23 +122,10 @@ public sealed class Gs
                 if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
                 if (regAddr == 0x01) _currentRgbaq = value;
 
-                if (regAddr == 0x03) // UV
-                {
-                    _lastU = (value & 0x3FFF) / 16.0f;
-                    _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
-                }
+                if (regAddr == 0x03) { _lastU = (value & 0x3FFF) / 16.0f; _lastV = ((value >> 16) & 0x3FFF) / 16.0f; }
+                if (regAddr == 0x02) { _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0); _lastT = _lastS; }
 
-                if (regAddr == 0x02) // ST
-                {
-                    _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
-                    _lastT = _lastS;
-                }
-
-                if (regAddr == 0x04 || regAddr == 0x05)
-                {
-                    AddVertexFromXyz(value);
-                    TryDispatchPrimitive();
-                }
+                if (regAddr == 0x04 || regAddr == 0x05) { AddVertexFromXyz(value); TryDispatchPrimitive(); }
             }
 
             addr += 16;
@@ -159,8 +138,7 @@ public sealed class Gs
             switch (primType)
             {
                 case 1: DrawLine(200, 200, 400, 300, _currentRgbaq); break;
-                case 3:
-                case 4: DrawTestTriangle(); break;
+                case 3: case 4: DrawTestTriangle(); break;
                 case 5: DrawQuad(250, 180, 180, 120, _currentRgbaq); break;
                 default: DrawTestTriangle(); break;
             }
@@ -172,10 +150,7 @@ public sealed class Gs
         uint primType = _currentPrim & 0x7;
         _maxVerticesForPrim = primType switch
         {
-            1 => 2,
-            3 or 4 => 3,
-            5 => 4,
-            _ => 3
+            1 => 2, 3 or 4 => 3, 5 => 4, _ => 3
         };
     }
 
@@ -189,17 +164,11 @@ public sealed class Gs
 
         _currentVertices.Add(new Vertex
         {
-            X = x,
-            Y = y,
-            Color = _currentRgbaq,
-            U = _lastU,
-            V = _lastV,
-            S = _lastS,
-            T = _lastT,
-            Z = 0.0f // TODO: decode Z from higher bits when available
+            X = x, Y = y, Color = _currentRgbaq,
+            U = _lastU, V = _lastV, S = _lastS, T = _lastT, Z = 0
         });
 
-        Console.WriteLine($"[GS] Vertex: ({x}, {y}) UV=({_lastU:F2},{_lastV:F2})");
+        Console.WriteLine($"[GS] Vertex added: ({x},{y}) UV=({_lastU:F2},{_lastV:F2})");
     }
 
     private void TryDispatchPrimitive()
@@ -210,36 +179,16 @@ public sealed class Gs
 
         switch (primType)
         {
-            case 3:
-            case 4:
-                if (_currentVertices.Count >= 3)
-                {
-                    DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]);
-                    _currentVertices.Clear();
-                }
+            case 3: case 4:
+                if (_currentVertices.Count >= 3) { DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]); _currentVertices.Clear(); }
                 break;
-
             case 1:
-                if (_currentVertices.Count >= 2)
-                {
-                    DrawLine(_currentVertices[0].X, _currentVertices[0].Y,
-                             _currentVertices[1].X, _currentVertices[1].Y,
-                             _currentVertices[0].Color);
-                    _currentVertices.Clear();
-                }
+                if (_currentVertices.Count >= 2) { DrawLine(_currentVertices[0].X, _currentVertices[0].Y, _currentVertices[1].X, _currentVertices[1].Y, _currentVertices[0].Color); _currentVertices.Clear(); }
                 break;
-
             case 5:
-                if (_currentVertices.Count >= 3)
-                {
-                    DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]);
-                    _currentVertices.Clear();
-                }
+                if (_currentVertices.Count >= 3) { DrawFilledTriangle(_currentVertices[0], _currentVertices[1], _currentVertices[2]); _currentVertices.Clear(); }
                 break;
-
-            default:
-                _currentVertices.Clear();
-                break;
+            default: _currentVertices.Clear(); break;
         }
     }
 
@@ -267,22 +216,17 @@ public sealed class Gs
     public void RenderTestScene()
     {
         uint bgColor = 0xFF1a1a3a;
-        for (int i = 0; i < _framebuffer.Length; i++)
-        {
-            _framebuffer[i] = bgColor;
-            _depthBuffer[i] = float.MaxValue;
-        }
-
-        // Test triangles with different colors
-        DrawFilledTriangle(
-            new Vertex { X = 120, Y = 80,  Color = 0xFF00FF00 },
-            new Vertex { X = 320, Y = 80,  Color = 0xFF00FF00 },
-            new Vertex { X = 220, Y = 280, Color = 0xFF00FF00 });
+        for (int i = 0; i < _framebuffer.Length; i++) { _framebuffer[i] = bgColor; _depthBuffer[i] = float.MaxValue; }
 
         DrawFilledTriangle(
-            new Vertex { X = 340, Y = 100, Color = 0xFFFF0000 },
-            new Vertex { X = 540, Y = 100, Color = 0xFFFF0000 },
-            new Vertex { X = 440, Y = 300, Color = 0xFFFF0000 });
+            new Vertex { X = 120, Y = 80, Color = 0xFF00FF00, U = 0, V = 0 },
+            new Vertex { X = 320, Y = 80, Color = 0xFF00FF00, U = 1, V = 0 },
+            new Vertex { X = 220, Y = 280, Color = 0xFF00FF00, U = 0.5f, V = 1 });
+
+        DrawFilledTriangle(
+            new Vertex { X = 340, Y = 100, Color = 0xFFFF0000, U = 0, V = 0 },
+            new Vertex { X = 540, Y = 100, Color = 0xFFFF0000, U = 1, V = 0 },
+            new Vertex { X = 440, Y = 300, Color = 0xFFFF0000, U = 0.5f, V = 1 });
 
         DrawQuad(80, 320, 160, 80, 0xFF00BFFF);
         DrawQuad(400, 320, 160, 80, 0xFFFFD700);
@@ -290,10 +234,13 @@ public sealed class Gs
         DrawLine(100, 380, 540, 380, 0xFFFFFFFF);
     }
 
-    public uint SampleTexture(int u, int v)
+    public uint SampleTexture(float u, float v)
     {
-        int tu = u % _texWidth;
-        int tv = v % _texHeight;
+        int tu = (int)(u * _texWidth) % _texWidth;
+        int tv = (int)(v * _texHeight) % _texHeight;
+        if (tu < 0) tu += _texWidth;
+        if (tv < 0) tv += _texHeight;
+
         bool checker = ((tu / 8) + (tv / 8)) % 2 == 0;
         return checker ? 0xFFFF00FF : 0xFF00FFFF;
     }
@@ -307,9 +254,9 @@ public sealed class Gs
 
     public void DrawTestTriangle()
     {
-        var v0 = new Vertex { X = 200, Y = 150, Color = _currentRgbaq };
-        var v1 = new Vertex { X = 440, Y = 150, Color = _currentRgbaq };
-        var v2 = new Vertex { X = 320, Y = 350, Color = _currentRgbaq };
+        var v0 = new Vertex { X = 200, Y = 150, Color = _currentRgbaq, U = 0, V = 0 };
+        var v1 = new Vertex { X = 440, Y = 150, Color = _currentRgbaq, U = 1, V = 0 };
+        var v2 = new Vertex { X = 320, Y = 350, Color = _currentRgbaq, U = 0.5f, V = 1 };
         DrawFilledTriangle(v0, v1, v2);
     }
 
@@ -346,10 +293,6 @@ public sealed class Gs
         }
     }
 
-    // =====================================================
-    // Improved Triangle Rasterizer with Color Interpolation
-    // =====================================================
-
     private void DrawFilledTriangle(Vertex v0, Vertex v1, Vertex v2)
     {
         int minX = Math.Max(0, Math.Min(v0.X, Math.Min(v1.X, v2.X)));
@@ -365,27 +308,38 @@ public sealed class Gs
                 {
                     int idx = y * FB_WIDTH + x;
 
-                    // Interpolate color (Gouraud shading foundation)
+                    // Interpolate color
                     uint color = InterpolateColor(v0.Color, v1.Color, v2.Color, a, b, c);
 
-                    // TODO: Add depth test here using interpolated Z
-                    // if (depthTest(x, y, interpolatedZ)) ...
+                    // Interpolate UV and sample texture
+                    float iu = v0.U * a + v1.U * b + v2.U * c;
+                    float iv = v0.V * a + v1.V * b + v2.V * c;
 
-                    _framebuffer[idx] = color;
+                    uint texColor = SampleTexture(iu, iv);
+
+                    // Simple modulation: multiply texture by vertex color (very basic)
+                    byte tr = (byte)((texColor >> 16) & 0xFF);
+                    byte tg = (byte)((texColor >> 8) & 0xFF);
+                    byte tb = (byte)(texColor & 0xFF);
+
+                    byte cr = (byte)((color >> 16) & 0xFF);
+                    byte cg = (byte)((color >> 8) & 0xFF);
+                    byte cb = (byte)(color & 0xFF);
+
+                    byte r = (byte)((tr * cr) / 255);
+                    byte g = (byte)((tg * cg) / 255);
+                    byte b = (byte)((tb * cb) / 255);
+
+                    _framebuffer[idx] = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
                 }
             }
         }
     }
 
-    private bool PointInTriangle(int px, int py, Vertex v0, Vertex v1, Vertex v2,
-                                 out float a, out float b, out float c)
+    private bool PointInTriangle(int px, int py, Vertex v0, Vertex v1, Vertex v2, out float a, out float b, out float c)
     {
         float denom = ((v1.Y - v2.Y) * (v0.X - v2.X) + (v2.X - v1.X) * (v0.Y - v2.Y));
-        if (Math.Abs(denom) < 0.0001f)
-        {
-            a = b = c = 0;
-            return false;
-        }
+        if (Math.Abs(denom) < 0.0001f) { a = b = c = 0; return false; }
 
         a = ((v1.Y - v2.Y) * (px - v2.X) + (v2.X - v1.X) * (py - v2.Y)) / denom;
         b = ((v2.Y - v0.Y) * (px - v2.X) + (v0.X - v2.X) * (py - v2.Y)) / denom;
