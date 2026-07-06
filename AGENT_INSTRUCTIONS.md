@@ -16,69 +16,76 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 ---
 
-## Round 5 Review
+## Honest Project Status Review (Rescan)
 
-**Good progress this round:**
+I re-scanned the project and the latest agent updates. Here is a clear assessment:
 
-- **Delta**: Successfully implemented basic SIF interrupt generation (`Iop.cs` now triggers `Intc.Raise` on SIF mailbox write). This is a meaningful, low-risk improvement that adds the first real IOP → EE interrupt path. Excellent work.
-- **Charlie**: Expanded the smoke test suite with three new deterministic scenarios (`Determinism_MasterCycles`, `SaveState_MasterCyclesRoundTrip`, `Reset_MasterCycles`). Solid foundational testing work.
+**Agents who delivered on the previous round:**
+- **Delta**: Successfully implemented basic SIF interrupt generation. Code is present and correct in `Iop.cs`. Good, concrete delivery.
+- **Charlie**: Expanded smoke tests with three new deterministic scenarios. Reliable delivery.
 
-**Still in progress:**
-- George, Foxtrot + Alpha, and Bravo have not yet delivered concrete implementations or proposals from the previous round.
+**Agents who did NOT deliver on the previous round:**
+- **George**: Still only in proposal stage. No work-cost prototype implemented.
+- **Foxtrot + Alpha**: Still in coordination phase. No concrete low-risk timing improvement shipped.
+- **Bravo**: No scheduler feedback proposal produced.
+
+**Assessment**: Some agents are consistently turning analysis into working code. Others are remaining in the "thinking/proposing" phase. We need to tighten accountability.
 
 ---
 
-## Next Orders (Round 6)
+## Next Orders (Round 7) - Accountability Focus
 
 ### Delta – IOP + SIF
-**Status**: `[COMPLETE]` (SIF interrupt generation)
+**Status**: Delivered
 
 **Next Orders**:
-- Stand by. Your SIF interrupt change is a good foundation. Be ready to extend it (e.g. more interrupt sources or status flag handling) once we validate the current implementation.
+- Good work. Stand by for validation and potential small extensions.
 
-### Charlie – Foundationalist (Lead)
+### Charlie – Foundationalist (Lead + Reviewer)
 **Next Orders**:
-- Review Delta’s SIF interrupt implementation and provide feedback (correctness, edge cases, test coverage).
-- Review George’s GIF/GS work-cost proposal and recommend whether we should pursue it now or later.
-- Continue expanding smoke tests if new synchronization behavior (like SIF interrupts) should be covered.
+- Review Delta’s SIF interrupt implementation for correctness and test coverage.
+- Provide a clear recommendation on whether George’s GIF/GS work-cost idea should be pursued now.
+- If you have bandwidth, begin writing a simple test that exercises the new SIF interrupt path.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Move from proposal to a small prototype.
-- Implement a minimal work-cost return in `Gif.Step()` or `Gs.Step()` (even if approximate).
-- Coordinate with Bravo on how this information could eventually influence scheduling.
-- Keep the change small and isolated.
+- **This round you must deliver a small prototype**, not just a proposal.
+- Implement a minimal version of work-cost feedback in `Gif.Step()` or `Gs.Step()` (even if very approximate).
+- The goal is to have *something* working that can be reviewed, even if basic.
+- If blocked, clearly state why in your section.
 
 ### Foxtrot + Alpha (VU / EE Timing)
 **Next Orders**:
-- Move from coordination to a concrete, low-risk change.
-- Pick one small area (e.g. better COP2 timing feedback or simple EFU latency modeling) and implement a minimal version.
-- Coordinate so changes in one don’t break the other.
+- **This round you must deliver one small concrete change**.
+- Choose the lowest-risk, highest-value item from your earlier analysis and implement it.
+- Examples: simple EFU latency modeling, better COP2 timing return value, or basic stall reporting.
+- Coordinate so your changes don’t conflict.
 
 ### Bravo – Scheduler
 **Next Orders**:
-- Produce a short proposal for how the Scheduler could accept timing feedback from components (e.g. GIF/GS work cost or VU stalls).
-- Keep it lightweight — we are not rewriting the scheduler yet. A simple extension point or optional callback is enough for now.
-- Review Delta’s SIF interrupt work for any scheduler implications.
+- **This round you must produce a written proposal**.
+- Describe how the Scheduler could accept optional timing feedback from components (e.g. a simple interface or method).
+- Keep it lightweight and non-breaking.
+- Review Delta’s SIF interrupt change for any implications.
 
 ### Echo – UI Developer
 **Next Orders**:
-- Continue UI planning. You may begin light prototyping on a separate branch if ready.
+- Continue planning. No urgent task this round.
 
 ---
 
 ## Project Manager Notes
 
-Delta delivered a real, useful improvement this round. Charlie is building good test coverage.
+We have a split in delivery speed. Some agents are shipping working code. Others are staying in analysis mode.
 
-The next focus is turning the remaining proposals into small implementations:
-- George: GIF/GS work cost prototype
-- Foxtrot + Alpha: One small VU/EE timing improvement
-- Bravo: Lightweight scheduler feedback proposal
+This round is about **accountability and momentum**:
+- George, Foxtrot+Alpha, and Bravo are expected to produce *something* concrete (implementation or written proposal).
+- Charlie is now acting as primary reviewer/coordinator.
+- Delta has earned a short stand-by period after good delivery.
 
-Charlie will act as the reviewer/coordinator for the above items.
+If any agent is blocked or unclear on scope, they should state it clearly in their section instead of staying silent.
 
-Keep changes minimal and reviewable. We are still building confidence in the accuracy layer.
+Let’s see stronger delivery this round.
 
 ---
 
