@@ -1,0 +1,40 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="DetPS2.Desktop.MainWindow"
+        Title="DetPS2Sharp — Deterministic PS2 Emulator"
+        Width="900" Height="700"
+        MinWidth="800" MinHeight="600">
+
+    <Grid RowDefinitions="Auto,*,Auto">
+        <!-- Top Menu / Toolbar -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6" Margin="8">
+            <Button Content="Load BIOS" Click="OnLoadBiosClick" />
+            <Button Content="Load ELF" Click="OnLoadElfClick" />
+            <Separator Width="1" Margin="4,0" />
+            <Button Content="Run" Click="OnRunClick" />
+            <Button Content="Pause" Click="OnPauseClick" />
+            <Button Content="Step 1M cycles" Click="OnStepClick" />
+            <Button Content="Reset" Click="OnResetClick" />
+            <Separator Width="1" Margin="4,0" />
+            <Button Content="Test Draw" Click="OnTestDrawClick" />
+            <Button Content="Save State" Click="OnSaveStateClick" />
+            <Button Content="Load State" Click="OnLoadStateClick" />
+        </StackPanel>
+
+        <!-- Main Display Area -->
+        <Border Grid.Row="1" BorderBrush="Gray" BorderThickness="1" Margin="8" Background="Black">
+            <Image x:Name="FramebufferImage"
+                   Stretch="Uniform"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center" />
+        </Border>
+
+        <!-- Status Bar -->
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="12" Margin="8,4">
+            <TextBlock x:Name="StatusText" Text="Ready - Load BIOS or ELF to begin" />
+            <TextBlock x:Name="CyclesText" Text="Master Cycles: 0" />
+            <TextBlock x:Name="FpsText" Text="FPS: --" />
+        </StackPanel>
+    </Grid>
+
+</Window>
