@@ -4,13 +4,16 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Base class for VU0 and VU1.
+/// Base class for VU0 and VU1 - Phase 6 Solid Implementation.
 /// 
-/// Significantly expanded implementation for Phase 6.
-/// Covers a large portion of the common VU instruction set.
-/// Focus on determinism, clean code, and reasonable accuracy.
+/// Expanded instruction set with improved accuracy and structure.
+/// Includes arithmetic, logical, conversion, EFU, and move/shuffle ops.
 /// 
-/// Upper/lower pipe parallelism and exact cycle timing are simplified.
+/// Limitations (documented for future work):
+/// - Upper/Lower pipe execution is simplified (no true parallel execution yet)
+/// - Per-field write masks are approximated
+/// - Cycle timing and stalls are basic
+/// - Full microprogrammed behavior is not yet emulated
 /// </summary>
 public abstract class VectorUnit
 {
@@ -19,26 +22,14 @@ public abstract class VectorUnit
     [StructLayout(LayoutKind.Sequential)]
     public struct VuReg128
     {
-        public float X;
-        public float Y;
-        public float Z;
-        public float W;
-
+        public float X, Y, Z, W;
         public override string ToString() => $"({X}, {Y}, {Z}, {W})";
     }
 
     protected readonly VuReg128[] _vf = new VuReg128[32];
-
     public VuReg128 ACC;
 
-    public uint Status;
-    public uint MAC;
-    public uint Clipping;
-    public uint R;
-    public uint I;
-    public uint Q;
-    public uint P;
-
+    public uint Status, MAC, Clipping, R, I, Q, P;
     public uint PC;
     public ulong LocalCycles;
 
@@ -52,16 +43,9 @@ public abstract class VectorUnit
     {
         Array.Clear(_vf);
         ACC = default;
-        Status = 0;
-        MAC = 0;
-        Clipping = 0;
-        R = 0;
-        I = 0;
-        Q = 0;
-        P = 0;
+        Status = MAC = Clipping = R = I = Q = P = 0;
         PC = 0;
         LocalCycles = 0;
-
         _vf[0] = new VuReg128 { X = 0f, Y = 0f, Z = 0f, W = 1f };
     }
 
@@ -69,10 +53,9 @@ public abstract class VectorUnit
     {
         for (ulong i = 0; i < cycles; i++)
         {
-            if (PC < 16 * 1024) // Simplified VU memory limit
+            if (PC < 16 * 1024)
             {
-                uint opcode = _memory.Read32(PC);
-                ExecuteInstruction(opcode);
+                ExecuteInstruction(_memory.Read32(PC));
                 PC += 4;
             }
             else break;
@@ -87,14 +70,8 @@ public abstract class VectorUnit
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 6) & 0x1F;
 
-        switch (primary)
-        {
-            case 0x00:
-                HandleSpecial(opcode, rs, rt, rd);
-                break;
-            default:
-                break;
-        }
+        if (primary == 0x00)
+            HandleSpecial(opcode, rs, rt, rd);
     }
 
     private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd)
@@ -104,55 +81,43 @@ public abstract class VectorUnit
         switch (function)
         {
             // Arithmetic
-            case 0x00: case 0x01:
-                ApplyVectorOp(rs, rt, rd, (a, b) => a + b); break;
-            case 0x02:
-                ApplyVectorOp(rs, rt, rd, (a, b) => a - b); break;
-            case 0x03:
-                ApplyVectorOp(rs, rt, rd, (a, b) => a * b); break;
+            case 0x00: case 0x01: ApplyArith(rs, rt, rd, (a,b) => a + b); break;
+            case 0x02: ApplyArith(rs, rt, rd, (a,b) => a - b); break;
+            case 0x03: ApplyArith(rs, rt, rd, (a,b) => a * b); break;
             case 0x04: ApplyMadd(rs, rt, rd); break;
             case 0x05: ApplyMsub(rs, rt, rd); break;
 
-            // Move / Shuffle
+            // Move & Shuffle
             case 0x09: _vf[rd] = _vf[rs]; break;
             case 0x0A: // MR32
-                _vf[rd].X = _vf[rs].Y; _vf[rd].Y = _vf[rs].Z;
-                _vf[rd].Z = _vf[rs].W; _vf[rd].W = _vf[rs].X; break;
+                _vf[rd] = new VuReg128 { X = _vf[rs].Y, Y = _vf[rs].Z, Z = _vf[rs].W, W = _vf[rs].X }; break;
 
             // Min/Max/Abs
-            case 0x0E: // ABS
-                _vf[rd].X = Math.Abs(_vf[rs].X); _vf[rd].Y = Math.Abs(_vf[rs].Y);
-                _vf[rd].Z = Math.Abs(_vf[rs].Z); _vf[rd].W = Math.Abs(_vf[rs].W); break;
-            case 0x10: // MIN
-                _vf[rd].X = Math.Min(_vf[rs].X, _vf[rt].X); /* ... repeat for YZW ... */ break;
-            case 0x11: // MAX
-                _vf[rd].X = Math.Max(_vf[rs].X, _vf[rt].X); break;
+            case 0x0E: ApplyAbs(rs, rd); break;
+            case 0x10: ApplyMin(rs, rt, rd); break;
+            case 0x11: ApplyMax(rs, rt, rd); break;
 
-            // Logical (bitwise)
-            case 0x17: case 0x18: case 0x19:
-                ApplyLogical(function, rs, rt, rd); break;
+            // Logical
+            case 0x17: case 0x18: case 0x19: ApplyLogical(function, rs, rt, rd); break;
 
             // Shifts
-            case 0x1A: case 0x1B: case 0x1C:
-                ApplyShift(function, rs, rt, rd); break;
+            case 0x1A: case 0x1B: case 0x1C: ApplyShift(function, rs, rt, rd); break;
 
-            // Conversions (improved)
+            // Conversions
             case 0x1E: case 0x1F: case 0x20: case 0x21:
             case 0x22: case 0x23: case 0x24: case 0x25:
                 HandleConversion(function, rs, rd); break;
 
-            // EFU basics
-            case 0x1D:
-                HandleEfu(rs, rt, rd); break;
+            // EFU
+            case 0x1D: HandleEfu(rs, rt, rd); break;
 
-            case 0x0D: // CLIP (stub)
-                break;
+            case 0x0D: /* CLIP stub */ break;
 
             default: break;
         }
     }
 
-    private void ApplyVectorOp(uint rs, uint rt, uint rd, Func<float, float, float> op)
+    private void ApplyArith(uint rs, uint rt, uint rd, Func<float, float, float> op)
     {
         _vf[rd].X = op(_vf[rs].X, _vf[rt].X);
         _vf[rd].Y = op(_vf[rs].Y, _vf[rt].Y);
@@ -176,14 +141,43 @@ public abstract class VectorUnit
         _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
     }
 
+    private void ApplyAbs(uint rs, uint rd)
+    {
+        _vf[rd].X = Math.Abs(_vf[rs].X);
+        _vf[rd].Y = Math.Abs(_vf[rs].Y);
+        _vf[rd].Z = Math.Abs(_vf[rs].Z);
+        _vf[rd].W = Math.Abs(_vf[rs].W);
+    }
+
+    private void ApplyMin(uint rs, uint rt, uint rd)
+    {
+        _vf[rd].X = Math.Min(_vf[rs].X, _vf[rt].X);
+        _vf[rd].Y = Math.Min(_vf[rs].Y, _vf[rt].Y);
+        _vf[rd].Z = Math.Min(_vf[rs].Z, _vf[rt].Z);
+        _vf[rd].W = Math.Min(_vf[rs].W, _vf[rt].W);
+    }
+
+    private void ApplyMax(uint rs, uint rt, uint rd)
+    {
+        _vf[rd].X = Math.Max(_vf[rs].X, _vf[rt].X);
+        _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
+        _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
+        _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
+    }
+
     private void ApplyLogical(uint function, uint rs, uint rt, uint rd)
     {
         int x = SingleToInt32Bits(_vf[rs].X);
         int y = SingleToInt32Bits(_vf[rt].X);
-        int res = function switch { 0x17 => x & y, 0x18 => x | y, 0x19 => x ^ y, _ => x };
-        _vf[rd].X = Int32BitsToSingle(res);
-        // Simplified for other lanes
-        _vf[rd].Y = _vf[rd].X; _vf[rd].Z = _vf[rd].X; _vf[rd].W = _vf[rd].X;
+        int res = function switch
+        {
+            0x17 => x & y,
+            0x18 => x | y,
+            0x19 => x ^ y,
+            _ => x
+        };
+        float f = Int32BitsToSingle(res);
+        _vf[rd].X = _vf[rd].Y = _vf[rd].Z = _vf[rd].W = f;
     }
 
     private void ApplyShift(uint function, uint rs, uint rt, uint rd)
@@ -198,39 +192,66 @@ public abstract class VectorUnit
             _ => val
         };
         _vf[rd].X = Int32BitsToSingle(res);
+        _vf[rd].Y = _vf[rd].Z = _vf[rd].W = _vf[rd].X;
     }
 
     private void HandleConversion(uint function, uint rs, uint rd)
     {
-        float val = _vf[rs].X;
+        float v = _vf[rs].X;
+        int iv = SingleToInt32Bits(v);
+
         float result = function switch
         {
-            0x1E => (float)SingleToInt32Bits(val),           // ITOF0
-            0x1F => Int32BitsToSingle((int)val),             // FTOI0
-            0x20 => SingleToInt32Bits(val) / 16.0f,          // ITOF4
-            0x21 => Int32BitsToSingle((int)(val * 16.0f)),   // FTOI4
-            0x22 => SingleToInt32Bits(val) / 4096.0f,
-            0x23 => Int32BitsToSingle((int)(val * 4096.0f)),
-            0x24 => SingleToInt32Bits(val) / 32768.0f,
-            0x25 => Int32BitsToSingle((int)(val * 32768.0f)),
-            _ => val
+            0x1E => (float)iv,                           // ITOF0
+            0x1F => Int32BitsToSingle((int)v),           // FTOI0
+            0x20 => iv / 16.0f,                          // ITOF4
+            0x21 => Int32BitsToSingle((int)(v * 16f)),   // FTOI4
+            0x22 => iv / 4096.0f,                        // ITOF12
+            0x23 => Int32BitsToSingle((int)(v * 4096f)), // FTOI12
+            0x24 => iv / 32768.0f,                       // ITOF15
+            0x25 => Int32BitsToSingle((int)(v * 32768f)),// FTOI15
+            _ => v
         };
-        _vf[rd].X = result; _vf[rd].Y = result; _vf[rd].Z = result; _vf[rd].W = result;
+
+        _vf[rd].X = _vf[rd].Y = _vf[rd].Z = _vf[rd].W = result;
     }
 
     private void HandleEfu(uint rs, uint rt, uint rd)
     {
         float a = _vf[rs].X;
         float b = _vf[rt].X;
-        float res = (b != 0) ? a / b : 0f; // DIV simplified
-        _vf[rd].X = res; _vf[rd].Y = res; _vf[rd].Z = res; _vf[rd].W = res;
+
+        // Basic EFU - can expand with SQRT/RSQRT later
+        float res = b != 0 ? a / b : 0f;
+        _vf[rd].X = _vf[rd].Y = _vf[rd].Z = _vf[rd].W = res;
     }
 
     private static int SingleToInt32Bits(float v) => BitConverter.SingleToInt32Bits(v);
     private static float Int32BitsToSingle(int v) => BitConverter.Int32BitsToSingle(v);
 
-    protected float SafeAdd(float a, float b) => a + b;
+    public virtual void SaveState(System.IO.BinaryWriter writer)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            writer.Write(_vf[i].X); writer.Write(_vf[i].Y);
+            writer.Write(_vf[i].Z); writer.Write(_vf[i].W);
+        }
+        writer.Write(ACC.X); writer.Write(ACC.Y); writer.Write(ACC.Z); writer.Write(ACC.W);
+        writer.Write(Status); writer.Write(MAC); writer.Write(Clipping);
+        writer.Write(R); writer.Write(I); writer.Write(Q); writer.Write(P); writer.Write(PC);
+    }
 
-    public virtual void SaveState(System.IO.BinaryWriter writer) { /* ... existing save ... */ }
-    public virtual void LoadState(System.IO.BinaryReader reader) { /* ... existing load ... */ }
+    public virtual void LoadState(System.IO.BinaryReader reader)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            _vf[i].X = reader.ReadSingle(); _vf[i].Y = reader.ReadSingle();
+            _vf[i].Z = reader.ReadSingle(); _vf[i].W = reader.ReadSingle();
+        }
+        ACC.X = reader.ReadSingle(); ACC.Y = reader.ReadSingle();
+        ACC.Z = reader.ReadSingle(); ACC.W = reader.ReadSingle();
+        Status = reader.ReadUInt32(); MAC = reader.ReadUInt32(); Clipping = reader.ReadUInt32();
+        R = reader.ReadUInt32(); I = reader.ReadUInt32(); Q = reader.ReadUInt32(); P = reader.ReadUInt32();
+        PC = reader.ReadUInt32();
+    }
 }
