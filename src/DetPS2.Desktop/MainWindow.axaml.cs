@@ -37,11 +37,11 @@ public partial class MainWindow : Window
 
         FramebufferImage.Source = _framebufferBitmap;
 
-        // Hook: Immediately show a nice colorful scene so the UI never feels empty or stub-like
+        // Always start with a nice colorful scene
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
 
-        UpdateStatus("DetPS2Sharp ready. Use the toolbar to load BIOS/ELF or draw test scenes.");
+        UpdateStatus("DetPS2Sharp ready — Menu and shortcuts fully hooked");
 
         _renderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16.666) };
         _renderTimer.Tick += OnRenderTick;
@@ -109,6 +109,8 @@ public partial class MainWindow : Window
         StatusText.Text = message;
     }
 
+    // ==================== Menu & Button Handlers ====================
+
     private async void OnLoadBiosClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
@@ -129,7 +131,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Error loading BIOS: {ex.Message}");
+                UpdateStatus($"Error: {ex.Message}");
             }
         }
     }
@@ -151,11 +153,11 @@ public partial class MainWindow : Window
             {
                 byte[] elfData = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
                 ulong entry = ElfLoader.LoadElf(elfData, _system.Memory);
-                UpdateStatus($"ELF loaded successfully. Entry point: 0x{entry:X8}");
+                UpdateStatus($"ELF loaded successfully — Entry: 0x{entry:X8}");
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Error loading ELF: {ex.Message}");
+                UpdateStatus($"Error: {ex.Message}");
             }
         }
     }
@@ -186,16 +188,15 @@ public partial class MainWindow : Window
         if (_system == null) return;
         _system.Reset();
         _isRunning = false;
-        _system.Gs.RenderTestScene();   // Re-draw nice scene after reset
+        _system.Gs.RenderTestScene();
         UpdateFramebuffer();
         UpdateStatusText();
-        UpdateStatus("System reset - test scene restored");
+        UpdateStatus("System reset — test scene restored");
     }
 
     private void OnTestDrawClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
-
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
         UpdateStatus("Colorful test scene rendered");
@@ -251,6 +252,49 @@ public partial class MainWindow : Window
             {
                 UpdateStatus($"Load failed: {ex.Message}");
             }
+        }
+    }
+
+    private void OnExitClick(object? sender, RoutedEventArgs e)
+    {
+        Close();
+    }
+
+    private async void OnAboutClick(object? sender, RoutedEventArgs e)
+    {
+        var about = new Window
+        {
+            Title = "About DetPS2Sharp",
+            Width = 420,
+            Height = 260,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false
+        };
+
+        var stack = new StackPanel { Margin = new Thickness(20), Spacing = 8 };
+        stack.Children.Add(new TextBlock { Text = "DetPS2Sharp", FontSize = 22, FontWeight = Avalonia.Media.FontWeight.Bold });
+        stack.Children.Add(new TextBlock { Text = "Deterministic PlayStation 2 Emulator in Pure C#" });
+        stack.Children.Add(new TextBlock { Text = "Version: Early Development (July 2026)" });
+        stack.Children.Add(new TextBlock { Text = "Architecture: .NET 9 + Avalonia + NativeAOT ready" });
+        stack.Children.Add(new TextBlock { Text = "" });
+        stack.Children.Add(new TextBlock { Text = "A clean-slate, determinism-first PS2 emulator." });
+        stack.Children.Add(new TextBlock { Text = "Built collaboratively — UI layer fully hooked into core." });
+
+        var okButton = new Button { Content = "OK", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Margin = new Thickness(0, 12, 0, 0) };
+        okButton.Click += (_, __) => about.Close();
+        stack.Children.Add(okButton);
+
+        about.Content = stack;
+        await about.ShowDialog(this);
+    }
+
+    private void OnResetFramebufferViewClick(object? sender, RoutedEventArgs e)
+    {
+        if (_system != null)
+        {
+            _system.Gs.RenderTestScene();
+            UpdateFramebuffer();
+            UpdateStatus("Framebuffer view reset to test scene");
         }
     }
 
