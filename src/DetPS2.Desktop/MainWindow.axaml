@@ -3,7 +3,8 @@
         x:Class="DetPS2.Desktop.MainWindow"
         Title="DetPS2Sharp — Deterministic PS2 Emulator"
         Width="960" Height="720"
-        MinWidth="800" MinHeight="600">
+        MinWidth="800" MinHeight="600"
+        DragDrop.AllowDrop="True">
 
     <Grid RowDefinitions="Auto,Auto,*,Auto">
         <!-- Menu Bar -->
@@ -64,9 +65,11 @@
             </StackPanel>
         </StackPanel>
 
-        <!-- Main Display Area -->
-        <Border Grid.Row="2" BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
-                CornerRadius="4">
+        <!-- Main Display Area (also accepts drops) -->
+        <Border Grid.Row="2" x:Name="DisplayBorder"
+                BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
+                CornerRadius="4"
+                DragDrop.AllowDrop="True">
             <Image x:Name="FramebufferImage"
                    Stretch="Uniform"
                    HorizontalAlignment="Center"
