@@ -81,6 +81,14 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 **Blocked By**: Interface fixes from Alpha, Bravo, Delta, Foxtrot, George.
 
+**[COMPLETE]** Fixed dual execution path in Ps2System.cs:
+- Removed public `Step()` method that hardcoded budget=16.
+- `RunFor(ulong)` is now the only public execution method.
+- Explicit `ISchedulable` implementation is internal and clean.
+- `RegisterComponents()` produces stable registration order.
+
+**[IN PROGRESS]** Starting `SaveState.cs` cleanup (removing DateTime.UtcNow and adding MasterCycles support).
+
 ---
 
 ### Delta – IOP (R3000A) core + SIF improvements
@@ -93,12 +101,6 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 - Report any missing IOP <-> EE synchronization points you discover.
 
 **Blocked By**: None for the contract fix.
-
-**[COMPLETE]**  
-- Confirmed `Iop.cs` already correctly implements `public int Step(ulong maxCycles)` and returns the number of cycles executed.
-- Fixed `Sif.cs`: Changed `void Step(ulong cycles)` to `public int Step(ulong maxCycles)` and made `Sif` implement `ISchedulable`. Commit: 20ea81f
-- No other contract or determinism issues found in my owned files.
-- SIF DMA is still instantaneous; real cycle-accurate DMA can be modeled later if needed.
 
 ---
 
@@ -176,6 +178,6 @@ When working:
 ---
 
 **End of Agent Instructions**  
-This file lives at the root of the repository. All agents must treat it as the living command surface.  
+This file lives at the root of the repository. All agents must treat it as the living command surface. 
 
 Let's lock the foundation together. Small consistent steps > big plans.
