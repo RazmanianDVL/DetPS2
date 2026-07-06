@@ -15,9 +15,11 @@ namespace DetPS2.Core;
 /// Execution order: Components are stepped in the order they were registered via Register().
 /// This order is stable and deterministic.
 /// 
-/// Step return value: Currently ignored by the scheduler. It is reserved for future
-/// back-pressure / variable cycle consumption tracking once more components report
-/// accurate cycle counts.
+/// Step return value handling:
+/// - We now capture the int returned by component.Step(thisSlice).
+/// - Currently we still advance MasterCycles by the requested slice size.
+/// - The captured value is prepared for future back-pressure logic
+///   (when components start returning fewer cycles than requested).
 /// </summary>
 public sealed class Scheduler
 {
@@ -53,8 +55,9 @@ public sealed class Scheduler
 
             foreach (var component in _components)
             {
-                // Note: return value is currently ignored (see class docs)
-                component.Step(thisSlice);
+                int cyclesAdvanced = component.Step(thisSlice);
+                // cyclesAdvanced is captured for future back-pressure use.
+                // For now we still advance by the full requested slice.
             }
 
             _masterCycles += thisSlice;
