@@ -29,6 +29,10 @@
             </MenuItem>
 
             <MenuItem Header="_View">
+                <MenuItem Header="Zoom _In" Click="OnZoomInClick" HotKey="Ctrl+Plus" />
+                <MenuItem Header="Zoom _Out" Click="OnZoomOutClick" HotKey="Ctrl+Minus" />
+                <MenuItem Header="Reset _Zoom" Click="OnResetZoomClick" HotKey="Ctrl+0" />
+                <Separator />
                 <MenuItem Header="Reset _Framebuffer View" Click="OnResetFramebufferViewClick" />
             </MenuItem>
 
@@ -62,6 +66,16 @@
                     <ComboBoxItem Content="Unlimited" />
                 </ComboBox>
             </StackPanel>
+
+            <Separator Width="1" Margin="6,2" />
+
+            <!-- Zoom Controls -->
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="2">
+                <Button Content="➖" Click="OnZoomOutClick" ToolTip.Tip="Zoom Out (Ctrl+-)" Width="32" />
+                <Button Content="➕" Click="OnZoomInClick" ToolTip.Tip="Zoom In (Ctrl++)" Width="32" />
+                <Button Content="⟲" Click="OnResetZoomClick" ToolTip.Tip="Reset Zoom (Ctrl+0)" Width="32" />
+                <TextBlock x:Name="ZoomLevelText" Text="100%" VerticalAlignment="Center" Margin="6,0,0,0" Width="50" />
+            </StackPanel>
         </StackPanel>
 
         <!-- Main Display Area -->
@@ -69,11 +83,13 @@
                 BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
                 CornerRadius="4"
                 DragDrop.AllowDrop="True">
-            <Image x:Name="FramebufferImage"
-                   Stretch="Uniform"
-                   HorizontalAlignment="Center"
-                   VerticalAlignment="Center"
-                   Margin="4" />
+            <Viewbox x:Name="FramebufferViewbox" Stretch="Uniform">
+                <Image x:Name="FramebufferImage"
+                       Stretch="None"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       RenderTransformOrigin="0.5,0.5" />
+            </Viewbox>
         </Border>
 
         <!-- Right Sidebar -->
