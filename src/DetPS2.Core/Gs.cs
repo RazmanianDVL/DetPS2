@@ -229,7 +229,7 @@ public sealed class Gs
 
         for (int y = 0; y < FB_HEIGHT; y++)
         {
-            for (int x = x = 0; x < FB_WIDTH; x++)
+            for (int x = 0; x < FB_WIDTH; x++)
             {
                 int index = y * FB_WIDTH + x;
                 uint pixel = _framebuffer[index];
