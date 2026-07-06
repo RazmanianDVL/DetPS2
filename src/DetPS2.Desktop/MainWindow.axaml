@@ -2,11 +2,11 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="DetPS2.Desktop.MainWindow"
         Title="DetPS2Sharp — Deterministic PS2 Emulator"
-        Width="1100" Height="720"
-        MinWidth="900" MinHeight="600"
+        Width="1100" Height="780"
+        MinWidth="900" MinHeight="650"
         DragDrop.AllowDrop="True">
 
-    <Grid ColumnDefinitions="*, Auto" RowDefinitions="Auto,Auto,*,Auto">
+    <Grid ColumnDefinitions="*, Auto" RowDefinitions="Auto,Auto,*,Auto,Auto">
         <!-- Menu Bar -->
         <Menu Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="0" Background="{DynamicResource MenuBackground}">
             <MenuItem Header="_File">
@@ -53,7 +53,6 @@
 
             <Separator Width="1" Margin="6,2" />
 
-            <!-- Emulation Speed Control -->
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="4">
                 <TextBlock Text="Speed:" VerticalAlignment="Center" Margin="0,0,4,0" />
                 <ComboBox x:Name="SpeedCombo" Width="110" SelectedIndex="1" SelectionChanged="OnSpeedChanged">
@@ -77,7 +76,7 @@
                    Margin="4" />
         </Border>
 
-        <!-- Right Sidebar: System Status Panel -->
+        <!-- Right Sidebar -->
         <Border Grid.Column="1" Grid.Row="2" Width="240" Margin="0,8,8,8"
                 Background="#1a1a22" BorderBrush="#444" BorderThickness="1" CornerRadius="4">
             <StackPanel Margin="12" Spacing="10">
@@ -111,8 +110,27 @@
             </StackPanel>
         </Border>
 
-        <!-- Status Bar -->
+        <!-- Bottom Log Panel -->
         <Border Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="3" 
+                Background="#111" BorderBrush="#333" BorderThickness="1" Margin="8,0,8,4" CornerRadius="4">
+            <Grid RowDefinitions="Auto,*">
+                <TextBlock Text="ACTION LOG" FontSize="11" Foreground="#888" Margin="8,4,8,2" />
+                <ScrollViewer Grid.Row="1" Margin="4" VerticalScrollBarVisibility="Auto">
+                    <TextBox x:Name="LogTextBox"
+                             IsReadOnly="True"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             Foreground="#ccc"
+                             FontFamily="Consolas, Menlo, monospace"
+                             FontSize="12" />
+                </ScrollViewer>
+            </Grid>
+        </Border>
+
+        <!-- Status Bar -->
+        <Border Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="4" 
                 Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" Padding="8,4">
             <StackPanel Orientation="Horizontal" Spacing="16">
                 <TextBlock x:Name="StatusText" Text="Ready" VerticalAlignment="Center" />
