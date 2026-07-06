@@ -30,13 +30,13 @@
 
 **Completed Work**:
 - Created `Vu1` class with Vif1 data reception and quadword-aware buffering/processing
-- Updated `Vif` class with realistic quadword transfer support to VU1 (`SendQuadwordToVu1`)
-- Significantly expanded shared `VectorUnit` instruction set
-- Implemented real instructions: AND, OR, XOR, SLL, SRL, SRA (using bit representation for determinism)
-- Added floating-point handling foundation (`SafeAdd` placeholder)
-- Improved COP2 routing in `EmotionEngine` with full operand passing
-- Maintained strong determinism focus across all new code
-- SaveState support extended
+- Updated `Vif` class with realistic quadword transfer support to VU1
+- Implemented real instructions: AND, OR, XOR, SLL, SRL, SRA
+- Implemented ITOF0/4/12/15 and FTOI0/4/12/15 conversion instructions
+- Added floating-point handling foundation (`SafeAdd`)
+- Improved COP2 routing in `EmotionEngine`
+- Strong determinism focus maintained
+- SaveState support
 
 **Remaining Work in Phase 6**:
 - Complete remaining VU instructions
