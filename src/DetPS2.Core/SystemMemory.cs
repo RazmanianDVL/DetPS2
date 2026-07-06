@@ -6,6 +6,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// System Memory with raw access for save states.
+/// Added LoadBinary helper for ElfLoader compatibility.
 /// </summary>
 public sealed class SystemMemory
 {
@@ -62,6 +63,18 @@ public sealed class SystemMemory
         Write8(vaddr + 1, (byte)(value >> 8));
         Write8(vaddr + 2, (byte)(value >> 16));
         Write8(vaddr + 3, (byte)(value >> 24));
+    }
+
+    /// <summary>
+    /// Load a binary blob into memory at the given virtual address.
+    /// Used by ElfLoader.
+    /// </summary>
+    public void LoadBinary(ReadOnlySpan<byte> data, ulong vaddr)
+    {
+        for (int i = 0; i < data.Length; i++)
+        {
+            Write8(vaddr + (ulong)i, data[i]);
+        }
     }
 
     /// <summary>
