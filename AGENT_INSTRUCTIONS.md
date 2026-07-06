@@ -95,6 +95,41 @@ We are now moving into the next phase. The focus shifts from fixing integration 
 
 ---
 
+## [6.2] Delta – IOP + SIF Analysis
+
+**[IN PROGRESS]** Initial review of IOP ↔ EE synchronization (2026-07-06)
+
+**Current State Findings:**
+
+1. **SIF Mailbox Mechanism**
+   - `Iop` has `WriteSifMailboxFromEE(uint value)` and `ReadSifMailboxToEE()`.
+   - These are simple mirrored registers (`SifMbxToEE = ~value`).
+   - No visible connection yet to real SIF DMA command queues or status flags used by actual PS2 BIOS/games.
+
+2. **Interrupt Path**
+   - `Iop` constructor takes an `Intc` reference.
+   - However, the current `Iop` implementation **never calls** `Intc.Raise(...)` or equivalent.
+   - There is no interrupt generation logic inside `Step()` or after SIF mailbox writes.
+   - This means the IOP currently cannot signal the EE via interrupts (a major missing piece for real synchronization).
+
+3. **Timing / Cycle Interaction**
+   - IOP runs in its own `Step(ulong maxCycles)` via the Scheduler.
+   - No modeled stalls, bus contention, or synchronization points with the EE’s memory accesses or COP0 status.
+   - SIF DMA (`Sif.DoDmaTransfer`) is currently instantaneous.
+
+4. **Missing Synchronization Points (High Priority for later)**
+   - IOP → EE interrupt generation (especially SIF IRQ).
+   - Proper SIF command/status register behavior (beyond simple mailboxes).
+   - Cycle-accurate modeling of SIF DMA transfers.
+   - EE-side SIF handling (likely lives in EmotionEngine COP0 or a future MMIO bus).
+
+**Recommendation for Phase 6.2:**
+Start with adding basic SIF interrupt generation from IOP when mailbox is written (or when `SendCommand` is called on Sif). This would be a low-risk, high-value synchronization improvement.
+
+**[COMPLETE]** Initial analysis documented.
+
+---
+
 ## Communication Protocol
 
 Continue using clear markers when updating your section (`[IN PROGRESS]`, `[COMPLETE]`, `[BLOCKER]`, `[PROPOSAL]`, etc.).
