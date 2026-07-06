@@ -5,8 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// VU1 - Vector Unit 1.
-/// Phase 6 solid state.
-/// Receives quadword data from VIF1 and executes instructions.
+/// Foxtrot - Phase 6.1 focus: ISchedulable contract compliance.
 /// </summary>
 public sealed class Vu1 : VectorUnit
 {
@@ -22,9 +21,9 @@ public sealed class Vu1 : VectorUnit
         _currentQuadwordWordCount = 0;
     }
 
-    public override void Step(ulong cycles)
+    public override int Step(ulong maxCycles)
     {
-        // Process any pending data from VIF1
+        // Process any pending data from VIF1 before executing
         while (_incomingData.Count > 0)
         {
             uint data = _incomingData.Dequeue();
@@ -35,7 +34,7 @@ public sealed class Vu1 : VectorUnit
                 _currentQuadwordWordCount = 0;
         }
 
-        base.Step(cycles);
+        return base.Step(maxCycles);
     }
 
     public void ReceiveFromVif1(uint data) => _incomingData.Enqueue(data);
