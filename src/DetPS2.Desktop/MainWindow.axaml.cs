@@ -25,7 +25,6 @@ public partial class MainWindow : Window
     private ulong _cyclesPerTick = 1_500_000;
     private string _currentSpeedMode = "Normal";
 
-    // Zoom
     private double _zoomLevel = 1.0;
     private const double ZoomStep = 0.25;
     private const double MinZoom = 0.5;
@@ -132,6 +131,17 @@ public partial class MainWindow : Window
             UpdateSidebar();
         }
         catch (Exception ex) { Log($"Drop error: {ex.Message}"); }
+    }
+
+    private void OnFramebufferWheelChanged(object? sender, PointerWheelEventArgs e)
+    {
+        if (e.Delta.Y > 0)
+            _zoomLevel = Math.Min(_zoomLevel + ZoomStep, MaxZoom);
+        else
+            _zoomLevel = Math.Max(_zoomLevel - ZoomStep, MinZoom);
+
+        UpdateZoomDisplay();
+        e.Handled = true;
     }
 
     private void OnRenderTick(object? sender, EventArgs e)
@@ -256,7 +266,7 @@ public partial class MainWindow : Window
     {
         if (_system == null) return;
         var file = await this.StorageProvider.SaveFilePickerAsync(new() { Title = "Save State", DefaultExtension = ".dps2", FileTypeChoices = new[] { new FilePickerFileType("DetPS2 Save State") { Patterns = new[] { "*.dps2" } } } });
-        if (file != null) { try { byte[] data = _system.SaveState(); await File.WriteAllBytesAsync(file.Path.LocalPath, data); Log($"State saved"); } catch (Exception ex) { Log($"Save error"); } }
+        if (file != null) { try { byte[] data = _system.SaveState(); await File.WriteAllBytesAsync(file.Path.LocalPath, data); Log("State saved"); } catch { Log("Save error"); } }
     }
 
     private async void OnLoadStateClick(object? sender, RoutedEventArgs e)
