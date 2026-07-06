@@ -4,8 +4,10 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// SIF - More realistic implementation for Phase 3.
+/// 
+/// Updated to comply with ISchedulable contract.
 /// </summary>
-public sealed class Sif
+public sealed class Sif : ISchedulable
 {
     private readonly SystemMemory _memory;
     public bool DmaBusy { get; private set; } = false;
@@ -47,5 +49,14 @@ public sealed class Sif
 
     public uint GetStatus() => Status;
 
-    public void Step(ulong cycles) { }
+    /// <summary>
+    /// ISchedulable contract implementation.
+    /// Currently does minimal work; real DMA timing can be added later.
+    /// </summary>
+    public int Step(ulong maxCycles)
+    {
+        // For now, SIF DMA is instantaneous in DoDmaTransfer.
+        // Future: model actual DMA transfer cycles here.
+        return 0;
+    }
 }
