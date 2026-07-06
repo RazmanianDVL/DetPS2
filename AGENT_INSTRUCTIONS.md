@@ -58,6 +58,13 @@ We are now moving into the next phase. The focus shifts from fixing integration 
 - Improve SaveState coverage further if gaps remain (especially DMA state).
 - Document the current execution model and cycle accounting strategy in a short `ARCHITECTURE.md` or in code comments.
 
+**[6.2][COMPLETE]** 
+- Created `ARCHITECTURE.md` documenting current execution model and cycle accounting.
+- Created foundational smoke test in `Tests/SmokeTests.cs`.
+- Improved SaveState.cs with better DMA channel state coverage (version bumped to 3).
+
+**Status**: All initial Phase 6.2 foundational tasks complete. Standing by for further direction or expansion of testing infrastructure.
+
 #### Bravo – Scheduler
 **Next Orders**:
 - Evaluate whether the current fixed-slice round-robin model is sufficient or if we should move toward a priority/event queue for better accuracy.
