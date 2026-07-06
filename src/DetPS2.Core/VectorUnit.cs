@@ -6,10 +6,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Focused on making the Vector Units actually work.
-/// - Functional branch handling
-/// - Working load/store operations
-/// - Continued EFU and field mask correctness
+/// Focused on making the Vector Units work.
+/// Continuing to improve functionality, accuracy, and completeness.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -49,7 +47,6 @@ public abstract class VectorUnit
         _vf[0] = new VuReg128 { X = 0f, Y = 0f, Z = 0f, W = 1f };
         _currentFieldMask = 0xF;
         _branchPending = false;
-        _pendingBranchTarget = 0;
     }
 
     public virtual void Step(ulong cycles)
@@ -88,7 +85,7 @@ public abstract class VectorUnit
         if (primary == 0x00)
             HandleSpecial(opcode, rs, rt, rd, function);
         else
-            HandleLoadStore(opcode, primary);
+            HandleLoadStore(opcode, primary, rs, rt);
     }
 
     private void HandleSpecial(uint opcode, uint rs, uint rt, uint rd, uint function)
@@ -123,22 +120,21 @@ public abstract class VectorUnit
         }
     }
 
-    private void HandleLoadStore(uint opcode, uint primary)
+    private void HandleLoadStore(uint opcode, uint primary, uint rs, uint rt)
     {
-        uint rs = (opcode >> 11) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
         short offset = (short)(opcode & 0xFFFF);
-
-        uint addr = (uint)(_vf[rs].X) + (uint)offset; // Simplified addressing
+        uint baseAddr = (uint)_vf[rs].X;
+        uint addr = baseAddr + (uint)offset;
 
         if (primary == 0x01) // Load
         {
             uint value = _memory.Read32(addr);
-            // Load into VF register (simplified)
-            if (rt < 32)
-            {
-                _vf[rt].X = BitConverter.Int32BitsToSingle((int)value);
-            }
+            float f = BitConverter.Int32BitsToSingle((int)value);
+
+            if ((_currentFieldMask & 0b0001) != 0) _vf[rt].X = f;
+            if ((_currentFieldMask & 0b0010) != 0) _vf[rt].Y = f;
+            if ((_currentFieldMask & 0b0100) != 0) _vf[rt].Z = f;
+            if ((_currentFieldMask & 0b1000) != 0) _vf[rt].W = f;
         }
         else if (primary == 0x02) // Store
         {
@@ -149,12 +145,11 @@ public abstract class VectorUnit
 
     private void HandleBranch(uint opcode, uint rs)
     {
-        // Basic branch support
         short offset = (short)(opcode & 0xFFFF);
         uint target = (uint)(PC + (offset << 2));
 
-        // Simple condition (can be expanded)
-        bool take = _vf[rs].X != 0;
+        // Improved branch condition (example)
+        bool take = _vf[rs].X != 0f || _vf[rs].Y != 0f || _vf[rs].Z != 0f || _vf[rs].W != 0f;
 
         if (take)
         {
@@ -163,7 +158,7 @@ public abstract class VectorUnit
         }
     }
 
-    // Field-aware helpers (same as previous)
+    // Field-aware helpers
     private void ApplyArith(uint rs, uint rt, uint rd, Func<float, float, float> op)
     {
         if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = op(_vf[rs].X, _vf[rt].X);
@@ -292,9 +287,9 @@ public abstract class VectorUnit
 
         switch (opcode & 0x3F)
         {
-            case 0x1D: result = (b != 0f) ? a / b : 0f; break;           // DIV
-            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break;    // SQRT
-            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break; // RSQRT
+            case 0x1D: result = (b != 0f) ? a / b : 0f; break;
+            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break;
+            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break;
             default: result = a; break;
         }
 
