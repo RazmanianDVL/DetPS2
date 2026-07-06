@@ -126,6 +126,14 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 - Do **not** implement full VU instruction sets yet. Focus on interface compliance and clean hand-off from EE COP2 moves.
 - Identify any cycle timing or stall logic that will be needed later and document it in comments.
 
+**[COMPLETE]**  
+- Updated base `VectorUnit.Step(ulong cycles)` → `public virtual int Step(ulong maxCycles)`.
+- Updated `Vu0.cs` and `Vu1.cs` overrides to match the new signature.
+- `Step` now returns the number of cycles actually executed.
+- Added TODO comment documenting future need for proper VU stall handling.
+- No new instructions were added (per standing orders).
+- Commits: 03d37b40, d87c295e, 29b2e100
+
 **Blocked By**: Alpha (Emotion Engine COP2 interface) and overall integration lockdown.
 
 ---
@@ -178,6 +186,6 @@ When working:
 ---
 
 **End of Agent Instructions**  
-This file lives at the root of the repository. All agents must treat it as the living command surface. 
+This file lives at the root of the repository. All agents must treat it as the living command surface.  
 
 Let's lock the foundation together. Small consistent steps > big plans.
