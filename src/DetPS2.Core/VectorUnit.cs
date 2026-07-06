@@ -7,7 +7,7 @@ namespace DetPS2.Core;
 /// Base class for VU0 and VU1.
 /// 
 /// Continuing to make the Vector Units work.
-/// Adding more instructions.
+/// Adding more instructions and improving capability.
 /// </summary>
 public abstract class VectorUnit
 {
