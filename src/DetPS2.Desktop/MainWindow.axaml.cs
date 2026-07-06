@@ -1,3 +1,4 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Media.Imaging;
@@ -54,7 +55,7 @@ public partial class MainWindow : Window
 
         if (_isRunning)
         {
-            // Run a chunk of cycles per frame (~1.5M cycles @ ~90M EE cycles/sec target later)
+            // Run a chunk of cycles per frame
             _system.RunFor(1_500_000);
         }
 
@@ -73,8 +74,8 @@ public partial class MainWindow : Window
         using var locked = _framebufferBitmap.Lock();
         uint* dest = (uint*)locked.Address;
 
-        // Convert 0x00RRGGBB (from Gs) to BGRA8888
-        for (int i = 0; i < framebuffer.Length; i++)
+        int pixelsToCopy = Math.Min(framebuffer.Length, width * height);
+        for (int i = 0; i < pixelsToCopy; i++)
         {
             uint src = framebuffer[i];
             byte r = (byte)((src >> 16) & 0xFF);
@@ -82,7 +83,7 @@ public partial class MainWindow : Window
             byte b = (byte)(src & 0xFF);
 
             // BGRA order for Avalonia WriteableBitmap
-            dest[i] = (uint)((0xFF << 24) | (b << 16) | (g << 8) | r);
+            dest[i] = (uint)((0xFFu << 24) | ((uint)b << 16) | ((uint)g << 8) | r);
         }
     }
 
@@ -97,7 +98,7 @@ public partial class MainWindow : Window
         {
             long current = (long)_system.MasterCycles;
             long delta = current - _lastCycles;
-            double fps = delta / 1_500_000.0; // rough estimate based on cycles per tick
+            double fps = delta / 1_500_000.0;
             FpsText.Text = $"~{fps:F1} updates/sec";
             _lastCycles = current;
             _lastFpsUpdate = now;
@@ -117,7 +118,7 @@ public partial class MainWindow : Window
     {
         if (_system == null) return;
 
-        var files = await StorageProvider.OpenFilePickerAsync(new()
+        var files = await this.StorageProvider.OpenFilePickerAsync(new()
         {
             Title = "Select PS2 BIOS",
             AllowMultiple = false,
@@ -142,7 +143,7 @@ public partial class MainWindow : Window
     {
         if (_system == null) return;
 
-        var files = await StorageProvider.OpenFilePickerAsync(new()
+        var files = await this.StorageProvider.OpenFilePickerAsync(new()
         {
             Title = "Select PS2 ELF Homebrew",
             AllowMultiple = false,
@@ -155,8 +156,7 @@ public partial class MainWindow : Window
             {
                 byte[] elfData = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
                 ulong entry = ElfLoader.LoadElf(elfData, _system.Memory);
-                UpdateStatus($"ELF loaded. Entry: 0x{entry:X8} (EE PC not yet wired)");
-                // TODO: Wire to EmotionEngine.PC once EE interpreter is expanded
+                UpdateStatus($"ELF loaded. Entry: 0x{entry:X8} (EE PC wiring pending full EmotionEngine)");
             }
             catch (Exception ex)
             {
@@ -200,17 +200,17 @@ public partial class MainWindow : Window
     {
         if (_system == null) return;
 
-        // Trigger test drawing through GIF/GS path
-        _system.Gif.ReceivePath3Data(0, 1); // This will parse and call into GS
+        // Trigger the existing GIF -> GS test path
+        _system.Gif.ReceivePath3Data(0, 1);
         UpdateFramebuffer();
-        UpdateStatus("Test scene rendered via GIF -> GS");
+        UpdateStatus("Test scene rendered (GIF -> GS)");
     }
 
     private async void OnSaveStateClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
 
-        var file = await StorageProvider.SaveFilePickerAsync(new()
+        var file = await this.StorageProvider.SaveFilePickerAsync(new()
         {
             Title = "Save State",
             DefaultExtension = ".dps2",
@@ -236,7 +236,7 @@ public partial class MainWindow : Window
     {
         if (_system == null) return;
 
-        var files = await StorageProvider.OpenFilePickerAsync(new()
+        var files = await this.StorageProvider.OpenFilePickerAsync(new()
         {
             Title = "Load Save State",
             AllowMultiple = false,
