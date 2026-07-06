@@ -130,6 +130,44 @@ Start with adding basic SIF interrupt generation from IOP when mailbox is writte
 
 ---
 
+## [6.2] George – GS + GIF Pipeline Timing Analysis
+
+**[IN PROGRESS]** Initial analysis of GIF/VIF/GS data flow timing (2026-07-06)
+
+**Current Architecture Observations:**
+
+1. **Component Registration**
+   - `Gif`, `Vif`, and `Gs` are all registered as independent `ISchedulable` components in `Ps2System.RegisterComponents()`.
+   - They each receive their own `Step(ulong maxCycles)` call from the Scheduler.
+
+2. **Current Step() Behavior**
+   - `Gs.Step()`: Returns `1`. Does no real work. All rendering is driven externally via `ReceiveCommandList()` / `ProcessGifPackedWord()` when DMAC transfers GIF packets.
+   - `Gif.Step()`: Returns `0`. The real work happens in `ReceivePath3Data()` when called by DMAC.
+   - `Vif.Step()`: Returns `0`. Work is triggered via `SendQuadwordToVu1()` from DMAC.
+
+3. **Data Flow Reality**
+   - GIF path is **event-driven** by DMAC transfers, not by time slices.
+   - The GS does not currently model any rendering time cost. A full screen of geometry can be “drawn” in effectively 0 cycles from the Scheduler’s perspective.
+   - There is no modeling of GIF/VIF FIFO occupancy, stalls, or bandwidth limits.
+
+4. **What GS Pipeline Needs from Scheduler (for future accuracy)**
+   - A way to report “rendering work” cost back to the Scheduler (so that heavy drawing can consume cycles).
+   - Event or signal mechanism when a GIF packet has finished processing (so VIF/GIF can react to completion).
+   - Better separation between “data arrival” (DMAC) and “processing time” (GS rasterization cost).
+
+**Current Limitations (Documented for Phase 6.2):**
+- GS has no concept of rendering time or bandwidth.
+- GIF/VIF have almost no timing behavior in their `Step()` methods.
+- No modeling of GIF/VIF path stalls or FIFO back-pressure.
+- The current design works for correctness of data movement but not for cycle-accurate graphics timing.
+
+**Recommendation:**
+For Phase 6.2, we should focus on making `Gif.Step()` and `Gs.Step()` more meaningful (even if simple) so the Scheduler can start accounting for graphics work. A basic “GIF processing cost” model would be a good first step.
+
+**[COMPLETE]** Initial analysis documented.
+
+---
+
 ## Communication Protocol
 
 Continue using clear markers when updating your section (`[IN PROGRESS]`, `[COMPLETE]`, `[BLOCKER]`, `[PROPOSAL]`, etc.).
