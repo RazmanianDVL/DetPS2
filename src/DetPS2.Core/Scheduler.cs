@@ -16,10 +16,12 @@ namespace DetPS2.Core;
 /// This order is stable and deterministic.
 /// 
 /// Step return value handling:
-/// - We now capture the int returned by component.Step(thisSlice).
-/// - Currently we still advance MasterCycles by the requested slice size.
-/// - The captured value is prepared for future back-pressure logic
-///   (when components start returning fewer cycles than requested).
+/// - We capture `int cyclesAdvanced = component.Step(thisSlice)`.
+/// - **Current policy**: The value is captured but ignored for advancement.
+///   We still advance `MasterCycles` by the full requested `thisSlice`.
+/// - This is intentional for Phase 6.1 stability.
+/// - Future policy (Phase 6.2+): We may use the returned value for back-pressure
+///   when components start accurately reporting partial cycle consumption.
 /// </summary>
 public sealed class Scheduler
 {
@@ -56,8 +58,8 @@ public sealed class Scheduler
             foreach (var component in _components)
             {
                 int cyclesAdvanced = component.Step(thisSlice);
-                // cyclesAdvanced is captured for future back-pressure use.
-                // For now we still advance by the full requested slice.
+                // cyclesAdvanced captured per current policy (see class docs).
+                // Not yet used for back-pressure.
             }
 
             _masterCycles += thisSlice;
