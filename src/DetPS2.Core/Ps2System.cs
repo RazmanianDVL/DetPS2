@@ -6,6 +6,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// Top-level PS2 system.
 /// Execution now flows exclusively through Scheduler.RunFor().
+/// Ps2System no longer registers itself to avoid duplicate stepping.
+/// All hardware blocks are stepped directly by the Scheduler in registration order.
 /// </summary>
 public sealed class Ps2System : ISchedulable
 {
@@ -48,7 +50,8 @@ public sealed class Ps2System : ISchedulable
 
     private void RegisterComponents()
     {
-        Scheduler.Register(this);
+        // NOTE: Do NOT register 'this' (Ps2System). Scheduler now drives leaf components directly.
+        // This eliminates duplicate execution and restores clean deterministic scheduling.
         Scheduler.Register(EE);
         Scheduler.Register(Dmac);
         Scheduler.Register(Vif);
@@ -94,23 +97,12 @@ public sealed class Ps2System : ISchedulable
         Scheduler.Reset();
     }
 
-    // ISchedulable implementation (used internally by Scheduler)
+    // ISchedulable implementation (kept for facade compatibility if needed externally)
     int ISchedulable.Step(ulong maxCycles)
     {
-        // For now we perform a combined step.
-        // Future versions should respect maxCycles and return actual cycles consumed.
-        EE.Step(maxCycles);
-        Dmac.Step(maxCycles);
-        Vif.Step(maxCycles);
-        Gif.Step(maxCycles);
-        Gs.Step(maxCycles);
-        Pcrtc.Step(maxCycles);
-        Intc.Step(maxCycles);
-        Iop.Step(maxCycles);
-        Cdvd.Step(maxCycles);
-        Sif.Step(maxCycles);
-
-        return 1; // Placeholder - should return real cycles later
+        // With leaf components now registered directly, this combined step is no longer used by Scheduler.
+        // Return 0 to indicate no additional cycles consumed at this level.
+        return 0;
     }
 
     void ISchedulable.Reset() => Reset();

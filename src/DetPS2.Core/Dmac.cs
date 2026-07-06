@@ -5,8 +5,11 @@ namespace DetPS2.Core;
 /// <summary>
 /// DMA Controller (DMAC) - Phase 2/3
 /// Supports major channels + chain mode + register interface.
+/// 
+/// Now implements ISchedulable exactly for Scheduler contract compliance.
+/// Step returns int (cycles/work indicator) per determinism requirements.
 /// </summary>
-public sealed class Dmac
+public sealed class Dmac : ISchedulable
 {
     private readonly SystemMemory _memory;
     private Gif _gif;
@@ -59,8 +62,12 @@ public sealed class Dmac
         Console.WriteLine($"[DMAC] Starting transfer on {channel} (Mode={ch.Mode}, QWC={ch.QWC})");
     }
 
-    public void Step(ulong cycles)
+    public int Step(ulong maxCycles)
     {
+        if (maxCycles == 0) return 0;
+
+        int workDone = 0;
+
         for (int i = 0; i < _channels.Length; i++)
         {
             var ch = _channels[i];
@@ -83,7 +90,11 @@ public sealed class Dmac
 
                 Console.WriteLine($"[DMAC] {(Channel)i} transfer finished");
             }
+
+            workDone++;
         }
+
+        return workDone > 0 ? 1 : 0;
     }
 
     private void DoNormalTransfer(Channel channel, ChannelState ch)
