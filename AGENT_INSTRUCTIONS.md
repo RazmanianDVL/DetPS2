@@ -16,115 +16,69 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 ---
 
-## Round 4 Review
+## Round 5 Review
 
-Good progress on the initial analysis and documentation tasks.
+**Good progress this round:**
 
-**Strong contributions this round:**
-- **Charlie**: Delivered `ARCHITECTURE.md`, foundational smoke tests, and improved SaveState (DMA coverage + version 3).
-- **Foxtrot**: Excellent detailed documentation on VU timing challenges and high-impact instructions.
-- **Delta**: Clear analysis of IOP ↔ EE synchronization gaps + concrete proposal for SIF interrupt generation.
-- **George**: Good breakdown of GIF/VIF/GS timing weaknesses + proposal for work costing feedback to the Scheduler.
+- **Delta**: Successfully implemented basic SIF interrupt generation (`Iop.cs` now triggers `Intc.Raise` on SIF mailbox write). This is a meaningful, low-risk improvement that adds the first real IOP → EE interrupt path. Excellent work.
+- **Charlie**: Expanded the smoke test suite with three new deterministic scenarios (`Determinism_MasterCycles`, `SaveState_MasterCyclesRoundTrip`, `Reset_MasterCycles`). Solid foundational testing work.
 
-**Still quiet:** Alpha, Bravo, and Echo have limited updates so far.
+**Still in progress:**
+- George, Foxtrot + Alpha, and Bravo have not yet delivered concrete implementations or proposals from the previous round.
 
 ---
 
-## Phase 6.2 Next Orders
+## Next Orders (Round 6)
 
-We are shifting from pure analysis into **small, targeted improvements** while continuing to build testing infrastructure.
+### Delta – IOP + SIF
+**Status**: `[COMPLETE]` (SIF interrupt generation)
+
+**Next Orders**:
+- Stand by. Your SIF interrupt change is a good foundation. Be ready to extend it (e.g. more interrupt sources or status flag handling) once we validate the current implementation.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Expand the smoke test suite (add at least 2–3 more deterministic scenarios).
-- Review Delta’s SIF interrupt proposal and George’s GIF/GS costing idea. Give a short recommendation on implementation order and risk.
-- Continue improving SaveState robustness as gaps are discovered during testing.
-
-**[6.2][COMPLETE]** Expanded smoke test suite with 3 new deterministic scenarios:
-- `Determinism_MasterCycles`
-- `SaveState_MasterCyclesRoundTrip`
-- `Reset_MasterCycles`
-
-**Next**: Will review Delta & George proposals and provide recommendation on implementation order/risk.
-
-### Bravo – Scheduler
-**Next Orders**:
-- Review the findings from Delta and George.
-- Evaluate whether the current fixed-slice model needs adjustment to support better timing feedback from components (e.g. GIF/GS work cost).
-- Propose a lightweight path forward (keep it simple — we are not doing a full event queue rewrite yet).
-
-### Delta – IOP + SIF
-**Next Orders**:
-- Implement the basic SIF interrupt generation you proposed (low-risk, high-value).
-- Start with mailbox write or `SendCommand` triggering an interrupt via `Intc`.
-- Keep changes minimal and well-commented.
-- Report when ready for review.
+- Review Delta’s SIF interrupt implementation and provide feedback (correctness, edge cases, test coverage).
+- Review George’s GIF/GS work-cost proposal and recommend whether we should pursue it now or later.
+- Continue expanding smoke tests if new synchronization behavior (like SIF interrupts) should be covered.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Prototype a simple work-cost model in `Gif.Step()` or `Gs.Step()` (e.g. return approximate cycles spent processing).
-- Feed that information back toward the Scheduler (coordinate with Bravo).
-- Keep scope small — this is exploratory.
+- Move from proposal to a small prototype.
+- Implement a minimal work-cost return in `Gif.Step()` or `Gs.Step()` (even if approximate).
+- Coordinate with Bravo on how this information could eventually influence scheduling.
+- Keep the change small and isolated.
 
-### Foxtrot – Vector Units
+### Foxtrot + Alpha (VU / EE Timing)
 **Next Orders**:
-- Pick 1–2 high-impact areas from your documentation (e.g. EFU latency or COP2 interlocks) and propose a minimal improvement approach.
-- Coordinate with Alpha on any EE/VU0 interleaving opportunities.
+- Move from coordination to a concrete, low-risk change.
+- Pick one small area (e.g. better COP2 timing feedback or simple EFU latency modeling) and implement a minimal version.
+- Coordinate so changes in one don’t break the other.
 
-### Alpha – Emotion Engine
+### Bravo – Scheduler
 **Next Orders**:
-- Review Foxtrot’s VU timing documentation.
-- Identify the most impactful low-risk COP2 / VU0 interaction improvements.
-- Begin light implementation work on one small area if comfortable.
+- Produce a short proposal for how the Scheduler could accept timing feedback from components (e.g. GIF/GS work cost or VU stalls).
+- Keep it lightweight — we are not rewriting the scheduler yet. A simple extension point or optional callback is enough for now.
+- Review Delta’s SIF interrupt work for any scheduler implications.
 
 ### Echo – UI Developer
 **Next Orders**:
-- Continue UI planning work.
-- You may start a lightweight prototype branch for window + input if desired (do not merge to main yet).
-
----
-
-## [6.2] Delta – IOP + SIF
-
-**[COMPLETE]** Basic SIF interrupt generation implemented (2026-07-06)
-
-**Change made in Iop.cs:**
-```csharp
-public void WriteSifMailboxFromEE(uint value)
-{
-    SifMbxFromEE = value;
-    SifMbxToEE = ~value;
-
-    // [6.2] Basic SIF interrupt generation
-    Intc?.Raise(Intc.InterruptSource.Sif);
-}
-```
-
-This provides the first real IOP → EE interrupt signaling path.
-
-Ready for review and integration testing.
-
----
-
-## Communication Protocol
-
-When reporting implementation work or proposals, use clear markers and keep changes minimal and reviewable.
+- Continue UI planning. You may begin light prototyping on a separate branch if ready.
 
 ---
 
 ## Project Manager Notes
 
-We have good momentum from the analysis round. Now we start turning that knowledge into small, safe improvements.
+Delta delivered a real, useful improvement this round. Charlie is building good test coverage.
 
-Priority order for this round:
-1. Delta’s SIF interrupt work (highest value / lowest risk)
-2. Charlie’s testing expansion + coordination recommendations
-3. George’s initial GS/GIF costing prototype
-4. Foxtrot + Alpha coordination on VU/EE timing
+The next focus is turning the remaining proposals into small implementations:
+- George: GIF/GS work cost prototype
+- Foxtrot + Alpha: One small VU/EE timing improvement
+- Bravo: Lightweight scheduler feedback proposal
 
-Keep changes small. We are still in exploration + foundation-building mode.
+Charlie will act as the reviewer/coordinator for the above items.
 
-Stand by for progress reports.
+Keep changes minimal and reviewable. We are still building confidence in the accuracy layer.
 
 ---
 
