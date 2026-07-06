@@ -71,18 +71,19 @@
 
             <!-- Zoom Controls -->
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="2">
-                <Button Content="➖" Click="OnZoomOutClick" ToolTip.Tip="Zoom Out (Ctrl+-)" Width="32" />
-                <Button Content="➕" Click="OnZoomInClick" ToolTip.Tip="Zoom In (Ctrl++)" Width="32" />
-                <Button Content="⟲" Click="OnResetZoomClick" ToolTip.Tip="Reset Zoom (Ctrl+0)" Width="32" />
-                <TextBlock x:Name="ZoomLevelText" Text="100%" VerticalAlignment="Center" Margin="6,0,0,0" Width="50" />
+                <Button Content="➖" Click="OnZoomOutClick" ToolTip.Tip="Zoom Out" Width="32" />
+                <Button Content="➕" Click="OnZoomInClick" ToolTip.Tip="Zoom In" Width="32" />
+                <Button Content="⟲" Click="OnResetZoomClick" ToolTip.Tip="Reset Zoom" Width="32" />
+                <TextBlock x:Name="ZoomLevelText" Text="100%" VerticalAlignment="Center" Margin="6,0,0,0" Width="55" />
             </StackPanel>
         </StackPanel>
 
-        <!-- Main Display Area -->
+        <!-- Main Display Area with Mouse Wheel Zoom -->
         <Border Grid.Column="0" Grid.Row="2" x:Name="DisplayBorder"
                 BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
                 CornerRadius="4"
-                DragDrop.AllowDrop="True">
+                DragDrop.AllowDrop="True"
+                PointerWheelChanged="OnFramebufferWheelChanged">
             <Viewbox x:Name="FramebufferViewbox" Stretch="Uniform">
                 <Image x:Name="FramebufferImage"
                        Stretch="None"
