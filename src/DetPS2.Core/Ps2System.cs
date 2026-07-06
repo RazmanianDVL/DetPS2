@@ -48,7 +48,7 @@ public sealed class Ps2System : ISchedulable
 
     private void RegisterComponents()
     {
-        Scheduler.Register(this);           // Ps2System itself
+        Scheduler.Register(this);
         Scheduler.Register(EE);
         Scheduler.Register(Dmac);
         Scheduler.Register(Vif);
@@ -90,22 +90,25 @@ public sealed class Ps2System : ISchedulable
         Scheduler.Reset();
     }
 
-    // ISchedulable implementation
     public int Step()
     {
-        // For now, do a simple combined step.
-        // Future versions can do more sophisticated per-component cycle accounting.
-        int cycles = EE.Step();
-        Dmac.Step(1);
-        Vif.Step(1);
-        Gif.Step(1);
-        Gs.Step(1);
-        Pcrtc.Step(1);
-        Intc.Step(1);
-        Iop.Step(1);
-        Cdvd.Step(1);
-        Sif.Step(1);
+        const ulong budget = 16;
 
-        return cycles;
+        EE.Step(budget);
+        Dmac.Step(budget);
+        Vif.Step(budget);
+        Gif.Step(budget);
+        Gs.Step(budget);
+        Pcrtc.Step(budget);
+        Intc.Step(budget);
+        Iop.Step(budget);
+        Cdvd.Step(budget);
+        Sif.Step(budget);
+
+        return 1;
     }
+
+    // ISchedulable
+    int ISchedulable.Step(ulong maxCycles) => Step();
+    void ISchedulable.Reset() => Reset();
 }
