@@ -76,6 +76,19 @@ We are now moving into the next phase. The focus shifts from fixing integration 
 - Identify which VU instructions have the biggest impact on timing accuracy.
 - Start light work on improving VU macro / COP2 interface timing if low-risk.
 
+**[6.2 COMPLETE]**
+- Significantly expanded class-level documentation in VectorUnit.cs covering:
+  - Current timing/stall state
+  - Key VU timing challenges (VIF coupling, EFU latency, COP2 interlocks, load/store conflicts)
+  - High-impact instructions for timing accuracy (EFU ops, Load/Store, COP2 moves, branches, MADD/MSUB)
+  - Future requirements (explicit stall tracking, early return from Step, EFU latency modeling)
+- Improved documentation around Step() current vs required behavior.
+- Updated Vu0.cs with COP2 interface analysis and noted a low-risk opportunity to return timing information from ExecuteVuInstruction for better EE/VU0 interleaving.
+
+**Blocked By**: None. Ready for further direction or integration with Scheduler/EE timing work.
+
+---
+
 #### George – GS + GIF Pipeline
 **Next Orders**:
 - Begin analyzing GIF/VIF data flow timing.
