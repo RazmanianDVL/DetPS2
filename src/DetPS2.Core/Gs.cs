@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace DetPS2.Core;
@@ -6,8 +7,16 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Supporting method added for the improved Gif.cs (ProcessGifPackedWord).
-/// This keeps the GIF → GS pipeline working while we continue the lane.
+/// Milestone: Improved XYZ decoding + basic UV/ST support (Option A)
+/// 
+/// Changes:
+/// - Richer Vertex struct with UV/ST
+/// - Better XYZ fixed-point decoding
+/// - UV (0x03) and ST (0x02) register tracking
+/// - Vertices now carry texture coordinates
+/// - Foundation for future textured rasterization
+/// 
+/// Still using simple software rasterizer. Real texture sampling comes later.
 /// </summary>
 public sealed class Gs
 {
@@ -21,9 +30,33 @@ public sealed class Gs
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
+    // Last known texture coordinates (updated via UV/ST registers)
+    private float _lastU = 0;
+    private float _lastV = 0;
+    private float _lastS = 1;
+    private float _lastT = 1;
+
     private uint _texBase = 0;
     private int _texWidth = 64;
     private int _texHeight = 64;
+
+    // =====================================================
+    // Vertex with UV/ST support
+    // =====================================================
+
+    private struct Vertex
+    {
+        public int X;
+        public int Y;
+        public uint Color;
+        public float U;
+        public float V;
+        public float S;
+        public float T;
+    }
+
+    private readonly List<Vertex> _currentVertices = new();
+    private int _maxVerticesForPrim = 3;
 
     public Gs(SystemMemory memory)
     {
@@ -37,15 +70,13 @@ public sealed class Gs
         Array.Clear(_framebuffer, 0, _framebuffer.Length);
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
+        _lastU = _lastV = 0;
+        _lastS = _lastT = 1;
+        _currentVertices.Clear();
     }
 
-    /// <summary>
-    /// Called by the improved Gif.cs for PACKED mode data.
-    /// Extracts register address and data, then applies it.
-    /// </summary>
     public void ProcessGifPackedWord(uint dataLow, uint dataHigh)
     {
-        // In many PACKED packets the register address lives in the upper bits
         uint regAddr = (dataHigh >> 24) & 0x7F;
         uint value   = dataLow;
 
@@ -53,20 +84,27 @@ public sealed class Gs
         {
             Registers.WriteRegister(regAddr, value);
 
-            if (regAddr == 0x00) _currentPrim = value;
+            if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
             if (regAddr == 0x01) _currentRgbaq = value;
 
-            // If this looks like vertex data, feed the primitive assembly
+            // UV register
+            if (regAddr == 0x03)
+            {
+                _lastU = (value & 0x3FFF) / 16.0f;
+                _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
+            }
+
+            // ST register (Q is usually in RGBAQ)
+            if (regAddr == 0x02)
+            {
+                _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0); // rough
+                _lastT = _lastS; // placeholder
+            }
+
             if (regAddr == 0x04 || regAddr == 0x05)
             {
-                // Rough decode so we get visible output from real data
-                int x = (int)(value & 0xFFFF) / 16;
-                int y = (int)((value >> 16) & 0xFFFF) / 16;
-                // For now we just trigger a test draw with the current color
-                // Full vertex collection will be expanded in the next pass
-                DrawFilledTriangle((x, y, _currentRgbaq),
-                                   (x + 80, y, _currentRgbaq),
-                                   (x + 40, y + 80, _currentRgbaq));
+                AddVertexFromXyz(value);
+                TryDispatchPrimitive();
             }
         }
     }
@@ -90,22 +128,126 @@ public sealed class Gs
             {
                 Registers.WriteRegister(regAddr, value);
 
-                if (regAddr == 0x00) _currentPrim = value;
+                if (regAddr == 0x00) { _currentPrim = value; _currentVertices.Clear(); UpdateMaxVerticesForPrim(); }
                 if (regAddr == 0x01) _currentRgbaq = value;
+
+                if (regAddr == 0x03) // UV
+                {
+                    _lastU = (value & 0x3FFF) / 16.0f;
+                    _lastV = ((value >> 16) & 0x3FFF) / 16.0f;
+                }
+
+                if (regAddr == 0x02) // ST
+                {
+                    _lastS = BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
+                    _lastT = _lastS;
+                }
+
+                if (regAddr == 0x04 || regAddr == 0x05)
+                {
+                    AddVertexFromXyz(value);
+                    TryDispatchPrimitive();
+                }
             }
 
             addr += 16;
             remaining--;
         }
 
+        if (_currentVertices.Count == 0)
+        {
+            uint primType = _currentPrim & 0x7;
+            switch (primType)
+            {
+                case 1: DrawLine(200, 200, 400, 300, _currentRgbaq); break;
+                case 3:
+                case 4: DrawTestTriangle(); break;
+                case 5: DrawQuad(250, 180, 180, 120, _currentRgbaq); break;
+                default: DrawTestTriangle(); break;
+            }
+        }
+    }
+
+    private void UpdateMaxVerticesForPrim()
+    {
         uint primType = _currentPrim & 0x7;
+        _maxVerticesForPrim = primType switch
+        {
+            1 => 2,
+            3 or 4 => 3,
+            5 => 4,
+            _ => 3
+        };
+    }
+
+    private void AddVertexFromXyz(uint xyz)
+    {
+        // Improved XYZ decoding (still simplified but much better than before)
+        // Real GS uses signed fixed-point. This gives reasonable screen coordinates.
+        int x = (int)(xyz & 0xFFFF);
+        int y = (int)((xyz >> 16) & 0xFFFF);
+
+        // Convert from GS internal units (roughly 4 bits sub-pixel)
+        x = (x * FB_WIDTH) / 4096;
+        y = (y * FB_HEIGHT) / 4096;
+
+        _currentVertices.Add(new Vertex
+        {
+            X = x,
+            Y = y,
+            Color = _currentRgbaq,
+            U = _lastU,
+            V = _lastV,
+            S = _lastS,
+            T = _lastT
+        });
+
+        Console.WriteLine($"[GS] Vertex: ({x}, {y}) UV=({_lastU:F2},{_lastV:F2})");
+    }
+
+    private void TryDispatchPrimitive()
+    {
+        if (_currentVertices.Count < _maxVerticesForPrim) return;
+
+        uint primType = _currentPrim & 0x7;
+
         switch (primType)
         {
-            case 1: DrawLine(200, 200, 400, 300, _currentRgbaq); break;
             case 3:
-            case 4: DrawTestTriangle(); break;
-            case 5: DrawQuad(250, 180, 180, 120, _currentRgbaq); break;
-            default: DrawTestTriangle(); break;
+            case 4:
+                if (_currentVertices.Count >= 3)
+                {
+                    var v0 = _currentVertices[0];
+                    var v1 = _currentVertices[1];
+                    var v2 = _currentVertices[2];
+                    DrawFilledTriangle((v0.X, v0.Y, v0.Color), (v1.X, v1.Y, v1.Color), (v2.X, v2.Y, v2.Color));
+                    _currentVertices.Clear();
+                }
+                break;
+
+            case 1:
+                if (_currentVertices.Count >= 2)
+                {
+                    var v0 = _currentVertices[0];
+                    var v1 = _currentVertices[1];
+                    DrawLine(v0.X, v0.Y, v1.X, v1.Y, v0.Color);
+                    _currentVertices.Clear();
+                }
+                break;
+
+            case 5:
+                if (_currentVertices.Count >= 3)
+                {
+                    DrawFilledTriangle(( _currentVertices[0].X, _currentVertices[0].Y, _currentVertices[0].Color),
+                                       ( _currentVertices[1].X, _currentVertices[1].Y, _currentVertices[1].Color),
+                                       ( _currentVertices[2].X, _currentVertices[2].Y, _currentVertices[2].Color));
+                    _currentVertices.Clear();
+                }
+                break;
+
+            default:
+                _currentVertices.Clear();
+                break;
         }
     }
 
@@ -113,6 +255,8 @@ public sealed class Gs
     {
         Registers.WriteRegister(0x00, prim);
         _currentPrim = prim;
+        _currentVertices.Clear();
+        UpdateMaxVerticesForPrim();
     }
 
     public void SetRGBAQ(uint rgbaq)
@@ -124,6 +268,8 @@ public sealed class Gs
     public void DrawVertex(uint xyz)
     {
         Registers.WriteRegister(0x04, xyz);
+        AddVertexFromXyz(xyz);
+        TryDispatchPrimitive();
     }
 
     public void RenderTestScene()
@@ -138,8 +284,6 @@ public sealed class Gs
         DrawQuad(400, 320, 160, 80, 0xFFFFD700);
         DrawLine(100, 60, 540, 60, 0xFFFFFFFF);
         DrawLine(100, 380, 540, 380, 0xFFFFFFFF);
-
-        Console.WriteLine("[GS] RenderTestScene() - nice colorful output produced");
     }
 
     public uint SampleTexture(int u, int v)
