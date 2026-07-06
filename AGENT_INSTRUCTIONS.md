@@ -98,6 +98,12 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 **Blocked By**: None for the contract fix.
 
+**[COMPLETE]**
+- `Iop.cs` already correctly implements `public int Step(ulong maxCycles)` and returns executed cycles. No changes needed.
+- `Sif.cs` has been updated to `public int Step(ulong maxCycles)` and now implements `ISchedulable`. (Previous commit 20ea81f)
+- Both components are now contract-compliant.
+- No blockers. Ready for Scheduler integration testing.
+
 ---
 
 ### Echo – UI Developer
