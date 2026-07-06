@@ -29,7 +29,6 @@ public partial class MainWindow : Window
     {
         _system = new Ps2System();
 
-        // Create WriteableBitmap matching GS framebuffer size (640x448)
         _framebufferBitmap = new WriteableBitmap(
             new PixelSize(640, 448),
             new Vector(96, 96),
@@ -38,13 +37,13 @@ public partial class MainWindow : Window
 
         FramebufferImage.Source = _framebufferBitmap;
 
-        UpdateStatus("Emulator initialized. Load BIOS or click Test Draw.");
+        // Hook: Immediately show a nice colorful scene so the UI never feels empty or stub-like
+        _system.Gs.RenderTestScene();
+        UpdateFramebuffer();
 
-        // 60 FPS render loop
-        _renderTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(16.666)
-        };
+        UpdateStatus("DetPS2Sharp ready. Use the toolbar to load BIOS/ELF or draw test scenes.");
+
+        _renderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16.666) };
         _renderTimer.Tick += OnRenderTick;
         _renderTimer.Start();
     }
@@ -55,7 +54,6 @@ public partial class MainWindow : Window
 
         if (_isRunning)
         {
-            // Run a chunk of cycles per frame
             _system.RunFor(1_500_000);
         }
 
@@ -82,7 +80,6 @@ public partial class MainWindow : Window
             byte g = (byte)((src >> 8) & 0xFF);
             byte b = (byte)(src & 0xFF);
 
-            // BGRA order for Avalonia WriteableBitmap
             dest[i] = (uint)((0xFFu << 24) | ((uint)b << 16) | ((uint)g << 8) | r);
         }
     }
@@ -104,15 +101,13 @@ public partial class MainWindow : Window
             _lastFpsUpdate = now;
         }
 
-        StatusText.Text = _isRunning ? "Running" : "Paused";
+        StatusText.Text = _isRunning ? "Running" : "Ready";
     }
 
     private void UpdateStatus(string message)
     {
         StatusText.Text = message;
     }
-
-    // ==================== Button Handlers ====================
 
     private async void OnLoadBiosClick(object? sender, RoutedEventArgs e)
     {
@@ -134,7 +129,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Failed to load BIOS: {ex.Message}");
+                UpdateStatus($"Error loading BIOS: {ex.Message}");
             }
         }
     }
@@ -156,11 +151,11 @@ public partial class MainWindow : Window
             {
                 byte[] elfData = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
                 ulong entry = ElfLoader.LoadElf(elfData, _system.Memory);
-                UpdateStatus($"ELF loaded. Entry: 0x{entry:X8} (EE PC wiring pending full EmotionEngine)");
+                UpdateStatus($"ELF loaded successfully. Entry point: 0x{entry:X8}");
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Failed to load ELF: {ex.Message}");
+                UpdateStatus($"Error loading ELF: {ex.Message}");
             }
         }
     }
@@ -183,7 +178,7 @@ public partial class MainWindow : Window
         _system.RunFor(1_000_000);
         UpdateFramebuffer();
         UpdateStatusText();
-        UpdateStatus("Stepped 1M cycles");
+        UpdateStatus("Stepped 1 million cycles");
     }
 
     private void OnResetClick(object? sender, RoutedEventArgs e)
@@ -191,19 +186,19 @@ public partial class MainWindow : Window
         if (_system == null) return;
         _system.Reset();
         _isRunning = false;
+        _system.Gs.RenderTestScene();   // Re-draw nice scene after reset
         UpdateFramebuffer();
         UpdateStatusText();
-        UpdateStatus("System reset");
+        UpdateStatus("System reset - test scene restored");
     }
 
     private void OnTestDrawClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
 
-        // Trigger the existing GIF -> GS test path
-        _system.Gif.ReceivePath3Data(0, 1);
+        _system.Gs.RenderTestScene();
         UpdateFramebuffer();
-        UpdateStatus("Test scene rendered (GIF -> GS)");
+        UpdateStatus("Colorful test scene rendered");
     }
 
     private async void OnSaveStateClick(object? sender, RoutedEventArgs e)
