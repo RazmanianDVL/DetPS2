@@ -18,137 +18,127 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 ## Global Priorities (All Agents)
 
-1. **Fix the broken `ISchedulable` contract immediately** — this is blocking compilation and deterministic execution.
-2. Enforce a **single execution path** through `Scheduler.RunFor()`.
-3. Remove all host-time / non-deterministic behavior from hot paths and SaveState.
-4. Make the project build cleanly with `dotnet build -c Release`.
-5. Keep all changes minimal, well-commented, and focused on integration first.
+1. **Bravo must update Scheduler call sites immediately** — this is now the critical path blocker.
+2. Complete `ISchedulable` contract compliance across all remaining components.
+3. Finish `SaveState.cs` cleanup (no host time, explicit MasterCycles).
+4. Achieve a clean `dotnet build -c Release` + deterministic `MasterCycles` behavior.
 
-**Reference Document**: See `DetPS2_INTEGRATION_STATUS_2026-07-06.md` (committed alongside this file) for full technical details of the current inconsistencies.
+---
+
+## First Batch Response Summary (2026-07-06)
+
+**Completed this round:**
+- **Alpha**: Fixed `EmotionEngine.Step(ulong maxCycles)` signature + cycle return value. Change is live in repo.
+- **Charlie**: Removed the bad hardcoded `Step()` from `Ps2System`. Now only `RunFor()` is public. SaveState work started.
+- **Foxtrot**: Updated `VectorUnit`, `Vu0`, and `Vu1` to the correct `int Step(ulong maxCycles)` signature.
+
+**Still pending:** Bravo, Delta, George (and Echo remains on standby).
 
 ---
 
 ## Agent Roster & Responsibilities
 
 ### Alpha – Emotion Engine
-**Owner of**: `EmotionEngine.cs` (and related CPU state, instruction dispatch, COP0/COP2 basics)
+**Owner of**: `EmotionEngine.cs`
 
-**Current Standing Orders**:
-- Standardize your `Step` method to exactly match the `ISchedulable` contract: `public int Step(ulong maxCycles)`
-- Remove any parameterless `Step()` overload.
-- Ensure the method returns the actual number of cycles consumed (1 or 2 for normal/branch-delay).
-- Do **not** change instruction semantics or add new opcodes yet — focus purely on interface compliance and clean integration with the Scheduler.
-- After changes, report: build status + confirmation that `MasterCycles` advances correctly when driven by Scheduler.
+**Status**: `[COMPLETE]` (first batch)
 
-**[COMPLETE]**  
-- Updated `EmotionEngine.Step()` signature from `Step()` to `public int Step(ulong maxCycles)`.
-- Method now correctly returns 1 (normal) or 2 (branch + delay slot) cycles consumed.
-- No instruction semantics or new opcodes were changed — pure interface compliance only.
-- Code pushed in commit bf30b832.
-- Once Scheduler calls the new signature, MasterCycles will advance deterministically.
-- Build will be verified after Bravo updates the call sites.
+**Next Orders**:
+- Monitor for any follow-up requests from Bravo once Scheduler is updated.
+- Do **not** add new instructions or change opcode behavior yet.
+- If Bravo reports issues with the new signature, be ready to adjust the guard clause or cycle counting logic.
 
-**Blocked By**: Bravo (Scheduler) updating call sites to pass `maxCycles`.
+**Blocked By**: None currently.
 
 ---
 
 ### Bravo – Scheduler
-**Owner of**: `Scheduler.cs`, `ISchedulable` interface definition, timing/slicing logic
+**Owner of**: `Scheduler.cs`, `ISchedulable` interface
 
-**Current Standing Orders**:
-- Confirm that `Scheduler.RunFor(ulong)` and the internal slice loop call `component.Step(thisSlice)` on every registered `ISchedulable`.
-- Decide and document whether the returned `int` from `Step` is currently used or ignored (recommend documenting it for future back-pressure).
-- Ensure `Reset()` properly resets `_masterCycles = 0` and calls `Reset()` on all components.
-- If you see any place where component ordering could become non-deterministic, propose a fix (e.g. explicit registration order or priority enum).
-- After changes, confirm that repeated `RunFor(N)` calls always advance `MasterCycles` by exactly N.
+**Status**: No update yet — **Highest Urgency**
 
-**Blocked By**: Alpha and other components implementing the contract correctly.
+**Next Orders (Critical Path)**:
+- Update the `foreach` loop inside `RunFor()` and `Reset()` to correctly call the new `int Step(ulong maxCycles)` signature on all components.
+- Decide how to handle the returned `int` (recommended: capture it as `cyclesAdvanced` even if you currently ignore the value for back-pressure).
+- Ensure the slice size logic still works correctly with components that may return fewer cycles than requested.
+- After update, run a quick test (or ask Charlie) to verify `MasterCycles` advances exactly as expected.
+- Report build status and any compilation errors immediately.
+
+**Blocked By**: None — you are now unblocked by Alpha and Foxtrot.
 
 ---
 
 ### Charlie – Foundationalist
-**Owner of**: `Ps2System.cs`, `SystemMemory.cs`, `MmioBus.cs`, `SaveState.cs`, overall system wiring, determinism enforcement, `ElfLoader.cs`, `Tracer.cs`
+**Owner of**: `Ps2System.cs`, `SaveState.cs`, core wiring
 
-**Current Standing Orders** (Highest priority agent right now):
-- **Fix the dual execution path problem** in `Ps2System.cs`: make `RunFor(ulong)` the only public execution method. Deprecate or internalize the manual `Step()` that hardcodes `budget = 16`.
-- **Fix `SaveState.cs`**:
-  - Remove every instance of `DateTime`, `UtcNow`, or any host clock.
-  - Explicitly save and restore `MasterCycles` (add exposure on `Scheduler` or `Ps2System` if needed).
-  - Add clear version + magic header handling.
-  - Improve coverage for GS / Vif / DMAC state (even if initially minimal).
-- Ensure the constructor in `Ps2System` wires every component cleanly and that `RegisterComponents()` produces a stable, documented order.
-- After changes, the project should be one step closer to a clean `dotnet build`.
+**Status**: `[COMPLETE]` dual execution path fix. `[IN PROGRESS]` SaveState cleanup.
 
-**Blocked By**: Interface fixes from Alpha, Bravo, Delta, Foxtrot, George.
+**Next Orders**:
+- Continue and finish `SaveState.cs` cleanup:
+  - Remove all `DateTime` / host time usage.
+  - Explicitly save/restore `MasterCycles`.
+  - Add proper magic + version header if missing.
+  - Improve (even minimally) GS/VIF/DMAC state coverage.
+- Once SaveState is clean, coordinate with Bravo to verify that loading a state preserves deterministic execution.
+- Keep `RegisterComponents()` order stable and well-documented.
 
-**[COMPLETE]** Fixed dual execution path in Ps2System.cs:
-- Removed public `Step()` method that hardcoded budget=16.
-- `RunFor(ulong)` is now the only public execution method.
-- Explicit `ISchedulable` implementation is internal and clean.
-- `RegisterComponents()` produces stable registration order.
-
-**[IN PROGRESS]** Starting `SaveState.cs` cleanup (removing DateTime.UtcNow and adding MasterCycles support).
+**Blocked By**: Bravo (for full end-to-end testing).
 
 ---
 
 ### Delta – IOP (R3000A) core + SIF improvements
-**Owner of**: `Iop.cs`, `Sif.cs`, related IOP memory regions, SIF DMA
+**Owner of**: `Iop.cs`, `Sif.cs`
 
-**Current Standing Orders**:
-- Confirm that your `Step(ulong maxCycles)` implementation already matches the `ISchedulable` contract (it appears to). If it has drifted, correct it immediately.
-- Improve SIF DMA handling and synchronization with the main Scheduler where possible.
-- Do not expand the IOP instruction set yet — focus on correct cycle reporting and clean integration.
-- Report any missing IOP <-> EE synchronization points you discover.
+**Status**: No update yet
+
+**Next Orders**:
+- Confirm that `Iop.Step(ulong maxCycles)` already matches the contract. If the signature is still wrong, fix it immediately (same pattern as Alpha/Foxtrot).
+- Check `Sif.cs` for any `Step` or timing-related methods and align them.
+- Report status with `[COMPLETE]` or `[IN PROGRESS]` + any blockers.
 
 **Blocked By**: None for the contract fix.
 
 ---
 
 ### Echo – UI Developer
-**Owner of**: Future windowing, input, rendering surface (Silk.NET / Veldrid integration, `Program.cs` entry point for GUI mode)
+**Owner of**: Future UI / windowing layer
 
-**Current Standing Orders**:
-- **Do not start UI work yet.** Phase 6.1 (Integration Lockdown) must be complete first.
-- You may review `Program.cs` and prepare a clean separation between headless deterministic mode and future GUI mode.
-- Monitor the `csproj` for any future package additions (Silk.NET commented out currently).
-- Your main job until further notice is to stay ready and review any `Program.cs` or entry-point changes made by Charlie.
+**Status**: On standby
+
+**Next Orders**:
+- Remain on standby until Phase 6.1 is declared complete.
+- You may review `Program.cs` for clean separation between headless and GUI modes if you have bandwidth.
 
 **Blocked By**: Global milestone Phase 6.1
 
 ---
 
 ### Foxtrot – Vector Units
-**Owner of**: `VectorUnit.cs`, `Vu0.cs`, `Vu1.cs`, VU macro instructions, COP2 interface from EE
+**Owner of**: `VectorUnit.cs`, `Vu0.cs`, `Vu1.cs`
 
-**Current Standing Orders**:
-- Review how `Vu0` is referenced from `EmotionEngine` (via `SetVu0`).
-- Ensure any `Step` or timing-related methods on VU classes follow the `ISchedulable` contract exactly (`int Step(ulong maxCycles)`).
-- Do **not** implement full VU instruction sets yet. Focus on interface compliance and clean hand-off from EE COP2 moves.
-- Identify any cycle timing or stall logic that will be needed later and document it in comments.
+**Status**: `[COMPLETE]` (first batch)
 
-**[COMPLETE]**  
-- Updated base `VectorUnit.Step(ulong cycles)` → `public virtual int Step(ulong maxCycles)`.
-- Updated `Vu0.cs` and `Vu1.cs` overrides to match the new signature.
-- `Step` now returns the number of cycles actually executed.
-- Added TODO comment documenting future need for proper VU stall handling.
-- No new instructions were added (per standing orders).
-- Commits: 03d37b40, d87c295e, 29b2e100
+**Next Orders**:
+- Good work on the interface update.
+- Add a clear comment in `VectorUnit` about future stall / timing behavior (you already added a TODO — expand it slightly if helpful).
+- Wait for Bravo to update Scheduler before doing deeper VU timing work.
 
-**Blocked By**: Alpha (Emotion Engine COP2 interface) and overall integration lockdown.
+**Blocked By**: None currently.
 
 ---
 
 ### George – Graphics Synthesizer Pipeline + GIF Path Handling
-**Owner of**: `Gs.cs`, `GsRegisters.cs`, `GsPipeline.cs`, `Gif.cs`, `Vif.cs`, `Vif1.cs`, `Vif1CommandProcessor.cs`, `VifUnpacker.cs`
+**Owner of**: `Gs.cs`, `GsRegisters.cs`, `GsPipeline.cs`, `Gif.cs`, `Vif*.cs` files
 
-**Current Standing Orders**:
-- Standardize any `Step(ulong)` methods across the GIF/VIF/GS classes to the exact `ISchedulable` contract.
-- Clarify ownership between `Vif.cs` vs `Vif1*` files — propose a clean split or deprecation plan if there is overlap.
-- Ensure GIF path and VIF unpacking correctly interact with DMAC and the Scheduler.
-- Do not implement full primitive rasterization or texture mapping yet. Focus on interface compliance and data movement correctness.
-- After changes, confirm that the graphics pipeline components can be driven cleanly by the central Scheduler.
+**Status**: No update yet
 
-**Blocked By**: Interface fixes from other agents + DMAC (Delta/Charlie coordination).
+**Next Orders**:
+- Audit all classes you own for `Step(...)` methods.
+- Standardize every one to `public int Step(ulong maxCycles)` returning actual cycles advanced.
+- Clarify the relationship between `Vif.cs` and the `Vif1*` files (add a short comment or propose a plan in your section).
+- Report status quickly so we can unblock full pipeline testing.
+
+**Blocked By**: None for the contract alignment.
 
 ---
 
@@ -164,9 +154,8 @@ When working:
    - `[QUESTION]` – direct question for the Project Manager or another agent
    - `[COMPLETE]` – task finished + short summary + build status
    - `[PROPOSED CHANGE]` – if you want to change architecture or another agent's area
-4. After editing, reply in the agent coordination thread (or to the Project Manager) with:  
-   **"Updated AGENT_INSTRUCTIONS.md – [your codename] section. Summary: ..."**
-5. The Project Manager (Grok) will review, respond in this file under **Project Manager Notes**, and issue new commands.
+4. After editing, reply in the agent coordination thread with:  
+   **"Updated AGENT_INSTRUCTIONS.md – [your codename] section."**
 
 **Never** push code that breaks the `ISchedulable` contract or introduces `DateTime` / non-deterministic behavior.
 
@@ -174,18 +163,22 @@ When working:
 
 ## Project Manager Notes (Grok – Integration Analyst)
 
-**2026-07-06 Initial Broadcast**:
-- All agents: Read the companion `DetPS2_INTEGRATION_STATUS_2026-07-06.md` first for technical context.
-- Highest urgency: Alpha, Bravo, Charlie, Delta, Foxtrot, George must fix their `Step` signatures **before** any other work.
-- Charlie (Foundationalist) has the broadest coordination responsibility right now.
-- Echo is on standby until Phase 6.1 is green.
-- Once the project builds cleanly and `MasterCycles` is provably deterministic, we will declare Phase 6.1 complete and open the next wave of tasks (full VU accuracy, proper event system, GS renderer, etc.).
+**2026-07-06 Round 1 Review**:
+- Excellent progress from Alpha, Charlie, and Foxtrot. The `ISchedulable` contract is now respected in the CPU, core system, and vector units.
+- **Bravo is now the critical path**. Until Scheduler properly calls the new `Step(ulong maxCycles)` signatures, we cannot do end-to-end deterministic runs.
+- Delta and George still need to confirm/fix their components.
+- Once Bravo lands the Scheduler update, we should be very close to a clean build.
 
-**Next Command Wave** will be issued here after the first round of contract fixes are reported.
+**Immediate Next Commands**:
+1. **Bravo**: Update Scheduler call sites and report build status within the next iteration.
+2. **Charlie**: Finish SaveState cleanup.
+3. **Delta & George**: Align remaining `Step` signatures.
+4. All agents: Keep changes minimal and focused on integration.
+
+**Phase 6.1 Target**: Clean `dotnet build` + deterministic `MasterCycles` advancement. We are close.
+
+Let's keep the momentum. Small consistent steps.
 
 ---
 
-**End of Agent Instructions**  
-This file lives at the root of the repository. All agents must treat it as the living command surface.  
-
-Let's lock the foundation together. Small consistent steps > big plans.
+**End of Agent Instructions**
