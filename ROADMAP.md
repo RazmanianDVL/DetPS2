@@ -39,6 +39,7 @@
 - Rebuilt `Intc.cs` with clean foundational structure and InterruptSource enum
 - Created foundational `Vif1.cs` structure
 - Created foundational `GsPipeline.cs`
+- Created foundational `Timer.cs` class
 - Integrated Scheduler foundation into `Ps2System`
 - Strong determinism focus maintained
 - SaveState support
@@ -48,7 +49,7 @@
 - Higher accuracy floating-point handling with determinism focus
 - Improved timing and synchronization between EE, IOP, and VUs (using Scheduler foundation)
 - Full Vif1 data unpacking and microcode handling
-- Interrupt integration with Emotion Engine (COP0)
+- Interrupt integration with Emotion Engine (COP0) + Timers
 - Expanded SaveState features
 
 ## Phase 7: Graphics Pipeline & Rendering
