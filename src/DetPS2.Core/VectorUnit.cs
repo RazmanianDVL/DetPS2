@@ -6,8 +6,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Focused on making the Vector Units work.
-/// Continuing to improve functionality, accuracy, and completeness.
+/// Continuing to make the Vector Units work.
+/// Adding more instructions and improving structure toward completeness.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -116,6 +116,10 @@ public abstract class VectorUnit
 
             case 0x0C: HandleBranch(opcode, rs); break;
 
+            // Additional instructions
+            case 0x06: ApplyArith(rs, rt, rd, (a, b) => a * b); break;
+            case 0x07: ApplyArith(rs, rt, rd, (a, b) => a + b); break;
+
             default: break;
         }
     }
@@ -148,7 +152,6 @@ public abstract class VectorUnit
         short offset = (short)(opcode & 0xFFFF);
         uint target = (uint)(PC + (offset << 2));
 
-        // Improved branch condition (example)
         bool take = _vf[rs].X != 0f || _vf[rs].Y != 0f || _vf[rs].Z != 0f || _vf[rs].W != 0f;
 
         if (take)
@@ -158,7 +161,6 @@ public abstract class VectorUnit
         }
     }
 
-    // Field-aware helpers
     private void ApplyArith(uint rs, uint rt, uint rd, Func<float, float, float> op)
     {
         if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = op(_vf[rs].X, _vf[rt].X);
