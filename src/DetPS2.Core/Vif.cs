@@ -5,6 +5,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// VIF (Vector Interface) - Phase 6.
 /// Provides data transfer between main memory and the Vector Units (especially VU1).
+/// 
+/// Phase 6.1: Standardized Step(ulong) to ISchedulable contract.
 /// </summary>
 public sealed class Vif
 {
@@ -21,7 +23,14 @@ public sealed class Vif
     public void SetVu1(Vu1 vu1) => _vu1 = vu1;
 
     public void Reset() { }
-    public void Step(ulong cycles) { }
+
+    /// <summary>
+    /// ISchedulable contract implementation.
+    /// </summary>
+    public int Step(ulong maxCycles)
+    {
+        return 0; // VIF is currently driven by DMAC events rather than time slices
+    }
 
     /// <summary>
     /// Send one quadword (16 bytes) from memory to VU1.
