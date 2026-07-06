@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 - logical and shift instructions implemented.
+/// Phase 6 - ITOF/FTOI conversion instructions implemented.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -179,7 +179,7 @@ public abstract class VectorUnit
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
                 break;
 
-            case 0x17: // AND (component-wise on bit representation)
+            case 0x17: // AND
                 _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) & SingleToInt32Bits(_vf[rt].X));
                 _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) & SingleToInt32Bits(_vf[rt].Y));
                 _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) & SingleToInt32Bits(_vf[rt].Z));
@@ -200,34 +200,86 @@ public abstract class VectorUnit
                 _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) ^ SingleToInt32Bits(_vf[rt].W));
                 break;
 
-            case 0x1A: // SLL (shift left logical on bit representation)
+            case 0x1A: // SLL
                 _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) << (int)(_vf[rt].X));
                 _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) << (int)(_vf[rt].Y));
                 _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) << (int)(_vf[rt].Z));
                 _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) << (int)(_vf[rt].W));
                 break;
 
-            case 0x1B: // SRL (shift right logical)
+            case 0x1B: // SRL
                 _vf[rd].X = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].X) >> (int)(_vf[rt].X)));
                 _vf[rd].Y = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].Y) >> (int)(_vf[rt].Y)));
                 _vf[rd].Z = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].Z) >> (int)(_vf[rt].Z)));
                 _vf[rd].W = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].W) >> (int)(_vf[rt].W)));
                 break;
 
-            case 0x1C: // SRA (shift right arithmetic)
+            case 0x1C: // SRA
                 _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) >> (int)(_vf[rt].X));
                 _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) >> (int)(_vf[rt].Y));
                 _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) >> (int)(_vf[rt].Z));
                 _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) >> (int)(_vf[rt].W));
                 break;
 
+            // === ITOF / FTOI Conversion Instructions ===
+            case 0x1E: // ITOF0 (int to float, no scaling)
+                _vf[rd].X = (float)SingleToInt32Bits(_vf[rs].X); // treat float bits as int then convert
+                _vf[rd].Y = (float)SingleToInt32Bits(_vf[rs].Y);
+                _vf[rd].Z = (float)SingleToInt32Bits(_vf[rs].Z);
+                _vf[rd].W = (float)SingleToInt32Bits(_vf[rs].W);
+                break;
+
+            case 0x1F: // FTOI0 (float to int, no scaling)
+                _vf[rd].X = Int32BitsToSingle((int)_vf[rs].X);
+                _vf[rd].Y = Int32BitsToSingle((int)_vf[rs].Y);
+                _vf[rd].Z = Int32BitsToSingle((int)_vf[rs].Z);
+                _vf[rd].W = Int32BitsToSingle((int)_vf[rs].W);
+                break;
+
+            // Scaled versions (common in games)
+            case 0x20: // ITOF4
+                _vf[rd].X = SingleToInt32Bits(_vf[rs].X) / 16.0f;
+                _vf[rd].Y = SingleToInt32Bits(_vf[rs].Y) / 16.0f;
+                _vf[rd].Z = SingleToInt32Bits(_vf[rs].Z) / 16.0f;
+                _vf[rd].W = SingleToInt32Bits(_vf[rs].W) / 16.0f;
+                break;
+
+            case 0x21: // FTOI4
+                _vf[rd].X = Int32BitsToSingle((int)(_vf[rs].X * 16.0f));
+                _vf[rd].Y = Int32BitsToSingle((int)(_vf[rs].Y * 16.0f));
+                _vf[rd].Z = Int32BitsToSingle((int)(_vf[rs].Z * 16.0f));
+                _vf[rd].W = Int32BitsToSingle((int)(_vf[rs].W * 16.0f));
+                break;
+
+            case 0x22: // ITOF12
+                _vf[rd].X = SingleToInt32Bits(_vf[rs].X) / 4096.0f;
+                _vf[rd].Y = SingleToInt32Bits(_vf[rs].Y) / 4096.0f;
+                _vf[rd].Z = SingleToInt32Bits(_vf[rs].Z) / 4096.0f;
+                _vf[rd].W = SingleToInt32Bits(_vf[rs].W) / 4096.0f;
+                break;
+
+            case 0x23: // FTOI12
+                _vf[rd].X = Int32BitsToSingle((int)(_vf[rs].X * 4096.0f));
+                _vf[rd].Y = Int32BitsToSingle((int)(_vf[rs].Y * 4096.0f));
+                _vf[rd].Z = Int32BitsToSingle((int)(_vf[rs].Z * 4096.0f));
+                _vf[rd].W = Int32BitsToSingle((int)(_vf[rs].W * 4096.0f));
+                break;
+
+            case 0x24: // ITOF15
+                _vf[rd].X = SingleToInt32Bits(_vf[rs].X) / 32768.0f;
+                _vf[rd].Y = SingleToInt32Bits(_vf[rs].Y) / 32768.0f;
+                _vf[rd].Z = SingleToInt32Bits(_vf[rs].Z) / 32768.0f;
+                _vf[rd].W = SingleToInt32Bits(_vf[rs].W) / 32768.0f;
+                break;
+
+            case 0x25: // FTOI15
+                _vf[rd].X = Int32BitsToSingle((int)(_vf[rs].X * 32768.0f));
+                _vf[rd].Y = Int32BitsToSingle((int)(_vf[rs].Y * 32768.0f));
+                _vf[rd].Z = Int32BitsToSingle((int)(_vf[rs].Z * 32768.0f));
+                _vf[rd].W = Int32BitsToSingle((int)(_vf[rs].W * 32768.0f));
+                break;
+
             case 0x1D: // CLIP
-                break;
-
-            case 0x1E: // ITOF0
-                break;
-
-            case 0x1F: // FTOI0
                 break;
 
             default:
@@ -235,7 +287,6 @@ public abstract class VectorUnit
         }
     }
 
-    // Helper methods for bit manipulation (deterministic)
     private static int SingleToInt32Bits(float value) => BitConverter.SingleToInt32Bits(value);
     private static float Int32BitsToSingle(int value) => BitConverter.Int32BitsToSingle(value);
 
