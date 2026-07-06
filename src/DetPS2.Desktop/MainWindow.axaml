@@ -2,13 +2,13 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="DetPS2.Desktop.MainWindow"
         Title="DetPS2Sharp — Deterministic PS2 Emulator"
-        Width="960" Height="720"
-        MinWidth="800" MinHeight="600"
+        Width="1100" Height="720"
+        MinWidth="900" MinHeight="600"
         DragDrop.AllowDrop="True">
 
-    <Grid RowDefinitions="Auto,Auto,*,Auto">
+    <Grid ColumnDefinitions="*, Auto" RowDefinitions="Auto,Auto,*,Auto">
         <!-- Menu Bar -->
-        <Menu Grid.Row="0" Background="{DynamicResource MenuBackground}">
+        <Menu Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="0" Background="{DynamicResource MenuBackground}">
             <MenuItem Header="_File">
                 <MenuItem Header="Load _BIOS..." Click="OnLoadBiosClick" HotKey="Ctrl+B" />
                 <MenuItem Header="Load _ELF..." Click="OnLoadElfClick" HotKey="Ctrl+E" />
@@ -38,7 +38,7 @@
         </Menu>
 
         <!-- Toolbar -->
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="8,4">
+        <StackPanel Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="8,4">
             <Button Content="Load BIOS" Click="OnLoadBiosClick" ToolTip.Tip="Ctrl+B" />
             <Button Content="Load ELF" Click="OnLoadElfClick" ToolTip.Tip="Ctrl+E" />
             <Separator Width="1" Margin="4,2" />
@@ -65,8 +65,8 @@
             </StackPanel>
         </StackPanel>
 
-        <!-- Main Display Area (also accepts drops) -->
-        <Border Grid.Row="2" x:Name="DisplayBorder"
+        <!-- Main Display Area -->
+        <Border Grid.Column="0" Grid.Row="2" x:Name="DisplayBorder"
                 BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
                 CornerRadius="4"
                 DragDrop.AllowDrop="True">
@@ -77,8 +77,43 @@
                    Margin="4" />
         </Border>
 
+        <!-- Right Sidebar: System Status Panel -->
+        <Border Grid.Column="1" Grid.Row="2" Width="240" Margin="0,8,8,8"
+                Background="#1a1a22" BorderBrush="#444" BorderThickness="1" CornerRadius="4">
+            <StackPanel Margin="12" Spacing="10">
+                <TextBlock Text="SYSTEM STATUS" FontWeight="Bold" FontSize="14" Foreground="#aaa" />
+                <Separator />
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Status" FontSize="12" Foreground="#888" />
+                    <TextBlock x:Name="SidebarStatus" Text="Ready" FontSize="15" FontWeight="SemiBold" />
+                </StackPanel>
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Master Cycles" FontSize="12" Foreground="#888" />
+                    <TextBlock x:Name="SidebarCycles" Text="0" FontSize="15" FontWeight="SemiBold" />
+                </StackPanel>
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Emulation Speed" FontSize="12" Foreground="#888" />
+                    <TextBlock x:Name="SidebarSpeed" Text="Normal" FontSize="15" FontWeight="SemiBold" />
+                </StackPanel>
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Updates / sec" FontSize="12" Foreground="#888" />
+                    <TextBlock x:Name="SidebarFps" Text="~60" FontSize="15" FontWeight="SemiBold" />
+                </StackPanel>
+
+                <Separator Margin="0,8" />
+
+                <TextBlock Text="Drag files here or use toolbar" 
+                           FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+            </StackPanel>
+        </Border>
+
         <!-- Status Bar -->
-        <Border Grid.Row="3" Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" Padding="8,4">
+        <Border Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="3" 
+                Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" Padding="8,4">
             <StackPanel Orientation="Horizontal" Spacing="16">
                 <TextBlock x:Name="StatusText" Text="Ready" VerticalAlignment="Center" />
                 <TextBlock x:Name="CyclesText" Text="Master Cycles: 0" VerticalAlignment="Center" />
