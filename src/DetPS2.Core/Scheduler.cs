@@ -4,28 +4,23 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Foundational deterministic scheduler for the PS2 system.
-/// This class is responsible for driving all components in a cycle-aware, deterministic order.
+/// Deterministic scheduler for the PS2 system.
 /// 
-/// Design goals:
-/// - Clear separation between components and timing logic
-/// - Easy to extend with cycle-accurate stepping later
-/// - Supports multiple clock domains (EE vs IOP)
-/// - Foundation for future interrupt and timing-sensitive work
+/// v2 design: Budgeted slicing
+/// - Components receive a cycle budget instead of being stepped 1 cycle at a time.
+/// - Dramatically reduces overhead while staying fully deterministic.
+/// - Master cycle counter remains the single source of truth.
+/// - Tunable slice size for performance vs granularity.
 /// </summary>
 public sealed class Scheduler
 {
     private readonly List<ISchedulable> _components = new();
     private ulong _masterCycles;
 
-    /// <summary>
-    /// Current master cycle count (shared timeline).
-    /// </summary>
     public ulong MasterCycles => _masterCycles;
 
-    /// <summary>
-    /// Register a component that can be stepped by the scheduler.
-    /// </summary>
+    public ulong SliceSize { get; set; } = 64;
+
     public void Register(ISchedulable component)
     {
         if (component == null) throw new ArgumentNullException(nameof(component));
@@ -33,33 +28,28 @@ public sealed class Scheduler
             _components.Add(component);
     }
 
-    /// <summary>
-    /// Remove a component from scheduling.
-    /// </summary>
     public void Unregister(ISchedulable component)
     {
         _components.Remove(component);
     }
 
-    /// <summary>
-    /// Advance the system by a number of master cycles.
-    /// This is the main entry point for running the emulator.
-    /// </summary>
-    public void RunFor(ulong cycles)
+    public void RunFor(ulong cyclesToRun)
     {
-        ulong target = _masterCycles + cycles;
+        if (cyclesToRun == 0) return;
+
+        ulong target = _masterCycles + cyclesToRun;
 
         while (_masterCycles < target)
         {
-            // Step all registered components
-            // In the future this can become more sophisticated (cycle-accurate per component, etc.)
+            ulong remaining = target - _masterCycles;
+            ulong thisSlice = Math.Min(remaining, SliceSize);
+
             foreach (var component in _components)
             {
-                int cyclesTaken = component.Step();
-                // For now we use a simple model. Future versions can track per-component cycles.
+                component.Step(thisSlice);
             }
 
-            _masterCycles++;
+            _masterCycles += thisSlice;
         }
     }
 
@@ -71,11 +61,8 @@ public sealed class Scheduler
     }
 }
 
-/// <summary>
-/// Interface for any component that can be driven by the Scheduler.
-/// </summary>
 public interface ISchedulable
 {
-    int Step();
+    int Step(ulong maxCycles);
     void Reset();
 }
