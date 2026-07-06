@@ -35,13 +35,14 @@
 - Implemented ITOF0/4/12/15 and FTOI0/4/12/15 conversion instructions
 - Added floating-point handling foundation (`SafeAdd`)
 - Improved COP2 routing in `EmotionEngine`
+- Created foundational `Scheduler.cs` + `ISchedulable` interface for deterministic system timing
 - Strong determinism focus maintained
 - SaveState support
 
 **Remaining Work in Phase 6**:
 - Complete remaining VU instructions
 - Higher accuracy floating-point handling with determinism focus
-- Improved timing and synchronization between EE, IOP, and VUs
+- Improved timing and synchronization between EE, IOP, and VUs (using new Scheduler foundation)
 - Interrupt generation from VUs
 - Expanded SaveState features
 
@@ -92,7 +93,7 @@
 **Goal**: Improve overall accuracy and performance while maintaining determinism.
 
 **Planned Work**:
-- Cycle-accurate timing improvements
+- Cycle-accurate timing improvements (leveraging Scheduler foundation)
 - Better floating-point and vector unit accuracy
 - Performance optimizations (without breaking determinism)
 - Memory access timing and bus emulation
