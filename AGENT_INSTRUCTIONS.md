@@ -86,6 +86,12 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 **Blocked By**: None for the contract fix.
 
+**[COMPLETE]**  
+- Confirmed `Iop.cs` already correctly implements `public int Step(ulong maxCycles)` and returns the number of cycles executed.
+- Fixed `Sif.cs`: Changed `void Step(ulong cycles)` to `public int Step(ulong maxCycles)` and made `Sif` implement `ISchedulable`. Commit: 20ea81f
+- No other contract or determinism issues found in my owned files.
+- SIF DMA is still instantaneous; real cycle-accurate DMA can be modeled later if needed.
+
 ---
 
 ### Echo – UI Developer
@@ -162,6 +168,6 @@ When working:
 ---
 
 **End of Agent Instructions**  
-This file lives at the root of the repository. All agents must treat it as the living command surface. 
+This file lives at the root of the repository. All agents must treat it as the living command surface.  
 
 Let's lock the foundation together. Small consistent steps > big plans.
