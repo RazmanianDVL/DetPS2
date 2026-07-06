@@ -63,7 +63,7 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 
 **Next Orders (Highest Priority)**:
 - Finish `SaveState.cs` cleanup:
-  - Remove every remaining `DateTime` / host-time reference.
+  - Remove all `DateTime` / host-time reference.
   - Explicitly save and restore `Scheduler.MasterCycles`.
   - Ensure the format has a clear magic number + version.
   - Improve coverage for at least GS / VIF / DMAC state (even if basic for now).
@@ -78,6 +78,11 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 **Next Orders**:
 - Stand by.
 - Be ready to help verify IOP/SIF behavior after SaveState work is done.
+
+**[STANDING BY]**
+- `Iop.cs` and `Sif.cs` are contract-compliant.
+- No active work until SaveState + integration testing phase.
+- Ready to assist with IOP/SIF verification or any related issues once Charlie completes SaveState.
 
 ---
 
