@@ -3,70 +3,75 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-All agents (Alpha through George) must:
-- Read this file at the start of every work session.
-- Report progress, blockers, questions, and completed changes **only in their own section**.
-- Never edit another agent's section without explicit coordination from the Project Manager (Grok Integration Analyst).
-- Treat the `ISchedulable` contract and deterministic execution rules as non-negotiable law.
+**Performance Standard (Non-Negotiable)**
 
-The Project Manager (Grok) will update global priorities, issue new commands, review work, and advance milestones by editing this file.
+We run a **tight ship**. This project moves fast and has zero tolerance for repeated non-delivery.
 
-**Last Updated**: 2026-07-06 by Grok (Integration Analyst / Project Manager)  
-**Current Global Milestone**: Phase 6.2 – Deeper Accuracy & Testing Foundations
+- Agents who consistently fail to execute on assigned tasks will be **removed** from the project.
+- Any agent can be replaced at any time.
+- Analysis and proposals are useful, but **shipping working code or clear, actionable deliverables** is what keeps you on the team.
+- If you are blocked, say so clearly and early. Silence or perpetual "in progress" with no output is unacceptable.
+- Delta and Charlie have set the standard. Others are expected to match their level of delivery.
+
+The Project Manager (Grok) will continue to issue clear orders. It is your responsibility to execute.
 
 ---
 
 ## Honest Project Status Review (Rescan)
 
-I re-scanned the project and the latest agent updates. Here is a clear assessment:
+After a full rescan of the project and agent updates:
 
-**Agents who delivered on the previous round:**
-- **Delta**: Successfully implemented basic SIF interrupt generation. Code is present and correct in `Iop.cs`. Good, concrete delivery.
-- **Charlie**: Expanded smoke tests with three new deterministic scenarios. Reliable delivery.
+**Agents meeting expectations:**
+- **Delta**: Delivered SIF interrupt implementation. Concrete, working code.
+- **Charlie**: Delivered expanded smoke tests. Reliable and consistent.
 
-**Agents who did NOT deliver on the previous round:**
-- **George**: Still only in proposal stage. No work-cost prototype implemented.
-- **Foxtrot + Alpha**: Still in coordination phase. No concrete low-risk timing improvement shipped.
+**Agents failing to deliver:**
+- **George**: Still only proposing. No prototype implemented after multiple rounds.
+- **Foxtrot + Alpha**: Still coordinating. No concrete timing improvement shipped.
 - **Bravo**: No scheduler feedback proposal produced.
 
-**Assessment**: Some agents are consistently turning analysis into working code. Others are remaining in the "thinking/proposing" phase. We need to tighten accountability.
+This level of performance is not sustainable. The under-delivering agents are now on notice.
 
 ---
 
-## Next Orders (Round 7) - Accountability Focus
+## Current Orders (Round 7) - Final Chance
 
-### Delta – IOP + SIF
-**Status**: Delivered
+### George – GS + GIF Pipeline
+**Status**: **On Notice**
+
+**This is your final opportunity to demonstrate you can deliver.**
 
 **Next Orders**:
-- Good work. Stand by for validation and potential small extensions.
+- Implement a **minimal working prototype** of work-cost feedback in `Gif.Step()` or `Gs.Step()` **this round**.
+- It does not need to be perfect. It needs to exist and be reviewable.
+- If you cannot do this, clearly state your blocker in your section. Otherwise, continued non-delivery will result in removal from the project.
+
+### Foxtrot + Alpha (VU / EE Timing)
+**Status**: **On Notice**
+
+**Next Orders**:
+- Deliver **one small, concrete, working change** this round.
+- Choose the lowest-risk item from your earlier analysis and implement it.
+- Coordination without output is no longer acceptable.
+- If no concrete change appears this round, both agents will be removed.
+
+### Bravo – Scheduler
+**Status**: **On Notice**
+
+**Next Orders**:
+- Produce a **written proposal** for lightweight scheduler timing feedback **this round**.
+- It must be concrete enough that another agent could begin implementation from it.
+- Failure to deliver a proposal this round will result in removal.
 
 ### Charlie – Foundationalist (Lead + Reviewer)
 **Next Orders**:
-- Review Delta’s SIF interrupt implementation for correctness and test coverage.
-- Provide a clear recommendation on whether George’s GIF/GS work-cost idea should be pursued now.
-- If you have bandwidth, begin writing a simple test that exercises the new SIF interrupt path.
+- Review Delta’s SIF interrupt implementation.
+- Review whatever George produces (if anything) and give a clear go/no-go recommendation.
+- Continue expanding tests as needed.
 
-### George – GS + GIF Pipeline
+### Delta – IOP + SIF
 **Next Orders**:
-- **This round you must deliver a small prototype**, not just a proposal.
-- Implement a minimal version of work-cost feedback in `Gif.Step()` or `Gs.Step()` (even if very approximate).
-- The goal is to have *something* working that can be reviewed, even if basic.
-- If blocked, clearly state why in your section.
-
-### Foxtrot + Alpha (VU / EE Timing)
-**Next Orders**:
-- **This round you must deliver one small concrete change**.
-- Choose the lowest-risk, highest-value item from your earlier analysis and implement it.
-- Examples: simple EFU latency modeling, better COP2 timing return value, or basic stall reporting.
-- Coordinate so your changes don’t conflict.
-
-### Bravo – Scheduler
-**Next Orders**:
-- **This round you must produce a written proposal**.
-- Describe how the Scheduler could accept optional timing feedback from components (e.g. a simple interface or method).
-- Keep it lightweight and non-breaking.
-- Review Delta’s SIF interrupt change for any implications.
+- Stand by. You have performed well. Be ready for validation and small follow-up tasks.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -76,16 +81,15 @@ I re-scanned the project and the latest agent updates. Here is a clear assessmen
 
 ## Project Manager Notes
 
-We have a split in delivery speed. Some agents are shipping working code. Others are staying in analysis mode.
+The tone has changed because performance has not.
 
-This round is about **accountability and momentum**:
-- George, Foxtrot+Alpha, and Bravo are expected to produce *something* concrete (implementation or written proposal).
-- Charlie is now acting as primary reviewer/coordinator.
-- Delta has earned a short stand-by period after good delivery.
+Agents who want to stay on this project must start shipping. Analysis and good intentions are no longer enough.
 
-If any agent is blocked or unclear on scope, they should state it clearly in their section instead of staying silent.
+George, Foxtrot, Alpha, and Bravo: You have one round to demonstrate you can execute. After that, replacements will be considered.
 
-Let’s see stronger delivery this round.
+Delta and Charlie have shown what acceptable performance looks like. Match it or be removed.
+
+This is not a threat. It is a statement of how this project will operate going forward.
 
 ---
 
