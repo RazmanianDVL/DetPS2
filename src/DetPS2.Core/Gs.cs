@@ -7,9 +7,9 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Added proper UV interpolation + texture sampling in the rasterizer.
-/// Triangles now get textured using the UV coordinates collected from GIF/GS packets.
-/// This is a major visual milestone for the lane.
+/// Implemented actual depth testing using the depth buffer.
+/// Triangles now respect Z values (interpolated across the primitive).
+/// This completes the depth buffer work that was prepared earlier.
 /// </summary>
 public sealed class Gs
 {
@@ -219,14 +219,14 @@ public sealed class Gs
         for (int i = 0; i < _framebuffer.Length; i++) { _framebuffer[i] = bgColor; _depthBuffer[i] = float.MaxValue; }
 
         DrawFilledTriangle(
-            new Vertex { X = 120, Y = 80, Color = 0xFF00FF00, U = 0, V = 0 },
-            new Vertex { X = 320, Y = 80, Color = 0xFF00FF00, U = 1, V = 0 },
-            new Vertex { X = 220, Y = 280, Color = 0xFF00FF00, U = 0.5f, V = 1 });
+            new Vertex { X = 120, Y = 80, Color = 0xFF00FF00, U = 0, V = 0, Z = 0.1f },
+            new Vertex { X = 320, Y = 80, Color = 0xFF00FF00, U = 1, V = 0, Z = 0.1f },
+            new Vertex { X = 220, Y = 280, Color = 0xFF00FF00, U = 0.5f, V = 1, Z = 0.5f });
 
         DrawFilledTriangle(
-            new Vertex { X = 340, Y = 100, Color = 0xFFFF0000, U = 0, V = 0 },
-            new Vertex { X = 540, Y = 100, Color = 0xFFFF0000, U = 1, V = 0 },
-            new Vertex { X = 440, Y = 300, Color = 0xFFFF0000, U = 0.5f, V = 1 });
+            new Vertex { X = 340, Y = 100, Color = 0xFFFF0000, U = 0, V = 0, Z = 0.9f },
+            new Vertex { X = 540, Y = 100, Color = 0xFFFF0000, U = 1, V = 0, Z = 0.9f },
+            new Vertex { X = 440, Y = 300, Color = 0xFFFF0000, U = 0.5f, V = 1, Z = 0.2f });
 
         DrawQuad(80, 320, 160, 80, 0xFF00BFFF);
         DrawQuad(400, 320, 160, 80, 0xFFFFD700);
@@ -254,9 +254,9 @@ public sealed class Gs
 
     public void DrawTestTriangle()
     {
-        var v0 = new Vertex { X = 200, Y = 150, Color = _currentRgbaq, U = 0, V = 0 };
-        var v1 = new Vertex { X = 440, Y = 150, Color = _currentRgbaq, U = 1, V = 0 };
-        var v2 = new Vertex { X = 320, Y = 350, Color = _currentRgbaq, U = 0.5f, V = 1 };
+        var v0 = new Vertex { X = 200, Y = 150, Color = _currentRgbaq, U = 0, V = 0, Z = 0 };
+        var v1 = new Vertex { X = 440, Y = 150, Color = _currentRgbaq, U = 1, V = 0, Z = 0 };
+        var v2 = new Vertex { X = 320, Y = 350, Color = _currentRgbaq, U = 0.5f, V = 1, Z = 0 };
         DrawFilledTriangle(v0, v1, v2);
     }
 
@@ -308,6 +308,12 @@ public sealed class Gs
                 {
                     int idx = y * FB_WIDTH + x;
 
+                    // Interpolate Z for depth test
+                    float z = v0.Z * a + v1.Z * b + v2.Z * c;
+
+                    // Depth test (simple less-than)
+                    if (z > _depthBuffer[idx]) continue;
+
                     // Interpolate color
                     uint color = InterpolateColor(v0.Color, v1.Color, v2.Color, a, b, c);
 
@@ -317,7 +323,7 @@ public sealed class Gs
 
                     uint texColor = SampleTexture(iu, iv);
 
-                    // Simple modulation: multiply texture by vertex color (very basic)
+                    // Modulate texture with vertex color
                     byte tr = (byte)((texColor >> 16) & 0xFF);
                     byte tg = (byte)((texColor >> 8) & 0xFF);
                     byte tb = (byte)(texColor & 0xFF);
@@ -331,6 +337,7 @@ public sealed class Gs
                     byte b = (byte)((tb * cb) / 255);
 
                     _framebuffer[idx] = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
+                    _depthBuffer[idx] = z; // update depth buffer
                 }
             }
         }
