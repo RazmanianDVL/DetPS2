@@ -38,7 +38,8 @@
 - Created foundational `Scheduler.cs` + `ISchedulable` interface
 - Rebuilt `Intc.cs` with clean foundational structure and InterruptSource enum
 - Created foundational `Vif1.cs` structure
-- Created foundational `GsPipeline.cs` for GS rendering flow
+- Created foundational `GsPipeline.cs`
+- Integrated Scheduler foundation into `Ps2System`
 - Strong determinism focus maintained
 - SaveState support
 
