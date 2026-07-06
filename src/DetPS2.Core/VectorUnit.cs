@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Base class for VU0 and VU1.
-/// Phase 6 foundation complete.
+/// Phase 6 - logical and shift instructions implemented.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -179,37 +179,46 @@ public abstract class VectorUnit
                 _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
                 break;
 
-            case 0x12: // EQ
-                break;
-
-            case 0x13: // LT
-                break;
-
-            case 0x14: // LE
-                break;
-
-            case 0x15: // GT
-                break;
-
-            case 0x16: // GE
-                break;
-
-            case 0x17: // AND
+            case 0x17: // AND (component-wise on bit representation)
+                _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) & SingleToInt32Bits(_vf[rt].X));
+                _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) & SingleToInt32Bits(_vf[rt].Y));
+                _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) & SingleToInt32Bits(_vf[rt].Z));
+                _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) & SingleToInt32Bits(_vf[rt].W));
                 break;
 
             case 0x18: // OR
+                _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) | SingleToInt32Bits(_vf[rt].X));
+                _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) | SingleToInt32Bits(_vf[rt].Y));
+                _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) | SingleToInt32Bits(_vf[rt].Z));
+                _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) | SingleToInt32Bits(_vf[rt].W));
                 break;
 
             case 0x19: // XOR
+                _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) ^ SingleToInt32Bits(_vf[rt].X));
+                _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) ^ SingleToInt32Bits(_vf[rt].Y));
+                _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) ^ SingleToInt32Bits(_vf[rt].Z));
+                _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) ^ SingleToInt32Bits(_vf[rt].W));
                 break;
 
-            case 0x1A: // SLL
+            case 0x1A: // SLL (shift left logical on bit representation)
+                _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) << (int)(_vf[rt].X));
+                _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) << (int)(_vf[rt].Y));
+                _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) << (int)(_vf[rt].Z));
+                _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) << (int)(_vf[rt].W));
                 break;
 
-            case 0x1B: // SRL
+            case 0x1B: // SRL (shift right logical)
+                _vf[rd].X = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].X) >> (int)(_vf[rt].X)));
+                _vf[rd].Y = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].Y) >> (int)(_vf[rt].Y)));
+                _vf[rd].Z = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].Z) >> (int)(_vf[rt].Z)));
+                _vf[rd].W = Int32BitsToSingle((int)((uint)SingleToInt32Bits(_vf[rs].W) >> (int)(_vf[rt].W)));
                 break;
 
-            case 0x1C: // SRA
+            case 0x1C: // SRA (shift right arithmetic)
+                _vf[rd].X = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].X) >> (int)(_vf[rt].X));
+                _vf[rd].Y = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Y) >> (int)(_vf[rt].Y));
+                _vf[rd].Z = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].Z) >> (int)(_vf[rt].Z));
+                _vf[rd].W = Int32BitsToSingle(SingleToInt32Bits(_vf[rs].W) >> (int)(_vf[rt].W));
                 break;
 
             case 0x1D: // CLIP
@@ -225,6 +234,10 @@ public abstract class VectorUnit
                 break;
         }
     }
+
+    // Helper methods for bit manipulation (deterministic)
+    private static int SingleToInt32Bits(float value) => BitConverter.SingleToInt32Bits(value);
+    private static float Int32BitsToSingle(int value) => BitConverter.Int32BitsToSingle(value);
 
     protected float SafeAdd(float a, float b)
     {
