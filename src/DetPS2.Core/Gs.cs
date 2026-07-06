@@ -4,22 +4,31 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Graphics Synthesizer - Phase 2/3
-/// Supports triangle, line, and quad primitives with PRIM-based dispatch.
-/// Texture sampling is a stub for future use.
+/// Graphics Synthesizer (GS) - GS Lane active (Phase 7 foundation)
+/// 
+/// Milestone: GsRegisters integration + basic real packet processing
+/// 
+/// We now have:
+/// - Explicit, save-state friendly register file
+/// - ReceiveCommandList that walks GIF data and applies registers
+/// - Legacy drawing path preserved so we still get visible output
+/// 
+/// Next in lane: Proper primitive assembly from real vertex data + GIFtag handling improvements
 /// </summary>
 public sealed class Gs
 {
     public SystemMemory Memory { get; }
+    public GsRegisters Registers { get; } = new();
 
     private const int FB_WIDTH = 640;
     private const int FB_HEIGHT = 448;
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
 
+    // Temporary legacy fields during transition to full register-driven pipeline
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
 
-    // Texture state (stub)
+    // Texture stub (will be replaced by proper state in Registers + sampler)
     private uint _texBase = 0;
     private int _texWidth = 64;
     private int _texHeight = 64;
@@ -32,20 +41,50 @@ public sealed class Gs
 
     public void Reset()
     {
+        Registers.Reset();
         Array.Clear(_framebuffer, 0, _framebuffer.Length);
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
     }
 
     /// <summary>
-    /// Called by GIF after parsing a command list.
-    /// Currently dispatches based on the last SetPrim() value.
-    /// In a more advanced version this would parse actual GS packets from memory.
+    /// Main entry point from GIF.
+    /// Walks the buffer at [address, address + qwc*16] and applies A+D style register writes.
     /// </summary>
     public void ReceiveCommandList(uint address, uint qwc)
     {
-        uint primType = _currentPrim & 0x7;
+        if (Memory == null || qwc == 0) return;
 
+        uint addr = address;
+        uint remaining = qwc;
+
+        while (remaining > 0)
+        {
+            // GIF data is 128-bit words. We read two 32-bit words per step.
+            uint dataLow  = Memory.Read32(addr);
+            uint dataHigh = Memory.Read32(addr + 4);
+
+            // Crude but functional A+D extraction for early work.
+            // Real format: lower 64 bits = data, upper contains address + control bits.
+            uint regAddr = (dataHigh >> 24) & 0x7F;   // common location for register address in many packets
+            uint value   = dataLow;
+
+            if (regAddr != 0)
+            {
+                Registers.WriteRegister(regAddr, value);
+
+                // Keep legacy path alive during transition
+                if (regAddr == 0x00) _currentPrim = value;
+                if (regAddr == 0x01) _currentRgbaq = value;
+            }
+
+            addr += 16;
+            remaining--;
+        }
+
+        // Temporary visual output so we can see progress immediately.
+        // This will be replaced by real DrawPrimitive calls once we have vertex assembly.
+        uint primType = _currentPrim & 0x7;
         switch (primType)
         {
             case 1: DrawLine(200, 200, 400, 300, _currentRgbaq); break;
@@ -58,25 +97,25 @@ public sealed class Gs
 
     public void SetPrim(uint prim)
     {
+        Registers.WriteRegister(0x00, prim);
         _currentPrim = prim;
         Console.WriteLine($"[GS] PRIM = 0x{prim:X}");
     }
 
     public void SetRGBAQ(uint rgbaq)
     {
+        Registers.WriteRegister(0x01, rgbaq);
         _currentRgbaq = rgbaq;
         Console.WriteLine($"[GS] RGBAQ = 0x{rgbaq:X8}");
     }
 
-    /// <summary>
-    /// Vertex data handler. Currently a stub for future primitive assembly.
-    /// </summary>
     public void DrawVertex(uint xyz)
     {
-        // TODO: Collect vertices for proper primitive assembly
+        Registers.WriteRegister(0x04, xyz);
+        // TODO (next in lane): collect into vertex buffer for real primitive assembly
     }
 
-    // ==================== Texture Sampling (Stub) ====================
+    // ==================== Texture (stub) ====================
 
     public uint SampleTexture(int u, int v)
     {
@@ -93,7 +132,7 @@ public sealed class Gs
         _texHeight = height;
     }
 
-    // ==================== Drawing Primitives ====================
+    // ==================== Software Drawing Primitives ====================
 
     public void DrawTestTriangle()
     {
