@@ -7,7 +7,7 @@ namespace DetPS2.Core;
 /// Base class for VU0 and VU1.
 /// 
 /// Continuing to make the Vector Units work.
-/// Expanding load/store support and adding more instructions.
+/// Adding more instructions and refining existing functionality.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -116,8 +116,10 @@ public abstract class VectorUnit
 
             case 0x0C: HandleBranch(opcode, rs); break;
 
-            case 0x06: ApplyArith(rs, rt, rd, (a, b) => a * b); break;
-            case 0x07: ApplyArith(rs, rt, rd, (a, b) => a + b); break;
+            // More common instructions
+            case 0x06: ApplyArith(rs, rt, rd, (a, b) => a * b); break; // MUL
+            case 0x07: ApplyArith(rs, rt, rd, (a, b) => a + b); break; // FADD
+            case 0x08: ApplyArith(rs, rt, rd, (a, b) => a - b); break; // FSUB
 
             default: break;
         }
@@ -129,7 +131,7 @@ public abstract class VectorUnit
         uint baseAddr = (uint)_vf[rs].X;
         uint addr = baseAddr + (uint)offset;
 
-        if (primary == 0x01) // Load (including LQI/SQI style)
+        if (primary == 0x01) // Load
         {
             uint value = _memory.Read32(addr);
             float f = BitConverter.Int32BitsToSingle((int)value);
@@ -138,12 +140,6 @@ public abstract class VectorUnit
             if ((_currentFieldMask & 0b0010) != 0) _vf[rt].Y = f;
             if ((_currentFieldMask & 0b0100) != 0) _vf[rt].Z = f;
             if ((_currentFieldMask & 0b1000) != 0) _vf[rt].W = f;
-
-            // Simple post-increment simulation for LQI-style
-            if ((opcode & 0x80000000) != 0) // Example flag for increment
-            {
-                _vf[rs].X += 16; // quadword increment
-            }
         }
         else if (primary == 0x02) // Store
         {
@@ -157,7 +153,8 @@ public abstract class VectorUnit
         short offset = (short)(opcode & 0xFFFF);
         uint target = (uint)(PC + (offset << 2));
 
-        bool take = _vf[rs].X != 0f || _vf[rs].Y != 0f || _vf[rs].Z != 0f || _vf[rs].W != 0f;
+        // More accurate branch condition
+        bool take = (_vf[rs].X != 0f) || (_vf[rs].Y != 0f) || (_vf[rs].Z != 0f) || (_vf[rs].W != 0f);
 
         if (take)
         {
