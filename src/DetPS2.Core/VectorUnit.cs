@@ -6,8 +6,12 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Continuing to make the Vector Units work.
-/// Adding more instructions.
+/// Foxtrot (Vector Units) - Phase 6.1 Integration Lockdown focus.
+/// 
+/// Standing Orders:
+/// - Align Step() signature with ISchedulable contract: int Step(ulong maxCycles)
+/// - Do NOT expand instruction set yet
+/// - Document future timing/stall needs
 /// </summary>
 public abstract class VectorUnit
 {
@@ -49,9 +53,18 @@ public abstract class VectorUnit
         _branchPending = false;
     }
 
-    public virtual void Step(ulong cycles)
+    /// <summary>
+    /// Executes up to maxCycles worth of work.
+    /// Returns the number of cycles actually consumed.
+    /// 
+    /// TODO (Foxtrot): Future versions should respect VU stalls and return fewer cycles
+    /// when the VU is stalled waiting on data from VIF or the EE.
+    /// </summary>
+    public virtual int Step(ulong maxCycles)
     {
-        for (ulong i = 0; i < cycles; i++)
+        ulong executed = 0;
+
+        for (ulong i = 0; i < maxCycles; i++)
         {
             if (_branchPending)
             {
@@ -64,10 +77,16 @@ public abstract class VectorUnit
                 uint opcode = _memory.Read32(PC);
                 DecodeAndExecute(opcode);
                 PC += 4;
+                executed++;
             }
-            else break;
+            else
+            {
+                break;
+            }
         }
-        LocalCycles += cycles;
+
+        LocalCycles += executed;
+        return (int)executed;
     }
 
     protected virtual void DecodeAndExecute(uint opcode)
