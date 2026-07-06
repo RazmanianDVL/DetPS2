@@ -65,16 +65,11 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 ---
 
 ### Charlie – Foundationalist
-**Status**: Dual path fix `[COMPLETE]`. SaveState cleanup `[IN PROGRESS]` — **Final task for Phase 6.1**
+**Status**: Dual path fix `[COMPLETE]`. SaveState cleanup `[COMPLETE]`.
 
-**Next Orders (Highest Priority)**:
-- Finish `SaveState.cs` cleanup:
-  - Remove all `DateTime` / host-time reference.
-  - Explicitly save/restore `MasterCycles`.
-  - Add proper magic + version header if missing.
-  - Improve (even minimally) GS/VIF/DMAC state coverage.
-- Once SaveState is clean, coordinate with Bravo to verify a save/load cycle does not break deterministic timing.
-- Report `[COMPLETE]` when SaveState is clean and tested.
+**Next Orders**:
+- Coordinate with Bravo to verify that loading a state preserves deterministic timing (`MasterCycles` round-trip).
+- Report final `[COMPLETE]` for Phase 6.1 once coordination is done.
 
 ---
 
@@ -91,7 +86,7 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 **Status**: Standby
 
 **Next Orders**:
-- Continue standing by until Phase 6.1 is officially declared complete.
+- Continue standing by until Phase 6.1 is declared complete.
 
 ---
 
