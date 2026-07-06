@@ -321,11 +321,11 @@ public abstract class VectorUnit
             0x1E => (float)iv,
             0x1F => Int32BitsToSingle((int)v),
             0x20 => iv / 16.0f,
-            0x21 => Int32BitsToSingle((int)(v * 16f)),
+            0x21 => Int32BitsToSingle((int)(v * 16f));
             0x22 => iv / 4096.0f,
-            0x23 => Int32BitsToSingle((int)(v * 4096f)),
+            0x23 => Int32BitsToSingle((int)(v * 4096f));
             0x24 => iv / 32768.0f,
-            0x25 => Int32BitsToSingle((int)(v * 32768f)),
+            0x25 => Int32BitsToSingle((int)(v * 32768f));
             _ => v
         };
 
@@ -389,5 +389,24 @@ public abstract class VectorUnit
         Q = reader.ReadUInt32();
         P = reader.ReadUInt32();
         PC = reader.ReadUInt32();
+    }
+
+    // ==================== COP2 / VU0 Interaction Helpers (Alpha + Foxtrot - Phase 6.2) ====================
+
+    /// <summary>
+    /// Returns a copy of the specified VF register.
+    /// Used by EmotionEngine for QMFC2 (Quadword Move From COP2).
+    /// </summary>
+    public VuReg128 GetVfRegister(int index)
+    {
+        return _vf[index & 0x1F];
+    }
+
+    /// <summary>
+    /// Sets the specified VF register from an external source (e.g. EmotionEngine QMTC2).
+    /// </summary>
+    public void SetVfRegister(int index, VuReg128 value)
+    {
+        _vf[index & 0x1F] = value;
     }
 }
