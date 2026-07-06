@@ -7,7 +7,7 @@ namespace DetPS2.Core;
 /// Base class for VU0 and VU1.
 /// 
 /// Continuing to make the Vector Units work.
-/// Adding more instructions and refining existing functionality.
+/// Adding more instructions and improving overall capability.
 /// </summary>
 public abstract class VectorUnit
 {
@@ -116,10 +116,9 @@ public abstract class VectorUnit
 
             case 0x0C: HandleBranch(opcode, rs); break;
 
-            // More common instructions
-            case 0x06: ApplyArith(rs, rt, rd, (a, b) => a * b); break; // MUL
-            case 0x07: ApplyArith(rs, rt, rd, (a, b) => a + b); break; // FADD
-            case 0x08: ApplyArith(rs, rt, rd, (a, b) => a - b); break; // FSUB
+            case 0x06: ApplyArith(rs, rt, rd, (a, b) => a * b); break;
+            case 0x07: ApplyArith(rs, rt, rd, (a, b) => a + b); break;
+            case 0x08: ApplyArith(rs, rt, rd, (a, b) => a - b); break;
 
             default: break;
         }
@@ -153,8 +152,7 @@ public abstract class VectorUnit
         short offset = (short)(opcode & 0xFFFF);
         uint target = (uint)(PC + (offset << 2));
 
-        // More accurate branch condition
-        bool take = (_vf[rs].X != 0f) || (_vf[rs].Y != 0f) || (_vf[rs].Z != 0f) || (_vf[rs].W != 0f);
+        bool take = _vf[rs].X != 0f || _vf[rs].Y != 0f || _vf[rs].Z != 0f || _vf[rs].W != 0f;
 
         if (take)
         {
