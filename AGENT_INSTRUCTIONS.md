@@ -131,6 +131,10 @@ The Project Manager (Grok) will update global priorities, issue new commands, re
 - Add a clear comment in `VectorUnit` about future stall / timing behavior (you already added a TODO — expand it slightly if helpful).
 - Wait for Bravo to update Scheduler before doing deeper VU timing work.
 
+**[COMPLETE]**  
+- Expanded the stall/timing comment in `VectorUnit.Step()` with detailed future behavior notes (VIF stalls, COP2 stalls, pipeline interlocks, etc.).
+- No other changes made.
+
 **Blocked By**: None currently.
 
 ---
