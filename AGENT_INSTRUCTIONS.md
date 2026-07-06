@@ -84,6 +84,28 @@ We are shifting from pure analysis into **small, targeted improvements** while c
 
 ---
 
+## [6.2] Delta – IOP + SIF
+
+**[COMPLETE]** Basic SIF interrupt generation implemented (2026-07-06)
+
+**Change made in Iop.cs:**
+```csharp
+public void WriteSifMailboxFromEE(uint value)
+{
+    SifMbxFromEE = value;
+    SifMbxToEE = ~value;
+
+    // [6.2] Basic SIF interrupt generation
+    Intc?.Raise(Intc.InterruptSource.Sif);
+}
+```
+
+This provides the first real IOP → EE interrupt signaling path.
+
+Ready for review and integration testing.
+
+---
+
 ## Communication Protocol
 
 When reporting implementation work or proposals, use clear markers and keep changes minimal and reviewable.
