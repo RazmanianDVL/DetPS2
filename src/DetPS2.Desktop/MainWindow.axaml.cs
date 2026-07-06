@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using Avalonia.Threading;
@@ -22,6 +23,7 @@ public partial class MainWindow : Window
     private DateTime _lastFpsUpdate = DateTime.UtcNow;
 
     private ulong _cyclesPerTick = 1_500_000;
+    private string _currentSpeedMode = "Normal";
 
     public MainWindow()
     {
@@ -45,7 +47,10 @@ public partial class MainWindow : Window
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
 
-        UpdateStatus("DetPS2Sharp ready — Drag & Drop supported");
+        UpdateStatus("DetPS2Sharp ready — Sidebar active");
+
+        // Initialize sidebar
+        UpdateSidebar();
 
         _renderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16.666) };
         _renderTimer.Tick += OnRenderTick;
@@ -54,12 +59,10 @@ public partial class MainWindow : Window
 
     private void SetupDragDrop()
     {
-        // Enable on both window and display border for best UX
         AddHandler(DragDrop.DragEnterEvent, OnDragEnter, RoutingStrategies.Bubble);
         AddHandler(DragDrop.DragLeaveEvent, OnDragLeave, RoutingStrategies.Bubble);
         AddHandler(DragDrop.DropEvent, OnDrop, RoutingStrategies.Bubble);
 
-        // Also on the display border specifically
         if (DisplayBorder != null)
         {
             DisplayBorder.AddHandler(DragDrop.DragEnterEvent, OnDragEnter, RoutingStrategies.Bubble);
@@ -73,9 +76,8 @@ public partial class MainWindow : Window
         if (e.Data.Contains(DataFormats.Files))
         {
             e.DragEffects = DragDropEffects.Copy;
-            // Visual feedback - highlight the display border
             if (DisplayBorder != null)
-                DisplayBorder.BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.DodgerBlue);
+                DisplayBorder.BorderBrush = new SolidColorBrush(Colors.DodgerBlue);
         }
         else
         {
@@ -86,13 +88,13 @@ public partial class MainWindow : Window
     private void OnDragLeave(object? sender, DragEventArgs e)
     {
         if (DisplayBorder != null)
-            DisplayBorder.BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.Gray);
+            DisplayBorder.BorderBrush = new SolidColorBrush(Colors.Gray);
     }
 
     private async void OnDrop(object? sender, DragEventArgs e)
     {
         if (DisplayBorder != null)
-            DisplayBorder.BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.Gray);
+            DisplayBorder.BorderBrush = new SolidColorBrush(Colors.Gray);
 
         if (_system == null) return;
 
@@ -109,16 +111,18 @@ public partial class MainWindow : Window
             {
                 _system.LoadBios(path);
                 UpdateStatus($"BIOS loaded via drag & drop: {Path.GetFileName(path)}");
+                UpdateSidebar();
             }
             else if (ext == ".elf")
             {
                 byte[] elfData = await File.ReadAllBytesAsync(path);
                 ulong entry = ElfLoader.LoadElf(elfData, _system.Memory);
                 UpdateStatus($"ELF loaded via drag & drop — Entry: 0x{entry:X8}");
+                UpdateSidebar();
             }
             else
             {
-                UpdateStatus("Unsupported file type. Use .bin, .rom, or .elf");
+                UpdateStatus("Unsupported file type (.bin, .rom, or .elf only)");
             }
         }
         catch (Exception ex)
@@ -138,6 +142,7 @@ public partial class MainWindow : Window
 
         UpdateFramebuffer();
         UpdateStatusText();
+        UpdateSidebar();
     }
 
     private unsafe void UpdateFramebuffer()
@@ -168,19 +173,17 @@ public partial class MainWindow : Window
         if (_system == null) return;
 
         CyclesText.Text = $"Master Cycles: {_system.MasterCycles:N0}";
+        FpsText.Text = $"~{(_cyclesPerTick / 1_500_000.0):F1} updates/sec";
+    }
 
-        var now = DateTime.UtcNow;
-        if ((now - _lastFpsUpdate).TotalSeconds >= 1.0)
-        {
-            long current = (long)_system.MasterCycles;
-            long delta = current - _lastCycles;
-            double fps = delta / (double)_cyclesPerTick;
-            FpsText.Text = $"~{fps:F1} updates/sec";
-            _lastCycles = current;
-            _lastFpsUpdate = now;
-        }
+    private void UpdateSidebar()
+    {
+        if (_system == null) return;
 
-        StatusText.Text = _isRunning ? "Running" : "Ready";
+        SidebarStatus.Text = _isRunning ? "Running" : "Ready";
+        SidebarCycles.Text = _system.MasterCycles.ToString("N0");
+        SidebarSpeed.Text = _currentSpeedMode;
+        SidebarFps.Text = $"~{(_cyclesPerTick / 1_500_000.0):F1}";
     }
 
     private void UpdateStatus(string message)
@@ -196,24 +199,30 @@ public partial class MainWindow : Window
         {
             case 0:
                 _cyclesPerTick = 300_000;
-                UpdateStatus("Speed: Slow (300k cycles/frame)");
+                _currentSpeedMode = "Slow";
+                UpdateStatus("Speed: Slow");
                 break;
             case 1:
                 _cyclesPerTick = 1_500_000;
-                UpdateStatus("Speed: Normal (1.5M cycles/frame)");
+                _currentSpeedMode = "Normal";
+                UpdateStatus("Speed: Normal");
                 break;
             case 2:
                 _cyclesPerTick = 6_000_000;
-                UpdateStatus("Speed: Fast (6M cycles/frame)");
+                _currentSpeedMode = "Fast";
+                UpdateStatus("Speed: Fast");
                 break;
             case 3:
                 _cyclesPerTick = 25_000_000;
-                UpdateStatus("Speed: Unlimited (25M cycles/frame)");
+                _currentSpeedMode = "Unlimited";
+                UpdateStatus("Speed: Unlimited");
                 break;
         }
+
+        UpdateSidebar();
     }
 
-    // ... (all other handlers remain the same - LoadBios, LoadElf, Run, Pause, etc.)
+    // ==================== All other handlers (Load, Run, etc.) remain unchanged ====================
 
     private async void OnLoadBiosClick(object? sender, RoutedEventArgs e)
     {
@@ -232,6 +241,7 @@ public partial class MainWindow : Window
             {
                 _system.LoadBios(files[0].Path.LocalPath);
                 UpdateStatus($"BIOS loaded: {Path.GetFileName(files[0].Path.LocalPath)}");
+                UpdateSidebar();
             }
             catch (Exception ex)
             {
@@ -258,6 +268,7 @@ public partial class MainWindow : Window
                 byte[] elfData = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
                 ulong entry = ElfLoader.LoadElf(elfData, _system.Memory);
                 UpdateStatus($"ELF loaded successfully — Entry: 0x{entry:X8}");
+                UpdateSidebar();
             }
             catch (Exception ex)
             {
@@ -270,12 +281,14 @@ public partial class MainWindow : Window
     {
         _isRunning = true;
         UpdateStatus("Running...");
+        UpdateSidebar();
     }
 
     private void OnPauseClick(object? sender, RoutedEventArgs e)
     {
         _isRunning = false;
         UpdateStatus("Paused");
+        UpdateSidebar();
     }
 
     private void OnStepClick(object? sender, RoutedEventArgs e)
@@ -284,6 +297,7 @@ public partial class MainWindow : Window
         _system.RunFor(1_000_000);
         UpdateFramebuffer();
         UpdateStatusText();
+        UpdateSidebar();
         UpdateStatus("Stepped 1 million cycles");
     }
 
@@ -295,6 +309,7 @@ public partial class MainWindow : Window
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
         UpdateStatusText();
+        UpdateSidebar();
         UpdateStatus("System reset — test scene restored");
     }
 
@@ -303,6 +318,7 @@ public partial class MainWindow : Window
         if (_system == null) return;
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
+        UpdateSidebar();
         UpdateStatus("Colorful test scene rendered");
     }
 
@@ -324,6 +340,7 @@ public partial class MainWindow : Window
                 byte[] data = _system.SaveState();
                 await File.WriteAllBytesAsync(file.Path.LocalPath, data);
                 UpdateStatus($"State saved: {Path.GetFileName(file.Path.LocalPath)}");
+                UpdateSidebar();
             }
             catch (Exception ex)
             {
@@ -350,6 +367,7 @@ public partial class MainWindow : Window
                 byte[] data = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
                 bool success = _system.LoadState(data);
                 UpdateFramebuffer();
+                UpdateSidebar();
                 UpdateStatus(success ? "State loaded successfully" : "State load failed");
             }
             catch (Exception ex)
@@ -398,6 +416,7 @@ public partial class MainWindow : Window
         {
             _system.Gs.RenderTestScene();
             UpdateFramebuffer();
+            UpdateSidebar();
             UpdateStatus("Framebuffer view reset to test scene");
         }
     }
