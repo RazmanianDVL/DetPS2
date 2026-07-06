@@ -1,10 +1,22 @@
-            case 0x0F: // SYNC
-                return 1;
+        bool take = false;
+        bool link = false;
 
-            case 0x0B: // MOVN
-                if (rd != 0 && _gprs[rt].Lo != 0) _gprs[rd].Lo = _gprs[rs].Lo;
-                return 1;
+        switch (rt)
+        {
+            case 0:  take = (long)_gprs[rs].Lo < 0; break;   // BLTZ
+            case 1:  take = (long)_gprs[rs].Lo >= 0; break;  // BGEZ
+            case 0x10: take = (long)_gprs[rs].Lo < 0; link = true; break;  // BLTZAL
+            case 0x11: take = (long)_gprs[rs].Lo >= 0; link = true; break; // BGEZAL
+        }
 
-            case 0x0A: // MOVZ
-                if (rd != 0 && _gprs[rt].Lo == 0) _gprs[rd].Lo = _gprs[rs].Lo;
-                return 1;
+        if (link)
+        {
+            _gprs[31].Lo = PC + 4; // link to delay slot
+        }
+
+        if (take)
+        {
+            _pendingBranchTarget = target;
+            _branchPending = true;
+        }
+        return 1;
