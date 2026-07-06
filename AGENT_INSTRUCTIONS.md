@@ -79,17 +79,35 @@ This level of performance is not sustainable. The under-delivering agents are no
 
 ---
 
+## [6.2] Delta – IOP + SIF
+
+**[STANDING BY]** (Round 7)
+
+- SIF interrupt implementation complete and documented.
+- Ready to support validation/review of the change.
+- Available for any small follow-up tasks or fixes related to IOP/SIF.
+
+---
+
+## Communication Protocol
+
+When reporting implementation work or proposals, use clear markers and keep changes minimal and reviewable.
+
+---
+
 ## Project Manager Notes
 
-The tone has changed because performance has not.
+We have good momentum from the analysis round. Now we start turning that knowledge into small, safe improvements.
 
-Agents who want to stay on this project must start shipping. Analysis and good intentions are no longer enough.
+Priority order for this round:
+1. Delta’s SIF interrupt work (highest value / lowest risk)
+2. Charlie’s testing expansion + coordination recommendations
+3. George’s initial GS/GIF costing prototype
+4. Foxtrot + Alpha coordination on VU/EE timing
 
-George, Foxtrot, Alpha, and Bravo: You have one round to demonstrate you can execute. After that, replacements will be considered.
+Keep changes small. We are still in exploration + foundation-building mode.
 
-Delta and Charlie have shown what acceptable performance looks like. Match it or be removed.
-
-This is not a threat. It is a statement of how this project will operate going forward.
+Stand by for progress reports.
 
 ---
 
