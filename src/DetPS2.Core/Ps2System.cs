@@ -5,7 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Now uses the foundational Scheduler for deterministic stepping.
+/// Execution now flows exclusively through Scheduler.RunFor().
 /// </summary>
 public sealed class Ps2System : ISchedulable
 {
@@ -80,6 +80,10 @@ public sealed class Ps2System : ISchedulable
         EE.PC = 0xBFC00000;
     }
 
+    /// <summary>
+    /// The single public entry point for running the system.
+    /// All execution must go through the Scheduler.
+    /// </summary>
     public void RunFor(ulong cyclesToRun)
     {
         Scheduler.RunFor(cyclesToRun);
@@ -90,25 +94,24 @@ public sealed class Ps2System : ISchedulable
         Scheduler.Reset();
     }
 
-    public int Step()
+    // ISchedulable implementation (used internally by Scheduler)
+    int ISchedulable.Step(ulong maxCycles)
     {
-        const ulong budget = 16;
+        // For now we perform a combined step.
+        // Future versions should respect maxCycles and return actual cycles consumed.
+        EE.Step(maxCycles);
+        Dmac.Step(maxCycles);
+        Vif.Step(maxCycles);
+        Gif.Step(maxCycles);
+        Gs.Step(maxCycles);
+        Pcrtc.Step(maxCycles);
+        Intc.Step(maxCycles);
+        Iop.Step(maxCycles);
+        Cdvd.Step(maxCycles);
+        Sif.Step(maxCycles);
 
-        EE.Step(budget);
-        Dmac.Step(budget);
-        Vif.Step(budget);
-        Gif.Step(budget);
-        Gs.Step(budget);
-        Pcrtc.Step(budget);
-        Intc.Step(budget);
-        Iop.Step(budget);
-        Cdvd.Step(budget);
-        Sif.Step(budget);
-
-        return 1;
+        return 1; // Placeholder - should return real cycles later
     }
 
-    // ISchedulable
-    int ISchedulable.Step(ulong maxCycles) => Step();
     void ISchedulable.Reset() => Reset();
 }
