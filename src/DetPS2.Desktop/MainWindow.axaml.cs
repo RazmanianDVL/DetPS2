@@ -19,6 +19,9 @@ public partial class MainWindow : Window
     private long _lastCycles;
     private DateTime _lastFpsUpdate = DateTime.UtcNow;
 
+    // Emulation speed control
+    private ulong _cyclesPerTick = 1_500_000; // Default = Normal
+
     public MainWindow()
     {
         InitializeComponent();
@@ -37,11 +40,10 @@ public partial class MainWindow : Window
 
         FramebufferImage.Source = _framebufferBitmap;
 
-        // Always start with a nice colorful scene
         _system.Gs.RenderTestScene();
         UpdateFramebuffer();
 
-        UpdateStatus("DetPS2Sharp ready — Menu and shortcuts fully hooked");
+        UpdateStatus("DetPS2Sharp ready — Speed control active (Normal)");
 
         _renderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16.666) };
         _renderTimer.Tick += OnRenderTick;
@@ -54,7 +56,7 @@ public partial class MainWindow : Window
 
         if (_isRunning)
         {
-            _system.RunFor(1_500_000);
+            _system.RunFor(_cyclesPerTick);
         }
 
         UpdateFramebuffer();
@@ -95,7 +97,7 @@ public partial class MainWindow : Window
         {
             long current = (long)_system.MasterCycles;
             long delta = current - _lastCycles;
-            double fps = delta / 1_500_000.0;
+            double fps = delta / (double)_cyclesPerTick;
             FpsText.Text = $"~{fps:F1} updates/sec";
             _lastCycles = current;
             _lastFpsUpdate = now;
@@ -107,6 +109,33 @@ public partial class MainWindow : Window
     private void UpdateStatus(string message)
     {
         StatusText.Text = message;
+    }
+
+    // ==================== Speed Control ====================
+
+    private void OnSpeedChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (SpeedCombo.SelectedIndex < 0 || _system == null) return;
+
+        switch (SpeedCombo.SelectedIndex)
+        {
+            case 0: // Slow
+                _cyclesPerTick = 300_000;
+                UpdateStatus("Speed: Slow (300k cycles/frame)");
+                break;
+            case 1: // Normal
+                _cyclesPerTick = 1_500_000;
+                UpdateStatus("Speed: Normal (1.5M cycles/frame)");
+                break;
+            case 2: // Fast
+                _cyclesPerTick = 6_000_000;
+                UpdateStatus("Speed: Fast (6M cycles/frame)");
+                break;
+            case 3: // Unlimited
+                _cyclesPerTick = 25_000_000;
+                UpdateStatus("Speed: Unlimited (25M cycles/frame) — caution with early core");
+                break;
+        }
     }
 
     // ==================== Menu & Button Handlers ====================
