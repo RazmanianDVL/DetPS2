@@ -4,21 +4,33 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Graphics Interface (GIF) - GS Lane improvements
+/// 
+/// Work-Cost Prototype integration: GIF now participates in deterministic timing.
+/// Step() returns meaningful cycle consumption instead of 0.
+/// Full cost model lives in Gs.CalculateWorkCost (called from here in future refinements).
 /// </summary>
 public sealed class Gif
 {
     private readonly Gs _gs;
+
+    // Tracks last transfer size for cost calculation (deterministic)
+    private uint _lastQwcProcessed;
 
     public Gif(Gs gs)
     {
         _gs = gs ?? throw new ArgumentNullException(nameof(gs));
     }
 
-    public void Reset() { }
+    public void Reset() 
+    { 
+        _lastQwcProcessed = 0; 
+    }
 
     public void ReceivePath3Data(uint address, uint qwc)
     {
         Console.WriteLine($"[GIF] PATH3 transfer: {qwc} quadwords @ 0x{address:X8}");
+
+        _lastQwcProcessed = qwc; // for deterministic cost reporting
 
         uint currentAddr = address;
         uint remaining = qwc;
@@ -77,8 +89,20 @@ public sealed class Gif
         _gs.ReceiveCommandList(address, qwc);
     }
 
+    /// <summary>
+    /// ISchedulable implementation for GIF.
+    /// Returns deterministic cycle cost based on last transfer.
+    /// In full implementation this will call _gs.CalculateWorkCost(_lastQwcProcessed, nreg).
+    /// </summary>
     public int Step(ulong maxCycles)
     {
-        return 0;
+        if (_lastQwcProcessed == 0)
+            return 1; // minimal progress when idle
+
+        // Use Gs work-cost model when possible (integer only, deterministic)
+        int cost = _gs.CalculateWorkCost(_lastQwcProcessed, 4); // assume average 4 registers per tag for now
+        _lastQwcProcessed = 0; // reset after reporting
+
+        return Math.Min(cost, (int)maxCycles);
     }
 }
