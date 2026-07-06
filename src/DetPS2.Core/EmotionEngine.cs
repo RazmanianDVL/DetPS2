@@ -6,14 +6,16 @@ namespace DetPS2.Core;
 /// <summary>
 /// Emotion Engine (R5900) - MIPS III + PS2 extensions.
 /// 
-/// Milestone 3: COP2 skeleton + more MMI-friendly instructions + robustness improvements.
+/// Milestone 4: Basic COP2 integration with VU0.
 /// 
-/// Next logical step after basic integer execution.
-/// We now recognize COP2 instructions (primary 0x12) so we can later route them to VU0.
+/// This is currently the highest priority task.
+/// We now support the most common COP2 data movement instructions so the EE can
+/// communicate with VU0. Full VU macro instruction execution comes later.
 /// </summary>
 public sealed class EmotionEngine : ISchedulable
 {
     private readonly SystemMemory _memory;
+    private Vu0? _vu0;
 
     public ulong PC { get; set; } = 0xBFC00000;
 
@@ -41,6 +43,15 @@ public sealed class EmotionEngine : ISchedulable
     {
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
         Reset();
+    }
+
+    /// <summary>
+    /// Connects this Emotion Engine to VU0 so COP2 instructions can access it.
+    /// Call this from Ps2System after construction.
+    /// </summary>
+    public void SetVu0(Vu0 vu0)
+    {
+        _vu0 = vu0 ?? throw new ArgumentNullException(nameof(vu0));
     }
 
     public void Reset()
@@ -111,7 +122,7 @@ public sealed class EmotionEngine : ISchedulable
             case 0x0E: ExecuteAndi(opcode); break;
             case 0x0F: ExecuteLui(opcode); break;
 
-            case 0x12: return ExecuteCop2(opcode);   // <-- New: COP2 entry point
+            case 0x12: return ExecuteCop2(opcode);
 
             case 0x20: ExecuteLb(opcode); break;
             case 0x21: ExecuteLh(opcode); break;
@@ -154,24 +165,28 @@ public sealed class EmotionEngine : ISchedulable
             case 0x0A: if (GetGpr(rt).Lo == 0 && rd != 0) SetGpr(rd, GetGpr(rs)); break; // MOVZ
             case 0x0B: if (GetGpr(rt).Lo != 0 && rd != 0) SetGpr(rd, GetGpr(rs)); break; // MOVN
 
-            case 0x0C: HandleSyscall(opcode); break; // SYSCALL
-            case 0x0D: break; // BREAK
+            case 0x0C: HandleSyscall(opcode); break;
+            case 0x0D: break;
 
             case 0x10: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = HI }); break; // MFHI
             case 0x11: HI = GetGpr(rs).Lo; break; // MTHI
             case 0x12: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO }); break; // MFLO
             case 0x13: LO = GetGpr(rs).Lo; break; // MTLO
 
-            case 0x18: case 0x19: // MULT/MULTU
+            case 0x18: case 0x19:
                 {
-                    long a = (long)GetGpr(rs).Lo; long b = (long)GetGpr(rt).Lo;
-                    long res = a * b; LO = (ulong)(res & 0xFFFFFFFF); HI = (ulong)((res >> 32) & 0xFFFFFFFF);
+                    long a = (long)GetGpr(rs).Lo;
+                    long b = (long)GetGpr(rt).Lo;
+                    long res = a * b;
+                    LO = (ulong)(res & 0xFFFFFFFF);
+                    HI = (ulong)((res >> 32) & 0xFFFFFFFF);
                 }
                 break;
 
-            case 0x1A: case 0x1B: // DIV/DIVU
+            case 0x1A: case 0x1B:
                 {
-                    long a = (long)GetGpr(rs).Lo; long b = (long)GetGpr(rt).Lo;
+                    long a = (long)GetGpr(rs).Lo;
+                    long b = (long)GetGpr(rt).Lo;
                     if (b != 0) { LO = (ulong)(a / b); HI = (ulong)(a % b); }
                 }
                 break;
@@ -196,8 +211,8 @@ public sealed class EmotionEngine : ISchedulable
         short offset = (short)(opcode & 0xFFFF);
         ulong target = PC + 4 + (ulong)((int)offset << 2);
 
-        if (rt == 0 && (long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; } // BLTZ
-        if (rt == 1 && (long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; } // BGEZ
+        if (rt == 0 && (long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; }
+        if (rt == 1 && (long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; }
         return false;
     }
 
@@ -208,7 +223,8 @@ public sealed class EmotionEngine : ISchedulable
     // ==================== Branches ====================
     private bool ExecuteBeq(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
         short off = (short)(opcode & 0xFFFF);
         if (GetGpr(rs).Lo == GetGpr(rt).Lo) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
@@ -216,7 +232,8 @@ public sealed class EmotionEngine : ISchedulable
 
     private bool ExecuteBne(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
         short off = (short)(opcode & 0xFFFF);
         if (GetGpr(rs).Lo != GetGpr(rt).Lo) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
@@ -224,80 +241,102 @@ public sealed class EmotionEngine : ISchedulable
 
     private bool ExecuteBlez(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         if ((long)GetGpr(rs).Lo <= 0) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
     private bool ExecuteBgtz(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         if ((long)GetGpr(rs).Lo > 0) { _delaySlotTarget = PC + 4 + (ulong)((int)off << 2); return true; }
         return false;
     }
 
     // ==================== Immediate ====================
-    private void ExecuteAddi(uint opcode) { ExecuteAddiu(opcode); }
+    private void ExecuteAddi(uint opcode) => ExecuteAddiu(opcode);
+
     private void ExecuteAddiu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo + (ulong)imm });
     }
 
     private void ExecuteSlti(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = ((long)GetGpr(rs).Lo < imm) ? 1UL : 0UL });
     }
 
     private void ExecuteSltiu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short imm = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short imm = (short)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (GetGpr(rs).Lo < (ulong)imm) ? 1UL : 0UL });
     }
 
     private void ExecuteOri(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo | imm });
     }
 
     private void ExecuteXori(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo ^ imm });
     }
 
     private void ExecuteAndi(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo & imm });
     }
 
     private void ExecuteLui(uint opcode)
     {
-        uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
+        uint rt = (opcode >> 16) & 0x1F;
+        ushort imm = (ushort)(opcode & 0xFFFF);
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)imm << 16 });
     }
 
     // ==================== Load/Store ====================
     private void ExecuteLb(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)(sbyte)_memory.Read8(addr) });
     }
 
     private void ExecuteLbu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = _memory.Read8(addr) });
     }
 
     private void ExecuteLh(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         short val = (short)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)val });
@@ -305,7 +344,9 @@ public sealed class EmotionEngine : ISchedulable
 
     private void ExecuteLhu(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         ushort val = (ushort)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = val });
@@ -313,51 +354,81 @@ public sealed class EmotionEngine : ISchedulable
 
     private void ExecuteLw(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         if (rt != 0) SetGpr(rt, new Gpr128 { Lo = _memory.Read32(addr) });
     }
 
     private void ExecuteSb(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         _memory.Write8(GetGpr(rs).Lo + (ulong)off, (byte)GetGpr(rt).Lo);
     }
 
     private void ExecuteSh(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
         ushort v = (ushort)GetGpr(rt).Lo;
-        _memory.Write8(addr, (byte)v); _memory.Write8(addr + 1, (byte)(v >> 8));
+        _memory.Write8(addr, (byte)v);
+        _memory.Write8(addr + 1, (byte)(v >> 8));
     }
 
     private void ExecuteSw(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F; short off = (short)(opcode & 0xFFFF);
+        uint rs = (opcode >> 21) & 0x1F;
+        uint rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
         _memory.Write32(GetGpr(rs).Lo + (ulong)off, (uint)GetGpr(rt).Lo);
     }
 
-    // ==================== COP2 (new in Milestone 3) ====================
+    // ==================== COP2 (VU0 communication) - Milestone 4 ====================
     private bool ExecuteCop2(uint opcode)
     {
-        // COP2 instructions are used to communicate with VU0.
-        // For now we just recognize them. Full routing to VectorUnit comes next.
-        // Common COP2 opcodes: 0x00 = CFC2, 0x02 = CTC2, 0x04 = QMFC2, 0x06 = QMTC2, etc.
-        uint sub = (opcode >> 21) & 0x1F;
+        uint rs = (opcode >> 21) & 0x1F;   // often used as sub-opcode
+        uint rt = (opcode >> 16) & 0x1F;
+        uint rd = (opcode >> 11) & 0x1F;
 
-        switch (sub)
+        // Common COP2 move instructions
+        switch (rs)
         {
-            case 0x00: // CFC2 - move from COP2 control register
-            case 0x02: // CTC2 - move to COP2 control register
-            case 0x04: // QMFC2 - quadword move from COP2
-            case 0x06: // QMTC2 - quadword move to COP2
-                // TODO: Route to VU0 when integrated
+            case 0x00: // CFC2 - Move from COP2 control register
+                // For now we treat it as a no-op or simple move from a placeholder
+                if (rt != 0) SetGpr(rt, new Gpr128 { Lo = 0 });
+                break;
+
+            case 0x02: // CTC2 - Move to COP2 control register
+                // Placeholder - real implementation will update VU0 control state
+                break;
+
+            case 0x04: // QMFC2 - Quadword Move From COP2 (VU0 register -> EE GPR)
+                if (_vu0 != null && rt < 32)
+                {
+                    // In real hardware this moves a full 128-bit VU register.
+                    // For this milestone we move the .Lo part and leave .Hi as 0.
+                    var vuReg = _vu0.GetVfRegister(rd); // We will add this helper to Vu0
+                    SetGpr(rt, new Gpr128 { Lo = (ulong)BitConverter.SingleToInt32Bits(vuReg.X) });
+                }
+                break;
+
+            case 0x06: // QMTC2 - Quadword Move To COP2 (EE GPR -> VU0 register)
+                if (_vu0 != null && rd < 32)
+                {
+                    Gpr128 gpr = GetGpr(rt);
+                    float val = BitConverter.Int32BitsToSingle((int)gpr.Lo);
+                    _vu0.SetVfRegister(rd, new VectorUnit.VuReg128 { X = val, Y = 0, Z = 0, W = 1 });
+                }
                 break;
 
             default:
-                // Many COP2 ops are VU macro instructions (VADD, VMUL, etc.)
-                // These will be handled when we connect the Vector Unit properly.
+                // Many other COP2 instructions are VU macro ops (VADD, VMUL, etc.)
+                // These will be expanded when we have full VU execution integration.
                 break;
         }
 
@@ -366,6 +437,6 @@ public sealed class EmotionEngine : ISchedulable
 
     private void HandleSyscall(uint opcode)
     {
-        // TODO: Minimal HLE syscall handling
+        // TODO: Add minimal HLE syscall handling here
     }
 }
