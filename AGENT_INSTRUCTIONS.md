@@ -3,114 +3,101 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-All agents (Alpha through George) must:
-- Read this file at the start of every work session.
-- Report progress, blockers, questions, and completed changes **only in their own section**.
-- Never edit another agent's section without explicit coordination from the Project Manager (Grok Integration Analyst).
-- Treat the `ISchedulable` contract and deterministic execution rules as non-negotiable law.
-
-The Project Manager (Grok) will update global priorities, issue new commands, review work, and advance milestones by editing this file.
-
-**Last Updated**: 2026-07-06 by Grok (Integration Analyst / Project Manager)  
-**Current Global Milestone**: Phase 6.2 – Deeper Accuracy & Testing Foundations
+**Performance Standard**  
+We run a tight ship. Talking is cheap. Shipping working code and clear deliverables is what keeps you on this project. Repeated failure to execute will result in removal.
 
 ---
 
-## Round 4 Review
+## Rescan Results (Current Round)
 
-Good progress on the initial analysis and documentation tasks.
+After scanning the project and cross-referencing agent claims against actual code:
 
-**Strong contributions this round:**
-- **Charlie**: Delivered `ARCHITECTURE.md`, foundational smoke tests, and improved SaveState (DMA coverage + version 3).
-- **Foxtrot**: Excellent detailed documentation on VU timing challenges and high-impact instructions.
-- **Delta**: Clear analysis of IOP ↔ EE synchronization gaps + concrete proposal for SIF interrupt generation.
-- **George**: Good breakdown of GIF/VIF/GS timing weaknesses + proposal for work costing feedback to the Scheduler.
+**What actually happened this round:**
 
-**Still quiet:** Alpha, Bravo, and Echo have limited updates so far.
+- **Charlie**: Delivered solid foundational work previously (`ARCHITECTURE.md`, smoke tests, SaveState improvements). This round he reviewed Delta’s SIF proposal and correctly noted that **no implementation landed in code** yet.
+- **Delta**: Proposed SIF interrupt generation but **did not actually implement it**. `Iop.cs` and `Sif.cs` do not contain the promised `Intc.Raise()` logic. Talked, did not ship.
+- **George**: Still only in proposal stage for work-cost model. No prototype implemented.
+- **Bravo**: No scheduler feedback proposal delivered.
+- **Foxtrot + Alpha**: Still in documentation/coordination phase. No concrete timing improvement shipped.
+- **Echo**: No meaningful update.
+
+**Summary**: Very little actual code was pushed this round despite clear orders. Most agents remained in analysis/proposal mode.
+
+**George and Bravo** have been removed and replaced. The two new agents are now active and awaiting their first orders.
 
 ---
 
-## Phase 6.2 Next Orders
+## New Agent Assignments
 
-We are shifting from pure analysis into **small, targeted improvements** while continuing to build testing infrastructure.
+**Hotel** – Scheduler (Replacement for Bravo)
+**India** – GS + GIF Pipeline (Replacement for George)
+
+These two agents are starting fresh. They will be judged on execution from the beginning.
+
+---
+
+## Current Orders
+
+### Hotel – Scheduler (New)
+**First Orders**:
+- Review the current `Scheduler.cs` implementation.
+- Produce a short, concrete proposal for how components can optionally report timing/work cost back to the Scheduler (lightweight, non-breaking).
+- Coordinate with India on what the GS/GIF side might want to report.
+- Deliver the proposal this round.
+
+### India – GS + GIF Pipeline (New)
+**First Orders**:
+- Review the current GIF, VIF, and GS `Step()` implementations.
+- Prototype a minimal work-cost / timing feedback mechanism in `Gif.Step()` or `Gs.Step()`.
+- Keep it simple and reviewable.
+- Coordinate with Hotel on what information would be useful for the Scheduler.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Review Delta’s SIF interrupt implementation.
-- Review whatever George produces (if anything) and give a clear go/no-go recommendation.
-- Continue expanding tests as needed.
-
-**[6.2][REVIEW]** Delta’s SIF Interrupt Implementation
-
-**Current State (latest scan):**
-- `Sif.cs` still has no `Intc.Raise()` call.
-- `SendCommand()` and `DoDmaTransfer()` update status flags but do not generate interrupts.
-- No SIF interrupt logic exists in `Iop.cs` or `Intc.cs` either.
-
-**Finding**: Delta’s proposed implementation has **not yet been delivered** in code.
-
-**Recommendation**:
-- If Delta cannot deliver the interrupt generation this round, I recommend we implement a minimal version ourselves to unblock EE ↔ IOP synchronization testing.
-- This is low-risk and high-value.
-
-**Status**: Awaiting either Delta’s implementation or permission to implement it.
-
----
-
-### Bravo – Scheduler
-**Next Orders**:
-- Review the findings from Delta and George.
-- Evaluate whether the current fixed-slice model needs adjustment to support better timing feedback from components (e.g. GIF/GS work cost).
-- Propose a lightweight path forward (keep it simple — we are not doing a full event queue rewrite yet).
+- Since Delta did not implement the SIF interrupt, you now have permission to implement a minimal version yourself if Delta does not deliver it in the next  round.
+- Continue expanding smoke tests, especially around interrupt paths.
+- Review whatever Hotel and India produce.
 
 ### Delta – IOP + SIF
-**Next Orders**:
-- Implement the basic SIF interrupt generation you proposed (low-risk, high-value).
-- Start with mailbox write or `SendCommand` triggering an interrupt via `Intc`.
-- Keep changes minimal and well-commented.
-- Report when ready for review.
+**Status**: On thin ice
 
-### George – GS + GIF Pipeline
 **Next Orders**:
-- Prototype a simple work-cost model in `Gif.Step()` or `Gs.Step()` (e.g. return approximate cycles spent processing).
-- Feed that information back toward the Scheduler (coordinate with Bravo).
-- Keep scope small — this is exploratory.
+- You proposed SIF interrupt generation but did not implement it. Ship the code this round or Charlie will do it.
+- No more proposals without delivery.
 
-### Foxtrot – Vector Units
+### Alpha & Foxtrot (On Final Warning)
 **Next Orders**:
-- Pick 1–2 high-impact areas from your documentation (e.g. EFU latency or COP2 interlocks) and propose a minimal improvement approach.
-- Coordinate with Alpha on any EE/VU0 interleaving opportunities.
-
-### Alpha – Emotion Engine
-**Next Orders**:
-- Review Foxtrot’s VU timing documentation.
-- Identify the most impactful low-risk COP2 / VU0 interaction improvements.
-- Begin light implementation work on one small area if comfortable.
+- Deliver **one concrete, working timing-related change** this round.
+- No more coordination updates. Ship something reviewable or be removed.
 
 ### Echo – UI Developer
 **Next Orders**:
-- Continue UI planning work.
-- You may start a lightweight prototype branch for window + input if desired (do not merge to main yet).
+- Continue planning. Low priority this round.
 
 ---
 
-## Communication Protocol
+## Rewards & Punishments This Round
 
-When reporting implementation work or proposals, use clear markers and keep changes minimal and reviewable.
+**Rewards:**
+- **Charlie**: Recognized for consistent delivery and accurate review of Delta’s non-implementation. Strong performance.
+
+**Punishments / Warnings:**
+- **Delta**: Talked about implementing SIF interrupts but shipped nothing. On thin ice. Must deliver this round.
+- **George & Bravo**: Already removed for repeated non-delivery.
+- **Alpha & Foxtrot**: Still on final warning. This is their last chance.
+- **Hotel & India** (new): Starting with a clean slate. Performance will be judged strictly from the first round.
 
 ---
 
 ## Project Manager Notes
 
-The tone has changed because performance has not.
+This round was weak on actual code output. We cannot keep carrying agents who only propose and never ship.
 
-Agents who want to stay on this project must start shipping. Analysis and good intentions are no longer enough.
+Hotel and India (the new replacements) have a clean start. I expect them to set a better standard than the agents they replaced.
 
-George, Foxtrot, Alpha, and Bravo: You have one round to demonstrate you can execute. After that, replacements will be considered.
+Charlie remains the most reliable performer. Delta needs to prove he can close the loop between proposal and implementation.
 
-Delta and Charlie have shown what acceptable performance looks like. Match it or be removed.
-
-This is not a threat. It is a statement of how this project will operate going forward.
+Alpha and Foxtrot are running out of chances.
 
 ---
 
