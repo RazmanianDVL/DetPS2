@@ -53,17 +53,24 @@ public static class SmokeTests
     }
 
     /// <summary>
-    /// Verifies that the new work-cost reporting mechanism in Scheduler works when enabled.
+    /// Verifies that the work-cost reporting system works correctly when enabled vs disabled.
     /// </summary>
     public static void Scheduler_WorkCostReporting()
     {
         var sys = new Ps2System();
+
+        // When disabled, LastReportedWork should stay 0
+        sys.Scheduler.UseReportedWorkCost = false;
+        sys.RunFor(5000);
+        if (sys.Scheduler.LastReportedWork != 0)
+            throw new Exception("LastReportedWork should be 0 when disabled");
+
+        // When enabled, LastReportedWork should increase (Gif/GS now report work)
         sys.Scheduler.UseReportedWorkCost = true;
+        sys.RunFor(5000);
 
-        sys.RunFor(10_000);
-
-        if (sys.Scheduler.LastReportedWork < 0)
-            throw new Exception("LastReportedWork should not be negative");
+        if (sys.Scheduler.LastReportedWork <= 0)
+            throw new Exception("LastReportedWork should increase when enabled and components report work");
 
         Console.WriteLine($"[Smoke] Scheduler_WorkCostReporting OK (LastReportedWork = {sys.Scheduler.LastReportedWork})");
     }
