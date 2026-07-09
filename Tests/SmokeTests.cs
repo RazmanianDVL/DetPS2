@@ -59,19 +59,37 @@ public static class SmokeTests
     {
         var sys = new Ps2System();
 
-        // When disabled, LastReportedWork should stay 0
         sys.Scheduler.UseReportedWorkCost = false;
         sys.RunFor(5000);
         if (sys.Scheduler.LastReportedWork != 0)
             throw new Exception("LastReportedWork should be 0 when disabled");
 
-        // When enabled, LastReportedWork should increase (Gif/GS now report work)
         sys.Scheduler.UseReportedWorkCost = true;
         sys.RunFor(5000);
 
         if (sys.Scheduler.LastReportedWork <= 0)
-            throw new Exception("LastReportedWork should increase when enabled and components report work");
+            throw new Exception("LastReportedWork should increase when enabled");
 
         Console.WriteLine($"[Smoke] Scheduler_WorkCostReporting OK (LastReportedWork = {sys.Scheduler.LastReportedWork})");
+    }
+
+    /// <summary>
+    /// Verifies that LastReportedWork resets properly when Scheduler.Reset() is called.
+    /// </summary>
+    public static void Scheduler_WorkCostResetsOnReset()
+    {
+        var sys = new Ps2System();
+        sys.Scheduler.UseReportedWorkCost = true;
+
+        sys.RunFor(5000);
+        if (sys.Scheduler.LastReportedWork <= 0)
+            throw new Exception("Expected work to be reported before reset");
+
+        sys.Reset();
+
+        if (sys.Scheduler.LastReportedWork != 0)
+            throw new Exception("LastReportedWork should be 0 after Reset()");
+
+        Console.WriteLine("[Smoke] Scheduler_WorkCostResetsOnReset OK");
     }
 }
