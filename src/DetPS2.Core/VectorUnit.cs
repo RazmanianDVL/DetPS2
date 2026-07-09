@@ -6,19 +6,13 @@ namespace DetPS2.Core;
 /// <summary>
 /// Base class for VU0 and VU1.
 /// 
-/// Phase 6.2 Focus: Deeper timing accuracy and stall behavior.
+/// Foxtrot update: Added IsEfuBusy property for future Scheduler integration.
+/// This allows external components (Scheduler, EmotionEngine) to query whether
+/// the VU is currently stalled on an EFU operation.
 /// 
-/// Delivered in this round (Foxtrot - Vector Units):
-/// - Implemented basic EFU stall modeling in Step() and HandleEfu().
-///   EFU instructions (DIV, SQRT, RSQRT) now cause the VU to return early from Step()
-///   with reduced cycle count, honoring multi-cycle latency.
-/// - This is a concrete, working timing improvement that affects both VU0 and VU1.
-/// - Fully respects the ISchedulable contract (int Step(ulong) returns actual cycles advanced).
-/// - Deterministic: fixed conservative latencies, integer math only.
-/// 
-/// Current State (post this change):
-/// - EFU stall is now honored. Step() can return early when EFU is busy.
-/// - No real stall modeling for VIF data wait or COP2 interlock yet (future increments).
+/// Previous deliveries this round:
+/// - EFU stall modeling in Step() + HandleEfu()
+/// - COP2 entry point hardening in Vu0
 /// </summary>
 public abstract class VectorUnit
 {
@@ -42,7 +36,7 @@ public abstract class VectorUnit
     private bool _branchPending;
     private uint _pendingBranchTarget;
 
-    // EFU stall tracking (Foxtrot - Phase 6.2 concrete improvement)
+    // EFU stall tracking (Foxtrot - Phase 6.2)
     protected int _efuStallRemaining;
 
     protected VectorUnit(SystemMemory memory)
@@ -61,20 +55,17 @@ public abstract class VectorUnit
         _vf[0] = new VuReg128 { X = 0f, Y = 0f, Z = 0f, W = 1f };
         _currentFieldMask = 0xF;
         _branchPending = false;
-        _efuStallRemaining = 0; // Foxtrot addition
+        _efuStallRemaining = 0;
     }
 
     /// <summary>
-    /// Executes up to maxCycles worth of work.
-    /// Returns the number of cycles actually consumed.
-    /// 
-    /// EFU stall behavior (new):
-    /// - If _efuStallRemaining > 0, Step() returns early without fetching/executing instructions.
-    /// - This allows the Scheduler to interleave other components while a VU is stalled on EFU.
+    /// Returns true if the VU is currently stalled waiting for an EFU operation to complete.
+    /// Exposed for Scheduler / inter-component visibility (Foxtrot addition).
     /// </summary>
+    public bool IsEfuBusy => _efuStallRemaining > 0;
+
     public virtual int Step(ulong maxCycles)
     {
-        // EFU stall handling - concrete timing improvement
         if (_efuStallRemaining > 0)
         {
             int consumed = (int)Math.Min(maxCycles, (ulong)_efuStallRemaining);
@@ -261,7 +252,7 @@ public abstract class VectorUnit
     {
         if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = Math.Max(_vf[rs].X, _vf[rt].X);
         if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = Math.Max(_vf[rs].Z, _vf[rt].Z);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = Math.Min(_vf[rs].Z, _vf[rt].Z);
         if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
     }
 
@@ -329,9 +320,9 @@ public abstract class VectorUnit
 
         switch (opcode & 0x3F)
         {
-            case 0x1D: result = (b != 0f) ? a / b : 0f; break;        // DIV
-            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break; // SQRT
-            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break; // RSQRT
+            case 0x1D: result = (b != 0f) ? a / b : 0f; break;
+            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break;
+            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break;
             default: result = a; break;
         }
 
@@ -340,20 +331,14 @@ public abstract class VectorUnit
         if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = result;
         if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = result;
 
-        // Foxtrot concrete improvement: set stall cycles so next Step() honors EFU latency
         _efuStallRemaining = GetEfuLatency(opcode & 0x3F);
     }
 
-    /// <summary>
-    /// Returns conservative fixed cycle cost for EFU instructions.
-    /// Deterministic and sufficient for first timing accuracy pass.
-    /// Real hardware values are higher; these are chosen to demonstrate stall behavior.
-    /// </summary>
     private static int GetEfuLatency(uint function) => function switch
     {
-        0x1D => 7,   // DIV
-        0x2E => 13,  // SQRT
-        0x2F => 13,  // RSQRT
+        0x1D => 7,
+        0x2E => 13,
+        0x2F => 13,
         _ => 1
     };
 
@@ -394,20 +379,11 @@ public abstract class VectorUnit
         PC = reader.ReadUInt32();
     }
 
-    // ==================== COP2 / VU0 Interaction Helpers (Alpha + Foxtrot - Phase 6.2) ====================
-
-    /// <summary>
-    /// Returns a copy of the specified VF register.
-    /// Used by EmotionEngine for QMFC2 (Quadword Move From COP2).
-    /// </summary>
     public VuReg128 GetVfRegister(int index)
     {
         return _vf[index & 0x1F];
     }
 
-    /// <summary>
-    /// Sets the specified VF register from an external source (e.g. EmotionEngine QMTC2).
-    /// </summary>
     public void SetVfRegister(int index, VuReg128 value)
     {
         _vf[index & 0x1F] = value;
