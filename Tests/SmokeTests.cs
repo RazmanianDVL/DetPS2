@@ -4,7 +4,7 @@ namespace DetPS2.Tests;
 
 /// <summary>
 /// Smoke / determinism tests for Phase 6.2.
-/// Includes SIF interrupt and work-cost reporting tests.
+/// Includes SIF interrupt and work-cost / dynamic scheduling tests.
 /// </summary>
 public static class SmokeTests
 {
@@ -111,5 +111,27 @@ public static class SmokeTests
             throw new Exception("LastReportedWork should accumulate across multiple RunFor calls");
 
         Console.WriteLine($"[Smoke] Scheduler_WorkCostAccumulates OK (first={first}, second={second})");
+    }
+
+    /// <summary>
+    /// Basic smoke test for dynamic scheduling behavior (work-cost feedback path is exercised).
+    /// </summary>
+    public static void Scheduler_DynamicSchedulingSmoke()
+    {
+        var sys = new Ps2System();
+
+        sys.Scheduler.UseReportedWorkCost = false;
+        sys.RunFor(10000);
+        ulong cyclesDisabled = sys.MasterCycles;
+
+        var sys2 = new Ps2System();
+        sys2.Scheduler.UseReportedWorkCost = true;
+        sys2.RunFor(10000);
+        ulong cyclesEnabled = sys2.MasterCycles;
+
+        if (cyclesDisabled == 0 || cyclesEnabled == 0)
+            throw new Exception("MasterCycles did not advance");
+
+        Console.WriteLine($"[Smoke] Scheduler_DynamicSchedulingSmoke OK (disabled={cyclesDisabled}, enabled={cyclesEnabled})");
     }
 }
