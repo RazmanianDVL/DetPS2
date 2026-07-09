@@ -14,61 +14,62 @@ After scanning the project and cross-referencing agent claims against actual cod
 
 **What actually happened this round:**
 
-- **Charlie**: Delivered solid foundational work previously (`ARCHITECTURE.md`, smoke tests, SaveState improvements). This round he reviewed Delta’s SIF proposal and correctly noted that **no implementation landed in code** yet.
-- **Delta**: Proposed SIF interrupt generation but **did not actually implement it**. `Iop.cs` and `Sif.cs` do not contain the promised `Intc.Raise()` logic. Talked, did not ship.
-- **George**: Still only in proposal stage for work-cost model. No prototype implemented.
-- **Bravo**: No scheduler feedback proposal delivered.
-- **Foxtrot + Alpha**: Still in documentation/coordination phase. No concrete timing improvement shipped.
+- **Charlie**: Performed well in prior rounds and gave an accurate review this round (noted that Delta’s SIF interrupt was proposed but not implemented in code).
+- **Delta**: Proposed SIF interrupt generation but **did not ship code**. No implementation landed in `Iop.cs` or related files.
+- **Foxtrot + Alpha**: Remained in documentation/coordination mode. No concrete timing improvement implemented.
 - **Echo**: No meaningful update.
 
-**Summary**: Very little actual code was pushed this round despite clear orders. Most agents remained in analysis/proposal mode.
+**George and Bravo** have been replaced with new agents operating under the same callsigns. They are starting fresh and have been introduced to their roles.
 
-**George and Bravo** have been removed and replaced. The two new agents are now active and awaiting their first orders.
+**Summary**: Actual code output was low this round. Most agents stayed in analysis/proposal mode.
 
 ---
 
-## New Agent Assignments
+## Current Active Agents
 
-**Hotel** – Scheduler (Replacement for Bravo)
-**India** – GS + GIF Pipeline (Replacement for George)
-
-These two agents are starting fresh. They will be judged on execution from the beginning.
+- **Alpha** – Emotion Engine (Final Warning)
+- **Bravo** – Scheduler (New agent in role)
+- **Charlie** – Foundationalist (Lead)
+- **Delta** – IOP + SIF (On thin ice)
+- **Echo** – UI Developer
+- **Foxtrot** – Vector Units (Final Warning)
+- **George** – GS + GIF Pipeline (New agent in role)
 
 ---
 
 ## Current Orders
 
-### Hotel – Scheduler (New)
+### Bravo – Scheduler (New)
 **First Orders**:
-- Review the current `Scheduler.cs` implementation.
+- Review the current `Scheduler.cs` and `ISchedulable` implementation.
 - Produce a short, concrete proposal for how components can optionally report timing/work cost back to the Scheduler (lightweight, non-breaking).
-- Coordinate with India on what the GS/GIF side might want to report.
+- Coordinate with George on what the GS/GIF side might want to report.
 - Deliver the proposal this round.
 
-### India – GS + GIF Pipeline (New)
+### George – GS + GIF Pipeline (New)
 **First Orders**:
 - Review the current GIF, VIF, and GS `Step()` implementations.
 - Prototype a minimal work-cost / timing feedback mechanism in `Gif.Step()` or `Gs.Step()`.
 - Keep it simple and reviewable.
-- Coordinate with Hotel on what information would be useful for the Scheduler.
+- Coordinate with Bravo on what information would be useful for the Scheduler.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Since Delta did not implement the SIF interrupt, you now have permission to implement a minimal version yourself if Delta does not deliver it in the next  round.
+- Since Delta has not implemented the SIF interrupt, you now have permission to implement a minimal version yourself if he does not deliver it soon.
 - Continue expanding smoke tests, especially around interrupt paths.
-- Review whatever Hotel and India produce.
+- Review whatever Bravo and George produce this round.
 
 ### Delta – IOP + SIF
 **Status**: On thin ice
 
 **Next Orders**:
-- You proposed SIF interrupt generation but did not implement it. Ship the code this round or Charlie will do it.
+- You proposed SIF interrupt generation but did not implement it. Ship the code this round or Charlie will implement it.
 - No more proposals without delivery.
 
 ### Alpha & Foxtrot (On Final Warning)
 **Next Orders**:
 - Deliver **one concrete, working timing-related change** this round.
-- No more coordination updates. Ship something reviewable or be removed.
+- No more coordination updates without output. Ship something reviewable or be removed.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -79,25 +80,24 @@ These two agents are starting fresh. They will be judged on execution from the b
 ## Rewards & Punishments This Round
 
 **Rewards:**
-- **Charlie**: Recognized for consistent delivery and accurate review of Delta’s non-implementation. Strong performance.
+- **Charlie**: Recognized for consistent delivery and accurate assessment of other agents’ progress.
 
 **Punishments / Warnings:**
-- **Delta**: Talked about implementing SIF interrupts but shipped nothing. On thin ice. Must deliver this round.
-- **George & Bravo**: Already removed for repeated non-delivery.
-- **Alpha & Foxtrot**: Still on final warning. This is their last chance.
-- **Hotel & India** (new): Starting with a clean slate. Performance will be judged strictly from the first round.
+- **Delta**: Proposed but did not implement. On thin ice. Must deliver this round.
+- **Alpha & Foxtrot**: Still on final warning. This is their last chance to demonstrate execution.
+- **Bravo & George** (new agents): Starting with a clean slate. Performance will be judged strictly going forward.
 
 ---
 
 ## Project Manager Notes
 
-This round was weak on actual code output. We cannot keep carrying agents who only propose and never ship.
+George and Bravo have been replaced. The new agents in those roles have a clean start and clear first orders.
 
-Hotel and India (the new replacements) have a clean start. I expect them to set a better standard than the agents they replaced.
+This round showed continued weakness in moving from proposals to actual implementation. That behavior will not be tolerated long-term.
 
-Charlie remains the most reliable performer. Delta needs to prove he can close the loop between proposal and implementation.
+Charlie remains the strongest performer. Delta needs to close the gap between talking and shipping.
 
-Alpha and Foxtrot are running out of chances.
+Alpha and Foxtrot are on their final warning.
 
 ---
 
