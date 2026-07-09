@@ -6,43 +6,49 @@ namespace DetPS2.Core;
 /// <summary>
 /// Deterministic scheduler for the PS2 system.
 /// 
-/// v2 design: Budgeted slicing
-/// - Components receive a cycle budget instead of being stepped 1 cycle at a time.
-/// - Dramatically reduces overhead while staying fully deterministic.
-/// - Master cycle counter remains the single source of truth.
-/// - Tunable slice size for performance vs granularity.
+/// Budgeted slice execution with optional work-cost feedback from components.
 /// 
-/// Execution order: Components are stepped in the order they were registered via Register().
-/// This order is stable and deterministic.
+/// Core rules (never broken):
+/// - MasterCycles is the single source of truth.
+/// - All advancement is deterministic and repeatable.
+/// - UseReportedWorkCost is completely optional. Default (false) = identical behavior to before.
 /// 
-/// Work-cost / timing feedback (formalized in this change):
-/// - ISchedulable.Step(ulong) returns int.
-/// - The returned value is the component's self-reported work/cycles consumed.
-/// - By default (UseReportedWorkCost = false) the value is captured but ignored for advancement (Phase 6.1 safety).
-/// - When UseReportedWorkCost = true, the Scheduler accumulates reported work for diagnostics and future back-pressure logic.
-/// - This mechanism is fully optional and non-breaking.
+/// Work-cost integration:
+/// - Components implement int Step(ulong maxCycles) and return meaningful work done.
+/// - When UseReportedWorkCost = true, Scheduler accumulates the returned values.
+/// - LastReportedWork and WorkEfficiency provide diagnostics.
+/// - George’s Gif.Step() implementation (which calls Gs.CalculateWorkCost) now participates automatically.
 /// </summary>
 public sealed class Scheduler
 {
     private readonly List<ISchedulable> _components = new();
     private ulong _masterCycles;
+    private ulong _lastRunRequestedCycles;
 
     public ulong MasterCycles => _masterCycles;
 
     public ulong SliceSize { get; set; } = 64;
 
     /// <summary>
-    /// When true, the Scheduler will accumulate the int returned from each component's Step() call.
-    /// Default is false to preserve exact current behavior and determinism guarantees.
-    /// Enable this for diagnostics or when components start providing accurate work-cost numbers.
+    /// Enables accumulation of work cost reported by components via their Step() return value.
+    /// When false (default), behavior is identical to previous versions — fully deterministic with no side effects.
+    /// Enable for diagnostics, profiling, or future adaptive scheduling experiments.
     /// </summary>
     public bool UseReportedWorkCost { get; set; } = false;
 
     /// <summary>
-    /// Sum of all non-negative values returned by components during the most recent RunFor() call.
-    /// Only meaningful when UseReportedWorkCost is true.
+    /// Total work reported by all components during the last RunFor() call.
+    /// Only updated when UseReportedWorkCost is true.
     /// </summary>
     public int LastReportedWork { get; private set; }
+
+    /// <summary>
+    /// Simple efficiency metric: (reported work / requested cycles) * 100.
+    /// 100 = components reported exactly as much work as cycles advanced.
+    /// Lower values indicate components were not fully utilizing the slice or chose to report conservatively.
+    /// Only meaningful when UseReportedWorkCost is true.
+    /// </summary>
+    public double LastWorkEfficiency { get; private set; }
 
     public void Register(ISchedulable component)
     {
@@ -60,6 +66,7 @@ public sealed class Scheduler
     {
         if (cyclesToRun == 0) return;
 
+        _lastRunRequestedCycles = cyclesToRun;
         LastReportedWork = 0;
 
         ulong target = _masterCycles + cyclesToRun;
@@ -81,12 +88,22 @@ public sealed class Scheduler
 
             _masterCycles += thisSlice;
         }
+
+        if (UseReportedWorkCost && _lastRunRequestedCycles > 0)
+        {
+            LastWorkEfficiency = (LastReportedWork / (double)_lastRunRequestedCycles) * 100.0;
+        }
+        else
+        {
+            LastWorkEfficiency = 0;
+        }
     }
 
     public void Reset()
     {
         _masterCycles = 0;
         LastReportedWork = 0;
+        LastWorkEfficiency = 0;
         foreach (var component in _components)
             component.Reset();
     }
@@ -95,16 +112,21 @@ public sealed class Scheduler
 public interface ISchedulable
 {
     /// <summary>
-    /// Advances the component by up to maxCycles.
+    /// Execute up to maxCycles of work.
     /// 
-    /// Return value contract (formalized):
-    ///   &gt; 0  = Approximate cycles or work units actually consumed by this component in the slice.
-    ///   == 0  = No work performed or component chose not to report.
-    ///   &lt; 0  = Reserved, do not use.
+    /// Return value rules (adoption guide for components):
+    /// - Return a positive integer representing approximate cycles or work units completed.
+    /// - Return 0 if idle or choosing not to report this slice.
+    /// - Never return a value &gt; maxCycles.
     /// 
-    /// Components should return a value between 0 and maxCycles inclusive.
-    /// The Scheduler may use this value when UseReportedWorkCost is enabled.
-    /// Returning values outside this range is undefined.
+    /// Example (from George’s Gif implementation):
+    ///   return Math.Min(costFromGsCalculateWorkCost, (int)maxCycles);
+    /// 
+    /// When Scheduler.UseReportedWorkCost is true, these values are accumulated
+    /// into LastReportedWork and used to calculate LastWorkEfficiency.
+    /// 
+    /// This is the primary lightweight mechanism for components (EE, DMAC, GIF, GS, VIF, etc.)
+    /// to provide timing feedback without changing the ISchedulable interface.
     /// </summary>
     int Step(ulong maxCycles);
 
