@@ -4,16 +4,13 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Deterministic PS2 scheduler with optional work-cost aware adaptive slicing.
+/// Work-cost aware deterministic scheduler.
 /// 
-/// === Quick Start for other components ===
-/// 1. Implement ISchedulable
-/// 2. Return meaningful positive work from Step(ulong)
-/// 3. Set scheduler.UseReportedWorkCost = true
-/// 4. After RunFor(), check LastReportedWork, LastWorkEfficiency, and CurrentEffectiveSliceSize
+/// When UseReportedWorkCost = true, the int returned from Step(ulong) directly affects how cycles are allocated:
+/// - High reported work → grows the current slice (up to 2x)
+/// - Low reported work → shrinks the current slice (down to 4)
 /// 
-/// High work reports → Scheduler grows slices. Low reports → Scheduler shrinks slices.
-/// The effect happens live during RunFor().
+/// Thresholds are tunable via HighUtilizationThreshold and LowUtilizationThreshold.
 /// </summary>
 public sealed class Scheduler
 {
@@ -29,12 +26,19 @@ public sealed class Scheduler
 
     public int LastReportedWork { get; private set; }
     public double LastWorkEfficiency { get; private set; }
+    public ulong CurrentEffectiveSliceSize => _currentEffectiveSliceSize;
 
     /// <summary>
-    /// The slice size the adaptive system is currently using.
-    /// Useful for debugging and observing how reported work is affecting allocation in real time.
+    /// Utilization (reported work / slice size) needed to grow the next slice.
+    /// Default: 0.75 (75%)
     /// </summary>
-    public ulong CurrentEffectiveSliceSize => _currentEffectiveSliceSize;
+    public double HighUtilizationThreshold { get; set; } = 0.75;
+
+    /// <summary>
+    /// Utilization below which we shrink the next slice.
+    /// Default: 0.5 (50%)
+    /// </summary>
+    public double LowUtilizationThreshold { get; set; } = 0.5;
 
     public void Register(ISchedulable component)
     {
@@ -79,11 +83,13 @@ public sealed class Scheduler
 
             if (UseReportedWorkCost)
             {
-                if (sliceReportedWork >= thisSlice * 3 / 4)
+                double utilization = thisSlice > 0 ? (double)sliceReportedWork / thisSlice : 0.0;
+
+                if (utilization >= HighUtilizationThreshold)
                 {
-                    _currentEffectiveSliceSize = Math.Min(SliceSize * 2, thisSlice * 3 / 2);
+                    _currentEffectiveSliceSize = Math.Min(SliceSize * 2, (ulong)(thisSlice * 1.5));
                 }
-                else if (sliceReportedWork < thisSlice / 2 && thisSlice > 4)
+                else if (utilization < LowUtilizationThreshold && thisSlice > 4)
                 {
                     _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
                 }
@@ -118,8 +124,8 @@ public sealed class Scheduler
 public interface ISchedulable
 {
     /// <summary>
-    /// Return positive work done. This value now directly influences how large
-    /// your future slices will be when UseReportedWorkCost is enabled on the Scheduler.
+    /// Return work done. Higher values cause the Scheduler to allocate larger slices
+    /// when UseReportedWorkCost is enabled.
     /// </summary>
     int Step(ulong maxCycles);
 
