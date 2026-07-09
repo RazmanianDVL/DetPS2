@@ -5,9 +5,7 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Top-level PS2 system.
-/// Execution now flows exclusively through Scheduler.RunFor().
-/// Ps2System no longer registers itself to avoid duplicate stepping.
-/// All hardware blocks are stepped directly by the Scheduler in registration order.
+/// Sif now receives Intc for minimal interrupt generation.
 /// </summary>
 public sealed class Ps2System : ISchedulable
 {
@@ -40,7 +38,7 @@ public sealed class Ps2System : ISchedulable
         Intc = new Intc();
         Iop = new Iop(Intc, Memory);
         Cdvd = new Cdvd();
-        Sif = new Sif(Memory);
+        Sif = new Sif(Memory, Intc);   // Pass Intc for SIF interrupt support
 
         Dmac.SetGif(Gif);
 
@@ -50,8 +48,6 @@ public sealed class Ps2System : ISchedulable
 
     private void RegisterComponents()
     {
-        // NOTE: Do NOT register 'this' (Ps2System). Scheduler now drives leaf components directly.
-        // This eliminates duplicate execution and restores clean deterministic scheduling.
         Scheduler.Register(EE);
         Scheduler.Register(Dmac);
         Scheduler.Register(Vif);
@@ -83,10 +79,6 @@ public sealed class Ps2System : ISchedulable
         EE.PC = 0xBFC00000;
     }
 
-    /// <summary>
-    /// The single public entry point for running the system.
-    /// All execution must go through the Scheduler.
-    /// </summary>
     public void RunFor(ulong cyclesToRun)
     {
         Scheduler.RunFor(cyclesToRun);
@@ -97,11 +89,18 @@ public sealed class Ps2System : ISchedulable
         Scheduler.Reset();
     }
 
-    // ISchedulable implementation (kept for facade compatibility if needed externally)
     int ISchedulable.Step(ulong maxCycles)
     {
-        // With leaf components now registered directly, this combined step is no longer used by Scheduler.
-        // Return 0 to indicate no additional cycles consumed at this level.
+        EE.Step(maxCycles);
+        Dmac.Step(maxCycles);
+        Vif.Step(maxCycles);
+        Gif.Step(maxCycles);
+        Gs.Step(maxCycles);
+        Pcrtc.Step(maxCycles);
+        Intc.Step(maxCycles);
+        Iop.Step(maxCycles);
+        Cdvd.Step(maxCycles);
+        Sif.Step(maxCycles);
         return 0;
     }
 
