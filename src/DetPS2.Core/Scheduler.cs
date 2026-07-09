@@ -6,17 +6,19 @@ namespace DetPS2.Core;
 /// <summary>
 /// Work-cost aware deterministic scheduler.
 /// 
-/// When UseReportedWorkCost = true, the int returned from Step(ulong) directly affects how cycles are allocated:
-/// - High reported work → grows the current slice (up to 2x)
-/// - Low reported work → shrinks the current slice (down to 4)
+/// Reported work from components directly influences live slice allocation during RunFor():
+/// - High utilization → grows slice size
+/// - Low utilization → shrinks slice size
 /// 
-/// Thresholds are tunable via HighUtilizationThreshold and LowUtilizationThreshold.
+/// Tunable via HighUtilizationThreshold / LowUtilizationThreshold.
+/// Observe via CurrentEffectiveSliceSize and LastSliceUtilization.
 /// </summary>
 public sealed class Scheduler
 {
     private readonly List<ISchedulable> _components = new();
     private ulong _masterCycles;
     private ulong _currentEffectiveSliceSize;
+    private double _lastSliceUtilization;
 
     public ulong MasterCycles => _masterCycles;
 
@@ -27,6 +29,7 @@ public sealed class Scheduler
     public int LastReportedWork { get; private set; }
     public double LastWorkEfficiency { get; private set; }
     public ulong CurrentEffectiveSliceSize => _currentEffectiveSliceSize;
+    public double LastSliceUtilization => _lastSliceUtilization;
 
     public double HighUtilizationThreshold { get; set; } = 0.75;
     public double LowUtilizationThreshold { get; set; } = 0.5;
@@ -49,6 +52,7 @@ public sealed class Scheduler
 
         LastReportedWork = 0;
         _currentEffectiveSliceSize = SliceSize;
+        _lastSliceUtilization = 0;
 
         ulong target = _masterCycles + cyclesToRun;
 
@@ -74,7 +78,20 @@ public sealed class Scheduler
 
             if (UseReportedWorkCost)
             {
-                AdjustSliceBasedOnWork(thisSlice, sliceReportedWork);
+                _lastSliceUtilization = thisSlice > 0 ? (double)sliceReportedWork / thisSlice : 0.0;
+
+                if (_lastSliceUtilization >= HighUtilizationThreshold)
+                {
+                    _currentEffectiveSliceSize = Math.Min(SliceSize * 2, (ulong)(thisSlice * 1.5));
+                }
+                else if (_lastSliceUtilization < LowUtilizationThreshold && thisSlice > 4)
+                {
+                    _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
+                }
+                else
+                {
+                    _currentEffectiveSliceSize = SliceSize;
+                }
             }
         }
 
@@ -88,30 +105,13 @@ public sealed class Scheduler
         }
     }
 
-    private void AdjustSliceBasedOnWork(ulong thisSlice, int reportedWork)
-    {
-        double utilization = thisSlice > 0 ? (double)reportedWork / thisSlice : 0.0;
-
-        if (utilization >= HighUtilizationThreshold)
-        {
-            _currentEffectiveSliceSize = Math.Min(SliceSize * 2, (ulong)(thisSlice * 1.5));
-        }
-        else if (utilization < LowUtilizationThreshold && thisSlice > 4)
-        {
-            _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
-        }
-        else
-        {
-            _currentEffectiveSliceSize = SliceSize;
-        }
-    }
-
     public void Reset()
     {
         _masterCycles = 0;
         LastReportedWork = 0;
         LastWorkEfficiency = 0;
         _currentEffectiveSliceSize = SliceSize;
+        _lastSliceUtilization = 0;
         foreach (var component in _components)
             component.Reset();
     }
@@ -120,7 +120,7 @@ public sealed class Scheduler
 public interface ISchedulable
 {
     /// <summary>
-    /// Return work done. Higher values cause the Scheduler to allocate larger slices
+    /// Return work done this slice. This directly influences future slice sizes
     /// when UseReportedWorkCost is enabled.
     /// </summary>
     int Step(ulong maxCycles);
