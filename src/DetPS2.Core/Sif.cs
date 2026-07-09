@@ -3,20 +3,22 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// SIF - More realistic implementation for Phase 3.
-/// 
-/// Updated to comply with ISchedulable contract.
+/// SIF - Subsystem Interface.
+/// Minimal SIF interrupt generation added (Phase 6.2).
 /// </summary>
 public sealed class Sif : ISchedulable
 {
     private readonly SystemMemory _memory;
+    private readonly Intc? _intc;
+
     public bool DmaBusy { get; private set; } = false;
     public uint LastCommand { get; private set; } = 0;
     public uint Status { get; private set; } = 0;
 
-    public Sif(SystemMemory memory)
+    public Sif(SystemMemory memory, Intc? intc = null)
     {
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        _intc = intc;
     }
 
     public void Reset()
@@ -45,18 +47,12 @@ public sealed class Sif : ISchedulable
     {
         LastCommand = command;
         Status |= 0x2;
+
+        // Minimal SIF interrupt generation
+        _intc?.Raise(Intc.InterruptSource.Sif);
     }
 
     public uint GetStatus() => Status;
 
-    /// <summary>
-    /// ISchedulable contract implementation.
-    /// Currently does minimal work; real DMA timing can be added later.
-    /// </summary>
-    public int Step(ulong maxCycles)
-    {
-        // For now, SIF DMA is instantaneous in DoDmaTransfer.
-        // Future: model actual DMA transfer cycles here.
-        return 0;
-    }
+    public int Step(ulong maxCycles) => 0;
 }
