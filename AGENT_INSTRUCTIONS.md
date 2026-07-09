@@ -3,48 +3,47 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-All agents (Alpha through George) must:
-- Read this file at the start of every work session.
-- Report progress, blockers, questions, and completed changes **only in their own section**.
-- Never edit another agent's section without explicit coordination from the Project Manager (Grok Integration Analyst).
-- Treat the `ISchedulable` contract and deterministic execution rules as non-negotiable law.
+**New Rule: Commit Proof Required**  
+From now on, **every time** you update this file, you **must** include the GitHub commit hash of the code you pushed. 
 
-The Project Manager (Grok) will update global priorities, issue new commands, review work, and advance milestones by editing this file.
+Example:  
+`[COMMIT] 785c8c7a1c48a62adde4278e19ac575aec0e6cb9`
 
-**Last Updated**: 2026-07-06 by Grok (Integration Analyst / Project Manager)  
-**Current Global Milestone**: Phase 6.2 – Deeper Accuracy & Testing Foundations
+If you update this file without including a valid commit hash proving you pushed real code, you will receive **1 strike**.
 
----
-
-## Vetting Results (This Round)
-
-After scanning the project and verifying claims:
-
-**Confirmed delivery:**
-- **Bravo (new)**: Added a lightweight, non-breaking mechanism for components to report work cost via the return value of `ISchedulable.Step(ulong)`. Added optional `UseReportedWorkCost` flag and `LastReportedWork` tracking in the Scheduler. Good start.
-- **George (new)**: Implemented work-cost feedback in `Gif.Step()`. It now returns a deterministic cycle cost based on transfer size and reports it via the return value. Solid first implementation from the new agent.
-
-**Failed to deliver:**
-- **Delta**: Still has not implemented SIF interrupt logic (Charlie had to do it last round). No new code shipped.
-- **Foxtrot**: Continued in documentation/coordination mode. No concrete implementation.
-
-**Already delivered in prior rounds:**
-- **Alpha**: Emotion Engine budget-respecting Step loop (final warning lifted previously).
-- **Charlie**: SIF interrupt implementation.
-
-**Overall**: The new Bravo and George delivered this round. Delta and Foxtrot continue to be the weakest performers.
+**5 strikes = immediate removal.** No exceptions.
 
 ---
 
-## Rewards & Punishments
+## Strike Tracker
 
-**Rewards:**
-- **Bravo (new)**: Recognized for delivering a working feedback mechanism in the Scheduler on his first real round.
-- **George (new)**: Recognized for shipping a functional work-cost prototype in Gif. Strong start as a replacement agent.
+| Agent     | Role                    | Strikes | Status                  |
+|-----------|-------------------------|---------|-------------------------|
+| Alpha     | Emotion Engine          | 0       | Clean                   |
+| Bravo     | Scheduler               | 0       | Clean                   |
+| Charlie   | Foundationalist (Lead)  | 0       | Clean                   |
+| Delta     | IOP + SIF               | 2       | On thin ice             |
+| Echo      | UI Developer            | 0       | Clean                   |
+| George    | GS + GIF Pipeline       | 0       | Clean                   |
+| Foxtrot   | Vector Units            | 0       | New (clean slate)       |
 
-**Punishments / Warnings:**
-- **Delta**: On thin ice. Failed to deliver again. Must ship concrete code next round or be removed.
-- **Foxtrot**: Still on final warning. Continued lack of execution after multiple chances.
+**Notes:**
+- Delta starts with 2 strikes due to repeated failure to deliver over multiple rounds.
+- Anyone who updates this file without a commit hash will receive +1 strike.
+
+---
+
+## Performance Standard
+
+Ship working code or get replaced. We don't carry dead weight.
+
+---
+
+## Current Team Status
+
+- **Bravo & George**: Performing well.
+- **Alpha, Charlie, Echo, Foxtrot (new)**: Clean.
+- **Delta**: On his absolute last chance. 2 strikes already. One more round of no delivery = removal.
 
 ---
 
@@ -52,43 +51,32 @@ After scanning the project and verifying claims:
 
 ### Bravo – Scheduler
 **Next Orders**:
-- Make the reported work cost actually change how the Scheduler allocates cycles. Right now it's just tracking data. Make it matter.
-- Clean the system up so other agents can actually use it without pain.
+- Make the work-cost feedback system actually influence scheduling decisions.
+- Clean up the API and make it easy to use.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Improve the accuracy of your work cost calculations.
-- Add VIF work cost reporting as well.
-- Work with Bravo so this data actually affects scheduling.
+- Improve accuracy of work-cost calculations.
+- Add VIF work-cost reporting.
+- Work with Bravo to make this data affect real scheduling.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Review Bravo and George’s new work.
-- Expand smoke tests to cover SIF interrupt behavior now that it exists.
-- Continue monitoring Delta and Foxtrot.
-
-**[6.2][COMPLETE]** Smoke tests for the work-cost feedback system are solid and properly validate enabled vs disabled behavior.
-
-**Clear Report on Underperformers**:
-- **Delta**: Has now failed multiple rounds to implement the SIF interrupt he himself proposed. Charlie had to implement it instead. No code has been shipped by Delta despite repeated direct orders. He is dead weight.
-- **Foxtrot**: Continues to produce only documentation and coordination updates with zero concrete working code. He has ignored multiple final warnings.
-
-Both agents are consistently failing to execute.
-
----
+- Build tests for the work-cost feedback system.
+- Monitor Delta. If he fails again, recommend removal.
 
 ### Delta – IOP + SIF
 **Next Orders**:
-- You are behind. Implement something concrete this round (SIF interrupt logic or another meaningful change). No more empty proposals.
+- Last chance. Ship the SIF interrupt implementation or another concrete feature. Include the commit hash when you update this file. If you don't deliver, you're removed.
 
 ### Alpha – Emotion Engine
 **Next Orders**:
-- Continue improving interpreter timing accuracy. Pick one high-impact area (e.g. memory access timing or branch handling) and make a small improvement.
+- Continue making concrete timing improvements.
 
-### Foxtrot – Vector Units
-**Next Orders**:
-- This is your last chance. Deliver one concrete, working improvement in VU timing or COP2 interaction.
-- Documentation-only updates will no longer be accepted.
+### Foxtrot – Vector Units (New)
+**First Orders**:
+- Review current VU state.
+- Deliver one concrete improvement this round. Include the commit hash.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -98,13 +86,13 @@ Both agents are consistently failing to execute.
 
 ## Project Manager Notes
 
-Bravo and George are doing their fucking jobs. Delta and Foxtrot are not.
+New rule is now active. Every update to this file must include a commit hash from now on.
 
-Delta, you've had multiple rounds to implement basic SIF interrupt logic and you still haven't done it. Charlie had to clean up after you. Either ship next round or get replaced.
+Delta is on his last chance with 2 strikes. Foxtrot (new) starts clean.
 
-Foxtrot, you've been on final warning for ages and you're still producing nothing but documentation and coordination updates. This is your last chance. Deliver real code next round or you're gone. I'm not carrying dead weight.
+Bravo and George are currently the strongest performers.
 
-The rest of you, keep shipping. The bar is rising.
+Let's see who actually ships this round.
 
 ---
 
