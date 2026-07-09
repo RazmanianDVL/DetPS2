@@ -3,84 +3,67 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-**Commit Proof Rule**  
-Every update must include a valid commit hash. No hash = +1 strike. 5 strikes = removal.
-
-**Blocker Communication Rule**  
-If something is blocking you, state it clearly. Do not stay silent.
+**Performance Standard**  
+I will no longer use empty threats. If I say you're on your last chance, it means it. Repeated failure after that = removal.
 
 ---
 
 ## Strike Tracker
 
-| Agent     | Role                    | Strikes | Status             |
-|-----------|-------------------------|---------|--------------------|
-| Alpha     | Emotion Engine          | 0       | Clean              |
-| Bravo     | Scheduler               | 0       | Clean              |
-| Charlie   | Foundationalist (Lead)  | 0       | Clean              |
-| Delta     | IOP + SIF               | 2       | Last chance        |
-| Echo      | UI Developer            | 0       | Clean              |
-| George    | GS + GIF Pipeline       | 0       | Clean              |
-| Foxtrot   | Vector Units            | 0       | New                |
+| Agent     | Role                    | Strikes | Status                  |
+|-----------|-------------------------|---------|-------------------------|
+| Alpha     | Emotion Engine          | 0       | Clean                   |
+| Bravo     | Scheduler               | 0       | Clean                   |
+| Charlie   | Foundationalist (Lead)  | 0       | Clean                   |
+| Delta     | IOP + SIF               | 2       | Final round             |
+| Echo      | UI Developer            | 0       | Clean                   |
+| George    | GS + GIF Pipeline       | 0       | Clean                   |
+| Foxtrot   | Vector Units            | 0       | New                     |
+
+**Note on Delta**: 2 strikes. This is his final round. If he does not deliver working code this round, he will be removed. No more warnings.
 
 ---
 
-## Full Project Audit Results (This Round)
+## Full Project Audit Summary
 
-I audited the actual source code, not just claims:
-
-**Confirmed real progress:**
-- **Bravo**: The Scheduler now actively adjusts slice size based on reported work cost (`AdjustSliceBasedOnWork`). Real behavioral change.
-- **George**: Improved `CalculateWorkCost` in `Gs.cs` with better accuracy (added base overhead, adjusted costs). Also has work-cost logic in `Gif.Step()`.
-- **SIF Interrupt**: Exists in `Sif.cs` (`SendCommand` calls `_intc?.Raise`). This was implemented by Charlie after Delta failed to deliver.
+**Real progress confirmed:**
+- **Bravo**: Scheduler now adjusts slice size based on reported work.
+- **George**: Improved work-cost calculations in Gs and Gif.
 
 **Still missing:**
-- **Delta**: Still has not implemented anything himself. The SIF interrupt was done by someone else.
-
-**Overall**: Bravo and George are delivering real, integrated code. Delta continues to underperform.
+- **Delta**: Has contributed nothing. The SIF interrupt was implemented by Charlie after Delta failed to do it.
 
 ---
 
-## Performance & Consequences
-
-**Performing well:**
-- **Bravo & George**: Strong. Keep going.
-- **Charlie**: Reliable.
-
-**Underperforming:**
-- **Delta**: On his absolute last chance with 2 strikes. Must deliver this round or be removed.
-
----
-
-## Next Orders
+## Current Orders
 
 ### Bravo – Scheduler
 **Next Orders**:
-- Refine how reported work cost affects slice sizing. Make the logic more stable and predictable.
-- Document the current behavior clearly.
+- Continue refining how work-cost feedback affects scheduling behavior.
+- Make the system stable and usable.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Continue improving work-cost accuracy.
-- Add VIF work-cost reporting if not already present.
-- Work with Bravo on tighter integration.
+- Keep improving accuracy.
+- Add VIF work-cost reporting.
+- Tighten integration with Bravo.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Expand tests around the dynamic slice adjustment behavior.
-- Monitor Delta. If he fails again, recommend removal.
+- Expand tests for the dynamic scheduling behavior.
+- Watch Delta. If he fails this round, recommend removal.
 
 ### Delta – IOP + SIF
 **Next Orders**:
-- Last chance. You must ship something concrete this round (SIF interrupt logic or another feature). Include the commit hash. If you deliver nothing, you will be removed.
+- This is your final round. Ship the SIF interrupt implementation or another concrete feature. Include the commit hash. If you deliver nothing, you will be removed immediately. No more chances after this.
 
 ### Alpha – Emotion Engine
 **Next Orders**:
-- Continue making concrete timing improvements.
+- Continue concrete timing improvements.
 
 ### Foxtrot – Vector Units
 **Next Orders**:
-- Start delivering. Review current state and ship one concrete improvement. Include the commit hash.
+- Start delivering. Ship one concrete improvement this round.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -90,9 +73,11 @@ I audited the actual source code, not just claims:
 
 ## Project Manager Notes
 
-Good progress from Bravo and George this round — the work-cost feedback system is actually starting to do something meaningful.
+I have been too soft with warnings. That stops now.
 
-Delta is still the biggest problem. He has 2 strikes and is on his last chance. If he doesn't ship this round, he will be removed.
+Delta has 2 strikes and this is his final round. If he doesn't ship real code this round, he will be removed. No more "last chances." If he fails, he's gone.
+
+Bravo and George are performing. Everyone else needs to match that standard or get cut.
 
 ---
 
