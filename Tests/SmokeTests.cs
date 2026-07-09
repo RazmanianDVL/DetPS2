@@ -92,4 +92,24 @@ public static class SmokeTests
 
         Console.WriteLine("[Smoke] Scheduler_WorkCostResetsOnReset OK");
     }
+
+    /// <summary>
+    /// Verifies that LastReportedWork accumulates across multiple RunFor calls.
+    /// </summary>
+    public static void Scheduler_WorkCostAccumulates()
+    {
+        var sys = new Ps2System();
+        sys.Scheduler.UseReportedWorkCost = true;
+
+        sys.RunFor(2000);
+        int first = sys.Scheduler.LastReportedWork;
+
+        sys.RunFor(2000);
+        int second = sys.Scheduler.LastReportedWork;
+
+        if (second <= first)
+            throw new Exception("LastReportedWork should accumulate across multiple RunFor calls");
+
+        Console.WriteLine($"[Smoke] Scheduler_WorkCostAccumulates OK (first={first}, second={second})");
+    }
 }
