@@ -4,7 +4,7 @@ namespace DetPS2.Tests;
 
 /// <summary>
 /// Smoke / determinism tests for Phase 6.2.
-/// Includes SIF interrupt behavior tests.
+/// Includes SIF interrupt and work-cost reporting tests.
 /// </summary>
 public static class SmokeTests
 {
@@ -42,22 +42,29 @@ public static class SmokeTests
         Console.WriteLine("[Smoke] MultipleShortRuns OK");
     }
 
-    /// <summary>
-    /// Verifies that calling Sif.SendCommand() raises the SIF interrupt.
-    /// </summary>
     public static void Sif_InterruptRaisedOnSendCommand()
     {
         var sys = new Ps2System();
-
         bool before = sys.Intc.IsPending(Intc.InterruptSource.Sif);
-
         sys.Sif.SendCommand(0x12345678);
-
         bool after = sys.Intc.IsPending(Intc.InterruptSource.Sif);
-
-        if (!after)
-            throw new Exception("SIF interrupt was not raised after SendCommand");
-
+        if (!after) throw new Exception("SIF interrupt was not raised");
         Console.WriteLine("[Smoke] Sif_InterruptRaisedOnSendCommand OK");
+    }
+
+    /// <summary>
+    /// Verifies that the new work-cost reporting mechanism in Scheduler works when enabled.
+    /// </summary>
+    public static void Scheduler_WorkCostReporting()
+    {
+        var sys = new Ps2System();
+        sys.Scheduler.UseReportedWorkCost = true;
+
+        sys.RunFor(10_000);
+
+        if (sys.Scheduler.LastReportedWork < 0)
+            throw new Exception("LastReportedWork should not be negative");
+
+        Console.WriteLine($"[Smoke] Scheduler_WorkCostReporting OK (LastReportedWork = {sys.Scheduler.LastReportedWork})");
     }
 }
