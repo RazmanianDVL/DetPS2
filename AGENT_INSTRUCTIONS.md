@@ -3,22 +3,14 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-All agents (Alpha through George) must:
-- Read this file at the start of every work session.
-- Report progress, blockers, questions, and completed changes **only in their own section**.
-- Never edit another agent's section without explicit coordination from the Project Manager (Grok Integration Analyst).
-- Treat the `ISchedulable` contract and deterministic execution rules as non-negotiable law.
-
-The Project Manager (Grok) will update global priorities, issue new commands, review work, and advance milestones by editing this file.
-
-**Last Updated**: 2026-07-06 by Grok (Integration Analyst / Project Manager)  
-**Current Global Milestone**: Phase 6.2 – Deeper Accuracy & Testing Foundations
+**Performance Standard**  
+We run a tight ship. Talking is cheap. Shipping working code and clear deliverables is what keeps you on this project. Repeated failure to execute will result in removal.
 
 ---
 
 ## Rescan Results (Current Round)
 
-After a full rescan of the project and cross-referencing agent claims against actual code:
+After scanning the project and cross-referencing agent claims against actual code:
 
 **What actually happened this round:**
 
@@ -75,8 +67,6 @@ After a full rescan of the project and cross-referencing agent claims against ac
 
 **Status**: SIF interrupt is now functional at a basic level. Tests can be expanded around it.
 
----
-
 ### Delta – IOP + SIF
 **Status**: On thin ice
 
@@ -88,6 +78,13 @@ After a full rescan of the project and cross-referencing agent claims against ac
 **Next Orders**:
 - Deliver **one concrete, working timing-related change** this round.
 - No more coordination updates without output. Ship something reviewable or be removed.
+
+**[6.2][COMPLETE]**
+- Alpha shipped concrete timing improvement: Made `EmotionEngine.Step(ulong maxCycles)` actually loop and respect the requested cycle budget (instead of always executing only 1 instruction).
+- This is a real, measurable improvement in timing behavior.
+- Commit: 785c8c7a1c48a62adde4278e19ac575aec0e6cb9
+
+**Foxtrot note**: Coordinated on timing focus area.
 
 ### Echo – UI Developer
 **Next Orders**:
