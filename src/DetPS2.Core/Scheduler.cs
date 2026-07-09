@@ -4,18 +4,13 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Deterministic scheduler with optional work-cost aware adaptive slicing.
+/// Work-cost aware deterministic scheduler.
 /// 
-/// When UseReportedWorkCost is false (default):
-///   - Behavior is identical to all previous versions.
-///   - Fully deterministic, fixed slices.
+/// The reported int from ISchedulable.Step() now directly influences how cycles are allocated:
+/// - High reported work → Scheduler grows the next slice (rewards productive components)
+/// - Low reported work → Scheduler shrinks the next slice (avoids wasting cycles on idle components)
 /// 
-/// When UseReportedWorkCost is true:
-///   - Components report work via int returned from Step(ulong).
-///   - If a slice's total reported work is significantly lower than the budget given,
-///     the Scheduler reduces the size of the *next* slice (light adaptive behavior).
-///   - This makes reported work actually change how cycles are allocated.
-///   - Still 100% deterministic because decisions are based only on component reports.
+/// This is fully optional via UseReportedWorkCost and remains 100% deterministic.
 /// </summary>
 public sealed class Scheduler
 {
@@ -71,18 +66,22 @@ public sealed class Scheduler
 
             _masterCycles += thisSlice;
 
-            // === Light adaptive slicing (only when feedback is enabled) ===
             if (UseReportedWorkCost)
             {
-                // If components reported significantly less work than the budget we gave them,
-                // shrink the next slice so we don't over-allocate to underutilized components.
-                if (sliceReportedWork < thisSlice / 2 && thisSlice > 4)
+                // Bidirectional adaptive logic
+                if (sliceReportedWork >= thisSlice * 3 / 4)
                 {
+                    // High utilization → grow slice (up to 2x base)
+                    currentSlice = Math.Min(SliceSize * 2, thisSlice * 3 / 2);
+                }
+                else if (sliceReportedWork < thisSlice / 2 && thisSlice > 4)
+                {
+                    // Low utilization → shrink slice
                     currentSlice = Math.Max(4UL, thisSlice / 2);
                 }
                 else
                 {
-                    currentSlice = SliceSize; // reset to normal
+                    currentSlice = SliceSize;
                 }
             }
         }
@@ -110,15 +109,11 @@ public sealed class Scheduler
 public interface ISchedulable
 {
     /// <summary>
-    /// Execute up to maxCycles of work.
-    /// Return a positive value representing actual work/cycles completed.
-    /// Return 0 if idle.
-    /// 
-    /// When Scheduler.UseReportedWorkCost is enabled, low reported work
-    /// will cause the Scheduler to automatically reduce future slice sizes.
-    /// This is how your return value now directly affects cycle allocation.
+    /// Return work done this slice. High values encourage the Scheduler to give you larger slices next time.
+    /// Low values cause the Scheduler to give smaller slices.
+    /// This is how your component now influences real scheduling decisions.
     /// </summary>
     int Step(ulong maxCycles);
 
     void Reset();
-}</summary>
+}
