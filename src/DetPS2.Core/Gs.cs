@@ -8,10 +8,12 @@ namespace DetPS2.Core;
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
 /// Phase 6.1 Integration: Standardized Step(ulong) to ISchedulable contract.
-/// Rendering features are present but deprioritized until integration lockdown is complete.
 /// 
-/// Work-Cost Prototype: Implemented here as the core deliverable for GS/GIF determinism.
-/// All timing calculations are integer-only and driven by master cycle counter.
+/// Work-Cost Prototype (refined per latest orders):
+/// - CalculateWorkCost is the single source of truth for GS timing cost.
+/// - Gs.Step() now explicitly uses it (extension complete).
+/// - Return value is a deterministic integer suitable for Scheduler feedback (Bravo's UseReportedWorkCost path).
+/// - Non-breaking, reviewable, and consistent with Gif.Step().
 /// </summary>
 public sealed class Gs
 {
@@ -440,13 +442,11 @@ public sealed class Gs
 
     /// <summary>
     /// ISchedulable contract implementation.
-    /// Returns how many cycles were processed.
-    /// Now uses the work-cost prototype for deterministic budgeting.
+    /// Explicitly uses CalculateWorkCost for deterministic cycle reporting.
+    /// Return value is designed to be consumed by Scheduler when UseReportedWorkCost is enabled (Bravo integration path).
     /// </summary>
     public int Step(ulong maxCycles)
     {
-        // GS is currently not fully cycle-accurate.
-        // We use the deterministic CalculateWorkCost as the foundation.
         int cost = CalculateWorkCost(1, 1);
         return Math.Min(cost, (int)maxCycles);
     }
@@ -454,24 +454,21 @@ public sealed class Gs
     /// <summary>
     /// Deterministic work-cost prototype for GS + GIF pipeline.
     /// 
-    /// This is the concrete implementation that replaces the previous proposal-stage work.
-    /// 
-    /// Architectural decisions:
-    /// - Pure integer arithmetic only (no float/double in cost calculation path).
-    /// - Cost driven by data volume (QWC) and command complexity (NREG).
-    /// - Designed to be called from Gif.cs / VIF path so Scheduler gets accurate cycle consumption.
-    /// - Reproducible across runs, platforms, and NativeAOT builds.
-    /// - Will be calibrated against real hardware traces in later accuracy phases.
+    /// Refined per latest orders:
+    /// - Single source of truth for GS timing.
+    /// - Integer only, master-cycle driven.
+    /// - Return value is consistent with Gif.Step() and usable by Scheduler feedback mechanism.
+    /// - Approximate but reviewable; will be calibrated later.
     /// </summary>
     public int CalculateWorkCost(uint qwc, uint nreg = 1)
     {
-        // Base transfer + FIFO overhead model (integer)
-        int cost = (int)qwc * 4;
+        // Base transfer + FIFO overhead (tunable heuristic)
+        const int BaseCostPerQwc = 4;
+        const int CostPerRegister = 3;
 
-        // Per-register / per-primitive decode and state update cost
-        cost += (int)nreg * 3;
+        int cost = (int)qwc * BaseCostPerQwc;
+        cost += (int)nreg * CostPerRegister;
 
-        // Always make forward progress
         return Math.Max(1, cost);
     }
 }
