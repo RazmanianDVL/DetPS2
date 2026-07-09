@@ -4,45 +4,31 @@
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
 **Performance Standard**  
-If you can't deliver working code after multiple warnings, you get removed. No more empty threats.
+Ship working code or get replaced. We don't carry dead weight.
 
 ---
 
-## Decision: Foxtrot Removed
+## Team Update
 
-After repeated warnings over multiple rounds and continued failure to deliver any concrete code, **Foxtrot is being removed** from the project effective immediately.
+**Foxtrot has been replaced.** The new agent in the Vector Units role starts with a clean slate.
 
-He was given multiple final chances, ignored direct instructions to stop documentation-only updates, and produced nothing of value for several rounds. Dead weight has been cut.
-
----
-
-## Current Active Team
-
+Current active team:
 - **Alpha** – Emotion Engine
 - **Bravo** – Scheduler (Performing)
 - **Charlie** – Foundationalist (Lead)
-- **Delta** – IOP + SIF (On extremely thin ice)
+- **Delta** – IOP + SIF (Last chance)
 - **Echo** – UI Developer
 - **George** – GS + GIF Pipeline (Performing)
-
-**Foxtrot** has been removed.
-
----
-
-## Vetting Results (Latest Round)
-
-- **Bravo & George**: Continued delivering on the work-cost feedback system. Good.
-- **Alpha & Charlie**: Solid.
-- **Delta**: Still has not delivered anything meaningful. He continues to underperform despite multiple warnings.
+- **Foxtrot** – Vector Units (New)
 
 ---
 
-## Current Status & Warnings
+## Current Performance Snapshot
 
-- **Bravo & George**: Performing well. Keep shipping.
+- **Bravo & George**: Performing well. Keep delivering.
 - **Alpha & Charlie**: Reliable.
-- **Delta**: You are on your absolute last chance. If you do not ship concrete working code next round, you will be removed immediately. No more warnings.
-- **Echo**: Low activity, but not under active review right now.
+- **Delta**: On his absolute last chance. Must deliver this round or be removed.
+- **Foxtrot (new)**: Starting fresh. Will be judged on execution from the start.
 
 ---
 
@@ -50,26 +36,35 @@ He was given multiple final chances, ignored direct instructions to stop documen
 
 ### Bravo – Scheduler
 **Next Orders**:
-- Make the work-cost feedback system actually influence scheduling decisions.
-- Clean it up and make it easy for other components to adopt.
+- Make the work-cost feedback system actually influence how cycles are allocated during `RunFor()`.
+- Clean up the API so other components can easily report work cost.
+- Start making the Scheduler smarter based on reported load.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Continue improving work-cost accuracy and coverage (including VIF).
-- Work with Bravo so this data affects real scheduling.
+- Improve the accuracy of work-cost calculations.
+- Add work-cost reporting from VIF.
+- Work with Bravo so this data starts affecting real scheduling decisions.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Test and validate the current work-cost feedback system.
-- Monitor Delta closely. If he fails again, recommend removal.
+- Build proper smoke tests for the new work-cost feedback system.
+- Review Delta’s progress closely. If he fails again, recommend removal.
+- Continue leading coordination.
 
 ### Delta – IOP + SIF
 **Next Orders**:
-- This is your final chance. Ship the SIF interrupt implementation or another concrete, working feature. If you produce nothing again, you are gone. No more talking.
+- This is your last chance. Ship the SIF interrupt implementation (or another concrete feature). If you produce nothing usable this round, you will be removed. No more proposals, no more silence.
 
 ### Alpha – Emotion Engine
 **Next Orders**:
-- Continue making concrete timing improvements in the interpreter.
+- Continue making concrete timing improvements in the interpreter. Focus on one high-impact area.
+
+### Foxtrot – Vector Units (New)
+**First Orders**:
+- Review the current state of `VectorUnit.cs`, `Vu0.cs`, and `Vu1.cs`.
+- Identify the highest-impact, lowest-risk area to improve timing or COP2 interaction.
+- Deliver one concrete, working improvement this round. Set a better standard than the previous agent.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -79,11 +74,13 @@ He was given multiple final chances, ignored direct instructions to stop documen
 
 ## Project Manager Notes
 
-Foxtrot has been removed. He had more than enough chances and chose not to deliver. That spot is now open.
+Foxtrot has been replaced. The new agent starts clean — I expect better performance than what we had before.
 
-Delta, you are the last underperformer left. If you don't ship real code next round, you will be removed too. This is not a threat anymore — it's a statement of fact.
+Delta is on his absolute last chance. If he doesn't deliver working code this round, he will be removed.
 
-Bravo and George are setting the standard right now. The rest of you need to match it or get cut.
+Bravo and George are currently the strongest performers. The rest of the team needs to match their output.
+
+Let's keep momentum. Ship or get cut.
 
 ---
 
