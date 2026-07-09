@@ -28,16 +28,7 @@ public sealed class Scheduler
     public double LastWorkEfficiency { get; private set; }
     public ulong CurrentEffectiveSliceSize => _currentEffectiveSliceSize;
 
-    /// <summary>
-    /// Utilization (reported work / slice size) needed to grow the next slice.
-    /// Default: 0.75 (75%)
-    /// </summary>
     public double HighUtilizationThreshold { get; set; } = 0.75;
-
-    /// <summary>
-    /// Utilization below which we shrink the next slice.
-    /// Default: 0.5 (50%)
-    /// </summary>
     public double LowUtilizationThreshold { get; set; } = 0.5;
 
     public void Register(ISchedulable component)
@@ -83,20 +74,7 @@ public sealed class Scheduler
 
             if (UseReportedWorkCost)
             {
-                double utilization = thisSlice > 0 ? (double)sliceReportedWork / thisSlice : 0.0;
-
-                if (utilization >= HighUtilizationThreshold)
-                {
-                    _currentEffectiveSliceSize = Math.Min(SliceSize * 2, (ulong)(thisSlice * 1.5));
-                }
-                else if (utilization < LowUtilizationThreshold && thisSlice > 4)
-                {
-                    _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
-                }
-                else
-                {
-                    _currentEffectiveSliceSize = SliceSize;
-                }
+                AdjustSliceBasedOnWork(thisSlice, sliceReportedWork);
             }
         }
 
@@ -107,6 +85,24 @@ public sealed class Scheduler
         else
         {
             LastWorkEfficiency = 0;
+        }
+    }
+
+    private void AdjustSliceBasedOnWork(ulong thisSlice, int reportedWork)
+    {
+        double utilization = thisSlice > 0 ? (double)reportedWork / thisSlice : 0.0;
+
+        if (utilization >= HighUtilizationThreshold)
+        {
+            _currentEffectiveSliceSize = Math.Min(SliceSize * 2, (ulong)(thisSlice * 1.5));
+        }
+        else if (utilization < LowUtilizationThreshold && thisSlice > 4)
+        {
+            _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
+        }
+        else
+        {
+            _currentEffectiveSliceSize = SliceSize;
         }
     }
 
