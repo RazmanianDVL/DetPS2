@@ -56,6 +56,13 @@ Every update to this file **must** include a valid GitHub commit hash. No commit
 - Keep expanding tests for the work-cost feedback system.
 - Monitor Delta closely. If he fails to deliver this round, recommend removal.
 
+**[6.2][COMPLETE]** Expanded work-cost tests with `Scheduler_WorkCostResetsOnReset()`.
+`[COMMIT] 213664be61c276da6195c7949c1209ca07b615af`
+
+**Status on Delta**: Has now failed multiple rounds to implement the SIF interrupt. No code shipped despite repeated direct orders. He is dead weight and should be removed if he fails to deliver this round.
+
+---
+
 ### Delta – IOP + SIF
 **Next Orders**:
 - This is your absolute last chance. Ship the SIF interrupt implementation **this round**. Include the commit hash when you update this file. If you don't deliver working code, you will be removed. No more warnings.
