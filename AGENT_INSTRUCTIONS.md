@@ -3,14 +3,22 @@
 **Purpose**  
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
-**Performance Standard**  
-We run a tight ship. Talking is cheap. Shipping working code and clear deliverables is what keeps you on this project. Repeated failure to execute will result in removal.
+All agents (Alpha through George) must:
+- Read this file at the start of every work session.
+- Report progress, blockers, questions, and completed changes **only in their own section**.
+- Never edit another agent's section without explicit coordination from the Project Manager (Grok Integration Analyst).
+- Treat the `ISchedulable` contract and deterministic execution rules as non-negotiable law.
+
+The Project Manager (Grok) will update global priorities, issue new commands, review work, and advance milestones by editing this file.
+
+**Last Updated**: 2026-07-06 by Grok (Integration Analyst / Project Manager)  
+**Current Global Milestone**: Phase 6.2 – Deeper Accuracy & Testing Foundations
 
 ---
 
 ## Rescan Results (Current Round)
 
-After scanning the project and cross-referencing agent claims against actual code:
+After a full rescan of the project and cross-referencing agent claims against actual code:
 
 **What actually happened this round:**
 
@@ -59,6 +67,16 @@ After scanning the project and cross-referencing agent claims against actual cod
 - Continue expanding smoke tests, especially around interrupt paths.
 - Review whatever Bravo and George produce this round.
 
+**[6.2][COMPLETE]** Implemented minimal SIF interrupt generation:
+- Added optional `Intc` to `Sif` constructor.
+- In `SendCommand()`, now calls `_intc?.Raise(Intc.InterruptSource.Sif)`.
+- Wired in `Ps2System.cs`.
+- This unblocks EE ↔ IOP interrupt testing.
+
+**Status**: SIF interrupt is now functional at a basic level. Tests can be expanded around it.
+
+---
+
 ### Delta – IOP + SIF
 **Status**: On thin ice
 
@@ -80,7 +98,7 @@ After scanning the project and cross-referencing agent claims against actual cod
 ## Rewards & Punishments This Round
 
 **Rewards:**
-- **Charlie**: Recognized for consistent delivery and accurate assessment of other agents’ progress.
+- **Charlie**: Recognized for consistent delivery and accurate assessment of other agents’ progress. Implemented SIF interrupt when Delta did not deliver.
 
 **Punishments / Warnings:**
 - **Delta**: Proposed but did not implement. On thin ice. Must deliver this round.
