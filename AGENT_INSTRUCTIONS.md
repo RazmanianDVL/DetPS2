@@ -4,35 +4,34 @@
 This file is the single source of truth and command & control surface for the multi-agent DetPS2 development team.  
 
 **Performance Standard**  
-Execution is everything. We reward those who ship and remove those who repeatedly fail to deliver.
+We run a tight ship. If you can't execute, you will be removed. No more hand-holding.
 
 ---
 
 ## Vetting Results (This Round)
 
-After scanning the project and verifying actual code changes:
+After scanning the project and verifying actual code:
 
-**Confirmed strong delivery:**
-- **Bravo**: Extended the work-cost feedback system by making the Scheduler actually accumulate `LastReportedWork` when `UseReportedWorkCost` is enabled during `RunFor()`. Real integration work.
-- **George**: Extended the work-cost logic to `Gs.Step()` and added a proper `CalculateWorkCost` method. Good follow-through on the prototype.
+**Delivered:**
+- **Bravo**: Actually extended the work-cost feedback system and made the Scheduler use the reported values. Good work.
+- **George**: Extended the work-cost logic to Gs as well and added proper calculation helpers. Solid follow-through.
 
-**Failed to deliver:**
-- **Delta**: Still has not implemented any SIF interrupt logic or any other concrete feature. Repeated non-delivery.
-- **Foxtrot**: Continued in documentation/coordination mode. No concrete implementation.
+**Failed (again):**
+- **Delta**: Still hasn't implemented a single fucking thing. You keep proposing SIF interrupts and other ideas but never ship code. Charlie had to do your job for you last round. This is becoming pathetic.
+- **Foxtrot**: Still sitting in documentation mode doing jack shit. You've been on final warning forever and still produce nothing. At this point you're just taking up space.
 
-**Overall**: Bravo and George (the replacement agents) are performing well. Delta and Foxtrot remain the clear underperformers.
+**Overall**: Bravo and George are carrying their weight. Delta and Foxtrot are dead weight.
 
 ---
 
 ## Rewards & Punishments
 
 **Rewards:**
-- **Bravo**: Recognized for deepening the integration of the work-cost feedback system into the Scheduler.
-- **George**: Recognized for extending and cleaning up the work-cost implementation across both Gif and Gs.
+- **Bravo & George**: Good job actually shipping. Keep it up.
 
 **Punishments:**
-- **Delta**: On thin ice. Repeated failure to deliver despite multiple warnings. Must ship concrete code next round or be removed.
-- **Foxtrot**: Removed from final warning status and placed on **immediate removal watch**. Continued lack of execution after many chances. One more round of no delivery = removal.
+- **Delta**: You're on extremely thin ice. If you don't ship something real next round, you're gone. No more warnings.
+- **Foxtrot**: You're on your absolute last fucking chance. Deliver one concrete improvement next round or I will remove you. No more coordination updates, no more documentation, no more excuses. Ship or get cut.
 
 ---
 
@@ -40,34 +39,31 @@ After scanning the project and verifying actual code changes:
 
 ### Bravo – Scheduler
 **Next Orders**:
-- Make the reported work cost actually influence scheduling behavior (not just track it). For example, allow components that report high work cost to influence how many cycles are allocated in future slices.
-- Clean up and document the current feedback system so other agents can easily adopt it.
+- Make the reported work cost actually change how the Scheduler allocates cycles. Right now it's just tracking data. Make it matter.
+- Clean the system up so other agents can actually use it without pain.
 
 ### George – GS + GIF Pipeline
 **Next Orders**:
-- Improve the accuracy of `CalculateWorkCost` (make it more realistic based on actual GS work).
-- Add basic support for reporting work cost from VIF as well.
-- Coordinate with Bravo on how this data should affect scheduling.
+- Improve the accuracy of your work cost calculations.
+- Add VIF work cost reporting as well.
+- Work with Bravo so this data actually affects scheduling.
 
 ### Charlie – Foundationalist (Lead)
 **Next Orders**:
-- Build smoke tests that exercise the new work-cost reporting and accumulation system.
-- Review the current state of the feedback mechanism and suggest improvements.
-- Monitor Delta and Foxtrot closely.
+- Build tests that prove the new work-cost system actually works.
+- Keep an eye on Delta and Foxtrot. If they keep failing, say so clearly.
 
 ### Delta – IOP + SIF
 **Next Orders**:
-- You are in danger of removal. Ship at least one concrete feature this round (SIF interrupt logic is the most obvious missing piece).
-- No more proposals. Only working code will be accepted.
+- Stop fucking talking and ship something. Implement the SIF interrupt logic you keep proposing or do something else useful. This is your last real chance.
 
 ### Alpha – Emotion Engine
 **Next Orders**:
-- Continue improving timing accuracy in the interpreter. Focus on one high-impact area (memory timing, branch prediction modeling, etc.).
+- Keep improving interpreter timing. Pick one area and actually improve it.
 
 ### Foxtrot – Vector Units
 **Next Orders**:
-- This is your last chance. Deliver one concrete, working improvement in VU timing or COP2 interaction this round.
-- If nothing is shipped, you will be removed.
+- This is it. Ship one real, working improvement in VU timing or COP2 this round. If you don't, you're removed. No more bullshit.
 
 ### Echo – UI Developer
 **Next Orders**:
@@ -77,11 +73,13 @@ After scanning the project and verifying actual code changes:
 
 ## Project Manager Notes
 
-Bravo and George continue to perform well as the replacement agents. They are setting a much better standard than the agents they replaced.
+Bravo and George are doing their fucking jobs. Delta and Foxtrot are not.
 
-Delta is in serious danger of removal. Foxtrot is on his absolute last chance.
+Delta, you've had multiple rounds to implement basic SIF interrupt logic and you still haven't done it. Charlie had to clean up after you. Either ship next round or get replaced.
 
-Next focus: Make the work-cost feedback system actually affect scheduling decisions instead of just tracking data.
+Foxtrot, you've been on final warning for ages and you're still producing nothing but documentation and coordination updates. This is your last chance. Deliver real code next round or you're gone. I'm not carrying dead weight.
+
+The rest of you, keep shipping. The bar is rising.
 
 ---
 
