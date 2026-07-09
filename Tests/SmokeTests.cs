@@ -3,8 +3,8 @@ using DetPS2.Core;
 namespace DetPS2.Tests;
 
 /// <summary>
-/// Basic smoke / determinism tests for Phase 6.2.
-/// Expanded with interrupt-path awareness.
+/// Smoke / determinism tests for Phase 6.2.
+/// Includes SIF interrupt behavior tests.
 /// </summary>
 public static class SmokeTests
 {
@@ -40,5 +40,24 @@ public static class SmokeTests
         var sys2 = new Ps2System(); for (int i = 0; i < 10; i++) sys2.RunFor(1000);
         if (sys1.MasterCycles != sys2.MasterCycles) throw new Exception("Multiple short runs violation");
         Console.WriteLine("[Smoke] MultipleShortRuns OK");
+    }
+
+    /// <summary>
+    /// Verifies that calling Sif.SendCommand() raises the SIF interrupt.
+    /// </summary>
+    public static void Sif_InterruptRaisedOnSendCommand()
+    {
+        var sys = new Ps2System();
+
+        bool before = sys.Intc.IsPending(Intc.InterruptSource.Sif);
+
+        sys.Sif.SendCommand(0x12345678);
+
+        bool after = sys.Intc.IsPending(Intc.InterruptSource.Sif);
+
+        if (!after)
+            throw new Exception("SIF interrupt was not raised after SendCommand");
+
+        Console.WriteLine("[Smoke] Sif_InterruptRaisedOnSendCommand OK");
     }
 }
