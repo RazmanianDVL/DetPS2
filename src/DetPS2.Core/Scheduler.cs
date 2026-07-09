@@ -6,49 +6,35 @@ namespace DetPS2.Core;
 /// <summary>
 /// Deterministic PS2 scheduler with optional work-cost aware adaptive slicing.
 /// 
-/// === How components participate (very easy) ===
-/// 1. Implement ISchedulable (most already do).
-/// 2. In your Step(ulong maxCycles) method, return a positive int representing work done.
-/// 3. High return value = Scheduler will give you larger slices next time.
-/// 4. Low return value = Scheduler will give you smaller slices.
+/// === Quick Start for other components ===
+/// 1. Implement ISchedulable
+/// 2. Return meaningful positive work from Step(ulong)
+/// 3. Set scheduler.UseReportedWorkCost = true
+/// 4. After RunFor(), check LastReportedWork, LastWorkEfficiency, and CurrentEffectiveSliceSize
 /// 
-/// Enable with: scheduler.UseReportedWorkCost = true;
-/// Then inspect scheduler.LastReportedWork and scheduler.LastWorkEfficiency after RunFor().
-/// 
-/// The adaptive behavior happens automatically during RunFor() when the flag is enabled.
+/// High work reports → Scheduler grows slices. Low reports → Scheduler shrinks slices.
+/// The effect happens live during RunFor().
 /// </summary>
 public sealed class Scheduler
 {
     private readonly List<ISchedulable> _components = new();
     private ulong _masterCycles;
+    private ulong _currentEffectiveSliceSize;
 
     public ulong MasterCycles => _masterCycles;
 
-    /// <summary>
-/// Base slice size used when starting a RunFor() call.
-/// The adaptive system may temporarily grow or shrink from this value.
-/// </summary>
     public ulong SliceSize { get; set; } = 64;
 
-    /// <summary>
-    /// When true, the Scheduler uses the int returned from every component's Step() call
-    /// to dynamically adjust future slice sizes during RunFor().
-    /// High reported work → larger slices. Low reported work → smaller slices.
-    /// Default is false for full backward compatibility and maximum determinism.
-    /// </summary>
     public bool UseReportedWorkCost { get; set; } = false;
 
-    /// <summary>
-    /// Total work reported by all components during the most recent RunFor() call.
-    /// Only updated when UseReportedWorkCost is true.
-    /// </summary>
     public int LastReportedWork { get; private set; }
+    public double LastWorkEfficiency { get; private set; }
 
     /// <summary>
-    /// Efficiency of the last run as a percentage (reported work / requested cycles * 100).
-    /// Useful diagnostic when UseReportedWorkCost is enabled.
+    /// The slice size the adaptive system is currently using.
+    /// Useful for debugging and observing how reported work is affecting allocation in real time.
     /// </summary>
-    public double LastWorkEfficiency { get; private set; }
+    public ulong CurrentEffectiveSliceSize => _currentEffectiveSliceSize;
 
     public void Register(ISchedulable component)
     {
@@ -67,13 +53,14 @@ public sealed class Scheduler
         if (cyclesToRun == 0) return;
 
         LastReportedWork = 0;
+        _currentEffectiveSliceSize = SliceSize;
+
         ulong target = _masterCycles + cyclesToRun;
-        ulong currentSlice = SliceSize;
 
         while (_masterCycles < target)
         {
             ulong remaining = target - _masterCycles;
-            ulong thisSlice = Math.Min(remaining, currentSlice);
+            ulong thisSlice = Math.Min(remaining, _currentEffectiveSliceSize);
 
             int sliceReportedWork = 0;
 
@@ -92,20 +79,17 @@ public sealed class Scheduler
 
             if (UseReportedWorkCost)
             {
-                // Bidirectional adaptive slicing based on reported load
                 if (sliceReportedWork >= thisSlice * 3 / 4)
                 {
-                    // High load → grow slice (reward productive components)
-                    currentSlice = Math.Min(SliceSize * 2, thisSlice * 3 / 2);
+                    _currentEffectiveSliceSize = Math.Min(SliceSize * 2, thisSlice * 3 / 2);
                 }
                 else if (sliceReportedWork < thisSlice / 2 && thisSlice > 4)
                 {
-                    // Low load → shrink slice
-                    currentSlice = Math.Max(4UL, thisSlice / 2);
+                    _currentEffectiveSliceSize = Math.Max(4UL, thisSlice / 2);
                 }
                 else
                 {
-                    currentSlice = SliceSize;
+                    _currentEffectiveSliceSize = SliceSize;
                 }
             }
         }
@@ -125,6 +109,7 @@ public sealed class Scheduler
         _masterCycles = 0;
         LastReportedWork = 0;
         LastWorkEfficiency = 0;
+        _currentEffectiveSliceSize = SliceSize;
         foreach (var component in _components)
             component.Reset();
     }
@@ -133,15 +118,8 @@ public sealed class Scheduler
 public interface ISchedulable
 {
     /// <summary>
-    /// Perform up to maxCycles of work.
-    /// 
-    /// Return value directly influences future slice allocation when the Scheduler's
-    /// UseReportedWorkCost flag is enabled:
-    ///   - High positive value → Scheduler tends to give this component larger slices going forward.
-    ///   - Low / zero value → Scheduler tends to give this component smaller slices.
-    /// 
-    /// This is the primary (and very simple) way for EE, DMAC, GIF, GS, VIF, VU, etc.
-    /// to participate in smarter scheduling.
+    /// Return positive work done. This value now directly influences how large
+    /// your future slices will be when UseReportedWorkCost is enabled on the Scheduler.
     /// </summary>
     int Step(ulong maxCycles);
 
