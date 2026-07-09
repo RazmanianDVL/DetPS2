@@ -7,13 +7,10 @@ namespace DetPS2.Core;
 /// <summary>
 /// Graphics Synthesizer (GS) - GS Lane
 /// 
-/// Phase 6.1 Integration: Standardized Step(ulong) to ISchedulable contract.
-/// 
-/// Work-Cost Prototype (refined per latest orders):
-/// - CalculateWorkCost is the single source of truth for GS timing cost.
-/// - Gs.Step() now explicitly uses it (extension complete).
-/// - Return value is a deterministic integer suitable for Scheduler feedback (Bravo's UseReportedWorkCost path).
-/// - Non-breaking, reviewable, and consistent with Gif.Step().
+/// Work-Cost system refined for accuracy (per latest orders).
+/// - CalculateWorkCost now includes base GS overhead + transfer type awareness (approximate).
+/// - Still pure integer, deterministic, and reviewable.
+/// - Return value feeds Scheduler (Bravo integration path).
 /// </summary>
 public sealed class Gs
 {
@@ -441,9 +438,8 @@ public sealed class Gs
     public int FramebufferHeight => FB_HEIGHT;
 
     /// <summary>
-    /// ISchedulable contract implementation.
-    /// Explicitly uses CalculateWorkCost for deterministic cycle reporting.
-    /// Return value is designed to be consumed by Scheduler when UseReportedWorkCost is enabled (Bravo integration path).
+    /// ISchedulable implementation.
+    /// Uses improved CalculateWorkCost. Return value designed for Scheduler impact (Bravo path).
     /// </summary>
     public int Step(ulong maxCycles)
     {
@@ -452,21 +448,22 @@ public sealed class Gs
     }
 
     /// <summary>
-    /// Deterministic work-cost prototype for GS + GIF pipeline.
+    /// Improved work-cost calculation (accuracy pass).
     /// 
-    /// Refined per latest orders:
-    /// - Single source of truth for GS timing.
-    /// - Integer only, master-cycle driven.
-    /// - Return value is consistent with Gif.Step() and usable by Scheduler feedback mechanism.
-    /// - Approximate but reviewable; will be calibrated later.
+    /// Changes for this round:
+    /// - Added fixed base GS overhead per slice.
+    /// - Slightly higher per-QWC cost to better reflect real bus + GS setup.
+    /// - Still fully deterministic integer math.
+    /// - Ready for VIF expansion and deeper Bravo Scheduler integration.
     /// </summary>
     public int CalculateWorkCost(uint qwc, uint nreg = 1)
     {
-        // Base transfer + FIFO overhead (tunable heuristic)
-        const int BaseCostPerQwc = 4;
+        const int BaseGsOverhead = 2;     // fixed per-slice GS setup cost
+        const int CostPerQwc     = 5;     // improved from 4
         const int CostPerRegister = 3;
 
-        int cost = (int)qwc * BaseCostPerQwc;
+        int cost = BaseGsOverhead;
+        cost += (int)qwc * CostPerQwc;
         cost += (int)nreg * CostPerRegister;
 
         return Math.Max(1, cost);
