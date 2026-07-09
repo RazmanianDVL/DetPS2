@@ -4,50 +4,31 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Deterministic scheduler for the PS2 system.
+/// Deterministic scheduler with optional work-cost aware adaptive slicing.
 /// 
-/// Budgeted slice execution with optional work-cost feedback from components.
+/// When UseReportedWorkCost is false (default):
+///   - Behavior is identical to all previous versions.
+///   - Fully deterministic, fixed slices.
 /// 
-/// Core rules (never broken):
-/// - MasterCycles is the single source of truth.
-/// - All advancement is deterministic and repeatable.
-/// - UseReportedWorkCost is completely optional. Default (false) = identical behavior to before.
-/// 
-/// Work-cost integration:
-/// - Components implement int Step(ulong maxCycles) and return meaningful work done.
-/// - When UseReportedWorkCost = true, Scheduler accumulates the returned values.
-/// - LastReportedWork and WorkEfficiency provide diagnostics.
-/// - George’s Gif.Step() implementation (which calls Gs.CalculateWorkCost) now participates automatically.
+/// When UseReportedWorkCost is true:
+///   - Components report work via int returned from Step(ulong).
+///   - If a slice's total reported work is significantly lower than the budget given,
+///     the Scheduler reduces the size of the *next* slice (light adaptive behavior).
+///   - This makes reported work actually change how cycles are allocated.
+///   - Still 100% deterministic because decisions are based only on component reports.
 /// </summary>
 public sealed class Scheduler
 {
     private readonly List<ISchedulable> _components = new();
     private ulong _masterCycles;
-    private ulong _lastRunRequestedCycles;
 
     public ulong MasterCycles => _masterCycles;
 
     public ulong SliceSize { get; set; } = 64;
 
-    /// <summary>
-    /// Enables accumulation of work cost reported by components via their Step() return value.
-    /// When false (default), behavior is identical to previous versions — fully deterministic with no side effects.
-    /// Enable for diagnostics, profiling, or future adaptive scheduling experiments.
-    /// </summary>
     public bool UseReportedWorkCost { get; set; } = false;
 
-    /// <summary>
-    /// Total work reported by all components during the last RunFor() call.
-    /// Only updated when UseReportedWorkCost is true.
-    /// </summary>
     public int LastReportedWork { get; private set; }
-
-    /// <summary>
-    /// Simple efficiency metric: (reported work / requested cycles) * 100.
-    /// 100 = components reported exactly as much work as cycles advanced.
-    /// Lower values indicate components were not fully utilizing the slice or chose to report conservatively.
-    /// Only meaningful when UseReportedWorkCost is true.
-    /// </summary>
     public double LastWorkEfficiency { get; private set; }
 
     public void Register(ISchedulable component)
@@ -66,15 +47,16 @@ public sealed class Scheduler
     {
         if (cyclesToRun == 0) return;
 
-        _lastRunRequestedCycles = cyclesToRun;
         LastReportedWork = 0;
-
         ulong target = _masterCycles + cyclesToRun;
+        ulong currentSlice = SliceSize;
 
         while (_masterCycles < target)
         {
             ulong remaining = target - _masterCycles;
-            ulong thisSlice = Math.Min(remaining, SliceSize);
+            ulong thisSlice = Math.Min(remaining, currentSlice);
+
+            int sliceReportedWork = 0;
 
             foreach (var component in _components)
             {
@@ -82,16 +64,32 @@ public sealed class Scheduler
 
                 if (UseReportedWorkCost && cyclesAdvanced > 0)
                 {
+                    sliceReportedWork += cyclesAdvanced;
                     LastReportedWork += cyclesAdvanced;
                 }
             }
 
             _masterCycles += thisSlice;
+
+            // === Light adaptive slicing (only when feedback is enabled) ===
+            if (UseReportedWorkCost)
+            {
+                // If components reported significantly less work than the budget we gave them,
+                // shrink the next slice so we don't over-allocate to underutilized components.
+                if (sliceReportedWork < thisSlice / 2 && thisSlice > 4)
+                {
+                    currentSlice = Math.Max(4UL, thisSlice / 2);
+                }
+                else
+                {
+                    currentSlice = SliceSize; // reset to normal
+                }
+            }
         }
 
-        if (UseReportedWorkCost && _lastRunRequestedCycles > 0)
+        if (UseReportedWorkCost && cyclesToRun > 0)
         {
-            LastWorkEfficiency = (LastReportedWork / (double)_lastRunRequestedCycles) * 100.0;
+            LastWorkEfficiency = (LastReportedWork / (double)cyclesToRun) * 100.0;
         }
         else
         {
@@ -113,22 +111,14 @@ public interface ISchedulable
 {
     /// <summary>
     /// Execute up to maxCycles of work.
+    /// Return a positive value representing actual work/cycles completed.
+    /// Return 0 if idle.
     /// 
-    /// Return value rules (adoption guide for components):
-    /// - Return a positive integer representing approximate cycles or work units completed.
-    /// - Return 0 if idle or choosing not to report this slice.
-    /// - Never return a value &gt; maxCycles.
-    /// 
-    /// Example (from George’s Gif implementation):
-    ///   return Math.Min(costFromGsCalculateWorkCost, (int)maxCycles);
-    /// 
-    /// When Scheduler.UseReportedWorkCost is true, these values are accumulated
-    /// into LastReportedWork and used to calculate LastWorkEfficiency.
-    /// 
-    /// This is the primary lightweight mechanism for components (EE, DMAC, GIF, GS, VIF, etc.)
-    /// to provide timing feedback without changing the ISchedulable interface.
+    /// When Scheduler.UseReportedWorkCost is enabled, low reported work
+    /// will cause the Scheduler to automatically reduce future slice sizes.
+    /// This is how your return value now directly affects cycle allocation.
     /// </summary>
     int Step(ulong maxCycles);
 
     void Reset();
-}
+}</summary>
