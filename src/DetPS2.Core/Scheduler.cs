@@ -15,13 +15,12 @@ namespace DetPS2.Core;
 /// Execution order: Components are stepped in the order they were registered via Register().
 /// This order is stable and deterministic.
 /// 
-/// Step return value handling:
-/// - We capture `int cyclesAdvanced = component.Step(thisSlice)`.
-/// - **Current policy**: The value is captured but ignored for advancement.
-///   We still advance `MasterCycles` by the full requested `thisSlice`.
-/// - This is intentional for Phase 6.1 stability.
-/// - Future policy (Phase 6.2+): We may use the returned value for back-pressure
-///   when components start accurately reporting partial cycle consumption.
+/// Work-cost / timing feedback (formalized in this change):
+/// - ISchedulable.Step(ulong) returns int.
+/// - The returned value is the component's self-reported work/cycles consumed.
+/// - By default (UseReportedWorkCost = false) the value is captured but ignored for advancement (Phase 6.1 safety).
+/// - When UseReportedWorkCost = true, the Scheduler accumulates reported work for diagnostics and future back-pressure logic.
+/// - This mechanism is fully optional and non-breaking.
 /// </summary>
 public sealed class Scheduler
 {
@@ -31,6 +30,19 @@ public sealed class Scheduler
     public ulong MasterCycles => _masterCycles;
 
     public ulong SliceSize { get; set; } = 64;
+
+    /// <summary>
+    /// When true, the Scheduler will accumulate the int returned from each component's Step() call.
+    /// Default is false to preserve exact current behavior and determinism guarantees.
+    /// Enable this for diagnostics or when components start providing accurate work-cost numbers.
+    /// </summary>
+    public bool UseReportedWorkCost { get; set; } = false;
+
+    /// <summary>
+    /// Sum of all non-negative values returned by components during the most recent RunFor() call.
+    /// Only meaningful when UseReportedWorkCost is true.
+    /// </summary>
+    public int LastReportedWork { get; private set; }
 
     public void Register(ISchedulable component)
     {
@@ -48,6 +60,8 @@ public sealed class Scheduler
     {
         if (cyclesToRun == 0) return;
 
+        LastReportedWork = 0;
+
         ulong target = _masterCycles + cyclesToRun;
 
         while (_masterCycles < target)
@@ -58,8 +72,11 @@ public sealed class Scheduler
             foreach (var component in _components)
             {
                 int cyclesAdvanced = component.Step(thisSlice);
-                // cyclesAdvanced captured per current policy (see class docs).
-                // Not yet used for back-pressure.
+
+                if (UseReportedWorkCost && cyclesAdvanced > 0)
+                {
+                    LastReportedWork += cyclesAdvanced;
+                }
             }
 
             _masterCycles += thisSlice;
@@ -69,6 +86,7 @@ public sealed class Scheduler
     public void Reset()
     {
         _masterCycles = 0;
+        LastReportedWork = 0;
         foreach (var component in _components)
             component.Reset();
     }
@@ -76,6 +94,19 @@ public sealed class Scheduler
 
 public interface ISchedulable
 {
+    /// <summary>
+    /// Advances the component by up to maxCycles.
+    /// 
+    /// Return value contract (formalized):
+    ///   &gt; 0  = Approximate cycles or work units actually consumed by this component in the slice.
+    ///   == 0  = No work performed or component chose not to report.
+    ///   &lt; 0  = Reserved, do not use.
+    /// 
+    /// Components should return a value between 0 and maxCycles inclusive.
+    /// The Scheduler may use this value when UseReportedWorkCost is enabled.
+    /// Returning values outside this range is undefined.
+    /// </summary>
     int Step(ulong maxCycles);
+
     void Reset();
 }
