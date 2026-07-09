@@ -6,10 +6,8 @@ namespace DetPS2.Core;
 /// <summary>
 /// Emotion Engine (R5900) - MIPS III + PS2 extensions.
 /// 
-/// Alpha Agent - Focused on ISchedulable contract compliance (Milestone 4.1).
-/// 
-/// Per standing orders: Only changed Step() signature to match the new contract.
-/// No new instructions or semantic changes were made.
+/// Alpha - Phase 6.2 timing improvement.
+/// Made Step(ulong maxCycles) actually consume up to the requested budget.
 /// </summary>
 public sealed class EmotionEngine : ISchedulable
 {
@@ -72,33 +70,41 @@ public sealed class EmotionEngine : ISchedulable
     }
 
     /// <summary>
-    /// Executes up to maxCycles worth of work.
-    /// For this compliance pass we execute one instruction (or branch+delay slot).
+    /// Executes up to maxCycles instructions.
+    /// Properly handles branch delay slots.
     /// Returns the number of cycles actually consumed.
     /// </summary>
     public int Step(ulong maxCycles)
     {
         if (maxCycles == 0) return 0;
 
-        uint opcode = _memory.Read32(PC);
-        bool tookBranch = ExecuteInstruction(opcode);
+        int executed = 0;
 
-        int cycles = 1;
-
-        if (tookBranch)
+        while ((ulong)executed < maxCycles)
         {
-            uint delayOpcode = _memory.Read32(PC + 4);
-            ExecuteInstruction(delayOpcode);
-            PC = _delaySlotTarget;
-            _inDelaySlot = false;
-            cycles += 1;
-        }
-        else
-        {
-            PC += 4;
+            uint opcode = _memory.Read32(PC);
+            bool tookBranch = ExecuteInstruction(opcode);
+            executed++;
+
+            if (tookBranch)
+            {
+                // Execute delay slot
+                uint delayOpcode = _memory.Read32(PC + 4);
+                ExecuteInstruction(delayOpcode);
+                PC = _delaySlotTarget;
+                _inDelaySlot = false;
+                executed++;
+
+                if ((ulong)executed >= maxCycles)
+                    break;
+            }
+            else
+            {
+                PC += 4;
+            }
         }
 
-        return cycles;
+        return executed;
     }
 
     private bool ExecuteInstruction(uint opcode)
@@ -377,7 +383,8 @@ public sealed class EmotionEngine : ISchedulable
             case 0x04:
                 if (_vu0 != null && rt < 32)
                 {
-                    // Placeholder until GetVfRegister is added to Vu0
+                    var reg = _vu0.GetVfRegister(rd);
+                    SetGpr(rt, new Gpr128 { Lo = (ulong)BitConverter.SingleToInt32Bits(reg.X) });
                 }
                 break;
             case 0x06:
@@ -385,7 +392,7 @@ public sealed class EmotionEngine : ISchedulable
                 {
                     Gpr128 gpr = GetGpr(rt);
                     float val = BitConverter.Int32BitsToSingle((int)gpr.Lo);
-                    // Placeholder until SetVfRegister is added to Vu0
+                    _vu0.SetVfRegister(rd, new VectorUnit.VuReg128 { X = val, Y = 0, Z = 0, W = 1 });
                 }
                 break;
             default:
