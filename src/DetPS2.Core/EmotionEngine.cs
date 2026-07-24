@@ -957,104 +957,51 @@ public sealed class EmotionEngine : ISchedulable
     }
 
     /// <summary>
-    /// MMI subset (SPECIAL2 / 0x1C) — common parallel integer ops used by games.
-    /// Operates on 128-bit GPR Lo/Hi as 2×64 or 4×32 lanes.
+    /// MMI (SPECIAL2 / 0x1C) — parallel integer SIMD ops over 128-bit GPRs.
+    ///
+    /// Real R5900 encoding is a TWO-field dispatch: bits[5:0] ("func") only
+    /// narrows to one of {8, 9, 0x28, 0x29} for the whole 128-bit arithmetic/
+    /// logic family; bits[10:6] ("sa") then selects the actual instruction
+    /// within that family. An earlier version of this method treated bits[5:0]
+    /// alone as the complete opcode, which happened to work for a couple of
+    /// entries by coincidence (PADDW) but was outright wrong for others —
+    /// PSUBW was listening on func=9, a slot the real ISA shares between
+    /// PMFHI/PMADDW/PCPYLD/PEXTUH/etc. depending on sa, so it would have
+    /// misfired on any of those instead of PSUBW.
+    ///
+    /// Verified against ps2dev-community opcode tables (github.com/wasaylor/
+    /// r5900-opcodes). Two (sa,func) slots had internally contradictory
+    /// documentation even in that source (PAND vs. a claimed "PEXTUW" both at
+    /// sa=18/func=9; a PEXEH-adjacent slot vs. "PEXTUB" both at sa=26/func=9) —
+    /// rather than guess, PAND is implemented at the contested slot (completes
+    /// the AND/OR/XOR/NOR family, which two independent, uncontested slots —
+    /// POR and PNOR — already confirm exists at neighboring sa values) and the
+    /// "U-extract" 32/8-bit variants some sources allege share it are left
+    /// unhandled (still telemetry-visible) rather than silently wrong.
     /// </summary>
     private void ExecuteMmi(uint opcode)
     {
-        uint function = opcode & 0x3F;
+        uint func = opcode & 0x3F;
         uint rs = (opcode >> 21) & 0x1F;
         uint rt = (opcode >> 16) & 0x1F;
         uint rd = (opcode >> 11) & 0x1F;
-        if (rd == 0) return;
+        uint sa = (opcode >> 6) & 0x1F;
 
-        var a = GetGpr(rs);
-        var b = GetGpr(rt);
-
-        switch (function)
+        if (func is 0x08 or 0x09 or 0x28 or 0x29)
         {
-            case 0x12: // PAND
-                SetGpr(rd, new Gpr128 { Lo = a.Lo & b.Lo, Hi = a.Hi & b.Hi });
-                break;
-            case 0x13: // POR
-                SetGpr(rd, new Gpr128 { Lo = a.Lo | b.Lo, Hi = a.Hi | b.Hi });
-                break;
-            case 0x14: // PXOR
-                SetGpr(rd, new Gpr128 { Lo = a.Lo ^ b.Lo, Hi = a.Hi ^ b.Hi });
-                break;
-            case 0x16: // PNOR
-                SetGpr(rd, new Gpr128 { Lo = ~(a.Lo | b.Lo), Hi = ~(a.Hi | b.Hi) });
-                break;
-            case 0x08: // PADDW — 4×32 add
+            ExecuteMmiFamily(sa, func, rs, rt, rd);
+            return;
+        }
+
+        if (rd == 0) return;
+        switch (func)
+        {
+            case 0x04: // PLZCW — leading zero/one run length per 32-bit lane (sign bit excluded)
             {
-                uint a0 = (uint)a.Lo, a1 = (uint)(a.Lo >> 32), a2 = (uint)a.Hi, a3 = (uint)(a.Hi >> 32);
-                uint b0 = (uint)b.Lo, b1 = (uint)(b.Lo >> 32), b2 = (uint)b.Hi, b3 = (uint)(b.Hi >> 32);
-                ulong lo = (uint)(a0 + b0) | ((ulong)(uint)(a1 + b1) << 32);
-                ulong hi = (uint)(a2 + b2) | ((ulong)(uint)(a3 + b3) << 32);
-                SetGpr(rd, new Gpr128 { Lo = lo, Hi = hi });
-                break;
-            }
-            case 0x09: // PSUBW
-            {
-                uint a0 = (uint)a.Lo, a1 = (uint)(a.Lo >> 32), a2 = (uint)a.Hi, a3 = (uint)(a.Hi >> 32);
-                uint b0 = (uint)b.Lo, b1 = (uint)(b.Lo >> 32), b2 = (uint)b.Hi, b3 = (uint)(b.Hi >> 32);
-                ulong lo = (uint)(a0 - b0) | ((ulong)(uint)(a1 - b1) << 32);
-                ulong hi = (uint)(a2 - b2) | ((ulong)(uint)(a3 - b3) << 32);
-                SetGpr(rd, new Gpr128 { Lo = lo, Hi = hi });
-                break;
-            }
-            case 0x28: // PEXTLW simplified — pack low 32s
-                SetGpr(rd, new Gpr128
-                {
-                    Lo = (a.Lo & 0xFFFFFFFF) | ((b.Lo & 0xFFFFFFFF) << 32),
-                    Hi = ((a.Lo >> 32) & 0xFFFFFFFF) | (((b.Lo >> 32) & 0xFFFFFFFF) << 32)
-                });
-                break;
-            case 0x29: // PEXTUW simplified
-                SetGpr(rd, new Gpr128
-                {
-                    Lo = (a.Hi & 0xFFFFFFFF) | ((b.Hi & 0xFFFFFFFF) << 32),
-                    Hi = ((a.Hi >> 32) & 0xFFFFFFFF) | (((b.Hi >> 32) & 0xFFFFFFFF) << 32)
-                });
-                break;
-            case 0x1B: // PCPYLD — copy lo/hi mixed
-                SetGpr(rd, new Gpr128 { Lo = b.Lo, Hi = a.Lo });
-                break;
-            case 0x1E: // PCPYUD
-                SetGpr(rd, new Gpr128 { Lo = b.Hi, Hi = a.Hi });
-                break;
-            case 0x18: // PADDB — 16×8 add (simplified on bytes of lo/hi)
-            {
-                ulong lo = 0, hi = 0;
-                for (int i = 0; i < 8; i++)
-                {
-                    int s = i * 8;
-                    lo |= (ulong)(byte)(((a.Lo >> s) & 0xFF) + ((b.Lo >> s) & 0xFF)) << s;
-                    hi |= (ulong)(byte)(((a.Hi >> s) & 0xFF) + ((b.Hi >> s) & 0xFF)) << s;
-                }
-                SetGpr(rd, new Gpr128 { Lo = lo, Hi = hi });
-                break;
-            }
-            case 0x0A: // PMAXW simplified as max of 32-bit lanes
-            {
-                uint a0 = (uint)a.Lo, a1 = (uint)(a.Lo >> 32), a2 = (uint)a.Hi, a3 = (uint)(a.Hi >> 32);
-                uint b0 = (uint)b.Lo, b1 = (uint)(b.Lo >> 32), b2 = (uint)b.Hi, b3 = (uint)(b.Hi >> 32);
-                uint r0 = (int)a0 > (int)b0 ? a0 : b0;
-                uint r1 = (int)a1 > (int)b1 ? a1 : b1;
-                uint r2 = (int)a2 > (int)b2 ? a2 : b2;
-                uint r3 = (int)a3 > (int)b3 ? a3 : b3;
-                SetGpr(rd, new Gpr128 { Lo = r0 | ((ulong)r1 << 32), Hi = r2 | ((ulong)r3 << 32) });
-                break;
-            }
-            case 0x0B: // PMINW
-            {
-                uint a0 = (uint)a.Lo, a1 = (uint)(a.Lo >> 32), a2 = (uint)a.Hi, a3 = (uint)(a.Hi >> 32);
-                uint b0 = (uint)b.Lo, b1 = (uint)(b.Lo >> 32), b2 = (uint)b.Hi, b3 = (uint)(b.Hi >> 32);
-                uint r0 = (int)a0 < (int)b0 ? a0 : b0;
-                uint r1 = (int)a1 < (int)b1 ? a1 : b1;
-                uint r2 = (int)a2 < (int)b2 ? a2 : b2;
-                uint r3 = (int)a3 < (int)b3 ? a3 : b3;
-                SetGpr(rd, new Gpr128 { Lo = r0 | ((ulong)r1 << 32), Hi = r2 | ((ulong)r3 << 32) });
+                var aw = ExtractW(GetGpr(rs));
+                var r = new uint[4];
+                for (int i = 0; i < 4; i++) r[i] = (uint)PlzcwLane(aw[i]);
+                SetGpr(rd, PackW(r));
                 break;
             }
             default:
@@ -1062,6 +1009,161 @@ public sealed class EmotionEngine : ISchedulable
                 break;
         }
     }
+
+    private void ExecuteMmiFamily(uint sa, uint func, uint rs, uint rt, uint rd)
+    {
+        if (rd == 0) return;
+        var a = GetGpr(rs);
+        var b = GetGpr(rt);
+        uint key = (sa << 6) | func;
+
+        switch (key)
+        {
+            // ---- word lanes (4x32) ----
+            case (0u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => unchecked(x + y)))); break; // PADDW
+            case (1u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => unchecked(x - y)))); break; // PSUBW
+            case (2u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => x == y ? 0xFFFFFFFFu : 0u))); break; // PCEQW
+            case (2u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x > (int)y ? 0xFFFFFFFFu : 0u))); break; // PCGTW
+            case (3u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x > (int)y ? x : y))); break; // PMAXW
+            case (3u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x < (int)y ? x : y))); break; // PMINW
+            case (16u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x + (int)y)))); break; // PADDSW
+            case (17u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x - (int)y)))); break; // PSUBSW
+            case (16u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => SatU32((long)x + y)))); break; // PADDUW
+            case (17u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => SatU32((long)x - y)))); break; // PSUBUW
+
+            // ---- halfword lanes (8x16) ----
+            case (4u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => unchecked((ushort)(x + y))))); break; // PADDH
+            case (5u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => unchecked((ushort)(x - y))))); break; // PSUBH
+            case (6u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)(x == y ? 0xFFFF : 0)))); break; // PCEQH
+            case (6u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)((short)x > (short)y ? 0xFFFF : 0)))); break; // PCGTH
+            case (7u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (short)x > (short)y ? x : y))); break; // PMAXH
+            case (7u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (short)x < (short)y ? x : y))); break; // PMINH
+            case (20u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x + (short)y)))); break; // PADDSH
+            case (21u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x - (short)y)))); break; // PSUBSH
+            case (20u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => SatU16(x + y)))); break; // PADDUH
+            case (21u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => SatU16(x - y)))); break; // PSUBUH
+
+            // ---- byte lanes (16x8) ----
+            case (8u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => unchecked((byte)(x + y))))); break; // PADDB
+            case (9u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => unchecked((byte)(x - y))))); break; // PSUBB
+            case (10u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)(x == y ? 0xFF : 0)))); break; // PCEQB
+            case (10u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)((sbyte)x > (sbyte)y ? 0xFF : 0)))); break; // PCGTB
+            case (24u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x + (sbyte)y)))); break; // PADDSB
+            case (25u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x - (sbyte)y)))); break; // PSUBSB
+            case (24u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => SatU8(x + y)))); break; // PADDUB
+            case (25u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => SatU8(x - y)))); break; // PSUBUB
+
+            // ---- logical (fixes the earlier func-only dispatch, which collided with other real slots) ----
+            case (18u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = a.Lo & b.Lo, Hi = a.Hi & b.Hi }); break; // PAND
+            case (18u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = a.Lo | b.Lo, Hi = a.Hi | b.Hi }); break; // POR
+            case (19u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = a.Lo ^ b.Lo, Hi = a.Hi ^ b.Hi }); break; // PXOR
+            case (19u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = ~(a.Lo | b.Lo), Hi = ~(a.Hi | b.Hi) }); break; // PNOR
+
+            // ---- extract-low interleave (high confidence; "U"/extract-high variants omitted, see note above) ----
+            case (18u << 6) | 0x08: // PEXTLW — interleave low 32-bit lanes: a0,b0,a1,b1
+            {
+                var aw = ExtractW(a); var bw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { aw[0], bw[0], aw[1], bw[1] }));
+                break;
+            }
+            case (22u << 6) | 0x08: // PEXTLH
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                SetGpr(rd, PackH(new[] { ah[0], bh[0], ah[1], bh[1], ah[2], bh[2], ah[3], bh[3] }));
+                break;
+            }
+            case (26u << 6) | 0x08: // PEXTLB
+            {
+                var ab = ExtractB(a); var bb = ExtractB(b);
+                var r = new byte[16];
+                for (int i = 0; i < 8; i++) { r[i * 2] = ab[i]; r[i * 2 + 1] = bb[i]; }
+                SetGpr(rd, PackB(r));
+                break;
+            }
+
+            // ---- 64-bit copy-mix ----
+            case (14u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = b.Lo, Hi = a.Lo }); break; // PCPYLD
+            case (14u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = b.Hi, Hi = a.Hi }); break; // PCPYUD
+
+            default:
+                _telemetry?.UnknownOpcode(CurrentCycle(), PC, key | 0x1C000000u | 0x80000000u);
+                break;
+        }
+    }
+
+    private static int PlzcwLane(uint v)
+    {
+        uint sign = (v >> 31) & 1;
+        int count = 0;
+        for (int b = 30; b >= 0; b--)
+        {
+            if (((v >> b) & 1) != sign) break;
+            count++;
+        }
+        return count;
+    }
+
+    private static uint[] ExtractW(Gpr128 v) => new[] { (uint)v.Lo, (uint)(v.Lo >> 32), (uint)v.Hi, (uint)(v.Hi >> 32) };
+    private static Gpr128 PackW(uint[] w) => new() { Lo = w[0] | ((ulong)w[1] << 32), Hi = w[2] | ((ulong)w[3] << 32) };
+
+    private static ushort[] ExtractH(Gpr128 v)
+    {
+        var h = new ushort[8];
+        for (int i = 0; i < 4; i++) h[i] = (ushort)(v.Lo >> (i * 16));
+        for (int i = 0; i < 4; i++) h[4 + i] = (ushort)(v.Hi >> (i * 16));
+        return h;
+    }
+    private static Gpr128 PackH(ushort[] h)
+    {
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 4; i++) lo |= (ulong)h[i] << (i * 16);
+        for (int i = 0; i < 4; i++) hi |= (ulong)h[4 + i] << (i * 16);
+        return new Gpr128 { Lo = lo, Hi = hi };
+    }
+
+    private static byte[] ExtractB(Gpr128 v)
+    {
+        var b = new byte[16];
+        for (int i = 0; i < 8; i++) b[i] = (byte)(v.Lo >> (i * 8));
+        for (int i = 0; i < 8; i++) b[8 + i] = (byte)(v.Hi >> (i * 8));
+        return b;
+    }
+    private static Gpr128 PackB(byte[] b)
+    {
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 8; i++) lo |= (ulong)b[i] << (i * 8);
+        for (int i = 0; i < 8; i++) hi |= (ulong)b[8 + i] << (i * 8);
+        return new Gpr128 { Lo = lo, Hi = hi };
+    }
+
+    private static uint[] WordOp(Gpr128 a, Gpr128 b, Func<uint, uint, uint> op)
+    {
+        var aw = ExtractW(a); var bw = ExtractW(b);
+        var r = new uint[4];
+        for (int i = 0; i < 4; i++) r[i] = op(aw[i], bw[i]);
+        return r;
+    }
+    private static ushort[] HalfOp(Gpr128 a, Gpr128 b, Func<ushort, ushort, ushort> op)
+    {
+        var ah = ExtractH(a); var bh = ExtractH(b);
+        var r = new ushort[8];
+        for (int i = 0; i < 8; i++) r[i] = op(ah[i], bh[i]);
+        return r;
+    }
+    private static byte[] ByteOp(Gpr128 a, Gpr128 b, Func<byte, byte, byte> op)
+    {
+        var ab = ExtractB(a); var bb = ExtractB(b);
+        var r = new byte[16];
+        for (int i = 0; i < 16; i++) r[i] = op(ab[i], bb[i]);
+        return r;
+    }
+
+    private static int SatS32(long v) => v > int.MaxValue ? int.MaxValue : v < int.MinValue ? int.MinValue : (int)v;
+    private static uint SatU32(long v) => v > uint.MaxValue ? uint.MaxValue : v < 0 ? 0u : (uint)v;
+    private static short SatS16(int v) => v > short.MaxValue ? short.MaxValue : v < short.MinValue ? short.MinValue : (short)v;
+    private static ushort SatU16(int v) => v > ushort.MaxValue ? ushort.MaxValue : v < 0 ? (ushort)0 : (ushort)v;
+    private static sbyte SatS8(int v) => v > sbyte.MaxValue ? sbyte.MaxValue : v < sbyte.MinValue ? sbyte.MinValue : (sbyte)v;
+    private static byte SatU8(int v) => v > byte.MaxValue ? byte.MaxValue : v < 0 ? (byte)0 : (byte)v;
 
     private void ExecuteLq(uint opcode)
     {

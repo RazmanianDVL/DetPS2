@@ -1026,11 +1026,18 @@ public static class SmokeTests
 
     public static void Ee_Mmi_PandPor()
     {
+        // Real R5900 MMI encoding is two-field: bits[5:0]=func narrows to the family
+        // (8/9/0x28/0x29), bits[10:6]=sa selects the actual op. PAND=sa18/func9,
+        // POR=sa18/func0x29 — NOT func=0x12/0x13 directly (that was the old, wrong
+        // single-field model this test used to assume).
+        static uint Mmi(uint rs, uint rt, uint rd, uint sa, uint func) =>
+            (0x1Cu << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | func;
+
         var sys = new Ps2System();
         sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFF0000FFFF0000UL, Hi = 0x0F0F0F0F0F0F0F0FUL });
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0x0000FFFF0000FFFFUL, Hi = 0xF0F0F0F0F0F0F0F0UL });
-        // MMI PAND: primary 0x1C, function 0x12, rs=4, rt=5, rd=6
-        uint pand = (0x1Cu << 26) | (4u << 21) | (5u << 16) | (6u << 11) | 0x12;
+
+        uint pand = Mmi(4, 5, 6, 18, 0x09);
         sys.Memory.Write32(0x1000, pand);
         sys.Memory.Write32(0x1004, 0); // nop
         sys.EE.PC = 0x1000;
@@ -1039,14 +1046,34 @@ public static class SmokeTests
         if (r.Lo != 0 || r.Hi != 0)
             throw new Exception($"PAND expected 0 got Lo={r.Lo:X} Hi={r.Hi:X}");
 
-        // POR
-        uint por = (0x1Cu << 26) | (4u << 21) | (5u << 16) | (7u << 11) | 0x13;
+        uint por = Mmi(4, 5, 7, 18, 0x29);
         sys.Memory.Write32(0x1008, por);
         sys.EE.PC = 0x1008;
         sys.EE.Step(1);
         var r2 = sys.EE.GetGpr(7);
         if (r2.Lo != 0xFFFFFFFFFFFFFFFFUL || r2.Hi != 0xFFFFFFFFFFFFFFFFUL)
             throw new Exception($"POR failed Lo={r2.Lo:X} Hi={r2.Hi:X}");
+
+        // PSUBW (sa=1,func=8) — this exact instruction used to be coded at the wrong
+        // slot (func=9, colliding with a totally different real instruction family).
+        sys.EE.SetGpr(8, new EmotionEngine.Gpr128 { Lo = 10, Hi = 0 });
+        sys.EE.SetGpr(9, new EmotionEngine.Gpr128 { Lo = 3, Hi = 0 });
+        uint psubw = Mmi(8, 9, 10, 1, 0x08);
+        sys.Memory.Write32(0x1010, psubw);
+        sys.EE.PC = 0x1010;
+        sys.EE.Step(1);
+        if ((uint)sys.EE.GetGpr(10).Lo != 7)
+            throw new Exception($"PSUBW expected 7 got {(uint)sys.EE.GetGpr(10).Lo}");
+
+        // PMAXH (sa=7,func=8) — exercises the halfword-lane path.
+        sys.EE.SetGpr(11, new EmotionEngine.Gpr128 { Lo = 0x0005000A, Hi = 0 });
+        sys.EE.SetGpr(12, new EmotionEngine.Gpr128 { Lo = 0x00090003, Hi = 0 });
+        uint pmaxh = Mmi(11, 12, 13, 7, 0x08);
+        sys.Memory.Write32(0x1014, pmaxh);
+        sys.EE.PC = 0x1014;
+        sys.EE.Step(1);
+        if ((uint)sys.EE.GetGpr(13).Lo != 0x0009000A)
+            throw new Exception($"PMAXH expected 0x0009000A got {(uint)sys.EE.GetGpr(13).Lo:X8}");
 
         Console.WriteLine("[Smoke] Ee_Mmi_PandPor OK");
     }
