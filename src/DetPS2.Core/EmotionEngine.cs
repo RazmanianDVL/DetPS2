@@ -1141,6 +1141,15 @@ public sealed class EmotionEngine : ISchedulable
             case 0x06: // CTC1
                 if (fs == 31) _fcr31 = (uint)GetGpr(ft).Lo;
                 break;
+            case 0x08: // BC1F/BC1T/BC1FL/BC1TL — FPU condition branch
+                return ExecuteBc1(opcode);
+            case 0x14: // W (word) format — source operand is an int stored in the FPR
+                if (func == 0x20) // CVT.S.W
+                {
+                    int iv = (int)BitConverter.SingleToUInt32Bits(_fpr[fs]);
+                    _fpr[fd] = DeterministicFloat.Canonicalize((float)iv);
+                }
+                break;
             case 0x10: // S (single)
                 switch (func)
                 {
@@ -1152,13 +1161,63 @@ public sealed class EmotionEngine : ISchedulable
                     case 0x07: _fpr[fd] = DeterministicFloat.Canonicalize(-_fpr[fs]); break; // NEG.S
                     case 0x05: _fpr[fd] = DeterministicFloat.Canonicalize(MathF.Abs(_fpr[fs])); break; // ABS.S
                     case 0x04: _fpr[fd] = DeterministicFloat.Canonicalize(MathF.Sqrt(MathF.Max(0, _fpr[fs]))); break; // SQRT.S
-                    default: break;
+                    case 0x24: // CVT.W.S — result is an int, stored raw (not canonicalized as float)
+                        {
+                            float f = _fpr[fs];
+                            int iv = float.IsNaN(f) ? int.MaxValue
+                                : f >= 2147483647f ? int.MaxValue
+                                : f <= -2147483648f ? int.MinValue
+                                : (int)f; // C# cast truncates toward zero, matching the common MIPS RM default
+                            _fpr[fd] = BitConverter.UInt32BitsToSingle((uint)iv);
+                        }
+                        break;
+                    default:
+                        // C.cond.S comparisons (func 0x30-0x3F): low 3 bits select the IEEE
+                        // predicate; bit 3 (quiet vs signaling NaN exception) is irrelevant
+                        // here since we don't model FPU exception trapping.
+                        if ((func & 0x30) == 0x30)
+                            ExecuteCondS(func, _fpr[fs], _fpr[ft]);
+                        break;
                 }
                 break;
             default:
                 break;
         }
         return false;
+    }
+
+    private bool ExecuteBc1(uint opcode)
+    {
+        uint rt = (opcode >> 16) & 0x1F;
+        bool tf = (rt & 1) != 0;     // 0=BC1F, 1=BC1T
+        bool likely = (rt & 2) != 0; // BC1FL/BC1TL nullify delay slot if not taken
+        short off = (short)(opcode & 0xFFFF);
+        bool cond = (_fcr31 & (1u << 23)) != 0;
+        if (likely) _branchWasLikely = true;
+        if (cond == tf)
+        {
+            _delaySlotTarget = PC + 4 + (ulong)((int)off << 2);
+            return true;
+        }
+        return false;
+    }
+
+    private void ExecuteCondS(uint func, float a, float b)
+    {
+        bool unordered = float.IsNaN(a) || float.IsNaN(b);
+        bool cond = (func & 0x7) switch
+        {
+            0x0 => false,                            // F
+            0x1 => unordered,                         // UN
+            0x2 => !unordered && a == b,               // EQ
+            0x3 => unordered || a == b,                // UEQ
+            0x4 => !unordered && a < b,                 // OLT
+            0x5 => unordered || a < b,                  // ULT
+            0x6 => !unordered && a <= b,                // OLE
+            0x7 => unordered || a <= b,                 // ULE
+            _ => false
+        };
+        if (cond) _fcr31 |= 1u << 23; else _fcr31 &= ~(1u << 23);
     }
 
     private void HandleSyscall(uint opcode)

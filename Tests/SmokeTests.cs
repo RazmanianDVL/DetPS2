@@ -617,6 +617,8 @@ public static class SmokeTests
             Cop0_Eret_RestoresPc();
             Irq_TakesVector_ThenEret();
             Cop0_CountAdvances();
+            Cop1_CompareAndConvert();
+            Cop1_Bc1t_SkipsDelayPlusTwo();
             LdSd_RoundTrip();
 
             // Phase 13
@@ -1316,6 +1318,88 @@ public static class SmokeTests
         if (sys.EE.COP0_Count < before + 50)
             throw new Exception($"Count did not advance enough: {before} -> {sys.EE.COP0_Count}");
         Console.WriteLine($"[Smoke] Cop0_CountAdvances OK ({before} -> {sys.EE.COP0_Count})");
+    }
+
+    public static void Cop1_CompareAndConvert()
+    {
+        var sys = new Ps2System();
+        var ee = sys.EE;
+
+        static uint Mtc1(int rt, int fs) => (0x11u << 26) | (0x04u << 21) | ((uint)rt << 16) | ((uint)fs << 11);
+        static uint Mfc1(int rt, int fs) => (0x11u << 26) | (0x00u << 21) | ((uint)rt << 16) | ((uint)fs << 11);
+        static uint Cfc1(int rt, int fs) => (0x11u << 26) | (0x02u << 21) | ((uint)rt << 16) | ((uint)fs << 11);
+        static uint CCondS(int fs, int ft, uint func) => (0x11u << 26) | (0x10u << 21) | ((uint)ft << 16) | ((uint)fs << 11) | func;
+        static uint CvtWS(int fs, int fd) => (0x11u << 26) | (0x10u << 21) | ((uint)fs << 11) | ((uint)fd << 6) | 0x24u;
+        static uint CvtSW(int fs, int fd) => (0x11u << 26) | (0x14u << 21) | ((uint)fs << 11) | ((uint)fd << 6) | 0x20u;
+
+        ee.SetGpr(8, new EmotionEngine.Gpr128 { Lo = BitConverter.SingleToUInt32Bits(1.0f) });
+        ee.SetGpr(9, new EmotionEngine.Gpr128 { Lo = BitConverter.SingleToUInt32Bits(2.0f) });
+        ee.SetGpr(10, new EmotionEngine.Gpr128 { Lo = BitConverter.SingleToUInt32Bits(3.7f) });
+        ee.SetGpr(11, new EmotionEngine.Gpr128 { Lo = 5 }); // raw int 5, for CVT.S.W
+
+        uint addr = 0xA000;
+        void W(uint w) { sys.Memory.Write32(addr, w); addr += 4; }
+
+        W(Mtc1(8, 0));          // f0 = 1.0
+        W(Mtc1(9, 1));          // f1 = 2.0
+        W(CCondS(0, 1, 0x3C));  // C.LT.S f0,f1 -> true (1.0 < 2.0)
+        W(Cfc1(4, 31));         // $a0 = FCR31
+
+        W(Mtc1(10, 2));         // f2 = 3.7
+        W(CvtWS(2, 3));         // f3 = (int)3.7 = 3
+        W(Mfc1(5, 3));          // $a1 = 3
+
+        W(Mtc1(11, 4));         // f4 = raw int 5
+        W(CvtSW(4, 5));         // f5 = 5.0f
+        W(Mfc1(6, 5));          // $a2 = bits of 5.0f
+
+        ee.PC = 0xA000;
+        ee.Step(10);
+
+        if ((ee.GetGpr(4).Lo & (1u << 23)) == 0)
+            throw new Exception("C.LT.S did not set FCR31 condition bit");
+        if ((int)ee.GetGpr(5).Lo != 3)
+            throw new Exception($"CVT.W.S wrong: {(int)ee.GetGpr(5).Lo}");
+        float f5 = BitConverter.UInt32BitsToSingle((uint)ee.GetGpr(6).Lo);
+        if (MathF.Abs(f5 - 5.0f) > 0.001f)
+            throw new Exception($"CVT.S.W wrong: {f5}");
+
+        Console.WriteLine("[Smoke] Cop1_CompareAndConvert OK");
+    }
+
+    public static void Cop1_Bc1t_SkipsDelayPlusTwo()
+    {
+        var sys = new Ps2System();
+        var ee = sys.EE;
+
+        static uint Mtc1(int rt, int fs) => (0x11u << 26) | (0x04u << 21) | ((uint)rt << 16) | ((uint)fs << 11);
+        static uint CCondS(int fs, int ft, uint func) => (0x11u << 26) | (0x10u << 21) | ((uint)ft << 16) | ((uint)fs << 11) | func;
+        static uint Bc1T(int offset) => (0x11u << 26) | (0x08u << 21) | (1u << 16) | ((uint)offset & 0xFFFF);
+        static uint Addiu(int rt, int rs, int imm) => (0x09u << 26) | ((uint)rs << 21) | ((uint)rt << 16) | ((uint)imm & 0xFFFF);
+
+        ee.SetGpr(8, new EmotionEngine.Gpr128 { Lo = BitConverter.SingleToUInt32Bits(1.0f) });
+        ee.SetGpr(9, new EmotionEngine.Gpr128 { Lo = BitConverter.SingleToUInt32Bits(2.0f) });
+
+        uint addr = 0xB000;
+        void W(uint w) { sys.Memory.Write32(addr, w); addr += 4; }
+
+        W(Mtc1(8, 0));           // 0xB000 f0 = 1.0
+        W(Mtc1(9, 1));           // 0xB004 f1 = 2.0
+        W(CCondS(0, 1, 0x3C));   // 0xB008 C.LT.S f0,f1 -> true
+        W(Bc1T(3));              // 0xB00C branch to 0xB00C+4+3*4 = 0xB01C
+        W(Addiu(20, 0, 999));    // 0xB010 delay slot — always runs
+        W(Addiu(21, 0, 111));    // 0xB014 must be skipped
+        W(Addiu(21, 0, 222));    // 0xB018 must be skipped
+        W(Addiu(21, 0, 333));    // 0xB01C landing point
+
+        ee.PC = 0xB000;
+        ee.Step(6);
+
+        if (ee.PC != 0xB020) throw new Exception($"BC1T landed at wrong PC 0x{ee.PC:X}");
+        if (ee.GetGpr(20).Lo != 999) throw new Exception("delay slot did not execute");
+        if (ee.GetGpr(21).Lo != 333) throw new Exception($"BC1T did not skip correctly, $t5={ee.GetGpr(21).Lo}");
+
+        Console.WriteLine("[Smoke] Cop1_Bc1t_SkipsDelayPlusTwo OK");
     }
 
     public static void LdSd_RoundTrip()
