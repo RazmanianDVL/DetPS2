@@ -20,6 +20,7 @@ public sealed class SonyKernelHle
     private bool _stubsInstalled;
     private const uint StubBase = 0x00081000;
     private int _stubSlots;
+    private readonly RealSifRpc _realRpc = new();
 
     public ulong Handled { get; private set; }
     public ulong Unknown { get; private set; }
@@ -53,6 +54,7 @@ public sealed class SonyKernelHle
         _recentSyscallIdx = 0;
         Array.Clear(RecentSyscalls);
         _syscallHistogram.Clear();
+        _realRpc.Reset();
     }
 
     public bool TryHandle(EmotionEngine ee, uint num, out long result)
@@ -477,11 +479,19 @@ public sealed class SonyKernelHle
     /// Perform SifSetDma transfers. Layout (SifDmaTransfer_t, 16 bytes each):
     /// +0 src, +4 dest, +8 size, +12 attr. Attr bit0: 0=EE→IOP, 1=IOP→EE (common SDK).
     /// After EE→IOP, run lightweight SIFCMD HLE so retail boot gets IOP replies.
+    /// Two passes: raw copies first, then SIFCMD interpretation — a real RPC call's
+    /// argument buffer is often sent as a second descriptor in the SAME batch as the
+    /// call packet, so it must already be in place before we read it back.
     /// </summary>
     private long PerformSifSetDma(uint listAddr, uint count)
     {
         if (listAddr == 0 || count == 0) return 0;
         if (count > 32) count = 32; // safety
+
+        Span<uint> srcs = stackalloc uint[32];
+        Span<uint> sizes = stackalloc uint[32];
+        Span<bool> eeToIop = stackalloc bool[32];
+
         for (uint i = 0; i < count; i++)
         {
             uint baseAddr = listAddr + i * 16;
@@ -489,18 +499,22 @@ public sealed class SonyKernelHle
             uint dest = _system.Memory.Read32(baseAddr + 4);
             uint size = _system.Memory.Read32(baseAddr + 8);
             uint attr = _system.Memory.Read32(baseAddr + 12);
+            srcs[(int)i] = src;
+            sizes[(int)i] = size;
+            eeToIop[(int)i] = (attr & 1) == 0;
             if (size == 0 || size > 0x200000) continue;
-            bool iopToEe = (attr & 1) != 0;
-            if (iopToEe)
+            if ((attr & 1) != 0)
                 _system.Sif.Sif0IopToEe(src, dest, size);
             else
-            {
                 _system.Sif.Sif1EeToIop(src, dest, size);
-                // EE→IOP: attempt SIFCMD / RPC HLE on the packet
-                if (size >= 16)
-                    HleSifCmdFromEe(src, size);
-            }
         }
+
+        for (uint i = 0; i < count; i++)
+        {
+            if (!eeToIop[(int)i] || sizes[(int)i] < 16 || sizes[(int)i] > 0x200000) continue;
+            HleSifCmdFromEe(srcs[(int)i], sizes[(int)i]);
+        }
+
         _system.Sif.Step(64);
         // Mark SMFLAG that IOP saw the transfer (retail polls this)
         _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | 0x10000u);
@@ -515,6 +529,15 @@ public sealed class SonyKernelHle
     /// </summary>
     private void HleSifCmdFromEe(uint eePacket, uint size)
     {
+        // Real RPC bind/call (cid 0x80000009/0x8000000A) — the protocol retail-compiled
+        // sifrpc.c actually speaks. Handled fully (response written + semaphore signaled),
+        // so nothing else in this method should run for it.
+        if (size >= 16 && _realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, eePacket))
+        {
+            _system.Intc.Raise(Intc.InterruptSource.Sif);
+            return;
+        }
+
         uint word0 = _system.Memory.Read32(eePacket);
         uint dest = _system.Memory.Read32(eePacket + 4);
         uint cid = _system.Memory.Read32(eePacket + 8);
