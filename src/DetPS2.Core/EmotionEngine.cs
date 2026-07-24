@@ -324,6 +324,19 @@ public sealed class EmotionEngine : ISchedulable
             if (_debugger != null && _debugger.ShouldHaltBefore(PC, cyc))
                 break;
 
+            // Real MIPS traps a misaligned instruction fetch (AdEL) rather than reading garbage.
+            // Without this, a wild jump (corrupted register/stack) silently free-runs through
+            // whatever bytes happen to sit at an unaligned PC — often unmapped MMIO returning 0
+            // (NOP), which just carries the runaway further instead of failing fast where the
+            // actual bug is visible.
+            if ((PC & 0x3) != 0)
+            {
+                _cop0BadVAddr = (uint)PC;
+                EnterException(GetExceptionVector(general: true), causeExcCode: 4); // AdEL
+                executed++;
+                continue;
+            }
+
             if (_cacheModelEnabled)
                 NoteICache(PC);
 
@@ -447,6 +460,8 @@ public sealed class EmotionEngine : ISchedulable
             case 0x10: return ExecuteCop0(opcode);
             case 0x11: return ExecuteCop1(opcode);
             case 0x12: return ExecuteCop2(opcode);
+            case 0x1A: ExecuteLdl(opcode); break; // LDL simplified (see LWL/SDL note)
+            case 0x1B: ExecuteLdr(opcode); break; // LDR simplified
             case 0x1C: ExecuteMmi(opcode); break;
             case 0x1E: ExecuteLq(opcode); break; // LQ
             case 0x1F: ExecuteSq(opcode); break; // SQ
@@ -1245,11 +1260,14 @@ public sealed class EmotionEngine : ISchedulable
         SetGpr(rt, new Gpr128 { Lo = w, Hi = 0 });
     }
 
-    // Unaligned load/store simplified: behave like aligned LW/SW for now (homebrew rarely relies on LWL edge cases in tests)
+    // Unaligned load/store simplified: behave like aligned LW/SW/LD/SD for now
+    // (LDL/LDR added after real-boot telemetry showed R5900-compiled retail code hits them)
     private void ExecuteLwl(uint opcode) => ExecuteLw(opcode);
     private void ExecuteLwr(uint opcode) => ExecuteLw(opcode);
     private void ExecuteSwl(uint opcode) => ExecuteSw(opcode);
     private void ExecuteSwr(uint opcode) => ExecuteSw(opcode);
     private void ExecuteSdl(uint opcode) => ExecuteSd(opcode);
     private void ExecuteSdr(uint opcode) => ExecuteSd(opcode);
+    private void ExecuteLdl(uint opcode) => ExecuteLd(opcode);
+    private void ExecuteLdr(uint opcode) => ExecuteLd(opcode);
 }

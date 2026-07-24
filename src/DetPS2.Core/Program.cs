@@ -60,6 +60,58 @@ if (args.Length > 0 && args[0].Equals("dump-spine", StringComparison.OrdinalIgno
     Environment.Exit(spine.SpineInfraOk ? 0 : 1);
 }
 
+if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalIgnoreCase))
+{
+    // Generic PC-level trace for whichever title(s) are in user-media.json — no hardcoded
+    // title/path assumptions, so it stays useful across the whole compat campaign.
+    Console.WriteLine(VersionInfo.Banner);
+    UserMediaConfig cfg = args.Length > 1 && !args[1].StartsWith("--")
+        ? UserMediaConfig.Load(args[1])
+        : UserMediaConfig.LoadDefault();
+    ulong cycles = 5_000_000;
+    foreach (var a in args)
+        if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) cycles = c;
+
+    if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
+    foreach (var title in cfg.Titles)
+    {
+        if (!title.Exists) { Console.WriteLine($"[{title.Id}] missing: {title.Path}"); continue; }
+        var traceSys = new Ps2System();
+        traceSys.Telemetry.Reset();
+        traceSys.LoadBios(cfg.BiosPath);
+        string msg;
+        if ((title.Kind ?? "iso").ToLowerInvariant() == "elf")
+        {
+            var load = traceSys.LoadElf(File.ReadAllBytes(title.Path));
+            msg = $"ELF entry=0x{load.Entry:X8}";
+        }
+        else
+        {
+            msg = traceSys.BootDiscFile(title.Path).Message;
+        }
+        Console.WriteLine($"[{title.Id}] {msg}");
+        traceSys.RunFor(cycles);
+        Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
+        Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
+        foreach (var ev in traceSys.Telemetry.SnapshotEvents())
+            Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-16} key=0x{ev.Key:X8} {ev.Detail}");
+
+        foreach (var a in args)
+        {
+            if (!a.StartsWith("--dump=")) continue;
+            var parts = a.Substring(7).Split(':');
+            uint start = Convert.ToUInt32(parts[0], 16);
+            uint len = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 0x40u;
+            Console.WriteLine($"  dump 0x{start:X8}..0x{start + len:X8}:");
+            for (uint addr = start; addr < start + len; addr += 4)
+                Console.WriteLine($"    {addr:X8}: {traceSys.Memory.Read32(addr):X8}");
+            Console.WriteLine($"  GPRs: v0={traceSys.EE.GetGpr(2).Lo:X} v1={traceSys.EE.GetGpr(3).Lo:X} a0={traceSys.EE.GetGpr(4).Lo:X} a1={traceSys.EE.GetGpr(5).Lo:X} " +
+                $"t0={traceSys.EE.GetGpr(8).Lo:X} t1={traceSys.EE.GetGpr(9).Lo:X} s0={traceSys.EE.GetGpr(16).Lo:X} s1={traceSys.EE.GetGpr(17).Lo:X} ra={traceSys.EE.GetGpr(31).Lo:X}");
+        }
+    }
+    Environment.Exit(0);
+}
+
 if (args.Length > 0 && args[0].Equals("play-path", StringComparison.OrdinalIgnoreCase))
 {
     Console.WriteLine(VersionInfo.Banner);
