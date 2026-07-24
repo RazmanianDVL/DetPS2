@@ -508,7 +508,8 @@ public static class SmokeTests
     public static void Dmac_IrqOnComplete()
     {
         var sys = new Ps2System();
-        sys.Dmac.WriteRegister(0x1000E030, 1u << (int)Dmac.Channel.GIF); // D_MASK
+        // D_STAT (0x1000E010): writing a 1 to bit (16+ch) XOR-toggles that channel's IRQ mask on real HW.
+        sys.Dmac.WriteRegister(0x1000E010, 1u << (16 + (int)Dmac.Channel.GIF));
         // minimal empty GIF transfer still completes
         sys.Dmac.Start(Dmac.Channel.GIF, 0x3000, 1, 0);
         for (int i = 0; i < 8; i++) sys.Dmac.Step(8);
@@ -1323,10 +1324,10 @@ public static class SmokeTests
         sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x1122334455667788UL });
         // SD r4, 0(r5) — need base. r5 = 0x9000
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0x9000 });
-        // SD: primary 0x37, rs=5, rt=4, off=0
-        uint sd = (0x37u << 26) | (5u << 21) | (4u << 16);
-        // LD r6, 0(r5)
-        uint ld = (0x27u << 26) | (5u << 21) | (6u << 16);
+        // SD: primary 0x3F, rs=5, rt=4, off=0
+        uint sd = (0x3Fu << 26) | (5u << 21) | (4u << 16);
+        // LD r6, 0(r5): primary 0x37
+        uint ld = (0x37u << 26) | (5u << 21) | (6u << 16);
         sys.Memory.Write32(0xA000, sd);
         sys.Memory.Write32(0xA004, ld);
         sys.EE.PC = 0xA000;
@@ -1446,7 +1447,9 @@ public static class SmokeTests
         int sid = k.CreateSema(1, 2);
         if (sid < 1) throw new Exception("sema");
         if (k.WaitSema(sid) != 0) throw new Exception("wait should succeed with count 1");
-        if (k.WaitSema(sid) != -1) throw new Exception("empty sema should fail non-block");
+        // WaitSema returns -2 (not -1) when it blocks — a distinct sentinel telling the
+        // caller to switch threads, per KernelHle.WaitSema's contract.
+        if (k.WaitSema(sid) != -2) throw new Exception("empty sema should block (-2)");
         if (k.SignalSema(sid) < 1) throw new Exception("signal");
         if (k.DeleteSema(sid) != 0) throw new Exception("delete sema");
 
@@ -1625,9 +1628,9 @@ public static class SmokeTests
         if (sys.Cdvd.ReadPending) throw new Exception("still pending");
         if (sys.Cdvd.Completions < 1) throw new Exception("completions");
         if (sys.Cdvd.SectorsRead < 1) throw new Exception("sectors");
-        // IPU bit used as CDVD complete stand-in
-        if (!sys.Intc.IsRaised(Intc.InterruptSource.Ipu))
-            throw new Exception($"expected IPU/CDVD IRQ, Stat=0x{sys.Intc.Stat:X}");
+        // SIF bit used as CDVD complete stand-in (matches Cdvd.cs / Sif.cs / Iop.cs convention)
+        if (!sys.Intc.IsRaised(Intc.InterruptSource.Sif))
+            throw new Exception($"expected SIF/CDVD IRQ, Stat=0x{sys.Intc.Stat:X}");
         Console.WriteLine($"[Smoke] Cdvd_AsyncRead_CompletesWithIrq OK (stat=0x{sys.Intc.Stat:X})");
     }
 
@@ -1664,6 +1667,9 @@ public static class SmokeTests
         sys.SetAudioSink(sink);
         // Key-on / enable
         sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1A0, 1);
+        // No real ADPCM voice data is loaded here, so opt into the test tone explicitly —
+        // UseSimpleToneFallback defaults to false on retail boots (silence until real voices play).
+        sys.Spu2.UseSimpleToneFallback = true;
         // Enough cycles for several samples (6144 cycles/sample)
         sys.RunFor(6144 * 20);
         if (sys.Spu2.SamplesGenerated < 20)
@@ -1678,6 +1684,7 @@ public static class SmokeTests
         var sink2 = new CapturingAudioSink();
         sys2.SetAudioSink(sink2);
         sys2.Spu2.WriteRegister(Spu2.PhysBase + 0x1A0, 1);
+        sys2.Spu2.UseSimpleToneFallback = true;
         sys2.RunFor(6144 * 20);
         if (sink2.SamplesReceived != sink.SamplesReceived)
             throw new Exception("audio sample count nondeterministic");
@@ -1878,8 +1885,8 @@ public static class SmokeTests
     {
         var sys = new Ps2System();
         sys.Telemetry.Reset();
-        // Primary 0x3F is reserved / unhandled (0x33 PREF is a silent nop since Phase 41)
-        uint bad = 0x3Fu << 26;
+        // Primary 0x3C is reserved / unhandled (0x3F is now SD, 0x33 PREF is a silent nop since Phase 41)
+        uint bad = 0x3Cu << 26;
         sys.Memory.Write32(0x00100000, bad);
         sys.Memory.Write32(0x00100004, 0);
         sys.EE.PC = 0x00100000;
@@ -1906,8 +1913,9 @@ public static class SmokeTests
     {
         var sys = new Ps2System();
         sys.Telemetry.Reset();
-        // Unmapped MMIO gap (timers end 0x10002000, DMAC starts 0x10008000)
-        uint addr = 0x10004000;
+        // Unmapped MMIO gap (GIF control ends 0x100030FF, VIF status stub starts 0x10003800;
+        // 0x10004000 is no longer a gap — VIF0 FIFO writes were wired up there since)
+        uint addr = 0x10003200;
         _ = sys.Memory.Read32(addr);
         sys.Memory.Write32(addr, 0x12345678);
         if (sys.Telemetry.CountOf(Telemetry.Kind.UnknownMmioRead) < 1)
