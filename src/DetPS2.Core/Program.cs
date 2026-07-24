@@ -93,6 +93,13 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         traceSys.RunFor(cycles);
         Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
+        if (traceSys.Hle.Sony != null)
+        {
+            Console.WriteLine("  top syscalls:");
+            foreach (var kv in traceSys.Hle.Sony.SyscallHistogram)
+                if (kv.Value > 100)
+                    Console.WriteLine($"    0x{kv.Key:X2} x{kv.Value}");
+        }
         foreach (var ev in traceSys.Telemetry.SnapshotEvents())
             Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-16} key=0x{ev.Key:X8} {ev.Detail}");
 

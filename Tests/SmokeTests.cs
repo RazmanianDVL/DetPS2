@@ -617,6 +617,7 @@ public static class SmokeTests
             Cop0_Eret_RestoresPc();
             Irq_TakesVector_ThenEret();
             Cop0_CountAdvances();
+            Regimm_BltzalSetsRaAndBranches();
             Cop1_CompareAndConvert();
             Cop1_Bc1t_SkipsDelayPlusTwo();
             LdSd_RoundTrip();
@@ -1318,6 +1319,32 @@ public static class SmokeTests
         if (sys.EE.COP0_Count < before + 50)
             throw new Exception($"Count did not advance enough: {before} -> {sys.EE.COP0_Count}");
         Console.WriteLine($"[Smoke] Cop0_CountAdvances OK ({before} -> {sys.EE.COP0_Count})");
+    }
+
+    public static void Regimm_BltzalSetsRaAndBranches()
+    {
+        var sys = new Ps2System();
+        var ee = sys.EE;
+        static uint Addiu(int rt, int rs, int imm) => (0x09u << 26) | ((uint)rs << 21) | ((uint)rt << 16) | ((uint)imm & 0xFFFF);
+        static uint Bltzal(int rs, int offset) => (0x01u << 26) | ((uint)rs << 21) | (0x10u << 16) | ((uint)offset & 0xFFFF);
+
+        ee.SetGpr(8, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)(long)-5) }); // $t0 < 0
+
+        uint addr = 0xC000;
+        void W(uint w) { sys.Memory.Write32(addr, w); addr += 4; }
+        W(Bltzal(8, 2));            // 0xC000 BLTZAL $t0, +2 -> target 0xC000+4+2*4=0xC00C
+        W(Addiu(20, 0, 999));       // 0xC004 delay slot — always runs
+        W(Addiu(21, 0, 111));       // 0xC008 must be skipped (branch taken since $t0<0)
+        W(Addiu(21, 0, 333));       // 0xC00C landing point
+
+        ee.PC = 0xC000;
+        ee.Step(3); // BLTZAL(+delay slot combined)=2, then land instruction=1
+
+        if (ee.GetGpr(31).Lo != 0xC008) throw new Exception($"BLTZAL did not set $ra correctly: 0x{ee.GetGpr(31).Lo:X}");
+        if (ee.GetGpr(20).Lo != 999) throw new Exception("delay slot did not execute");
+        if (ee.GetGpr(21).Lo != 333) throw new Exception($"BLTZAL did not branch/skip correctly, $t5={ee.GetGpr(21).Lo}");
+
+        Console.WriteLine("[Smoke] Regimm_BltzalSetsRaAndBranches OK");
     }
 
     public static void Cop1_CompareAndConvert()

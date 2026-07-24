@@ -657,8 +657,24 @@ public sealed class EmotionEngine : ISchedulable
         short offset = (short)(opcode & 0xFFFF);
         ulong target = PC + 4 + (ulong)((int)offset << 2);
 
-        if (rt == 0 && (long)GetGpr(rs).Lo < 0) { _delaySlotTarget = target; return true; }
-        if (rt == 1 && (long)GetGpr(rs).Lo >= 0) { _delaySlotTarget = target; return true; }
+        // rt selects: BLTZ=0x00 BGEZ=0x01 BLTZL=0x02 BGEZL=0x03
+        //             BLTZAL=0x10 BGEZAL=0x11 BLTZALL=0x12 BGEZALL=0x13
+        // bit0=GE(vs LT), bit1=likely, bit4=link. Only these 8 rt values are real
+        // REGIMM branches (0x08-0x0E are trap-on-condition, not branches — not handled).
+        if (rt <= 0x03 || (rt >= 0x10 && rt <= 0x13))
+        {
+            bool ge = (rt & 1) != 0;
+            bool likely = (rt & 2) != 0;
+            bool link = (rt & 0x10) != 0;
+            bool cond = ge ? (long)GetGpr(rs).Lo >= 0 : (long)GetGpr(rs).Lo < 0;
+
+            // $ra is set unconditionally on real MIPS, whether or not the branch is taken.
+            if (link) SetGpr(31, new Gpr128 { Lo = PC + 8 });
+            if (likely) _branchWasLikely = true;
+
+            if (cond) { _delaySlotTarget = target; return true; }
+            return false;
+        }
         return false;
     }
 
