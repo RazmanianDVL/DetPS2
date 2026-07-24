@@ -105,6 +105,25 @@ public sealed class Spu2 : ISchedulable
         uint idx = off / 4;
         if (idx < _regs.Length)
             _regs[idx] = value;
+
+        // Per-voice core block: each of the 24 voices owns a 16-byte window
+        // (VOLL/VOLR/PITCH/ADSR1/ADSR2/ENVX/VOLXL/VOLXR at +0x0.._0xE), the
+        // same layout PS1 SPU established and PS2 SPU2 kept for voices 0-23.
+        if (off < 0x180)
+        {
+            int voice = (int)(off / 0x10);
+            uint reg = off % 0x10;
+            var v = _voices[voice];
+            switch (reg)
+            {
+                case 0x0: v.VolumeL = SignExtend16(value); break;
+                case 0x2: v.VolumeR = SignExtend16(value); break;
+                case 0x4: v.Pitch = (int)(value & 0x3FFF); break;
+                case 0x6: ApplyAdsr1(v, value); break;
+                case 0x8: ApplyAdsr2(v, value); break;
+            }
+        }
+
         if (off == 0x1A0)
             Enabled = (value & 1) != 0;
         if (off is >= 0x1A8 and <= 0x1B0)
@@ -120,6 +139,29 @@ public sealed class Spu2 : ISchedulable
             Enabled = true;
             KeyOnMask(value, start: 16);
         }
+    }
+
+    private static int SignExtend16(uint v) => (short)(v & 0xFFFF);
+
+    // ADSR1: bits 0-3 sustain-rate step size (unused here), 4-9 decay shift,
+    // 10-14 attack shift, 15 attack mode. ADSR2: 0-4 release shift, 5 release mode,
+    // 6-9 sustain shift bits, 10-14 sustain level index. Rates are simplified to a
+    // linear step-per-sample scale (see TickAdsr) rather than PSX's exact
+    // exponential/pseudo-exponential curve — real curve shape is future accuracy work.
+    private static void ApplyAdsr1(Voice v, uint value)
+    {
+        int decayShift = (int)(value >> 4) & 0xF;
+        int attackShift = (int)(value >> 10) & 0x1F;
+        v.AttackRate = Math.Max(1, 0x20 - attackShift);
+        v.DecayRate = Math.Max(1, 0x20 - decayShift);
+    }
+
+    private static void ApplyAdsr2(Voice v, uint value)
+    {
+        int releaseShift = (int)value & 0x1F;
+        int sustainLevelIdx = (int)(value >> 10) & 0x1F;
+        v.ReleaseRate = Math.Max(1, 0x20 - releaseShift);
+        v.SustainLevel = (sustainLevelIdx + 1) * (0x7FFF / 32);
     }
 
     private void KeyOnMask(uint mask, int start)
