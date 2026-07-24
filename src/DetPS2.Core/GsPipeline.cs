@@ -3,45 +3,47 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// GS Pipeline - Foundational structure for the Graphics Synthesizer rendering pipeline.
-/// 
-/// This class provides the high-level architecture for how graphics data flows:
-/// GIF → GS Registers → Primitive Assembly → Rasterization → Framebuffer
-/// 
-/// Current state: Foundation only.
-/// Heavy implementation (real primitive assembly, rasterization logic, texture sampling, etc.)
-/// should be built on top of this structure.
+/// GS Pipeline orchestrator (Phase 7).
+/// GIF paths → GS → PCRTC present.
 /// </summary>
 public sealed class GsPipeline
 {
     private readonly Gs _gs;
-    private readonly GsRegisters _registers;
+    private readonly Gif _gif;
+    private readonly Pcrtc _pcrtc;
 
-    public GsPipeline(Gs gs, GsRegisters registers)
+    public Gs Gs => _gs;
+    public Gif Gif => _gif;
+    public Pcrtc Pcrtc => _pcrtc;
+
+    public long FramesPresented { get; private set; }
+
+    public GsPipeline(Gs gs, Gif gif, Pcrtc pcrtc)
     {
         _gs = gs ?? throw new ArgumentNullException(nameof(gs));
-        _registers = registers ?? throw new ArgumentNullException(nameof(registers));
+        _gif = gif ?? throw new ArgumentNullException(nameof(gif));
+        _pcrtc = pcrtc ?? throw new ArgumentNullException(nameof(pcrtc));
     }
 
-    public void Reset() { }
+    public void Reset() => FramesPresented = 0;
 
-    /// <summary>
-    /// Main entry point when GIF sends a command list to the GS.
-    /// This is where register writes and primitive data would be processed.
-    /// </summary>
-    public void ProcessCommandList(uint address, uint qwc)
+    public void ProcessPath3(uint address, uint qwc) => _gif.ReceivePath3Data(address, qwc);
+    public void ProcessPath2(uint address, uint qwc) => _gif.ReceivePath2Data(address, qwc);
+    public void ProcessPath1(uint address, uint qwc) => _gif.ReceivePath1Data(address, qwc);
+
+    /// <summary>Screen-space triangle via GS (no GIF).</summary>
+    public void DrawImmediateTriangle(int x0, int y0, int x1, int y1, int x2, int y2, uint color)
     {
-        // Foundation hook - actual processing logic goes here in future implementations
-        _gs.ReceiveCommandList(address, qwc);
+        _gs.WriteGsRegister(0x00, 0x03);
+        _gs.DrawScreenTriangle(x0, y0, x1, y1, x2, y2, color);
     }
 
-    /// <summary>
-    /// Called when a new primitive type is set.
-    /// </summary>
-    public void OnPrimChanged(uint prim)
+    public void Present(string? ppmPath = null)
     {
-        // Foundation for tracking current primitive state
+        if (ppmPath != null)
+            _pcrtc.Present(ppmPath);
+        else
+            _pcrtc.PresentFrame();
+        FramesPresented++;
     }
-
-    public void Step(ulong cycles) { }
 }

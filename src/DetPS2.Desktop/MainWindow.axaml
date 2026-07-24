@@ -1,160 +1,136 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="DetPS2.Desktop.MainWindow"
-        Title="DetPS2Sharp — Deterministic PS2 Emulator"
-        Width="1100" Height="780"
-        MinWidth="900" MinHeight="650"
+        Title="DetPS2Sharp — Game Library"
+        Width="1100" Height="720"
+        MinWidth="800" MinHeight="520"
         DragDrop.AllowDrop="True">
 
-    <Grid ColumnDefinitions="*, Auto" RowDefinitions="Auto,Auto,*,Auto,Auto">
-        <!-- Menu Bar -->
-        <Menu Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="0" Background="{DynamicResource MenuBackground}">
+    <Grid RowDefinitions="Auto,Auto,*,Auto,Auto">
+        <!-- Menu -->
+        <Menu Grid.Row="0">
             <MenuItem Header="_File">
-                <MenuItem Header="Load _BIOS..." Click="OnLoadBiosClick" HotKey="Ctrl+B" />
-                <MenuItem Header="Load _ELF..." Click="OnLoadElfClick" HotKey="Ctrl+E" />
+                <MenuItem Header="_Settings…" Click="OnSettingsClick" />
                 <Separator />
-                <MenuItem Header="_Save State..." Click="OnSaveStateClick" HotKey="Ctrl+S" />
-                <MenuItem Header="_Load State..." Click="OnLoadStateClick" HotKey="Ctrl+L" />
+                <MenuItem Header="Load _ISO…" Click="OnLoadIsoClick" HotKey="Ctrl+I" />
+                <MenuItem Header="Load _ELF…" Click="OnLoadElfClick" HotKey="Ctrl+E" />
                 <Separator />
+                <MenuItem Header="_Save State…" Click="OnSaveStateClick" HotKey="Ctrl+S" />
+                <MenuItem Header="_Load State…" Click="OnLoadStateClick" HotKey="Ctrl+L" />
+                <Separator />
+                <MenuItem Header="Open log folder" Click="OnOpenLogFolderClick" />
                 <MenuItem Header="E_xit" Click="OnExitClick" HotKey="Alt+F4" />
             </MenuItem>
 
             <MenuItem Header="_Emulation">
-                <MenuItem Header="_Run" Click="OnRunClick" HotKey="F5" />
+                <MenuItem Header="_Boot selected" Click="OnBootSelectedClick" HotKey="F2" />
+                <MenuItem Header="_Run / Resume" Click="OnRunClick" HotKey="F5" />
                 <MenuItem Header="_Pause" Click="OnPauseClick" HotKey="F6" />
-                <MenuItem Header="_Reset" Click="OnResetClick" HotKey="F9" />
+                <MenuItem Header="_Stop &amp; close game window" Click="OnStopEmulationClick" HotKey="F9" />
                 <Separator />
-                <MenuItem Header="Step _1M cycles" Click="OnStepClick" HotKey="F10" />
-                <MenuItem Header="Render _Test Scene" Click="OnTestDrawClick" HotKey="F11" />
+                <MenuItem Header="Show _game window" Click="OnShowGameWindowClick" />
             </MenuItem>
 
-            <MenuItem Header="_View">
-                <MenuItem Header="Zoom _In" Click="OnZoomInClick" HotKey="Ctrl+Plus" />
-                <MenuItem Header="Zoom _Out" Click="OnZoomOutClick" HotKey="Ctrl+Minus" />
-                <MenuItem Header="Reset _Zoom" Click="OnResetZoomClick" HotKey="Ctrl+0" />
-                <Separator />
-                <MenuItem Header="Reset _Framebuffer View" Click="OnResetFramebufferViewClick" />
+            <MenuItem Header="_Library">
+                <MenuItem Header="Set library _path…" Click="OnSetLibraryPathClick" HotKey="Ctrl+O" />
+                <MenuItem Header="_Rescan" Click="OnRescanLibraryClick" HotKey="F4" />
             </MenuItem>
 
             <MenuItem Header="_Help">
-                <MenuItem Header="_About DetPS2Sharp..." Click="OnAboutClick" />
+                <MenuItem Header="_About…" Click="OnAboutClick" />
             </MenuItem>
         </Menu>
 
-        <!-- Toolbar -->
-        <StackPanel Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="8,4">
-            <Button Content="Load BIOS" Click="OnLoadBiosClick" ToolTip.Tip="Ctrl+B" />
-            <Button Content="Load ELF" Click="OnLoadElfClick" ToolTip.Tip="Ctrl+E" />
+        <!-- Toolbar: library + run only -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="12,8">
+            <Button Content="📁 Set library path…" Click="OnSetLibraryPathClick" Padding="12,8" />
+            <Button Content="🔄 Rescan" Click="OnRescanLibraryClick" Padding="12,8" />
             <Separator Width="1" Margin="4,2" />
-            <Button Content="▶ Run" Click="OnRunClick" ToolTip.Tip="F5" />
-            <Button Content="⏸ Pause" Click="OnPauseClick" ToolTip.Tip="F6" />
-            <Button Content="⟲ Reset" Click="OnResetClick" ToolTip.Tip="F9" />
-            <Button Content="Step" Click="OnStepClick" ToolTip.Tip="F10" />
+            <Button Content="▶ Boot &amp; play" Click="OnBootSelectedClick" Padding="14,8" FontWeight="SemiBold" />
+            <Button Content="⏸ Pause" Click="OnPauseClick" Padding="12,8" />
+            <Button Content="⏹ Stop" Click="OnStopEmulationClick" Padding="12,8" />
             <Separator Width="1" Margin="4,2" />
-            <Button Content="🎨 Test Scene" Click="OnTestDrawClick" ToolTip.Tip="F11" />
-            <Button Content="💾 Save State" Click="OnSaveStateClick" ToolTip.Tip="Ctrl+S" />
-            <Button Content="📂 Load State" Click="OnLoadStateClick" ToolTip.Tip="Ctrl+L" />
-
-            <Separator Width="1" Margin="6,2" />
-
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="4">
-                <TextBlock Text="Speed:" VerticalAlignment="Center" Margin="0,0,4,0" />
-                <ComboBox x:Name="SpeedCombo" Width="110" SelectedIndex="1" SelectionChanged="OnSpeedChanged">
-                    <ComboBoxItem Content="Slow" />
-                    <ComboBoxItem Content="Normal" />
-                    <ComboBoxItem Content="Fast" />
-                    <ComboBoxItem Content="Unlimited" />
-                </ComboBox>
-            </StackPanel>
-
-            <Separator Width="1" Margin="6,2" />
-
-            <!-- Zoom Controls -->
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="2">
-                <Button Content="➖" Click="OnZoomOutClick" ToolTip.Tip="Zoom Out" Width="32" />
-                <Button Content="➕" Click="OnZoomInClick" ToolTip.Tip="Zoom In" Width="32" />
-                <Button Content="⟲" Click="OnResetZoomClick" ToolTip.Tip="Reset Zoom" Width="32" />
-                <TextBlock x:Name="ZoomLevelText" Text="100%" VerticalAlignment="Center" Margin="6,0,0,0" Width="55" />
-            </StackPanel>
+            <Button Content="⚙ Settings…" Click="OnSettingsClick" Padding="12,8" />
+            <Button Content="📋 Logs" Click="OnOpenLogFolderClick" Padding="12,8" />
         </StackPanel>
 
-        <!-- Main Display Area with Mouse Wheel Zoom -->
-        <Border Grid.Column="0" Grid.Row="2" x:Name="DisplayBorder"
-                BorderBrush="#444" BorderThickness="1" Margin="8" Background="#0a0a12"
-                CornerRadius="4"
-                DragDrop.AllowDrop="True"
-                PointerWheelChanged="OnFramebufferWheelChanged">
-            <Viewbox x:Name="FramebufferViewbox" Stretch="Uniform">
-                <Image x:Name="FramebufferImage"
-                       Stretch="None"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Center"
-                       RenderTransformOrigin="0.5,0.5" />
-            </Viewbox>
-        </Border>
-
-        <!-- Right Sidebar -->
-        <Border Grid.Column="1" Grid.Row="2" Width="240" Margin="0,8,8,8"
-                Background="#1a1a22" BorderBrush="#444" BorderThickness="1" CornerRadius="4">
-            <StackPanel Margin="12" Spacing="10">
-                <TextBlock Text="SYSTEM STATUS" FontWeight="Bold" FontSize="14" Foreground="#aaa" />
-                <Separator />
-
-                <StackPanel Spacing="4">
-                    <TextBlock Text="Status" FontSize="12" Foreground="#888" />
-                    <TextBlock x:Name="SidebarStatus" Text="Ready" FontSize="15" FontWeight="SemiBold" />
-                </StackPanel>
-
-                <StackPanel Spacing="4">
-                    <TextBlock Text="Master Cycles" FontSize="12" Foreground="#888" />
-                    <TextBlock x:Name="SidebarCycles" Text="0" FontSize="15" FontWeight="SemiBold" />
-                </StackPanel>
-
-                <StackPanel Spacing="4">
-                    <TextBlock Text="Emulation Speed" FontSize="12" Foreground="#888" />
-                    <TextBlock x:Name="SidebarSpeed" Text="Normal" FontSize="15" FontWeight="SemiBold" />
-                </StackPanel>
-
-                <StackPanel Spacing="4">
-                    <TextBlock Text="Updates / sec" FontSize="12" Foreground="#888" />
-                    <TextBlock x:Name="SidebarFps" Text="~60" FontSize="15" FontWeight="SemiBold" />
-                </StackPanel>
-
-                <Separator Margin="0,8" />
-
-                <TextBlock Text="Drag files here or use toolbar" 
-                           FontSize="11" Foreground="#666" TextWrapping="Wrap" />
-            </StackPanel>
-        </Border>
-
-        <!-- Bottom Log Panel -->
-        <Border Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="3" 
-                Background="#111" BorderBrush="#333" BorderThickness="1" Margin="8,0,8,4" CornerRadius="4">
-            <Grid RowDefinitions="Auto,*">
-                <TextBlock Text="ACTION LOG" FontSize="11" Foreground="#888" Margin="8,4,8,2" />
-                <ScrollViewer Grid.Row="1" Margin="4" VerticalScrollBarVisibility="Auto">
-                    <TextBox x:Name="LogTextBox"
-                             IsReadOnly="True"
-                             AcceptsReturn="True"
-                             TextWrapping="Wrap"
+        <!-- Main: library + status side by side (no game framebuffer blotch) -->
+        <Grid Grid.Row="2" ColumnDefinitions="*,280" Margin="8,0">
+            <Border Grid.Column="0" Background="#14141c" BorderBrush="#333" BorderThickness="1" CornerRadius="6" Margin="0,0,6,0"
+                    DragDrop.AllowDrop="True" x:Name="LibraryDropZone">
+                <DockPanel Margin="12">
+                    <StackPanel DockPanel.Dock="Top" Spacing="6">
+                        <TextBlock Text="GAME LIBRARY" FontWeight="Bold" FontSize="15" Foreground="#bbb" />
+                        <TextBlock x:Name="LibraryFolderText" Text="No library path set"
+                                   FontSize="12" Foreground="#8c8" TextWrapping="Wrap" />
+                        <TextBlock Text="Local or network (UNC) path. Double-click a title to boot — video opens in a separate window."
+                                   FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+                        <Separator />
+                    </StackPanel>
+                    <ListBox x:Name="LibraryList"
+                             DoubleTapped="OnLibraryDoubleTapped"
                              Background="Transparent"
                              BorderThickness="0"
-                             Foreground="#ccc"
-                             FontFamily="Consolas, Menlo, monospace"
-                             FontSize="12" />
+                             FontSize="13">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Spacing="2" Margin="4,8">
+                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="14" Foreground="#eee" />
+                                    <TextBlock Text="{Binding Path}" FontSize="11" Foreground="#666" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+            </Border>
+
+            <Border Grid.Column="1" Background="#1a1a22" BorderBrush="#333" BorderThickness="1" CornerRadius="6" Margin="6,0,0,0">
+                <StackPanel Margin="14" Spacing="10">
+                    <TextBlock Text="STATUS" FontWeight="Bold" FontSize="14" Foreground="#aaa" />
+                    <Separator />
+                    <TextBlock Text="State" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="SidebarStatus" Text="Ready" FontSize="16" FontWeight="SemiBold" />
+                    <TextBlock Text="Master cycles" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="SidebarCycles" Text="0" FontSize="15" FontFamily="Consolas,monospace" />
+                    <TextBlock Text="EE PC" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="SidebarPc" Text="—" FontSize="14" FontFamily="Consolas,monospace" />
+                    <TextBlock Text="Last boot" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="SidebarBoot" Text="—" FontSize="12" TextWrapping="Wrap" Foreground="#ccc" />
+                    <TextBlock Text="BIOS" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="LibraryBiosText" Text="not set (Settings)" FontSize="12" TextWrapping="Wrap" Foreground="#ccc" />
+                    <TextBlock Text="Log file" FontSize="11" Foreground="#888" />
+                    <TextBlock x:Name="SidebarLogPath" Text="—" FontSize="10" TextWrapping="Wrap" Foreground="#6a6" />
+                    <Separator />
+                    <TextBlock Text="Gameplay opens in its own window when you Boot or Run."
+                               FontSize="11" Foreground="#777" TextWrapping="Wrap" />
+                    <TextBlock Text="BIOS, controllers, speed, and advanced options are under File → Settings."
+                               FontSize="11" Foreground="#777" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- Log -->
+        <Border Grid.Row="3" Background="#0e0e12" BorderBrush="#333" BorderThickness="1" Margin="8,8,8,4" CornerRadius="4">
+            <Grid RowDefinitions="Auto,*">
+                <DockPanel Margin="8,4">
+                    <TextBlock Text="LOG" FontSize="11" Foreground="#888" VerticalAlignment="Center" />
+                    <TextBlock x:Name="LogHintText" DockPanel.Dock="Right" FontSize="10" Foreground="#555"
+                               Text="Also written to TEMP\DetPS2\" />
+                </DockPanel>
+                <ScrollViewer Grid.Row="1" Height="140" Margin="4">
+                    <TextBox x:Name="LogTextBox" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
+                             Background="Transparent" BorderThickness="0" Foreground="#ccc"
+                             FontFamily="Consolas,monospace" FontSize="12" />
                 </ScrollViewer>
             </Grid>
         </Border>
 
-        <!-- Status Bar -->
-        <Border Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="4" 
-                Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" Padding="8,4">
-            <StackPanel Orientation="Horizontal" Spacing="16">
-                <TextBlock x:Name="StatusText" Text="Ready" VerticalAlignment="Center" />
-                <TextBlock x:Name="CyclesText" Text="Master Cycles: 0" VerticalAlignment="Center" />
-                <TextBlock x:Name="FpsText" Text="~60 updates/sec" VerticalAlignment="Center" />
+        <Border Grid.Row="4" Padding="10,4" Background="#1a1a22">
+            <StackPanel Orientation="Horizontal" Spacing="20">
+                <TextBlock x:Name="StatusText" Text="Ready" />
+                <TextBlock x:Name="CyclesText" Text="Cycles: 0" />
+                <TextBlock x:Name="FpsText" Text="" />
             </StackPanel>
         </Border>
     </Grid>
-
 </Window>

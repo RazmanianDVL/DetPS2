@@ -3,24 +3,33 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP - Phase 3/4 with expanded instruction set.
-/// 
-/// [6.2] Added basic SIF interrupt generation on mailbox write.
-/// This provides the first real IOP → EE synchronization point.
+/// IOP R3000A interpreter (Phase 8).
+/// Delay slots, LO/HI, expanded loads/stores, minimal COP0, deterministic stepping.
 /// </summary>
-public sealed class Iop
+public sealed class Iop : ISchedulable
 {
     public Intc Intc { get; }
 
     public uint PC { get; set; } = 0xBFC00000;
     private readonly uint[] _gprs = new uint[32];
 
+    public uint LO { get; private set; }
+    public uint HI { get; private set; }
+
+    public uint Cop0Status { get; set; }
+    public uint Cop0Cause { get; set; }
+    public uint Cop0Epc { get; set; }
+    public uint Cop0BadVAddr { get; set; }
+
     public uint SifMbxFromEE { get; private set; }
     public uint SifMbxToEE { get; private set; }
 
     public bool Running { get; private set; } = true;
+    public ulong InstructionsExecuted { get; private set; }
 
     private readonly SystemMemory _memory;
+    private bool _branchPending;
+    private uint _branchTarget;
 
     public Iop(Intc intc, SystemMemory memory)
     {
@@ -33,199 +42,334 @@ public sealed class Iop
     {
         PC = 0xBFC00000;
         Array.Clear(_gprs);
+        LO = HI = 0;
+        Cop0Status = 0;
+        Cop0Cause = 0;
+        Cop0Epc = 0;
+        Cop0BadVAddr = 0;
         SifMbxFromEE = 0;
         SifMbxToEE = 0;
         Running = true;
+        InstructionsExecuted = 0;
+        _branchPending = false;
+        _branchTarget = 0;
     }
 
     public uint GetGpr(int index) => _gprs[index & 0x1F];
-    public void SetGpr(int index, uint value) { if ((index & 0x1F) != 0) _gprs[index & 0x1F] = value; }
+    public void SetGpr(int index, uint value)
+    {
+        if ((index & 0x1F) != 0) _gprs[index & 0x1F] = value;
+    }
 
     public void WriteSifMailboxFromEE(uint value)
     {
         SifMbxFromEE = value;
         SifMbxToEE = ~value;
-
-        // [6.2] Basic SIF interrupt generation
-        // This signals the EE that new SIF data/command is available.
-        Intc?.Raise(Intc.InterruptSource.Sif);
+        Intc.Raise(Intc.InterruptSource.Sif);
     }
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
 
     public int Step(ulong maxCycles)
     {
-        if (!Running) return 0;
+        if (!Running || maxCycles == 0) return 0;
 
-        ulong executed = 0;
-        for (ulong i = 0; i < maxCycles && Running; i++)
+        int executed = 0;
+        while ((ulong)executed < maxCycles && Running)
         {
             uint opcode = _memory.Read32(PC);
-            ExecuteInstruction(opcode);
-            PC += 4;
+            bool tookBranch = ExecuteInstruction(opcode);
             executed++;
+            InstructionsExecuted++;
+
+            if (tookBranch)
+            {
+                // Delay slot
+                uint delay = _memory.Read32(PC + 4);
+                ExecuteInstruction(delay);
+                executed++;
+                InstructionsExecuted++;
+                PC = _branchTarget;
+                _branchPending = false;
+            }
+            else
+            {
+                PC += 4;
+            }
         }
-        return (int)executed;
+        return executed;
     }
 
-    private void ExecuteInstruction(uint opcode)
+    private bool ExecuteInstruction(uint opcode)
     {
         uint primary = (opcode >> 26) & 0x3F;
 
-        switch (primary)
+        return primary switch
         {
-            case 0x00: ExecuteSpecial(opcode); break;
-            case 0x01: ExecuteRegimm(opcode); break;
-            case 0x02: ExecuteJ(opcode); break;
-            case 0x03: ExecuteJal(opcode); break;
-            case 0x04: ExecuteBeq(opcode); break;
-            case 0x05: ExecuteBne(opcode); break;
-            case 0x08: ExecuteAddi(opcode); break;
-            case 0x09: ExecuteAddiu(opcode); break;
-            case 0x0C: ExecuteOri(opcode); break;
-            case 0x0F: ExecuteLui(opcode); break;
-            case 0x23: ExecuteLw(opcode); break;
-            case 0x2B: ExecuteSw(opcode); break;
-            default: break;
-        }
+            0x00 => ExecuteSpecial(opcode),
+            0x01 => ExecuteRegimm(opcode),
+            0x02 => BranchTo(((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2)),
+            0x03 => Jal(opcode),
+            0x04 => BranchIf(_gprs[Rs(opcode)] == _gprs[Rt(opcode)], opcode),
+            0x05 => BranchIf(_gprs[Rs(opcode)] != _gprs[Rt(opcode)], opcode),
+            0x06 => BranchIf((int)_gprs[Rs(opcode)] <= 0, opcode), // BLEZ
+            0x07 => BranchIf((int)_gprs[Rs(opcode)] > 0, opcode),  // BGTZ
+            0x08 => ImmArith(opcode, (a, i) => a + (uint)i),       // ADDI
+            0x09 => ImmArith(opcode, (a, i) => a + (uint)i),       // ADDIU
+            0x0A => ImmArith(opcode, (a, i) => (uint)((int)a < i ? 1 : 0)), // SLTI
+            0x0B => ImmArith(opcode, (a, i) => a < (uint)i ? 1u : 0u),      // SLTIU
+            0x0C => ImmLogic(opcode, (a, i) => a & i),             // ANDI
+            0x0D => ImmLogic(opcode, (a, i) => a | i),             // ORI
+            0x0E => ImmLogic(opcode, (a, i) => a ^ i),             // XORI
+            0x0F => Lui(opcode),
+            0x10 => ExecuteCop0(opcode),
+            0x20 => LoadStore8(opcode, store: false, signed: true),   // LB
+            0x21 => LoadStore16(opcode, store: false, signed: true),  // LH
+            0x23 => LoadWord(opcode),                                 // LW
+            0x24 => LoadStore8(opcode, store: false, signed: false),  // LBU
+            0x25 => LoadStore16(opcode, store: false, signed: false), // LHU
+            0x28 => LoadStore8(opcode, store: true, signed: false),   // SB
+            0x29 => LoadStore16(opcode, store: true, signed: false),  // SH
+            0x2B => StoreWord(opcode),                                // SW
+            _ => false
+        };
     }
 
-    private void ExecuteSpecial(uint opcode)
-    {
-        uint function = opcode & 0x3F;
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        uint rd = (opcode >> 11) & 0x1F;
-        uint sa = (opcode >> 6) & 0x1F;
+    private static uint Rs(uint op) => (op >> 21) & 0x1F;
+    private static uint Rt(uint op) => (op >> 16) & 0x1F;
+    private static uint Rd(uint op) => (op >> 11) & 0x1F;
+    private static uint Sa(uint op) => (op >> 6) & 0x1F;
+    private static short Imm16(uint op) => (short)(op & 0xFFFF);
+    private static ushort ImmU16(uint op) => (ushort)(op & 0xFFFF);
 
-        switch (function)
+    private bool BranchTo(uint target)
+    {
+        _branchTarget = target;
+        return true;
+    }
+
+    private bool BranchIf(bool cond, uint opcode)
+    {
+        if (!cond) return false;
+        int off = Imm16(opcode) << 2;
+        return BranchTo((uint)(PC + 4 + off));
+    }
+
+    private bool Jal(uint opcode)
+    {
+        _gprs[31] = PC + 8;
+        return BranchTo(((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2));
+    }
+
+    private bool ImmArith(uint opcode, Func<uint, int, uint> fn)
+    {
+        uint rt = Rt(opcode);
+        if (rt != 0) _gprs[rt] = fn(_gprs[Rs(opcode)], Imm16(opcode));
+        return false;
+    }
+
+    private bool ImmLogic(uint opcode, Func<uint, uint, uint> fn)
+    {
+        uint rt = Rt(opcode);
+        if (rt != 0) _gprs[rt] = fn(_gprs[Rs(opcode)], ImmU16(opcode));
+        return false;
+    }
+
+    private bool Lui(uint opcode)
+    {
+        uint rt = Rt(opcode);
+        if (rt != 0) _gprs[rt] = (uint)ImmU16(opcode) << 16;
+        return false;
+    }
+
+    private bool ExecuteSpecial(uint opcode)
+    {
+        uint fn = opcode & 0x3F;
+        uint rs = Rs(opcode), rt = Rt(opcode), rd = Rd(opcode);
+        int sa = (int)Sa(opcode);
+
+        switch (fn)
         {
-            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break;
-            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break;
-            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break;
-            case 0x08: PC = _gprs[rs] - 4; break;
-            case 0x18: ExecuteMult(rs, rt); break;
-            case 0x19: ExecuteMultu(rs, rt); break;
+            case 0x00: if (rd != 0) _gprs[rd] = _gprs[rt] << sa; break; // SLL
+            case 0x02: if (rd != 0) _gprs[rd] = _gprs[rt] >> sa; break; // SRL
+            case 0x03: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> sa); break; // SRA
+            case 0x04: if (rd != 0) _gprs[rd] = _gprs[rt] << (int)(_gprs[rs] & 0x1F); break; // SLLV
+            case 0x06: if (rd != 0) _gprs[rd] = _gprs[rt] >> (int)(_gprs[rs] & 0x1F); break; // SRLV
+            case 0x07: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> (int)(_gprs[rs] & 0x1F)); break; // SRAV
+            case 0x08: return BranchTo(_gprs[rs]); // JR
+            case 0x09: // JALR
+                uint ret = PC + 8;
+                uint target = _gprs[rs];
+                if (rd != 0) _gprs[rd] = ret;
+                return BranchTo(target);
+            case 0x0C: // SYSCALL — halt for tests / HLE hook
+                Cop0Cause |= 1u << 8;
+                Running = false;
+                break;
+            case 0x0D: // BREAK
+                Running = false;
+                break;
+            case 0x10: if (rd != 0) _gprs[rd] = HI; break; // MFHI
+            case 0x11: HI = _gprs[rs]; break; // MTHI
+            case 0x12: if (rd != 0) _gprs[rd] = LO; break; // MFLO
+            case 0x13: LO = _gprs[rs]; break; // MTLO
+            case 0x18: // MULT
+            {
+                long r = (long)(int)_gprs[rs] * (int)_gprs[rt];
+                LO = (uint)r;
+                HI = (uint)(r >> 32);
+                break;
+            }
+            case 0x19: // MULTU
+            {
+                ulong r = (ulong)_gprs[rs] * _gprs[rt];
+                LO = (uint)r;
+                HI = (uint)(r >> 32);
+                break;
+            }
+            case 0x1A: // DIV
+                if (_gprs[rt] != 0)
+                {
+                    LO = (uint)((int)_gprs[rs] / (int)_gprs[rt]);
+                    HI = (uint)((int)_gprs[rs] % (int)_gprs[rt]);
+                }
+                break;
+            case 0x1B: // DIVU
+                if (_gprs[rt] != 0)
+                {
+                    LO = _gprs[rs] / _gprs[rt];
+                    HI = _gprs[rs] % _gprs[rt];
+                }
+                break;
             case 0x20:
             case 0x21: if (rd != 0) _gprs[rd] = _gprs[rs] + _gprs[rt]; break;
+            case 0x22:
             case 0x23: if (rd != 0) _gprs[rd] = _gprs[rs] - _gprs[rt]; break;
             case 0x24: if (rd != 0) _gprs[rd] = _gprs[rs] & _gprs[rt]; break;
             case 0x25: if (rd != 0) _gprs[rd] = _gprs[rs] | _gprs[rt]; break;
             case 0x26: if (rd != 0) _gprs[rd] = _gprs[rs] ^ _gprs[rt]; break;
-            case 0x2A: if (rd != 0) _gprs[rd] = ((int)_gprs[rs] < (int)_gprs[rt]) ? 1u : 0; break;
-            case 0x2B: if (rd != 0) _gprs[rd] = (_gprs[rs] < _gprs[rt]) ? 1u : 0; break;
+            case 0x27: if (rd != 0) _gprs[rd] = ~(_gprs[rs] | _gprs[rt]); break; // NOR
+            case 0x2A: if (rd != 0) _gprs[rd] = (int)_gprs[rs] < (int)_gprs[rt] ? 1u : 0u; break;
+            case 0x2B: if (rd != 0) _gprs[rd] = _gprs[rs] < _gprs[rt] ? 1u : 0u; break;
         }
+        return false;
     }
 
-    private void ExecuteMult(int rs, int rt)
+    private bool ExecuteRegimm(uint opcode)
     {
-        long result = (long)(int)_gprs[rs] * (int)_gprs[rt];
-        _gprs[0] = (uint)(result & 0xFFFFFFFF);
-    }
-
-    private void ExecuteMultu(int rs, int rt)
-    {
-        ulong result = (ulong)_gprs[rs] * _gprs[rt];
-        _gprs[0] = (uint)(result & 0xFFFFFFFF);
-    }
-
-    private void ExecuteRegimm(uint opcode)
-    {
-        uint rt = (opcode >> 16) & 0x1F;
-        int val = (int)_gprs[(opcode >> 21) & 0x1F];
-        short offset = (short)(opcode & 0xFFFF);
-
-        bool take = (rt == 0 && val < 0) || (rt == 1 && val >= 0);
-        if (take)
+        uint rt = Rt(opcode);
+        int val = (int)_gprs[Rs(opcode)];
+        bool take = rt switch
         {
-            PC += (uint)((int)offset << 2);
-            PC -= 4;
-        }
+            0x00 => val < 0,  // BLTZ
+            0x01 => val >= 0, // BGEZ
+            0x10 => val < 0,  // BLTZAL
+            0x11 => val >= 0, // BGEZAL
+            _ => false
+        };
+        if ((rt == 0x10 || rt == 0x11) && take)
+            _gprs[31] = PC + 8;
+        return take && BranchIf(true, opcode);
     }
 
-    private void ExecuteJ(uint opcode)
+    private bool ExecuteCop0(uint opcode)
     {
-        uint target = opcode & 0x03FFFFFF;
-        PC = (PC & 0xF0000000) | (target << 2);
-        PC -= 4;
-    }
-
-    private void ExecuteJal(uint opcode)
-    {
-        _gprs[31] = PC + 8;
-        uint target = opcode & 0x03FFFFFF;
-        PC = (PC & 0xF0000000) | (target << 2);
-        PC -= 4;
-    }
-
-    private void ExecuteBeq(uint opcode)
-    {
-        if (_gprs[(opcode >> 21) & 0x1F] == _gprs[(opcode >> 16) & 0x1F])
+        uint rs = Rs(opcode);
+        uint rt = Rt(opcode);
+        uint rd = Rd(opcode);
+        switch (rs)
         {
-            short offset = (short)(opcode & 0xFFFF);
-            PC += (uint)((int)offset << 2);
-            PC -= 4;
+            case 0x00: // MFC0
+                if (rt != 0) _gprs[rt] = ReadCop0(rd);
+                break;
+            case 0x04: // MTC0
+                WriteCop0(rd, _gprs[rt]);
+                break;
+            case 0x10: // RFE-ish — clear EXL in status
+                Cop0Status &= ~0x2u;
+                break;
         }
+        return false;
     }
 
-    private void ExecuteBne(uint opcode)
+    private uint ReadCop0(uint reg) => reg switch
     {
-        if (_gprs[(opcode >> 21) & 0x1F] != _gprs[(opcode >> 16) & 0x1F])
+        8 => Cop0BadVAddr,
+        12 => Cop0Status,
+        13 => Cop0Cause,
+        14 => Cop0Epc,
+        _ => 0
+    };
+
+    private void WriteCop0(uint reg, uint value)
+    {
+        switch (reg)
         {
-            short offset = (short)(opcode & 0xFFFF);
-            PC += (uint)((int)offset << 2);
-            PC -= 4;
+            case 12: Cop0Status = value; break;
+            case 13: Cop0Cause = value; break;
+            case 14: Cop0Epc = value; break;
         }
     }
 
-    private void ExecuteAddi(uint opcode)
-    {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
-        if (rt != 0) _gprs[rt] = _gprs[rs] + (uint)imm;
-    }
+    private uint EffectiveAddress(uint opcode) => _gprs[Rs(opcode)] + (uint)Imm16(opcode);
 
-    private void ExecuteAddiu(uint opcode)
+    private bool LoadWord(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short imm = (short)(opcode & 0xFFFF);
-        if (rt != 0) _gprs[rt] = _gprs[rs] + (uint)imm;
-    }
-
-    private void ExecuteOri(uint opcode)
-    {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
-        if (rt != 0) _gprs[rt] = _gprs[rs] | imm;
-    }
-
-    private void ExecuteLui(uint opcode)
-    {
-        uint rt = (opcode >> 16) & 0x1F;
-        ushort imm = (ushort)(opcode & 0xFFFF);
-        if (rt != 0) _gprs[rt] = (uint)imm << 16;
-    }
-
-    private void ExecuteLw(uint opcode)
-    {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        uint addr = _gprs[rs] + (uint)offset;
+        uint rt = Rt(opcode);
+        uint addr = EffectiveAddress(opcode);
         if (rt != 0) _gprs[rt] = _memory.Read32(addr);
+        return false;
     }
 
-    private void ExecuteSw(uint opcode)
+    private bool StoreWord(uint opcode)
     {
-        uint rs = (opcode >> 21) & 0x1F;
-        uint rt = (opcode >> 16) & 0x1F;
-        short offset = (short)(opcode & 0xFFFF);
-        uint addr = _gprs[rs] + (uint)offset;
-        _memory.Write32(addr, _gprs[rt]);
+        _memory.Write32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
+        return false;
+    }
+
+    private bool LoadStore8(uint opcode, bool store, bool signed)
+    {
+        uint addr = EffectiveAddress(opcode);
+        uint rt = Rt(opcode);
+        if (store)
+        {
+            _memory.Write8(addr, (byte)_gprs[rt]);
+        }
+        else if (rt != 0)
+        {
+            byte b = _memory.Read8(addr);
+            _gprs[rt] = signed ? (uint)(sbyte)b : b;
+        }
+        return false;
+    }
+
+    private bool LoadStore16(uint opcode, bool store, bool signed)
+    {
+        uint addr = EffectiveAddress(opcode);
+        uint rt = Rt(opcode);
+        if (store)
+        {
+            _memory.Write8(addr, (byte)_gprs[rt]);
+            _memory.Write8(addr + 1, (byte)(_gprs[rt] >> 8));
+        }
+        else if (rt != 0)
+        {
+            ushort h = (ushort)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
+            _gprs[rt] = signed ? (uint)(short)h : h;
+        }
+        return false;
     }
 
     public void Stop() => Running = false;
+
+    /// <summary>Assemble helper: write words into IOP-visible memory and set PC.</summary>
+    public void LoadProgram(uint address, ReadOnlySpan<uint> words)
+    {
+        for (int i = 0; i < words.Length; i++)
+            _memory.Write32(address + (uint)(i * 4), words[i]);
+        PC = address;
+        Running = true;
+        InstructionsExecuted = 0;
+        _branchPending = false;
+    }
 }

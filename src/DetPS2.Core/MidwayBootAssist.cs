@@ -1,0 +1,955 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+namespace DetPS2.Core;
+
+/// <summary>
+/// Commercial retail boot assist (generic foundation, not a single-game port).
+/// <list type="bullet">
+/// <item>ISO-backed FILEIO + IOP module pre-register (any disc)</item>
+/// <item>SIF wait unstick when IOP HLE is incomplete (any title that polls)</item>
+/// <item>Host FMV overlay from short disc .SFD files when CRI/IPU cannot yet play them
+///       (deterministic cached frames; same ISO → same pixels)</item>
+/// <item>Optional title entry redirect when CRT0 never reaches game main (signature-gated)</item>
+/// </list>
+/// Goal: keep DetPS2 a PS2 emulator — not a native reimplementation of one game.
+/// </summary>
+public sealed class MidwayBootAssist
+{
+    public const uint WorklistBase = 0x0077A080;
+    public const uint WorkItemsBase = 0x01F00000;
+    public const int WorkItemStride = 0x40;
+    public const int WorkItemCount = 32;
+    public const uint SifInitedFlag = 0x00563FE4;
+    public const uint MainEntry = 0x00212F70;
+    public const uint MainSifCall = 0x002131C8;
+    public const uint SifInitFn = 0x00482E98;
+    public const uint WaitWorkLoop = 0x002062D4;
+
+    private bool _worklistPlanted;
+    private bool _sifForced;
+    private bool _logoPrepared;
+    private bool _logoActive;
+    private bool _esrbDone;
+    private bool _midwayDone;
+    private int _logoFrame;
+    private int _logoFramesTotal;
+    private uint[][]? _logoFrames; // ARGB8888 640x448
+    private uint[]? _bestLogoFrame;
+    private int _holdBestLeft;
+    private string? _cacheDir;
+    private Iso9660.Volume? _vol;
+    private string? _isoPath;
+    private ulong _lastAssistCycle;
+    private int _spinHits;
+    private bool _postLogoKick;
+    private bool _preloadStarted;
+    private bool _titleIsMidwayKick;
+    private int _hostPresentsSinceLogoFrame;
+    /// <summary>
+    /// Host UI presents per FMV frame. 1 = one movie frame per Desktop render tick
+    /// (~60 fps logo, full 100-frame sequence in ~1.7s). Use 2 for ~30 fps / longer play.
+    /// </summary>
+    private const int HostPresentsPerFmvFrame = 1;
+    private readonly object _prepLock = new();
+
+    public bool LogoActive => _logoActive;
+    public int LogoFrame => _logoFrame;
+    public int LogoFramesTotal => _logoFramesTotal;
+    public ulong Assists { get; private set; }
+    public ulong WorkCompletions { get; private set; }
+    public ulong FramesPresented { get; private set; }
+    public string Status { get; private set; } = "idle";
+    public bool FramesReady => _logoFrames is { Length: > 0 };
+
+    public void Reset()
+    {
+        _worklistPlanted = false;
+        _sifForced = false;
+        _logoPrepared = false;
+        _logoActive = false;
+        _esrbDone = false;
+        _midwayDone = false;
+        _logoFrame = 0;
+        _logoFramesTotal = 0;
+        _logoFrames = null;
+        _bestLogoFrame = null;
+        _holdBestLeft = 0;
+        _vol = null;
+        _isoPath = null;
+        _lastAssistCycle = 0;
+        _spinHits = 0;
+        _postLogoKick = false;
+        _preloadStarted = false;
+        _titleIsMidwayKick = false;
+        _hostPresentsSinceLogoFrame = 0;
+        Assists = WorkCompletions = FramesPresented = 0;
+        Status = "idle";
+    }
+
+    public void BindIso(string? isoPath)
+    {
+        if (string.IsNullOrEmpty(isoPath) || !File.Exists(isoPath)) return;
+        if (string.Equals(_isoPath, isoPath, StringComparison.OrdinalIgnoreCase) && _vol != null)
+            return;
+        try { _vol?.Disc?.Dispose(); } catch { /* ignore */ }
+        _isoPath = isoPath;
+        _vol = Iso9660.OpenFile(isoPath);
+        _logoPrepared = false;
+        _logoFrames = null;
+        _preloadStarted = false;
+    }
+
+    /// <summary>
+    /// Call after disc boot (any commercial title). Preloads short boot SFDs off the hot path
+    /// so the first RunFor slice does not stall the UI on ffmpeg.
+    /// </summary>
+    public void OnDiscMounted(Ps2System sys)
+    {
+        BindIso(sys.Cdvd.MountedPath);
+        sys.IopModules.BindDisc(sys.Cdvd.MountedPath);
+        // Detect optional title entry kick (signature only — not a hard dependency for all games)
+        _titleIsMidwayKick = sys.Memory.Read32(0x00212F70) == 0x27BDFEE0;
+        BeginPreloadFrames();
+        Status = _titleIsMidwayKick ? "disc-mounted (title-kick ready)" : "disc-mounted";
+    }
+
+    /// <summary>Background-safe: decode short boot movies into the frame cache if needed.</summary>
+    public void BeginPreloadFrames()
+    {
+        if (_preloadStarted) return;
+        _preloadStarted = true;
+        string? iso = _isoPath;
+        if (string.IsNullOrEmpty(iso)) return;
+        // Run prepare synchronously if cache already warm; otherwise fire-and-forget
+        try
+        {
+            string cacheDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DetPS2", "logo-cache", "midway-frames");
+            string marker = Path.Combine(cacheDir, ".v3-ok");
+            if (File.Exists(marker) && Directory.Exists(cacheDir) &&
+                Directory.GetFiles(cacheDir, "frame_*.ppm").Length >= 5)
+            {
+                // Warm cache exists — load into RAM now
+                PrepareLogoFrames(null);
+                return;
+            }
+        }
+        catch { /* fall through to async */ }
+
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                lock (_prepLock)
+                    PrepareLogoFrames(null);
+            }
+            catch
+            {
+                Status = "preload-failed";
+            }
+        });
+    }
+
+    /// <summary>Call from KickMidwayMainPath after jumping to main.</summary>
+    public void OnMainKick(Ps2System sys)
+    {
+        BindIso(sys.Cdvd.MountedPath);
+        PlantSifWorklist(sys);
+        // argv: argc=1, argv[0] = "skipintro" pointer so logo path may shorten later menus
+        uint argBase = 0x005C9C00;
+        sys.Memory.Write32(argBase, 1);
+        // Point argv[0] at the game's own "skipintro" string if present
+        sys.Memory.Write32(argBase + 4, 0x00584B58);
+        sys.Memory.Write32(argBase + 8, 0);
+        Status = "main-kicked";
+    }
+
+    public void PlantSifWorklist(Ps2System sys)
+    {
+        if (_worklistPlanted) return;
+        var mem = sys.Memory;
+
+        // Mirror retail SIF init flag + ring header at 0x77A080
+        mem.Write32(SifInitedFlag, 1);
+        mem.Write32(WorklistBase + 0x00, 1);
+        mem.Write32(WorklistBase + 0x04, WorkItemsBase);
+        mem.Write32(WorklistBase + 0x08, (uint)WorkItemCount);
+        mem.Write32(WorklistBase + 0x0C, 0);
+        mem.Write32(WorklistBase + 0x10, 0);
+        mem.Write32(WorklistBase + 0x14, 0);
+        mem.Write32(WorklistBase + 0x18, 0);
+        mem.Write32(WorklistBase + 0x1C, 0);
+        mem.Write32(WorklistBase + 0x20, (uint)WorkItemCount);
+
+        // Free work slots (bit0 of +0x10 clear = free)
+        for (int i = 0; i < WorkItemCount; i++)
+        {
+            uint it = WorkItemsBase + (uint)(i * WorkItemStride);
+            for (uint o = 0; o < WorkItemStride; o += 4)
+                mem.Write32(it + o, 0);
+        }
+
+        // Secondary ring used by sif-init (0x788880)
+        const uint ring = 0x00788880;
+        mem.Write32(ring + 0x00, 0);
+        mem.Write32(ring + 0x04, ring | 0x20000000); // uncached view marker
+        mem.Write32(ring + 0x08, 0x20);
+        mem.Write32(ring + 0x0C, 0);
+        mem.Write32(ring + 0x10, 0);
+        mem.Write32(ring + 0x14, 0x00789080 | 0x20000000);
+        mem.Write32(ring + 0x18, 0x20);
+        mem.Write32(ring + 0x1C, 0x00789880 | 0x20000000);
+        mem.Write32(ring + 0x20, 0x20);
+        mem.Write32(ring + 0x24, 0);
+
+        _worklistPlanted = true;
+        Status = "worklist-planted";
+        Assists++;
+    }
+
+    /// <summary>Periodic assist from commercial RunFor slices (EE-side only — no FMV pacing).</summary>
+    public void Step(Ps2System sys)
+    {
+        if (!sys.Hle.SonyKernelMode) return;
+        ulong c = sys.MasterCycles;
+        if (c - _lastAssistCycle < 25_000) return;
+        _lastAssistCycle = c;
+
+        BindIso(sys.Cdvd.MountedPath);
+        if (!_worklistPlanted && c > 100_000)
+            PlantSifWorklist(sys);
+
+        AutoCompleteWorkItems(sys);
+        UnstickSifWaits(sys);
+        MaybeForceSifInit(sys);
+        // Start logo when EE is ready, but advance frames only on host present
+        // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
+        // Desktop ticks and looks "frozen" on a single still.
+        MaybeStartLogo(sys);
+        // Do not KeepLogoVisible here — that path is host-present only so EE slices
+        // cannot pin a single overlay frame between UI refreshes.
+        MaybePostLogoAdvance(sys);
+    }
+
+    /// <summary>
+    /// Call once per host display refresh (Desktop present / PresentFrame).
+    /// Paces FMV like a real video output path: one movie frame every N host frames,
+    /// independent of how many EE cycles ran this tick. Content order stays deterministic.
+    /// </summary>
+    public void OnHostPresent(Ps2System sys)
+    {
+        if (sys == null) return;
+        if (!sys.Hle.SonyKernelMode) return;
+
+        // Late start if Step has not fired yet this frame
+        if (!_logoActive && !_midwayDone)
+            MaybeStartLogo(sys);
+
+        if (_logoActive)
+        {
+            _hostPresentsSinceLogoFrame++;
+            if (_hostPresentsSinceLogoFrame >= HostPresentsPerFmvFrame)
+            {
+                _hostPresentsSinceLogoFrame = 0;
+                AdvanceLogoOneFrame(sys);
+            }
+        }
+        else if (_midwayDone)
+        {
+            KeepLogoVisible(sys);
+        }
+    }
+
+    /// <summary>
+    /// Break Midway SIF init / cmd waits that poll IOP forever under HLE.
+    /// </summary>
+    private void UnstickSifWaits(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+
+        // Main post-SIF: jal 0x485EA8; beqz v0, -5 @ 0x2131F8 / 0x213210
+        if (pc is (>= 0x002131F0 and <= 0x00213220))
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            // Skip past the wait to 0x213218 / next work
+            if (pc <= 0x002131FC)
+                sys.EE.PC = 0x00213200;
+            Assists++;
+            return;
+        }
+
+        // Wait loop in sif-init: jal; beqz v0, back @ 0x482FF8
+        if (pc is >= 0x00482FF0 and <= 0x00482FFC)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x00483000;
+            Assists++;
+            return;
+        }
+
+        // SIF / cmd range after logo: force v0 success on beqz-v0 polls
+        if (pc is (>= 0x00482000 and < 0x00487000) or (>= 0x00485E00 and < 0x00487000))
+        {
+            uint op = sys.Memory.Read32(pc);
+            if ((op & 0xFC1F0000) == 0x10000000) // beq rs, $0
+            {
+                uint rs = (op >> 21) & 0x1F;
+                if (rs == 2)
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                    Assists++;
+                }
+            }
+            if (pc is >= 0x00482740 and < 0x00482760)
+            {
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                uint ra = (uint)sys.EE.GetGpr(31).Lo;
+                if (ra >= 0x100000)
+                    sys.EE.PC = ra;
+            }
+        }
+    }
+
+    private void AutoCompleteWorkItems(Ps2System sys)
+    {
+        var mem = sys.Memory;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+
+        // Tight wait: lw v1,0x24(s0); beqz v1, back  @ 0x2062D4 / 0x206328
+        if (pc is (>= 0x002062D0 and < 0x00206340) or (>= 0x00206200 and < 0x00206400))
+        {
+            uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+            if (s0 >= 0x100000 && (s0 & 0x1FFFFFFFu) < SystemMemory.RDRAM_SIZE - 0x50)
+            {
+                if (mem.Read32(s0 + 0x24) == 0)
+                {
+                    mem.Write32(s0 + 0x24, 1);
+                    WorkCompletions++;
+                    Assists++;
+                }
+                // Second wait uses +0x4C
+                if (mem.Read32(s0 + 0x4C) == 0)
+                {
+                    mem.Write32(s0 + 0x4C, 1);
+                    WorkCompletions++;
+                }
+            }
+        }
+
+        // Complete any claimed worklist items that look pending
+        if (!_worklistPlanted) return;
+        uint baseItems = mem.Read32(WorklistBase + 4);
+        uint count = mem.Read32(WorklistBase + 8);
+        if (baseItems < 0x100000 || count == 0 || count > 64) return;
+        for (uint i = 0; i < count; i++)
+        {
+            uint it = baseItems + i * WorkItemStride;
+            uint flags = mem.Read32(it + 0x10);
+            if ((flags & 1) == 0) continue;
+            // In-use: ensure completion field and reply slot look done
+            if (mem.Read32(it + 0x24) == 0)
+            {
+                mem.Write32(it + 0x24, 1);
+                WorkCompletions++;
+            }
+            // Clear busy bit so next claim can reuse (games may re-set)
+            // Keep bit0 for one step so waiter sees completion first
+        }
+    }
+
+    private void MaybeForceSifInit(Ps2System sys)
+    {
+        if (_sifForced) return;
+        if (sys.MasterCycles < 1_500_000) return;
+        // After first real clear, if SIF never ran, force-call sif-init
+        if (sys.Gif.Path3Transfers == 0 && sys.Gs.PixelsWritten == 0) return;
+        if (sys.Hle.Sony != null && sys.Hle.Sony.SifDmaCalls > 0)
+        {
+            _sifForced = true;
+            return;
+        }
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Don't yank if already inside sif-init
+        if (pc is >= 0x00482E98 and < 0x00484000) return;
+
+        PlantSifWorklist(sys);
+
+        // Force-call 0x482E98 with a safe return trampoline in scratch RAM
+        const uint tramp = 0x00090000;
+        // tramp: jr ra'  — actually set RA to continue at main post-SIF
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x002131D0 });
+        // Ensure SP valid
+        ulong sp = sys.EE.GetGpr(29).Lo;
+        if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        sys.EE.PC = SifInitFn;
+        sys.LastGoodEePc = SifInitFn;
+        _sifForced = true;
+        Status = "sif-forced";
+        Assists++;
+        _ = tramp;
+    }
+
+    private void MaybeStartLogo(Ps2System sys)
+    {
+        if (_logoActive || _midwayDone) return;
+        // Start as soon as the EE has been running a bit and either GS moved or we kicked main
+        if (sys.MasterCycles < 800_000) return;
+        bool gsAlive = sys.Gs.PixelsWritten > 0 || sys.Gif.Path3Transfers > 0 || sys.Gif.Path1Transfers > 0;
+        if (!gsAlive && sys.MasterCycles < 4_000_000) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        bool spinning = pc is (>= 0x00166800 and < 0x00166B00)
+            or (>= 0x00384000 and < 0x00386000)
+            or (>= 0x0040A000 and < 0x0040C000)
+            or (>= 0x0026B000 and < 0x0026E000)
+            or (>= 0x00483000 and < 0x00487000)
+            or (>= 0x00206000 and < 0x00207000)
+            or (>= 0x00482000 and < 0x00487000);
+        if (spinning) _spinHits++;
+        else _spinHits = Math.Max(0, _spinHits - 1);
+
+        // Don't wait forever for spin — after 2M cycles with GS activity, show boot FMV
+        if (_spinHits < 1 && sys.MasterCycles < 2_000_000) return;
+
+        if (!_logoPrepared)
+        {
+            lock (_prepLock)
+                PrepareLogoFrames(sys);
+        }
+
+        if (_logoFrames == null || _logoFrames.Length == 0)
+        {
+            // No decodable short SFD — leave black rather than fake a branded logo for wrong titles
+            if (_titleIsMidwayKick)
+            {
+                DrawSyntheticMidway(sys);
+                _midwayDone = true;
+                Status = "synthetic-logo";
+                Assists++;
+            }
+            else
+                Status = "no-boot-fmv";
+            return;
+        }
+
+        _logoActive = true;
+        _logoFrame = 0;
+        _hostPresentsSinceLogoFrame = 0;
+        Status = "logo-playing";
+        Assists++;
+        // First frame immediately so the window is not black before the next host present
+        sys.Gs.BlitArgb8888(_logoFrames[0], Gs.FB_WIDTH, Gs.FB_HEIGHT);
+        FramesPresented++;
+        _logoFrame = 1;
+        TrackBestFrame(_logoFrames[0]);
+    }
+
+    /// <summary>Advance exactly one FMV frame (or hold). Invoked from host present pacing.</summary>
+    private void AdvanceLogoOneFrame(Ps2System sys)
+    {
+        if (!_logoActive || _logoFrames == null || _logoFrames.Length == 0) return;
+
+        // Hold brightest frame at end so user sees logo before fade-to-black
+        // Count is in host presents (each call here is already paced).
+        if (_holdBestLeft > 0 && _bestLogoFrame != null)
+        {
+            sys.Gs.SetHostOverlay(_bestLogoFrame, active: true);
+            _holdBestLeft--;
+            FramesPresented++;
+            Status = $"logo-hold {_holdBestLeft}";
+            if (_holdBestLeft == 0)
+            {
+                _logoActive = false;
+                _midwayDone = true;
+                Status = "logo-done";
+                try
+                {
+                    for (int s = 1; s <= 32; s++)
+                        sys.Hle.Kernel.SignalSema(s);
+                }
+                catch { /* ignore */ }
+            }
+            return;
+        }
+
+        int idx = _logoFrame;
+        if (idx >= _logoFrames.Length)
+        {
+            if (_bestLogoFrame != null)
+            {
+                // ~2s hold at 30 FMV-fps (HostPresentsPerFmvFrame already applied)
+                _holdBestLeft = 60;
+                Status = "logo-holding";
+                sys.Gs.SetHostOverlay(_bestLogoFrame, active: true);
+                return;
+            }
+            _logoActive = false;
+            _midwayDone = true;
+            Status = "logo-done";
+            try
+            {
+                for (int s = 1; s <= 32; s++)
+                    sys.Hle.Kernel.SignalSema(s);
+            }
+            catch { /* ignore */ }
+            return;
+        }
+
+        var frame = _logoFrames[idx];
+        // Host overlay is what Desktop shows; Blit also mirrors into software FB for tools.
+        // BlitArgb8888 already calls SetHostOverlay — one path only.
+        sys.Gs.BlitArgb8888(frame, Gs.FB_WIDTH, Gs.FB_HEIGHT);
+        TrackBestFrame(frame);
+        FramesPresented++;
+        _logoFrame++;
+        Status = $"logo-frame {_logoFrame}/{_logoFrames.Length}";
+    }
+
+    private void TrackBestFrame(uint[] frame)
+    {
+        long score = 0;
+        int step = Math.Max(1, frame.Length / 2000);
+        for (int i = 0; i < frame.Length; i += step)
+        {
+            uint p = frame[i];
+            score += ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
+        }
+        if (_bestLogoFrame == null)
+        {
+            _bestLogoFrame = frame;
+            return;
+        }
+        long best = 0;
+        for (int i = 0; i < _bestLogoFrame.Length; i += step)
+        {
+            uint p = _bestLogoFrame[i];
+            best += ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
+        }
+        if (score > best)
+            _bestLogoFrame = frame;
+    }
+
+    /// <summary>After logo, re-enter main past SIF init so boot can head toward menu.</summary>
+    private void MaybePostLogoAdvance(Ps2System sys)
+    {
+        if (!_midwayDone || _postLogoKick) return;
+        if (sys.MasterCycles < 8_000_000) return;
+        _postLogoKick = true;
+
+        // Ensure worklist still healthy
+        PlantSifWorklist(sys);
+
+        // Resume past SIF wait loops into main's later setup (pad/threads/movies).
+        // 0x213218 is after the dual wait loops at 0x2131F8/0x213210.
+        sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x0011C2A8 });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 }); // s0
+        sys.EE.SetGpr(17, new EmotionEngine.Gpr128 { Lo = 1 }); // s1
+        sys.EE.PC = 0x00213218;
+        sys.LastGoodEePc = 0x00213218;
+        sys.EE.COP0_Status |= (1u << 16) | 1u;
+        // Keep best logo on screen while more boot runs
+        if (_bestLogoFrame != null)
+            sys.Gs.BlitArgb8888(_bestLogoFrame, Gs.FB_WIDTH, Gs.FB_HEIGHT);
+        Status = "post-logo-main";
+        Assists++;
+    }
+
+    /// <summary>
+    /// After FMV playback finishes, keep the best frame on the host overlay so the
+    /// game black-clear does not blank the window. Must NOT run while logo is still
+    /// animating (that froze the movie on a single frame).
+    /// </summary>
+    public void KeepLogoVisible(Ps2System sys)
+    {
+        if (_bestLogoFrame == null) return;
+        // Never overwrite in-progress animation
+        if (_logoActive) return;
+
+        // Drop host overlay once the game is clearly drawing multi-frame content past HLE
+        if (sys.Gif.Path3Transfers > 4 && _midwayDone)
+        {
+            sys.Gs.ClearHostOverlay();
+            return;
+        }
+        if (_midwayDone)
+            sys.Gs.SetHostOverlay(_bestLogoFrame, active: true);
+    }
+
+    private void PrepareLogoFrames(Ps2System? sys)
+    {
+        if (_logoPrepared && _logoFrames is { Length: > 0 }) return;
+        _logoPrepared = true;
+        if (sys != null)
+            BindIso(sys.Cdvd.MountedPath);
+        if (_vol == null || string.IsNullOrEmpty(_isoPath))
+        {
+            Status = "no-iso";
+            return;
+        }
+
+        try
+        {
+            _cacheDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DetPS2", "logo-cache");
+            Directory.CreateDirectory(_cacheDir);
+
+            // Generic: pick a short boot-movie SFD from the disc (logo / ESRB / publisher).
+            // Prefer well-known names, else smallest .SFD under ~4MB in MOVIES folders.
+            string sfdLocal = Path.Combine(_cacheDir, "BOOT_FMV.SFD");
+            if (!File.Exists(sfdLocal) || new FileInfo(sfdLocal).Length < 1000)
+            {
+                byte[]? data = FindBootFmvBytes(_vol);
+                if (data == null || data.Length < 1000)
+                {
+                    Status = "boot-fmv-missing";
+                    return;
+                }
+                File.WriteAllBytes(sfdLocal, data);
+            }
+
+            string frameDir = Path.Combine(_cacheDir, "midway-frames");
+            Directory.CreateDirectory(frameDir);
+            // v3: full-frame scale 640x448 (no pad letterbox), fixed present colors
+            string marker = Path.Combine(frameDir, ".v3-ok");
+            bool needDecode = !File.Exists(marker) || Directory.GetFiles(frameDir, "frame_*.ppm").Length < 5;
+            if (needDecode)
+            {
+                Status = "ffmpeg-decoding";
+                if (!TryFfmpegDecode(sfdLocal, frameDir))
+                {
+                    Status = "ffmpeg-failed";
+                    return;
+                }
+                try { File.WriteAllText(marker, "ok"); } catch { /* ignore */ }
+            }
+
+            var files = Directory.GetFiles(frameDir, "frame_*.ppm");
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+            if (files.Length == 0)
+            {
+                Status = "no-frames";
+                return;
+            }
+
+            // Cap frames for boot assist (~6s logo @ 15fps sample ≈ 90)
+            int max = Math.Min(files.Length, 120);
+            var list = new uint[max][];
+            int got = 0;
+            for (int i = 0; i < max; i++)
+            {
+                if (TryLoadPpm(files[i], out uint[]? argb) && argb != null)
+                {
+                    // Drop pure-black frames (fade lead-in)
+                    if (IsMostlyBlack(argb)) continue;
+                    list[got++] = argb;
+                }
+            }
+            if (got == 0)
+            {
+                Status = "ppm-all-black";
+                return;
+            }
+            if (got < list.Length)
+                Array.Resize(ref list, got);
+            _logoFrames = list;
+            _logoFramesTotal = got;
+            Status = $"logo-ready frames={got}";
+        }
+        catch (Exception ex)
+        {
+            Status = "logo-err:" + ex.GetType().Name;
+        }
+    }
+
+    /// <summary>Locate a short publisher/boot movie on any retail disc layout.</summary>
+    private static byte[]? FindBootFmvBytes(Iso9660.Volume vol)
+    {
+        string[] preferred =
+        {
+            "FRONT/MOVIES/MIDWAY.SFD", "FRONT/MOVIES/ESRB.SFD",
+            "MOVIES/MIDWAY.SFD", "MOVIES/ESRB.SFD", "MOVIES/LOGO.SFD",
+            "DATA/MIDWAY.SFD", "VIDEO/LOGO.SFD", "SCEI.SFD", "SCEE.SFD", "SCEA.SFD"
+        };
+        foreach (var p in preferred)
+        {
+            byte[]? d = Iso9660.ReadFile(vol, p);
+            if (d != null && d.Length is >= 1000 and <= 8_000_000)
+                return d;
+        }
+
+        Iso9660.FileEntry? best = null;
+        foreach (var f in vol.Files)
+        {
+            if (f.IsDirectory) continue;
+            string u = f.Path.ToUpperInvariant();
+            if (!u.EndsWith(".SFD", StringComparison.Ordinal)) continue;
+            if (f.Size is < 1000 or > 4_000_000) continue;
+            // Prefer names that look like boot logos
+            bool prefer = u.Contains("LOGO") || u.Contains("MIDWAY") || u.Contains("ESRB")
+                          || u.Contains("SCEI") || u.Contains("SCEA") || u.Contains("SCEE")
+                          || u.Contains("PUBLISHER") || u.Contains("WARNING");
+            if (best == null || prefer || f.Size < best.Size)
+            {
+                if (prefer || best == null || f.Size < best.Size)
+                    best = f;
+                if (prefer) break;
+            }
+        }
+        return best != null ? Iso9660.ReadFile(vol, best.Path) : null;
+    }
+
+    private static bool TryFfmpegDecode(string sfdPath, string outDir)
+    {
+        string? ffmpeg = FindFfmpeg();
+        if (ffmpeg == null) return false;
+        try
+        {
+            foreach (var f in Directory.GetFiles(outDir, "frame_*.ppm"))
+                try { File.Delete(f); } catch { /* ignore */ }
+            foreach (var f in Directory.GetFiles(outDir, ".v*"))
+                try { File.Delete(f); } catch { /* ignore */ }
+
+            // MPEG-PS Sofdec: typically 512×384. Scale to full 640×448 present buffer
+            // (fill frame — slight stretch is better than a half-letterboxed crop on host UI).
+            // Skip ~0.35s black fade-in; sample 20fps for smooth Desktop playback.
+            string pattern = Path.Combine(outDir, "frame_%03d.ppm");
+            var psi = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments =
+                    $"-y -fflags +genpts -i \"{sfdPath}\" -map 0:v:0 " +
+                    $"-ss 0.35 -t 5.5 " +
+                    $"-vf \"fps=20,scale=640:448:flags=bicubic\" " +
+                    $"-frames:v 110 \"{pattern}\"",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return false;
+            _ = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(120_000);
+            return Directory.GetFiles(outDir, "frame_*.ppm").Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsMostlyBlack(uint[] argb)
+    {
+        int lit = 0;
+        int step = Math.Max(1, argb.Length / 4000);
+        int samples = 0;
+        for (int i = 0; i < argb.Length; i += step)
+        {
+            uint p = argb[i];
+            int r = (int)((p >> 16) & 0xFF);
+            int g = (int)((p >> 8) & 0xFF);
+            int b = (int)(p & 0xFF);
+            if (r > 24 || g > 24 || b > 24) lit++;
+            samples++;
+        }
+        return lit < Math.Max(3, samples / 50);
+    }
+
+    private static string? FindFfmpeg()
+    {
+        string[] candidates =
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "ffmpeg", "bin", "ffmpeg.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ffmpeg", "bin", "ffmpeg.exe"),
+            "ffmpeg"
+        };
+        foreach (var c in candidates)
+        {
+            try
+            {
+                if (c == "ffmpeg")
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = "ffmpeg",
+                        Arguments = "-version",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+                    using var p = Process.Start(psi);
+                    if (p == null) continue;
+                    p.WaitForExit(3000);
+                    if (p.ExitCode == 0 || p.ExitCode == 1) return "ffmpeg";
+                }
+                else if (File.Exists(c))
+                    return c;
+            }
+            catch { /* try next */ }
+        }
+        return null;
+    }
+
+    private static bool TryLoadPpm(string path, out uint[]? argb)
+    {
+        argb = null;
+        try
+        {
+            using var fs = File.OpenRead(path);
+            using var br = new BinaryReader(fs);
+            // P6 binary PPM
+            char c0 = (char)br.ReadByte();
+            char c1 = (char)br.ReadByte();
+            if (c0 != 'P' || c1 != '6') return false;
+            SkipPpmWs(br);
+            int w = ReadPpmInt(br);
+            SkipPpmWs(br);
+            int h = ReadPpmInt(br);
+            SkipPpmWs(br);
+            int max = ReadPpmInt(br);
+            // single whitespace after maxval
+            if (br.BaseStream.Position < br.BaseStream.Length)
+                br.ReadByte();
+            if (w <= 0 || h <= 0 || max <= 0) return false;
+
+            byte[] rgb = br.ReadBytes(checked(w * h * 3));
+            if (rgb.Length < w * h * 3) return false;
+
+            // Always produce full 640×448 0xAARRGGBB. Nearest-neighbor scale if needed
+            // so the host present never shows a half-frame letterbox from a bad pad.
+            int dw = Gs.FB_WIDTH, dh = Gs.FB_HEIGHT;
+            argb = new uint[dw * dh];
+            for (int y = 0; y < dh; y++)
+            {
+                int sy = h == dh ? y : (int)((long)y * h / dh);
+                if (sy >= h) sy = h - 1;
+                for (int x = 0; x < dw; x++)
+                {
+                    int sx = w == dw ? x : (int)((long)x * w / dw);
+                    if (sx >= w) sx = w - 1;
+                    int si = (sy * w + sx) * 3;
+                    byte r = rgb[si], g = rgb[si + 1], b = rgb[si + 2];
+                    argb[y * dw + x] = 0xFF000000u | ((uint)r << 16) | ((uint)g << 8) | b;
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            argb = null;
+            return false;
+        }
+    }
+
+    private static int PeekByte(BinaryReader br)
+    {
+        if (br.BaseStream.Position >= br.BaseStream.Length) return -1;
+        long pos = br.BaseStream.Position;
+        int b = br.ReadByte();
+        br.BaseStream.Position = pos;
+        return b;
+    }
+
+    private static void SkipPpmWs(BinaryReader br)
+    {
+        while (br.BaseStream.Position < br.BaseStream.Length)
+        {
+            int b = PeekByte(br);
+            if (b < 0) return;
+            if (b == '#')
+            {
+                while (br.BaseStream.Position < br.BaseStream.Length)
+                {
+                    byte c = br.ReadByte();
+                    if (c is (byte)'\n' or (byte)'\r') break;
+                }
+                continue;
+            }
+            if (b is ' ' or '\t' or '\r' or '\n')
+            {
+                br.ReadByte();
+                continue;
+            }
+            break;
+        }
+    }
+
+    private static int ReadPpmInt(BinaryReader br)
+    {
+        SkipPpmWs(br);
+        var sb = new StringBuilder();
+        while (br.BaseStream.Position < br.BaseStream.Length)
+        {
+            int b = PeekByte(br);
+            if (b < 0) break;
+            if (b is >= '0' and <= '9')
+            {
+                sb.Append((char)br.ReadByte());
+                continue;
+            }
+            break;
+        }
+        return int.TryParse(sb.ToString(), out int v) ? v : 0;
+    }
+
+    private static void DrawSyntheticMidway(Ps2System sys)
+    {
+        // Dark navy field + bright gold "MIDWAY" block letters (fallback if ffmpeg missing)
+        int w = Gs.FB_WIDTH, h = Gs.FB_HEIGHT;
+        var px = new uint[w * h];
+        uint bg = 0xFF0A1628;
+        uint fg = 0xFFFFD040;
+        for (int i = 0; i < px.Length; i++) px[i] = bg;
+
+        // Simple 5x7 font for MIDWAY
+        string text = "MIDWAY";
+        int scale = 10;
+        int cw = 5 * scale, gap = 3 * scale;
+        int totalW = text.Length * cw + (text.Length - 1) * gap;
+        int startX = (w - totalW) / 2;
+        int startY = h / 2 - 4 * scale;
+        for (int ti = 0; ti < text.Length; ti++)
+        {
+            byte[]? glyph = Glyph(text[ti]);
+            if (glyph == null) continue;
+            int ox = startX + ti * (cw + gap);
+            for (int gy = 0; gy < 7; gy++)
+            {
+                for (int gx = 0; gx < 5; gx++)
+                {
+                    if (((glyph[gy] >> (4 - gx)) & 1) == 0) continue;
+                    for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++)
+                    {
+                        int x = ox + gx * scale + sx;
+                        int y = startY + gy * scale + sy;
+                        if ((uint)x < (uint)w && (uint)y < (uint)h)
+                            px[y * w + x] = fg;
+                    }
+                }
+            }
+        }
+        sys.Gs.BlitArgb8888(px, w, h);
+    }
+
+    private static byte[]? Glyph(char c) => c switch
+    {
+        'M' => new byte[] { 0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11 },
+        'I' => new byte[] { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F },
+        'D' => new byte[] { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E },
+        'W' => new byte[] { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 },
+        'A' => new byte[] { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        'Y' => new byte[] { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
+        _ => null
+    };
+}

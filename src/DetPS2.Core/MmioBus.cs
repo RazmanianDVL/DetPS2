@@ -4,55 +4,287 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// MmioBus - Foundational memory-mapped I/O abstraction.
-/// 
-/// This class provides a clean central place to register and access
-/// hardware registers (INTC, DMAC, Timers, GS, etc.).
-/// 
-/// Design goals:
-/// - Single point for all MMIO reads/writes
-/// - Easy to debug and log register access
-/// - Extensible (components can register their own handlers)
-/// - Foundation for accurate hardware behavior and SaveState
+/// Central MMIO decode (Phase 8–9).
+/// Timers, INTC, DMAC, SIF, Pad, SPU2 alias.
 /// </summary>
 public sealed class MmioBus
 {
-    private readonly Dictionary<uint, Func<uint>> _readHandlers = new();
-    private readonly Dictionary<uint, Action<uint>> _writeHandlers = new();
+    private readonly Dictionary<uint, Func<uint>> _readExact = new();
+    private readonly Dictionary<uint, Action<uint>> _writeExact = new();
 
-    /// <summary>
-    /// Register a read handler for a specific address.
-    /// </summary>
-    public void RegisterRead(uint address, Func<uint> readHandler)
+    private EeTimers? _timers;
+    private Intc? _intc;
+    private Dmac? _dmac;
+    private Sif? _sif;
+    private PadInput? _pad;
+    private Spu2? _spu2;
+    private Sio2? _sio2;
+    private Ipu? _ipu;
+    private Gif? _gif;
+    private Gs? _gs;
+    private Vif? _vif;
+    private Telemetry? _telemetry;
+    private Func<(ulong cycle, ulong pc)>? _context;
+
+    // MCH RDRAM init stubs (ps2tek) — games/BIOS poll these during early bring-up
+    private uint _mchRicm;
+    private uint _mchDrd;
+    private int _rdramSdevId;
+
+    public void Attach(EeTimers timers, Intc intc, Dmac dmac, Sif sif, PadInput? pad = null, Spu2? spu2 = null, Sio2? sio2 = null, Ipu? ipu = null)
     {
-        _readHandlers[address] = readHandler;
+        _timers = timers;
+        _intc = intc;
+        _dmac = dmac;
+        _sif = sif;
+        _pad = pad;
+        _spu2 = spu2;
+        _sio2 = sio2;
+        _ipu = ipu;
     }
 
-    /// <summary>
-    /// Register a write handler for a specific address.
-    /// </summary>
-    public void RegisterWrite(uint address, Action<uint> writeHandler)
+    public void AttachGraphics(Gif gif, Gs gs, Vif? vif = null)
     {
-        _writeHandlers[address] = writeHandler;
+        _gif = gif;
+        _gs = gs;
+        _vif = vif;
     }
+
+    public void SetTelemetry(Telemetry? telemetry, Func<(ulong cycle, ulong pc)>? context = null)
+    {
+        _telemetry = telemetry;
+        _context = context;
+    }
+
+    public void RegisterRead(uint address, Func<uint> readHandler) =>
+        _readExact[address] = readHandler;
+
+    public void RegisterWrite(uint address, Action<uint> writeHandler) =>
+        _writeExact[address] = writeHandler;
 
     public uint Read32(uint address)
     {
-        if (_readHandlers.TryGetValue(address, out var handler))
-            return handler();
+        if (_readExact.TryGetValue(address, out var h))
+            return h();
 
-        // Default: return 0 for unmapped registers
+        // IPU window 0x10002000–0x10002FFF (games polls past 0x800)
+        if (address >= Ipu.MmioBase && address < Ipu.MmioBase + 0x1000 && _ipu != null)
+            return _ipu.ReadRegister(address);
+
+        if (address >= 0x10000000 && address < 0x10002000 && _timers != null)
+            return _timers.ReadRegister(address);
+
+        // GIF control + FIFO window
+        if (address >= 0x10003000 && address < 0x10003100 && _gif != null)
+            return _gif.ReadRegister(address);
+        if (address >= 0x10006000 && address < 0x10006010 && _gif != null)
+            return 0; // FIFO write-only
+
+        // VIF0 / VIF1 status stubs — return idle, FQC=0 so games don't spin forever
+        if (address >= 0x10003800 && address < 0x10003C00)
+            return ReadVifStub(address, vif1: false);
+        if (address >= 0x10003C00 && address < 0x10004000)
+            return ReadVifStub(address, vif1: true);
+
+        if ((address == Intc.AddrStat || address == Intc.AddrMask ||
+             (address & 0xFFFFFF00) == 0x1000F000) && _intc != null)
+            return _intc.ReadRegister(address);
+
+        if (address >= 0x10008000 && address < 0x1000F000 && _dmac != null)
+            return _dmac.ReadRegister(address);
+
+        // D_ENABLER / D_ENABLEW live above the channel window
+        if ((address == 0x1000F520 || address == 0x1000F590) && _dmac != null)
+            return _dmac.ReadRegister(address);
+
+        if (address >= 0x1000F200 && address < 0x1000F300 && _sif != null)
+            return _sif.ReadRegister(address);
+
+        // SSBUS / SBUS window (0x1000F100–0x1000F1FF) — games poll these during
+        // IOP bring-up. Return "ready" patterns so commercial boot doesn't spin.
+        if (address >= 0x1000F100 && address < 0x1000F200)
+        {
+            // 0x1000F130 is a common status poll; bit patterns match "idle/ready"
+            if (address == 0x1000F130) return 0x00000000; // not busy
+            if (address == 0x1000F140) return 0x00000001;
+            return 0;
+        }
+
+        // MCH RDRAM init (ps2tek)
+        if (address == 0x1000F430) return 0;
+        if (address == 0x1000F440) return ReadMchDrd();
+
+        if (address >= PadInput.MmioBase && address < PadInput.MmioBase + 0x20 && _pad != null)
+            return _pad.ReadRegister(address);
+
+        if (address >= Spu2.MmioAlias && address < Spu2.MmioAlias + 0x400 && _spu2 != null)
+            return _spu2.ReadRegister(address);
+
+        if (address >= Sio2.MmioBase && address < Sio2.MmioBase + 0x100 && _sio2 != null)
+            return _sio2.ReadRegister(address);
+
+        // Privileged GS registers (0x12000000)
+        if (address >= 0x12000000 && address < 0x12002000 && _gs != null)
+            return _gs.ReadPrivileged32(address);
+
+        // Unhandled MMIO read (Phase 21 telemetry)
+        if (_telemetry != null && address >= 0x10000000 && address < 0x1F000000)
+        {
+            var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
+            _telemetry.UnknownMmioRead(cyc, pc, address);
+        }
         return 0;
     }
 
     public void Write32(uint address, uint value)
     {
-        if (_writeHandlers.TryGetValue(address, out var handler))
-            handler(value);
+        if (_writeExact.TryGetValue(address, out var h))
+        {
+            h(value);
+            return;
+        }
+
+        if (address >= Ipu.MmioBase && address < Ipu.MmioBase + 0x1000 && _ipu != null)
+        {
+            _ipu.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= 0x10000000 && address < 0x10002000 && _timers != null)
+        {
+            _timers.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= 0x10003000 && address < 0x10003100 && _gif != null)
+        {
+            _gif.WriteRegister(address, value);
+            return;
+        }
+        if (address >= 0x10006000 && address < 0x10006010 && _gif != null)
+        {
+            _gif.WriteFifo(value);
+            return;
+        }
+
+        // VIF0 FIFO @ 0x10004000, VIF1 FIFO @ 0x10005000 (ps2tek)
+        if (address >= 0x10004000 && address < 0x10005000 && _vif != null)
+        {
+            _vif.FeedData(value);
+            return;
+        }
+        if (address >= 0x10005000 && address < 0x10006000 && _vif != null)
+        {
+            _vif.FeedData(value);
+            return;
+        }
+
+        // VIF0/VIF1 control — accept writes (NOP FBRST etc.)
+        if (address >= 0x10003800 && address < 0x10004000)
+            return;
+
+        if ((address == Intc.AddrStat || address == Intc.AddrMask ||
+             (address & 0xFFFFFF00) == 0x1000F000) && _intc != null)
+        {
+            _intc.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= 0x10008000 && address < 0x1000F000 && _dmac != null)
+        {
+            _dmac.WriteRegister(address, value);
+            return;
+        }
+
+        if ((address == 0x1000F520 || address == 0x1000F590) && _dmac != null)
+        {
+            _dmac.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= 0x1000F200 && address < 0x1000F300 && _sif != null)
+        {
+            _sif.WriteRegister(address, value);
+            return;
+        }
+
+        if (address == 0x1000F430)
+        {
+            uint sa = (value >> 16) & 0xFFF;
+            uint sbc = (value >> 6) & 0xF;
+            if (sa == 0x21 && sbc == 0x1 && ((_mchDrd >> 7) & 1) == 0)
+                _rdramSdevId = 0;
+            _mchRicm = value & ~0x80000000u;
+            return;
+        }
+        if (address == 0x1000F440)
+        {
+            _mchDrd = value;
+            return;
+        }
+
+        if (address >= PadInput.MmioBase && address < PadInput.MmioBase + 0x20 && _pad != null)
+        {
+            _pad.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= Spu2.MmioAlias && address < Spu2.MmioAlias + 0x400 && _spu2 != null)
+        {
+            _spu2.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= Sio2.MmioBase && address < Sio2.MmioBase + 0x100 && _sio2 != null)
+        {
+            _sio2.WriteRegister(address, value);
+            return;
+        }
+
+        if (address >= 0x12000000 && address < 0x12002000 && _gs != null)
+        {
+            _gs.WritePrivileged32(address, value);
+            return;
+        }
+
+        // Unhandled MMIO write (Phase 21 telemetry)
+        if (_telemetry != null && address >= 0x10000000 && address < 0x1F000000)
+        {
+            var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
+            _telemetry.UnknownMmioWrite(cyc, pc, address);
+        }
     }
 
-    public void Reset()
+    private static uint ReadVifStub(uint address, bool vif1)
     {
-        // Components are responsible for their own reset
+        uint off = address & 0x3FF;
+        // STAT (0x00): idle, FQC empty
+        if (off == 0x00) return 0;
+        // FBRST / ERR / MARK — 0
+        return 0;
     }
+
+    private uint ReadMchDrd()
+    {
+        // ps2tek MCH_DRD probe sequence for RDRAM init
+        uint sop = (_mchRicm >> 6) & 0xF;
+        uint sa = (_mchRicm >> 16) & 0xFFF;
+        if (sop != 0) return 0;
+        switch (sa)
+        {
+            case 0x21:
+                if (_rdramSdevId < 2)
+                {
+                    _rdramSdevId++;
+                    return 0x1F;
+                }
+                return 0;
+            case 0x23: return 0x0D0D;
+            case 0x24: return 0x0090;
+            case 0x40: return _mchRicm & 0x1F;
+            default: return 0;
+        }
+    }
+
+    public void Reset() { }
 }

@@ -1,0 +1,19 @@
+{
+  "biosPath": "C:/path/to/your/SCPH-70004_BIOS_V12_EUR_200.BIN",
+  "titles": [
+    {
+      "id": "my-game-1",
+      "title": "Example Game",
+      "path": "C:/path/to/game.iso",
+      "kind": "iso"
+    },
+    {
+      "id": "homebrew-elf",
+      "title": "My Homebrew",
+      "path": "C:/path/to/app.elf",
+      "kind": "elf"
+    }
+  ],
+  "bootCycles": 5000000,
+  "sampleEvery": 100000
+}

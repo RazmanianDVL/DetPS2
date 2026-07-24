@@ -4,18 +4,12 @@ using System.Runtime.InteropServices;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Base class for VU0 and VU1.
-/// 
-/// Foxtrot update: Added IsEfuBusy property for future Scheduler integration.
-/// This allows external components (Scheduler, EmotionEngine) to query whether
-/// the VU is currently stalled on an EFU operation.
-/// 
-/// Previous deliveries this round:
-/// - EFU stall modeling in Step() + HandleEfu()
-/// - COP2 entry point hardening in Vu0
+/// Base class for VU0 and VU1 (Phase 10: microprogram mem + deterministic float).
 /// </summary>
 public abstract class VectorUnit
 {
+    public const int MicroMemWords = 2048; // 8KB micro mem (VU0-ish); VU1 uses same for simplicity
+
     protected readonly SystemMemory _memory;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -32,12 +26,17 @@ public abstract class VectorUnit
     public uint PC;
     public ulong LocalCycles;
 
+    /// <summary>Private microprogram memory (word-addressed opcodes).</summary>
+    protected readonly uint[] _microMem = new uint[MicroMemWords];
+
     private uint _currentFieldMask = 0xF;
     private bool _branchPending;
     private uint _pendingBranchTarget;
 
-    // EFU stall tracking (Foxtrot - Phase 6.2)
     protected int _efuStallRemaining;
+    protected int _cop2InterlockCycles;
+    public bool RunningMicro { get; protected set; }
+    public ulong MicroOpsExecuted { get; protected set; }
 
     protected VectorUnit(SystemMemory memory)
     {
@@ -48,6 +47,7 @@ public abstract class VectorUnit
     public virtual void Reset()
     {
         Array.Clear(_vf);
+        Array.Clear(_microMem);
         ACC = default;
         Status = MAC = Clipping = R = I = Q = P = 0;
         PC = 0;
@@ -56,16 +56,50 @@ public abstract class VectorUnit
         _currentFieldMask = 0xF;
         _branchPending = false;
         _efuStallRemaining = 0;
+        _cop2InterlockCycles = 0;
+        RunningMicro = false;
+        MicroOpsExecuted = 0;
     }
 
-    /// <summary>
-    /// Returns true if the VU is currently stalled waiting for an EFU operation to complete.
-    /// Exposed for Scheduler / inter-component visibility (Foxtrot addition).
-    /// </summary>
     public bool IsEfuBusy => _efuStallRemaining > 0;
+    public bool IsCop2Interlocked => _cop2InterlockCycles > 0 || IsEfuBusy;
+
+    public void LoadMicroProgram(ReadOnlySpan<uint> words, uint startPc = 0)
+    {
+        int n = Math.Min(words.Length, MicroMemWords - (int)startPc);
+        for (int i = 0; i < n; i++)
+            _microMem[startPc + i] = words[i];
+    }
+
+    public void WriteMicroWord(uint index, uint opcode)
+    {
+        if (index < MicroMemWords) _microMem[index] = opcode;
+    }
+
+    public uint ReadMicroWord(uint index) => index < MicroMemWords ? _microMem[index] : 0;
+
+    /// <summary>Start microprogram at PC (in words * 4 byte addressing, PC is byte-ish word index*4).</summary>
+    public void StartMicro(uint entryPc = 0)
+    {
+        PC = entryPc;
+        RunningMicro = true;
+        _branchPending = false;
+    }
+
+    public void StopMicro() => RunningMicro = false;
 
     public virtual int Step(ulong maxCycles)
     {
+        if (maxCycles == 0) return 0;
+
+        if (_cop2InterlockCycles > 0)
+        {
+            int c = (int)Math.Min(maxCycles, (ulong)_cop2InterlockCycles);
+            _cop2InterlockCycles -= c;
+            LocalCycles += (ulong)c;
+            return c;
+        }
+
         if (_efuStallRemaining > 0)
         {
             int consumed = (int)Math.Min(maxCycles, (ulong)_efuStallRemaining);
@@ -74,9 +108,11 @@ public abstract class VectorUnit
             return consumed;
         }
 
-        ulong executed = 0;
+        if (!RunningMicro)
+            return 0;
 
-        for (ulong i = 0; i < maxCycles; i++)
+        ulong executed = 0;
+        for (ulong i = 0; i < maxCycles && RunningMicro; i++)
         {
             if (_branchPending)
             {
@@ -84,15 +120,20 @@ public abstract class VectorUnit
                 _branchPending = false;
             }
 
-            if (PC < 16 * 1024)
+            uint wordIndex = (PC / 4) % MicroMemWords;
+            uint opcode = _microMem[wordIndex];
+            // E-bit in high bit of micro: stop after this op (simplified)
+            bool end = (opcode & 0x80000000) != 0;
+            opcode &= 0x7FFFFFFF;
+
+            DecodeAndExecute(opcode);
+            MicroOpsExecuted++;
+            PC += 4;
+            executed++;
+
+            if (end || opcode == 0)
             {
-                uint opcode = _memory.Read32(PC);
-                DecodeAndExecute(opcode);
-                PC += 4;
-                executed++;
-            }
-            else
-            {
+                RunningMicro = false;
                 break;
             }
         }
@@ -194,26 +235,26 @@ public abstract class VectorUnit
 
     private void ApplyArith(uint rs, uint rt, uint rd, Func<float, float, float> op)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = op(_vf[rs].X, _vf[rt].X);
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = op(_vf[rs].Y, _vf[rt].Y);
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = op(_vf[rs].Z, _vf[rt].Z);
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = op(_vf[rs].W, _vf[rt].W);
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = DeterministicFloat.Canonicalize(op(_vf[rs].X, _vf[rt].X));
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = DeterministicFloat.Canonicalize(op(_vf[rs].Y, _vf[rt].Y));
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = DeterministicFloat.Canonicalize(op(_vf[rs].Z, _vf[rt].Z));
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = DeterministicFloat.Canonicalize(op(_vf[rs].W, _vf[rt].W));
     }
 
     private void ApplyMadd(uint rs, uint rt, uint rd)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = _vf[rs].X * _vf[rt].X + ACC.X;
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = _vf[rs].Y * _vf[rt].Y + ACC.Y;
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = _vf[rs].Z * _vf[rt].Z + ACC.Z;
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = _vf[rs].W * _vf[rt].W + ACC.W;
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = DeterministicFloat.Madd(_vf[rs].X, _vf[rt].X, ACC.X);
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = DeterministicFloat.Madd(_vf[rs].Y, _vf[rt].Y, ACC.Y);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = DeterministicFloat.Madd(_vf[rs].Z, _vf[rt].Z, ACC.Z);
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = DeterministicFloat.Madd(_vf[rs].W, _vf[rt].W, ACC.W);
     }
 
     private void ApplyMsub(uint rs, uint rt, uint rd)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = _vf[rs].X * _vf[rt].X - ACC.X;
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = _vf[rs].Y * _vf[rt].Y - ACC.Y;
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = _vf[rs].Z * _vf[rt].Z - ACC.Z;
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = _vf[rs].W * _vf[rt].W - ACC.W;
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = DeterministicFloat.Sub(DeterministicFloat.Mul(_vf[rs].X, _vf[rt].X), ACC.X);
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = DeterministicFloat.Sub(DeterministicFloat.Mul(_vf[rs].Y, _vf[rt].Y), ACC.Y);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = DeterministicFloat.Sub(DeterministicFloat.Mul(_vf[rs].Z, _vf[rt].Z), ACC.Z);
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = DeterministicFloat.Sub(DeterministicFloat.Mul(_vf[rs].W, _vf[rt].W), ACC.W);
     }
 
     private void ApplyMove(uint rs, uint rd)
@@ -234,26 +275,26 @@ public abstract class VectorUnit
 
     private void ApplyAbs(uint rs, uint rd)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = Math.Abs(_vf[rs].X);
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = Math.Abs(_vf[rs].Y);
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = Math.Abs(_vf[rs].Z);
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = Math.Abs(_vf[rs].W);
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = MathF.Abs(_vf[rs].X);
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = MathF.Abs(_vf[rs].Y);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = MathF.Abs(_vf[rs].Z);
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = MathF.Abs(_vf[rs].W);
     }
 
     private void ApplyMin(uint rs, uint rt, uint rd)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = Math.Min(_vf[rs].X, _vf[rt].X);
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = Math.Min(_vf[rs].Y, _vf[rt].Y);
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = Math.Min(_vf[rs].Z, _vf[rt].Z);
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = Math.Min(_vf[rs].W, _vf[rt].W);
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = DeterministicFloat.Min(_vf[rs].X, _vf[rt].X);
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = DeterministicFloat.Min(_vf[rs].Y, _vf[rt].Y);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = DeterministicFloat.Min(_vf[rs].Z, _vf[rt].Z);
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = DeterministicFloat.Min(_vf[rs].W, _vf[rt].W);
     }
 
     private void ApplyMax(uint rs, uint rt, uint rd)
     {
-        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = Math.Max(_vf[rs].X, _vf[rt].X);
-        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = Math.Max(_vf[rs].Y, _vf[rt].Y);
-        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = Math.Min(_vf[rs].Z, _vf[rt].Z);
-        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = Math.Max(_vf[rs].W, _vf[rt].W);
+        if ((_currentFieldMask & 0b0001) != 0) _vf[rd].X = DeterministicFloat.Max(_vf[rs].X, _vf[rt].X);
+        if ((_currentFieldMask & 0b0010) != 0) _vf[rd].Y = DeterministicFloat.Max(_vf[rs].Y, _vf[rt].Y);
+        if ((_currentFieldMask & 0b0100) != 0) _vf[rd].Z = DeterministicFloat.Max(_vf[rs].Z, _vf[rt].Z);
+        if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = DeterministicFloat.Max(_vf[rs].W, _vf[rt].W);
     }
 
     private void ApplyLogical(uint function, uint rs, uint rt, uint rd)
@@ -298,11 +339,11 @@ public abstract class VectorUnit
             0x1E => (float)iv,
             0x1F => Int32BitsToSingle((int)v),
             0x20 => iv / 16.0f,
-            0x21 => Int32BitsToSingle((int)(v * 16f));
+            0x21 => Int32BitsToSingle((int)(v * 16f)),
             0x22 => iv / 4096.0f,
-            0x23 => Int32BitsToSingle((int)(v * 4096f));
+            0x23 => Int32BitsToSingle((int)(v * 4096f)),
             0x24 => iv / 32768.0f,
-            0x25 => Int32BitsToSingle((int)(v * 32768f));
+            0x25 => Int32BitsToSingle((int)(v * 32768f)),
             _ => v
         };
 
@@ -312,6 +353,9 @@ public abstract class VectorUnit
         if ((_currentFieldMask & 0b1000) != 0) _vf[rd].W = result;
     }
 
+    /// <summary>Mark COP2/EE interlock stall (cycles EE should wait).</summary>
+    public void AddCop2Interlock(int cycles) => _cop2InterlockCycles = Math.Max(_cop2InterlockCycles, cycles);
+
     private void HandleEfu(uint opcode, uint rs, uint rt, uint rd)
     {
         float a = _vf[rs].X;
@@ -320,9 +364,9 @@ public abstract class VectorUnit
 
         switch (opcode & 0x3F)
         {
-            case 0x1D: result = (b != 0f) ? a / b : 0f; break;
-            case 0x2E: result = (float)Math.Sqrt(Math.Abs(a)); break;
-            case 0x2F: result = (b != 0f) ? 1f / (float)Math.Sqrt(Math.Abs(b)) : 0f; break;
+            case 0x1D: result = DeterministicFloat.Div(a, b); break;
+            case 0x2E: result = DeterministicFloat.Sqrt(a); break;
+            case 0x2F: result = DeterministicFloat.Div(1f, DeterministicFloat.Sqrt(b)); break;
             default: result = a; break;
         }
 
@@ -384,8 +428,12 @@ public abstract class VectorUnit
         return _vf[index & 0x1F];
     }
 
+    public VuReg128 GetVfRegister(uint index) => GetVfRegister((int)index);
+
     public void SetVfRegister(int index, VuReg128 value)
     {
         _vf[index & 0x1F] = value;
     }
+
+    public void SetVfRegister(uint index, VuReg128 value) => SetVfRegister((int)index, value);
 }

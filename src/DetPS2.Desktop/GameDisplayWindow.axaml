@@ -1,0 +1,33 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="DetPS2.Desktop.GameDisplayWindow"
+        Title="DetPS2 — Game"
+        Width="960" Height="720"
+        MinWidth="640" MinHeight="448"
+        Background="#000"
+        WindowStartupLocation="CenterScreen">
+    <Grid RowDefinitions="*,Auto">
+        <Border Grid.Row="0" Background="#000" Margin="0">
+            <Grid>
+                <Viewbox Stretch="Uniform">
+                    <Image x:Name="GameImage" Stretch="None" />
+                </Viewbox>
+                <!-- Shown when GS has not drawn yet so black screen is not silent failure -->
+                <Border x:Name="NoVideoOverlay" Background="#CC0a0a12" IsVisible="True"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"
+                        Padding="24" CornerRadius="8" MaxWidth="520">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="No video yet" FontSize="18" FontWeight="SemiBold"
+                                   Foreground="#eee" HorizontalAlignment="Center" />
+                        <TextBlock x:Name="OverlayDetail" TextWrapping="Wrap" FontSize="12"
+                                   Foreground="#aaa" TextAlignment="Center"
+                                   Text="Emulation is running. Waiting for GS to draw pixels. Retail titles often need more EE/GS/IOP work before anything appears — check the session log for blockers." />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+        <Border Grid.Row="1" Background="#1a1a22" Padding="8,4">
+            <TextBlock x:Name="StatusLabel" Text="Running…" Foreground="#aaa" FontSize="11" />
+        </Border>
+    </Grid>
+</Window>

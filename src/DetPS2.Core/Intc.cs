@@ -3,25 +3,15 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Interrupt Controller (INTC) - Foundational implementation.
-/// 
-/// This class provides the core interrupt system for the PS2.
-/// It manages interrupt status, masking, and pending checks.
-/// 
-/// Design goals:
-/// - Clean, extensible structure
-/// - Clear separation between status and mask
-/// - Easy to connect to Emotion Engine (COP0) later
-/// - Foundation for realistic timer and DMA interrupt sources
+/// Interrupt Controller (Phase 8).
+/// STAT / MASK registers with MMIO; notifies EE to sync COP0 Cause.
 /// </summary>
-public sealed class Intc
+public sealed class Intc : ISchedulable
 {
-    /// <summary>
-    /// PS2 Interrupt sources (standard INTC bits).
-/// </summary>
     public enum InterruptSource
     {
         GS = 0,
+        SbUs = 1,
         VBlankStart = 2,
         VBlankEnd = 3,
         Vif0 = 4,
@@ -35,16 +25,20 @@ public sealed class Intc
         Timer3 = 12,
         Sif = 13,
         DmaController = 14,
-        // Add more as needed
     }
+
+    // EE INTC MMIO
+    public const uint AddrStat = 0x1000F000;
+    public const uint AddrMask = 0x1000F010;
 
     public uint Stat { get; private set; }
     public uint Mask { get; private set; }
 
-    public Intc()
-    {
-        Reset();
-    }
+    private Action? _onChanged;
+
+    public Intc() => Reset();
+
+    public void SetNotify(Action onChanged) => _onChanged = onChanged;
 
     public void Reset()
     {
@@ -52,49 +46,78 @@ public sealed class Intc
         Mask = 0;
     }
 
-    /// <summary>
-    /// Raise an interrupt (set the bit in Stat).
-    /// </summary>
     public void Raise(InterruptSource source)
     {
-        Stat |= (1u << (int)source);
+        uint bit = 1u << (int)source;
+        if ((Stat & bit) == 0)
+        {
+            Stat |= bit;
+            _onChanged?.Invoke();
+        }
+        else
+        {
+            Stat |= bit;
+            _onChanged?.Invoke();
+        }
     }
 
-    /// <summary>
-    /// Acknowledge (clear) an interrupt.
-    /// </summary>
     public void Acknowledge(InterruptSource source)
     {
         Stat &= ~(1u << (int)source);
+        _onChanged?.Invoke();
     }
 
-    /// <summary>
-    /// Check if a specific interrupt is pending (Stat & Mask).
-    /// </summary>
-    public bool IsPending(InterruptSource source)
+    /// <summary>Write-1-to-clear style for STAT.</summary>
+    public void WriteStatClear(uint value)
     {
-        return (Stat & (1u << (int)source)) != 0 &&
-               (Mask & (1u << (int)source)) != 0;
+        Stat &= ~value;
+        _onChanged?.Invoke();
     }
 
-    /// <summary>
-    /// Set the interrupt mask.
-    /// </summary>
+    public bool IsRaised(InterruptSource source) =>
+        (Stat & (1u << (int)source)) != 0;
+
+    public bool IsPending(InterruptSource source) =>
+        (Stat & (1u << (int)source)) != 0 &&
+        (Mask & (1u << (int)source)) != 0;
+
     public void SetMask(uint mask)
     {
         Mask = mask;
+        _onChanged?.Invoke();
     }
 
-    /// <summary>
-    /// Get the current pending interrupts (Stat & Mask).
-    /// Useful for COP0 Cause register updates.
-    /// </summary>
-    public uint GetPendingInterrupts()
+    /// <summary>Restore STAT/MASK from save state.</summary>
+    public void RestoreState(uint stat, uint mask)
     {
-        return Stat & Mask;
+        Stat = stat;
+        Mask = mask;
+        _onChanged?.Invoke();
     }
 
-    // Placeholder for future register read/write if needed
-    public void WriteRegister(uint address, uint value) { }
-    public uint ReadRegister(uint address) => 0;
+    public uint GetPendingInterrupts() => Stat & Mask;
+
+    public bool AnyPending => GetPendingInterrupts() != 0;
+
+    public uint ReadRegister(uint address)
+    {
+        return address switch
+        {
+            AddrStat => Stat,
+            AddrMask => Mask,
+            _ when (address & ~0xFu) == AddrStat => Stat,
+            _ when (address & ~0xFu) == AddrMask => Mask,
+            _ => 0
+        };
+    }
+
+    public void WriteRegister(uint address, uint value)
+    {
+        if (address == AddrStat || (address & ~0xFu) == AddrStat)
+            WriteStatClear(value);
+        else if (address == AddrMask || (address & ~0xFu) == AddrMask)
+            SetMask(value);
+    }
+
+    public int Step(ulong maxCycles) => 0;
 }

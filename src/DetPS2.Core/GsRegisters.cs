@@ -4,100 +4,107 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Graphics Synthesizer Register File.
-/// 
-/// Design goals for DetPS2Sharp:
-/// - Explicit fields for the most commonly used registers (clarity + easy SaveState)
-/// - Indexed access for generic A+D packet processing from GIF
-/// - Strong determinism: no hidden state, integer-only where possible
-/// - Easy to extend as we implement more of the GS pipeline
-/// 
-/// References: GS User's Manual chapters on registers and packet formats.
+/// Graphics Synthesizer register file (Phase 7).
+/// 64-bit storage (native GS register width). Deterministic sorted snapshot.
 /// </summary>
 public sealed class GsRegisters
 {
-    // ============================================
-    // Commonly used drawing registers (explicit for clarity)
-    // ============================================
+    public ulong PRIM { get; private set; }
+    public ulong RGBAQ { get; private set; }
+    public ulong ST { get; private set; }
+    public ulong UV { get; private set; }
+    public ulong XYZ2 { get; private set; }
+    public ulong XYZ3 { get; private set; }
+    public ulong FOG { get; private set; }
+    public ulong FOGCOL { get; private set; }
+    public ulong PRMODECONT { get; private set; }
+    public ulong PRMODE { get; private set; }
 
-    public uint PRIM     { get; private set; }   // 0x00 - Primitive type and settings
-    public uint RGBAQ    { get; private set; }   // 0x01 - Vertex color + Q
-    public uint ST       { get; private set; }   // 0x02 - Texture ST coordinates
-    public uint UV       { get; private set; }   // 0x03 - Texture UV coordinates
-    public uint XYZ2     { get; private set; }   // 0x04 - Vertex XYZ (draw)
-    public uint XYZ3     { get; private set; }   // 0x05 - Vertex XYZ (don't draw)
-    public uint FOG      { get; private set; }   // 0x0A - Fog value
+    public ulong TEX0_1 { get; private set; }
+    public ulong TEX0_2 { get; private set; }
+    public ulong TEX1_1 { get; private set; }
+    public ulong TEX1_2 { get; private set; }
+    public ulong TEX2_1 { get; private set; }
+    public ulong TEX2_2 { get; private set; }
+    public ulong CLAMP_1 { get; private set; }
+    public ulong CLAMP_2 { get; private set; }
+    public ulong TEXCLUT { get; private set; }
 
-    // Texture registers
-    public uint TEX0_1   { get; private set; }   // 0x06
-    public uint TEX0_2   { get; private set; }   // 0x07
-    public uint CLAMP_1  { get; private set; }   // 0x08
-    public uint CLAMP_2  { get; private set; }   // 0x09
+    public ulong FRAME_1 { get; private set; }
+    public ulong FRAME_2 { get; private set; }
+    public ulong ZBUF_1 { get; private set; }
+    public ulong ZBUF_2 { get; private set; }
+    public ulong XYOFFSET_1 { get; private set; }
+    public ulong XYOFFSET_2 { get; private set; }
+    public ulong SCISSOR_1 { get; private set; }
+    public ulong SCISSOR_2 { get; private set; }
+    public ulong TEST_1 { get; private set; }
+    public ulong TEST_2 { get; private set; }
+    public ulong ALPHA_1 { get; private set; }
+    public ulong ALPHA_2 { get; private set; }
+    public ulong FBA_1 { get; private set; }
+    public ulong FBA_2 { get; private set; }
+    public ulong DIMX { get; private set; }
+    public ulong DTHE { get; private set; }
+    public ulong COLCLAMP { get; private set; }
+    public ulong PABE { get; private set; }
 
-    // Framebuffer / Depth / Scissor (context 1 for now)
-    public uint FRAME_1  { get; private set; }   // 0x4C
-    public uint ZBUF_1   { get; private set; }   // 0x4D
-    public uint XYOFFSET_1 { get; private set; } // 0x4E
-    public uint SCISSOR_1  { get; private set; } // 0x50
-    public uint TEST_1     { get; private set; } // 0x52
-    public uint ALPHA_1    { get; private set; } // 0x53
-    public uint FBA_1      { get; private set; } // 0x54
-    public uint FRAME_2  { get; private set; }
-    public uint ZBUF_2   { get; private set; }
+    public ulong PMODE { get; private set; }
+    public ulong SMODE2 { get; private set; }
+    public ulong DISPLAY1 { get; private set; }
+    public ulong DISPLAY2 { get; private set; }
+    public ulong DISPFB1 { get; private set; }
+    public ulong DISPFB2 { get; private set; }
 
-    // Display / PCRTC related (subset)
-    public uint PMODE    { get; private set; }   // 0x00 in PCRTC space, but we keep it here for now
-    public uint SMODE2   { get; private set; }
+    public void SetPmode(ulong v) => PMODE = v;
+    public void SetSmode2(ulong v) => SMODE2 = v;
+    public void SetDisplay1(ulong v) => DISPLAY1 = v;
+    public void SetDisplay2(ulong v) => DISPLAY2 = v;
+    public void SetDispfb1(ulong v) => DISPFB1 = v;
+    public void SetDispfb2(ulong v) => DISPFB2 = v;
 
-    // ============================================
-    // Internal storage for generic register access
-    // ============================================
+    private readonly SortedDictionary<uint, ulong> _regs = new();
 
-    private readonly Dictionary<uint, uint> _registers = new();
-
-    public GsRegisters()
-    {
-        Reset();
-    }
+    public GsRegisters() => Reset();
 
     public void Reset()
     {
         PRIM = 0;
-        RGBAQ = 0xFFFFFFFF;
-        ST = 0;
-        UV = 0;
-        XYZ2 = 0;
-        XYZ3 = 0;
-        FOG = 0;
+        RGBAQ = 0xFFFFFFFFUL;
+        ST = UV = XYZ2 = XYZ3 = FOG = FOGCOL = 0;
+        PRMODECONT = 1;
+        PRMODE = 0;
 
-        TEX0_1 = 0;
-        TEX0_2 = 0;
-        CLAMP_1 = 0;
-        CLAMP_2 = 0;
+        TEX0_1 = TEX0_2 = TEX1_1 = TEX1_2 = TEX2_1 = TEX2_2 = 0;
+        CLAMP_1 = CLAMP_2 = TEXCLUT = 0;
 
-        FRAME_1 = 0;
-        ZBUF_1 = 0;
-        XYOFFSET_1 = 0;
-        SCISSOR_1 = 0;
-        TEST_1 = 0;
-        ALPHA_1 = 0;
-        FBA_1 = 0;
-        FRAME_2 = 0;
-        ZBUF_2 = 0;
+        FRAME_1 = FRAME_2 = ZBUF_1 = ZBUF_2 = 0;
+        XYOFFSET_1 = XYOFFSET_2 = 0;
+        SCISSOR_1 = PackScissor(0, 639, 0, 447);
+        SCISSOR_2 = SCISSOR_1;
+        TEST_1 = TEST_2 = 0;
+        ALPHA_1 = ALPHA_2 = 0;
+        FBA_1 = FBA_2 = 0;
+        DIMX = DTHE = 0;
+        COLCLAMP = 1;
+        PABE = 0;
 
-        PMODE = 0;
-        SMODE2 = 0;
-
-        _registers.Clear();
+        PMODE = SMODE2 = DISPLAY1 = DISPLAY2 = DISPFB1 = DISPFB2 = 0;
+        _regs.Clear();
     }
 
-    /// <summary>
-    /// Generic register write used by A+D packet processing.
-    /// Updates both the named field (when known) and the raw dictionary.
-    /// </summary>
-    public void WriteRegister(uint address, uint value)
+    public static ulong PackScissor(int x0, int x1, int y0, int y1) =>
+        ((ulong)(x0 & 0x7FF))
+        | ((ulong)(x1 & 0x7FF) << 16)
+        | ((ulong)(y0 & 0x7FF) << 32)
+        | ((ulong)(y1 & 0x7FF) << 48);
+
+    public void WriteRegister(uint address, uint value) => WriteRegister64(address, value);
+
+    public void WriteRegister64(uint address, ulong value)
     {
-        _registers[address] = value;
+        address &= 0x7F;
+        _regs[address] = value;
 
         switch (address)
         {
@@ -108,40 +115,43 @@ public sealed class GsRegisters
             case 0x04: XYZ2 = value; break;
             case 0x05: XYZ3 = value; break;
             case 0x0A: FOG = value; break;
-
+            case 0x3D: FOGCOL = value; break;
+            case 0x1A: TEXCLUT = value; break;
+            case 0x14: TEX1_1 = value; break;
+            case 0x15: TEX1_2 = value; break;
+            case 0x16: TEX2_1 = value; break;
+            case 0x17: TEX2_2 = value; break;
             case 0x06: TEX0_1 = value; break;
             case 0x07: TEX0_2 = value; break;
             case 0x08: CLAMP_1 = value; break;
             case 0x09: CLAMP_2 = value; break;
-
             case 0x4C: FRAME_1 = value; break;
             case 0x4D: ZBUF_1 = value; break;
             case 0x4E: XYOFFSET_1 = value; break;
+            case 0x4F: XYOFFSET_2 = value; break;
             case 0x50: SCISSOR_1 = value; break;
+            case 0x51: SCISSOR_2 = value; break;
             case 0x52: TEST_1 = value; break;
             case 0x53: ALPHA_1 = value; break;
             case 0x54: FBA_1 = value; break;
+            case 0x55: TEST_2 = value; break;
+            case 0x5A: ALPHA_2 = value; break;
+            case 0x5B: FBA_2 = value; break;
             case 0x5C: FRAME_2 = value; break;
             case 0x5D: ZBUF_2 = value; break;
-
-            case 0x00: /* PMODE handled in PCRTC later */ break;
-            case 0x01: SMODE2 = value; break;
-
-            default:
-                // Unknown or less common register - still stored for future use
-                break;
+            case 0x44: DIMX = value; break;
+            case 0x45: DTHE = value; break;
+            case 0x46: COLCLAMP = value; break;
+            case 0x49: PABE = value; break;
+            case 0x1C: PRMODECONT = value; break;
+            case 0x1D: PRMODE = value; break;
         }
     }
 
-    /// <summary>
-    /// Generic read (used for save states and debugging).
-    /// </summary>
-    public uint ReadRegister(uint address)
+    public ulong ReadRegister64(uint address)
     {
-        if (_registers.TryGetValue(address, out uint value))
-            return value;
-
-        // Fallback to named fields for known registers
+        address &= 0x7F;
+        if (_regs.TryGetValue(address, out ulong v)) return v;
         return address switch
         {
             0x00 => PRIM,
@@ -150,11 +160,11 @@ public sealed class GsRegisters
             0x03 => UV,
             0x04 => XYZ2,
             0x05 => XYZ3,
-            0x0A => FOG,
             0x06 => TEX0_1,
             0x07 => TEX0_2,
             0x08 => CLAMP_1,
             0x09 => CLAMP_2,
+            0x0A => FOG,
             0x4C => FRAME_1,
             0x4D => ZBUF_1,
             0x4E => XYOFFSET_1,
@@ -166,18 +176,88 @@ public sealed class GsRegisters
         };
     }
 
-    /// <summary>
-    /// Returns a snapshot for SaveState. Sorted for determinism.
-    /// </summary>
-    public IReadOnlyDictionary<uint, uint> GetAllRegisters()
+    public uint ReadRegister(uint address) => (uint)ReadRegister64(address);
+
+    public IReadOnlyDictionary<uint, ulong> GetAllRegisters()
     {
-        var snapshot = new SortedDictionary<uint, uint>(_registers);
-
-        // Ensure named registers are included even if never written via raw path
-        snapshot.TryAdd(0x00, PRIM);
-        snapshot.TryAdd(0x01, RGBAQ);
-        // ... add more as needed
-
-        return snapshot;
+        var snap = new SortedDictionary<uint, ulong>(_regs);
+        void Ensure(uint a, ulong v)
+        {
+            if (!snap.ContainsKey(a)) snap[a] = v;
+        }
+        Ensure(0x00, PRIM);
+        Ensure(0x01, RGBAQ);
+        Ensure(0x06, TEX0_1);
+        Ensure(0x50, SCISSOR_1);
+        Ensure(0x52, TEST_1);
+        Ensure(0x53, ALPHA_1);
+        return snap;
     }
+
+    public int PrimType => (int)(PRIM & 0x7);
+    public bool PrimIip => ((PRIM >> 3) & 1) != 0;
+    public bool PrimTme => ((PRIM >> 4) & 1) != 0;
+    public bool PrimFge => ((PRIM >> 5) & 1) != 0;
+    public bool PrimAbe => ((PRIM >> 6) & 1) != 0;
+    public bool PrimFst => ((PRIM >> 8) & 1) != 0;
+
+    public void GetScissor(out int x0, out int x1, out int y0, out int y1)
+    {
+        ulong s = SCISSOR_1;
+        x0 = (int)(s & 0x7FF);
+        x1 = (int)((s >> 16) & 0x7FF);
+        y0 = (int)((s >> 32) & 0x7FF);
+        y1 = (int)((s >> 48) & 0x7FF);
+        if (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0)
+        {
+            x0 = 0; x1 = 639; y0 = 0; y1 = 447;
+        }
+    }
+
+    public void GetXyOffset(out int ofx, out int ofy)
+    {
+        ofx = (int)(XYOFFSET_1 & 0xFFFF);
+        ofy = (int)((XYOFFSET_1 >> 32) & 0xFFFF);
+    }
+
+    public int TexWidthLog2
+    {
+        get
+        {
+            int tw = (int)((TEX0_1 >> 26) & 0xF);
+            return tw == 0 ? 6 : Math.Clamp(tw, 0, 10);
+        }
+    }
+
+    public int TexHeightLog2
+    {
+        get
+        {
+            int th = (int)((TEX0_1 >> 30) & 0xF);
+            return th == 0 ? 6 : Math.Clamp(th, 0, 10);
+        }
+    }
+
+    public int TexWidth => 1 << TexWidthLog2;
+    public int TexHeight => 1 << TexHeightLog2;
+    public int TexPsm => (int)((TEX0_1 >> 20) & 0x3F);
+    public uint TexBaseWords => (uint)(TEX0_1 & 0x3FFF);
+
+    /// <summary>ZTE (bit 16). When set, depth testing is active.</summary>
+    public bool DepthTestEnabled => ((TEST_1 >> 16) & 1) != 0;
+
+    /// <summary>ZTST (bits 17-18): 0=NEVER 1=ALWAYS 2=GEQUAL 3=GREATER</summary>
+    public int DepthTestMode => (int)((TEST_1 >> 17) & 0x3);
+
+    /// <summary>ZMSK (bit 19): 0=write Z, 1=mask (no write)</summary>
+    public bool DepthWriteEnabled => ((TEST_1 >> 19) & 1) == 0;
+
+    public int AlphaA => (int)(ALPHA_1 & 0x3);
+    public int AlphaB => (int)((ALPHA_1 >> 2) & 0x3);
+    public int AlphaC => (int)((ALPHA_1 >> 4) & 0x3);
+    public int AlphaD => (int)((ALPHA_1 >> 6) & 0x3);
+    public int AlphaFix => (int)((ALPHA_1 >> 32) & 0xFF);
+
+    public int ClampWms => (int)(CLAMP_1 & 0x3);
+    public int ClampWmt => (int)((CLAMP_1 >> 2) & 0x3);
 }

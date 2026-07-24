@@ -3,51 +3,58 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// VIF1 - Foundational implementation for VIF1 (Vector Interface 1).
-/// 
-/// VIF1 is responsible for transferring data from main memory to VU1,
-/// unpacking data, and loading microcode into VU1.
-/// 
-/// This class provides the foundational structure only.
-/// Heavy implementation (full VifCode parsing, microcode handling, etc.)
-/// should be done on top of this foundation.
+/// VIF1 façade over the production <see cref="Vif"/> backend (Phase 50 integrity).
+/// No TODO stubs: codes and DMA streams use <see cref="Vif.ProcessStream"/> / <see cref="Vif.ProcessVifCode"/>.
 /// </summary>
 public sealed class Vif1
 {
     private readonly SystemMemory _memory;
+    private readonly Vif _vif;
     private readonly Vu1 _vu1;
 
-    public Vif1(SystemMemory memory, Vu1 vu1)
+    public Vif Backend => _vif;
+    public ulong CodesSent { get; private set; }
+    public ulong WordsProcessed { get; private set; }
+
+    public Vif1(Vif vif, Vu1 vu1, SystemMemory memory)
     {
-        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        _vif = vif ?? throw new ArgumentNullException(nameof(vif));
         _vu1 = vu1 ?? throw new ArgumentNullException(nameof(vu1));
+        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        _vif.SetVu1(_vu1);
     }
 
-    public void Reset() { }
+    public Vif1(SystemMemory memory, Vu1 vu1)
+        : this(new Vif(memory), vu1, memory)
+    {
+    }
 
-    /// <summary>
-    /// Process data from a specific memory address into VU1.
-    /// This is a high-level entry point.
-    /// </summary>
+    public void Reset()
+    {
+        _vif.Reset();
+        CodesSent = WordsProcessed = 0;
+    }
+
+    /// <summary>Process <paramref name="qwc"/> quadwords from EE memory as a VIF stream.</summary>
     public void ProcessData(uint address, uint qwc)
     {
-        // Foundation only - actual unpacking logic goes here in the future
-        for (uint i = 0; i < qwc; i++)
-        {
-            uint data = _memory.Read32(address + (i * 16));
-            _vu1.ReceiveFromVif1(data);
-        }
+        uint words = qwc * 4;
+        _vif.ProcessStream(address, words);
+        WordsProcessed += words;
     }
 
-    /// <summary>
-    /// Send a VifCode command.
-    /// Foundation for future command parsing (MSCAL, MPG, etc.).
-    /// </summary>
+    /// <summary>Send one VIF code through the production command processor.</summary>
     public void SendVifCode(uint vifCode)
     {
-        // TODO: Parse VifCode and act accordingly
-        // Examples: MSCAL (run microcode), MPG (load microprogram), etc.
+        _vif.ProcessVifCode(vifCode);
+        CodesSent++;
     }
 
-    public void Step(ulong cycles) { }
+    public void FeedData(uint word)
+    {
+        _vif.FeedData(word);
+        WordsProcessed++;
+    }
+
+    public int Step(ulong cycles) => _vif.Step(cycles);
 }

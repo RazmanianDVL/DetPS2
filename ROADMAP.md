@@ -14,121 +14,244 @@
 **Status**: Complete
 
 ## Phase 3: Boot Real Software
-**Status**: Complete
+**Status**: Complete (ELF loader + BIOS load path)
 
 ## Phase 4: Determinism & Tooling
-**Status**: Complete
+**Status**: Complete (save states, smoke tests, master-cycle determinism)
 
 ## Phase 5: Vector Units + Accuracy (VU0 / VU1)
-**Status**: Complete
+**Status**: Complete (base ISA, conversions, EFU stall hooks, COP2 entry)
 
 ## Phase 6: Advanced Accuracy & Integration
+**Status**: Complete (Integration Lockdown)
 
-**Goal**: Deepen system integration and improve accuracy.
+**Delivered**:
+- Unified `ISchedulable` contract on all scheduled components
+- Single execution path: `Ps2System.RunFor` → `Scheduler.RunFor`
+- Work-cost aware adaptive slice sizing (`UseReportedWorkCost`)
+- SIF → INTC interrupt raise
+- SaveState restores `MasterCycles` (no host time)
+- GS test scene + software rasterizer path
+- Vu0/Vu1 wired into `Ps2System` / VIF / EE
+- Solution (`DetPS2.slnx`), smoke test project, Avalonia desktop shell
+- Clean Release build; all smoke tests pass
 
-**Status**: In Progress (Foundation Complete)
-
-**Completed Work**:
-- Created `Vu1` class with Vif1 data reception and quadword-aware buffering/processing
-- Updated `Vif` class with realistic quadword transfer support to VU1
-- Implemented real instructions: AND, OR, XOR, SLL, SRL, SRA
-- Implemented ITOF0/4/12/15 and FTOI0/4/12/15 conversion instructions
-- Added floating-point handling foundation (`SafeAdd`)
-- Improved COP2 routing in `EmotionEngine`
-- Created foundational `Scheduler.cs` + `ISchedulable` interface
-- Rebuilt `Intc.cs` with clean foundational structure and InterruptSource enum
-- Created foundational `Vif1.cs` structure
-- Created foundational `GsPipeline.cs`
-- Created foundational `Timer.cs` class
-- Created foundational `MmioBus.cs` for centralized MMIO handling
-- Created foundational `VifUnpacker.cs`
-- Created foundational `DmaChannel.cs`
-- Created foundational `Vif1CommandProcessor.cs`
-- Integrated Scheduler foundation into `Ps2System`
-- Strong determinism focus maintained
-- SaveState support
-
-**Remaining Work in Phase 6**:
-- Complete remaining VU instructions
-- Higher accuracy floating-point handling with determinism focus
-- Improved timing and synchronization between EE, IOP, and VUs (using Scheduler foundation)
-- Full Vif1 data unpacking, microcode handling, and command processing
-- Interrupt integration with Emotion Engine (COP0) + Timers
-- Expanded SaveState features
+**Intentionally deferred** (higher phases):
+- Full VU microcode / remaining ISA
+- Event-queue scheduler (vs fixed-slice round-robin)
+- Full VIF1 unpack + command processor integration
+- EE COP0 interrupt delivery from INTC
+- Expanded save-state component coverage (DMA/GS/VIF bodies)
 
 ## Phase 7: Graphics Pipeline & Rendering
+**Status**: Complete
 
-**Goal**: Implement a functional and accurate Graphics Synthesizer (GS).
-
-**Planned Work**:
-- Full GS register set and primitive rasterization
-- Texture mapping, filtering, and blending
-- Depth testing, alpha blending, and fog
-- Framebuffer and display pipeline
-- GIF path 1/2/3 handling
-- Basic software renderer (later replaceable with hardware acceleration)
-
-**Status**: Not started.
+**Delivered**:
+- Expanded 64-bit `GsRegisters` (PRIM/TEX/FRAME/SCISSOR/TEST/ALPHA/…)
+- GIF Path1 / Path2 / Path3 APIs; PACKED (A+D), REGLIST, IMAGE tag formats
+- Primitive assembly: point, line, line strip, triangle, strip, fan, sprite
+- Software rasterizer: scissor, Gouraud, depth test/write, alpha blend formula, fog
+- Texturing: procedural + local GS memory upload (PSMCT32), clamp/repeat
+- `GsPipeline` orchestrator; PCRTC present + VBlank → INTC
+- DMAC GIF uses start MADR for Path3
+- Phase 7 smoke tests (sprite, depth, blend, texture, GIF packed, DMAC path3)
 
 ## Phase 8: IOP & Subsystem Completion
+**Status**: Complete
 
-**Goal**: Complete the IOP subsystem and related components.
-
-**Planned Work**:
-- Full IOP (R3000A) instruction accuracy and timing
-- Complete SIF DMA and command handling
-- CDVD subsystem implementation
-- Full interrupt controller (INTC) behavior
-- DMA controller (DMAC) refinements
-- SPR (Scratchpad RAM) and other memory regions
-
-**Status**: Not started.
+**Delivered**:
+- Expanded IOP R3000A: delay slots, LO/HI, loads/stores, branches, COP0 MFC/MTC/RFE, SYSCALL
+- SIF command queue + SIF0/SIF1 DMA (EE RDRAM ↔ IOP RAM)
+- CDVD: TOC stub, deterministic sector buffer, optional ISO/memory mount
+- INTC STAT/MASK MMIO; EE COP0 Cause IP sync + `HasCop0Interrupt`
+- EE Timers T0–T3 (prescale, compare IRQ, clear-on-compare)
+- DMAC: 10 channels, stall, D_STAT/D_MASK, IRQ on complete, SIF/GIF/VIF hooks
+- Memory: IOP RAM 2MB, SPR (untranslated), BIOS ROM window, MMIO bus
+- MmioBus central decode for timers/INTC/DMAC/SIF
+- Phase 8 smoke tests (IOP loop, SIF DMA, timer→COP0, CDVD, SPR, MMIO, DMAC IRQ)
 
 ## Phase 9: System Integration & Compatibility
+**Status**: Complete
 
-**Goal**: Achieve basic commercial game boot and compatibility.
-
-**Planned Work**:
-- BIOS boot improvements and HLE refinement
-- Game loading and basic execution
-- Fixing major compatibility blockers
-- Sound/SPU2 stub or basic implementation
-- Input handling foundation
-- Save/load state robustness
-
-**Status**: Not started.
+**Delivered**:
+- `BiosHle`: graph/pad/file/thread/exit/write/timer syscalls (`$v1` number)
+- ELF loader: PT_LOAD, BSS zero, MIPS reginfo GP, `LoadIntoEe`, minimal ELF builder
+- Built-in homebrew GS demo ELF (clear + sprite + triangle via HLE)
+- ISO9660 minimal reader/builder; `SystemCnf` parse; `DiscBoot` synthetic + image boot
+- `PadInput` digital bits + MMIO + Desktop key map
+- `Spu2` register stub + silence mix
+- `BootTrace` PC sampling; stub BIOS absolute jump (lui/ori/jr)
+- Optional EE IRQ exception vector (`TakeExceptions` → `0x80000200`)
+- `COMPATIBILITY.md` tracker
+- Phase 9 smoke tests (homebrew GS, ISO boot, pad, SPU2, boot trace, save-state)
 
 ## Phase 10: Accuracy Polish & Optimization
+**Status**: Complete
 
-**Goal**: Improve overall accuracy and performance while maintaining determinism.
-
-**Planned Work**:
-- Cycle-accurate timing improvements (leveraging Scheduler foundation)
-- Better floating-point and vector unit accuracy
-- Performance optimizations (without breaking determinism)
-- Memory access timing and bus emulation
-- Scheduler improvements
-
-**Status**: Not started.
+**Delivered**:
+- Event-queue scheduler mode (`ScheduleEvent`, exact MasterCycles budget)
+- VU microprogram memory + run/stop (E-bit), COP2 interlock stalls on EE
+- EE MMI subset (PAND/POR/PXOR/PNOR/PADDW/PSUBW/PEXT*/PCPY*)
+- Optional I-cache line hit/miss accounting
+- `DeterministicFloat` policy + FLOAT_POLICY.md (no FMA, NaN canonicalize)
+- `BusContention` EE budget scaling under DMA
+- GS hot path: `GetFramebufferSpan`, `ClearFast`
+- `RegressionFixtures` FB FNV hash + cycle goldens
+- PERF_NOTES.md; Phase 10 smoke tests
 
 ## Phase 11: Tooling, Netplay & Advanced Features
+**Status**: Complete
 
-**Goal**: Build developer tooling and prepare for advanced features like netplay.
+**Delivered**:
+- `Debugger`: breakpoints, step-one, register/memory format; Desktop Debug menu + reg panel
+- `Tracer` v2: cycle-stamped in-memory/file log + `Tracer.Diff` (`docs/TRACE_DIFF.md`)
+- Save state **v4**: Deflate envelope, IOP/SPR/pad/VU micro/INTC; empty RAM ≪ 32MB
+- `InputRecording` tape (INPR) + identical replay hashes
+- `NetplaySession` lockstep quanta over shared pad frames
+- `IFramePresenter` / software + hardware stub; GS remains determinism source
+- `CONTRIBUTING.md`, `ARCHITECTURE_FREEZE.md`
 
-**Planned Work**:
-- Debugger and memory viewer
-- Execution tracer and logging tools
-- Save state compression and delta states
-- Netplay foundation (deterministic replay, input recording)
-- Optional hardware acceleration path (Vulkan/OpenGL)
-- Documentation and contributor guidelines
-
-**Status**: Not started.
+**Also**: hardware present is a stub (`HardwarePresentStub`); full Vulkan/OpenGL is future work on the same `IFramePresenter` seam.
 
 ---
+
+## Phase 12+: Depth campaign
+
+See **[NEXT_PLAN.md](NEXT_PLAN.md)**.
+
+### Phase 12 — EE Kernel, COP0 & Exceptions
+**Status**: Complete
+
+- COP0 MFC0/MTC0 (Status, Cause, EPC, Count, Compare, BadVAddr, PRId, Config)
+- ERET (clear EXL/ERL, restore PC)
+- Exception vectors (BEV-aware); IRQ → `0x80000200` + ERET
+- PreferHleSyscalls vs architectural SYSCALL
+- LD/SD, LWL/LWR/SWL/SWR (simplified), CACHE/SYNC nop
+- COP0 Count ticks with EE steps
+
+### Phase 13 — SIF RPC & IOP modules
+**Status**: Complete
+
+- DetPS2 RPC ABI: 16-byte EE packet (cmd, buffer, size, result)
+- Commands: open/close/read/write/seek/pad/cdvd/loadmodule/getmodule
+- `IopModuleHost` defaults FILEIO, PADMAN, CDVDMAN, SIO2MAN
+- `Sif.SubmitRpc` + `Step` processes queue; MMIO `+0x60` submit
+- HLE: `SysSifRpcCall` (0x80), `SysLoadModule` (0x81), `SysSifRpcSync` (0x82)
+
+### Phase 14 — Kernel HLE & BIOS path
+**Status**: Complete
+
+- `KernelState`: threads, semaphores, event flags, VBlank wait
+- EE stalls on `WaitingVblank`; PCRTC → `Hle.OnVblank`
+- Expanded BIOS HLE (0x40–0x4E, WaitVblank, LoadExec, FIO via RPC)
+- `RunBiosHarness` / BootTrace PC sampling
+
+### Phase 15 — EE / VU / GS accuracy
+**Status**: Complete
+
+- EE NOR / SLT / SLTU
+- VU1 `XgKick` → GIF Path1
+- GS PSMCT16 sample + `UploadTexture16`
+
+### Phase 16 — ISO multi-dir + CDVD async + pad analog
+**Status**: Complete
+
+- ISO9660 recursive dirs + `BuildWithDirs`
+- CDVD async read (cmd 0x13) + complete IRQ
+- Dual-analog sticks; RPC status buffer (8 bytes)
+
+### Phase 17 — Audio
+**Status**: Complete
+
+- `IAudioSink` + Capturing + `RingBufferAudioSink`
+- SPU2 deterministic square mix @ 48 kHz (6144 cycles/sample)
+- Desktop ring sink + meter drain (no host clock in core)
+
+### Phase 18 — Netplay transport + tape UX
+**Status**: Complete
+
+- Wire format `NetplayFrameMsg`; in-memory + TCP transports
+- Lockstep exchange + desync detector
+- Desktop: Record/Play `.inpr`; Netplay Host/Client
+
+### Phase 19 — GPU present path
+**Status**: Complete
+
+- `GpuFramePresenter` staging texture + upload stats
+- `DeterminismMode` forces software GS as hash truth
+- Desktop present mode toggle
+
+### Phase 20 — Compatibility + v1.0
+**Status**: Complete
+
+- `TitleFixtures` synthetic campaign (4 titles)
+- EE MULTU/DIVU/DSLL* + likely branches
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — **v1.0 shipped**
+
+### Phase 21 — Telemetry & Target Catalog (v2.0 campaign)
+**Status**: Complete
+
+- `Telemetry`: unknown opcode / SPECIAL / MMIO / syscall with PC + MasterCycles
+- BootTrace v2 JSON + telemetry blockers
+- `CompatEntry` schema + majority % helper
+- [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md) — **301** titles
+- Master plan: [PARITY_PLAN.md](PARITY_PLAN.md) (Phases 21–38)
+
+### Phases 22–26 (v2.0 foundation)
+**Status**: Complete (implementation + smoke)
+
+- **22** IRX loader + MCMAN/LIBSD defaults + MemoryCard stub  
+- **23** Kernel HLE expand + PreferHle toggle + LoadIrx syscall  
+- **24** CDVD dual-layer/stream/async multi-sector  
+- **25** EE LQ/SQ, LQC2/SQC2, COP1, BEQL nullify, more MMI  
+- **26** VIF MSCAL/MPG + VU1 micro run  
+
+### Phases 27–31
+**Status**: Complete
+
+- **27** DMAC chain/MFIFO/priority, timer gate/clock, bus knobs  
+- **28** GS PSMT8/CLUT, alpha test, TEXFLUSH  
+- **29** GsCommandBuffer + GPU scale/aspect  
+- **30** SPU2 ADPCM + multi-voice ADSR  
+- **31** SIO2, multitap, memory card  
+
+### Phases 32–36
+**Status**: Complete (implementation + smoke)
+
+- **32** EE/IOP basic-block JIT + VU accelerator (Det parity)  
+- **33** SnapshotEngine full/delta + CoW pages + fuzz  
+- **34** RollbackSession (predict/confirm/resim, 2P sim)  
+- **35** MajorityCampaign synthetic runner (gate math)  
+- **36** IPU command/DMA/FMV stub  
+
+### Phases 37–39 (v2.0 ship)
+**Status**: Complete (implementation)
+
+- **37** Settings, game library scan, frame limit, run-ahead, memcard I/O, crash log, Desktop menus, `publish.ps1`  
+- **38** Version **2.0.0**, RELEASE_NOTES, PERF_NOTES, netplay-certified synthetic list  
+- **39** `DxTracker` promote/save DX markdown (commercial DX ongoing)
+
+**Product version**: **v2.0.0** — synthetic gates green; commercial majority needs user dumps.
+
+### Phases 40–49 (commercial campaign → v3.0)
+**Status**: Complete (implementation + synthetic DoD)
+
+- **40** `UserMediaConfig` + `CommercialBootRunner`  
+- **41** `BlockerRanker`, boot-spine HLE, ≥10 synthetic P0  
+- **42** GS bilinear, VIF V4_32, homebrew P2  
+- **43** Host audio, SPU2 reverb, `InputMapper`  
+- **44** `VulkanFramePresenter` staging (Det hash unchanged)  
+- **45** EE JIT `EmitIl`, FastDelta  
+- **46** UDP + production rollback peer, netgraph, desync dump, soak cert  
+- **47** Scored majority campaign, TITLE_HACKS, DxTracker reports  
+- **48** IPU IQ/MPEG/SkipFMV + rescore policy  
+- **49** **v3.0.0** Commercial ship (checklist, notes, publish)
+
+**Product version**: **v3.0.0** — synthetic commercial gates green; real-catalog majority needs user dumps.
 
 ## Guiding Principles
 
 1. Determinism > Speed early on.
 2. Small, verifiable milestones.
 3. Clean, well-commented code.
+4. Integration is a first-class responsibility — the project must always build and pass smoke tests.

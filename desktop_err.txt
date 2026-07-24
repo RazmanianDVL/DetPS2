@@ -1,0 +1,14 @@
+Unhandled exception. System.NullReferenceException: Object reference not set to an instance of an object.
+   at DetPS2.Desktop.MainWindow.OnSpeedChanged(Object sender, SelectionChangedEventArgs e) in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\MainWindow.axaml.cs:line 497
+   at Avalonia.Interactivity.EventRoute.RaiseEventImpl(RoutedEventArgs e)
+   at Avalonia.Interactivity.EventRoute.RaiseEvent(Interactive source, RoutedEventArgs e)
+   at Avalonia.Interactivity.Interactive.RaiseEvent(RoutedEventArgs e)
+   at Avalonia.Controls.Selection.SelectionModel`1.CommitOperation(Operation operation, Boolean raisePropertyChanged)
+   at Avalonia.Controls.Selection.SelectionModel`1.BatchUpdateOperation.Dispose()
+   at Avalonia.Controls.Selection.SelectionModel`1.set_SelectedIndex(Int32 value)
+   at Avalonia.Controls.Primitives.SelectingItemsControl.EndUpdating()
+   at DetPS2.Desktop.MainWindow.!XamlIlPopulate(IServiceProvider, MainWindow) in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\MainWindow.axaml:line 120
+   at DetPS2.Desktop.MainWindow.InitializeComponent(Boolean loadXaml) in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\obj\Release\net9.0\Avalonia.Generators\Avalonia.Generators.NameGenerator.AvaloniaNameSourceGenerator\DetPS2.Desktop.MainWindow.g.cs:line 59
+   at DetPS2.Desktop.MainWindow..ctor() in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\MainWindow.axaml.cs:line 57
+   at DetPS2.Desktop.App.OnFrameworkInitializationCompleted() in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\App.axaml.cs:line 18
+   at DetPS2.Desktop.Program.Main(String[] args) in C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Desktop\Program.cs:line 11

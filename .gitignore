@@ -1,0 +1,34 @@
+# Build
+**/bin/
+**/obj/
+**/dist/
+*.user
+*.suo
+.vs/
+
+# User-supplied media (NEVER commit)
+user-media.json
+user-media.local.json
+**/bios/
+**/dumps/
+**/isos/
+*.BIN
+*.bin
+*.iso
+*.ISO
+*.cso
+*.CSO
+# allow source .bin references in docs only via explicit force if needed
+
+# Local emulator state
+**/memcard.ps2
+**/*.mcd
+**/*.dps2
+**/*.inpr
+detps2_frame.ppm
+detps2_*.ppm
+crash.log
+
+# OS
+Thumbs.db
+.DS_Store
