@@ -31,6 +31,13 @@ public sealed class MmioBus
     private uint _mchDrd;
     private int _rdramSdevId;
 
+    // Genuinely unmapped corners of the 0x10000000-0x1F000000 I/O window get real
+    // write-then-read memory semantics (like a mature reference emulator's generic
+    // fallback handler) instead of "always return 0" — code that uses an unmapped
+    // address as scratch memory (a real pattern seen on retail boots) should see what
+    // it wrote, not silently-wrong zeros. Telemetry still records the access either way.
+    private readonly Dictionary<uint, uint> _unmappedFallback = new();
+
     public void Attach(EeTimers timers, Intc intc, Dmac dmac, Sif sif, PadInput? pad = null, Spu2? spu2 = null, Sio2? sio2 = null, Ipu? ipu = null)
     {
         _timers = timers;
@@ -128,10 +135,14 @@ public sealed class MmioBus
             return _gs.ReadPrivileged32(address);
 
         // Unhandled MMIO read (Phase 21 telemetry)
-        if (_telemetry != null && address >= 0x10000000 && address < 0x1F000000)
+        if (address >= 0x10000000 && address < 0x1F000000)
         {
-            var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
-            _telemetry.UnknownMmioRead(cyc, pc, address);
+            if (_telemetry != null)
+            {
+                var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
+                _telemetry.UnknownMmioRead(cyc, pc, address);
+            }
+            return _unmappedFallback.TryGetValue(address, out uint v) ? v : 0;
         }
         return 0;
     }
@@ -248,10 +259,14 @@ public sealed class MmioBus
         }
 
         // Unhandled MMIO write (Phase 21 telemetry)
-        if (_telemetry != null && address >= 0x10000000 && address < 0x1F000000)
+        if (address >= 0x10000000 && address < 0x1F000000)
         {
-            var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
-            _telemetry.UnknownMmioWrite(cyc, pc, address);
+            if (_telemetry != null)
+            {
+                var (cyc, pc) = _context?.Invoke() ?? (0UL, 0UL);
+                _telemetry.UnknownMmioWrite(cyc, pc, address);
+            }
+            _unmappedFallback[address] = value;
         }
     }
 
@@ -286,5 +301,5 @@ public sealed class MmioBus
         }
     }
 
-    public void Reset() { }
+    public void Reset() => _unmappedFallback.Clear();
 }
