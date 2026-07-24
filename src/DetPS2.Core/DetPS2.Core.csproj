@@ -11,7 +11,10 @@
     <!-- Determinism & Performance friendly settings -->
     <TieredCompilation>false</TieredCompilation>
     <TieredPGO>false</TieredPGO>
-    <PublishAot Condition="'$(Configuration)' == 'Release'">true</PublishAot>
+    <!-- Not PublishAot: EeJit uses System.Reflection.Emit.DynamicMethod (incompatible with
+         Native AOT), and publish.ps1 does a framework-dependent publish, not AOT. Setting
+         PublishAot here only had the side effect of disabling reflection-based JSON
+         serialization for every Release build/run, breaking user-media.json / config loading. -->
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
 
