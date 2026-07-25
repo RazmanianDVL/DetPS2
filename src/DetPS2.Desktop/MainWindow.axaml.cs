@@ -325,7 +325,10 @@ public partial class MainWindow : Window
                     _system.RunFor(_cyclesPerTick);
                     // Phase 1: FMV advances on host present only (once per UI tick).
                     // Must not live inside RunFor or the logo burns in one EE slice.
-                    _system.MidwayAssist.OnHostPresent(_system);
+                    // ActiveQuirk aliases MidwayAssist when the mounted disc is SLUS_210.87
+                    // (see Ps2System.MidwayAssist) — call once via ActiveQuirk so this is
+                    // correctly serial-gated instead of firing for every commercial title.
+                    _system.ActiveQuirk?.OnHostPresent(_system);
                     _system.PresentFrame();
                 }
 

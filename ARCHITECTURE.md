@@ -97,13 +97,25 @@ Cdvd.ReadSector → 2048B buffer (ISO or deterministic stub)
 Memory: SPR @ 0x70000000 (before translate), MMIO via MmioBus
 ```
 
+### Interrupt delivery (updated 2026-07-25)
+
+The EE now genuinely takes IRQ exceptions and dispatches to game-registered handlers —
+see `docs/DEVELOPER_GUIDE.md` §4 for the full mechanism (`EmotionEngine.SyncInterruptsFromIntc`
+gates delivery on real COP0 `Status.IMx`/`Cause.IPx` masking; `TryDispatchRegisteredIntcHandler`
+redirects straight to whatever the game installed via `AddIntcHandler`/`AddDmacHandler` instead
+of a no-op vector). This replaced an earlier state where `TakeExceptions` was permanently off
+after fast-boot and Cause was flagged but never actually delivered.
+
 ### Current Limitations
 
 - Fixed-slice round-robin (no event queue yet)
 - Many components use simplified / instantaneous timing
 - DMA/VIF/GS timing are not cycle-accurate
 - GS texturing is a PSMCT32/local-mem subset (not full CLUT/swizzle)
-- EE does not yet take exception vectors on IRQ (Cause flagged only)
-- Full commercial BIOS/game boot is Phase 9+
+- IOP is HLE'd (module RPC surfaces stubbed/emulated), not real R3000A execution of every module
+- Full commercial BIOS/game boot is Phase 9+; see `docs/DEVELOPER_GUIDE.md` for current real-disc status
 
 This architecture prioritizes **determinism and clean integration** over raw accuracy in early phases.
+
+**For a comprehensive, current map of every subsystem and how to integrate new code (including
+the GameQuirks SDK for per-title HLE fixes), see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md).**

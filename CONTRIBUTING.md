@@ -1,5 +1,10 @@
 # Contributing to DetPS2
 
+**New here?** Read [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) first — a full map of
+every subsystem, the HLE/interrupt architecture, and (§7) the `GameQuirks` SDK for contributing
+per-title fixes without touching shared core files. This document is the process/rules layer on
+top of that.
+
 ## Principles
 
 1. **Determinism first** — no host clocks in core or save paths (`FLOAT_POLICY.md`).
@@ -22,8 +27,11 @@ dotnet run --project src/DetPS2.Desktop -c Release
 | Path | Role |
 |------|------|
 | `src/DetPS2.Core` | Emulator core (pure C#, determinism) |
+| `src/DetPS2.Core/GameQuirks` | Per-title HLE fix modules (`IGameQuirkModule`) — see `docs/DEVELOPER_GUIDE.md` §7 |
 | `src/DetPS2.Desktop` | Avalonia UI / debugger surface |
 | `Tests` | Smoke / regression suite |
+| `docs/DEVELOPER_GUIDE.md` | Full architecture map + how to integrate (start here) |
+| `docs/TITLE_HACKS.md` | Log of per-title workarounds and why a general fix wasn't possible |
 | `BUILD_PLAN.md` | Full phase plan to completion |
 | `ARCHITECTURE.md` | Contracts and registration order |
 | `COMPATIBILITY.md` | Title / path tracker |

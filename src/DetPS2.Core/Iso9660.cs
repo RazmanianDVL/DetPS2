@@ -463,7 +463,8 @@ public sealed class DiscBoot
         if (cnfBytes == null)
             return new Result { Success = false, Message = "SYSTEM.CNF not found" };
 
-        var cnf = SystemCnf.Parse(Encoding.ASCII.GetString(cnfBytes));
+        string cnfText = Encoding.ASCII.GetString(cnfBytes);
+        var cnf = SystemCnf.Parse(cnfText);
         string? bootName = cnf.BootFileName;
         if (bootName == null)
             return new Result { Success = false, Message = "BOOT2 missing", Cnf = cnf };
@@ -479,9 +480,16 @@ public sealed class DiscBoot
         if (system.Hle.SonyKernelMode)
             KernelBootstrap.InstallCommercialRuntime(system);
 
-        // Generic commercial path: ISO FILEIO + optional boot-FMV preload (any title)
         system.IopModules.BindDisc(system.Cdvd.MountedPath);
-        system.MidwayAssist.OnDiscMounted(system);
+
+        // GameQuirks SDK: resolve any registered module for this disc's serial (additive —
+        // most titles resolve to null and nothing else changes). See IGameQuirkModule.
+        // MidwayBootAssist is now itself an IGameQuirkModule (serial SLUS_210.87) — this is
+        // the only OnDiscMounted call site, so it's correctly serial-gated rather than firing
+        // for every commercial title regardless of which disc is mounted.
+        string? serial = MediaVerify.ExtractSerial(cnfText, bootName);
+        system.ActiveQuirk = GameQuirkRegistry.Resolve(serial);
+        system.ActiveQuirk?.OnDiscMounted(system);
 
         long mb = disc.Length / (1024 * 1024);
         return new Result

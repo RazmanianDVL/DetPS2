@@ -22,6 +22,7 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dump paths
 
 | Doc | Purpose |
 |-----|---------|
+| [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Start here to contribute** — full subsystem map, HLE layering, interrupt system, GameQuirks SDK |
 | [COMPLETENESS.md](COMPLETENESS.md) | **Honest done vs open** |
 | [COMMERCIAL_PLAN.md](COMMERCIAL_PLAN.md) | Phases 40–49 (synthetic campaign) |
 | [PARITY_PLAN.md](PARITY_PLAN.md) | v2.0 parity plan (Phases 21–39) |

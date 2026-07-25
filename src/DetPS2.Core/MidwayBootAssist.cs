@@ -16,8 +16,11 @@ namespace DetPS2.Core;
 /// </list>
 /// Goal: keep DetPS2 a PS2 emulator — not a native reimplementation of one game.
 /// </summary>
-public sealed class MidwayBootAssist
+public sealed class MidwayBootAssist : IGameQuirkModule
 {
+    public string Serial => "SLUS_210.87";
+    public string DisplayName => "Mortal Kombat: Shaolin Monks (USA)";
+
     public const uint WorklistBase = 0x0077A080;
     public const uint WorkItemsBase = 0x01F00000;
     public const int WorkItemStride = 0x40;
@@ -223,9 +226,12 @@ public sealed class MidwayBootAssist
         if (!_worklistPlanted && c > 100_000)
             PlantSifWorklist(sys);
 
-        AutoCompleteWorkItems(sys);
-        UnstickSifWaits(sys);
-        MaybeForceSifInit(sys);
+        if (!Ps2System.DisableAutoCompleteWorkItems)
+            AutoCompleteWorkItems(sys);
+        if (!Ps2System.DisableUnstickSifWaits)
+            UnstickSifWaits(sys);
+        if (!Ps2System.DisableForceSifInit)
+            MaybeForceSifInit(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -387,6 +393,16 @@ public sealed class MidwayBootAssist
         ulong sp = sys.EE.GetGpr(29).Lo;
         if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
             sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        // Clear every other GPR before the jump. This is a hand-crafted entry, not a real
+        // call — SifInitFn (and code reached from it) has no legitimate way to receive
+        // caller-set arguments here, so whatever was left in a0-a3/s0-s7/t0-t9/v0-v1/fp from
+        // wherever we yanked PC from is pure leftover noise. Left alone, that noise can look
+        // exactly like a valid pointer (observed: a stale code address survived into a
+        // "manager" register and got read as a list-descriptor pointer three functions later,
+        // producing a scan bound in the tens of millions instead of tripping an obviously
+        // invalid-pointer check) — zero is at least an unambiguous "empty" sentinel instead.
+        foreach (int reg in new[] { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 30 })
+            sys.EE.SetGpr(reg, default);
         sys.EE.PC = SifInitFn;
         sys.LastGoodEePc = SifInitFn;
         _sifForced = true;

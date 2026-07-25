@@ -128,6 +128,24 @@ public static class MediaVerify
         cnf.Contains("BOOT2", StringComparison.OrdinalIgnoreCase) ||
         cnf.Contains("cdrom0", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>Extract + normalize a disc serial (e.g. "SLUS_210.87") from SYSTEM.CNF text
+    /// and/or the resolved BOOT2 filename, without re-reading the disc. Used by DiscBoot to
+    /// key GameQuirkRegistry lookups the same way Identify() keys its own report.</summary>
+    public static string? ExtractSerial(string? cnfText, string? boot2)
+    {
+        if (!string.IsNullOrEmpty(cnfText))
+        {
+            var m = SerialRx.Match(cnfText);
+            if (m.Success) return NormalizeSerial(m.Groups[1].Value);
+        }
+        if (!string.IsNullOrEmpty(boot2))
+        {
+            var m = SerialRx.Match(boot2);
+            if (m.Success) return NormalizeSerial(m.Groups[1].Value);
+        }
+        return null;
+    }
+
     public static string NormalizeSerial(string s)
     {
         s = s.ToUpperInvariant().Replace("-", "_").Replace(" ", "");

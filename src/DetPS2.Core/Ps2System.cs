@@ -52,8 +52,43 @@ public sealed class Ps2System : ISchedulable
     public ulong LastGoodEePc { get; set; }
     private bool _commercialWorkerKicked;
     private bool _commercialSifInitKicked;
-    /// <summary>Shaolin Monks / Midway commercial boot + logo assist.</summary>
-    public MidwayBootAssist MidwayAssist { get; } = new();
+    /// <summary>Diagnostic-only escape hatch to test whether the real boot now proceeds
+    /// without the Midway forced-jump assists, now that several real EE/SIF-RPC bugs have
+    /// been fixed. Opt-in via blocker-trace/etc --no-assist or DETPS2_DISABLE_MIDWAY_ASSIST=1.</summary>
+    public static bool DisableMidwayAssist =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_MIDWAY_ASSIST") == "1";
+    /// <summary>Diagnostic-only: disables only the cruder MaybeForceSifInit direct-jump
+    /// fallback (which hands 0x482E98 whatever registers happened to be lying around),
+    /// while keeping KickMidwayMainPath's real-main() redirect active. Opt-in via
+    /// --no-force-sif or DETPS2_DISABLE_FORCE_SIF=1.</summary>
+    public static bool DisableForceSifInit =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_FORCE_SIF") == "1";
+    /// <summary>Same diagnostic purpose as DisableForceSifInit, targeting UnstickSifWaits
+    /// (which force-injects v0=1 and sometimes redirects PC on hardcoded PC-range polls).
+    /// Opt-in via --no-unstick-waits or DETPS2_DISABLE_UNSTICK_WAITS=1.</summary>
+    public static bool DisableUnstickSifWaits =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_UNSTICK_WAITS") == "1";
+    /// <summary>Same diagnostic purpose, targeting AutoCompleteWorkItems (force-completes
+    /// planted worklist items). Opt-in via --no-auto-complete or
+    /// DETPS2_DISABLE_AUTO_COMPLETE=1.</summary>
+    public static bool DisableAutoCompleteWorkItems =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_AUTO_COMPLETE") == "1";
+    /// <summary>Quirk module resolved for the currently mounted disc's serial, if any
+    /// (see GameQuirkRegistry). Null for the overwhelming majority of titles that need none.</summary>
+    public IGameQuirkModule? ActiveQuirk { get; set; }
+
+    private MidwayBootAssist? _fallbackMidwayAssist;
+    /// <summary>Shaolin Monks / Midway commercial boot + logo assist — now a real
+    /// IGameQuirkModule (see GameQuirks/), registered for serial SLUS_210.87.
+    /// Kept as a typed property (rather than requiring every existing caller to cast
+    /// ActiveQuirk) since Program.cs's probe-frame and several Desktop UI status displays
+    /// read its diagnostic fields (Status/LogoFrame/FramesPresented/...) directly. Resolves
+    /// to the live ActiveQuirk instance when the mounted disc is SLUS_210.87 (so there is
+    /// exactly one instance, correctly serial-gated); otherwise returns an idle fallback
+    /// instance that is never stepped, so other titles' boots never touch its hardcoded
+    /// MK-specific addresses.</summary>
+    public MidwayBootAssist MidwayAssist =>
+        (ActiveQuirk as MidwayBootAssist) ?? (_fallbackMidwayAssist ??= new MidwayBootAssist());
 
     public Ps2System()
     {
@@ -255,11 +290,19 @@ public sealed class Ps2System : ISchedulable
 
                 // Midway: jump to real main (0x212F70). Early kick (after ~100k) is
                 // required — delaying until the idle pump misses the GIF clear path.
-                if (!_commercialSifInitKicked && MasterCycles > 100_000)
+                // Gated by ActiveQuirk (i.e. the mounted disc's serial actually resolved to
+                // MidwayBootAssist) — previously this ran unconditionally for ANY commercial
+                // boot, poking MK-specific addresses regardless of which title was mounted.
+                if (!DisableMidwayAssist && ActiveQuirk is MidwayBootAssist &&
+                    !_commercialSifInitKicked && MasterCycles > 100_000)
                     KickMidwayMainPath();
 
-                // SIF worklist auto-complete + real MIDWAY.SFD logo presentation
-                MidwayAssist.Step(this);
+                // GameQuirks SDK: step whichever module (if any) matched the mounted disc's
+                // serial. --no-assist specifically disables MidwayBootAssist (kept for the
+                // existing blocker-trace diagnostic meaning "no Midway hacks") without
+                // disabling quirk modules for other titles in general.
+                if (ActiveQuirk != null && !(ActiveQuirk is MidwayBootAssist && DisableMidwayAssist))
+                    ActiveQuirk.Step(this);
 
                 ulong n = left > slice ? slice : left;
                 Scheduler.RunFor(n);
@@ -473,7 +516,10 @@ public sealed class Ps2System : ISchedulable
         LastGoodEePc = 0;
         _commercialWorkerKicked = false;
         _commercialSifInitKicked = false;
-        MidwayAssist.Reset();
+        // The fallback MidwayAssist instance (used when no quirk is active) is never
+        // stepped/touched, so it never accumulates real state and needs no reset here.
+        ActiveQuirk?.Reset();
+        ActiveQuirk = null;
     }
 
     /// <summary>Phase 21: boot harness JSON including telemetry blockers.</summary>
