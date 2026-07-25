@@ -23,6 +23,17 @@ public sealed class SonyKernelHle
     private readonly RealSifRpc _realRpc = new();
     public RealSifRpc RealRpc => _realRpc;
 
+    /// <summary>Looks up a game-registered AddIntcHandler entry so EmotionEngine can
+    /// dispatch directly to it instead of the synthesized (no-op) interrupt vector.</summary>
+    public bool TryGetIntcHandler(int cause, out uint handlerAddr) =>
+        _intcHandlers.TryGetValue(cause, out handlerAddr);
+
+    /// <summary>Looks up a game-registered AddDmacHandler entry (keyed by DMA channel, e.g.
+    /// DMA_CHANNEL_SIF0=5) — real hardware routes DMA-channel completion here, not through
+    /// AddIntcHandler; e.g. ps2sdk's sceSifInitCmd installs _SifCmdIntHandler this way.</summary>
+    public bool TryGetDmacHandler(int channel, out uint handlerAddr) =>
+        _dmacHandlers.TryGetValue(channel, out handlerAddr);
+
     public ulong Handled { get; private set; }
     public ulong Unknown { get; private set; }
     /// <summary>Last few Sony syscall numbers (ring) for boot diagnostics.</summary>
@@ -138,6 +149,16 @@ public sealed class SonyKernelHle
             case 0x10: // AddIntcHandler(cause, handler, next, arg, flag)
                 _intcHandlers[(int)a0] = a1;
                 result = (int)a0; // handler id
+                // KernelBootstrap deliberately leaves EE.TakeExceptions off after fast-boot
+                // ("without a full ISR that ACKs INTC, VBlank would storm the EE... games
+                // that install their own handlers via AddIntcHandler can enable later") but
+                // never actually flips it back on anywhere — the real, general fix belongs
+                // here: once the game has installed its own handler for a cause, it owns
+                // acknowledging that interrupt, so it's safe (and necessary — this is the
+                // only thing that lets any IRQ-driven wait, e.g. real SIF_CMD_INIT_CMD
+                // handshakes, ever resolve instead of spinning forever) to start taking
+                // exceptions.
+                _system.EE.TakeExceptions = true;
                 break;
             case 0x11: // RemoveIntcHandler
                 _intcHandlers.Remove((int)a0);
@@ -245,8 +266,13 @@ public sealed class SonyKernelHle
                 break;
             case 0x44: // WaitSema — block + yield to another thread when empty
                 {
-                    // Auto-create missing semas (titles sometimes Wait before Create races)
-                    if (a0 != 0 && _kernel.WaitSemaBlocking((int)a0) < 0 && !_kernel.LastWaitSemaBlocked)
+                    // Auto-create missing semas (titles sometimes Wait before Create races).
+                    // Must be a non-mutating existence check — WaitSemaBlocking decrements the
+                    // count as a side effect on success, so probing with it here would silently
+                    // consume a legitimate signal (e.g. one our own synchronous SIF RPC handling
+                    // just posted) before the real wait below ever sees it, forcing a spurious
+                    // block on every semaphore that starts at count 1.
+                    if (a0 != 0 && !_kernel.SemaExists((int)a0))
                     {
                         _kernel.CreateSema(0, 1);
                         // fall through with new id only if a0 was out of range — use given id map
@@ -254,10 +280,14 @@ public sealed class SonyKernelHle
                     int wr = _kernel.WaitSemaBlocking((int)a0);
                     if (_kernel.LastWaitSemaBlocked)
                     {
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8}");
                         if (!_kernel.SwitchToNext(ee))
                         {
                             // Nobody else runnable: park on VBlank instead of busy-spin.
                             // Next PCRTC VBlank wakes us so the frame loop can progress.
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no runnable thread)");
                             _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
@@ -545,6 +575,9 @@ public sealed class SonyKernelHle
         uint opt = _system.Memory.Read32(eePacket + 12);
         uint psize = word0 & 0xFF;
         uint dsize = word0 >> 8;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine($"[SIFCMD] cid=0x{cid:X8} dest=0x{dest:X8} opt=0x{opt:X8} psize={psize} dsize={dsize} eePacket=0x{eePacket:X8}");
 
         // System commands (Sony)
         switch (cid)

@@ -425,8 +425,9 @@ public static class SmokeTests
         sys.Timers.T0.WriteMode(0x80 | 0x100 | 0x40);
         // Unmask timer0 on INTC
         sys.Intc.SetMask(1u << (int)Intc.InterruptSource.Timer0);
-        // Enable EE interrupts (IE)
-        sys.EE.COP0_Status = 1;
+        // Enable EE interrupts (IE) and unmask IM2 (bit10) — real MIPS gates Cause.IP2
+        // (the INTC summary bit) by the matching Status.IM2 bit, not just global IE.
+        sys.EE.COP0_Status = 1 | (1u << 10);
 
         sys.Timers.Step(150);
 
@@ -1365,7 +1366,7 @@ public static class SmokeTests
         sys.EE.PC = 0x8000;
         sys.EE.TakeExceptions = true;
         sys.EE.PreferHleSyscalls = true;
-        sys.EE.COP0_Status = 1; // IE
+        sys.EE.COP0_Status = 1 | (1u << 10); // IE + IM2 (Cause.IP2 = INTC summary)
         sys.Intc.SetMask(1u << (int)Intc.InterruptSource.Timer0);
         sys.Timers.T0.WriteCompare(5);
         sys.Timers.T0.WriteMode(0x80 | 0x100 | 0x40);

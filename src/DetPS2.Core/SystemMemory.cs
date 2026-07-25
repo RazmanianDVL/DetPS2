@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace DetPS2.Core;
@@ -61,6 +62,8 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write8(ulong vaddr, byte value)
     {
+        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL & ~3UL) == WatchAddr.Value)
+            WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
         ulong paddr = TranslateAddress(vaddr);
 
         if ((vaddr & 0xFFFFFFFFUL) is >= SPR_BASE and < SPR_BASE + SPR_SIZE)
@@ -97,6 +100,8 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public uint Read32(ulong vaddr)
     {
+        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
+            WatchHits.Add((CurrentPcForWatch, vaddr, 0, false));
         if (IsScratchpad(vaddr))
         {
             int off = (int)((vaddr - SPR_BASE) & (SPR_SIZE - 1));
@@ -126,9 +131,19 @@ public sealed class SystemMemory
         return (uint)(Read8(vaddr) | (Read8(vaddr + 1) << 8) | (Read8(vaddr + 2) << 16) | (Read8(vaddr + 3) << 24));
     }
 
+    /// <summary>Diagnostic-only write watchpoint (opt-in via blocker-trace --watch=ADDR). Null
+    /// when unused so normal Write32/Write8 callers pay no cost; set once per process, so it's
+    /// intentionally not thread-safe — this is a single-process CLI diagnostic tool, not runtime
+    /// infrastructure.</summary>
+    public static uint? WatchAddr;
+    public static readonly List<(ulong Pc, ulong Vaddr, uint Value, bool IsWrite)> WatchHits = new();
+    public static ulong CurrentPcForWatch;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write32(ulong vaddr, uint value)
     {
+        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
+            WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
         if (IsScratchpad(vaddr))
         {
             int off = (int)((vaddr - SPR_BASE) & (SPR_SIZE - 1));

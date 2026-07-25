@@ -33,7 +33,14 @@ public static class KernelBootstrap
         // Vectors ready in RAM (BEV=0). Do NOT force TakeExceptions yet:
         // without a full ISR that ACKs INTC, VBlank would storm the EE.
         // Games that install their own handlers via AddIntcHandler can enable later.
-        sys.EE.COP0_Status = (sys.EE.COP0_Status & ~(1u << 22)) | (1u << 16) | 1u;
+        //
+        // Real BIOS boot also leaves Status.IM2 (bit10, INTC summary) and IM7 (bit15,
+        // Compare/Timer) set by the time it hands off to a game — our fast-boot skips that
+        // init sequence, so approximate its end state here. EmotionEngine.SyncInterruptsFromIntc
+        // gates delivery on these IM bits matching the pending Cause.IPx bits (real MIPS
+        // semantics); a game is still free to mask them back off itself (e.g. around a
+        // deliberate INTC_STAT busy-poll) via its own mtc0 Status writes.
+        sys.EE.COP0_Status = (sys.EE.COP0_Status & ~(1u << 22)) | (1u << 16) | (1u << 15) | (1u << 10) | 1u;
         sys.EE.TakeExceptions = false;
 
         // Mask open so software polling of INTC.STAT sees expected sources; delivery is polled via Sync

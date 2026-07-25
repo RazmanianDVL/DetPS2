@@ -311,6 +311,9 @@ public sealed class KernelState
 
     public int DeleteSema(int id) => _semas.Remove(id) ? 0 : -1;
 
+    /// <summary>Non-mutating existence check — unlike WaitSemaBlocking, does not consume a count.</summary>
+    public bool SemaExists(int id) => _semas.ContainsKey(id);
+
     public int SignalSema(int id)
     {
         if (!_semas.TryGetValue(id, out var s)) return -1;

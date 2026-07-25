@@ -66,6 +66,16 @@ public sealed class EmotionEngine : ISchedulable
     public ulong LO { get; set; }
     public ulong HI { get; set; }
 
+    /// <summary>Diagnostic-only: logs v0/v1/ra to stderr every time PC hits this address.
+    /// Opt-in via blocker-trace --pcbreak=ADDR; null (default) costs one branch per Step().</summary>
+    public static uint? PcBreakGpr;
+
+    /// <summary>MMI "pipeline 1" HI/LO — real R5900 HI/LO are 128-bit registers; regular
+    /// MULT/DIV/MADD use the lower 64 bits (HI/LO above), MULT1/DIV1/MADD1/MFHI1/MTHI1/
+    /// MFLO1/MTLO1 use this independent upper-64-bit lane.</summary>
+    public ulong LO1 { get; set; }
+    public ulong HI1 { get; set; }
+
     public uint COP0_Status { get; set; }
     public uint COP0_Cause { get; set; }
     public ulong COP0_EPC { get; set; }
@@ -191,7 +201,13 @@ public sealed class EmotionEngine : ISchedulable
 
         bool ie = (COP0_Status & 1) != 0 || (COP0_Status & (1u << 16)) != 0;
         bool blocked = (COP0_Status & 0x6) != 0; // EXL | ERL
-        bool causeIp = (COP0_Cause & ((1u << 10) | (1u << 15))) != 0;
+        // Real MIPS gates each Cause.IPx bit (8-15) by the matching Status.IMx bit at the
+        // same position — software (e.g. a busy-poll on INTC_STAT with IM left at 0 while it
+        // hasn't set up a dispatcher yet) can leave IE=1 with all IM bits clear specifically
+        // to keep interrupts from being taken while it observes STAT by hand. Without this,
+        // we'd take a phantom exception (and ack the STAT bit as a side effect) out from
+        // under exactly that kind of legitimate polling loop.
+        bool causeIp = (COP0_Cause & COP0_Status & 0xFF00u) != 0;
         InterruptPending = causeIp && ie && !blocked;
     }
 
@@ -312,7 +328,8 @@ public sealed class EmotionEngine : ISchedulable
             // Exception vectoring for external / compare IRQs
             if (_takeExceptions && InterruptPending)
             {
-                EnterException(GetExceptionVector(general: true), causeExcCode: 0); // Int
+                if (!TryDispatchRegisteredIntcHandler())
+                    EnterException(GetExceptionVector(general: true), causeExcCode: 0); // Int
                 executed++;
                 continue;
             }
@@ -342,6 +359,11 @@ public sealed class EmotionEngine : ISchedulable
 
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
+            if (SystemMemory.WatchAddr.HasValue) SystemMemory.CurrentPcForWatch = (ulong)PC;
+            if (PcBreakGpr.HasValue && PC == PcBreakGpr.Value)
+                Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} " +
+                    $"s0=0x{GetGpr(16).Lo:X} s1=0x{GetGpr(17).Lo:X} s2=0x{GetGpr(18).Lo:X} s3=0x{GetGpr(19).Lo:X} sp=0x{GetGpr(29).Lo:X} ra=0x{GetGpr(31).Lo:X} " +
+                    $"COP0_Status=0x{COP0_Status:X8} COP0_Cause=0x{COP0_Cause:X8} InterruptPending={InterruptPending} takeExceptions={_takeExceptions} cyc={cyc}");
             _branchWasLikely = false;
             HleRedirectPc = null;
             bool tookBranch = ExecuteInstruction(opcode);
@@ -421,6 +443,69 @@ public sealed class EmotionEngine : ISchedulable
 
     public void RaiseException(uint excCode, ulong? vector = null) =>
         EnterException(vector ?? GetExceptionVector(general: true), excCode);
+
+    /// <summary>
+    /// Our synthesized interrupt vector is a bare eret stub — real hardware instead runs a
+    /// BIOS dispatcher that walks the table AddIntcHandler builds and calls each registered
+    /// handler for the pending INTC source(s). Rather than hand-write that dispatcher in MIPS,
+    /// do the equivalent here: if the game has registered a handler for a currently pending
+    /// (and unmasked) source, take the exception exactly as EnterException would (EPC/Cause/EXL),
+    /// then redirect PC straight to that handler instead of the vector. a0=cause matches the
+    /// real `s32 (*handler_func)(s32 cause)` signature; ra is pointed at the vector itself
+    /// (already just `eret`), so the handler's own `jr ra` epilogue restores EPC and clears EXL
+    /// exactly like the real ISR return path would.
+    /// </summary>
+    private bool TryDispatchRegisteredIntcHandler()
+    {
+        var sony = _hle?.Sony;
+        if (sony == null || _intc == null) return false;
+
+        uint pending = _intc.GetPendingInterrupts();
+        for (int src = 0; src < 15; src++)
+        {
+            if ((pending & (1u << src)) == 0) continue;
+
+            bool found = sony.TryGetIntcHandler(src, out uint handlerAddr) && handlerAddr != 0;
+            int handlerArg = src;
+
+            // Real hardware routes SIF0 DMA-channel completion (our INTC "Sif" summary bit)
+            // to whatever the game registered via AddDmacHandler(DMA_CHANNEL_SIF0=5, ...) —
+            // e.g. ps2sdk's sceSifInitCmd installs _SifCmdIntHandler this way — not through
+            // AddIntcHandler. Fall back to the DMAC table for that channel when there's no
+            // direct INTC handler for this source.
+            if (!found && src == (int)Intc.InterruptSource.Sif &&
+                sony.TryGetDmacHandler(5, out uint dmacHandlerAddr) && dmacHandlerAddr != 0)
+            {
+                handlerAddr = dmacHandlerAddr;
+                handlerArg = 5; // DMA_CHANNEL_SIF0
+                found = true;
+            }
+
+            if (!found) continue;
+
+            EnterException(GetExceptionVector(general: true), causeExcCode: 0);
+            PC = handlerAddr;
+            SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
+            SetGpr(31, new Gpr128 { Lo = KernelBootstrap.Kseg0Interrupt }); // ra = vector's eret
+            return true;
+        }
+
+        // No game/kernel-registered handler owns any currently pending source. Real BIOS
+        // always acknowledges INTC internally (e.g. a default OS-tick handler) even before
+        // user code installs its own handler; our synthesized vector is a bare eret with no
+        // such bookkeeping, so leaving these unacked would re-raise the same interrupt on
+        // the very next instruction fetch forever, pinning PC in place. Ack them exactly
+        // like a minimal no-op default ISR would — but NOT VBlankStart: Pcrtc.Step()
+        // deliberately leaves that bit sticky ("games poll/ACK via INTC_STAT write-1-clear")
+        // specifically so code can busy-poll INTC_STAT directly with COP0 interrupts masked
+        // off, exactly as real hardware requires; auto-acking it here on behalf of some
+        // unrelated co-pending source would steal the event out from under that poll.
+        if (pending != 0)
+            for (int src = 0; src < 15; src++)
+                if ((pending & (1u << src)) != 0 && src != (int)Intc.InterruptSource.VBlankStart)
+                    _intc.Acknowledge((Intc.InterruptSource)src);
+        return false;
+    }
 
     private bool ExecuteInstruction(uint opcode)
     {
@@ -1000,25 +1085,156 @@ public sealed class EmotionEngine : ISchedulable
             return;
         }
 
-        if (rd == 0) return;
+        // Real tbl_MMI[64] (verified against PCSX2's R5900OpcodeTables.cpp/MMI.cpp — the
+        // func field directly indexes a 64-entry table; only 8/9/0x28/0x29 delegate to the
+        // MMI0-3 sub-tables above, everything else here is a direct top-level instruction).
         switch (func)
         {
+            case 0x00: // MADD — pipeline-0 32x32+64->64 accumulate (shares LO/HI with MULT/DIV)
+            {
+                long acc = unchecked((long)((uint)LO | ((ulong)(uint)HI << 32)));
+                long temp = acc + (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
+                LO = (ulong)(uint)temp;
+                HI = (ulong)(uint)(temp >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
+                break;
+            }
+            case 0x01: // MADDU
+            {
+                ulong acc = (uint)LO | ((ulong)(uint)HI << 32);
+                ulong tempu = unchecked(acc + (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo);
+                LO = (ulong)(uint)tempu;
+                HI = (ulong)(uint)(tempu >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
+                break;
+            }
             case 0x04: // PLZCW — leading zero/one run length per 32-bit lane (sign bit excluded)
             {
+                if (rd == 0) break;
                 var aw = ExtractW(GetGpr(rs));
                 var r = new uint[4];
                 for (int i = 0; i < 4; i++) r[i] = (uint)PlzcwLane(aw[i]);
                 SetGpr(rd, PackW(r));
                 break;
             }
+            case 0x10: // MFHI1
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = HI1 });
+                break;
+            case 0x11: // MTHI1
+                HI1 = GetGpr(rs).Lo;
+                break;
+            case 0x12: // MFLO1
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
+                break;
+            case 0x13: // MTLO1
+                LO1 = GetGpr(rs).Lo;
+                break;
+            case 0x18: // MULT1
+            {
+                long res = (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
+                LO1 = (ulong)(uint)res;
+                HI1 = (ulong)(uint)(res >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
+                break;
+            }
+            case 0x19: // MULTU1
+            {
+                ulong res = (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo;
+                LO1 = (ulong)(uint)res;
+                HI1 = (ulong)(uint)(res >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
+                break;
+            }
+            case 0x1A: // DIV1
+            {
+                int a = (int)(uint)GetGpr(rs).Lo, b = (int)(uint)GetGpr(rt).Lo;
+                if ((uint)a == 0x80000000u && b == -1) { LO1 = unchecked((ulong)(uint)0x80000000u); HI1 = 0; }
+                else if (b != 0) { LO1 = (ulong)(uint)(a / b); HI1 = (ulong)(uint)(a % b); }
+                else { LO1 = (ulong)(uint)(a < 0 ? 1 : -1); HI1 = (ulong)(uint)a; }
+                break;
+            }
+            case 0x1B: // DIVU1
+            {
+                uint a = (uint)GetGpr(rs).Lo, b = (uint)GetGpr(rt).Lo;
+                if (b != 0) { LO1 = (ulong)(uint)(a / b); HI1 = (ulong)(uint)(a % b); }
+                else { LO1 = unchecked((ulong)(uint)(-1)); HI1 = (ulong)(uint)(int)a; }
+                break;
+            }
+            case 0x20: // MADD1
+            {
+                long acc = unchecked((long)((uint)LO1 | ((ulong)(uint)HI1 << 32)));
+                long temp = acc + (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
+                LO1 = (ulong)(uint)temp;
+                HI1 = (ulong)(uint)(temp >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
+                break;
+            }
+            case 0x21: // MADDU1
+            {
+                ulong acc = (uint)LO1 | ((ulong)(uint)HI1 << 32);
+                ulong tempu = unchecked(acc + (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo);
+                LO1 = (ulong)(uint)tempu;
+                HI1 = (ulong)(uint)(tempu >> 32);
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
+                break;
+            }
+
+            // ---- Shift-immediate families (PSLLH/PSRLH/PSRAH over 8 halfwords,
+            // PSLLW/PSRLW/PSRAW over 4 words) — sa is the shift amount here, not a sub-opcode.
+            case 0x34: // PSLLH
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => unchecked((ushort)(x << (int)(s & 0xF))), sa); SetGpr(rd, PackH(h)); }
+                break;
+            case 0x36: // PSRLH
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)(x >> (int)(s & 0xF)), sa); SetGpr(rd, PackH(h)); }
+                break;
+            case 0x37: // PSRAH
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)((short)x >> (int)(s & 0xF)), sa); SetGpr(rd, PackH(h)); }
+                break;
+            case 0x3C: // PSLLW
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x << (int)s, sa); SetGpr(rd, PackW(w)); }
+                break;
+            case 0x3E: // PSRLW
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x >> (int)s, sa); SetGpr(rd, PackW(w)); }
+                break;
+            case 0x3F: // PSRAW
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => (uint)((int)x >> (int)s), sa); SetGpr(rd, PackW(w)); }
+                break;
+
             default:
                 _telemetry?.UnknownOpcode(CurrentCycle(), PC, opcode | 0x1C000000u);
                 break;
         }
     }
 
+    private static uint[] WordOp1(Gpr128 t, Func<uint, uint, uint> op, uint sa)
+    {
+        var tw = ExtractW(t);
+        var r = new uint[4];
+        for (int i = 0; i < 4; i++) r[i] = op(tw[i], sa);
+        return r;
+    }
+
+    private static ushort[] HalfOp1(Gpr128 t, Func<ushort, uint, ushort> op, uint sa)
+    {
+        var th = ExtractH(t);
+        var r = new ushort[8];
+        for (int i = 0; i < 8; i++) r[i] = op(th[i], sa);
+        return r;
+    }
+
     private void ExecuteMmiFamily(uint sa, uint func, uint rs, uint rt, uint rd)
     {
+        // PMTHI/PMTLO (MMI3, sa=8/9) write only to HI/HI1 or LO/LO1 — real encoding leaves
+        // rd unused (0), so they must run before the rd==0 guard below that every other
+        // (rd-producing) entry in this table relies on.
+        if (func == 0x29 && sa is 8 or 9)
+        {
+            var src = GetGpr(rs);
+            if (sa == 8) { HI = src.Lo; HI1 = src.Hi; } // PMTHI
+            else { LO = src.Lo; LO1 = src.Hi; }         // PMTLO
+            return;
+        }
+
         if (rd == 0) return;
         var a = GetGpr(rs);
         var b = GetGpr(rt);
@@ -1091,6 +1307,115 @@ public sealed class EmotionEngine : ISchedulable
             // ---- 64-bit copy-mix ----
             case (14u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = b.Lo, Hi = a.Lo }); break; // PCPYLD
             case (14u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = b.Hi, Hi = a.Hi }); break; // PCPYUD
+
+            // ---- MMI1 (func=0x28) remaining entries ----
+            case (1u << 6) | 0x28: // PABSW — operates on Rt, per-word signed abs with 0x80000000 clamp
+            {
+                var tw = ExtractW(b);
+                var r = new uint[4];
+                for (int i = 0; i < 4; i++)
+                    r[i] = tw[i] == 0x80000000u ? 0x7FFFFFFFu : (int)tw[i] < 0 ? unchecked((uint)(-(int)tw[i])) : tw[i];
+                SetGpr(rd, PackW(r));
+                break;
+            }
+            case (4u << 6) | 0x28: // PADSBH — low 4 halfwords = Rs-Rt, high 4 = Rs+Rt
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                var r = new ushort[8];
+                for (int i = 0; i < 4; i++) r[i] = unchecked((ushort)(ah[i] - bh[i]));
+                for (int i = 4; i < 8; i++) r[i] = unchecked((ushort)(ah[i] + bh[i]));
+                SetGpr(rd, PackH(r));
+                break;
+            }
+            case (5u << 6) | 0x28: // PABSH — operates on Rt, per-halfword signed abs with 0x8000 clamp
+            {
+                var th = ExtractH(b);
+                var r = new ushort[8];
+                for (int i = 0; i < 8; i++)
+                    r[i] = th[i] == 0x8000 ? (ushort)0x7FFF : (short)th[i] < 0 ? unchecked((ushort)(-(short)th[i])) : th[i];
+                SetGpr(rd, PackH(r));
+                break;
+            }
+            case (18u << 6) | 0x28: // PEXTUW — interleave UPPER 32-bit lanes: rt[2],rs[2],rt[3],rs[3]
+            {
+                var aw = ExtractW(a); var bw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { bw[2], aw[2], bw[3], aw[3] }));
+                break;
+            }
+            case (22u << 6) | 0x28: // PEXTUH — interleave UPPER 4 halfword lanes: rt[4..7] with rs[4..7]
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                SetGpr(rd, PackH(new[] { bh[4], ah[4], bh[5], ah[5], bh[6], ah[6], bh[7], ah[7] }));
+                break;
+            }
+            case (26u << 6) | 0x28: // PEXTUB — interleave UPPER 8 byte lanes: rt[8..15] with rs[8..15]
+            {
+                var ab = ExtractB(a); var bb = ExtractB(b);
+                var r = new byte[16];
+                for (int i = 0; i < 8; i++) { r[i * 2] = bb[8 + i]; r[i * 2 + 1] = ab[8 + i]; }
+                SetGpr(rd, PackB(r));
+                break;
+            }
+
+            // ---- MMI2 (func=0x09) remaining entries ----
+            case (8u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = HI, Hi = HI1 }); break; // PMFHI — full 128-bit HI:HI1
+            case (9u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = LO, Hi = LO1 }); break; // PMFLO — full 128-bit LO:LO1
+            case (10u << 6) | 0x09: // PINTH
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                SetGpr(rd, PackH(new[] { bh[0], ah[4], bh[1], ah[5], bh[2], ah[6], bh[3], ah[7] }));
+                break;
+            }
+            case (26u << 6) | 0x09: // PEXEH — swap Rt's US[0]<->US[2] and US[4]<->US[6] within each half
+            {
+                var th = ExtractH(b);
+                SetGpr(rd, PackH(new[] { th[2], th[1], th[0], th[3], th[6], th[5], th[4], th[7] }));
+                break;
+            }
+            case (27u << 6) | 0x09: // PREVH — reverse Rt's halfwords within each 64-bit half
+            {
+                var th = ExtractH(b);
+                SetGpr(rd, PackH(new[] { th[3], th[2], th[1], th[0], th[7], th[6], th[5], th[4] }));
+                break;
+            }
+            case (30u << 6) | 0x09: // PEXEW — swap Rt's UL[0]<->UL[2]
+            {
+                var tw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { tw[2], tw[1], tw[0], tw[3] }));
+                break;
+            }
+            case (31u << 6) | 0x09: // PROT3W — rotate Rt's lower 3 words left
+            {
+                var tw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { tw[1], tw[2], tw[0], tw[3] }));
+                break;
+            }
+
+            // ---- MMI3 (func=0x29) remaining entries ----
+            case (10u << 6) | 0x29: // PINTEH
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                SetGpr(rd, PackH(new[] { bh[0], ah[0], bh[2], ah[2], bh[4], ah[4], bh[6], ah[6] }));
+                break;
+            }
+            case (26u << 6) | 0x29: // PEXCH — swap Rt's US[1]<->US[2] and US[5]<->US[6] within each half
+            {
+                var th = ExtractH(b);
+                SetGpr(rd, PackH(new[] { th[0], th[2], th[1], th[3], th[4], th[6], th[5], th[7] }));
+                break;
+            }
+            case (27u << 6) | 0x29: // PCPYH — broadcast Rt.US[0] to lanes 0-3, Rt.US[4] to lanes 4-7
+            {
+                var th = ExtractH(b);
+                SetGpr(rd, PackH(new[] { th[0], th[0], th[0], th[0], th[4], th[4], th[4], th[4] }));
+                break;
+            }
+            case (30u << 6) | 0x29: // PEXCW — swap Rt's UL[1]<->UL[2]
+            {
+                var tw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { tw[0], tw[2], tw[1], tw[3] }));
+                break;
+            }
 
             default:
                 _telemetry?.UnknownOpcode(CurrentCycle(), PC, key | 0x1C000000u | 0x80000000u);

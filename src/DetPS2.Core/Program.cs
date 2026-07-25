@@ -14,6 +14,10 @@ using DetPS2.Core;
 //   detps2 commercial-checklist
 //   detps2 netplay-soak [frames]
 //   detps2 netplay-cert [frames]
+//   detps2 elf-info [user-media.json]
+//   detps2 blocker-trace [user-media.json] [cycles] [--dump=ADDR:LEN] [--trace-window=N]
+//   detps2 disasm <user-media.json> <cycles> <addr>:<len> [titleIndex]
+//   detps2 long-run <user-media.json> --hours=N [--log=PATH] [--checkpoint-seconds=S]
 
 if (args.Length > 0 && args[0].Equals("commercial-boot", StringComparison.OrdinalIgnoreCase))
 {
@@ -144,11 +148,20 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     ulong cycles = 5_000_000;
     foreach (var a in args)
         if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) cycles = c;
+    foreach (var a in args)
+        if (a.StartsWith("--watch=")) SystemMemory.WatchAddr = Convert.ToUInt32(a.Substring(8), 16);
+    foreach (var a in args)
+        if (a.StartsWith("--pcbreak=")) EmotionEngine.PcBreakGpr = Convert.ToUInt32(a.Substring(10), 16);
+    if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
+    if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
+    if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;
+    if (args.Contains("--no-auto-complete")) Ps2System.DisableAutoCompleteWorkItems = true;
 
     if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
     foreach (var title in cfg.Titles)
     {
         if (!title.Exists) { Console.WriteLine($"[{title.Id}] missing: {title.Path}"); continue; }
+        SystemMemory.WatchHits.Clear();
         var traceSys = new Ps2System();
         traceSys.Telemetry.Reset();
         traceSys.LoadBios(cfg.BiosPath);
@@ -165,6 +178,15 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         Console.WriteLine($"[{title.Id}] {msg}");
         traceSys.RunFor(cycles);
         Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
+        if (SystemMemory.WatchAddr.HasValue)
+        {
+            Console.WriteLine($"  watch 0x{SystemMemory.WatchAddr.Value:X8}: {SystemMemory.WatchHits.Count} access(es)");
+            foreach (var (wpc, wvaddr, wval, isWrite) in SystemMemory.WatchHits)
+            {
+                string kind = isWrite ? $"WROTE 0x{wval:X8}" : "READ ";
+                Console.WriteLine($"    pc=0x{wpc:X8} {kind} 0x{wvaddr:X8}  {EeDisassembler.Disassemble((uint)wpc, traceSys.Memory.Read32((uint)wpc))}");
+            }
+        }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
         if (traceSys.Hle.Sony != null)
         {
@@ -188,7 +210,10 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             uint len = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 0x40u;
             Console.WriteLine($"  dump 0x{start:X8}..0x{start + len:X8}:");
             for (uint addr = start; addr < start + len; addr += 4)
-                Console.WriteLine($"    {addr:X8}: {traceSys.Memory.Read32(addr):X8}");
+            {
+                uint word = traceSys.Memory.Read32(addr);
+                Console.WriteLine($"    {addr:X8}: {word:X8}  {EeDisassembler.Disassemble(addr, word)}");
+            }
             Console.WriteLine($"  GPRs: v0={traceSys.EE.GetGpr(2).Lo:X} v1={traceSys.EE.GetGpr(3).Lo:X} a0={traceSys.EE.GetGpr(4).Lo:X} a1={traceSys.EE.GetGpr(5).Lo:X} " +
                 $"a2={traceSys.EE.GetGpr(6).Lo:X} a3={traceSys.EE.GetGpr(7).Lo:X} t0={traceSys.EE.GetGpr(8).Lo:X} t1={traceSys.EE.GetGpr(9).Lo:X} " +
                 $"s0={traceSys.EE.GetGpr(16).Lo:X} s1={traceSys.EE.GetGpr(17).Lo:X} sp={traceSys.EE.GetGpr(29).Lo:X} ra={traceSys.EE.GetGpr(31).Lo:X}");
@@ -213,8 +238,226 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             foreach (var e in traceSys.Tracer.Entries) pcCounts[e.Pc] = pcCounts.GetValueOrDefault(e.Pc) + 1;
             Console.WriteLine($"  unique PCs in window: {pcCounts.Count}");
             foreach (var kv in pcCounts.OrderBy(k => k.Key))
-                Console.WriteLine($"    pc=0x{kv.Key:X8} hits={kv.Value} op=0x{traceSys.Memory.Read32((uint)kv.Key):X8}");
+            {
+                uint word = traceSys.Memory.Read32((uint)kv.Key);
+                Console.WriteLine($"    pc=0x{kv.Key:X8} hits={kv.Value} op=0x{word:X8}  {EeDisassembler.Disassemble((uint)kv.Key, word)}");
+            }
         }
+    }
+    Environment.Exit(0);
+}
+
+// detps2 long-run <media.json> --hours=N [--log=PATH] [--checkpoint-seconds=S] — boots the
+// first title and runs it in bounded chunks for up to N wall-clock hours, writing a flushed
+// checkpoint line to a log file after every chunk. Exists specifically so a multi-hour
+// unattended run survives the terminal being closed or the process being killed: the log file
+// is the durable record, not console output, which dies with the window. Ctrl+C writes one
+// final "interrupted" line before exiting; the log is otherwise append-only and safe to tail
+// while the run is still in progress.
+if (args.Length > 0 && args[0].Equals("long-run", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 long-run <media.json> --hours=N [--log=PATH] [--checkpoint-seconds=S]"); Environment.Exit(1); }
+    UserMediaConfig lcfg = UserMediaConfig.Load(args[1]);
+    double hours = 6.0;
+    string? logPath = null;
+    int checkpointSeconds = 60;
+    foreach (var a in args)
+    {
+        if (a.StartsWith("--hours=") && double.TryParse(a.AsSpan(8), out var h)) hours = h;
+        else if (a.StartsWith("--log=")) logPath = a.Substring(6);
+        else if (a.StartsWith("--checkpoint-seconds=") && int.TryParse(a.AsSpan(21), out var cs)) checkpointSeconds = cs;
+    }
+    logPath ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DetPS2", $"long-run-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+    Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+
+    if (lcfg.Titles.Count == 0) { Console.WriteLine("No titles in user-media.json"); Environment.Exit(1); }
+    var ltitle = lcfg.Titles[0];
+    var lsys = new Ps2System();
+    lsys.LoadBios(lcfg.BiosPath!);
+    var lmsg = lsys.BootDiscFile(ltitle.Path);
+
+    using var logWriter = new StreamWriter(logPath, append: true) { AutoFlush = true };
+    void Log(string line)
+    {
+        string stamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {line}";
+        Console.WriteLine(stamped);
+        logWriter.WriteLine(stamped);
+        logWriter.Flush();
+    }
+
+    Log($"=== long-run started: {ltitle.Id} target={hours}h checkpoint={checkpointSeconds}s log={logPath} ===");
+    Log($"boot: {lmsg.Message}");
+
+    bool stopRequested = false;
+    Console.CancelKeyPress += (_, ev) =>
+    {
+        ev.Cancel = true; // let us write the final line before exiting
+        stopRequested = true;
+    };
+    AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+    {
+        // Best-effort: fires on graceful shutdown paths; a hard taskkill /F or closed
+        // console window will NOT run this, which is exactly why checkpoints below
+        // (not this handler) are the actual durability guarantee for this feature.
+        try { Log("=== process exiting ==="); } catch { /* stream may already be gone */ }
+    };
+
+    var started = DateTime.Now;
+    var deadline = started.AddHours(hours);
+    ulong totalCycles = 0;
+    const ulong chunkCycles = 20_000_000; // ~a few seconds per chunk at typical interpreter throughput
+    var lastCheckpoint = started;
+    ulong lastPx = 0;
+    int stableCheckpoints = 0;
+
+    while (DateTime.Now < deadline && !stopRequested)
+    {
+        lsys.RunFor(chunkCycles);
+        totalCycles += chunkCycles;
+
+        if ((DateTime.Now - lastCheckpoint).TotalSeconds >= checkpointSeconds)
+        {
+            lastCheckpoint = DateTime.Now;
+            ulong px = (ulong)lsys.Gs.PixelsWritten;
+            bool stalledPx = px == lastPx;
+            stableCheckpoints = stalledPx ? stableCheckpoints + 1 : 0;
+            lastPx = px;
+            var elapsed = DateTime.Now - started;
+            Log($"checkpoint cyc={totalCycles} elapsed={elapsed:hh\\:mm\\:ss} PC=0x{lsys.EE.PC:X8} " +
+                $"px={px} gifPath3={lsys.Gif.Path3Transfers} dmac={lsys.Dmac.TransfersCompleted} " +
+                $"syscalls={lsys.Hle.SyscallCount} spu2Samples={lsys.Spu2.SamplesGenerated} " +
+                $"rpcBinds={lsys.Hle.Sony?.RealRpc.Binds} rpcCalls={lsys.Hle.Sony?.RealRpc.Calls} " +
+                $"pxStableFor={stableCheckpoints}x{checkpointSeconds}s");
+            if (stableCheckpoints > 0 && stableCheckpoints % 10 == 0)
+                Log($"NOTE: pixel count hasn't changed in {stableCheckpoints * checkpointSeconds}s — " +
+                    "may be a legitimate long CPU-bound stretch (matches loops seen earlier this session) " +
+                    "or a genuine new stall; worth a --dump/--trace-window pass at this PC if it persists.");
+        }
+    }
+
+    Log($"=== long-run ended: reason={(stopRequested ? "interrupted" : "deadline reached")} " +
+        $"totalCycles={totalCycles} PC=0x{lsys.EE.PC:X8} px={lsys.Gs.PixelsWritten} ===");
+    string ppmPath = Path.Combine(Path.GetDirectoryName(logPath)!, "long-run-final-frame.ppm");
+    lsys.Gs.SaveFramebufferAsPPM(ppmPath);
+    Log($"wrote final framebuffer: {ppmPath}");
+    Environment.Exit(0);
+}
+
+// detps2 find-store <media.json> <cycles> <targetAddrHex> [codeStart] [codeEnd] — boot, run N
+// cycles, then scan a code range for "lui rX, hi16 ... sw/sh/sb rY, lo16(rX)" instruction pairs
+// that write to the given absolute address, tracking a small forward window per lui so it
+// catches near (not just adjacent) store instructions. Used to find where game code populates a
+// specific global (e.g. a cached SIF RPC client-data pointer) so we can see what it's supposed
+// to hold and diagnose why our HLE leaves it in a "not yet ready" state.
+if (args.Length > 0 && args[0].Equals("find-store", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 4) { Console.WriteLine("usage: detps2 find-store <media.json> <cycles> <targetAddrHex> [codeStart] [codeEnd]"); Environment.Exit(1); }
+    UserMediaConfig fcfg = UserMediaConfig.Load(args[1]);
+    ulong fcycles = ulong.TryParse(args[2], out var fc) ? fc : 5_000_000ul;
+    uint target = Convert.ToUInt32(args[3], 16);
+    uint codeStart = args.Length > 4 ? Convert.ToUInt32(args[4], 16) : 0x00100000u;
+    uint codeEnd = args.Length > 5 ? Convert.ToUInt32(args[5], 16) : 0x00700000u;
+    var fsys = new Ps2System();
+    fsys.LoadBios(fcfg.BiosPath!);
+    var fmsg = fsys.BootDiscFile(fcfg.Titles[0].Path);
+    Console.WriteLine($"[{fcfg.Titles[0].Id}] {fmsg.Message}");
+    fsys.RunFor(fcycles);
+    Console.WriteLine($"after {fcycles} cyc: PC=0x{fsys.EE.PC:X8}; scanning 0x{codeStart:X8}..0x{codeEnd:X8} for stores to 0x{target:X8}");
+    ushort targetHi = (ushort)(target >> 16);
+    ushort targetLo = (ushort)(target & 0xFFFF);
+    if ((targetLo & 0x8000) != 0) targetHi++; // compiler emits lui(hi16+1) when the low half's sign bit would otherwise subtract
+    int found = 0;
+    for (uint addr = codeStart; addr < codeEnd; addr += 4)
+    {
+        uint op = fsys.Memory.Read32(addr);
+        if ((op >> 26) != 0x0F) continue; // lui
+        uint rt = (op >> 16) & 0x1F;
+        if ((ushort)(op & 0xFFFF) != targetHi) continue;
+        for (uint fwd = addr + 4; fwd < addr + 4 + (20 * 4) && fwd < codeEnd; fwd += 4)
+        {
+            uint op2 = fsys.Memory.Read32(fwd);
+            uint opc2 = op2 >> 26;
+            uint baseReg = (op2 >> 21) & 0x1F;
+            uint rtOrRs = (op2 >> 16) & 0x1F; // for lui/addiu/ori clobber-check on rt
+            if (opc2 is 0x28 or 0x29 or 0x2B && baseReg == rt && (ushort)(op2 & 0xFFFF) == targetLo)
+            {
+                Console.WriteLine($"  {addr:X8}: {op:X8}  {EeDisassembler.Disassemble(addr, op)}");
+                Console.WriteLine($"  {fwd:X8}: {op2:X8}  {EeDisassembler.Disassemble(fwd, op2)}   <== store to target");
+                found++;
+                break;
+            }
+            // stop scanning forward if rt gets clobbered by another lui/ori/addiu/move before a matching store
+            bool clobbers = (opc2 == 0x0F && rtOrRs == rt) || (opc2 == 0x0D && rtOrRs == rt) || (opc2 == 0x09 && rtOrRs == rt);
+            if (clobbers) break;
+        }
+    }
+    Console.WriteLine($"scan complete: {found} candidate store site(s) found");
+    Environment.Exit(0);
+}
+
+// detps2 find-word <media.json> <cycles> <wordHex> [codeStart] [codeEnd] — boot, run N cycles,
+// then scan a code range for an exact 32-bit instruction word match (e.g. a specific "jal
+// 0xTARGET" encoding) so callers of a given function can be found without a symbol table.
+if (args.Length > 0 && args[0].Equals("find-word", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 4) { Console.WriteLine("usage: detps2 find-word <media.json> <cycles> <wordHex> [codeStart] [codeEnd]"); Environment.Exit(1); }
+    UserMediaConfig wcfg = UserMediaConfig.Load(args[1]);
+    ulong wcycles = ulong.TryParse(args[2], out var wc) ? wc : 5_000_000ul;
+    uint target = Convert.ToUInt32(args[3], 16);
+    uint wStart = args.Length > 4 ? Convert.ToUInt32(args[4], 16) : 0x00100000u;
+    uint wEnd = args.Length > 5 ? Convert.ToUInt32(args[5], 16) : 0x00700000u;
+    uint wMask = 0xFFFFFFFFu;
+    foreach (var a in args)
+        if (a.StartsWith("--mask=")) wMask = Convert.ToUInt32(a.Substring(7), 16);
+    var wsys = new Ps2System();
+    wsys.LoadBios(wcfg.BiosPath!);
+    var wmsg = wsys.BootDiscFile(wcfg.Titles[0].Path);
+    Console.WriteLine($"[{wcfg.Titles[0].Id}] {wmsg.Message}");
+    wsys.RunFor(wcycles);
+    Console.WriteLine($"after {wcycles} cyc: PC=0x{wsys.EE.PC:X8}; scanning 0x{wStart:X8}..0x{wEnd:X8} for word 0x{target:X8} mask=0x{wMask:X8}");
+    int wfound = 0;
+    for (uint addr = wStart; addr < wEnd; addr += 4)
+    {
+        uint word = wsys.Memory.Read32(addr);
+        if ((word & wMask) != (target & wMask)) continue;
+        Console.WriteLine($"  {addr:X8}: {word:X8}  {EeDisassembler.Disassemble(addr, word)}");
+        wfound++;
+    }
+    Console.WriteLine($"scan complete: {wfound} match(es) found");
+    Environment.Exit(0);
+}
+
+// detps2 disasm <media.json> <cycles> <addr>:<len> [titleIndex] — boot, run N cycles, then
+// disassemble a raw address range with EeDisassembler. Standalone tool for reading real-boot
+// code without going through blocker-trace's fuller (and slower) telemetry/tracer machinery.
+if (args.Length > 0 && args[0].Equals("disasm", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 4) { Console.WriteLine("usage: detps2 disasm <media.json> <cycles> <addr>:<len> [titleIndex]"); Environment.Exit(1); }
+    UserMediaConfig cfg = UserMediaConfig.Load(args[1]);
+    ulong dcycles = ulong.TryParse(args[2], out var dc) ? dc : 5_000_000ul;
+    var drange = args[3].Split(':');
+    uint dstart = Convert.ToUInt32(drange[0], 16);
+    uint dlen = drange.Length > 1 ? Convert.ToUInt32(drange[1], 16) : 0x100u;
+    int titleIdx = args.Length > 4 && int.TryParse(args[4], out var ti) ? ti : 0;
+    if (titleIdx >= cfg.Titles.Count) { Console.WriteLine("No such title index"); Environment.Exit(1); }
+    var dtitle = cfg.Titles[titleIdx];
+    var dsys = new Ps2System();
+    dsys.LoadBios(cfg.BiosPath!);
+    var dmsg = dsys.BootDiscFile(dtitle.Path);
+    Console.WriteLine($"[{dtitle.Id}] {dmsg.Message}");
+    dsys.RunFor(dcycles);
+    Console.WriteLine($"after {dcycles} cyc: PC=0x{dsys.EE.PC:X8}");
+    Console.WriteLine($"disasm 0x{dstart:X8}..0x{dstart + dlen:X8}:");
+    for (uint addr = dstart; addr < dstart + dlen; addr += 4)
+    {
+        uint word = dsys.Memory.Read32(addr);
+        string marker = addr == (uint)dsys.EE.PC ? " <== PC" : "";
+        Console.WriteLine($"  {addr:X8}: {word:X8}  {EeDisassembler.Disassemble(addr, word)}{marker}");
     }
     Environment.Exit(0);
 }
@@ -306,6 +549,95 @@ if (args.Length > 0 && args[0].Equals("probe-iso", StringComparison.OrdinalIgnor
             Console.WriteLine($"{(f.IsDirectory ? "DIR " : "FILE")} {f.Path} size={f.Size} lba={f.ExtentLba}");
     }
     Console.WriteLine($"total entries={vol.Files.Count}");
+    Environment.Exit(0);
+}
+
+// detps2 extract-file <iso> <isoPathOrSubstring> <outPath> — pull a raw file off the disc image
+// so it can be examined directly (e.g. a real IOP .IRX module) rather than only through the
+// running emulator's memory.
+if (args.Length > 0 && args[0].Equals("extract-file", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 4) { Console.WriteLine("usage: detps2 extract-file <iso> <isoPathOrSubstring> <outPath>"); Environment.Exit(1); }
+    var evol = Iso9660.OpenFile(args[1]);
+    if (evol == null) { Console.WriteLine("bad iso"); Environment.Exit(2); }
+    var match = evol.Files.FirstOrDefault(f => !f.IsDirectory && f.Path.Contains(args[2], StringComparison.OrdinalIgnoreCase));
+    if (match == null) { Console.WriteLine($"no file matching '{args[2]}'"); Environment.Exit(1); }
+    byte[]? data = Iso9660.ReadFile(evol, match.Path);
+    if (data == null) { Console.WriteLine($"failed to read {match.Path}"); Environment.Exit(1); }
+    Directory.CreateDirectory(Path.GetDirectoryName(args[3])!);
+    File.WriteAllBytes(args[3], data);
+    Console.WriteLine($"extracted {match.Path} ({data.Length} bytes) -> {args[3]}");
+    Environment.Exit(0);
+}
+
+// detps2 elf-sections <filePath> — dump section headers of any ELF/IRX file (not just the
+// game's boot ELF via user-media.json) so extracted IOP modules can be inspected directly.
+if (args.Length > 0 && args[0].Equals("elf-sections", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 elf-sections <filePath>"); Environment.Exit(1); }
+    byte[] elf = File.ReadAllBytes(args[1]);
+    ushort etype = BitConverter.ToUInt16(elf, 0x10);
+    ushort emachine = BitConverter.ToUInt16(elf, 0x12);
+    uint eentry = BitConverter.ToUInt32(elf, 0x18);
+    uint eshoff = BitConverter.ToUInt32(elf, 0x20);
+    ushort eshentsize = BitConverter.ToUInt16(elf, 0x2E);
+    ushort eshnum = BitConverter.ToUInt16(elf, 0x30);
+    ushort eshstrndx = BitConverter.ToUInt16(elf, 0x32);
+    Console.WriteLine($"e_type=0x{etype:X4} e_machine={emachine} e_entry=0x{eentry:X8} shoff=0x{eshoff:X} shnum={eshnum} shstrndx={eshstrndx}");
+    if (eshoff == 0 || eshnum == 0) { Console.WriteLine("no section headers"); Environment.Exit(0); }
+    uint strTabOff = BitConverter.ToUInt32(elf, (int)(eshoff + eshstrndx * eshentsize + 16));
+    for (int i = 0; i < eshnum; i++)
+    {
+        int off = (int)eshoff + i * eshentsize;
+        uint nameOff = BitConverter.ToUInt32(elf, off);
+        uint type = BitConverter.ToUInt32(elf, off + 4);
+        uint addr = BitConverter.ToUInt32(elf, off + 12);
+        uint secOffset = BitConverter.ToUInt32(elf, off + 16);
+        uint size = BitConverter.ToUInt32(elf, off + 20);
+        int nameStart = (int)(strTabOff + nameOff);
+        int nameEnd = nameStart;
+        while (nameEnd < elf.Length && elf[nameEnd] != 0) nameEnd++;
+        string name = nameStart < elf.Length ? System.Text.Encoding.ASCII.GetString(elf, nameStart, nameEnd - nameStart) : "?";
+        Console.WriteLine($"  [{i}] {name,-16} type={type} addr=0x{addr:X8} fileOff=0x{secOffset:X6} size=0x{size:X6}");
+    }
+    Environment.Exit(0);
+}
+
+// detps2 iop-disasm <filePath> <fileOffsetHex>:<lenHex> — disassemble raw bytes from any file
+// as R3000A/IOP code (see IopDisassembler.cs). Operates on raw file offsets, not a running
+// system's memory — used to read real IOP module (.IRX) code extracted from the disc.
+if (args.Length > 0 && args[0].Equals("iop-disasm", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 3) { Console.WriteLine("usage: detps2 iop-disasm <filePath> <fileOffsetHex>:<lenHex>"); Environment.Exit(1); }
+    byte[] ibytes = File.ReadAllBytes(args[1]);
+    var irange = args[2].Split(':');
+    uint istart = Convert.ToUInt32(irange[0], 16);
+    uint ilen = irange.Length > 1 ? Convert.ToUInt32(irange[1], 16) : 0x100u;
+    for (uint off = istart; off < istart + ilen && off + 3 < ibytes.Length; off += 4)
+    {
+        uint word = BitConverter.ToUInt32(ibytes, (int)off);
+        Console.WriteLine($"  {off:X6}: {word:X8}  {IopDisassembler.Disassemble(off, word)}");
+    }
+    Environment.Exit(0);
+}
+
+// detps2 iop-find-word <filePath> <wordHex> [start] [end] — scan raw file bytes for an exact
+// 32-bit word match (e.g. a specific "jal TARGET" encoding), file-offset based.
+if (args.Length > 0 && args[0].Equals("iop-find-word", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 3) { Console.WriteLine("usage: detps2 iop-find-word <filePath> <wordHex> [start] [end]"); Environment.Exit(1); }
+    byte[] fbytes = File.ReadAllBytes(args[1]);
+    uint ftarget = Convert.ToUInt32(args[2], 16);
+    uint fstart = args.Length > 3 ? Convert.ToUInt32(args[3], 16) : 0u;
+    uint fend = args.Length > 4 ? Convert.ToUInt32(args[4], 16) : (uint)fbytes.Length;
+    int ffound = 0;
+    for (uint off = fstart; off + 3 < fend && off + 3 < fbytes.Length; off += 4)
+    {
+        if (BitConverter.ToUInt32(fbytes, (int)off) != ftarget) continue;
+        Console.WriteLine($"  {off:X6}: {ftarget:X8}  {IopDisassembler.Disassemble(off, ftarget)}");
+        ffound++;
+    }
+    Console.WriteLine($"scan complete: {ffound} match(es)");
     Environment.Exit(0);
 }
 
