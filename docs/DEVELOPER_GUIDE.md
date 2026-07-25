@@ -472,19 +472,41 @@ Verified over a 400M-cycle window past the post-logo transition: `Gs.PrimitivesD
 time, `Cdvd.SectorsRead` stays at `0` throughout, yet `Gs.PixelsWritten` grows by *exactly* one
 full framebuffer (640×448 = 286720) every single frame — consistent with a plain screen clear,
 not new rendering. Simulating repeated Start-button taps via `PadInput.Press`/`Release` made no
-difference (same PC pattern, same frozen counters). The rendered framebuffer is solid black the
-entire time (checked via periodic PPM snapshots converted with ffmpeg).
+difference. The real GS framebuffer is solid black throughout (confirmed via periodic PPM
+snapshots); a real user testing the Desktop app independently observed a frozen *logo* frame
+instead of black — both are correct and consistent: `Gs.HostOverlayActive` stays `true` because
+`MidwayBootAssist.KeepLogoVisible` only clears the display overlay once `Gif.Path3Transfers > 4`,
+which — per the same frozen counter above — never happens, so the cached "best" FMV frame stays
+shown on top of the real (black, empty) framebuffer. Confirmed directly from a real session log
+(`%TEMP%\DetPS2\session-*.log`, written by `SessionLog.cs`) — `overlay=True` the entire time.
 
-Working hypothesis, not yet confirmed: the iterated list's count (`*(s2+8)` in the loop) is
-plausibly zero — i.e. the scene/entity list this loop walks hasn't been populated yet — and
-`Cdvd.SectorsRead == 0` for 400M+ cycles suggests whatever should trigger loading the next
-screen's assets from disc hasn't fired. A `DETPS2_TRACE_RPC=1` trace across this exact window
-showed **zero** `RealSifRpc.HandleCall`/`HandleBind` activity at all, which is itself worth
-double-checking before trusting as a negative result (confirm the env var is actually reaching
-the process, and consider whether this game's CD/status queries route through a different,
-older SIF path that doesn't go through `RealSifRpc.cs`'s real-packet interception at all — see
-§5.4). Next step: instrument the object-list loop directly (its count field, and whether
-`0x27EEA0` ever actually runs) rather than continuing to infer purely from counters.
+Two candidate explanations were investigated and **ruled out**:
+- *Lost writes to unmapped memory*: the object-update loop's list-population code (traced to
+  `0x20C0D8`, a free-list/pool-init routine) writes real heap pointers into a table based at
+  `0x13400000` — outside any real hardware register range `MmioBus` models, so these register as
+  `UnknownMmioWrite` in telemetry. But `MmioBus._unmappedFallback` (see its own doc comment)
+  already gives genuinely-unmapped addresses real write-then-read memory semantics — confirmed by
+  reading `Read32`/`Write32` directly. Writes here round-trip correctly; nothing is being lost.
+- *The older `MidwayBootAssist` hacks (`UnstickSifWaits`/`AutoCompleteWorkItems`) are secretly
+  doing the real work, not this session's SIF-init fix*: disabling both via
+  `DETPS2_DISABLE_UNSTICK_WAITS=1 DETPS2_DISABLE_AUTO_COMPLETE=1` and rerunning `probe-frame`
+  produced a byte-identical result (`px=192389120` at the same cycle count) to the all-assists-on
+  run. The SIF-init gating fix alone (plus the always-on FMV/post-logo mechanisms) is what gets
+  this far — confirmed, not assumed.
+
+**Still open, and now sharper**: `DETPS2_TRACE_RPC=1` shows **zero** `RealSifRpc.HandleCall`/
+`HandleBind` activity across the entire run — sanity-checked against `DETPS2_TRACE_PREEMPT=1` in
+the identical invocation style (which *does* produce output), ruling out "the env var isn't
+reaching the process" as the explanation. So this is a real, confirmed negative result: whatever
+lets `sceSifBindRpc` succeed and the boot progress this far is **not** going through
+`RealSifRpc.cs`'s real-packet interception at all — some other path in `SonyKernelHle`'s SIF
+dispatch (see §5.1/§5.4, the "system-cid/heuristic handling" fallback `RealSifRpc.TryHandle`
+itself mentions) must be involved instead. Combined with `Cdvd.SectorsRead == 0` for 400M+ cycles
+straight, the next concrete step is instrumenting `SonyKernelHle`'s syscall-0x77 (`SifSetDma`)
+dispatch directly to see which branch real SIF traffic for this title actually takes, rather than
+continuing to infer from `RealSifRpc.cs`'s own counters — and separately, instrumenting the
+object-list loop itself (its count field, and whether `0x27EEA0` ever actually runs) to confirm
+the "empty entity list" theory directly instead of continuing to infer it from GS counters alone.
 
 ---
 
@@ -511,7 +533,7 @@ general-purpose ones:
 |---|---|
 | `blocker-trace <user-media.json> [--cycles=N] [--pcbreak=HEX] [--dump=ADDR:LEN] [--trace-window=N] [--no-assist\|--no-force-sif\|--no-unstick-waits\|--no-auto-complete]` | The main real-disc-boot diagnostic: boots the title(s) in `user-media.json`, runs N cycles, reports final PC/px/DMA/syscall counts. `--pcbreak` prints full GPR/COP0 state every time PC hits that address (careful — a tight spin loop can produce gigabytes of output in seconds; pipe through `head` or use a short `--cycles`). `--dump` disassembles/dumps raw memory at a fixed address. `--trace-window=N` captures the last N executed instructions once the run completes, useful for telling "genuinely stuck in a tight loop" apart from "just landed here when the cycle budget ran out" (see the PC=`0x480338` vs PC=`0x2062B4` investigation in git history for a worked example of this distinction mattering). The `--no-*` flags disable `MidwayBootAssist`'s synthetic hacks individually so you can measure how far *general* fixes alone get a boot — this is how the §4 interrupt-dispatch fixes were verified as real, not accidental. |
 | `long-run --hours=N --log=PATH` | Unattended multi-hour soak: boots, runs in chunks, writes flushed timestamped checkpoints. For overnight/background investigation. |
-| `probe-frame` | Boots MK Shaolin Monks specifically (hardcoded paths), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Calls `ActiveQuirk?.OnHostPresent` every iteration (required for `MidwayBootAssist`'s FMV pacing to advance at all — see §7.4's "Bug B" for what happens if a tool forgets this). Useful for a quick visual sanity check without setting up `user-media.json`; convert the output PPM with `ffmpeg -i in.ppm -update 1 out.png` to view it. |
+| `probe-frame [biosPath] [isoPath] [--watch=HEX]` | Boots MK Shaolin Monks specifically (hardcoded paths if omitted — pass positionally to override, flags starting with `--` are filtered out of positional matching), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Calls `ActiveQuirk?.OnHostPresent` every iteration (required for `MidwayBootAssist`'s FMV pacing to advance at all — see §7.4's "Bug B" for what happens if a tool forgets this). `--watch=HEX` reports every read/write to that address across the whole run (same mechanism as `blocker-trace`'s `--watch`). Useful for a quick visual sanity check without setting up `user-media.json`; convert the output PPM with `ffmpeg -i in.ppm -update 1 out.png` to view it. |
 | `extract-file <iso> <pathOrSubstring> <outPath>` | Pull a raw file (e.g. an `.IRX` module) off a mounted ISO for offline analysis. |
 | `elf-sections <file>` / `elf-info <file>` | Dump ELF/IRX section headers. |
 | `iop-disasm <file> <fileOffsetHex>:<lenHex>` | Disassemble raw IOP (R3000A) bytes — used for reverse-engineering real `.IRX` modules extracted via `extract-file` (see §5.3). |

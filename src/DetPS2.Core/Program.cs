@@ -685,10 +685,13 @@ if (args.Length > 0 && args[0].Equals("probe-str", StringComparison.OrdinalIgnor
 // detps2 probe-frame — boot MK and write framebuffer PPM + syscall hist
 if (args.Length > 0 && args[0].Equals("probe-frame", StringComparison.OrdinalIgnoreCase))
 {
-    string bios = args.Length > 1 ? args[1] : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+    string[] posArgs = args.Skip(1).Where(a => !a.StartsWith("--")).ToArray();
+    string bios = posArgs.Length > 0 ? posArgs[0] : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
         "PCSX2", "bios", "Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin");
-    string iso = args.Length > 2 ? args[2] : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+    string iso = posArgs.Length > 1 ? posArgs[1] : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         "Downloads", "Mortal Kombat - Shaolin Monks (USA).iso");
+    foreach (var a in args)
+        if (a.StartsWith("--watch=")) SystemMemory.WatchAddr = Convert.ToUInt32(a.Substring(8), 16);
     var p = new Ps2System();
     p.LoadBios(bios);
     p.BootDiscFile(iso);
@@ -762,6 +765,15 @@ if (args.Length > 0 && args[0].Equals("probe-frame", StringComparison.OrdinalIgn
     catch { /* optional */ }
     Console.WriteLine($"final assist={p.MidwayAssist.Status} presented={p.MidwayAssist.FramesPresented} px={p.Gs.PixelsWritten}");
     Console.WriteLine($"wrote {outPpm}");
+    if (SystemMemory.WatchAddr.HasValue)
+    {
+        Console.WriteLine($"  watch 0x{SystemMemory.WatchAddr.Value:X8}: {SystemMemory.WatchHits.Count} access(es)");
+        foreach (var (wpc, wvaddr, wval, isWrite) in SystemMemory.WatchHits)
+        {
+            string kind = isWrite ? $"WROTE 0x{wval:X8}" : "READ ";
+            Console.WriteLine($"    pc=0x{wpc:X8} {kind} 0x{wvaddr:X8}  {EeDisassembler.Disassemble((uint)wpc, p.Memory.Read32((uint)wpc))}");
+        }
+    }
     Environment.Exit(p.MidwayAssist.FramesPresented > 0 || p.Gs.PixelsWritten > 0 ? 0 : 1);
 
     static void WriteP6(string path, Gs gs)
