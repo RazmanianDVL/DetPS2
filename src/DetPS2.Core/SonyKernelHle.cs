@@ -21,6 +21,7 @@ public sealed class SonyKernelHle
     private const uint StubBase = 0x00081000;
     private int _stubSlots;
     private readonly RealSifRpc _realRpc = new();
+    public RealSifRpc RealRpc => _realRpc;
 
     public ulong Handled { get; private set; }
     public ulong Unknown { get; private set; }

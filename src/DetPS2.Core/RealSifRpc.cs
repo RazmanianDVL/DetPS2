@@ -34,6 +34,12 @@ public sealed class RealSifRpc
     public const uint SidPad1 = 0x80000100;
     public const uint SidPad2 = 0x80000101;
     public const uint SidMcServ = 0x80000400;
+    // Confirmed real CDVDMAN also registers additional sids in the same 0x8000059x family
+    // (a public search over a disassembled CDVDMAN v0.1.1 module lists 0x592/593/595/597/
+    // 59A/59C) — 0x592 is the one observed in a real boot; treated as the same CDVD family
+    // (status-query semantics) as SidCdScmd rather than left unknown, since it's clearly
+    // sibling infrastructure, not a fundamentally different module.
+    public const uint SidCdBase = 0x80000592;
 
     // CD_SCMD function numbers (ee/rpc/cdvd/src/scmd.c)
     private const uint ScmdReadClock = 0x01;
@@ -60,6 +66,8 @@ public sealed class RealSifRpc
     public ulong Calls { get; private set; }
     public ulong UnknownServiceCalls { get; private set; }
     public ulong UnknownBindSids { get; private set; }
+    private readonly List<uint> _unknownSidsSeen = new();
+    public IReadOnlyList<uint> UnknownSidsSeen => _unknownSidsSeen;
 
     public void Reset()
     {
@@ -67,6 +75,7 @@ public sealed class RealSifRpc
         _cdToArgBuf.Clear();
         _nextSlot = 0;
         Binds = Calls = UnknownServiceCalls = UnknownBindSids = 0;
+        _unknownSidsSeen.Clear();
     }
 
     /// <summary>Recognizes and handles a real RPC bind/call packet. Returns false for
@@ -102,8 +111,11 @@ public sealed class RealSifRpc
         _cdToSid[cdPtr] = sid;
         _cdToArgBuf[cdPtr] = argBuf;
 
-        if (sid != SidCdScmd && sid != SidCdNcmd && sid != SidPad1 && sid != SidPad2 && sid != SidMcServ)
+        if (sid != SidCdScmd && sid != SidCdNcmd && sid != SidPad1 && sid != SidPad2 && sid != SidMcServ && sid != SidCdBase)
+        {
             UnknownBindSids++;
+            _unknownSidsSeen.Add(sid);
+        }
 
         // SifRpcClientData_t (40B): +8 hdr.sema_id, +20 buf, +24 cbuf, +36 server.
         // buf/cbuf/server are opaque handles the client only ever echoes back to us
@@ -141,6 +153,13 @@ public sealed class RealSifRpc
     {
         switch (sid)
         {
+            case SidCdBase:
+                // Exact function-number table for this sid isn't independently confirmed —
+                // real CDVDMAN's 0x592 family member is likely a base/init-style service.
+                // Answer with a generic "ok" (1) rather than the unknown-service 0, on the
+                // hypothesis that this caller's own logic treats 0 as failure and halts.
+                return 1;
+
             case SidCdScmd:
                 return fno switch
                 {
