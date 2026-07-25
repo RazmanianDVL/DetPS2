@@ -625,6 +625,7 @@ public static class SmokeTests
             Cop1_CompareAndConvert();
             Cop1_Bc1t_SkipsDelayPlusTwo();
             LdSd_RoundTrip();
+            Lw_SignExtends();
 
             // Phase 13
             SifRpc_PadAndCdvd();
@@ -1500,6 +1501,37 @@ public static class SmokeTests
         if (ee.GetGpr(21).Lo != 333) throw new Exception($"BC1T did not skip correctly, $t5={ee.GetGpr(21).Lo}");
 
         Console.WriteLine("[Smoke] Cop1_Bc1t_SkipsDelayPlusTwo OK");
+    }
+
+    public static void Lw_SignExtends()
+    {
+        // Real MIPS III/R5900 LW sign-extends into the 64-bit GPR — that's exactly what
+        // distinguishes it from LWU (zero-extend). A prior bug here (uint->ulong implicit
+        // widening) turned 0xFFFFFFFF into +4294967295 instead of -1, which silently broke
+        // any signed comparison against a loaded negative 32-bit value — including a real
+        // "for (i=0; i<(unsigned)-1; i++) { ...; if (done) break; }" loop idiom in an actual
+        // game, which the bug turned into a true infinite loop.
+        var sys = new Ps2System();
+        sys.Memory.Write32(0x9000, 0xFFFFFFFFu); // -1 as a 32-bit value in memory
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x9000 });
+        uint lw = (0x23u << 26) | (4u << 21) | (5u << 16); // LW $5, 0($4)
+        sys.Memory.Write32(0xA000, lw);
+        sys.EE.PC = 0xA000;
+        sys.EE.Step(1);
+        long loaded = (long)sys.EE.GetGpr(5).Lo;
+        if (loaded != -1)
+            throw new Exception($"LW did not sign-extend: got {loaded} (0x{sys.EE.GetGpr(5).Lo:X}), expected -1");
+
+        // The actual failure shape: SLT (signed) comparing a small positive value against
+        // the loaded -1 must be false — a zero-extending bug made this true forever.
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 5 }); // small positive
+        uint slt = (0x00u << 26) | (6u << 21) | (5u << 16) | (7u << 11) | 0x2A; // SLT $7, $6, $5
+        sys.Memory.Write32(0xA004, slt);
+        sys.EE.Step(1);
+        if (sys.EE.GetGpr(7).Lo != 0)
+            throw new Exception($"SLT(5, -1) should be false, got {sys.EE.GetGpr(7).Lo}");
+
+        Console.WriteLine("[Smoke] Lw_SignExtends OK");
     }
 
     public static void LdSd_RoundTrip()
