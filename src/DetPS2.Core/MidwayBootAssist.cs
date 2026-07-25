@@ -371,8 +371,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         if (_sifForced) return;
         if (sys.MasterCycles < 1_500_000) return;
-        // After first real clear, if SIF never ran, force-call sif-init
-        if (sys.Gif.Path3Transfers == 0 && sys.Gs.PixelsWritten == 0) return;
+        // Previously gated on "GS has already drawn something," on the assumption real SIF
+        // init would only be worth forcing once boot had visibly progressed. Traced precisely
+        // (2026-07-25): sceSifBindRpc's underlying packet-pool allocator (_rpc_get_packet,
+        // real vaddr 0x483060) fails because sceSifInitRpc (real vaddr 0x482E98, confirmed by
+        // disassembling its body against real ps2sdk's ee/kernel/src/sifrpc.c) never runs at
+        // all in this game's observed boot path — searched every one of its 14 real call sites
+        // across the whole binary; none fire before the pad-bind retry starts. That's true
+        // whether or not GS has drawn anything yet (pad init can legitimately happen before
+        // any rendering), so requiring prior GS activity here just prevented this fix from
+        // ever firing for that ordering. Removed; the cycle-count/SifDmaCalls guards below are
+        // sufficient to avoid interfering with a boot that's already succeeding on its own.
         if (sys.Hle.Sony != null && sys.Hle.Sony.SifDmaCalls > 0)
         {
             _sifForced = true;

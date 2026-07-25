@@ -435,6 +435,51 @@ yet) — worth doing once a second title's `GameQuirks` module exists and its ac
 known, per §7.1's general guidance to hardening the interface against real second-consumer needs
 rather than guessing now.
 
+### 7.4 MK Shaolin Monks boot trace — current state (2026-07-25)
+
+Neither the "pure" boot (all `MidwayBootAssist` hacks disabled via `--no-assist` etc., testing
+whether general fixes alone are sufficient) nor the assisted boot currently reaches a real menu
+or gameplay. Traced precisely, instruction-by-instruction, to two distinct, now-understood bugs:
+
+**Bug A (root-caused, partially mitigated): `sceSifInitRpc` never runs.**
+`sceSifBindRpc` (real vaddr `0x4834E0`) fails because its packet-pool allocator
+(`_rpc_get_packet`, real vaddr `0x483060`) sees `_sif_rpc_data.pkt_table_len` (at `0x77A088`,
+offset+8 of the real `struct rpc_data` — confirmed field-by-field against
+`ee/kernel/src/sifrpc.c`) still zero. `sceSifInitRpc` (real vaddr `0x482E98`) is the only code
+that sets it (`= 32`, confirmed by disassembling its body) — and it never runs: every one of its
+14 real call sites across the whole binary was checked with `find-word`/`--pcbreak`, and none
+fire before the pad-bind retry starts (`main()` itself reaches this point directly, single
+thread — an earlier "separate thread starvation" hypothesis this session was empirically
+disproven via `DETPS2_TRACE_PREEMPT=1`). `MidwayBootAssist.MaybeForceSifInit` already force-calls
+this exact real function (not a synthetic memory-poke) — but was gated on
+`Gs.PixelsWritten > 0 || Gif.Path3Transfers > 0`, a chicken-and-egg condition when pad/input needs
+to init before anything renders. That gate was removed 2026-07-25 (see the method's comment) —
+verified: full smoke suite green, zero change to the already-working assisted-boot outcome
+(confirming no regression), and it's the correct fix for the pure-path ordering gap even though
+the pure path still doesn't reach further on its own (see Bug B).
+
+**Bug B (found, not yet root-caused): FMV/logo frame count never advances.**
+Even with `MaybeForceSifInit` firing successfully (confirmed: `dmac`/`sifBytes` counters go
+nonzero), the boot plateaus — verified flat from 500M cycles all the way to 3B cycles (identical
+PC/pixel/syscall counts) via `blocker-trace`, and separately via `probe-frame` (which, unlike
+`blocker-trace`, does call `OnHostPresent` every iteration — ruling out "the CLI harness just
+never drives the present loop" as the explanation). `MidwayBootAssist.LogoFrame` gets set to `1`
+exactly once (confirms `MaybeStartLogo`'s first-frame path ran) but never increments across 80+
+subsequent `OnHostPresent`/`AdvanceLogoOneFrame` calls, and `Status` stays `"sif-forced"` rather
+than ever showing `"logo-playing"` again — meaning `AdvanceLogoOneFrame` itself, or the
+`_logoActive`/pacing state it depends on, isn't behaving the way a straight reading of the code
+implies. Root cause not yet found — the likely next step is instrumenting
+`OnHostPresent`/`AdvanceLogoOneFrame` directly (a `DETPS2_TRACE_*`-style env-gated trace, matching
+the pattern already used for RPC/preemption) rather than continuing to infer state from the
+outside, since static reasoning about this one hit a contradiction (the code path that would
+explain the observed `LogoFrame`/`Status` combination isn't obvious from inspection alone).
+
+PC ends up oscillating among three addresses (`0x474F94`/`0x476A28`/`0x476D44`) inside a
+real MMI-based memory/string-scan routine (`psubb`/`pnor`/`pand`/`pcpyld` — a classic SWAR
+`strlen`-style byte scan) — this is very likely *not itself* the bug (it's plausibly a hot,
+frequently-called utility function, not a spin loop), just where the periodic 1M-cycle samples
+happen to land while whatever outer loop calls it repeats without completing.
+
 ---
 
 ## 8. Save states & determinism contracts
