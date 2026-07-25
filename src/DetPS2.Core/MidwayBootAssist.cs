@@ -30,9 +30,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     public const uint MainSifCall = 0x002131C8;
     public const uint SifInitFn = 0x00482E98;
     public const uint WaitWorkLoop = 0x002062D4;
+    /// <summary>Scratch-RAM "return address" for the non-destructive MaybeForceSifInit call
+    /// (see its own doc comment) — holds a tight self-loop the interrupted code's real ra
+    /// gets pointed at temporarily, not a real caller. Must be >= 0x100000: anything below
+    /// that is "low memory" as far as KernelBootstrap.RescueIfLostInLowMem is concerned, and
+    /// that safety net runs every slice BEFORE Step()'s own resume check gets a chance to —
+    /// it would yank PC away from the trampoline before MaybeResumeAfterForcedSifInit ever
+    /// saw it there (confirmed the hard way: a first attempt at 0x00090000 never resumed).
+    /// Placed near this file's other "top of RAM" scratch addresses (WorkItemsBase, the
+    /// 0x01FF0000 stack safety net) with enough separation not to collide with either.</summary>
+    private const uint SifInitReturnTrampoline = 0x01FE0000;
 
     private bool _worklistPlanted;
     private bool _sifForced;
+    private bool _sifTrampolineWritten;
+    private bool _sifResumePending;
+    private ulong _sifSavedPc;
+    private ulong[]? _sifSavedGpr;
     private bool _logoPrepared;
     private bool _logoActive;
     private bool _esrbDone;
@@ -71,6 +85,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         _worklistPlanted = false;
         _sifForced = false;
+        _sifTrampolineWritten = false;
+        _sifResumePending = false;
+        _sifSavedPc = 0;
+        _sifSavedGpr = null;
         _logoPrepared = false;
         _logoActive = false;
         _esrbDone = false;
@@ -231,7 +249,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (!Ps2System.DisableUnstickSifWaits)
             UnstickSifWaits(sys);
         if (!Ps2System.DisableForceSifInit)
+        {
             MaybeForceSifInit(sys);
+            MaybeResumeAfterForcedSifInit(sys);
+        }
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -394,30 +415,66 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         PlantSifWorklist(sys);
 
-        // Force-call 0x482E98 with a safe return trampoline in scratch RAM
-        const uint tramp = 0x00090000;
-        // tramp: jr ra'  — actually set RA to continue at main post-SIF
-        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x002131D0 });
-        // Ensure SP valid
+        // Non-destructive force-call (2026-07-25). An earlier version zeroed every GPR and
+        // set ra to a fixed point in main() (0x2131D0) — which does call the real
+        // sceSifInitRpc, but permanently ABANDONS whatever the game was doing at the
+        // interrupted PC. Traced precisely: that interrupted PC is the pad-bind retry loop
+        // itself, mid-flight (--pcbreak confirms its entire call chain, including
+        // _rpc_get_packet, never executes again for the rest of the run once this fires) —
+        // so the old approach silently broke padman initialization rather than fixing it,
+        // which is exactly why nothing downstream of it (rendering, disc reads) ever
+        // recovered. sceSifInitRpc never reads a0 (confirmed: no instruction in its body
+        // touches it), so there's no need to scrub registers for its own protection — save
+        // the full interrupted context (PC + all 32 GPRs, the same technique as
+        // KernelState's forced-preemption save/restore) and resume it exactly once
+        // sceSifInitRpc returns, via a tiny scratch-RAM trampoline (a tight self-loop) its ra
+        // points at instead of a real caller. MaybeResumeAfterForcedSifInit (called from
+        // Step()) detects PC reaching that trampoline and restores everything, so the retry
+        // loop continues naturally and — now that pkt_table_len is real — can actually
+        // succeed instead of being abandoned.
+        if (!_sifTrampolineWritten)
+        {
+            sys.Memory.Write32(SifInitReturnTrampoline, 0x1000FFFFu); // beq zero,zero,self
+            sys.Memory.Write32(SifInitReturnTrampoline + 4, 0);       // nop (delay slot)
+            _sifTrampolineWritten = true;
+        }
+        _sifSavedPc = sys.EE.PC;
+        _sifSavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _sifSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SIFINIT") == "1")
+            Console.Error.WriteLine($"[SIFINIT] forcing call, savedPc=0x{_sifSavedPc:X8} ra_was=0x{_sifSavedGpr[31]:X8} cyc={sys.MasterCycles}");
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = SifInitReturnTrampoline });
+        // Ensure SP valid for sceSifInitRpc's own stack frame while it runs.
         ulong sp = sys.EE.GetGpr(29).Lo;
         if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
             sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
-        // Clear every other GPR before the jump. This is a hand-crafted entry, not a real
-        // call — SifInitFn (and code reached from it) has no legitimate way to receive
-        // caller-set arguments here, so whatever was left in a0-a3/s0-s7/t0-t9/v0-v1/fp from
-        // wherever we yanked PC from is pure leftover noise. Left alone, that noise can look
-        // exactly like a valid pointer (observed: a stale code address survived into a
-        // "manager" register and got read as a list-descriptor pointer three functions later,
-        // producing a scan bound in the tens of millions instead of tripping an obviously
-        // invalid-pointer check) — zero is at least an unambiguous "empty" sentinel instead.
-        foreach (int reg in new[] { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 30 })
-            sys.EE.SetGpr(reg, default);
         sys.EE.PC = SifInitFn;
-        sys.LastGoodEePc = SifInitFn;
         _sifForced = true;
+        _sifResumePending = true;
         Status = "sif-forced";
         Assists++;
-        _ = tramp;
+    }
+
+    /// <summary>Detects the forced sceSifInitRpc call (see MaybeForceSifInit) returning to its
+    /// scratch-RAM trampoline, and restores the interrupted context so execution continues
+    /// exactly where it was yanked from — rather than staying abandoned at the trampoline's
+    /// self-loop, or (the old behavior) never coming back at all.</summary>
+    private void MaybeResumeAfterForcedSifInit(Ps2System sys)
+    {
+        if (!_sifResumePending) return;
+        if ((uint)(sys.EE.PC & 0x1FFFFFFF) != SifInitReturnTrampoline) return;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SIFINIT") == "1")
+            Console.Error.WriteLine($"[SIFINIT] resuming at 0x{_sifSavedPc:X8} cyc={sys.MasterCycles}");
+        sys.EE.PC = _sifSavedPc;
+        if (_sifSavedGpr != null)
+            for (int i = 1; i < 32; i++) // skip $zero
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _sifSavedGpr[i] });
+        sys.LastGoodEePc = _sifSavedPc;
+        _sifResumePending = false;
+        Status = "sif-resumed";
     }
 
     private void MaybeStartLogo(Ps2System sys)

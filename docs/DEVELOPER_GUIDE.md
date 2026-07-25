@@ -533,23 +533,69 @@ path, which was also independently checked and never hit) shows **zero hits acro
 earlier branch diverts it" (a different code path would still eventually re-enter this function)
 — the whole `sceSifBindRpc`/`_rpc_get_packet` call chain simply **stops executing entirely** the
 moment `MaybeForceSifInit`'s forced jump fires at `cyc=1,500,000`, and is never re-entered for the
-rest of the run. This is the cleanest possible confirmation of the abandonment theory above: the
-padman-bind thread isn't failing repeatedly, isn't stuck — it's just gone, teleported away from
-and never returned to.
+rest of the run.
 
-**So the real remaining work is not "why does the bind fail" — it's "what would let padman's own
-code run to completion without being forcibly interrupted."** That means either: (a) finding and
-fixing whatever *actually* blocks `main()`'s own natural progress toward `0x2131C8` (the real
-`sceSifInitRpc` call site inside `main()`) so `MaybeForceSifInit` never needs to fire in the first
-place — genuinely closing Bug A instead of routing around it — or (b) accepting the forced-jump
-approach as a legitimate, documented per-title accommodation (§7.1's policy already allows this
-when a general fix isn't currently feasible) and separately, deliberately re-implementing whatever
-padman's completion would have set up (a real `IGameQuirkModule` hook that provides working pad
-input state, rather than leaving it silently broken). Option (a) is more valuable long-term
-(genuinely fixes the general mechanism) but requires understanding why `main()` doesn't reach
-`0x2131C8` on its own within a normal timeframe — that trace hasn't been done yet. `Cdvd.SectorsRead
-== 0` for 400M+ cycles straight and the empty object-list loop (§7.4 "Bug C") are very likely
-downstream symptoms of this same abandonment, not independent bugs.
+**MaybeForceSifInit was made non-destructive (2026-07-25)**: it used to zero every GPR and jump to
+a *fixed* point in `main()` (`0x2131D0`), permanently abandoning whatever the interrupted code was
+doing. It now saves the full interrupted context (PC + all 32 GPRs — same technique as
+`KernelState`'s forced-preemption save/restore) and resumes it exactly where it left off once
+`sceSifInitRpc` returns, via a scratch-RAM trampoline (`MidwayBootAssist.SifInitReturnTrampoline`).
+This is a real, verified engineering improvement (smoke suite green; the trampoline had to be
+moved from an initial `0x00090000` to `0x01FE0000` because anything below `0x00100000` gets
+treated as "lost in garbage" by `KernelBootstrap.RescueIfLostInLowMem`, which runs every slice
+*before* `Step()`'s own resume check and would otherwise yank PC away first).
+
+**But tracing what it actually resumes revealed something bigger than "which fix gets credit."**
+With `DETPS2_TRACE_SIFINIT=1`, the interrupted PC the forced call saves/resumes turns out to be
+`0x0040BB08` — a floating-point math utility, not the pad-bind retry loop at all. Chasing why led
+to a third, previously-unexamined mechanism: **`Ps2System.KickMidwayMainPath`** (gated only by
+`--no-assist`/`DisableMidwayAssist`, *not* by any of the four specific `--no-force-sif` /
+`--no-unstick-waits` / `--no-auto-complete` flags) forcibly resets `PC` straight to `main()`'s
+entry (`0x00212F70`) the moment `MasterCycles > 100_000` — confirmed directly:
+`--pcbreak=212F70` with only `--no-force-sif`/`--no-unstick-waits`/`--no-auto-complete` (no
+`--no-assist`) shows `main()` entered at **`cyc=150,000`**, with `sp=0x01FF0000` (this function's
+own hardcoded safety value) and `takeExceptions=False` (still false — this is well before the
+real CRT0 path would have set it), not the natural entry this session separately confirmed at
+`cyc=957,104` when `--no-assist` genuinely disables everything.
+
+**This means every "combined" test run this whole investigation — including the supposedly
+"isolated" ones that only disabled `UnstickSifWaits`/`AutoCompleteWorkItems` via their env vars —
+was running on a *different boot timeline* than the "pure" (`--no-assist`) test**, because
+`KickMidwayMainPath` restarts `main()` ~800,000 cycles earlier than it would run on its own,
+changing every subsequent cycle count (including exactly when the pad-bind retry starts, and
+whether `MaybeForceSifInit`'s `cyc < 1,500,000` gate catches it mid-retry or long after it's moved
+on). Separately, `MidwayBootAssist.PlantSifWorklist` (called unconditionally, gated by none of the
+four disable flags) writes directly into `WorklistBase = 0x0077A080` — **the exact same address**
+as this game's real `_sif_rpc_data` struct — and one of its writes
+(`WorklistBase + 0x08 = WorkItemCount = 32`) lands precisely on `pkt_table_len`. Confirmed:
+`sceSifBindRpc`'s own entry (`0x4834E0`) is *also* never hit again in a run with `PlantSifWorklist`
+active but `MaybeForceSifInit` explicitly disabled — the retry loop is abandoned by something
+else entirely in that configuration too, most likely `KickMidwayMainPath`'s own early restart.
+
+**Honest bottom line**: this title's boot-assist code has accumulated five overlapping synthetic
+mechanisms across multiple sessions (`KickMidwayMainPath`, `PlantSifWorklist`, `MaybeForceSifInit`,
+`UnstickSifWaits`, `AutoCompleteWorkItems`), and they interact — `KickMidwayMainPath` alone changes
+*when* everything downstream happens, and `PlantSifWorklist` pokes the same memory the real SIF-RPC
+subsystem uses. Untangling exactly which one is "responsible" for any given downstream observation
+requires disabling all five and reasoning from the single clean baseline that actually exists:
+`--no-assist`, which disables everything at once (confirmed: `main()` reached naturally at
+`cyc=957,104`, pad-bind retry starts at `cyc≈1,250,064` and never completes — `pkt_table_len`
+verified via direct memory dump to stay `0` for the entire run). This session's own contribution
+(`MaybeForceSifInit` no longer destructively abandoning state) is a genuine, unambiguous quality
+improvement regardless of how much of any specific run's *observed* progress traces back to it
+versus the other four mechanisms — verified via the full smoke suite with no regression to the
+already-working assisted boot.
+
+**What "genuinely fixing this" would require**: finding and fixing whatever actually blocks
+`main()`'s own natural progress toward its own `sceSifInitRpc` call site (`0x2131C8`) *without* any
+of the five mechanisms firing — i.e. root-causing why the general architecture fixes from earlier
+this session (interrupt dispatch, IM masking, thread preemption) aren't, on their own, sufficient
+for this title's SIF-RPC subsystem to initialize the way it would on real hardware. That trace
+hasn't been done yet, and per the above, doing it cleanly means disabling all five mechanisms via
+`--no-assist` and working from that single, honest baseline — not layering a sixth mechanism on
+top of five that already interact in ways that took this long to even characterize.
+`Cdvd.SectorsRead == 0` for 400M+ cycles straight and the empty object-list loop (§7.4 "Bug C")
+are very likely downstream symptoms of the same underlying gap, not independent bugs.
 
 ---
 
