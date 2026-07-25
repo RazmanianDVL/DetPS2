@@ -30,6 +30,16 @@ public sealed class KernelState
         /// <summary>Argument passed to StartThread (becomes $a0 on first entry).</summary>
         public ulong StartArg;
         public bool FreshStart;
+
+        /// <summary>Full 32-GPR save for forced (non-cooperative) preemption — see
+        /// <see cref="SaveFullContext"/>. SaveCurrentContext/RestoreContext only preserve the
+        /// callee-saved set (sp/gp/ra/s0-s8) because every EXISTING caller switches only at a
+        /// syscall boundary, where caller-saved registers (v0/v1/a0-a3/t0-t9/...) are already
+        /// expected to be volatile by normal MIPS calling convention. A forced preemption can
+        /// land literally anywhere — including mid-loop code actively using v0/v1 as a counter
+        /// (the exact real scenario this exists for) — so it needs the full register file.</summary>
+        public ulong[]? SavedGprFull;
+        public bool HasFullSave;
     }
 
     public sealed class Sema
@@ -69,6 +79,7 @@ public sealed class KernelState
         _currentTid = 1;
         WaitingVblank = false;
         VblankWaits = 0;
+        _cyclesSinceLastPreempt = 0;
         // Main thread — already running
         _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0 });
     }
@@ -277,6 +288,69 @@ public sealed class KernelState
         if (next == _currentTid) return false;
         SaveCurrentContext(ee, fromSyscall: false);
         return RestoreContext(ee, next, fromSyscall: false);
+    }
+
+    private uint _preemptQuantum = 0x10000; // ~65536 EE cycles per timeslice
+    private ulong _cyclesSinceLastPreempt;
+
+    /// <summary>Save every GPR (not just the callee-saved subset) — see the
+    /// SavedGprFull doc comment on why a forced preemption needs this.</summary>
+    private void SaveFullContext(EmotionEngine ee)
+    {
+        var t = FindThread(_currentTid);
+        if (t == null) return;
+        t.SavedGprFull ??= new ulong[32];
+        for (int i = 0; i < 32; i++)
+            t.SavedGprFull[i] = ee.GetGpr(i).Lo;
+        t.HasFullSave = true;
+        t.SavedPc = ee.PC; // preempted mid-stream: resume at the exact interrupted PC
+    }
+
+    /// <summary>Restore every GPR saved by <see cref="SaveFullContext"/>, or fall back to the
+    /// existing partial restore for a thread that's never been force-preempted before (only
+    /// ever entered fresh or resumed from a syscall boundary).</summary>
+    private bool RestoreFullContext(EmotionEngine ee, int id)
+    {
+        var t = FindThread(id);
+        if (t == null || !t.Alive) return false;
+        if (!t.HasFullSave || t.SavedGprFull == null)
+            return RestoreContext(ee, id, fromSyscall: false);
+
+        _currentTid = id;
+        ee.PC = t.SavedPc;
+        for (int i = 1; i < 32; i++) // skip $zero
+            ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
+        t.Sleeping = false;
+        t.Started = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Real PS2 kernel threads are preempted by a periodic timer tick regardless of whether
+    /// they ever call a blocking syscall — our scheduler otherwise only switches at explicit
+    /// SleepThread/WaitSema/etc. call sites (see SwitchToNext), so a thread that busy-waits
+    /// without ever yielding (legal, common real-hardware code — e.g. a bind-retry loop with a
+    /// local software delay) would starve every other thread forever. Called periodically from
+    /// EmotionEngine.Step(); a full GPR save/restore is required (see SaveFullContext) since
+    /// this can land anywhere, unlike every other switch point in this file.
+    /// </summary>
+    public void MaybePreempt(EmotionEngine ee)
+    {
+        _cyclesSinceLastPreempt++;
+        if (_cyclesSinceLastPreempt < _preemptQuantum) return;
+        _cyclesSinceLastPreempt = 0;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT") == "1")
+            Console.Error.WriteLine($"[PREEMPT] tick threads={_threads.Count} cur={_currentTid} pc=0x{ee.PC:X8}");
+        if (_threads.Count < 2) return; // common case: nothing else to switch to
+
+        int next = FindNextRunnable(_currentTid);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT") == "1")
+            Console.Error.WriteLine($"[PREEMPT] cur={_currentTid} next={next}");
+        if (next == _currentTid) return;
+        SaveFullContext(ee);
+        RestoreFullContext(ee, next);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT") == "1")
+            Console.Error.WriteLine($"[PREEMPT] switched {_currentTid} -> pc=0x{ee.PC:X8}");
     }
 
     /// <summary>Block until next VBlank (PCRTC). EE Step should stall while WaitingVblank.</summary>

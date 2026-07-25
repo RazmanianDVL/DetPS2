@@ -314,6 +314,14 @@ public sealed class EmotionEngine : ISchedulable
                 continue;
             }
 
+            // Kernel thread preemption (see KernelState.MaybePreempt): real hardware
+            // timeslices threads via a periodic timer tick even if they never yield
+            // voluntarily (e.g. a bind-retry loop with a local software delay and no
+            // syscalls at all) — without this, such a thread starves every other thread
+            // forever under our otherwise purely-cooperative scheduler. No-ops (cheap) in
+            // the overwhelmingly common single-thread-of-interest case.
+            _hle?.Kernel.MaybePreempt(this);
+
             // COP2 interlock stall (Phase 10)
             if (_cop2StallRemaining > 0 || (_vu0 != null && _vu0.IsCop2Interlocked))
             {
