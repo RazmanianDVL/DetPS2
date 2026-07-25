@@ -707,14 +707,21 @@ if (args.Length > 0 && args[0].Equals("probe-frame", StringComparison.OrdinalIgn
     if (p.Hle.Sony != null)
         foreach (var kv in p.Hle.Sony.SyscallHistogram.OrderByDescending(k => k.Value).Take(15))
             Console.WriteLine($"  sc 0x{kv.Key:X2} x{kv.Value}");
-    // Continue until logo finishes (or timeout)
-    for (int i = 0; i < 80; i++)
+    // Continue until logo finishes (or timeout). FMV only advances on host-present ticks
+    // (see MidwayBootAssist.OnHostPresent's own doc comment) — this loop previously only
+    // called RunFor, which never drives that path at all (a test-tool gap, not a product bug;
+    // matches MainWindow.axaml.cs's real per-tick RunFor+OnHostPresent+PresentFrame pattern).
+    int postLogoGrace = 60;
+    for (int i = 0; i < 500; i++)
     {
         p.RunFor(1_000_000);
+        p.ActiveQuirk?.OnHostPresent(p);
         Console.WriteLine($"  +{i + 1}M PC=0x{p.EE.PC:X8} px={p.Gs.PixelsWritten} " +
                           $"assist={p.MidwayAssist.Status} logo={p.MidwayAssist.LogoFrame}/{p.MidwayAssist.LogoFramesTotal} pres={p.MidwayAssist.FramesPresented}");
-        if (p.MidwayAssist.Status is "logo-done" or "synthetic-logo")
-            break;
+        if (p.MidwayAssist.Status is "logo-done" or "synthetic-logo" or "post-logo-main")
+        {
+            if (postLogoGrace-- <= 0) break;
+        }
         // Snapshot mid-logo
         if (p.MidwayAssist.LogoFrame == 5 || p.MidwayAssist.LogoFrame == 20)
             p.Gs.SaveFramebufferAsPPM(outPpm.Replace(".ppm", $"-f{p.MidwayAssist.LogoFrame}.ppm"));
