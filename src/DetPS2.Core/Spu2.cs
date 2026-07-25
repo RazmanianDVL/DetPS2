@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace DetPS2.Core;
 
@@ -22,6 +23,14 @@ public sealed class Spu2 : ISchedulable
     private IAudioSink? _sink;
     private bool _irqPending;
     private Intc? _intc;
+
+    // Real SPU2 local work RAM (2MB, confirmed size) games upload ADPCM sample data
+    // into via the transfer-address/data register pair, then reference by byte offset
+    // from each voice's SSA (sample start address) register on key-on.
+    private const int SpuRamSize = 2 * 1024 * 1024;
+    private readonly byte[] _spuRam = new byte[SpuRamSize];
+    private uint _transferAddr;
+    private readonly uint[] _voiceSsa = new uint[VoiceCount];
 
     public ulong Writes { get; private set; }
     public ulong Reads { get; private set; }
@@ -88,6 +97,9 @@ public sealed class Spu2 : ISchedulable
         Array.Clear(_reverbR);
         for (int i = 0; i < VoiceCount; i++)
             _voices[i] = new Voice();
+        Array.Clear(_spuRam);
+        Array.Clear(_voiceSsa);
+        _transferAddr = 0;
     }
 
     public uint ReadRegister(uint address)
@@ -124,20 +136,41 @@ public sealed class Spu2 : ISchedulable
             }
         }
 
-        if (off == 0x1A0)
-            Enabled = (value & 1) != 0;
-        if (off is >= 0x1A8 and <= 0x1B0)
-            Enabled = true;
-        // Key-on low voices 0-15
-        if (off == 0x1A8 || off == 0x1AA)
+        // Real SPU2 register map (verified against PCSX2 zerospu2/reg.h): 0x1A0/0x1A2 =
+        // SPUON1/2 (key-on bitmask, voices 0-15 / 16-23), 0x1A4/0x1A6 = SPUOFF1/2
+        // (key-off), 0x1A8/0x1AA = transfer address hi/lo into SPU2's own local RAM,
+        // 0x1AC = transfer data port (each write appends 16 bits and auto-increments).
+        // An earlier version of this mapped 0x1A8-0x1AE as key-on instead — wrong, and
+        // it meant there was never a way for real ADPCM sample data to reach SPU2 RAM
+        // in the first place, so playback could only ever fall back to a synthetic tone.
+        switch (off)
         {
-            Enabled = true;
-            KeyOnMask(value, start: 0);
+            case 0x1A0: Enabled = true; KeyOnMask(value, start: 0); break;
+            case 0x1A2: Enabled = true; KeyOnMask(value, start: 16); break;
+            case 0x1A4: KeyOffMask(value, start: 0); break;
+            case 0x1A6: KeyOffMask(value, start: 16); break;
+            case 0x1A8: _transferAddr = (_transferAddr & 0x0000FFFFu) | (value << 16); break;
+            case 0x1AA: _transferAddr = (_transferAddr & 0xFFFF0000u) | (value & 0xFFFFu); break;
+            case 0x1AC:
+                if (_transferAddr + 1 < _spuRam.Length)
+                {
+                    _spuRam[_transferAddr] = (byte)value;
+                    _spuRam[_transferAddr + 1] = (byte)(value >> 8);
+                }
+                _transferAddr += 2;
+                break;
         }
-        if (off == 0x1AC || off == 0x1AE)
+
+        // Per-voice SSA (waveform/ADPCM start address in SPU2 RAM). Real hardware
+        // documents one SSA register; the per-voice offset/stride here (0x1C0 + voice*0xC)
+        // is a reasoned inference from the address gap to Core 1's base, not an
+        // independently confirmed layout — worth validating against real boot telemetry
+        // if voice playback ever starts from a visibly wrong offset.
+        if (off >= 0x1C0 && off < 0x1C0 + VoiceCount * 0xC)
         {
-            Enabled = true;
-            KeyOnMask(value, start: 16);
+            int voice = (int)((off - 0x1C0) / 0xC);
+            uint reg = (off - 0x1C0) % 0xC;
+            if (reg == 0) _voiceSsa[voice] = value;
         }
     }
 
@@ -169,15 +202,56 @@ public sealed class Spu2 : ISchedulable
         for (int i = 0; i < 16 && start + i < VoiceCount; i++)
         {
             if (((mask >> i) & 1) == 0) continue;
-            var v = _voices[start + i];
+            int voice = start + i;
+            var v = _voices[voice];
             v.KeyOn = true;
             v.Playing = true;
             v.SamplePos = 0;
             v.AdsrPhase = 0;
             v.Envelope = 0;
+
+            // Real playback: if the game configured a sample start address, decode
+            // whatever ADPCM data actually sits in SPU2 RAM there — same as real
+            // hardware, which doesn't know or care whether upload "succeeded".
+            uint ssa = _voiceSsa[voice];
+            v.Pcm = ssa != 0 && ssa < (uint)_spuRam.Length ? DecodeAdpcmFromRam(ssa) : null;
             if (v.Pcm == null || v.Pcm.Length == 0)
                 v.Pcm = GenerateSquarePcm(ToneFrequencyHz, ToneAmplitude, OutputSampleRate / 4);
         }
+    }
+
+    private void KeyOffMask(uint mask, int start)
+    {
+        for (int i = 0; i < 16 && start + i < VoiceCount; i++)
+        {
+            if (((mask >> i) & 1) != 0)
+                ReleaseVoice(start + i);
+        }
+    }
+
+    /// <summary>Decode consecutive 16-byte ADPCM blocks from SPU2 RAM starting at
+    /// <paramref name="startOffset"/> until the loop-end flag (block header byte[1] bit0)
+    /// is set — standard SPU-ADPCM flag byte convention shared across the PS1/PS2 SPU
+    /// family. Carries predictor history across block boundaries (required for correct
+    /// reconstruction; resetting it per block, as an earlier version of this did,
+    /// produces an audible discontinuity every 16 bytes / 28 samples).</summary>
+    private short[] DecodeAdpcmFromRam(uint startOffset, int maxBlocks = 8192)
+    {
+        var samples = new List<short>(Math.Min(maxBlocks, 256) * 28);
+        short hist1 = 0, hist2 = 0;
+        uint offset = startOffset;
+        Span<short> block28 = stackalloc short[28];
+        for (int b = 0; b < maxBlocks && offset + 16 <= _spuRam.Length; b++)
+        {
+            var block = _spuRam.AsSpan((int)offset, 16);
+            byte flags = block[1];
+            DecodeAdpcmBlock(block, ref hist1, ref hist2, block28);
+            samples.AddRange(block28.ToArray());
+            AdpcmBlocksDecoded++;
+            offset += 16;
+            if ((flags & 1) != 0) break; // loop end
+        }
+        return samples.ToArray();
     }
 
     /// <summary>Load PCM samples into a voice (tests / HLE).</summary>
@@ -188,16 +262,28 @@ public sealed class Spu2 : ISchedulable
         _voices[voice].SamplePos = 0;
     }
 
-    /// <summary>Decode one PSX/PS2-style ADPCM block (16 bytes → 28 samples).</summary>
+    /// <summary>Decode one PSX/PS2-style ADPCM block (16 bytes → 28 samples), starting
+    /// from zero predictor history. For multi-block streams, use the ref-history overload
+    /// instead — starting each block fresh from zero produces an audible discontinuity
+    /// at every block boundary, since ADPCM prediction depends on the previous block's
+    /// tail samples.</summary>
     public static short[] DecodeAdpcmBlock(ReadOnlySpan<byte> block)
     {
-        // Minimal SPU-ADPCM: filter 0, range from nibble
-        short[] outS = new short[28];
-        if (block.Length < 16) return outS;
+        short hist1 = 0, hist2 = 0;
+        Span<short> outS = stackalloc short[28];
+        DecodeAdpcmBlock(block, ref hist1, ref hist2, outS);
+        return outS.ToArray();
+    }
+
+    /// <summary>Decode one ADPCM block, carrying predictor history in/out via
+    /// <paramref name="hist1"/>/<paramref name="hist2"/> — pass the same variables across
+    /// consecutive calls for a real multi-block stream.</summary>
+    public static void DecodeAdpcmBlock(ReadOnlySpan<byte> block, ref short hist1, ref short hist2, Span<short> outS)
+    {
+        if (block.Length < 16 || outS.Length < 28) return;
         int shift = block[0] & 0xF;
         int filter = (block[0] >> 4) & 0x7;
         int o = 0;
-        short hist1 = 0, hist2 = 0;
         // Predictor coeffs (common set)
         int f0 = filter switch { 1 => 60, 2 => 115, 3 => 98, 4 => 122, _ => 0 };
         int f1 = filter switch { 2 => -52, 3 => -55, 4 => -60, _ => 0 };
@@ -217,7 +303,6 @@ public sealed class Spu2 : ISchedulable
                 hist1 = (short)sample;
             }
         }
-        return outS;
     }
 
     /// <summary>Decode ADPCM stream into voice PCM.</summary>
@@ -226,12 +311,10 @@ public sealed class Spu2 : ISchedulable
         if ((uint)voice >= VoiceCount) return;
         int blocks = adpcm.Length / 16;
         var list = new short[blocks * 28];
-        int p = 0;
+        short hist1 = 0, hist2 = 0;
         for (int b = 0; b < blocks; b++)
         {
-            var s = DecodeAdpcmBlock(adpcm.Slice(b * 16, 16));
-            s.CopyTo(list.AsSpan(p));
-            p += 28;
+            DecodeAdpcmBlock(adpcm.Slice(b * 16, 16), ref hist1, ref hist2, list.AsSpan(b * 28, 28));
             AdpcmBlocksDecoded++;
         }
         _voices[voice].Pcm = list;

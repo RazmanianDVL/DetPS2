@@ -706,6 +706,7 @@ public static class SmokeTests
 
             // Phase 30
             Spu2_Adpcm_DecodeAndMix();
+            Spu2_RealAdpcmViaRegisters();
             Spu2_VoiceAdsr_Ends();
 
             // Phase 31
@@ -2452,6 +2453,46 @@ public static class SmokeTests
     }
 
     // -------------------- Phase 30 --------------------
+
+    public static void Spu2_RealAdpcmViaRegisters()
+    {
+        // Exercises the real game-facing path end to end: transfer address/data
+        // registers upload ADPCM bytes into SPU2 RAM, the voice's SSA register points
+        // at them, and key-on (SPUON1, 0x1A0) should decode real data — not fall back
+        // to the synthetic tone. Distinguishes "real decode happened" via
+        // AdpcmBlocksDecoded, since GenerateSquarePcm never touches that counter.
+        var sys = new Ps2System();
+        var sink = new CapturingAudioSink();
+        sys.SetAudioSink(sink);
+
+        byte[] block = new byte[16];
+        block[0] = 0x00; // shift=0, filter=0 -> direct passthrough, no prediction
+        block[1] = 0x01; // loop-end flag set -> exactly one block
+        for (int i = 2; i < 16; i++) block[i] = 0x11; // both nibbles = 1 each byte
+
+        uint spuAddr = 0x1000;
+        sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1A8, spuAddr >> 16);   // transfer addr hi
+        sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1AA, spuAddr & 0xFFFF); // transfer addr lo
+        for (int i = 0; i < 16; i += 2)
+        {
+            uint word = (uint)(block[i] | (block[i + 1] << 8));
+            sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1AC, word); // data port, auto-increments
+        }
+
+        sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1C0, spuAddr); // voice 0 SSA
+
+        ulong before = sys.Spu2.AdpcmBlocksDecoded;
+        sys.Spu2.WriteRegister(Spu2.PhysBase + 0x1A0, 1); // SPUON1: key-on voice 0
+        ulong after = sys.Spu2.AdpcmBlocksDecoded;
+        if (after <= before)
+            throw new Exception("key-on via SSA did not decode real ADPCM data (fell back to tone?)");
+
+        sys.RunFor(6144 * 5);
+        if (sink.SamplesReceived < 5)
+            throw new Exception("no samples produced after real key-on");
+
+        Console.WriteLine($"[Smoke] Spu2_RealAdpcmViaRegisters OK (blocksDecoded={after - before}, samples={sink.SamplesReceived})");
+    }
 
     public static void Spu2_Adpcm_DecodeAndMix()
     {
