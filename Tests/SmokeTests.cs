@@ -1015,7 +1015,7 @@ public static class SmokeTests
         const uint fs = 1, ft = 2, fd = 3, destMaskAll = 0xF;
         uint addUpper = 40u | (fd << 6) | (fs << 11) | (ft << 16) | (destMaskAll << 21); // ADD vf3 = vf1 + vf2
         uint addLower = 0; // destmask=0 -> LQ-shaped no-op
-        uint nopUpperEnd = (63u | (15u << 6)) | 0x80000000u; // FD_11 idx15 = NOP, E-bit set
+        uint nopUpperEnd = (63u | (11u << 6)) | 0x80000000u; // FD_11 idx11 = NOP (verbatim-confirmed), E-bit set
         uint nopLower = 0;
 
         sys.Vu0.LoadMicroProgram(new[] { addLower, addUpper, nopLower, nopUpperEnd });
@@ -1050,7 +1050,7 @@ public static class SmokeTests
         // ADD vf4, vf1, vf2 with destmask = 0b0101 (X,Z only) — Y/W must stay unchanged.
         const uint fd4 = 4, destMaskXZ = 0b0101;
         uint addUpper = 40u | (fd4 << 6) | (fs1 << 11) | (ft2 << 16) | (destMaskXZ << 21);
-        uint nopUpperEnd = (63u | (15u << 6)) | 0x80000000u;
+        uint nopUpperEnd = (63u | (11u << 6)) | 0x80000000u; // FD_11 idx11 = NOP
 
         sys.Vu0.LoadMicroProgram(new[] { 0u, mulxUpper, 0u, addUpper, 0u, nopUpperEnd });
         sys.Vu0.StartMicro(0);

@@ -60,6 +60,77 @@ if (args.Length > 0 && args[0].Equals("dump-spine", StringComparison.OrdinalIgno
     Environment.Exit(spine.SpineInfraOk ? 0 : 1);
 }
 
+if (args.Length > 0 && args[0].Equals("elf-info", StringComparison.OrdinalIgnoreCase))
+{
+    // Diagnostic: is the boot ELF from user-media.json a stripped retail build or a
+    // debug build (unstripped symbols / .debug sections)? Helps explain otherwise-odd
+    // runtime behavior like heavy Deci2Call (Sony's dev-kit debug protocol) usage.
+    UserMediaConfig cfg = args.Length > 1 && !args[1].StartsWith("--")
+        ? UserMediaConfig.Load(args[1])
+        : UserMediaConfig.LoadDefault();
+    if (cfg.Titles.Count == 0) { Console.WriteLine("No titles in user-media.json"); Environment.Exit(1); }
+    var t = cfg.Titles[0];
+    var vol = Iso9660.OpenFile(t.Path);
+    if (vol == null) { Console.WriteLine("Could not open ISO"); Environment.Exit(1); }
+    byte[]? cnfBytes = Iso9660.ReadFile(vol, "SYSTEM.CNF");
+    string boot2 = cnfBytes != null ? SystemCnf.Parse(System.Text.Encoding.ASCII.GetString(cnfBytes)).Boot2 : "";
+    string bootFile = boot2;
+    int semi = bootFile.IndexOf(';');
+    if (semi >= 0) bootFile = bootFile[..semi];
+    int slash = bootFile.LastIndexOfAny(new[] { '/', '\\' });
+    if (slash >= 0) bootFile = bootFile[(slash + 1)..];
+    Console.WriteLine($"BOOT2={boot2} -> file={bootFile}");
+    byte[]? elf = Iso9660.ReadFile(vol, bootFile);
+    if (elf == null) { Console.WriteLine("Could not read boot ELF"); Environment.Exit(1); }
+    Console.WriteLine($"ELF size={elf.Length} bytes");
+
+    uint shoff = BitConverter.ToUInt32(elf, 0x20);
+    ushort shentsize = BitConverter.ToUInt16(elf, 0x2E);
+    ushort shnum = BitConverter.ToUInt16(elf, 0x30);
+    ushort shstrndx = BitConverter.ToUInt16(elf, 0x32);
+    Console.WriteLine($"shoff=0x{shoff:X} shentsize={shentsize} shnum={shnum} shstrndx={shstrndx}");
+    if (shoff == 0 || shnum == 0) { Console.WriteLine("No section headers (fully stripped)."); Environment.Exit(0); }
+
+    uint strTabOff = BitConverter.ToUInt32(elf, (int)(shoff + shstrndx * shentsize + 16));
+    bool hasSymtab = false, hasDebug = false;
+    int symCount = 0;
+    for (int i = 0; i < shnum; i++)
+    {
+        int off = (int)shoff + i * shentsize;
+        uint nameOff = BitConverter.ToUInt32(elf, off);
+        uint type = BitConverter.ToUInt32(elf, off + 4);
+        uint secOffset = BitConverter.ToUInt32(elf, off + 16);
+        uint size = BitConverter.ToUInt32(elf, off + 20);
+        uint entsize = BitConverter.ToUInt32(elf, off + 36);
+        int nameStart = (int)(strTabOff + nameOff);
+        int nameEnd = nameStart;
+        while (nameEnd < elf.Length && elf[nameEnd] != 0) nameEnd++;
+        string name = nameStart < elf.Length ? System.Text.Encoding.ASCII.GetString(elf, nameStart, nameEnd - nameStart) : "?";
+        if (name.Length > 0) Console.WriteLine($"  [{i}] {name} type={type} offset=0x{secOffset:X} size={size}");
+        if (type == 2) { hasSymtab = true; symCount = entsize > 0 ? (int)(size / entsize) : 0; } // SHT_SYMTAB
+        if (name.Contains("debug", StringComparison.OrdinalIgnoreCase)) hasDebug = true;
+
+        if (name == ".vutext" && size >= 8 && secOffset + size <= elf.Length)
+        {
+            var words = new uint[size / 4];
+            Buffer.BlockCopy(elf, (int)secOffset, words, 0, words.Length * 4);
+            var stats = VectorUnit.AnalyzeMicrocode(words);
+            double upperPct = stats.Instructions > 0 ? 100.0 * (stats.Instructions - stats.UnmappedUpper) / stats.Instructions : 0;
+            double lowerPct = stats.Instructions > 0 ? 100.0 * (stats.Instructions - stats.UnmappedLower) / stats.Instructions : 0;
+            Console.WriteLine($"    .vutext decode: instructions={stats.Instructions} " +
+                $"upperRecognized={upperPct:F1}% ({stats.Instructions - stats.UnmappedUpper}/{stats.Instructions}) " +
+                $"lowerRecognized={lowerPct:F1}% ({stats.Instructions - stats.UnmappedLower}/{stats.Instructions})");
+            if (stats.UnmappedLowerHistogram != null)
+                foreach (var kv in stats.UnmappedLowerHistogram)
+                    if (kv.Value > 20)
+                        Console.WriteLine($"      unmapped lower op=0x{kv.Key:X2} count={kv.Value}");
+        }
+    }
+    Console.WriteLine($"hasSymtab={hasSymtab} symCount={symCount} hasDebugSection={hasDebug}");
+    Console.WriteLine(hasSymtab || hasDebug ? "=> looks like a DEBUG/unstripped build" : "=> looks like a stripped retail build");
+    Environment.Exit(0);
+}
+
 if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalIgnoreCase))
 {
     // Generic PC-level trace for whichever title(s) are in user-media.json — no hardcoded
