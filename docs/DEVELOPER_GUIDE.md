@@ -526,18 +526,30 @@ object list stays empty and nothing new ever renders because whatever legitimate
 real bind completion would have triggered never happened — the game is running in a
 "skipped a step" state, not a healthy one.
 
-**The real open question, sharper now**: why does `sceSifBindRpc` never complete on its own?
-`_rpc_get_packet` (the 32-slot pool allocator) never reaches `sceSifSendCmd` even once, despite
-`pkt_table_len` now being correctly initialized. Two live hypotheses, neither confirmed: (a) the
-32-slot pool exhausts almost immediately because nothing ever calls `rpc_packet_free()` for a bind
-that never truly completes, so after the first ~32 (near-instant) retries it's back to permanent
-allocation failure for a different reason than the original zero-init bug; (b) an earlier branch
-inside `sceSifBindRpc`/`_rpc_get_packet` that wasn't correctly traced diverts execution before
-ever reaching `0x483588`. Next step: instrument `_rpc_get_packet` (`0x483060`) directly — log its
-`a0` (`pkt_table_len`) and return value on every call — rather than continuing to infer from
-whether a much-later call site is ever reached. Separately, `Cdvd.SectorsRead == 0` for 400M+
-cycles straight and instrumenting the object-list loop's count field remain open threads too, but
-are likely downstream of this same root cause rather than independent bugs.
+**Resolved — the two candidate explanations above were both wrong; it's simpler than either.**
+`--pcbreak=483060` (`_rpc_get_packet`'s own entry point — not just its later exhausted-pool return
+path, which was also independently checked and never hit) shows **zero hits across the entire
+270M-cycle run** past the initial brief window. Not "fails every time" (pool exhaustion) or "an
+earlier branch diverts it" (a different code path would still eventually re-enter this function)
+— the whole `sceSifBindRpc`/`_rpc_get_packet` call chain simply **stops executing entirely** the
+moment `MaybeForceSifInit`'s forced jump fires at `cyc=1,500,000`, and is never re-entered for the
+rest of the run. This is the cleanest possible confirmation of the abandonment theory above: the
+padman-bind thread isn't failing repeatedly, isn't stuck — it's just gone, teleported away from
+and never returned to.
+
+**So the real remaining work is not "why does the bind fail" — it's "what would let padman's own
+code run to completion without being forcibly interrupted."** That means either: (a) finding and
+fixing whatever *actually* blocks `main()`'s own natural progress toward `0x2131C8` (the real
+`sceSifInitRpc` call site inside `main()`) so `MaybeForceSifInit` never needs to fire in the first
+place — genuinely closing Bug A instead of routing around it — or (b) accepting the forced-jump
+approach as a legitimate, documented per-title accommodation (§7.1's policy already allows this
+when a general fix isn't currently feasible) and separately, deliberately re-implementing whatever
+padman's completion would have set up (a real `IGameQuirkModule` hook that provides working pad
+input state, rather than leaving it silently broken). Option (a) is more valuable long-term
+(genuinely fixes the general mechanism) but requires understanding why `main()` doesn't reach
+`0x2131C8` on its own within a normal timeframe — that trace hasn't been done yet. `Cdvd.SectorsRead
+== 0` for 400M+ cycles straight and the empty object-list loop (§7.4 "Bug C") are very likely
+downstream symptoms of this same abandonment, not independent bugs.
 
 ---
 
