@@ -435,50 +435,56 @@ yet) — worth doing once a second title's `GameQuirks` module exists and its ac
 known, per §7.1's general guidance to hardening the interface against real second-consumer needs
 rather than guessing now.
 
-### 7.4 MK Shaolin Monks boot trace — current state (2026-07-25)
+### 7.4 MK Shaolin Monks boot trace — current state (2026-07-25, updated same day)
 
-Neither the "pure" boot (all `MidwayBootAssist` hacks disabled via `--no-assist` etc., testing
-whether general fixes alone are sufficient) nor the assisted boot currently reaches a real menu
-or gameplay. Traced precisely, instruction-by-instruction, to two distinct, now-understood bugs:
+**Bug A (fixed): `sceSifInitRpc` never ran.** `sceSifBindRpc` (real vaddr `0x4834E0`) was failing
+because its packet-pool allocator (`_rpc_get_packet`, real vaddr `0x483060`) saw
+`_sif_rpc_data.pkt_table_len` (at `0x77A088`, offset+8 of the real `struct rpc_data` — confirmed
+field-by-field against `ee/kernel/src/sifrpc.c`) still zero. `sceSifInitRpc` (real vaddr
+`0x482E98`) is the only code that sets it, and none of its 14 real call sites across the whole
+binary fired before the pad-bind retry started. `MidwayBootAssist.MaybeForceSifInit` already
+force-calls this exact real function (not a synthetic memory-poke) but was gated on
+`Gs.PixelsWritten > 0 || Gif.Path3Transfers > 0` — a chicken-and-egg condition when pad/input
+needs to init before anything renders. Gate removed; verified via full smoke suite plus a
+byte-identical already-working assisted-boot outcome (no regression).
 
-**Bug A (root-caused, partially mitigated): `sceSifInitRpc` never runs.**
-`sceSifBindRpc` (real vaddr `0x4834E0`) fails because its packet-pool allocator
-(`_rpc_get_packet`, real vaddr `0x483060`) sees `_sif_rpc_data.pkt_table_len` (at `0x77A088`,
-offset+8 of the real `struct rpc_data` — confirmed field-by-field against
-`ee/kernel/src/sifrpc.c`) still zero. `sceSifInitRpc` (real vaddr `0x482E98`) is the only code
-that sets it (`= 32`, confirmed by disassembling its body) — and it never runs: every one of its
-14 real call sites across the whole binary was checked with `find-word`/`--pcbreak`, and none
-fire before the pad-bind retry starts (`main()` itself reaches this point directly, single
-thread — an earlier "separate thread starvation" hypothesis this session was empirically
-disproven via `DETPS2_TRACE_PREEMPT=1`). `MidwayBootAssist.MaybeForceSifInit` already force-calls
-this exact real function (not a synthetic memory-poke) — but was gated on
-`Gs.PixelsWritten > 0 || Gif.Path3Transfers > 0`, a chicken-and-egg condition when pad/input needs
-to init before anything renders. That gate was removed 2026-07-25 (see the method's comment) —
-verified: full smoke suite green, zero change to the already-working assisted-boot outcome
-(confirming no regression), and it's the correct fix for the pure-path ordering gap even though
-the pure path still doesn't reach further on its own (see Bug B).
+**Bug B (was a test-tool bug, not a product bug): "FMV/logo frame count never advances."**
+`probe-frame`'s own post-boot loop called only `RunFor` in a loop, never `OnHostPresent` — but
+`MidwayBootAssist`'s own design (see its doc comments) requires `OnHostPresent` to advance the
+FMV; `RunFor`/`Step()` deliberately does not, to avoid burning an entire movie in one slice. So of
+course the logo frame counter stayed frozen in this specific tool — that's not evidence of a
+product bug, it's a gap in the test harness itself. Fixed by adding the missing
+`ActiveQuirk?.OnHostPresent(p)` call per iteration, matching `MainWindow.axaml.cs`'s real per-tick
+pattern. **Lesson**: before concluding a state genuinely never changes, confirm the test harness
+actually drives every code path the mechanism depends on — a static "this looks stuck" reading
+from outside can be indistinguishable from "the tool never pokes the thing that would move it."
 
-**Bug B (found, not yet root-caused): FMV/logo frame count never advances.**
-Even with `MaybeForceSifInit` firing successfully (confirmed: `dmac`/`sifBytes` counters go
-nonzero), the boot plateaus — verified flat from 500M cycles all the way to 3B cycles (identical
-PC/pixel/syscall counts) via `blocker-trace`, and separately via `probe-frame` (which, unlike
-`blocker-trace`, does call `OnHostPresent` every iteration — ruling out "the CLI harness just
-never drives the present loop" as the explanation). `MidwayBootAssist.LogoFrame` gets set to `1`
-exactly once (confirms `MaybeStartLogo`'s first-frame path ran) but never increments across 80+
-subsequent `OnHostPresent`/`AdvanceLogoOneFrame` calls, and `Status` stays `"sif-forced"` rather
-than ever showing `"logo-playing"` again — meaning `AdvanceLogoOneFrame` itself, or the
-`_logoActive`/pacing state it depends on, isn't behaving the way a straight reading of the code
-implies. Root cause not yet found — the likely next step is instrumenting
-`OnHostPresent`/`AdvanceLogoOneFrame` directly (a `DETPS2_TRACE_*`-style env-gated trace, matching
-the pattern already used for RPC/preemption) rather than continuing to infer state from the
-outside, since static reasoning about this one hit a contradiction (the code path that would
-explain the observed `LogoFrame`/`Status` combination isn't obvious from inspection alone).
+**With both fixed**, the boot progresses dramatically further than anything seen before this
+pair of fixes: the FMV plays through all 103 real decoded frames, `MaybePostLogoAdvance` fires
+(`Status` → `"post-logo-main"`), and PC settles into `0x27E0D0` — disassembled and confirmed to be
+a genuine object-list iteration loop (`for each item: if item->field56 != filter, call a
+per-item update callback`), whose callback (`0x27EEA0`) does real floating-point distance/timer
+math on object pairs. This is real, executing per-frame game logic — not a synthetic stall.
 
-PC ends up oscillating among three addresses (`0x474F94`/`0x476A28`/`0x476D44`) inside a
-real MMI-based memory/string-scan routine (`psubb`/`pnor`/`pand`/`pcpyld` — a classic SWAR
-`strlen`-style byte scan) — this is very likely *not itself* the bug (it's plausibly a hot,
-frequently-called utility function, not a spin loop), just where the periodic 1M-cycle samples
-happen to land while whatever outer loop calls it repeats without completing.
+**Bug C (found, not yet root-caused): the frame loop runs but produces zero new content.**
+Verified over a 400M-cycle window past the post-logo transition: `Gs.PrimitivesDrawn` and
+`Gif.Path3Transfers` are **completely frozen** (unchanged instruction-for-instruction) the entire
+time, `Cdvd.SectorsRead` stays at `0` throughout, yet `Gs.PixelsWritten` grows by *exactly* one
+full framebuffer (640×448 = 286720) every single frame — consistent with a plain screen clear,
+not new rendering. Simulating repeated Start-button taps via `PadInput.Press`/`Release` made no
+difference (same PC pattern, same frozen counters). The rendered framebuffer is solid black the
+entire time (checked via periodic PPM snapshots converted with ffmpeg).
+
+Working hypothesis, not yet confirmed: the iterated list's count (`*(s2+8)` in the loop) is
+plausibly zero — i.e. the scene/entity list this loop walks hasn't been populated yet — and
+`Cdvd.SectorsRead == 0` for 400M+ cycles suggests whatever should trigger loading the next
+screen's assets from disc hasn't fired. A `DETPS2_TRACE_RPC=1` trace across this exact window
+showed **zero** `RealSifRpc.HandleCall`/`HandleBind` activity at all, which is itself worth
+double-checking before trusting as a negative result (confirm the env var is actually reaching
+the process, and consider whether this game's CD/status queries route through a different,
+older SIF path that doesn't go through `RealSifRpc.cs`'s real-packet interception at all — see
+§5.4). Next step: instrument the object-list loop directly (its count field, and whether
+`0x27EEA0` ever actually runs) rather than continuing to infer purely from counters.
 
 ---
 
@@ -505,7 +511,7 @@ general-purpose ones:
 |---|---|
 | `blocker-trace <user-media.json> [--cycles=N] [--pcbreak=HEX] [--dump=ADDR:LEN] [--trace-window=N] [--no-assist\|--no-force-sif\|--no-unstick-waits\|--no-auto-complete]` | The main real-disc-boot diagnostic: boots the title(s) in `user-media.json`, runs N cycles, reports final PC/px/DMA/syscall counts. `--pcbreak` prints full GPR/COP0 state every time PC hits that address (careful — a tight spin loop can produce gigabytes of output in seconds; pipe through `head` or use a short `--cycles`). `--dump` disassembles/dumps raw memory at a fixed address. `--trace-window=N` captures the last N executed instructions once the run completes, useful for telling "genuinely stuck in a tight loop" apart from "just landed here when the cycle budget ran out" (see the PC=`0x480338` vs PC=`0x2062B4` investigation in git history for a worked example of this distinction mattering). The `--no-*` flags disable `MidwayBootAssist`'s synthetic hacks individually so you can measure how far *general* fixes alone get a boot — this is how the §4 interrupt-dispatch fixes were verified as real, not accidental. |
 | `long-run --hours=N --log=PATH` | Unattended multi-hour soak: boots, runs in chunks, writes flushed timestamped checkpoints. For overnight/background investigation. |
-| `probe-frame` | Boots MK Shaolin Monks specifically (hardcoded paths), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Useful for a quick visual sanity check without setting up `user-media.json`. |
+| `probe-frame` | Boots MK Shaolin Monks specifically (hardcoded paths), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Calls `ActiveQuirk?.OnHostPresent` every iteration (required for `MidwayBootAssist`'s FMV pacing to advance at all — see §7.4's "Bug B" for what happens if a tool forgets this). Useful for a quick visual sanity check without setting up `user-media.json`; convert the output PPM with `ffmpeg -i in.ppm -update 1 out.png` to view it. |
 | `extract-file <iso> <pathOrSubstring> <outPath>` | Pull a raw file (e.g. an `.IRX` module) off a mounted ISO for offline analysis. |
 | `elf-sections <file>` / `elf-info <file>` | Dump ELF/IRX section headers. |
 | `iop-disasm <file> <fileOffsetHex>:<lenHex>` | Disassemble raw IOP (R3000A) bytes — used for reverse-engineering real `.IRX` modules extracted via `extract-file` (see §5.3). |

@@ -711,13 +711,23 @@ if (args.Length > 0 && args[0].Equals("probe-frame", StringComparison.OrdinalIgn
     // (see MidwayBootAssist.OnHostPresent's own doc comment) — this loop previously only
     // called RunFor, which never drives that path at all (a test-tool gap, not a product bug;
     // matches MainWindow.axaml.cs's real per-tick RunFor+OnHostPresent+PresentFrame pattern).
-    int postLogoGrace = 60;
-    for (int i = 0; i < 500; i++)
+    int postLogoGrace = 400;
+    for (int i = 0; i < 800; i++)
     {
         p.RunFor(1_000_000);
         p.ActiveQuirk?.OnHostPresent(p);
-        Console.WriteLine($"  +{i + 1}M PC=0x{p.EE.PC:X8} px={p.Gs.PixelsWritten} " +
+        // Test whether the post-logo black screen is a real "press start" wait: tap Start
+        // every ~10 frames once we're past the logo (a single held press could be missed by
+        // edge-triggered input handling; a real controller also releases between presses).
+        if (p.MidwayAssist.Status is "post-logo-main" && i % 10 < 2)
+            p.Pad.Press(PadInput.Button.Start);
+        else
+            p.Pad.Release(PadInput.Button.Start);
+        Console.WriteLine($"  +{i + 1}M PC=0x{p.EE.PC:X8} px={p.Gs.PixelsWritten} prims={p.Gs.PrimitivesDrawn} " +
+                          $"gifP3={p.Gif.Path3Transfers} cdvd={p.Cdvd.SectorsRead} " +
                           $"assist={p.MidwayAssist.Status} logo={p.MidwayAssist.LogoFrame}/{p.MidwayAssist.LogoFramesTotal} pres={p.MidwayAssist.FramesPresented}");
+        if (p.MidwayAssist.Status is "post-logo-main" && i % 50 == 0)
+            p.Gs.SaveFramebufferAsPPM(outPpm.Replace(".ppm", $"-post{i}.ppm"));
         if (p.MidwayAssist.Status is "logo-done" or "synthetic-logo" or "post-logo-main")
         {
             if (postLogoGrace-- <= 0) break;
