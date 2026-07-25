@@ -167,7 +167,8 @@ public sealed class RealSifRpc
                     ScmdTrayReq => cdvd.TrayOpen ? 1 : 0,
                     ScmdStatus => (int)cdvd.MechaconStatus,
                     ScmdReadClock => 0,
-                    _ => 0
+                    _ => 1 // unmapped function number on a known service — same "0 reads as
+                           // failure" reasoning as the top-level unknown-service fallback
                 };
 
             case SidCdNcmd:
@@ -188,7 +189,7 @@ public sealed class RealSifRpc
                     return ok > 0 ? 1 : 0;
                 }
                 if (fno == NcmdSeek) return 1;
-                return 0;
+                return 1; // unmapped fno — see SidCdScmd comment
 
             case SidPad1:
             case SidPad2:
@@ -199,11 +200,17 @@ public sealed class RealSifRpc
                 return (int)pad.Buttons;
 
             case SidMcServ:
-                return 0;
+                return 1; // unmapped fno — see SidCdScmd comment
 
             default:
+                // Generic fallback for a genuinely unrecognized service: return a
+                // success-shaped 1 rather than 0. Untested assumption, but a defensible
+                // one — many PS2 SDK RPC wrappers treat a 0 return as failure, and for a
+                // module we don't understand at all, "pretend it succeeded and let the
+                // caller carry on" risks less than "return a value that reads as failure
+                // and makes the caller give up/halt", which is what we were observing.
                 UnknownServiceCalls++;
-                return 0;
+                return 1;
         }
     }
 }
