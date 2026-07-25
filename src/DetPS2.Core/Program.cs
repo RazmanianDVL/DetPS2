@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using DetPS2.Core;
 
 // Headless CLI
@@ -185,6 +187,22 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 Console.WriteLine($"    {addr:X8}: {traceSys.Memory.Read32(addr):X8}");
             Console.WriteLine($"  GPRs: v0={traceSys.EE.GetGpr(2).Lo:X} v1={traceSys.EE.GetGpr(3).Lo:X} a0={traceSys.EE.GetGpr(4).Lo:X} a1={traceSys.EE.GetGpr(5).Lo:X} " +
                 $"t0={traceSys.EE.GetGpr(8).Lo:X} t1={traceSys.EE.GetGpr(9).Lo:X} s0={traceSys.EE.GetGpr(16).Lo:X} s1={traceSys.EE.GetGpr(17).Lo:X} ra={traceSys.EE.GetGpr(31).Lo:X}");
+        }
+
+        foreach (var a in args)
+        {
+            if (!a.StartsWith("--trace-window=")) continue;
+            ulong window = ulong.TryParse(a.AsSpan(15), out var w) ? w : 3000ul;
+            traceSys.Tracer.MaxEntries = (int)Math.Min(window + 16, int.MaxValue);
+            traceSys.Tracer.Enable();
+            traceSys.RunFor(window);
+            traceSys.Tracer.Disable();
+            Console.WriteLine($"  trace-window: {traceSys.Tracer.Count} entries captured after cycle {cycles}");
+            var pcCounts = new Dictionary<ulong, int>();
+            foreach (var e in traceSys.Tracer.Entries) pcCounts[e.Pc] = pcCounts.GetValueOrDefault(e.Pc) + 1;
+            Console.WriteLine($"  unique PCs in window: {pcCounts.Count}");
+            foreach (var kv in pcCounts.OrderByDescending(k => k.Value).Take(30))
+                Console.WriteLine($"    pc=0x{kv.Key:X8} hits={kv.Value}");
         }
     }
     Environment.Exit(0);
