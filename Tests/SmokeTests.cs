@@ -600,6 +600,7 @@ public static class SmokeTests
             Scheduler_EventQueue_MasterCyclesExact();
             Regression_FbHashStable();
             Vu_MicroProgram_Runs();
+            Vu_BroadcastAndDestMask();
             Ee_Mmi_PandPor();
             BusContention_ScalesEeBudget();
             DeterministicFloat_CanonicalNaN();
@@ -1000,16 +1001,21 @@ public static class SmokeTests
 
     public static void Vu_MicroProgram_Runs()
     {
+        // Real VU microcode is 64-bit VLIW: each instruction is TWO words in micro mem
+        // ([i]=lower, [i+1]=upper), not one 32-bit MIPS-style word. Upper opcode 40 = ADD
+        // (plain vector-vector form). Fields: opcode[5:0], Fd[10:6], Fs[15:11], Ft[20:16],
+        // destmask[24:21]. E-bit (end of microprogram) at upper-word bit 31.
         var sys = new Ps2System();
-        // micro: ADD-like special 0 + E bit on last
-        // simplified: opcode function 0 (add fields) then end
         sys.Vu0.SetVfRegister(1, new VectorUnit.VuReg128 { X = 1, Y = 2, Z = 3, W = 4 });
         sys.Vu0.SetVfRegister(2, new VectorUnit.VuReg128 { X = 10, Y = 20, Z = 30, W = 40 });
-        // Encode as special primary 0, function 0 (add), rs=1, rt=2, rd=3 — layout in DecodeAndExecute
-        // rs bits 11-15, rt 16-20, rd 6-10, function 0-5
-        uint addOp = (1u << 11) | (2u << 16) | (3u << 6) | 0u;
-        uint endOp = 0x80000000u; // E-bit stop (with nop body)
-        sys.Vu0.LoadMicroProgram(new[] { addOp, endOp });
+
+        const uint fs = 1, ft = 2, fd = 3, destMaskAll = 0xF;
+        uint addUpper = 40u | (fd << 6) | (fs << 11) | (ft << 16) | (destMaskAll << 21); // ADD vf3 = vf1 + vf2
+        uint addLower = 0; // destmask=0 -> LQ-shaped no-op
+        uint nopUpperEnd = (63u | (15u << 6)) | 0x80000000u; // FD_11 idx15 = NOP, E-bit set
+        uint nopLower = 0;
+
+        sys.Vu0.LoadMicroProgram(new[] { addLower, addUpper, nopLower, nopUpperEnd });
         sys.Vu0.StartMicro(0);
         int work = 0;
         for (int i = 0; i < 16; i++)
@@ -1021,8 +1027,44 @@ public static class SmokeTests
         var r = sys.Vu0.GetVfRegister(3);
         if (Math.Abs(r.X - 11f) > 0.01f)
             throw new Exception($"VU add expected ~11 got {r.X}");
+        if (Math.Abs(r.W - 44f) > 0.01f)
+            throw new Exception($"VU add (W lane) expected ~44 got {r.W}");
 
         Console.WriteLine($"[Smoke] Vu_MicroProgram_Runs OK (ops={sys.Vu0.MicroOpsExecuted}, work={work})");
+    }
+
+    public static void Vu_BroadcastAndDestMask()
+    {
+        var sys = new Ps2System();
+        sys.Vu0.SetVfRegister(1, new VectorUnit.VuReg128 { X = 2, Y = 3, Z = 4, W = 5 });
+        sys.Vu0.SetVfRegister(2, new VectorUnit.VuReg128 { X = 10, Y = 20, Z = 30, W = 40 });
+        sys.Vu0.SetVfRegister(4, new VectorUnit.VuReg128 { X = 100, Y = 200, Z = 300, W = 400 });
+
+        // MULx vf3, vf1, vf2 — broadcast ops always write all 4 components (the mask bits
+        // instead select which single ft component to broadcast; here bc=0 -> ft.X=10).
+        const uint fs1 = 1, ft2 = 2, fd3 = 3;
+        uint mulxUpper = 24u | (fd3 << 6) | (fs1 << 11) | (ft2 << 16); // opcode 24 = MULx, bc field = op&3 = 0
+        // ADD vf4, vf1, vf2 with destmask = 0b0101 (X,Z only) — Y/W must stay unchanged.
+        const uint fd4 = 4, destMaskXZ = 0b0101;
+        uint addUpper = 40u | (fd4 << 6) | (fs1 << 11) | (ft2 << 16) | (destMaskXZ << 21);
+        uint nopUpperEnd = (63u | (15u << 6)) | 0x80000000u;
+
+        sys.Vu0.LoadMicroProgram(new[] { 0u, mulxUpper, 0u, addUpper, 0u, nopUpperEnd });
+        sys.Vu0.StartMicro(0);
+        for (int i = 0; i < 16 && sys.Vu0.RunningMicro; i++) sys.Vu0.Step(4);
+
+        var mulResult = sys.Vu0.GetVfRegister(3);
+        if (Math.Abs(mulResult.X - 20f) > 0.01f || Math.Abs(mulResult.Y - 30f) > 0.01f ||
+            Math.Abs(mulResult.Z - 40f) > 0.01f || Math.Abs(mulResult.W - 50f) > 0.01f)
+            throw new Exception($"MULx broadcast wrong: {mulResult}");
+
+        var addResult = sys.Vu0.GetVfRegister(4);
+        if (Math.Abs(addResult.X - 12f) > 0.01f) throw new Exception($"ADD destmask X wrong: {addResult.X}");
+        if (Math.Abs(addResult.Y - 200f) > 0.01f) throw new Exception($"ADD destmask should not touch Y: {addResult.Y}");
+        if (Math.Abs(addResult.Z - 34f) > 0.01f) throw new Exception($"ADD destmask Z wrong: {addResult.Z}");
+        if (Math.Abs(addResult.W - 400f) > 0.01f) throw new Exception($"ADD destmask should not touch W: {addResult.W}");
+
+        Console.WriteLine("[Smoke] Vu_BroadcastAndDestMask OK");
     }
 
     public static void Ee_Mmi_PandPor()
