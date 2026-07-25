@@ -874,7 +874,14 @@ public sealed class EmotionEngine : ISchedulable
         uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
         short off = (short)(opcode & 0xFFFF);
         ulong addr = GetGpr(rs).Lo + (ulong)off;
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = _memory.Read32(addr) });
+        // LW sign-extends into the 64-bit GPR (that's exactly what distinguishes it from
+        // LWU, which zero-extends) — a plain uint->ulong assignment here is a zero-extend,
+        // silently turning any loaded value with the high bit set (e.g. -1, or any negative
+        // 32-bit int/loop-bound-sentinel) into a huge positive 64-bit number instead. Found
+        // by hand-tracing a real infinite loop: `slt v0,s0,a1` with a1 loaded as 0xFFFFFFFF
+        // via LW should compare as "positive < -1" (false, loop should end) but was instead
+        // comparing "positive < +4294967295" (true, forever) because of this bug.
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)(long)(int)_memory.Read32(addr) });
     }
 
     private void ExecuteSb(uint opcode)
