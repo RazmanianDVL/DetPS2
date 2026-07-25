@@ -56,6 +56,14 @@ public sealed class GsRegisters
     public ulong DISPFB1 { get; private set; }
     public ulong DISPFB2 { get; private set; }
 
+    // Host-to-local / local-to-local VRAM transfer registers (real addresses 0x50-0x54,
+    // confirmed against multiple real ps2sdk-derived headers — see WriteRegister64 note).
+    public ulong BITBLTBUF { get; private set; }
+    public ulong TRXPOS { get; private set; }
+    public ulong TRXREG { get; private set; }
+    public ulong TRXDIR { get; private set; }
+    public ulong HWREG { get; private set; }
+
     public void SetPmode(ulong v) => PMODE = v;
     public void SetSmode2(ulong v) => SMODE2 = v;
     public void SetDisplay1(ulong v) => DISPLAY1 = v;
@@ -101,6 +109,16 @@ public sealed class GsRegisters
 
     public void WriteRegister(uint address, uint value) => WriteRegister64(address, value);
 
+    // Real GS register addresses (verified against multiple real ps2sdk-derived headers,
+    // e.g. quake1_ps2/ps2_gs.h and the ps2dev.org GS privileged-register thread). An
+    // earlier version of this map had a sweeping set of wrong IDs in the 0x18-0x54 range
+    // — XYOFFSET/SCISSOR/ALPHA/TEST/FBA/ZBUF/FRAME_2/PRMODECONT/PRMODE/TEXCLUT were all
+    // at the wrong addresses, and BITBLTBUF/TRXPOS/TRXREG/TRXDIR/HWREG (the real VRAM
+    // transfer registers real games use to upload all texture/framebuffer data) weren't
+    // mapped at all — 0x50-0x54 was occupied by SCISSOR/TEST/ALPHA/FBA instead. Any real
+    // game configuring scissor clipping, alpha blending, depth test, or issuing a VRAM
+    // transfer via its real, SDK-compiled register addresses would have silently hit the
+    // wrong state (or nothing at all) under the old map.
     public void WriteRegister64(uint address, ulong value)
     {
         address &= 0x7F;
@@ -116,7 +134,7 @@ public sealed class GsRegisters
             case 0x05: XYZ3 = value; break;
             case 0x0A: FOG = value; break;
             case 0x3D: FOGCOL = value; break;
-            case 0x1A: TEXCLUT = value; break;
+            case 0x1C: TEXCLUT = value; break;
             case 0x14: TEX1_1 = value; break;
             case 0x15: TEX1_2 = value; break;
             case 0x16: TEX2_1 = value; break;
@@ -125,26 +143,31 @@ public sealed class GsRegisters
             case 0x07: TEX0_2 = value; break;
             case 0x08: CLAMP_1 = value; break;
             case 0x09: CLAMP_2 = value; break;
+            case 0x18: XYOFFSET_1 = value; break;
+            case 0x19: XYOFFSET_2 = value; break;
             case 0x4C: FRAME_1 = value; break;
-            case 0x4D: ZBUF_1 = value; break;
-            case 0x4E: XYOFFSET_1 = value; break;
-            case 0x4F: XYOFFSET_2 = value; break;
-            case 0x50: SCISSOR_1 = value; break;
-            case 0x51: SCISSOR_2 = value; break;
-            case 0x52: TEST_1 = value; break;
-            case 0x53: ALPHA_1 = value; break;
-            case 0x54: FBA_1 = value; break;
-            case 0x55: TEST_2 = value; break;
-            case 0x5A: ALPHA_2 = value; break;
-            case 0x5B: FBA_2 = value; break;
-            case 0x5C: FRAME_2 = value; break;
-            case 0x5D: ZBUF_2 = value; break;
+            case 0x4D: FRAME_2 = value; break;
+            case 0x4E: ZBUF_1 = value; break;
+            case 0x4F: ZBUF_2 = value; break;
+            case 0x40: SCISSOR_1 = value; break;
+            case 0x41: SCISSOR_2 = value; break;
+            case 0x47: TEST_1 = value; break;
+            case 0x48: TEST_2 = value; break;
+            case 0x42: ALPHA_1 = value; break;
+            case 0x43: ALPHA_2 = value; break;
+            case 0x4A: FBA_1 = value; break;
+            case 0x4B: FBA_2 = value; break;
             case 0x44: DIMX = value; break;
             case 0x45: DTHE = value; break;
             case 0x46: COLCLAMP = value; break;
             case 0x49: PABE = value; break;
-            case 0x1C: PRMODECONT = value; break;
-            case 0x1D: PRMODE = value; break;
+            case 0x1A: PRMODECONT = value; break;
+            case 0x1B: PRMODE = value; break;
+            case 0x50: BITBLTBUF = value; break;
+            case 0x51: TRXPOS = value; break;
+            case 0x52: TRXREG = value; break;
+            case 0x53: TRXDIR = value; break;
+            case 0x54: HWREG = value; break;
         }
     }
 
@@ -165,13 +188,19 @@ public sealed class GsRegisters
             0x08 => CLAMP_1,
             0x09 => CLAMP_2,
             0x0A => FOG,
+            0x18 => XYOFFSET_1,
             0x4C => FRAME_1,
-            0x4D => ZBUF_1,
-            0x4E => XYOFFSET_1,
-            0x50 => SCISSOR_1,
-            0x52 => TEST_1,
-            0x53 => ALPHA_1,
-            0x54 => FBA_1,
+            0x4D => FRAME_2,
+            0x4E => ZBUF_1,
+            0x40 => SCISSOR_1,
+            0x47 => TEST_1,
+            0x42 => ALPHA_1,
+            0x4A => FBA_1,
+            0x50 => BITBLTBUF,
+            0x51 => TRXPOS,
+            0x52 => TRXREG,
+            0x53 => TRXDIR,
+            0x54 => HWREG,
             _ => 0
         };
     }
@@ -188,9 +217,9 @@ public sealed class GsRegisters
         Ensure(0x00, PRIM);
         Ensure(0x01, RGBAQ);
         Ensure(0x06, TEX0_1);
-        Ensure(0x50, SCISSOR_1);
-        Ensure(0x52, TEST_1);
-        Ensure(0x53, ALPHA_1);
+        Ensure(0x40, SCISSOR_1);
+        Ensure(0x47, TEST_1);
+        Ensure(0x42, ALPHA_1);
         return snap;
     }
 

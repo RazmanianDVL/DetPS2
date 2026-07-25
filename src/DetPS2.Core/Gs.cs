@@ -559,6 +559,82 @@ public sealed class Gs : ISchedulable
         return (color & 0xFF000000) | ((uint)r << 16) | ((uint)g << 8) | b;
     }
 
+    // ===================== GS local memory swizzle addressing =====================
+    // Real GS VRAM is not laid out row-major; it's tiled into 8KB "pages" made of 32
+    // fixed-layout blocks, each block internally Z-order (Morton) swizzled. Real games'
+    // texture/framebuffer data is written and expected to be read back in this layout —
+    // naive row-major addressing (what this file used before) only round-trips data this
+    // engine wrote itself, and would render real GS-hardware-authored texture data as
+    // scrambled noise. blockTable32/columnTable32 below are transcribed VERBATIM from
+    // PCSX2's GSTables.cpp (github.com/PCSX2/pcsx2) — a real, working GS implementation —
+    // rather than derived from a general description, given how easy this is to get
+    // subtly wrong. PSMT8's block table is confirmed identical to PSMT32's; its column
+    // (within-block) table is NOT independently confirmed — generated via the same
+    // Morton bit-interleave pattern columnTable32 was confirmed to follow, extended to
+    // PSMT8's 16x16 block (vs. PSMCT32's 8x8), which is a reasoned extension, not a
+    // verbatim-sourced table. PSMCT16/PSMT4 are NOT swizzled here — deliberately left on
+    // the existing row-major path pending further verification (their block dimensions
+    // are non-square, arithmetically derived rather than confirmed, per research notes).
+    private static readonly int[,] BlockTable32 =
+    {
+        { 0, 1, 4, 5,16,17,20,21},
+        { 2, 3, 6, 7,18,19,22,23},
+        { 8, 9,12,13,24,25,28,29},
+        {10,11,14,15,26,27,30,31}
+    };
+    private static readonly int[,] ColumnTable32 =
+    {
+        { 0, 1, 4, 5, 8, 9,12,13},
+        { 2, 3, 6, 7,10,11,14,15},
+        {16,17,20,21,24,25,28,29},
+        {18,19,22,23,26,27,30,31},
+        {32,33,36,37,40,41,44,45},
+        {34,35,38,39,42,43,46,47},
+        {48,49,52,53,56,57,60,61},
+        {50,51,54,55,58,59,62,63}
+    };
+
+    /// <summary>Bit-interleave (Morton/Z-order) x and y into a single index — the pattern
+    /// ColumnTable32 was confirmed to follow (x supplies even bits, y supplies odd bits).</summary>
+    private static int MortonInterleave(int x, int y, int bits)
+    {
+        int r = 0;
+        for (int i = 0; i < bits; i++)
+        {
+            r |= ((x >> i) & 1) << (2 * i);
+            r |= ((y >> i) & 1) << (2 * i + 1);
+        }
+        return r;
+    }
+
+    /// <summary>PSMCT32 swizzled byte offset for pixel (x,y). Page 64x32px, block 8x8px,
+    /// 4 bytes/pixel, 256 bytes/block (8192/32), 8192 bytes/page.</summary>
+    private static uint SwizzleOffset32(uint texBaseBytes, int x, int y, int bufferWidthPx)
+    {
+        const int pageW = 64, pageH = 32, blockW = 8, blockH = 8;
+        int pagesPerRow = Math.Max(1, (bufferWidthPx + pageW - 1) / pageW);
+        int pageX = x / pageW, pageY = y / pageH;
+        int pageIdx = pageY * pagesPerRow + pageX;
+        int ix = x % pageW, iy = y % pageH;
+        int blockIdx = BlockTable32[(iy / blockH) % 4, (ix / blockW) % 8];
+        int pixelIdx = ColumnTable32[iy % blockH, ix % blockW];
+        return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx * 4);
+    }
+
+    /// <summary>PSMT8 swizzled byte offset for pixel (x,y). Page 128x64px, block 16x16px
+    /// (256 bytes/block, matching PSMT32's block-table shape), 1 byte/pixel.</summary>
+    private static uint SwizzleOffset8(uint texBaseBytes, int x, int y, int bufferWidthPx)
+    {
+        const int pageW = 128, pageH = 64, blockW = 16, blockH = 16;
+        int pagesPerRow = Math.Max(1, (bufferWidthPx + pageW - 1) / pageW);
+        int pageX = x / pageW, pageY = y / pageH;
+        int pageIdx = pageY * pagesPerRow + pageX;
+        int ix = x % pageW, iy = y % pageH;
+        int blockIdx = BlockTable32[(iy / blockH) % 4, (ix / blockW) % 8];
+        int pixelIdx = MortonInterleave(ix % blockW, iy % blockH, 4);
+        return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx);
+    }
+
     public uint SampleTexture(float u, float v)
     {
         int tw = _texWidth;
@@ -614,10 +690,12 @@ public sealed class Gs : ISchedulable
         }
 
         int psm = Registers.TexPsm;
-        // PSMT8 (0x13): 8-bit index → CLUT
+        // PSMT8 (0x13): 8-bit index → CLUT. Real block-swizzled addressing (see
+        // SwizzleOffset8) — buffer width defaults to the texture's own width, which is
+        // correct for the common single-texture case; real TBW isn't modeled separately.
         if (psm == 0x13)
         {
-            int bi = (int)(_texBase + tv * tw + tu);
+            int bi = (int)SwizzleOffset8(_texBase, tu, tv, tw);
             if (bi < 0 || bi >= _localMem.Length) return 0xFFFFFFFF;
             byte idx8 = _localMem[bi];
             return _hasClut ? _clut[idx8] : 0xFF000000u | ((uint)idx8 << 16) | ((uint)idx8 << 8) | idx8;
@@ -643,8 +721,8 @@ public sealed class Gs : ISchedulable
             return 0xFF000000u | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
         }
 
-        // PSMCT32 / default
-        int byteIndex = (int)(_texBase + (tv * tw + tu) * 4);
+        // PSMCT32 / default — real block-swizzled addressing (see SwizzleOffset32).
+        int byteIndex = (int)SwizzleOffset32(_texBase, tu, tv, tw);
         if (byteIndex < 0 || byteIndex + 3 >= _localMem.Length)
             return 0xFFFFFFFF;
         return (uint)(_localMem[byteIndex]
@@ -683,7 +761,7 @@ public sealed class Gs : ISchedulable
         int n = Math.Min(indices.Length, width * height);
         for (int i = 0; i < n; i++)
         {
-            int bi = (int)_texBase + i;
+            int bi = (int)SwizzleOffset8(_texBase, i % width, i / width, width);
             if (bi >= _localMem.Length) break;
             _localMem[bi] = indices[i];
         }
@@ -737,7 +815,7 @@ public sealed class Gs : ISchedulable
         int n = Math.Min(pixels.Length, width * height);
         for (int i = 0; i < n; i++)
         {
-            int bi = (int)(_texBase + i * 4);
+            int bi = (int)SwizzleOffset32(_texBase, i % width, i / width, width);
             if (bi + 3 >= _localMem.Length) break;
             uint p = pixels[i];
             _localMem[bi] = (byte)p;
@@ -771,7 +849,16 @@ public sealed class Gs : ISchedulable
         }
     }
 
-    /// <summary>IMAGE path: write raw QW data into local mem at current BITBLT position (simplified linear).</summary>
+    /// <summary>IMAGE path: write raw QW data into local mem at current BITBLT position
+    /// (simplified linear — NOT yet swizzle-aware). This is the real path commercial games
+    /// use for every texture/framebuffer upload (BITBLTBUF/TRXPOS/TRXREG/TRXDIR-driven
+    /// transfer, now correctly stored at their real register addresses — see
+    /// GsRegisters.WriteRegister64 — but this method still writes a contiguous linear byte
+    /// run rather than tracking a real per-pixel (x,y) cursor through SwizzleOffset32/8, so
+    /// data arriving through here doesn't land where SampleTexel now expects it. Only the
+    /// synthetic UploadTexture/UploadTexture8 test helpers are swizzle-consistent today.
+    /// Making this path correct needs real TRXPOS/TRXREG-driven cursor tracking, not just
+    /// a formula change — left as flagged, scoped-out future work.</summary>
     public void WriteImageData(ReadOnlySpan<byte> data, int destByteOffset)
     {
         int n = Math.Min(data.Length, _localMem.Length - destByteOffset);

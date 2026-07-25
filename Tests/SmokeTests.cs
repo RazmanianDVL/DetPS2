@@ -176,8 +176,10 @@ public static class SmokeTests
     {
         var sys = new Ps2System();
         sys.Gs.Clear(0xFF000000, float.MaxValue);
-        // Enable ZTE + ZTST=GREATER (3) + write: bits 16=1, 17-18=3, 19=0
-        sys.Gs.WriteGsRegister(0x52, (1u << 16) | (3u << 17));
+        // Enable ZTE + ZTST=GREATER (3) + write: bits 16=1, 17-18=3, 19=0. TEST_1 is real
+        // address 0x47 (was wrongly 0x52 — TRXREG's real address — before the GS register
+        // map fix).
+        sys.Gs.WriteGsRegister(0x47, (1u << 16) | (3u << 17));
         // Near triangle (small z)
         sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFF00FF00, 0.1f, 0.1f, 0.1f);
         uint nearPix = sys.Gs.GetPixel(250, 230);
@@ -197,7 +199,8 @@ public static class SmokeTests
         sys.Gs.Clear(0xFF0000FF); // blue dest
         // Standard-ish blend: (Cs - 0) * As + Cd  => A=Cs B=0 C=As D=Cd → ALPHA low bits
         // A=0 (Cs), B=2 (0), C=0 (As), D=1 (Cd)  → bits: A=00 B=10 C=00 D=01 = 0b01_00_10_00 = 0x48
-        sys.Gs.WriteGsRegister(0x53, 0x48UL);
+        // ALPHA_1 is real address 0x42 (was wrongly 0x53 — TRXDIR's real address).
+        sys.Gs.WriteGsRegister(0x42, 0x48UL);
         sys.Gs.WriteGsRegister(0x00, (1UL << 6) | 6); // sprite + ABE
         // semi-red source A=128
         uint src = 0x80FF0000;
@@ -2446,9 +2449,9 @@ public static class SmokeTests
     {
         var sys = new Ps2System();
         // ATE=1, ATST=4 EQUAL, AREF=0xFF — only full alpha passes
-        // Write TEST_1 register 0x52
+        // TEST_1 is real address 0x47 (was wrongly 0x52 — TRXREG's real address).
         ulong test = 1u | (4u << 1) | (0xFFu << 4);
-        sys.Gs.Registers.WriteRegister64(0x52, test);
+        sys.Gs.Registers.WriteRegister64(0x47, test);
         // Draw with low alpha via clear then quad — DrawQuad uses solid color with A=FF usually
         // Force fragment path: clear, enable depth off, draw with color alpha 0x10
         sys.Gs.Clear(0xFF000000);
@@ -2458,7 +2461,7 @@ public static class SmokeTests
         if (sys.Gs.FragmentsRejectedAlpha <= rejBefore)
         {
             // If DrawQuad doesn't set alpha path, set ATE never
-            sys.Gs.Registers.WriteRegister64(0x52, 1u | (0u << 1)); // NEVER
+            sys.Gs.Registers.WriteRegister64(0x47, 1u | (0u << 1)); // NEVER
             sys.Gs.DrawQuad(30, 30, 10, 10, 0xFFFFFFFF);
             if (sys.Gs.FragmentsRejectedAlpha <= rejBefore)
                 throw new Exception("alpha test never rejected");
