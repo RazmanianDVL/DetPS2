@@ -494,19 +494,50 @@ Two candidate explanations were investigated and **ruled out**:
   run. The SIF-init gating fix alone (plus the always-on FMV/post-logo mechanisms) is what gets
   this far — confirmed, not assumed.
 
-**Still open, and now sharper**: `DETPS2_TRACE_RPC=1` shows **zero** `RealSifRpc.HandleCall`/
-`HandleBind` activity across the entire run — sanity-checked against `DETPS2_TRACE_PREEMPT=1` in
-the identical invocation style (which *does* produce output), ruling out "the env var isn't
-reaching the process" as the explanation. So this is a real, confirmed negative result: whatever
-lets `sceSifBindRpc` succeed and the boot progress this far is **not** going through
-`RealSifRpc.cs`'s real-packet interception at all — some other path in `SonyKernelHle`'s SIF
-dispatch (see §5.1/§5.4, the "system-cid/heuristic handling" fallback `RealSifRpc.TryHandle`
-itself mentions) must be involved instead. Combined with `Cdvd.SectorsRead == 0` for 400M+ cycles
-straight, the next concrete step is instrumenting `SonyKernelHle`'s syscall-0x77 (`SifSetDma`)
-dispatch directly to see which branch real SIF traffic for this title actually takes, rather than
-continuing to infer from `RealSifRpc.cs`'s own counters — and separately, instrumenting the
-object-list loop itself (its count field, and whether `0x27EEA0` ever actually runs) to confirm
-the "empty entity list" theory directly instead of continuing to infer it from GS counters alone.
+**Correction — important, changes how "fixed" Bug A really is**: `DETPS2_TRACE_RPC=1` showed
+**zero** `RealSifRpc.HandleCall`/`HandleBind` activity across the entire run (sanity-checked
+against `DETPS2_TRACE_PREEMPT=1` in the identical invocation style, which *does* produce output —
+ruling out "the env var isn't reaching the process"). Chasing why led somewhere more important
+than the original question: `--pcbreak=483588` (`sceSifBindRpc`'s own call site for
+`sceSifSendCmd`, confirmed by disassembly to build a real `cid=0x80000009` bind packet) **never
+fires once** in 270M cycles. And `--pcbreak=482E98` (`sceSifInitRpc`'s entry) shows, at the exact
+cycle `MaybeForceSifInit`'s `MasterCycles < 1_500_000` gate allows it to fire
+(`cyc=1500000` exactly): `ra=0x2131D0` with every GPR zeroed except `sp`/`ra` — the unmistakable
+signature of `MaybeForceSifInit`'s own forced jump (it explicitly zeros GPRs 2-25/28/30 and sets
+`ra=0x2131D0`), not a real caller.
+
+Since the pad-bind retry starts at `cyc≈1,250,064` and is still spinning at `cyc=1,500,000` (its
+own retry delay is near-instant, so it's continuously re-entering the loop, not blocked
+elsewhere), **`MaybeForceSifInit`'s forced jump almost certainly fires while `sceSifBindRpc` is
+still mid-retry and abandons it outright** — PC is yanked directly into `sceSifInitRpc` and then
+teleported to `0x2131D0` (a point in `main()`'s own later continuation), rather than the bind ever
+actually completing. `sceSifInitRpc` genuinely does get initialized for real (verified — this part
+of the original fix is real and correct, and removing the chicken-and-egg gate was still the right
+call), but the padman bind itself is **abandoned, not resolved**.
+
+**What this means, stated plainly**: the boot reaching `"post-logo-main"` and a real per-frame
+object-update loop is genuine — more of the game's own code demonstrably executes now, which has
+real diagnostic value (§7.4 above, "Bug C") — but it is **not** evidence that `sceSifBindRpc`
+completes correctly. It's the pre-existing per-title forced-jump hack (now just correctly gated)
+skipping past the stuck state, exactly like its own doc comment describes
+("Redirect CRT0 into Midway's real main... Observed: fast-boot never hits 0x212F70 and idles"),
+not a general fix that lets the real SIF-RPC handshake happen. This directly explains Bug C: the
+object list stays empty and nothing new ever renders because whatever legitimate setup padman's
+real bind completion would have triggered never happened — the game is running in a
+"skipped a step" state, not a healthy one.
+
+**The real open question, sharper now**: why does `sceSifBindRpc` never complete on its own?
+`_rpc_get_packet` (the 32-slot pool allocator) never reaches `sceSifSendCmd` even once, despite
+`pkt_table_len` now being correctly initialized. Two live hypotheses, neither confirmed: (a) the
+32-slot pool exhausts almost immediately because nothing ever calls `rpc_packet_free()` for a bind
+that never truly completes, so after the first ~32 (near-instant) retries it's back to permanent
+allocation failure for a different reason than the original zero-init bug; (b) an earlier branch
+inside `sceSifBindRpc`/`_rpc_get_packet` that wasn't correctly traced diverts execution before
+ever reaching `0x483588`. Next step: instrument `_rpc_get_packet` (`0x483060`) directly — log its
+`a0` (`pkt_table_len`) and return value on every call — rather than continuing to infer from
+whether a much-later call site is ever reached. Separately, `Cdvd.SectorsRead == 0` for 400M+
+cycles straight and instrumenting the object-list loop's count field remain open threads too, but
+are likely downstream of this same root cause rather than independent bugs.
 
 ---
 
