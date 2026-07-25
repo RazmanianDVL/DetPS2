@@ -434,6 +434,36 @@ if (args.Length > 0 && args[0].Equals("find-word", StringComparison.OrdinalIgnor
 // detps2 disasm <media.json> <cycles> <addr>:<len> [titleIndex] — boot, run N cycles, then
 // disassemble a raw address range with EeDisassembler. Standalone tool for reading real-boot
 // code without going through blocker-trace's fuller (and slower) telemetry/tracer machinery.
+if (args.Length > 0 && args[0].Equals("scanword", StringComparison.OrdinalIgnoreCase))
+{
+    // Finds every occurrence of a raw 32-bit word (e.g. a specific JAL encoding, to
+    // locate all callers of a given function) across a title's loaded code+data range.
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 5) { Console.WriteLine("usage: detps2 scanword <media.json> <word_hex> <start_hex> <len_hex> [titleIndex]"); Environment.Exit(1); }
+    UserMediaConfig scfg = UserMediaConfig.Load(args[1]);
+    uint word = Convert.ToUInt32(args[2], 16);
+    uint sstart = Convert.ToUInt32(args[3], 16);
+    uint slen = Convert.ToUInt32(args[4], 16);
+    int stitleIdx = args.Length > 5 && int.TryParse(args[5], out var sti) ? sti : 0;
+    if (stitleIdx >= scfg.Titles.Count) { Console.WriteLine("No such title index"); Environment.Exit(1); }
+    var stitle = scfg.Titles[stitleIdx];
+    var ssys = new Ps2System();
+    ssys.LoadBios(scfg.BiosPath!);
+    var smsg = ssys.BootDiscFile(stitle.Path);
+    Console.WriteLine($"[{stitle.Id}] {smsg.Message}");
+    int hits = 0;
+    for (uint addr = sstart; addr < sstart + slen; addr += 4)
+    {
+        if (ssys.Memory.Read32(addr) == word)
+        {
+            Console.WriteLine($"  0x{addr:X8}");
+            hits++;
+        }
+    }
+    Console.WriteLine($"total matches: {hits}");
+    Environment.Exit(0);
+}
+
 if (args.Length > 0 && args[0].Equals("disasm", StringComparison.OrdinalIgnoreCase))
 {
     Console.WriteLine(VersionInfo.Banner);

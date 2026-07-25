@@ -586,16 +586,56 @@ improvement regardless of how much of any specific run's *observed* progress tra
 versus the other four mechanisms — verified via the full smoke suite with no regression to the
 already-working assisted boot.
 
-**What "genuinely fixing this" would require**: finding and fixing whatever actually blocks
-`main()`'s own natural progress toward its own `sceSifInitRpc` call site (`0x2131C8`) *without* any
-of the five mechanisms firing — i.e. root-causing why the general architecture fixes from earlier
-this session (interrupt dispatch, IM masking, thread preemption) aren't, on their own, sufficient
-for this title's SIF-RPC subsystem to initialize the way it would on real hardware. That trace
-hasn't been done yet, and per the above, doing it cleanly means disabling all five mechanisms via
-`--no-assist` and working from that single, honest baseline — not layering a sixth mechanism on
-top of five that already interact in ways that took this long to even characterize.
-`Cdvd.SectorsRead == 0` for 400M+ cycles straight and the empty object-list loop (§7.4 "Bug C")
-are very likely downstream symptoms of the same underlying gap, not independent bugs.
+**Resolved (2026-07-25) — the exact deadlock, traced instruction-by-instruction from `main()`
+down to the specific stalled retry, with the `--no-assist` baseline as the only input.** This
+supersedes the "why doesn't `main()` reach `0x2131C8` fast enough" framing above — it isn't a
+speed problem, it's a permanent, well-formed deadlock:
+
+1. `main()`'s very first action (`0x212FA8`, before anything else including its own argument
+   parsing) tail-calls a lazy-init guard (`0x205F00`/`0x205E50`) that walks a **221-entry static
+   C++ constructor table** (`base=0x5656DC`, count read directly from static ELF data) in
+   *reverse* declaration order — a completely ordinary, real toolchain pattern, confirmed by
+   reading the table and its walk loop directly out of loaded memory.
+2. Tracing four call-chain hops deep (`0x2F7F68` → `0x2C6520` → `0x00212990` → `0x00206268`,
+   each hop confirmed by scanning the whole loaded ELF for the exact `jal` encoding to the
+   previous hop's address via the new `scanword` CLI command — see §9), one of those
+   constructors performs a pad (`sid=0x80000100`) `sceSifBindRpc` call, checks the bind result,
+   and — if it's zero — spins in a calibrated delay loop and retries, forever. This is real,
+   correctly-compiled game code; there is nothing synthetic or emulator-specific about it.
+3. `sceSifBindRpc` (`0x4834E0`) calls `_rpc_get_packet(0x0077A080)` (`0x483060`) first. That
+   function's very first check is `lw a0,8(s1); blez a0,<fail>` — i.e. it bails immediately if
+   `pkt_table_len` (`rpc_data+8`) is `<= 0`, before ever touching the 32-slot packet pool or
+   calling `sceSifSendCmd`. Confirmed directly: `--watch=77A088` across the whole natural boot
+   shows this address is **read 36+ times and never once written** — every single read happens
+   at `pc=0x00483078` inside `_rpc_get_packet`, always finding zero.
+4. `0x0077A080` sits in the game's own BSS (past the ELF's file-backed region per
+   `PT_LOAD file=0x4B1F94 mem=0x680898` — file ends at `0x5B1F94`, BSS runs to `0x780898`), so it
+   is correctly zero-initialized by our loader (and would be on real hardware too) — nothing
+   pre-seeds it. Only `sceSifInitRpc` (`0x482E98`) is known to write `pkt_table_len=32`.
+5. `sceSifInitRpc` is **never called anywhere in the natural boot** — confirmed via
+   `--pcbreak=482E98` across the *entire* run (cycles 0 through 270,000,000; before, during, and
+   long after `main()`'s natural entry at `cyc=957,104`): zero hits. `main()` itself has **five**
+   direct call sites to it (`0x2131C8`, `0x21321C`, `0x213250`, `0x213370`, `0x213428`, all
+   confirmed via `scanword`), but they sit in straight-line code *after* the constructor-table
+   call at `0x212FA8` — so `main()` never reaches its own calls, because it never returns from
+   its first instruction. CRT0 (`0x0011C070`..`0x0011C2A0`, fully disassembled) doesn't call it
+   either; its own pre-`main()` dispatcher at `0x00486228` fans out into seven subsystem-init
+   functions (semaphore/heap/module-table setup) that were spot-checked and don't write
+   `pkt_table_len` either, though not every instruction of all seven has been read line-by-line.
+
+**So the honest open question is now narrow and concrete**: on real hardware this exact
+compiled binary doesn't deadlock here, so *something* makes `pkt_table_len` nonzero (or makes
+the first bind succeed some other way) before this constructor runs — and it is not any of the
+five now-identified call sites, not CRT0's dispatcher's obvious candidates, and not static ELF
+data. Candidates worth checking next: (a) full instruction-level read of all seven
+`0x00486228` subsystem-init callees (three of the eight found were only skimmed), in case one
+writes `rpc_data+8` via inlined stores rather than a call to the `sceSifInitRpc` symbol; (b) the
+possibility that this specific compiled function's `pkt_table_len` gate isn't actually gating on
+initialization-not-yet-run, but on a *different* precondition our struct-offset mapping has
+subtly wrong; (c) IOP-side timing/module-preload behavior real hardware provides that isn't
+reproduced here. This is now a well-scoped, disprovable hypothesis-testing task rather than an
+open-ended "why is this slow" question. `Cdvd.SectorsRead == 0` for 400M+ cycles straight and the
+empty object-list loop (§7.4 "Bug C") remain very likely downstream symptoms of this same gap.
 
 ---
 
@@ -627,6 +667,8 @@ general-purpose ones:
 | `elf-sections <file>` / `elf-info <file>` | Dump ELF/IRX section headers. |
 | `iop-disasm <file> <fileOffsetHex>:<lenHex>` | Disassemble raw IOP (R3000A) bytes — used for reverse-engineering real `.IRX` modules extracted via `extract-file` (see §5.3). |
 | `iop-find-word <file> <wordHex> [start] [end]` | Exact-word scan over raw IOP module bytes — e.g. finding import-stub headers or `jal` call sites. |
+| `disasm <media.json> <cycles> <addr>:<len> [titleIndex]` | Boots the title, runs N cycles, disassembles a fixed EE virtual-address range. `cycles=0` is fine for pure static disassembly of already-ELF-loaded code/data — nothing needs to execute first. |
+| `scanword <media.json> <wordHex> <startHex> <lenHex> [titleIndex]` | EE-side analogue of `iop-find-word`, but scans the *loaded virtual memory image* rather than a raw file — e.g. finding every caller of a function by searching for its exact `jal` encoding (`(0x03<<26) \| (target>>2)`). This is how the whole §7.4 static-constructor call chain (`main()` → `0x2F7F68` → `0x2C6520` → `0x00212990` → `0x00206268`) was traced: each hop found by computing the `jal` word for the previous hop's address and scanning the whole PT_LOAD range for it. |
 | `find-word --mask=HEX <target>` | Same idea but for *running EE memory*, with an optional bitmask for matching an instruction pattern regardless of one field (e.g. "any `jalr $ra,$rs`" regardless of which register). |
 | `dump-spine` / `play-path` / `majority-catalog` / `netplay-cert` / `commercial-checklist` | The synthetic compatibility/campaign gates the smoke suite's `[Smoke] ...` checklist output is built from — see `COMPLETENESS.md` for what each gate actually certifies. |
 
