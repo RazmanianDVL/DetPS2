@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace DetPS2.Core;
@@ -90,6 +91,16 @@ public sealed class EmotionEngine : ISchedulable
 
     private bool _inDelaySlot;
     private ulong _delaySlotTarget;
+    /// <summary>LIFO of $ra values clobbered by TryDispatchRegisteredIntcHandler's
+    /// return-through-eret trick (it points $ra at the exception vector so the handler's own
+    /// `jr ra` epilogue reaches `eret`, without an explicit dispatcher). That overwrite used to
+    /// discard whatever $ra held for the code that got interrupted — since interrupts can land
+    /// at any instruction boundary, including mid-call-chain with a live, not-yet-saved $ra,
+    /// this silently corrupted arbitrary in-flight return addresses (confirmed: MK Shaolin
+    /// Monks' CRT0 static-constructor walker returned into garbage because of exactly this).
+    /// Push the real value before clobbering; ExecuteEret pops and restores it, so this is
+    /// invisible to any code that wasn't relying on the synthesized dispatch's own return path.</summary>
+    private readonly Stack<ulong> _savedRaAcrossIntcDispatch = new();
     /// <summary>Phase 25: when true and branch not taken, skip delay slot (likely branches).</summary>
     private bool _nullifyDelayIfNotTaken;
     private bool _branchWasLikely;
@@ -494,6 +505,7 @@ public sealed class EmotionEngine : ISchedulable
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
+            _savedRaAcrossIntcDispatch.Push(GetGpr(31).Lo);
             SetGpr(31, new Gpr128 { Lo = KernelBootstrap.Kseg0Interrupt }); // ra = vector's eret
             return true;
         }
@@ -1743,6 +1755,8 @@ public sealed class EmotionEngine : ISchedulable
         InterruptPending = false;
         EretCount++;
         PC = target - 4;
+        if (_savedRaAcrossIntcDispatch.Count > 0)
+            SetGpr(31, new Gpr128 { Lo = _savedRaAcrossIntcDispatch.Pop() });
     }
 
     private void ExecuteLd(uint opcode)

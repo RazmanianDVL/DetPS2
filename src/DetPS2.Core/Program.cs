@@ -148,8 +148,15 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     ulong cycles = 5_000_000;
     foreach (var a in args)
         if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) cycles = c;
+    uint? watchAddrArg = null;
     foreach (var a in args)
-        if (a.StartsWith("--watch=")) SystemMemory.WatchAddr = Convert.ToUInt32(a.Substring(8), 16);
+        if (a.StartsWith("--watch=")) watchAddrArg = Convert.ToUInt32(a.Substring(8), 16);
+    // Defers arming --watch until this many cycles have already run — without it, --watch
+    // records every access to the address across the ENTIRE run (often hundreds of thousands
+    // of hits for a commonly-reused stack slot), drowning out the specific access you want.
+    ulong watchAfter = 0;
+    foreach (var a in args)
+        if (a.StartsWith("--watch-after=") && ulong.TryParse(a.AsSpan(14), out var wa)) watchAfter = wa;
     foreach (var a in args)
         if (a.StartsWith("--pcbreak=")) EmotionEngine.PcBreakGpr = Convert.ToUInt32(a.Substring(10), 16);
     if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
@@ -176,7 +183,16 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             msg = traceSys.BootDiscFile(title.Path).Message;
         }
         Console.WriteLine($"[{title.Id}] {msg}");
-        traceSys.RunFor(cycles);
+        if (watchAddrArg.HasValue && watchAfter > 0)
+        {
+            traceSys.RunFor(Math.Min(watchAfter, cycles));
+            SystemMemory.WatchAddr = watchAddrArg;
+        }
+        else if (watchAddrArg.HasValue)
+        {
+            SystemMemory.WatchAddr = watchAddrArg;
+        }
+        traceSys.RunFor(cycles > watchAfter ? cycles - watchAfter : 0);
         Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
         if (SystemMemory.WatchAddr.HasValue)
         {

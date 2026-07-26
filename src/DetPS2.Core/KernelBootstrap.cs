@@ -161,6 +161,18 @@ public static class KernelBootstrap
     /// </summary>
     public static void RescueIfLostInLowMem(Ps2System sys, ulong lastGoodPc = 0)
     {
+        // Legitimate KSEG0 exception-vector execution (interrupt/syscall/exception dispatch —
+        // see EmotionEngine.GetExceptionVector: 0x80000000/0x80000180/0x80000200, the common
+        // non-BEV vectors) is NOT "lost." The check below used to run unconditionally on the
+        // masked `PC & 0x1FFFFFFF`, which collapses these KSEG0 addresses to tiny physical
+        // offsets (0x80000200 -> 0x200) that trivially fail the "in RDRAM" test below — meaning
+        // this safety net could fire (and it did, confirmed via MK Shaolin Monks) WHILE the CPU
+        // was legitimately mid-exception-handler, between vector entry and its own `eret`. That
+        // forcibly clears COP0 EXL/ERL and overwrites PC with a locally-recomputed "resume"
+        // guess *before* eret's own proper unwind runs, sending execution to a garbage address
+        // instead of wherever eret would have actually returned to.
+        if (sys.EE.PC >= 0x80000000UL && sys.EE.PC < 0x80001000UL) return;
+
         ulong pcPhys = sys.EE.PC & 0x1FFFFFFFUL;
         // Game code for commercial titles lives in RDRAM (1MB .. 32MB)
         if (pcPhys >= 0x00100000UL && pcPhys < SystemMemory.RDRAM_SIZE) return;

@@ -653,30 +653,55 @@ deep, previously-unreached game code (`0x00959AE4`+ by `cyc=2,000,000`, vs. neve
 `0x2062xx`/`0x483xxx` region before). Full smoke suite still green (no regression to the
 already-working assisted boot or anything else).
 
-**New blocker found (2026-07-25, not yet fixed) — a corrupted return address, traced to its
-exact instruction.** `--trace-window` sorts by address, not execution order, which is misleading
-for control-flow bugs — added `--trace-window=N --trace-chrono` (dumps `Tracer.Entries` in true
-insertion/cycle order instead) specifically to unpick this. Using it plus a cycle-count bisection
-(binary-searching `--cycles=N` for the PC value at increasing N until the "steady linear PC drift,
-~3.75 bytes/cycle, no taken branches" signature starts) pinned the originating bad jump to a
-single `jr ra` at `0x00345B08`, inside a small audio/volume-calc function
-(`0x00345930`..`0x00345B08`, real prologue `sd ra,0(sp)` at `0x00345954`). Confirmed via
-`--pcbreak=345954`: entered at `cyc=985200` with `sp=0x01FFFE60`, `ra=0x0034D730` (the correct,
-legitimate caller) and `s0=0x0274C7C0` (its own "sound object" struct pointer — note this is
-*already* past the 32MB RDRAM boundary as a raw KUSEG address, aliasing back into range only via
-masking, which is at least unusual). By the matching `ld ra,0(sp)` / `jr ra` at
-`cyc=986628` (confirmed via `--trace-window=600 --trace-chrono --cycles=986500`), the value
-read back from that exact same stack slot (`0x01FFFE60`) is `0x005BA000` instead of the correct
-`0x0034D730` — something wrote into this function's own saved-`ra` stack slot while it was
-running. `0x01FFFE60` is a very commonly-reused address (confirmed via `--watch=1FFFE60`: dozens
-of unrelated functions save/restore `ra` there across a 200,000-cycle window, since it's near the
-top of the main thread's stack, reused every time call depth returns to the same level) — the
-exact corrupting write wasn't isolated before time ran out this session; the next step is
-`--watch=1FFFE60` scoped tightly to `cyc=985200..986628` (this function's own lifetime) to see
-literally every access in between and find which one clobbers it, then trace that write's own
-source register back to see whether it's an off-by-something in the same audio function's
-`13204`-`13224(s0)` struct-field stores (all relative to `s0`, which — see above — already looks
-suspicious) or something unrelated stomping the stack from a different call.
+**FIXED (2026-07-25) — a real, general interpreter bug: interrupt dispatch silently clobbered
+`$ra` for whatever code got interrupted.** Chasing the wild-jump blocker above (adding
+`--trace-window=N --trace-chrono` — dumps `Tracer.Entries` in true insertion/cycle order, unlike
+the existing address-sorted view — plus bisecting `--cycles=N` to find where the "steady linear
+PC drift" signature first appears) traced the drift's true origin to the *221-entry static
+constructor table walker itself* (`0x00205E50`..`0x00205EF8`, see the finding above — this is the
+function `main()`'s first instruction tail-calls into, which runs every C++ global constructor
+in reverse order before `main()`'s own body executes). Its own final `jr ra` — returning to
+`main()` after all 221 constructors finish — jumps to `0x005B9FF0` garbage instead of the correct
+`0x00212FB0`. `--pcbreak=205EEC` (its restore sequence) showed why: `sp=0x01FFFEE0`, not the
+`0x01FFFEB0` it was entered with — a `+0x30` (48-byte) stack imbalance had crept in somewhere
+across the 221 constructor calls, so its own `ld ra,32(sp)` read from the wrong address entirely
+(explaining why `--watch=1FFFE60`/`--watch=1FFFED0` on the *expected* correct addresses upstream
+never showed a corrupting write in either this or the audio-function repro below — the actual
+read/write pair was happening 48 bytes away from where it should have been the whole time).
+
+Root cause, found by reading `EmotionEngine.TryDispatchRegisteredIntcHandler` (the shortcut that
+lets a registered `AddIntcHandler` callback run without a hand-written MIPS dispatcher — see its
+own doc comment): it points `$ra` at the exception vector (`KernelBootstrap.Kseg0Interrupt`, a
+bare `eret` stub) so the handler's own epilogue `jr ra` naturally reaches `eret` and resumes
+normal execution — a clever trick, but it **unconditionally overwrote `$ra` with no save**.
+Interrupts land at arbitrary instruction boundaries, including mid-call-chain with a live,
+not-yet-saved `$ra` (e.g. right after a `jal`, before the callee's own prologue has saved it to
+its stack frame) — any interrupt firing at exactly that moment permanently destroyed that
+call's real return address for the rest of its execution, only reachable via a `sd ra,N(sp)` that
+would now save `Kseg0Interrupt`'s address instead. Fixed in `EmotionEngine.cs`: added a
+`Stack<ulong> _savedRaAcrossIntcDispatch`, pushed before the clobbering `SetGpr(31, ...)` in
+`TryDispatchRegisteredIntcHandler`, popped and restored in `ExecuteEret` (a no-op when the stack
+is empty, so unrelated `eret`s — syscalls, faults, BEV boot — are unaffected; LIFO correctly
+handles a nested interrupt firing inside an already-dispatched handler). Full smoke suite green.
+
+**Note**: this fix did *not* change the specific `+0x30` sp-imbalance symptom above (verified —
+identical `sp=0x01FFFEE0` before and after). It's still a genuine, independently-justified fix
+(exception-frequency in this run is high enough — roughly one every 64–100 cycles — that this
+exact corruption mode was essentially guaranteed to fire eventually somewhere in a 221-call
+sequence), but the sp-drift's specific trigger is a **different, not-yet-found** bug. Ruled out
+so far: (a) thread preemption (`KernelState.MaybePreempt`) — confirmed via
+`DETPS2_TRACE_PREEMPT=1` that no actual thread switch occurs anywhere in this cycle range (the
+newly-startable SIF thread from the `ReferThreadStatus` fix never actually becomes runnable
+during this window, so `_threads.Count>=2` never leads to a real `SaveFullContext`/
+`RestoreFullContext` call); (b) every other unconditional `SetGpr(29/31, ...)` call site
+(`grep -n "SetGpr(29\|SetGpr(31"` across the codebase) is either gated by `--no-assist` or
+requires a state (a real thread switch, a genuinely-lost PC) that doesn't occur here. The
+remaining candidates are an interpreter-level bug in some other instruction (an `addiu sp,...`
+or a load/store width handled wrong for one specific case among the 221 constructors' bodies) or
+another not-yet-found register-clobbering shortcut similar to the one just fixed. Next session:
+bisect which of the 221 table entries (dump the table at `0x5656E0`..`0x565A50`, walk with
+`disasm`/`scanword` per entry) is executing when the imbalance first appears, using
+`--pcbreak=<entry addr>` per-constructor to compare `sp` on entry vs. on return.
 
 **Investigated and ruled out**: `SetupHeap` (EE syscall `0x3D`) was *also* a no-op stub
 (`result = 0`) alongside the already-fixed `ReferThreadStatus`, and CRT0 calls it right after
