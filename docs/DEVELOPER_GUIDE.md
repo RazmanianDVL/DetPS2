@@ -1053,6 +1053,31 @@ bytes, and why does the exception vector then get entered in an unbreakable cycl
 both the SIF-worker-thread deadlock and whatever's beyond it, in one shot, rather than needing
 one force-call per gap the way today's four fixes did.
 
+**Pushed on the `"material"` livelock directly (same day), and hit a second false lead — caught
+the same way, before it got written down as fact.** The write pattern feeding the livelock (a real
+library `strcpy`-equivalent at `0x00474E1C`-`0x00474E6C`, using the standard MIPS "hasless" SIMD
+zero-byte-detection trick via `PSUBB`/`PNOR`/`PAND`/`PCPYUD`) looked, from a wide trace, like it
+might be a self-overlapping runaway copy — worth checking given this session's whole ALU-bug theme.
+It wasn't. Built `--pcbreak=START:END` (dumps registers, now including `a3`/`t0`/`t1`/`t2`, at
+*every* instruction in a range, not just one PC) specifically because neither `--trace-chrono`
+(opcodes, no registers) nor single-address `--pcbreak` (registers, but only one PC per iteration)
+could resolve this precisely enough on their own. With it: `a2` (destination) is set once per
+invocation and genuinely never changes within a call — the earlier "a2 grows in lockstep with a1"
+reading was from *separate* invocations, not one runaway loop. And `PSUBB`'s output was hand-verified
+byte-by-byte against the real quadword content (`t1=0x750380` vs `t2=0x0101010101010101` →
+`v0=0xFFFFFFFFFF74027F`, exactly right) — the MMI zero-detection logic is computing correctly, and
+the specific chunk traced genuinely does contain a real terminator, so the loop correctly exits
+rather than running away. No bug in this loop or in `PSUBB` as tested. Reverted the "runaway copy"
+framing before it could mislead a future investigation.
+
+**What's still true, unretracted**: the exception-vector livelock itself (confirmed via two
+independent reproductions, `s0`-`s3`/`ra` full of `"material"` bytes at the moment it's entered) is
+real and still unexplained. What's now ruled out is "a broken strcpy self-overlap corrupts the
+stack" as its cause. The actual mechanism — how literal ASCII string bytes end up in callee-saved
+registers at an exception boundary — remains open. `--pcbreak=START:END` is now available for
+whoever picks this up next to trace it precisely instead of inferring it from wide snapshots, which
+is what produced both false leads here.
+
 ---
 
 ## 8. Save states & determinism contracts
