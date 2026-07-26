@@ -343,6 +343,21 @@ public sealed class Ps2System : ISchedulable
         Dmac.WriteRegister(0x1000E000, 1);
         Dmac.WriteRegister(0x1000F520, 0x1201);
 
+        // TRIED (2026-07-26) and REVERTED: redirecting into real CRT0 (0x0011C200, right before
+        // the real SetupThread syscall) instead of faking its effect and jumping straight to
+        // main(). Real CRT0 does run for real then — SetupThread/SetupHeap syscalls, the
+        // 0x00486228 init chain (confirmed: creates 2 library mutexes via CreateSema — this
+        // fixed the semaphore-ID-zero bug documented in DEVELOPER_GUIDE.md §7.4), and even
+        // creates a real worker thread (entry 0x00480A18) for the first time all session. But
+        // that worker thread immediately blocks on a semaphore (id 3) that nothing in the whole
+        // run ever signals — its entry point sits in the SIF-RPC library region, strongly
+        // suggesting it's the real SIF worker thread, permanently blocked on something only
+        // genuine IOP-side interaction would ever satisfy. Net effect measured: px capped at
+        // 573440 (was 860160+), gifPath3/dmac stuck at 0 (was 1/4 and climbing) — a real,
+        // reproducible regression versus the fake-CRT0 jump below, not an improvement, even
+        // though it's more architecturally correct. Reverted. The finding is real and valuable
+        // (concrete confirmation that real IOP-side SIF RPC service handling is the actual next
+        // wall — not a maybe) but the code change itself made the boot worse right now.
         // Run CRT0 SetupThread/Heap if we haven't (needed for SP)
         if (pc < 0x0011C250)
         {
