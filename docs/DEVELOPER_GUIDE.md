@@ -969,6 +969,21 @@ it isn't blindly re-attempted; the next real move is building that IOP-side serv
 narrower, deliberately-scoped stand-in for semaphore id `3` specifically) with this exact deadlock
 already mapped out, rather than rediscovering it.
 
+**FIXED, narrower version (same day)**: rather than redirecting all of CRT0 (which drags in the
+thread-creation deadlock above), `MidwayBootAssist.MaybeForceInitLocks` force-calls just
+`InitLocksFn` (`0x00486020`) in isolation — confirmed self-contained (allocate + 2× real
+`CreateSema` syscall, no thread creation anywhere in its own body) — via the same non-destructive
+save/resume trampoline technique as the other two forced calls, gated on the same `cyc>3,000,000`
+threshold already proven safe. **Verified**: `CreateSema` now fires for real (syscall count
+`41`→`43`), `px`/`gifPath3`/`dmac` match the known-good baseline exactly through the full
+30,000,000-cycle window (zero regression), and — critically — no thread gets created, confirming
+this genuinely avoids the deadlock the full-CRT0 experiment hit. The `cyc≈97,888,448` crash (wild
+jump into the unpopulated `0x002022B0` overlay slot) is unaffected either way, as expected — a
+separate, still-open issue. Four real fixes today, all following the same shape: find the
+unreachable one-time call, confirm via `scanword`/`--find-writer`/`--pcbreak` exactly what it does
+and why it's unreached, force-call it in the narrowest safe scope, verify zero regression before
+committing.
+
 ---
 
 ## 8. Save states & determinism contracts
