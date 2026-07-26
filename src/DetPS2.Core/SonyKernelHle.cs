@@ -653,6 +653,8 @@ public sealed class SonyKernelHle
 
     private long SetupThread(uint gp, uint stack, uint stackSize, uint args)
     {
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SETUPTHREAD") == "1")
+            Console.Error.WriteLine($"[SETUPTHREAD] gp=0x{gp:X8} stack=0x{stack:X8} stackSize=0x{stackSize:X8} args=0x{args:X8}");
         if (stackSize == 0) stackSize = 0x10000;
         ulong spTop = (ulong)stack + stackSize;
         if (stack >= 0x100000 && spTop <= SystemMemory.RDRAM_SIZE)

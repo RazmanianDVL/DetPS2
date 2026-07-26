@@ -216,6 +216,14 @@ public sealed class KernelState
         // From SYSCALL: PC is the SYSCALL insn → resume after it.
         // From preemptive yield: PC is the next insn to run → keep as-is.
         t.SavedPc = fromSyscall ? ee.PC + 4 : ee.PC;
+        // Invalidate any older full-preemption snapshot (see SaveFullContext's doc comment for
+        // the matching half of this fix): once this thread has taken a normal cooperative save,
+        // that snapshot's caller-saved registers (v0/v1/a0-a3/t0-t9) are stale relative to
+        // whatever this save just captured. A later MaybePreempt on THIS thread always calls
+        // SaveFullContext fresh before anyone restores it, but a later RestoreFullContext call
+        // could otherwise resurrect the old SavedGprFull array instead of the fields just written
+        // below -- clearing the flag forces it to fall back to these (always current) fields.
+        t.HasFullSave = false;
         t.SavedSp = ee.GetGpr(29).Lo;
         t.SavedGp = ee.GetGpr(28).Lo;
         t.SavedRa = ee.GetGpr(31).Lo;
@@ -333,6 +341,33 @@ public sealed class KernelState
             t.SavedGprFull[i] = ee.GetGpr(i).Lo;
         t.HasFullSave = true;
         t.SavedPc = ee.PC; // preempted mid-stream: resume at the exact interrupted PC
+        // Also refresh the partial-save fields SaveCurrentContext normally maintains. A thread
+        // preempted here can later be resumed via the ordinary cooperative path instead of
+        // RestoreFullContext (e.g. another thread's own SwitchToNext/StartAndMaybeSwitch picking
+        // this thread as "next runnable") -- RestoreContext has no idea SavedGprFull exists and
+        // only ever reads these partial fields. Without this, it would silently resurrect
+        // whatever ancient SavedSp/SavedRa/etc. this thread had from its LAST COOPERATIVE yield
+        // (which can be millions of cycles and many nested calls stale) instead of the position
+        // it was actually just interrupted at -- PC gets restored correctly (both paths use
+        // SavedPc) but every stack-relative access afterward computes from the wrong SP, silently
+        // reading/writing whatever unrelated data now sits at that offset. Confirmed exactly this
+        // failure mode (2026-07-26): a stale SavedSp resurrected a shallower stack frame under a
+        // deeper PC, and the resulting offset mismatch looked like memory corruption (near-null
+        // writes, tiny garbage values in place of real pointers) several layers downstream before
+        // being traced back here.
+        t.SavedSp = ee.GetGpr(29).Lo;
+        t.SavedGp = ee.GetGpr(28).Lo;
+        t.SavedRa = ee.GetGpr(31).Lo;
+        t.SavedS0 = ee.GetGpr(16).Lo;
+        t.SavedS1 = ee.GetGpr(17).Lo;
+        t.SavedS2 = ee.GetGpr(18).Lo;
+        t.SavedS3 = ee.GetGpr(19).Lo;
+        t.SavedS4 = ee.GetGpr(20).Lo;
+        t.SavedS5 = ee.GetGpr(21).Lo;
+        t.SavedS6 = ee.GetGpr(22).Lo;
+        t.SavedS7 = ee.GetGpr(23).Lo;
+        t.SavedS8 = ee.GetGpr(30).Lo;
+        t.SavedFp = ee.GetGpr(30).Lo;
         LogThreadEvent("PreemptOut", _currentTid, t.SavedPc, ee.GetGpr(29).Lo);
     }
 
