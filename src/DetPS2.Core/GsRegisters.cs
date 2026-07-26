@@ -102,10 +102,10 @@ public sealed class GsRegisters
     }
 
     public static ulong PackScissor(int x0, int x1, int y0, int y1) =>
-        ((ulong)(x0 & 0x7FF))
-        | ((ulong)(x1 & 0x7FF) << 16)
-        | ((ulong)(y0 & 0x7FF) << 32)
-        | ((ulong)(y1 & 0x7FF) << 48);
+        ((ulong)(uint)(x0 & 0x7FF))
+        | ((ulong)(uint)(x1 & 0x7FF) << 16)
+        | ((ulong)(uint)(y0 & 0x7FF) << 32)
+        | ((ulong)(uint)(y1 & 0x7FF) << 48);
 
     public void WriteRegister(uint address, uint value) => WriteRegister64(address, value);
 

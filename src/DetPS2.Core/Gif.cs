@@ -23,7 +23,6 @@ public sealed class Gif : ISchedulable
     // GIF I/O (0x10003000)
     private uint _ctrl;
     private uint _mode;
-    private uint _fifoWords; // QWs pending in simplified FIFO model
     private readonly uint[] _fifo = new uint[64]; // 16 QW max
     private int _fifoR, _fifoW, _fifoCount;
 
@@ -44,7 +43,6 @@ public sealed class Gif : ISchedulable
         _nreg = 0;
         _ctrl = _mode = 0;
         _fifoR = _fifoW = _fifoCount = 0;
-        _fifoWords = 0;
     }
 
     /// <summary>GIF_CTRL / MODE / STAT / FIFO at 0x10003000–0x10006000.</summary>
@@ -73,7 +71,6 @@ public sealed class Gif : ISchedulable
                 if ((value & 1) != 0) // reset
                 {
                     _fifoR = _fifoW = _fifoCount = 0;
-                    _fifoWords = 0;
                 }
                 break;
             case 0x3010: // GIF_MODE

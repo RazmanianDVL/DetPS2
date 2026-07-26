@@ -50,7 +50,6 @@ public sealed class Ps2System : ISchedulable
     public bool UseJit { get; set; }
     /// <summary>Last EE PC in game/code space — used to recover from low-memory thrash.</summary>
     public ulong LastGoodEePc { get; set; }
-    private bool _commercialWorkerKicked;
     private bool _commercialSifInitKicked;
     /// <summary>Diagnostic-only escape hatch to test whether the real boot now proceeds
     /// without the Midway forced-jump assists, now that several real EE/SIF-RPC bugs have
@@ -424,7 +423,6 @@ public sealed class Ps2System : ISchedulable
     /// </summary>
     private void KickCommercialWorker()
     {
-        _commercialWorkerKicked = true;
         uint ring = Memory.Read32(0x77A080);
         if (ring < 0x100000 || (ring & 0x1FFFFFFFu) >= SystemMemory.RDRAM_SIZE)
             ring = 0x01F80000;
@@ -514,7 +512,6 @@ public sealed class Ps2System : ISchedulable
         Snapshots.Reset();
         UseJit = false;
         LastGoodEePc = 0;
-        _commercialWorkerKicked = false;
         _commercialSifInitKicked = false;
         // The fallback MidwayAssist instance (used when no quirk is active) is never
         // stepped/touched, so it never accumulates real state and needs no reset here.

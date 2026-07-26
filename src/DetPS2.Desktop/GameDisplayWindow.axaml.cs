@@ -87,7 +87,7 @@ public partial class GameDisplayWindow : Window
                 AlphaFormat.Opaque);
         }
 
-        using (var locked = _bitmap.Lock())
+        using (var locked = _bitmap!.Lock())
         {
             // Avalonia Bgra8888 LE = B,G,R,A bytes → uint 0xAARRGGBB (same as our GS pack).
             // RowBytes stride required or the image shears.

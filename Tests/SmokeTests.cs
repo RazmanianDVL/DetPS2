@@ -546,8 +546,8 @@ public static class SmokeTests
 
     private static void WriteAdXyz(SystemMemory mem, ref uint addr, int x, int y, uint z)
     {
-        ulong xyz = (ulong)((x << 4) & 0xFFFF)
-                  | ((ulong)((y << 4) & 0xFFFF) << 16)
+        ulong xyz = (ulong)(uint)((x << 4) & 0xFFFF)
+                  | ((ulong)(uint)((y << 4) & 0xFFFF) << 16)
                   | ((ulong)(z & 0xFFFFFF) << 32);
         WriteAd(mem, ref addr, 0x04, xyz);
     }

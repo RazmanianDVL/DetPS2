@@ -49,7 +49,6 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong[]? _sifSavedGpr;
     private bool _logoPrepared;
     private bool _logoActive;
-    private bool _esrbDone;
     private bool _midwayDone;
     private int _logoFrame;
     private int _logoFramesTotal;
@@ -91,7 +90,6 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _sifSavedGpr = null;
         _logoPrepared = false;
         _logoActive = false;
-        _esrbDone = false;
         _midwayDone = false;
         _logoFrame = 0;
         _logoFramesTotal = 0;

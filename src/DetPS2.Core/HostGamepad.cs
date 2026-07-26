@@ -353,7 +353,6 @@ public sealed class HostGamepadService
         // Non-blocking peek: use HidD_GetInputReport if possible; else skip (XInput path preferred when available)
         byte[] buf = new byte[64];
         // Many DS4/DualSense devices need exclusive access; if read fails, return false
-        uint read = 0;
         // Try synchronous short read via ReadFile with 0 timeout is hard; use HidD_GetInputReport
         if (!HidD_GetInputReport(h, buf, (uint)buf.Length))
         {

@@ -30,7 +30,6 @@ public sealed class Cdvd : ISchedulable
     private uint _pendingLba;
     private ulong _readCyclesLeft;
     private uint _pendingCount = 1;
-    private uint _streamRemaining;
 
     public uint TocTracks { get; private set; } = 1;
     public uint TocLeadOutSector { get; private set; } = 100_000;
@@ -55,7 +54,6 @@ public sealed class Cdvd : ISchedulable
         _pendingCount = 1;
         StreamCursor = 0;
         StreamBytes = 0;
-        _streamRemaining = 0;
         LayerBreakLba = 0;
         MechaconStatus = 0x40;
         Array.Clear(_sectorBuffer);
@@ -196,7 +194,6 @@ public sealed class Cdvd : ISchedulable
     {
         if (!DiscPresent || TrayOpen) return 0;
         StreamCursor = lba;
-        _streamRemaining = 0xFFFF; // open-ended until cancelled; tests use ReadSector
         return 1;
     }
 

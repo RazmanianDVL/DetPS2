@@ -21,7 +21,6 @@ public sealed class Spu2 : ISchedulable
     private ulong _cycleAccum;
     private int _phase; // global tone phase fallback
     private IAudioSink? _sink;
-    private bool _irqPending;
     private Intc? _intc;
 
     // Real SPU2 local work RAM (2MB, confirmed size) games upload ADPCM sample data
@@ -90,7 +89,6 @@ public sealed class Spu2 : ISchedulable
         VoiceEnds = 0;
         _cycleAccum = 0;
         _phase = 0;
-        _irqPending = false;
         ReverbEnabled = false;
         _reverbPos = 0;
         Array.Clear(_reverbL);
@@ -409,7 +407,6 @@ public sealed class Spu2 : ISchedulable
             if (_voices[i].EndIrq)
             {
                 _voices[i].EndIrq = false;
-                _irqPending = true;
                 _intc?.Raise(Intc.InterruptSource.SbUs); // stand-in for SPU2 IRQ
             }
         }

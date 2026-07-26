@@ -28,7 +28,6 @@ public sealed class Iop : ISchedulable
     public ulong InstructionsExecuted { get; private set; }
 
     private readonly SystemMemory _memory;
-    private bool _branchPending;
     private uint _branchTarget;
 
     public Iop(Intc intc, SystemMemory memory)
@@ -51,7 +50,6 @@ public sealed class Iop : ISchedulable
         SifMbxToEE = 0;
         Running = true;
         InstructionsExecuted = 0;
-        _branchPending = false;
         _branchTarget = 0;
     }
 
@@ -90,7 +88,6 @@ public sealed class Iop : ISchedulable
                 executed++;
                 InstructionsExecuted++;
                 PC = _branchTarget;
-                _branchPending = false;
             }
             else
             {
@@ -370,6 +367,5 @@ public sealed class Iop : ISchedulable
         PC = address;
         Running = true;
         InstructionsExecuted = 0;
-        _branchPending = false;
     }
 }

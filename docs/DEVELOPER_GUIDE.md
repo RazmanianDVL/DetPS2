@@ -770,6 +770,41 @@ existing `MULTU` expectation, which had encoded the old *incorrect* zero-extende
 low-32 result (`0xFFFFFFFE`) was right, but real hardware sign-extends it (bit 31 is set) to
 `0xFFFFFFFFFFFFFFFE`, not `0x00000000FFFFFFFE`. Full smoke suite green throughout.
 
+**Cleanup pass (2026-07-25) — dead code and disposable diagnostics purged.** Alongside the ALU
+audit, did a project-wide bloat pass on the theory that dirty/dead code makes exactly this kind of
+systemic-bug hunting harder (easy to mistake a stale write-only field for a real invariant, or
+waste time reading a diagnostic tool that isn't actually maintained):
+  - Removed 7 write-only fields that were never read anywhere: `Cdvd._streamRemaining`,
+    `EmotionEngine._nullifyDelayIfNotTaken`, `Gif._fifoWords`, `Iop._branchPending`,
+    `MidwayBootAssist._esrbDone`, `Ps2System._commercialWorkerKicked`, `Spu2._irqPending` — each
+    confirmed via grep to have zero reads before removal, so this is dead state, not an
+    incomplete feature waiting to be wired up.
+  - Removed `Program.cs`'s 19 genuinely disposable `probe-*` commands (`probe-iso`, `probe-str`,
+    `probe-path`, `probe-callers`, `probe-gif`, `probe-desktop`, `probe-sif`, `probe-cmp`,
+    `probe-main`, `probe-hang`, `probe-mk5`, `probe-mk4`, `probe-mk3`, `probe-mk2`, `probe-mk`,
+    `probe-worker`, `probe-struct`, `probe-di`, `probe-boot`) — one-off diagnostics hardcoded to
+    a specific developer machine's file paths and MK Shaolin Monks' addresses, already documented
+    in §10 below as "not a maintained, stable tool surface." **`probe-frame` was deliberately kept**
+    — it's the one `probe-*` command with real, current, documented use (see §10's tools table,
+    including `--watch=HEX` support). `Program.cs` dropped from 1865 to 869 lines; every other
+    command (`commercial-boot`, `dump-spine`, `elf-info`, `blocker-trace`, `long-run`,
+    `find-store`, `find-word`, `scanmasked`, `scanword`, `disasm`, `play-path`,
+    `majority-campaign`, `majority-catalog`, `commercial-checklist`, `netplay-soak`,
+    `netplay-cert`, `extract-file`, `elf-sections`, `iop-disasm`, `iop-find-word`) is untouched.
+  - Fixed the remaining compiler warnings project-wide (was 12, now 0): an unused local in
+    `HostGamepad.cs`, two `CS0675` "bitwise-or on a sign-extended operand" sites (`GsRegisters.cs`
+    `PackScissor`, a test helper in `SmokeTests.cs`) fixed by casting through `uint` before
+    widening to `ulong`, a `CS8602` possible-null-deref in `GameDisplayWindow.axaml.cs` (the null
+    check a few lines above already guarantees non-null, the compiler just can't see it), and the
+    `CS8600`/`CS8602` chain in `Program.cs`'s `elf-info` command caused by `SystemCnf.Boot2` being
+    `string?` (fixed with `?? ""` at the point it's first assigned to a non-nullable local).
+  - Left alone (out of scope for a mechanical cleanup pass, would need actual judgment calls):
+    the 16 root-level `.md` docs, some of which `DEVELOPER_GUIDE.md`'s own honesty note admits
+    "describe aspirational or historical state and drift out of date" — worth a deliberate survey
+    later, not a drive-by deletion.
+  - Full smoke suite green throughout; `dotnet build` on Core, Tests, and Desktop all report
+    0 warnings / 0 errors as of this pass.
+
 ---
 
 ## 8. Save states & determinism contracts

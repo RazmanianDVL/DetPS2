@@ -101,8 +101,6 @@ public sealed class EmotionEngine : ISchedulable
     /// Push the real value before clobbering; ExecuteEret pops and restores it, so this is
     /// invisible to any code that wasn't relying on the synthesized dispatch's own return path.</summary>
     private readonly Stack<ulong> _savedRaAcrossIntcDispatch = new();
-    /// <summary>Phase 25: when true and branch not taken, skip delay slot (likely branches).</summary>
-    private bool _nullifyDelayIfNotTaken;
     private bool _branchWasLikely;
 
     // COP1 FPU (Phase 25) — 32 single regs, Det policy
@@ -176,7 +174,6 @@ public sealed class EmotionEngine : ISchedulable
         _cacheLineHits = _cacheLineMisses = 0;
         _lastCacheLine = ulong.MaxValue;
         _preferHleSyscalls = true;
-        _nullifyDelayIfNotTaken = false;
         _branchWasLikely = false;
         Array.Clear(_fpr);
         _fcr31 = 0;
