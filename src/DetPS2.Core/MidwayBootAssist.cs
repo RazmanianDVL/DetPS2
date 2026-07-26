@@ -55,6 +55,22 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// <summary>First of the 4 consecutive manager-pointer globals ManagerInitFn populates —
     /// used purely as a "has this already run" guard, not because only this one slot matters.</summary>
     private const uint ManagerInitGlobalSlot = 0x004EFE94;
+    /// <summary>Third scratch trampoline — distinct from the other two so all three forced
+    /// calls can never collide.</summary>
+    private const uint InitLocksReturnTrampoline = 0x01FE0020;
+    /// <summary>Real vaddr of the library init function that creates 2 mutexes via the real
+    /// CreateSema syscall (confirmed self-contained: alloc + 2x CreateSema, no thread creation
+    /// in its own body — see DEVELOPER_GUIDE.md §7.4). Its real caller chain is CRT0 itself
+    /// (0x0011C250, inside the real SetupThread/SetupHeap/init-chain sequence
+    /// KickMidwayMainPath's fake CRT0 jump skips entirely). Deliberately force-called in
+    /// isolation rather than redirecting into real CRT0 wholesale — that was tried and reverted
+    /// (see KickMidwayMainPath's own comment) because CRT0's later steps create a real SIF
+    /// worker thread that then deadlocks forever on an unrelated, never-signaled semaphore.
+    /// This function alone gives the semaphore fix without touching thread creation at all.</summary>
+    private const uint InitLocksFn = 0x00486020;
+    /// <summary>First of the 2 semaphore-id globals InitLocksFn populates — "has this already
+    /// run" guard.</summary>
+    private const uint InitLocksGlobalSlot = 0x005640A8;
 
     private bool _worklistPlanted;
     private bool _sifForced;
@@ -67,6 +83,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private bool _managerInitResumePending;
     private ulong _managerInitSavedPc;
     private ulong[]? _managerInitSavedGpr;
+    private bool _initLocksForced;
+    private bool _initLocksTrampolineWritten;
+    private bool _initLocksResumePending;
+    private ulong _initLocksSavedPc;
+    private ulong[]? _initLocksSavedGpr;
     private bool _logoPrepared;
     private bool _logoActive;
     private bool _midwayDone;
@@ -113,6 +134,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _managerInitResumePending = false;
         _managerInitSavedPc = 0;
         _managerInitSavedGpr = null;
+        _initLocksForced = false;
+        _initLocksTrampolineWritten = false;
+        _initLocksResumePending = false;
+        _initLocksSavedPc = 0;
+        _initLocksSavedGpr = null;
         _logoPrepared = false;
         _logoActive = false;
         _midwayDone = false;
@@ -278,6 +304,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         MaybeForceManagerInit(sys);
         MaybeResumeAfterForcedManagerInit(sys);
+        MaybeForceInitLocks(sys);
+        MaybeResumeAfterForcedInitLocks(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -577,6 +605,63 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _managerInitSavedGpr[i] });
         sys.LastGoodEePc = _managerInitSavedPc;
         _managerInitResumePending = false;
+    }
+
+    /// <summary>Force-calls InitLocksFn (0x486020) — same non-destructive technique as the other
+    /// two forced calls. See InitLocksFn's own doc comment for why this is scoped to just this
+    /// one self-contained function rather than redirecting into real CRT0 wholesale (tried,
+    /// reverted — see KickMidwayMainPath).</summary>
+    private void MaybeForceInitLocks(Ps2System sys)
+    {
+        if (_initLocksForced) return;
+        if (_sifResumePending || _managerInitResumePending) return; // never yank mid-forced-call
+        if (sys.MasterCycles < 3_000_000) return; // same safe threshold established for manager-init
+        if (sys.Memory.Read32(InitLocksGlobalSlot) != 0)
+        {
+            _initLocksForced = true;
+            return;
+        }
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        if (pc is >= InitLocksFn and < 0x00486090) return; // already inside it
+
+        if (!_initLocksTrampolineWritten)
+        {
+            sys.Memory.Write32(InitLocksReturnTrampoline, 0x1000FFFFu); // beq zero,zero,self
+            sys.Memory.Write32(InitLocksReturnTrampoline + 4, 0);       // nop (delay slot)
+            _initLocksTrampolineWritten = true;
+        }
+        _initLocksSavedPc = sys.EE.PC;
+        _initLocksSavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _initLocksSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INITLOCKS") == "1")
+            Console.Error.WriteLine($"[INITLOCKS] forcing call, savedPc=0x{_initLocksSavedPc:X8} cyc={sys.MasterCycles}");
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = InitLocksReturnTrampoline });
+        ulong sp = sys.EE.GetGpr(29).Lo;
+        if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        sys.EE.PC = InitLocksFn;
+        _initLocksForced = true;
+        _initLocksResumePending = true;
+        Assists++;
+    }
+
+    /// <summary>Mirror of MaybeResumeAfterForcedManagerInit for the InitLocks forced call.</summary>
+    private void MaybeResumeAfterForcedInitLocks(Ps2System sys)
+    {
+        if (!_initLocksResumePending) return;
+        if ((uint)(sys.EE.PC & 0x1FFFFFFF) != InitLocksReturnTrampoline) return;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INITLOCKS") == "1")
+            Console.Error.WriteLine($"[INITLOCKS] resuming at 0x{_initLocksSavedPc:X8} cyc={sys.MasterCycles}");
+        sys.EE.PC = _initLocksSavedPc;
+        if (_initLocksSavedGpr != null)
+            for (int i = 1; i < 32; i++) // skip $zero
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _initLocksSavedGpr[i] });
+        sys.LastGoodEePc = _initLocksSavedPc;
+        _initLocksResumePending = false;
     }
 
     private void MaybeStartLogo(Ps2System sys)

@@ -77,6 +77,7 @@ public sealed class SystemMemory
             if (ProtectKernelVectors && paddr < 0x300)
                 return; // preserve exception vectors
             _rdram[paddr] = value;
+            if (TrackLastWriter) NoteLastWriterByte(paddr);
             return;
         }
 
@@ -87,6 +88,20 @@ public sealed class SystemMemory
         }
 
         // BIOS ROM — ignore writes
+    }
+
+    /// <summary>Reconstructs the containing word from raw RDRAM bytes (no watch side effects,
+    /// unlike Read32) so SB/SH writes update LastWriterLog with an accurate current value instead
+    /// of being invisible to it — Write32's NoteLastWriter alone missed any field a compiler
+    /// stored via SH/SB (see DEVELOPER_GUIDE.md §7.4, the cyc≈97.66M lead: this exact gap first
+    /// showed up as a false "never written" reading for a 16-bit field actually set via SH).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void NoteLastWriterByte(ulong paddr)
+    {
+        ulong wordBase = paddr & ~3UL;
+        if (wordBase + 3 >= (ulong)RDRAM_SIZE) return;
+        uint word = (uint)(_rdram[wordBase] | (_rdram[wordBase + 1] << 8) | (_rdram[wordBase + 2] << 16) | (_rdram[wordBase + 3] << 24));
+        LastWriterLog[(uint)wordBase] = (CurrentCycleForWriterLog, CurrentPcForWatch, word);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
