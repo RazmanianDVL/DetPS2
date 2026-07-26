@@ -939,6 +939,36 @@ face, or a genuinely separate gap. Given the pattern (three real fixes today, ea
 one-time call site is unreachable from the fast-boot path"), that's the leading hypothesis but is
 **not confirmed**.
 
+**CONFIRMED, then tried and reverted, same day.** Traced `CreateSema`'s real syscall stub
+(`0x0047FE60`, confirmed via its exact 2-instruction body: `addiu v1,64; syscall; jr ra`) — **0**
+executions across the full 97.8M-cycle run, out of 23 real call sites in the compiled binary. One
+of those call sites (`0x00486228`, called from real CRT0 at `0x0011C250`) creates exactly the two
+mutexes the earlier finding needed. `KickMidwayMainPath`'s fake CRT0 jump — straight to `main()`
+with synthesized `a0`/`a1`/`ra`, skipping everything from `0x0011C1E0` onward — is confirmed as the
+reason none of this ever runs, the same root cause as the manager-init gap, now nailed down
+precisely instead of hypothesized.
+
+**Tried the obvious fix — redirect to real CRT0 (`0x0011C200`, right before the real `SetupThread`
+syscall) instead of faking it.** It works exactly as predicted: the real init chain runs, `CreateSema`
+fires for real, and — for the first time in any trace this whole session — a real worker thread gets
+created (`entry=0x00480A18`, squarely in the SIF-RPC library address region). But that thread
+immediately calls `WaitSema` on a semaphore id (`3`) that **nothing** in the entire run ever signals,
+confirmed via `--pcbreak` at the real `SignalSema`/`WaitSema` stubs (the one real `SignalSema` call
+that does happen targets a *different* semaphore, id `1` — the `InitLocks` mutex, unrelated). The
+whole boot stalls harder as a result: `px` capped at `573440` (previously `860160`+ and climbing),
+`gifPath3`/`dmac` stuck at `0` (previously `1`/`4` and climbing). **Reverted** — a real, measured
+regression against the fake-CRT0 baseline, not an improvement, despite being more architecturally
+correct.
+
+**What this is worth, despite the revert**: this is no longer a hypothesis. A real SIF-RPC-adjacent
+worker thread, once actually allowed to run, blocks permanently and immediately on a semaphore that
+only genuine IOP-side interaction could ever signal. That is a concrete, evidence-based confirmation
+that real IOP-side SIF RPC service handling — not another force-call patch — is the thing standing
+between here and further real progress. The revert is recorded in `Ps2System.cs`'s own comment so
+it isn't blindly re-attempted; the next real move is building that IOP-side service handling (or a
+narrower, deliberately-scoped stand-in for semaphore id `3` specifically) with this exact deadlock
+already mapped out, rather than rediscovering it.
+
 ---
 
 ## 8. Save states & determinism contracts
