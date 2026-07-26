@@ -1000,16 +1000,39 @@ force-calling the loader here would just be a second instance of trying to skip 
 interaction the way the reverted CRT0 experiment did, and would need its own careful regression
 check the same way.
 
-**Where this leaves the investigation**: every currently-open thread (SIF-worker-thread deadlock,
-this overlay crash, and by extension `cdvdSectors=0` never moving in any trace all session) now
-traces to one well-evidenced, scoped root cause — real IOP-side SIF RPC / CD-streamed-module
-service handling doesn't exist. That's a genuine feature to build (real service dispatch for
-whatever SID(s) the game's RPC binds target, and/or real sector-read servicing that unblocks
-CD-dependent loads), not another one-function force-call. The four fixes above cleared out every
-gap that *was* reachable with that technique; what's left needs actual IOP-side implementation
-work. That's the honest state of the investigation at the end of this session's work — not a wall
-in the sense of "stuck," but a clear, evidence-backed handoff to what the next phase of work
-actually is.
+**CORRECTION, same day — "real IOP-side SIF RPC service handling doesn't exist" above was wrong.**
+Checked `RealSifRpc.cs` before writing that, and shouldn't have skipped it: real bind/call handling
+already exists and is substantial — real `sceCdRead`-family sector reads via `cdvd.ReadSector`, pad
+state, memory-card stub, a real IOP-heap bump allocator, and Midway-specific modules (SNDF_Driver,
+CRI ADX, an SPU2 register driver) individually extracted from the actual disc and disassembled to
+get their protocols right. It's wired in — `SonyKernelHle.HleSifCmdFromEe` calls
+`_realRpc.TryHandle` for every real `SifSetDma`-driven command packet. `RealSifRpc: binds=0 calls=0`
+holding at zero all session isn't "the feature is missing" — it's that `HleSifCmdFromEe` only ever
+runs when the game's own code issues a real EE→IOP SIF DMA transfer, and that never happens, for
+the same reason `_rpc_get_packet`/`sceSifBindRpc` were already documented above as never executing.
+This is the *same* unreachable-call shape as the four fixes today, one layer further out — not a
+missing feature.
+
+**Traced one layer further** (temporarily re-applied the reverted CRT0 experiment locally, not
+committed, purely to gather data): the semaphore the worker thread blocks on (id `3`) is created by
+the *main* thread, at the exact cycle the worker thread itself is created (`cyc=157488`,
+`ra=0x480B34`) — a standard "create the sync primitive, then spawn the worker that waits on it"
+pattern. `--pcbreak` on the real `SignalSema` stub across the full 30,000,000-cycle run: fires
+exactly once, still only ever targeting semaphore `1` (the `InitLocks` mutex) — semaphore `3` is
+never signaled by anything. Meanwhile the main thread, after switching back from the newly-created
+(and now permanently blocked) worker, runs into a bounded copy loop at `0x00487830`
+(`while (a3 < a2) *a0++ = *a1++`) that — given `px`/`gifPath3`/`dmac` stay frozen for the rest of
+the 30M-cycle window — never reaches its own exit condition, suggesting its iteration count (`a2`)
+is itself wrong, quite possibly the same "reads a size that should have come from a real load that
+never happened" shape as everything else today.
+
+**Honest state at the end of this session**: the real IOP-side service layer is already built and
+was never the gap. What's actually blocking further progress is a genuinely deep chain within the
+game's own real CRT0/thread-startup path — a main-thread-created semaphore nothing signals, and a
+main-thread copy loop that appears not to terminate — that would need substantially more tracing to
+fully resolve, each layer no shallower than the last few uncovered today. Not a "build a new
+subsystem" task after all; more tracing of the same kind that produced today's four fixes, just
+several layers deeper than any of them individually were.
 
 ---
 
