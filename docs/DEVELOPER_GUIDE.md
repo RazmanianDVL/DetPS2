@@ -1356,6 +1356,36 @@ deliberately doesn't allocate a real kernel semaphore for the synthetic client's
 semaphore the game's own code creates afterward. Verified neutral otherwise: assisted-boot baseline
 unchanged except the intentional `cdvdSectors` 0→1.
 
+**Why the game never reaches that real call — a strong new lead (2026-07-26).** Went looking for
+what the main thread is actually doing instead of ever calling `sceSifBindRpc`. Found a genuine
+static string via a raw ISO byte search: `"PS2RNA Ver.1.32 Build:Jun 16 2005 11:06:15"` plus real
+error-format strings for `PS2RNA_SetupVoice` — Midway's own real audio middleware, confirming the
+earlier `PS2RNA_Init`/`SifAllocIopHeap` panic-string finding wasn't an isolated data point. Checked
+whether any of this actually gets logged via the now-real `Deci2Call` (previous entry) during a
+100M-cycle trace — it does, extensively: a repeating
+
+    assertion "X" failed: file "Y", line N
+
+message, sent (`Deci2Send`) then polled (`Deci2Poll`) in a tight loop, tens of thousands of times.
+Decoded the raw bytes by hand (not just the naive ASCII dump) to check whether this was a real,
+meaningful diagnostic or telemetry noise: the format string itself is intact and literal ("assertion
+\"", "\" failed: file \"", "\", line " all decode as clean ASCII at fixed offsets), but every single
+substituted value is garbage-shaped — `Y` decodes to unprintable bytes forming a 32-bit value miles
+outside valid RDRAM (`0x7C401A68`), and `N`, formatted as a plausible decimal integer, is actually a
+stack address in the `0x01FFxxxx` range, decrementing by exactly 32 bytes on every iteration (the
+same 32 bytes recurring throughout this session as a record/array stride). This is not a decoding
+bug — a real assert-style call is firing with real (if wrong) arguments, once per 32-byte record, on
+what looks like a validation pass over an array with (going by the observed call volume) many
+thousands of entries. Root cause of the array's own content not yet pinned down, but every other
+finding this session points the same direction: whatever `PS2RNA` (or its loader) is validating —
+almost certainly loaded-module or asset records that a real IOP module load would have populated —
+was never actually written for real, because the real SIF module-loading path this whole file is
+about never runs. This plausibly *is* the reason the game bails to a fatal `exit(1)` before it would
+otherwise reach a real `SifBindRpc` call at all, rather than a separate, unrelated failure. Next
+concrete step: find the outer loop that builds each assertion message (one level above the
+retry-poll snippet at `0x00481238`-`0x00481258`, `ra=0x00481254` when calling the `Deci2Poll`
+wrapper) to identify exactly what array it walks and what a "valid" entry should look like.
+
 ---
 
 ## 8. Save states & determinism contracts
