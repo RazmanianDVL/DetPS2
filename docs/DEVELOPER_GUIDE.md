@@ -1829,6 +1829,91 @@ of by hand-subtracting hex offsets a fourth time.
 this specific crash. **Not fixed:** the game-logic corruption itself remains unconfirmed; per this
 file's conventions, no speculative fix was applied. Baseline unchanged, smoke suite green.
 
+**Follow-up (2026-07-26) — root-caused the `cyc≈96.2M` crash to a genuine self-modifying-code
+corruption from an uninitialized voice-table pointer; this closes the entire `SifBindRpc`-unreachable
+arc.** Executed the previous entry's own concrete next step (`--pcbreak=0040AC48:0040AD90` around
+`cyc≈96246000-96246600`) — but first had to correct a process error: initially ran it against the
+real-CRT0-redirect testbed instead of the **default boot path**, which the crash was originally
+bisected against (§ two entries above, "Confirmed this crash is specific to the
+`--host-present`-driven boot path"). The testbed run showed no crash at all and a wildly different
+`px` (55,910,400 vs the ~860K baseline) — a real, useful negative result (the testbed path legitimately
+diverges enough to avoid this specific bug) but not what was needed. Reverted the testbed edit and
+re-ran against the plain default path with `--host-present`: reproduced the exact fault
+(`ra=0x6237BBC0` at `0x0040AD88`, `cyc=96246528`) on the first try.
+
+With `sp` read directly from `--pcbreak` register dumps (not hand-subtracted), `0x0040AC48`'s epilogue
+`ld ra, 80(sp)` at `0x0040AD74` executes with `sp=0x1FEFCF0` — **not** the `0x1FEFC60` its own prologue
+set two instructions after entry. Something inside the function's body bumped `sp` by exactly `+0x90`
+(144) without a matching pop. Bisected the culprit to `0x0040ACE0`'s `jal 0x002025E8`: `0x002025E8` is
+a real, self-balancing function (`addiu sp,sp,-144` at entry, `addiu sp,sp,144` at its own exit,
+`0x00202648`) — but on *this specific invocation*, its own prologue instruction doesn't decrement `sp`
+at all, while its epilogue's increment still fires, leaking the entire +144 net effect into the caller.
+
+Added `op=0x{opcode:X8}` to the existing `--pcbreak` diagnostic line in `EmotionEngine.cs` (it
+previously printed only registers, not the fetched opcode) specifically to cross-check this against a
+red herring: `--trace-window --trace-chrono` showed the same invocation fetching garbage-looking
+opcodes (`0x00000000`, `0x20000004`, `0x00004000`, `0x00400004`) at `0x002025E8`-`0x002025F4`, four
+words that also turned out to reproduce *inside* the unrelated, already-understood `0x002022B0`
+classify leaf at a different offset — initially suspected this was itself a Tracer bug (IOP/EE
+interleaving, ring-buffer misattribution) rather than a real fetch problem, since it looked exactly
+like the kind of secondary-instrumentation artifact this session has already found twice. The new
+`--pcbreak` opcode field, which reads `_memory.Read32(PC)` directly with no separate logging path,
+confirmed the garbage opcodes are real, not a tracing artifact: `_memory.Read32(0x002025E8)` really
+does return `0x00000000` at this point in execution, not the real `0x27BDFF70` (`addiu sp,sp,-144`).
+
+**Root cause, confirmed via `--find-writer=002025E0:20` (with the delay-slot attribution fix from the
+entry above already in place, so this result is trustworthy): this is genuine, accidental
+self-modifying code.** `0x0024DD88` (`sd v0, 8(v1)`) and `0x0024DD9C` (`sd v0, 16(v1)`) — two ordinary
+struct-field write-backs inside a function around `0x0024DD40` that otherwise looks like a per-item
+loop (bumps `s1`, loops back to `0x0024DBD8` while `s1 < *(sp+8)`) — wrote `0x00000000`/`0x20000004`
+and `0x00004000`/`0x00400004` directly into `0x002025E8`-`0x002025F4` at `cyc=96245632`, ~640 cycles
+before the corrupted invocation. `v1` is computed at `0x0024DD84`/`0x0024DD94` as
+`v1 = s5 + *(s4 + 444)` — the exact "base register + loaded offset from another structure" shape this
+section has already flagged twice as a live "voice pointer" pattern (§ the two entries above, on the
+`ra` value itself and on `0x0040AC48`'s own incoming `a1`). Here it's computing the address of a
+per-voice (or per-channel) record to write two fields into, and because the underlying voice table is
+never populated (no code path in this boot has ever reached the real audio/`PS2RNA` init — the
+entire, now-closed `SifBindRpc` investigation above), the pointer it produces is garbage that happens
+to alias into `.text` instead of a real heap/BSS voice struct. This one write corrupts exactly 16 bytes
+(4 instruction words) of `0x002025E8`'s own prologue. The *next* time anything calls `0x002025E8`
+(a few hundred cycles later, per this trace), the corrupted prologue no longer decrements `sp`, the
+function's body still runs (using whatever `sp` value it inherited, silently reusing the caller's own
+live stack slots as if they were its locals), and its unconditional epilogue `addiu sp,sp,144` still
+fires on the way out — leaking +144 into the caller (`0x0040AC48`), which pushes its own frame
+computations out of alignment with its actual (unmoved) prologue-decremented `sp`, so its own epilogue
+`ld ra, 80(sp)` reads a stack slot that physically belongs to a still-live *grandparent* frame
+(`0x0026B150`, confirmed via `--find-writer` to be exactly where `0x6237BBC0` was written, by that
+frame's own prologue `sq s0, 112(sp)` at `0x0026B154` — i.e. the "corrupted `ra`" was never really a
+`ra` value at all, it's `0x0026B150`'s caller-supplied `s0`, an ordinary live register value, read
+through a slot `0x0040AC48` no longer owns). `jr ra` then jumps into that garbage address, which lands
+in unmapped memory that `MmioBus.cs` silently reads back as all-zero (`nop`), so execution free-runs
+forever instead of faulting — this is the actual, complete, instruction-level mechanism for the
+"freeze" that has stopped `main()` from ever reaching the real `sceSifBindRpc` sites across this
+entire multi-round investigation.
+
+**No source fix applied to the game-logic corruption itself** — the write at `0x0024DD88`/`0x0024DD9C`
+is not a bug in isolation (it's a completely ordinary struct write-back); the actual defect is
+upstream, in whatever leaves the voice table at `s4`/`s5` uninitialized-but-not-zeroed in a way that
+produces an in-range-looking `.text` address rather than a safely-inert one (a null pointer would have
+faulted cleanly instead of corrupting code). Fixing that requires understanding what real
+initialization call this voice table depends on and reproducing enough of it to zero the table (or,
+more surgically, faking a benign no-op landing pad for this exact write) — a materially different,
+larger task than this pass's scope, and this file's conventions warn against a blind patch on top of
+an already-multiply-corrected root-cause chain. **Concrete next step:** identify what populates
+`*(s4+444)` and `s5` on a boot path that *does* reach real audio init (if any title/path in this
+codebase does), to characterize what a "safe" (zeroed or sentinel) uninitialized state should look
+like, then either zero the table proactively during boot setup or intercept this specific write
+site defensively.
+
+**Fixed and committed this entry:** added the fetched opcode to the `--pcbreak` diagnostic line in
+`EmotionEngine.cs` (`op=0x{opcode:X8}`, reading the same `opcode` local the interpreter's own fetch
+already computed) — a real, general, zero-risk diagnostic improvement that let this entry rule out a
+tracer artifact instead of chasing it, independent of whether it's ever used again. Verified: default
+assisted-boot baseline unaffected (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1` at both
+96.25M and 150M cycles, `--host-present` `px` also reconfirmed at 150M cycles as a non-baseline
+reference point only). Full smoke suite green
+(`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
+
 ---
 
 ## 8. Save states & determinism contracts

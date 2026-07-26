@@ -394,7 +394,7 @@ public sealed class EmotionEngine : ISchedulable
             if (Intc.TraceRaise) Intc.CurrentCycleForTrace = cyc;
             if (PcProfiler.Enabled) PcProfiler.Sample((ulong)PC);
             if (PcBreakGpr.HasValue && PC >= PcBreakGpr.Value && PC <= (PcBreakEnd ?? PcBreakGpr.Value))
-                Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} a3=0x{GetGpr(7).Lo:X} " +
+                Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} op=0x{opcode:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} a3=0x{GetGpr(7).Lo:X} " +
                     $"t0=0x{GetGpr(8).Lo:X} t1=0x{GetGpr(9).Lo:X} t2=0x{GetGpr(10).Lo:X} " +
                     $"s0=0x{GetGpr(16).Lo:X} s1=0x{GetGpr(17).Lo:X} s2=0x{GetGpr(18).Lo:X} s3=0x{GetGpr(19).Lo:X} sp=0x{GetGpr(29).Lo:X} ra=0x{GetGpr(31).Lo:X} " +
                     $"COP0_Status=0x{COP0_Status:X8} COP0_Cause=0x{COP0_Cause:X8} InterruptPending={InterruptPending} takeExceptions={_takeExceptions} cyc={cyc}");
