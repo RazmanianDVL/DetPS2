@@ -1114,6 +1114,79 @@ rather than a hardcoded approximation) differs from real hardware's enough to tu
 overflow into a fatal one. Distinguishing these needs comparing our heap/stack layout against a
 real PS2's allocator behavior, not more tracing of this one call site.
 
+**CORRECTION (2026-07-26) — the INTC ack fix above was itself wrong and has been reverted.**
+Re-testing the (uncommitted, experimental) real-CRT0-redirect in `KickMidwayMainPath` with the
+fix in place showed real progress (syscalls 43→139, PC reaching the genuine SIF-library poll loop
+at `0x00480330` instead of deadlocking on semaphore 3) but then a *new* stall at that exact loop.
+Root cause: `EmotionEngine.TryDispatchRegisteredIntcHandler` already acks every pending INTC source
+except `VBlankStart` on its no-handler-found fallback path, deliberately, specifically so busy-poll
+code can see that bit stay sticky (its own comment says as much — see §4.4). The synthesized
+vector's unconditional ack ran immediately after that fallback on the very same code path and undid
+the exclusion, clearing `VBlankStart` out from under the poll on effectively every interrupt from
+any other unmasked source. The vector-level ack was fully redundant with, and actively defeated,
+logic that already existed and was already correct. Reverted `KernelBootstrap.cs` to its pre-fix
+state (bare `eret`, no ack); kept the harmless diagnostic additions (`Intc.TraceRaise`). Re-verified
+the assisted-boot baseline is back to exactly `px=860160/gifPath3=1/dmac=4/syscalls=43` at 30M
+cycles. While disabling the CRT0-redirect experiment (still not the committed path — it reproduces
+the original 2026-07-26 `px=573440` semaphore-3 deadlock once the vector ack is gone, confirming
+that wall is independent of the INTC ack question), also caught and fixed a self-inflicted
+regression: a second `if (pc < 0x0011C250)` block that sets up SP/GP (`SetupThread`-equivalent) had
+been deleted as "dead code" alongside the experiment, on the mistaken assumption that it was
+unreachable — it *looked* unreachable only because the experiment's own early `return` always fired
+first while the experiment was active. Without the experiment, it's the real SP/GP init the
+fake-CRT0-jump path depends on; losing it collapsed the baseline to `px=573440`/2 syscalls with PC
+drifting into the strcpy-overflow region above. Caught via the same "verify before concluding"
+discipline as everything else this session — re-ran the baseline after the revert instead of
+assuming it was clean, saw the wrong numbers, and traced it back to the diff, not a guess.
+
+**Follow-up investigation (2026-07-26) — characterizing the assisted-boot plateau more precisely.**
+Built `PcProfiler` (`--profile-pc` / `DETPS2_PROFILE_PC=1`, a cheap opt-in PC-visit histogram) to
+answer "is the CPU actually stuck, or just not producing GS output" during the long
+`px=860160/gifPath3=1` plateau. Findings, in order of investigation:
+- A burst of `UnknownMmioRead`/`UnknownMmioWrite` telemetry starting only after ~47–48M cycles
+  (bisected precisely) turned out to be a **red herring**: `MmioBus.cs` already documents, by
+  design, that genuinely-unmapped corners of the `0x10000000`-`0x1F000000` I/O window get real
+  write-then-read memory semantics rather than always-zero, specifically because some real retail
+  code legitimately uses addresses in that window as scratch memory. The read-then-write-same-
+  address pattern observed matches that intentional fallback, not corruption — it doesn't explain
+  the plateau.
+- The hottest non-vector PC range (`0x002022B0`-`0x002022DC`) disassembled (via the existing
+  `--dump=` + `EeDisassembler`) to a small floating-point classification leaf function (exponent-
+  field extraction, `fpclassify`-style return codes) — real, active computation, not a hardware
+  poll. `spu2Samples` keeps climbing the whole time. The game is genuinely alive and computing.
+- The actual signal: `CreateThread` (syscall `0x20`) never appears in the syscall histogram across
+  the entire plateau — the fake-CRT0-jump path (unlike the real-CRT0-redirect experiment) never
+  spawns a second thread at all, so whatever second-thread/render hand-off the game normally relies
+  on can't happen. This independently corroborates the CRT0-redirect experiment's own finding
+  (semaphore-3 deadlock on a real IOP-side SIF worker thread) — two different boot strategies, two
+  different symptoms, same underlying missing piece: the real IOP-side SIF RPC handshake.
+
+**Follow-up fix (2026-07-26) — starved-semaphore auto-unblock.** Re-enabled the CRT0-redirect
+experiment locally with `DETPS2_TRACE_RPC=1` to inspect the semaphore-3 wait directly: it's the
+third of exactly three legitimate `CreateSema` calls this run (not an "auto-create missing sema"
+artifact — that path only fires when the target id doesn't exist yet, and id 3 already did), and
+nothing ever calls `SignalSema(3)` because the main thread stays runnable forever and the scheduler
+never revisits the worker. Added `MidwayBootAssist.MaybeUnblockStarvedSema`: after a 2,000,000-cycle
+grace period, force-signal any thread that's been sleeping on the same semaphore id the whole time
+— same effect as a real signal, no execution redirect or faked function effect, re-armed per thread
+since this turned out to be a real mutex re-locked in a loop (`WaitSema(3)` recurred roughly every
+2M cycles once unblocked). Result on the CRT0-redirect experiment: syscalls climbed to 139 over 40M
+cycles (the same ceiling the now-reverted INTC ack fix reached, via a mechanism that doesn't touch
+INTC/VBlank semantics at all) — but `px`/`gifPath3` still don't exceed the redirect experiment's
+`573440`/`0` ceiling, worse than the default fake-jump baseline's `860160`/`1`. Verified neutral on
+the default path (never creates a second thread, so nothing to act on — baseline unchanged). Kept
+as a real, safe, independently-useful fix; the CRT0-redirect itself stays disabled since it's still
+not the better boot path for actual pixel output. **Current standing wall, confirmed from three
+independent angles this session (semaphore-3 deadlock, missing-CreateThread pattern, and
+`RealSifRpc: binds=0 calls=0` for the entire run every single time): the real IOP-side SIF RPC
+handshake never gets exercised because the EE-side call chain that would invoke it
+(`sceSifBindRpc`/`_rpc_get_packet`) is itself unreachable from either boot strategy.** `RealSifRpc.cs`
+already has a substantial, real implementation ready to serve those calls (CD reads, pad state, IOP
+heap) — it just never gets invoked. Making it reachable (either by getting real CRT0 execution far
+enough to hit the real call site, or by synthesizing a plausible SIF RPC completion directly from
+the semaphore-3 wait point using `RealSifRpc`'s existing service logic) is the next concrete step
+toward clearing the cached-logo-overlay plateau and producing genuinely new rendered content.
+
 ---
 
 ## 8. Save states & determinism contracts
