@@ -25,6 +25,10 @@ public sealed class SonyKernelHle
     private const uint HeapTop = 0x01FFF000;
     private int _stubSlots;
     private readonly RealSifRpc _realRpc = new();
+    /// <summary>Deci2Open handler slots: (device, bufferAddr) per allocated id, or null if free.
+    /// Matches Play!'s Deci2HandlerList — a small fixed pool is realistic (real games open one
+    /// or two DECI2 channels, e.g. stdout/stderr, at most).</summary>
+    private readonly (uint device, uint bufferAddr)?[] _deci2Handlers = new (uint, uint)?[8];
     public RealSifRpc RealRpc => _realRpc;
 
     /// <summary>Looks up a game-registered AddIntcHandler entry so EmotionEngine can
@@ -459,8 +463,17 @@ public sealed class SonyKernelHle
             case 0x7B: // ExecOSD
                 result = -1;
                 break;
-            case 0x7C: // Deci2Call
-                result = 0;
+            case 0x7C: // Deci2Call(function=a0, param=a1) — real sub-dispatch, per ps2sdk/Play!'s
+                       // CPS2OS::sc_Deci2Call. Previously always returned 0 regardless of function
+                       // or param, which never touches the caller-supplied DECI2BUFFER struct's
+                       // status fields — a game whose debug-output retry loop polls that struct for
+                       // "link ready" (Deci2Poll) or "send complete" (Deci2Send's status0) would
+                       // never see it change and retry indefinitely. Confirmed exactly this: traced
+                       // an ~197,000-call storm (each recomputing a CRC over a ~10-byte outgoing
+                       // debug packet) back to this stub. DECI2BUFFER layout (0x14 bytes:
+                       // unknown0@0, status0@4, unknown1@8, status1@0xC, dataAddr@0x10) and
+                       // DECI2SEND layout (size@0, data@0xC) confirmed against Play!'s PS2OS.cpp.
+                result = Deci2Call(a0, a1);
                 break;
             case 0x7D: // PSMode
                 result = 0;
@@ -737,6 +750,82 @@ public sealed class SonyKernelHle
             if (init > max) init = max;
         }
         return _kernel.CreateSema(init, max);
+    }
+
+    /// <summary>Real Deci2Call sub-dispatch (function/param convention and struct layouts
+    /// confirmed against Play!'s CPS2OS::sc_Deci2Call). Debug-link semantics only — no genuine
+    /// devkit is attached, so Send/kPuts just surface the text (opt-in trace) rather than
+    /// transmitting anywhere; the important part is Poll/Send always updating the caller's
+    /// status fields so a real retry loop sees success and stops retrying.</summary>
+    private int Deci2Call(uint function, uint param)
+    {
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_DECI2") == "1";
+        switch (function)
+        {
+            case 0x01: // Deci2Open(param->{device, bufferAddr}) -> handler id
+            {
+                uint device = _system.Memory.Read32(param + 0x00);
+                uint bufferAddr = _system.Memory.Read32(param + 0x04);
+                for (int i = 0; i < _deci2Handlers.Length; i++)
+                {
+                    if (_deci2Handlers[i].HasValue) continue;
+                    _deci2Handlers[i] = (device, bufferAddr);
+                    if (trace) Console.Error.WriteLine($"[DECI2] Open id={i} device=0x{device:X8} bufferAddr=0x{bufferAddr:X8}");
+                    return i;
+                }
+                return -1; // no free slot
+            }
+            case 0x03: // Deci2Send(param->{id}) — id's buffer->dataAddr points at a DECI2SEND
+            {
+                uint id = _system.Memory.Read32(param + 0x00);
+                if (id >= (uint)_deci2Handlers.Length || !_deci2Handlers[id].HasValue) return 0;
+                uint bufferAddr = _deci2Handlers[id]!.Value.bufferAddr;
+                uint dataAddr = _system.Memory.Read32(bufferAddr + 0x10);
+                if (dataAddr != 0)
+                {
+                    uint size = _system.Memory.Read32(dataAddr + 0x00);
+                    if (trace && size >= 0x0C)
+                    {
+                        int len = (int)(size - 0x0C);
+                        var bytes = new byte[Math.Min(len, 256)];
+                        for (int i = 0; i < bytes.Length; i++) bytes[i] = _system.Memory.Read8(dataAddr + 0x0C + (uint)i);
+                        Console.Error.WriteLine($"[DECI2] Send id={id}: {System.Text.Encoding.ASCII.GetString(bytes)}");
+                    }
+                    _system.Memory.Write32(bufferAddr + 0x04, 0); // status0 = 0 (sent)
+                }
+                else
+                {
+                    _system.Memory.Write32(bufferAddr + 0x04, unchecked((uint)-1)); // status0 = error
+                }
+                return 0;
+            }
+            case 0x04: // Deci2Poll(param->{id}) — always report "not busy" (status1=0), return 1
+            {
+                uint id = _system.Memory.Read32(param + 0x00);
+                if (id < (uint)_deci2Handlers.Length && _deci2Handlers[id].HasValue)
+                    _system.Memory.Write32(_deci2Handlers[id]!.Value.bufferAddr + 0x0C, 0);
+                return 1;
+            }
+            case 0x10: // kPuts(param->{stringAddr})
+            {
+                uint stringAddr = _system.Memory.Read32(param + 0x00);
+                if (trace)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    for (uint i = 0; i < 256; i++)
+                    {
+                        byte b = _system.Memory.Read8(stringAddr + i);
+                        if (b == 0) break;
+                        sb.Append((char)b);
+                    }
+                    Console.Error.WriteLine($"[DECI2] kPuts: {sb}");
+                }
+                return 0;
+            }
+            default:
+                if (trace) Console.Error.WriteLine($"[DECI2] unknown function=0x{function:X8}");
+                return 0;
+        }
     }
 
     private void EnsureStubs()

@@ -377,12 +377,20 @@ public sealed class Ps2System : ISchedulable
         // RE-TESTED (2026-07-26) with the PCPYUD fix (the "material" corruption's real root
         // cause) in place: no longer regresses -- px/gifPath3/dmac now match the fake-CRT0-jump
         // baseline (860160/1/4) instead of the old 573440/0/0 -- but syscalls balloon to ~200,000
-        // by 40M cycles, almost entirely UnknownSyscall with garbage codes (e.g. 0xFFFFFFBD),
-        // consistent with execution wandering into a different corrupted/garbage region later in
-        // the run (PC observed at 0x4020C9C8, a valid-looking but implausible address for real
-        // game code at that point). A different bug than the one PCPYUD fixed, not yet traced.
-        // Still not enabling this path by default until that's understood -- the fake-CRT0-jump
-        // baseline below remains the known-good state.
+        // by 40M cycles, almost all Deci2Call (0x7C). Traced precisely, not guessed: 0x4020C9C8
+        // (the reported hot PC) is a completely ordinary table-driven CRC-32 routine, not garbage
+        // execution. It's called once per outgoing Deci2Send debug packet by a Deci2Poll retry
+        // loop that never sees success, because Deci2Open (which would register the handler id ->
+        // buffer mapping) never runs -- same root cause as everything else in this file, real
+        // CRT0 being skipped. Fixed Deci2Call's HLE (SonyKernelHle.cs) to actually implement its
+        // real sub-function dispatch (Open/Send/Poll/kPuts) instead of a flat stub, using struct
+        // layouts confirmed against Play!'s CPS2OS::sc_Deci2Call -- this alone roughly halved the
+        // retry count. What's left is self-resolving, not a real block: syscalls=93,824 already by
+        // 5M cycles and only 96,347 by 40M, i.e. the retry loop exhausts itself in the first few
+        // million cycles and then stops, same as it would on real hardware polling for a debug
+        // host that was never attached. Not the reason rendering stays capped -- that's still
+        // whatever comes after this resolves. Leaving this path disabled by default regardless;
+        // the fake-CRT0-jump baseline below remains the better one for actual pixel output.
         // Run CRT0 SetupThread/Heap if we haven't (needed for SP)
         if (pc < 0x0011C250)
         {
