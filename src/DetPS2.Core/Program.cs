@@ -164,6 +164,14 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             EmotionEngine.PcBreakGpr = Convert.ToUInt32(pcbParts[0], 16);
             EmotionEngine.PcBreakEnd = pcbParts.Length > 1 ? Convert.ToUInt32(pcbParts[1], 16) : (uint?)null;
         }
+    // --host-present: drive ActiveQuirk.OnHostPresent once per 1M-cycle slice, matching
+    // probe-frame's and the real Desktop per-tick RunFor+OnHostPresent pattern. Without this,
+    // MidwayBootAssist's FMV/logo pacing (which only advances on host-present ticks by design,
+    // see MidwayBootAssist.OnHostPresent's own doc comment) never fires under blocker-trace, so
+    // a plain RunFor-only trace can show "0 pcbreak hits past the logo" even though the logo
+    // never even finished — a test-harness gap, not evidence of unreachability. Opt-in (not
+    // default) to keep this tool's existing plain-RunFor telemetry comparable to prior runs.
+    bool driveHostPresent = args.Contains("--host-present");
     if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
     if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
     if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;
@@ -258,7 +266,22 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         {
             SystemMemory.WatchAddr = watchAddrArg;
         }
-        traceSys.RunFor(cycles > watchAfter ? cycles - watchAfter : 0);
+        ulong remaining = cycles > watchAfter ? cycles - watchAfter : 0;
+        if (driveHostPresent)
+        {
+            const ulong slice = 1_000_000;
+            while (remaining > 0)
+            {
+                ulong step = Math.Min(slice, remaining);
+                traceSys.RunFor(step);
+                traceSys.ActiveQuirk?.OnHostPresent(traceSys);
+                remaining -= step;
+            }
+        }
+        else
+        {
+            traceSys.RunFor(remaining);
+        }
         Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
         if (SystemMemory.WatchAddr.HasValue)
         {

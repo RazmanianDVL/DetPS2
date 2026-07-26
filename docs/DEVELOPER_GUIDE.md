@@ -1650,6 +1650,69 @@ No source changes this entry — read-only investigation (`disasm`, `scanword`, 
 necessarily unchanged (nothing was edited). Full smoke suite green
 (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
 
+**Follow-up (2026-07-26) — added the missing `OnHostPresent` drive to `blocker-trace` itself
+(`--host-present`, opt-in), got real `--pcbreak` evidence, and it overturns the previous entry's
+"ordinary always-executed boot code" conclusion.** Executed the concrete next step named above:
+added an opt-in `--host-present` flag to `blocker-trace` (`Program.cs`) that slices the run into
+1,000,000-cycle chunks and calls `traceSys.ActiveQuirk?.OnHostPresent(traceSys)` between slices,
+mirroring `probe-frame`'s existing pattern exactly — this makes `blocker-trace`'s own `--pcbreak`
+support trustworthy for this question for the first time, instead of borrowing `probe-frame`'s
+coarse once-per-1M-cycle PC sampling. Kept it opt-in (default behavior untouched) specifically so
+every prior baseline number in this file stays comparable.
+
+Two `--pcbreak` runs, both 150,000,000 cycles, both with `--host-present`, on the **plain default
+boot path** (no CRT0-redirect edit needed — `KickMidwayMainPath`'s fake-jump-to-`main()` at
+`0x00212F70` is the committed, always-on default; the "CRT0-redirect testbed" mentioned in earlier
+entries is a separate, unrelated experiment that was NOT used here):
+- `--pcbreak=0020626C:00206330` (the padOpen bind-and-poll region): **0 hits.**
+- `--pcbreak=0021338C:00213394` (the single instruction the previous entry's static disasm
+  identified as `jal 0x002F7F68`, the shared function both traced `SifBindRpc` chains bottom out
+  in): **0 hits.**
+
+So not only does execution never enter the padOpen retry loop, it never even reaches the
+*instruction that would call into it*. This directly contradicts the immediately preceding entry's
+conclusion that `0x0021338C`/`0x002F7F68` are "ordinary, always-executed boot code" — that
+conclusion was built entirely on static disassembly (a real `jal` instruction exists at that
+address) with no runtime confirmation that the instruction is ever fetched. It isn't, in either of
+these two 150M-cycle runs.
+
+Where does it actually go instead? Both runs' final state matches: `PC=0x623A97F8`,
+`px=72826880 gifPath3=1 dmac=4 syscalls=62 spu2Samples=48828 cdvdSectors=1` — landed squarely in
+the `0x6237xxxx`-`0x623Axxxx` garbage band the previous-but-one entry (commit `4921491`) already
+bisected to a precise `cyc=96,234,000`-`96,236,000` crash window and explicitly, and now
+incorrectly, ruled out as unrelated to the bind-site question ("happens tens of millions of cycles
+after the 14 real bind call sites would have needed to fire and didn't ... ruling it out as the
+reason they're unreached"). That ruling assumed the bind sites' caller was reached earlier and
+uneventfully; with `0x0021338C` now confirmed at 0 hits across the *entire* 150M-cycle run
+(not just "before the crash"), the more consistent reading is the opposite: **this same
+memory-corruption crash is very plausibly upstream of, and directly responsible for, main() never
+reaching `0x0021338C`/the bind sites at all** — not a coincidence discovered after the fact, but
+the actual mechanism. (Note `px=72826880` here vs. the documented baseline's frozen `px=860160` —
+`--host-present` genuinely changes execution, since it's what lets `MidwayBootAssist`'s FMV/logo
+pacing advance per the already-documented Bug B/C screen-clear behavior; this is expected and is
+exactly why the flag was needed to get honest evidence here, and it does not indicate the crash
+finding is an artifact of the new flag, since the crash landing PC and all four other counters
+matched exactly between the two separate 150M-cycle runs.)
+
+**Corrected net conclusion, superseding both `4921491` and `585f452`**: this was never a "padOpen
+retry-forever" bug nor a "legitimately never fired, it's match-start-gated" situation nor "ordinary
+reached-but-uninteresting boot code" — it is that the already-documented, not-yet-root-caused
+`cyc≈96.2M` wild-pointer corruption crash (§7.4's "Bug C" plateau region) derails execution before
+it ever reaches the code that would call `sceSifBindRpc`, full stop. Root-causing *that* crash —
+which instruction writes/reads the bad pointer that lands PC in the `0x6237xxxx` band — is now the
+single highest-value next step for this entire thread, superseding the SIF-bind angle entirely;
+continuing to look for SIF/pad-specific triggers past this point would be investigating a symptom.
+Did not attempt to root-cause it in this entry — that's a distinct, substantial tracing task
+(binary-searching `--cycles=N` checkpoints and `--find-writer` on whatever register/pointer goes
+bad, the same technique `4921491` already used to bisect the window down to 2,000 cycles) and
+deserves its own focused pass rather than being rushed at the tail of this one.
+
+Verified: default assisted-boot baseline (no `--host-present`) unchanged
+(`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1` at 150M cycles, re-confirmed directly).
+Full smoke suite green (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`). Source change
+this entry: `Program.cs` only (`--host-present` flag for `blocker-trace`, opt-in, `--pcbreak`
+diagnostics only — no behavior change to the emulator itself or to any default-path output).
+
 ---
 
 ## 8. Save states & determinism contracts
