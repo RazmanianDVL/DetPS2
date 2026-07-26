@@ -1078,6 +1078,42 @@ registers at an exception boundary — remains open. `--pcbreak=START:END` is no
 whoever picks this up next to trace it precisely instead of inferring it from wide snapshots, which
 is what produced both false leads here.
 
+**RESOLVED (2026-07-26) — part one: the VBlank/INTC storm was real and is fixed.** Built
+`DETPS2_TRACE_INTC` specifically to answer "is this actually a fast-firing interrupt, or something
+else" — and it wasn't fast-firing at all: `Intc.Raise(VBlankStart/End)` fires only ~3 times in
+1,000,000 cycles (`cyc≈250k` apart, a completely normal rate), but the *second* raise already shows
+`alreadyRaised=True` — the first was never acknowledged. `InstallCommercialRuntime`'s own comment
+already named this exact risk ("without a full ISR that ACKs INTC, VBlank would storm the EE") and
+originally left `TakeExceptions=false` as the guard — but both `KickMidwayMainPath`'s forced
+`COP0_Status` write and real CRT0's own `ei` enable interrupts before any real handler exists to ack
+them. Fixed: `KernelBootstrap`'s synthesized exception vector (the only handler that exists
+pre-full-BIOS) now reads-then-writes-back INTC's `I_STAT` register before every `eret` — real
+write-1-to-clear hardware semantics (confirmed via `MmioBus`/`Intc.WriteRegister`), giving it the
+same baseline "ack whatever's pending" behavior a real kernel's default dispatcher always has.
+Verified: 20 clean raises over 5,000,000 cycles post-fix, `alreadyRaised` mostly `False`. Assisted
+boot baseline unaffected (`px`/`gifPath3`/`dmac` unchanged at 30M cycles).
+
+**Part two, found while verifying part one — a second, separate, still-open issue.** With the
+storm fixed, `--no-assist` no longer VBlank-storms, but still doesn't fully recover: it now hits a
+genuine `AdEL` (Address Error, instruction fetch) exception, also fast-repeating. Traced with
+`--trace-chrono` + `--find-writer` to full precision, not guessed: a function at `0x00364690`-ish
+allocates a 160-byte stack frame, calls the same real library `strcpy` (`0x00474DC4`) into a local
+32-byte buffer at `sp+32`, then on return restores `s0`-`s4`/`ra` from `sp+64`-`sp+144` and does
+`jr ra`. `--find-writer=1FFFEA0:8` (the exact `ra`-save slot for this specific run, `sp=0x1FFFDC0`)
+shows it was last written by the *strcpy's own copy loop* (`sq t1,0(a2)` at `0x00474E48`,
+`cyc=981296`) — a genuine buffer overflow. The copy loop itself was already verified correct
+(previous entry, hand-checked `PSUBB`): it operates in 16-byte-aligned quadword chunks based on
+where the *source* data's null terminator falls relative to that 16-byte grid, not the string's
+logical length, so under the wrong source alignment it can legitimately write more than the
+destination's 32 bytes — trampling the caller's saved `ra` a few quadwords later, causing exactly
+this `jr ra`-to-garbage fault. Not yet fixed. Two live hypotheses, not yet distinguished: (a) a
+genuine latent bug in the shipped game's compiled code that real hardware's differently-laid-out
+stack simply never happens to trample anything load-bearing for, or (b) our own stack/heap
+placement (even under `--no-assist`, which does reach a real, syscall-computed `SetupThread` `SP`
+rather than a hardcoded approximation) differs from real hardware's enough to turn a harmless
+overflow into a fatal one. Distinguishing these needs comparing our heap/stack layout against a
+real PS2's allocator behavior, not more tracing of this one call site.
+
 ---
 
 ## 8. Save states & determinism contracts
