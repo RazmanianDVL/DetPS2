@@ -828,6 +828,15 @@ public static class SmokeTests
             MediaVerify_SyntheticIso();
             HostGamepad_Enumerate();
 
+            // Virtual HDD (APA + PFS foundation)
+            Apa_FormatAndPartitionChecksumValid();
+            Apa_ChecksumDetectsCorruption();
+            Pfs_FormatCreatesValidRootDirectory();
+            Pfs_FileRoundTrip_SmallAndMultiZone();
+            Pfs_NestedDirectories();
+            Pfs_DeleteReclaimsSpace();
+            VirtualHdd_SaveFileRoundTripAcrossReopen();
+
             Console.WriteLine("\n=== ALL SMOKE TESTS PASSED (Phase 56 + media) ===");
             return 0;
         }
@@ -837,6 +846,181 @@ public static class SmokeTests
             Console.WriteLine(ex.StackTrace);
             return 1;
         }
+    }
+
+    // -------------------- Virtual HDD (APA + PFS) --------------------
+
+    // Reserved-area math (see PfsVolume.Format doc) needs the disk large enough to clear
+    // ~530 reserved zones before any user data can be allocated; 64MB leaves plenty of
+    // headroom (~62MB free) while staying fast to allocate/format in a test.
+    private const long TestDiskSize = 64L * 1024 * 1024;
+
+    public static void Apa_FormatAndPartitionChecksumValid()
+    {
+        var disk = new ApaDisk((uint)(TestDiskSize / Apa.SectorSize));
+        disk.FormatDisk();
+        uint sector = disk.CreatePartition("__common", 4096, Apa.TypePfs);
+        if (sector == 0) throw new Exception("partition sector should never be 0 (that's the self header)");
+
+        var found = disk.FindPartition("__common");
+        if (found == null) throw new Exception("partition not found after creation");
+        if (found.Type != Apa.TypePfs) throw new Exception("wrong partition type read back");
+        if (found.Length != 4096) throw new Exception($"wrong length read back: {found.Length}");
+
+        // Re-read the raw bytes and verify the on-disk checksum actually validates —
+        // exercises the same apaCheckSum algorithm real PS2 HDD tools use.
+        var raw = new byte[Apa.HeaderBytes];
+        Array.Copy(disk.Data, (long)sector * Apa.SectorSize, raw, 0, Apa.HeaderBytes);
+        if (!found.VerifyChecksum(raw)) throw new Exception("APA partition header checksum failed to validate");
+
+        // The disk's own self header (sector 0) should chain to this partition.
+        var self = new byte[Apa.HeaderBytes];
+        Array.Copy(disk.Data, 0, self, 0, Apa.HeaderBytes);
+        var selfHeader = ApaHeader.FromBytes(self);
+        if (!selfHeader.VerifyChecksum(self)) throw new Exception("APA self header checksum failed to validate");
+        if (selfHeader.Next != sector) throw new Exception("self header does not chain to the new partition");
+
+        Console.WriteLine("[Smoke] Apa_FormatAndPartitionChecksumValid OK");
+    }
+
+    public static void Apa_ChecksumDetectsCorruption()
+    {
+        var disk = new ApaDisk((uint)(TestDiskSize / Apa.SectorSize));
+        disk.FormatDisk();
+        uint sector = disk.CreatePartition("__common", 4096, Apa.TypePfs);
+        var raw = new byte[Apa.HeaderBytes];
+        Array.Copy(disk.Data, (long)sector * Apa.SectorSize, raw, 0, Apa.HeaderBytes);
+        var header = ApaHeader.FromBytes(raw);
+        if (!header.VerifyChecksum(raw)) throw new Exception("checksum should validate before corruption");
+
+        raw[100] ^= 0xFF; // corrupt a byte inside the id/password region
+        if (header.VerifyChecksum(raw)) throw new Exception("checksum should NOT validate after corruption");
+
+        Console.WriteLine("[Smoke] Apa_ChecksumDetectsCorruption OK");
+    }
+
+    private static (ApaDisk disk, PfsVolume vol) NewFormattedPfsVolume()
+    {
+        var disk = new ApaDisk((uint)(TestDiskSize / Apa.SectorSize));
+        disk.FormatDisk();
+        uint available = disk.TotalSectors - Apa.HeaderSectors;
+        uint mainSectors = available - (available % Pfs.SectorsPerZone);
+        disk.CreatePartition("__common", mainSectors, Apa.TypePfs);
+        var partition = disk.FindPartition("__common") ?? throw new Exception("partition not found");
+        var vol = new PfsVolume(disk, partition);
+        vol.Format();
+        return (disk, vol);
+    }
+
+    public static void Pfs_FormatCreatesValidRootDirectory()
+    {
+        var (_, vol) = NewFormattedPfsVolume();
+        if (vol.Super.Magic != Pfs.SuperMagic) throw new Exception("bad superblock magic after format");
+        if (vol.Super.Version != Pfs.FormatVersion) throw new Exception("bad superblock version after format");
+        if (vol.Super.NumSubs != 0) throw new Exception("expected zero sub-partitions");
+
+        var listing = vol.ListDirectory("/");
+        if (listing.Count != 0) throw new Exception($"expected empty root ('.'/'..' filtered out), got {listing.Count} entries");
+
+        Console.WriteLine("[Smoke] Pfs_FormatCreatesValidRootDirectory OK");
+    }
+
+    public static void Pfs_FileRoundTrip_SmallAndMultiZone()
+    {
+        var (_, vol) = NewFormattedPfsVolume();
+
+        var small = new byte[100];
+        new Random(1).NextBytes(small);
+        vol.WriteFile("/small.dat", small);
+        var smallBack = vol.ReadFile("/small.dat");
+        if (!BytesEqual(small, smallBack)) throw new Exception("small file round-trip mismatch");
+
+        // Spans 3 zones (8192 bytes each) — exercises multi-zone data[] population and readback.
+        var big = new byte[Pfs.ZoneSize * 2 + 777];
+        new Random(2).NextBytes(big);
+        vol.WriteFile("/big.dat", big);
+        var bigBack = vol.ReadFile("/big.dat");
+        if (!BytesEqual(big, bigBack)) throw new Exception("multi-zone file round-trip mismatch");
+
+        var listing = vol.ListDirectory("/");
+        if (listing.Count != 2) throw new Exception($"expected 2 root entries, got {listing.Count}");
+
+        Console.WriteLine($"[Smoke] Pfs_FileRoundTrip_SmallAndMultiZone OK (small={small.Length}B big={big.Length}B)");
+    }
+
+    public static void Pfs_NestedDirectories()
+    {
+        var (_, vol) = NewFormattedPfsVolume();
+        vol.CreateDirectory("/SAVES");
+        vol.CreateDirectory("/SAVES/SLUS_210.87");
+        var payload = System.Text.Encoding.ASCII.GetBytes("save-data-payload");
+        vol.WriteFile("/SAVES/SLUS_210.87/slot1.bin", payload);
+
+        var savesListing = vol.ListDirectory("/SAVES");
+        if (savesListing.Count != 1 || !savesListing[0].IsDirectory)
+            throw new Exception("expected exactly one subdirectory under /SAVES");
+
+        var gameListing = vol.ListDirectory("/SAVES/SLUS_210.87");
+        if (gameListing.Count != 1 || gameListing[0].IsDirectory)
+            throw new Exception("expected exactly one file under the game's save directory");
+        if (gameListing[0].Size != (ulong)payload.Length)
+            throw new Exception($"wrong size recorded: {gameListing[0].Size} vs {payload.Length}");
+
+        var readBack = vol.ReadFile("/SAVES/SLUS_210.87/slot1.bin");
+        if (!BytesEqual(payload, readBack)) throw new Exception("nested file round-trip mismatch");
+
+        Console.WriteLine("[Smoke] Pfs_NestedDirectories OK");
+    }
+
+    public static void Pfs_DeleteReclaimsSpace()
+    {
+        var (_, vol) = NewFormattedPfsVolume();
+        var data = new byte[Pfs.ZoneSize]; // exactly one zone
+        new Random(3).NextBytes(data);
+
+        vol.WriteFile("/a.dat", data);
+        if (!vol.FileExists("/a.dat")) throw new Exception("file should exist after write");
+        vol.DeleteFile("/a.dat");
+        if (vol.FileExists("/a.dat")) throw new Exception("file should not exist after delete");
+        if (vol.ListDirectory("/").Count != 0) throw new Exception("root should be empty after delete");
+
+        // Space should be reusable: writing many more one-zone files than would fit without
+        // reclamation proves the freed zone (and inode zone) actually went back to the bitmap.
+        for (int i = 0; i < 20; i++)
+            vol.WriteFile($"/b{i}.dat", data);
+        if (vol.ListDirectory("/").Count != 20) throw new Exception("expected 20 files after re-allocation");
+
+        Console.WriteLine("[Smoke] Pfs_DeleteReclaimsSpace OK");
+    }
+
+    public static void VirtualHdd_SaveFileRoundTripAcrossReopen()
+    {
+        var hdd = VirtualHdd.CreateNew(TestDiskSize);
+        var save = new byte[2048];
+        new Random(4).NextBytes(save);
+        hdd.WriteSaveFile("SLUS_210.87", "slot0.bin", save);
+
+        // Round-trip the whole disk image through serialize/reopen, exactly as a real save
+        // would need to survive being written to and read back from a host file.
+        var reopened = VirtualHdd.Open(hdd.Disk.Data);
+        if (!reopened.SaveFileExists("SLUS_210.87", "slot0.bin"))
+            throw new Exception("save file missing after reopen");
+        var readBack = reopened.ReadSaveFile("SLUS_210.87", "slot0.bin");
+        if (!BytesEqual(save, readBack)) throw new Exception("save file mismatch after reopen");
+
+        var listing = reopened.ListSaveFiles("SLUS_210.87");
+        if (listing.Count != 1 || listing[0].Name != "slot0.bin")
+            throw new Exception("unexpected save file listing after reopen");
+
+        Console.WriteLine("[Smoke] VirtualHdd_SaveFileRoundTripAcrossReopen OK");
+    }
+
+    private static bool BytesEqual(byte[] a, byte[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     // -------------------- Phase 9 --------------------

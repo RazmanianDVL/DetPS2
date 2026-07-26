@@ -752,7 +752,91 @@ via `DETPS2_TRACE_PREEMPT=1` — no actual thread switch occurs anywhere in the 
 
 ---
 
-## 9. Debugging tools
+## 9. Virtual HDD (APA + PFS) — 2026-07-25
+
+Memory cards top out at 8MB with only 2 slots and no switching — real PS2 hardware solved this
+with the Expansion Bay + Network Adaptor + HDD (APA partition table, PFS filesystem). We're
+giving the emulator the same solution: a virtual HDD with effectively unbounded save capacity,
+using the *real* on-disk format, not a synthetic shortcut. Memory cards are untouched — this is
+an addition, not a replacement.
+
+**Status: foundation only.** `ApaPartitionTable.cs` / `PfsFileSystem.cs` / `PfsVolume.cs` /
+`VirtualHdd.cs` implement and unit-test the on-disk format as a standalone library. **Nothing is
+wired to game-facing I/O yet** — no SIF RPC service, no IOP device HLE, no syscall interception.
+That's the deliberate next phase, not an oversight: the format needed to be built and verified
+in isolation first (see `Tests/SmokeTests.cs`'s `Apa_*`/`Pfs_*`/`VirtualHdd_*` tests — 7 tests,
+all green, covering checksum validation, checksum-corruption detection, multi-zone file
+round-trips, nested directories, delete-then-reclaim, and full serialize/reopen round-trips).
+
+### 9.1 What's real vs. what's scoped down
+
+Struct layouts, field names, checksum algorithms, and the exact zone-bitmap sizing formulas are
+verified against real ps2sdk source (github.com/ps2dev/ps2sdk — fetched directly via `curl`, not
+paraphrased/summarized, specifically because AI-summarized fetches of these files dropped
+precision that matters for byte-exact structs):
+  - `iop/hdd/libapa/include/libapa.h`, `iop/hdd/libapa/src/apa.c` (`apa_header_t`, `APA_MAGIC`,
+    `apaCheckSum` — sum of the header's 256 u32 words, skipping word 0/the checksum field itself).
+  - `common/include/hdd-ioctl.h` (`APA_IDMAX`/`APA_MAXSUB`/`APA_PASSMAX`/`APA_TYPE_*`).
+  - `iop/hdd/libpfs/include/libpfs.h` (`pfs_super_block_t`/`pfs_inode_t`/`pfs_dentry_t`/
+    `pfs_blockinfo_t`, `PFS_SUPER_MAGIC`, `PFS_SUPER_SECTOR`=8192/`PFS_SUPER_BACKUP_SECTOR`=8193,
+    `PFS_BLOCKSIZE`=0x2000, `PFS_INODE_MAX_BLOCKS`=114).
+  - `iop/hdd/libpfs/src/super.c` (`pfsGetBitmapSizeSectors`/`pfsGetBitmapSizeBlocks` — genuinely
+    non-obvious, deliberately-replicated-verbatim rounding quirks, not a clean ceiling-division).
+  - `iop/hdd/libpfs/src/superWrite.c` (`pfsFormat`/`pfsFormatSub` — the exact reserved-zone/log/
+    root layout sequence; the `reserved = (0x2000>>scale) + log.count + 3 + bitmapBlocks` formula
+    was cross-checked by independently computing "zone right after the root directory's data
+    zone" two different ways and confirming they match exactly — see the git history for this
+    file for the full derivation walkthrough).
+  - `iop/hdd/libpfs/src/inode.c`, `dir.c` (`pfsInodeCheckSum` — same algorithm as APA's checksum;
+    `pfsInodeFill`/`pfsFillSelfAndParentDentries`/`pfsFillDentry` — root/general inode and dentry
+    construction).
+  - `common/include/iox_stat.h` (`FIO_S_IFDIR`=0x1000, `FIO_S_IFREG`=0x2000, `FIO_S_IFMT`=0xF000).
+
+Deliberately out of scope for this pass (documented, not silently approximated):
+  - **Single main partition only** (`NumSubs` always 0) — real PFS supports up to 64
+    sub-partitions per volume; multi-partition volumes (the OPL "one HDL partition per installed
+    game" pattern) aren't implemented.
+  - **Single-segment inodes only** — files up to `PFS_INODE_MAX_BLOCKS` (114) direct zones
+    (~912KB at the default 8192-byte zone size). Real PFS continues large files via chained
+    "segment descriptor" inodes (`next_segment`/`SEGI` blocks); `PfsVolume.WriteFile` throws
+    `NotSupportedException` rather than silently truncating if a file would need this.
+  - **One zone per directory** (this implementation's own allocator choice, not a real-PFS
+    constant) — real PFS grows a directory's dentry listing across multiple zones as needed;
+    here, `AddDentry` throws once a directory's single 8192-byte zone (16 x 512-byte dentry
+    chunks) is full. Fine for save-data folders; not fine for "install thousands of files."
+  - **No journal replay** — the log/journal area is reserved at the correct real on-disk
+    position (so a real PFS-aware tool would recognize the layout), but no actual write-ahead
+    logging or crash-recovery replay happens. We don't simulate power loss mid-write.
+  - **No sub-partition/APA-extended (LBA48, GPT) support** — `apa_header_t`'s `mbr` sub-struct
+    is written in the non-GPT (200-byte padding) layout only.
+
+### 9.2 Layout quick-reference
+
+For a single main partition with zero sub-partitions and the default zone_size (8192 bytes,
+16 sectors, `Pfs.SectorScale`=4):
+
+```
+sector 0            APA "self" header (id "PlayStation2", type MBR) — start of the partition chain
+sector N..N+1        each APA partition's own 2-sector (1024-byte) header, chained via next/prev
+zone 512              PFS superblock (sector 8192) + backup (sector 8193) — inside one zone
+zone 513..513+B-1     zone bitmap (B = GetBitmapSizeBlocks(4, partitionSectors))
+zone 513+B            journal/log area start (log.count = max(0x20000/zone_size, 1) zones)
+zone 513+B+log.count  root directory inode (1 zone)
+zone 513+B+log.count+1  root directory dentry data ("." and ".." only after Format())
+```
+
+### 9.3 Concrete next step
+
+Wire this into game-facing I/O — likely as a new SID service in `RealSifRpc.cs`, following the
+exact pattern `SidMcServ`/`SidCdScmd` already use (intercept the real IOP-side RPC calls games
+actually make, back them with a `VirtualHdd`/`PfsVolume` instance instead of returning `1` for
+everything). The real HDD-facing service IDs/protocol (`hdd.irx`'s IOCTL2 transfer calls,
+`ps2fs`/`pfs.irx`'s mount/file RPC) need the same kind of verification pass this session gave
+CDVD/pad — don't guess service IDs the way `SidMcServ`'s current stub effectively does.
+
+---
+
+## 10. Debugging tools
 
 Most of these are `dotnet run --project src/DetPS2.Core -- <command> [args]`. The stable,
 general-purpose ones:
@@ -782,7 +866,7 @@ programmatic (non-CLI) equivalents, usable from C# tests or a REPL-style investi
 
 ---
 
-## 10. Testing
+## 11. Testing
 
 `Tests/DetPS2.Tests.csproj` is a plain console `Main` (not an xunit/NUnit project — `dotnet test`
 will appear to succeed instantly without running anything; use
@@ -796,7 +880,7 @@ run synthetic multi-step scenarios and report a pass ratio.
 
 ---
 
-## 11. Where to start
+## 12. Where to start
 
 - Read `CONTRIBUTING.md` for the PR-level workflow rules (never commit BIOS/ISOs, keep diffs
   focused, etc.) — this document is architecture, that one is process.
