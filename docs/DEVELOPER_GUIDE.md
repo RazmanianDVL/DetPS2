@@ -1386,6 +1386,43 @@ concrete step: find the outer loop that builds each assertion message (one level
 retry-poll snippet at `0x00481238`-`0x00481258`, `ra=0x00481254` when calling the `Deci2Poll`
 wrapper) to identify exactly what array it walks and what a "valid" entry should look like.
 
+**Follow-up (2026-07-26) — corrected the "array validation" theory, found the real mechanism, hit
+a real limit.** Traced up two more call levels: `0x00481128` (builds/sends the message) is called
+from `0x00480428`/`0x004804A8` — a generic device-1/device-2 "ensure Deci2 open, then print or
+read" pair, not per-record validation — which is in turn called from `0x0047B000`. That function
+reads a global fault-code register (`*(0x00563B58)`, right next to the already-known
+`SifInitedFlag` at `0x00563FE4` — same PS2RNA/SIF global state block) and a paired message-string
+pointer (`*0x00563B5C`), and reports whichever fault is currently set. Confirmed with
+`--find-writer` that this register is real and actively changes over the run (0x2A, then 0x31,
+then finally 0x0B by cyc≈99.3M) — this is a **periodic fault-status watchdog** firing roughly every
+7,488 cycles for tens of millions of cycles, not a one-time burst over an array. It re-reports
+whatever the last real fault was, over and over, because nothing ever clears it (the same "stuck
+forever, no code path resolves it" pattern as everything else in this file).
+
+Caught and corrected a wrong turn while identifying this: the buffer holding the formatted message
+(`0x007778A8`) looked, out of context, like it might just be static game data with placeholder
+text baked in rather than something corrupted at runtime — checked this directly against the raw
+disc image before accepting it. It's wrong: `grep -aoE "assertion.{0,60}line"` against the actual
+ISO finds the real template on disc is `"assertion \"%s\" failed: file \"%s\", line %d"` — genuine
+unsubstituted `%s`/`%s`/`%d` placeholders. So the original finding stands: whatever calls this
+report function is substituting real but wrong-looking values (a 32-bit value outside valid RDRAM
+for the file string, a `0x01FFxxxx`-range stack address printed as if it were a plausible decimal
+line number) into a real, live sprintf-style call — this is a genuine runtime bug, not baked-in
+disc content, confirmed by checking the disc rather than assuming either way.
+
+What's still open, honestly: the exact plumbing from the fault-code register through to those two
+specific bad arguments isn't nailed down — the wrapper chain (`0x0047B000` → `0x00480428` →
+`0x00481128`) passes several counts/lengths whose exact role wasn't fully disentangled, and this
+periodic watchdog reporting a real (if garbled) internal fault doesn't establish that it's the
+*same* fault behind the `exit(1)` loop from the previous entry — they may be two independent
+symptoms of the same root cause (PS2RNA's audio init depending on the still-unreachable real
+`SifBindRpc`) rather than one causing the other. Given the scheduler/CPU bugs already found and
+fixed this session, and the SIF chain being independently proven to work end to end, this specific
+sub-thread (chasing PS2RNA's exact fault semantics) is not obviously the fastest remaining path to
+pixels — it may be more productive to focus on why the game's own code never reaches a real
+`SifBindRpc` call at all (§7.4 above), since fixing that would very plausibly make this whole
+class of PS2RNA fault-reporting moot rather than needing to be understood in detail.
+
 ---
 
 ## 8. Save states & determinism contracts
