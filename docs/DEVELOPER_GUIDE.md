@@ -1241,6 +1241,55 @@ what real hardware never triggers) is the next concrete step, and now looks like
 priority — fixing it plausibly unblocks the SIF bind/call chain as a side effect, rather than the
 other way around.
 
+**Root-caused (2026-07-26): the "material" corruption was a real bug in this emulator's PCPYUD
+instruction, not a strcpy quirk or a stack-layout mismatch.** Added `--find-string=TEXT` (scans
+RDRAM for a literal byte pattern) specifically to locate a corrupted string's actual source, then
+traced one live occurrence with `--pcbreak`/`--find-writer` to full precision: the real strcpy's
+SIMD zero-byte-detection sequence (`psubb`/`pnor`/`pand` computing `hasless(x,0)` across a full
+128-bit chunk) correctly detects a genuine null terminator sitting in the chunk's *upper* 64 bits,
+then does `pcpyud a0,v0,t1` / `or v1,v0,a0` / `bne v1,zero,...` specifically to move that upper-half
+result into a position a scalar `bne` can see (real R5900 semantics only ever expose a GPR's low 64
+bits to non-MMI instructions). This emulator's `PCPYUD` computed `rd.Lo=rt.Hi, rd.Hi=rs.Hi`
+(mechanically mirroring `PCPYLD`'s confirmed-correct `rd.Lo=rt.Lo, rd.Hi=rs.Lo` pattern) — for
+`pcpyud a0,v0,t1` (rs=v0, rt=t1) that put `a0.Lo=t1.Hi` (raw source data, generally nonzero) instead
+of `a0.Lo=v0.Hi` (the actual detection signal), so whenever a terminator landed in a chunk's upper
+half the scalar check could never see it and the copy loop walked off the end of its buffer
+indefinitely — confirmed live: it wrote the same repeating 8-byte source pattern via `sq` every 16
+bytes, unbroken, for 4,132+ iterations (65KB+) before the trace was stopped, trampling everything
+in its path including saved return addresses. Fixed to `rd.Lo=rs.Hi, rd.Hi=rt.Hi`; the same
+instruction sequence that ran the corrupting loop 4,132+ times in 1.5M cycles now hits zero times.
+Assisted-boot syscalls climbed 43→62 at the 5M mark from real work no longer being derailed by the
+corruption; `px`/`gifPath3`/`dmac`/`RealSifRpc` unchanged — this alone doesn't clear the SIF wall,
+but it's a real, independently-necessary fix (this class of bug could derail any code whose
+zero-detection or similar bit-trick needs a marker byte in a quadword's upper half, well beyond
+this one strcpy call site).
+
+The EE Core Instruction Set Manual PDF and PCSX2's source wouldn't yield clean pseudocode for
+PCPYUD through any fetch attempt available here, so the fix was resolved empirically against a
+precisely-traced failure rather than left guessed — and then, at explicit suggestion, cross-checked
+against **Play!** (jpd002/Play-, a mature independent PS2 HLE emulator, cloned locally for
+inspection): its `PCPYUD` computes exactly `RD.Lo=RS.Hi, RD.Hi=RT.Hi`, an exact independent match.
+Spot-checked several other MMI "shuffle" instructions the same way (`PEXEW`, `PROT3W`, `PABSW`,
+`PREVH`) — all already correct in our implementation, so this bug was isolated to PCPYUD, not a
+systemic pattern across the MMI set.
+
+**Also fixed via the same Play! comparison: Deci2Call (syscall 0x7C) was a flat stub.** Play!'s
+`CPS2OS::sc_Deci2Call` gave the real sub-function dispatch (Open/Send/Poll/kPuts) and struct
+layouts (`DECI2BUFFER`: unknown0@0/status0@4/unknown1@8/status1@0xC/dataAddr@0x10; `DECI2SEND`:
+size@0/data@0xC) our stub never had — it always returned 0 regardless of the function argument,
+never touching the caller-supplied buffer's status fields. Traced a ~197,000-syscall storm in the
+real-CRT0-redirect experiment to exactly this: a debug-output retry loop (`Deci2Send` once, then
+`Deci2Poll` repeatedly) that never saw success because the fields it polls were never written.
+Implemented the real dispatch (`SonyKernelHle.Deci2Call`, opt-in text surfaced via
+`DETPS2_TRACE_DECI2=1`). Result: retry count roughly halved, and — more importantly, traced rather
+than assumed — confirmed self-resolving, not a real block: 93,824 of the eventual 96,347 calls
+already happen by 5M cycles, i.e. the loop exhausts itself early and moves on, same as it would on
+real hardware polling for a debug host that was never attached (`Deci2Open` never runs because
+fast-boot skips real CRT0 — the same root cause as everything else in this file). Confirmed this
+isn't what caps `gifPath3`/`px` either. The real-CRT0-redirect experiment stays disabled regardless
+(worse for actual pixel output than the fake-jump baseline); what comes after this retry loop
+resolves is still untraced and remains the next concrete lead.
+
 ---
 
 ## 8. Save states & determinism contracts
