@@ -684,35 +684,57 @@ would now save `Kseg0Interrupt`'s address instead. Fixed in `EmotionEngine.cs`: 
 is empty, so unrelated `eret`s — syscalls, faults, BEV boot — are unaffected; LIFO correctly
 handles a nested interrupt firing inside an already-dispatched handler). Full smoke suite green.
 
-**Note**: this fix did *not* change the specific `+0x30` sp-imbalance symptom above (verified —
-identical `sp=0x01FFFEE0` before and after). It's still a genuine, independently-justified fix
-(exception-frequency in this run is high enough — roughly one every 64–100 cycles — that this
-exact corruption mode was essentially guaranteed to fire eventually somewhere in a 221-call
-sequence), but the sp-drift's specific trigger is a **different, not-yet-found** bug. Ruled out
-so far: (a) thread preemption (`KernelState.MaybePreempt`) — confirmed via
-`DETPS2_TRACE_PREEMPT=1` that no actual thread switch occurs anywhere in this cycle range (the
-newly-startable SIF thread from the `ReferThreadStatus` fix never actually becomes runnable
-during this window, so `_threads.Count>=2` never leads to a real `SaveFullContext`/
-`RestoreFullContext` call); (b) every other unconditional `SetGpr(29/31, ...)` call site
-(`grep -n "SetGpr(29\|SetGpr(31"` across the codebase) is either gated by `--no-assist` or
-requires a state (a real thread switch, a genuinely-lost PC) that doesn't occur here. The
-remaining candidates are an interpreter-level bug in some other instruction (an `addiu sp,...`
-or a load/store width handled wrong for one specific case among the 221 constructors' bodies) or
-another not-yet-found register-clobbering shortcut similar to the one just fixed. Next session:
-bisect which of the 221 table entries (dump the table at `0x5656E0`..`0x565A50`, walk with
-`disasm`/`scanword` per entry) is executing when the imbalance first appears, using
-`--pcbreak=<entry addr>` per-constructor to compare `sp` on entry vs. on return.
+**Note**: that fix did *not* change the specific `+0x30` sp-imbalance symptom above (verified —
+identical `sp=0x01FFFEE0` before and after). It's still a genuine, independently-justified fix,
+but the sp-drift had a different, separate trigger — found and fixed below.
 
-**Investigated and ruled out**: `SetupHeap` (EE syscall `0x3D`) was *also* a no-op stub
-(`result = 0`) alongside the already-fixed `ReferThreadStatus`, and CRT0 calls it right after
-`SetupThread` — a very plausible way for a bad heap-end value to eventually corrupt an unrelated
-buffer's placement. Implemented a real return value (matching `EndOfHeap`'s existing
-`0x01FFF000` boundary) and re-ran the exact same repro: **identical failure, same cycle, same
-PC** — so this isn't what's consumed by whatever's going wrong here. Reverted to `result = 0`
-(unverified either way, but changing it demonstrably didn't help) with a comment recording the
-negative result so this doesn't get silently re-tried.
-`Cdvd.SectorsRead == 0` and the empty object-list loop (§7.4 "Bug C") should be re-checked against
-this new, much-further boot state rather than assumed still relevant.
+**FIXED (2026-07-25) — the actual root cause: `LUI` didn't sign-extend, corrupting the extremely
+common `lui+ori` idiom for loading a negative 32-bit constant.** Traced by bisecting `--cycles=N`
+down to the *exact instruction* (the previous entries in this section were false leads — see below
+for what they turned out to mean): inside `0x0034CE10` (one of the 221 constructors, a normal
+audio-related init routine — not a game bug, this is real, correctly-compiled retail code), a
+`memset(sp, 0, 144)` call is followed by an 8-byte-tail-copy loop whose exit test is
+`lui v0,0xFFFF; ori v0,v0,0xFFFF; addiu a2,a2,-1; beq a2,v0,<exit>` — the standard compiler
+pattern for "loop until counter reaches -1". `addiu` correctly produces a 64-bit sign-extended
+`-1` (`0xFFFFFFFFFFFFFFFF`) when `a2` underflows past 0. But `ExecuteLui` in `EmotionEngine.cs`
+was `Lo = (ulong)imm << 16` — a *zero-extending* 32-to-64 widen — so `lui v0,0xFFFF` produced
+`0x00000000FFFF0000` instead of the correct sign-extended `0xFFFFFFFFFFFF0000`; after the `ori`,
+`v0` ends up `0x00000000FFFFFFFF`, not the true 64-bit `-1`. The `beq a2,v0,<exit>` then compares
+two bit-patterns that both *mean* -1 but don't *equal* each other, so the exit branch never
+fires, and the loop executes exactly one extra iteration — writing one stray zero byte one past
+`memset`'s intended 144-byte range, directly into the adjacent, live stack slot holding this
+constructor's own saved `$ra` (`0x0034D780` → `0x0034D700`, only the low byte changed — an exact
+match for a single corrupting `sb`). That corrupted return address is what sent the
+constructor-table walker's eventual `jr ra` into garbage, which is what every earlier entry in
+this section (the `0x005B9FF0` wild jump, the `+0x30` sp imbalance, the audio-function trace) was
+actually downstream of. None of those earlier findings were wrong, they just weren't the root —
+each was one more layer of the same single bug's blast radius.
+
+This is checked with certainty via `--pcbreak`/`--watch` at the exact byte address (confirmed the
+single `sb a1,0(v1)` write, confirmed its `memset` caller's `a0`/`a2` args cover exactly
+`[dest,dest+144)` while the corrupted address sits at `dest+144`, one past the end) — not a guess.
+Fixed in `EmotionEngine.ExecuteLui`: `Lo = unchecked((ulong)(long)(int)((uint)imm << 16))`, sign-
+extending through `int` before widening to `ulong`. This is `LUI`'s real, spec-defined MIPS64/R5900
+behavior — not a game-specific patch. Since `lui` is one of the most common instructions in any
+compiled MIPS binary (used for essentially every 32-bit constant/address load, and specifically
+for every negative constant via the `lui+ori`/`lui+addiu` idiom this bug broke), this fix likely
+has broad positive effects on titles and code paths well beyond this one boot sequence. Full smoke
+suite green (including `HostGamepad_Enumerate`, `NetplayCert_ProductionGate`, JIT-parity, and
+determinism-sensitive rollback/soak tests — no regressions from a change this fundamental).
+
+**Effect, verified**: boot now proceeds *far* past the previous `UnknownOpcode`/wild-jump failure
+point — by `cyc=2,000,000`, `px=286720` (the game is genuinely writing pixels to the framebuffer),
+`gifPath3=1`, `dmac=4`, real MMIO reads/writes in the `0x1A700xxx` hardware-register range (no more
+`UnknownOpcode` events at all in this window). `Cdvd.SectorsRead == 0` and the empty object-list
+loop (§7.4 "Bug C") should be re-checked against this new, much-further boot state rather than
+assumed still relevant — the whole picture past this point needs fresh investigation.
+
+**Also investigated and ruled out along the way** (kept for the record so they aren't re-tried
+blindly): `SetupHeap` (EE syscall `0x3D`) is a no-op stub (`result = 0`) alongside the
+already-fixed `ReferThreadStatus`; implementing a real return value (matching `EndOfHeap`'s
+`0x01FFF000` boundary) made no difference to this specific bug and was reverted, with a comment
+recording the negative result. Thread preemption (`KernelState.MaybePreempt`) was also ruled out
+via `DETPS2_TRACE_PREEMPT=1` — no actual thread switch occurs anywhere in the relevant window.
 
 ---
 

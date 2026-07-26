@@ -502,6 +502,8 @@ public sealed class EmotionEngine : ISchedulable
 
             if (!found) continue;
 
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
+                Console.Error.WriteLine($"[INTC_DISPATCH] src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
@@ -936,8 +938,19 @@ public sealed class EmotionEngine : ISchedulable
 
     private void ExecuteLui(uint opcode)
     {
+        // Real MIPS64/R5900 LUI sign-extends its 32-bit result (imm<<16) to 64 bits — this
+        // used to zero-extend instead, so `lui rt,0xFFFF` produced 0x00000000FFFF0000
+        // instead of the correct 0xFFFFFFFFFFFF0000. The extremely common `lui rt,0xFFFF;
+        // ori rt,rt,0xFFFF` idiom for loading a -1 (or any other negative 32-bit) constant
+        // therefore produced 0x00000000FFFFFFFF instead of the true 64-bit -1
+        // (0xFFFFFFFFFFFFFFFF), silently breaking any 64-bit compare/branch against a
+        // properly sign-extended value built via addiu (which already sign-extends
+        // correctly). Confirmed as a real, firing bug: this exact mismatch made a loop-exit
+        // check inside MK Shaolin Monks' own compiled memset() fail to match, causing one
+        // extra byte to be written past the intended range and corrupting an adjacent
+        // stack slot — see DEVELOPER_GUIDE.md #7.4 for the full trace.
         uint rt = (opcode >> 16) & 0x1F; ushort imm = (ushort)(opcode & 0xFFFF);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = (ulong)imm << 16 });
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)imm << 16)) });
     }
 
     private void ExecuteLb(uint opcode)
