@@ -46,8 +46,13 @@ public sealed class Intc : ISchedulable
         Mask = 0;
     }
 
+    public static ulong CurrentCycleForTrace;
+    public static readonly bool TraceRaise = Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC") == "1";
+
     public void Raise(InterruptSource source)
     {
+        if (TraceRaise)
+            Console.Error.WriteLine($"[INTC] Raise {source} cyc={CurrentCycleForTrace} alreadyRaised={(Stat & (1u << (int)source)) != 0} mask={Mask:X8}");
         uint bit = 1u << (int)source;
         if ((Stat & bit) == 0)
         {
