@@ -1586,6 +1586,70 @@ unchanged (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`). Full smoke 
 (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release` — note this project is a console app,
 not an SDK test project, so `dotnet test` builds it but silently runs nothing; use `dotnet run`).
 
+**Correction (2026-07-26) — the "per-player match-start constructor" framing above is wrong; this
+is ordinary boot-time init, and the "0-hit" pcbreak evidence it was based on was a test-harness gap,
+not a reachability finding.** Picked this back up expecting to trace what gates progress out of
+`0x00213218` into a menu. Two things fell out instead:
+
+1. **`0x002F7F68` (the shared function both traced `SifBindRpc` chains bottom out in) is not a
+   match-start object constructor — it's called directly from `0x0021338C`, four instructions after
+   `main()`'s straight-line body resumes.** Confirmed via `disasm` on `0x00213380`: `0x0021338C` is
+   `jal 0x002F7F68`, full stop — not `jal 0x00212DD0` as an earlier entry in this same section (§7.4,
+   "found the actual root cause... `0x00212DD0`'s own caller is `0x0021338C`") stated. That earlier
+   claim was itself slightly wrong: `0x00212DD0` (the manager-init call `MaybeForceManagerInit`
+   already force-calls in isolation) is reached *indirectly*, from inside `0x002F7F68` at `0x2F7FF0`,
+   not directly from `0x0021338C`. `0x002F7F68` is a single "bootstrap: bind pad RPC, bind two Midway
+   PS2RNA audio RPC services, call manager-init, do final setup" routine sitting in `main()`'s own
+   ordinary post-logo-wait sequence — real, straight-line, always-executed-on-every-boot code, not
+   something gated behind an in-game event. This also explains *why* `MaybeForceManagerInit` force-
+   calls `0x00212DD0` in narrow isolation rather than its enclosing `0x002F7F68`: calling the whole
+   wrapper would re-trigger the exact padOpen retry-forever loop this file traced in painstaking
+   detail earlier in this same section (§7.4, "the exact deadlock, traced instruction-by-instruction")
+   — the narrow-scope force-call was already correctly avoiding this, whether or not that reasoning
+   was written down at the time.
+
+2. **The zero-hits `--pcbreak` evidence for the 14 `SifBindRpc` sites (this entry and the one before
+   it) was measured with `blocker-trace`, which never calls `MidwayBootAssist.OnHostPresent` — so
+   `_midwayDone` never becomes `true`, `MaybePostLogoAdvance` never fires, and `EE.PC` never reaches
+   `0x00213218` (or anywhere past it) in the first place under that tool.** This is the *exact* test-
+   harness gap already documented and fixed once before, for a different tool, in §7.4's own "Bug B"
+   entry ("`probe-frame`'s own post-boot loop called only `RunFor`... `MidwayBootAssist`'s own design
+   requires `OnHostPresent` to advance the FMV") — it recurred here because `blocker-trace` never got
+   the same fix `probe-frame` did, and nothing flagged that the two tools now disagree about whether
+   this path is even reachable. Confirmed directly: re-ran with `probe-frame` (which already drives
+   `OnHostPresent` every simulated frame, plus periodic `Start` taps) and the boot genuinely reaches
+   `"post-logo-main"`, `cdvdSectors=1`, and real per-frame computation — `PC` settles at `0x00202C48`,
+   which disassembles to a tight bit-normalization loop (`dsll`/`sltu`/`beq` back-edge) feeding into
+   the already-identified `0x002022B0` float-classification leaf (§7.4's "Follow-up investigation...
+   characterizing the assisted-boot plateau" entry) — real, active software floating-point work
+   (almost certainly audio mixing, matching `spu2Samples` climbing the whole session), not a hang.
+   **Lesson, restated because it bears repeating**: a "zero hits over N cycles" result only means
+   something if the harness that produced it actually drives every mechanism the code path depends
+   on — `blocker-trace` joins `probe-frame`'s own earlier list of tools that looked authoritative but
+   weren't, for the same underlying reason.
+
+**Net effect on this investigation's framing**: the 14-site `SifBindRpc`-unreachability question is
+answered, but not the way the last two entries concluded. It isn't "legitimately gated behind match
+start" (wrong) and it isn't "gated behind boot" either in the sense of never being attempted — under
+the boot configuration that actually drives FMV pacing (`probe-frame`), execution runs real code well
+past `0x00213218` and reaches genuine per-frame audio computation without observably hanging on the
+padOpen retry loop at all in this run (no direct instruction-level confirmation either way — `probe-
+frame` only samples PC once per simulated 1,000,000-cycle slice, so a retry loop entered and later
+escaped, or one whose PC happens to fall outside those exact sample points, wouldn't necessarily show
+up). This reopens, rather than closes, the question of whether `0x002F7F68`'s padOpen bind ever
+actually executes and blocks on this specific boot path — determining that precisely (via `--pcbreak`
+on `0x0020626C:0x00206330` or similar, added to `probe-frame` or ported into `blocker-trace` behind a
+`--host-present` flag) is the concrete next step. Separately and at least as important: `blocker-
+trace`'s missing `OnHostPresent` call means **every finding in the two entries directly above this
+one that relied on `blocker-trace`'s "0 pcbreak hits" as evidence of unreachability past the logo
+should be treated as unconfirmed, not refuted** — they may still be correct, but the specific evidence
+cited for them wasn't measuring what it claimed to.
+
+No source changes this entry — read-only investigation (`disasm`, `scanword`, `probe-frame`, one
+`dotnet build` of the unmodified tree to get a fresh binary to run these against). Baseline
+necessarily unchanged (nothing was edited). Full smoke suite green
+(`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
+
 ---
 
 ## 8. Save states & determinism contracts
