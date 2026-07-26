@@ -376,6 +376,12 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         }
         foreach (var ev in traceSys.Telemetry.SnapshotEvents())
             Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-16} key=0x{ev.Key:X8} {ev.Detail}");
+        if (PcProfiler.Enabled)
+        {
+            Console.WriteLine($"  PcProfiler: samples={PcProfiler.TotalSamples} unique={PcProfiler.UniqueCount}");
+            foreach (var (pc, count) in PcProfiler.Top(20))
+                Console.WriteLine($"    0x{pc:X8} x{count}");
+        }
 
         foreach (var a in args)
         {
