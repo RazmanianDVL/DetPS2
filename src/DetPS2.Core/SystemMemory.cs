@@ -29,11 +29,20 @@ public sealed class SystemMemory
 
     private MmioBus? _mmio;
     private Spu2? _spu2;
+    private Sif? _sif;
     /// <summary>When true, refuse writes to exception vector page (0x0–0x2FF) so memset cannot wipe handlers.</summary>
     public bool ProtectKernelVectors { get; set; }
 
     public void AttachMmio(MmioBus bus) => _mmio = bus ?? throw new ArgumentNullException(nameof(bus));
     public void AttachSpu2(Spu2 spu2) => _spu2 = spu2;
+    public void AttachSif(Sif sif) => _sif = sif;
+
+    /// <summary>Real IOP-side SIF mailbox window (ps2tek: IOP sees these at 0x1D000000, the EE
+    /// sees the SAME shared hardware mailbox at 0x1000F200 via MmioBus/Sif.ReadRegister/
+    /// WriteRegister — same register offsets, 0x00=MSCOM/0x10=SMCOM/0x20=MSFLAG/0x30=SMFLAG/
+    /// 0x40=STAT). Only needed on the Iop*() accessor family below.</summary>
+    public const uint IOP_SIF_BASE = 0x1D000000;
+    public const uint IOP_SIF_SIZE = 0x100;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ulong TranslateAddress(ulong virtualAddress) => virtualAddress & 0x1FFFFFFFUL;
@@ -148,6 +157,81 @@ public sealed class SystemMemory
             return Unsafe.ReadUnaligned<uint>(ref _bios[paddr - BIOS_BASE]);
 
         return (uint)(Read8(vaddr) | (Read8(vaddr + 1) << 8) | (Read8(vaddr + 2) << 16) | (Read8(vaddr + 3) << 24));
+    }
+
+    /// <summary>
+    /// IOP-side memory accessors (Iop.cs's own bus — NOT the EE's Read8/Read32/Write8/Write32
+    /// above). On real hardware the EE and IOP are separate CPUs on separate physical buses:
+    /// an IOP address like 0x00001000 refers to a byte in the IOP's own 2MB RAM chip, completely
+    /// unrelated to the EE's identically-numbered RDRAM address. This emulator gives the IOP its
+    /// own backing array (<see cref="_iopRam"/>) but, until 2026-07-26, Iop.cs's own load/store
+    /// helpers called straight into the EE's Read8/Read32/Write8/Write32 above with the IOP's raw
+    /// (untranslated, unmasked) address — which resolve low addresses to `_rdram` (checked before
+    /// the IOP_RAM_BASE-offset branch even exists in that path), not `_iopRam`. Confirmed via
+    /// --dump: with a real PS2 BIOS loaded and the IOP core actually stepping, Iop.PC settled at
+    /// a stable address whose disassembly was genuine EE R5900/MMI opcodes (`padduw`, `sq`, 64-bit
+    /// `sd`/`ld`) — instructions that don't exist on the IOP's 32-bit R3000A — meaning the "IOP"
+    /// was silently misinterpreting the EE's own compiled game binary as if it were IOP firmware,
+    /// not executing anything IOP-side at all. These accessors give the IOP a correctly isolated
+    /// view: its own RAM at IOP-physical 0x00000000-0x001FFFFF (mapped to the SAME `_iopRam`
+    /// array the EE side reaches via IOP_RAM_BASE, just without that offset — this is the same
+    /// physical chip, two different numbering schemes depending which CPU's bus is asking), the
+    /// shared BIOS ROM window (physically the same chip both CPUs boot from), the real IOP-side
+    /// SIF mailbox window (ps2tek: 0x1D000000, routed to the same <see cref="Sif"/> object the EE
+    /// reaches via MmioBus/0x1000F200 — same hardware register, two address windows), and zero /
+    /// no-op for anything else this emulator doesn't model on the IOP's own bus (its own DMA
+    /// controller, timers, interrupt controller — real IOP kernel firmware needs all of these to
+    /// actually boot, which is out of scope here; see Sif.SmFlag's proactive SIFINIT/CMDINIT/
+    /// BOOTEND bits for how the EE-visible *effects* of a completed IOP boot are represented
+    /// instead of simulating the boot itself).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public byte IopRead8(uint addr)
+    {
+        uint paddr = addr & 0x1FFFFFFFu;
+        if (paddr < (uint)IOP_RAM_SIZE) return _iopRam[paddr];
+        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+            return (byte)(_sif.ReadRegister(paddr) >> (int)((paddr & 3) * 8));
+        if (paddr >= BIOS_BASE && paddr < BIOS_BASE + (uint)BIOS_SIZE) return _bios[paddr - BIOS_BASE];
+        return 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void IopWrite8(uint addr, byte value)
+    {
+        uint paddr = addr & 0x1FFFFFFFu;
+        if (paddr < (uint)IOP_RAM_SIZE) { _iopRam[paddr] = value; return; }
+        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+        {
+            _sif.WriteRegister(paddr, value);
+            return;
+        }
+        // BIOS ROM / unmapped — ignore writes, matching the EE-side Write8 policy.
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint IopRead32(uint addr)
+    {
+        uint paddr = addr & 0x1FFFFFFFu;
+        if (paddr + 3 < (uint)IOP_RAM_SIZE) return Unsafe.ReadUnaligned<uint>(ref _iopRam[paddr]);
+        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+            return _sif.ReadRegister(paddr);
+        if (paddr >= BIOS_BASE && paddr + 3 < BIOS_BASE + (uint)BIOS_SIZE)
+            return Unsafe.ReadUnaligned<uint>(ref _bios[paddr - BIOS_BASE]);
+        return 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void IopWrite32(uint addr, uint value)
+    {
+        uint paddr = addr & 0x1FFFFFFFu;
+        if (paddr + 3 < (uint)IOP_RAM_SIZE) { Unsafe.WriteUnaligned(ref _iopRam[paddr], value); return; }
+        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+        {
+            _sif.WriteRegister(paddr, value);
+            return;
+        }
+        // BIOS ROM / unmapped — ignore writes.
     }
 
     /// <summary>Diagnostic-only write watchpoint (opt-in via blocker-trace --watch=ADDR). Null

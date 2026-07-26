@@ -332,8 +332,13 @@ public static class SmokeTests
     public static void Iop_HandAssembledLoop_Deterministic()
     {
         var sys = new Ps2System();
-        // Place program in IOP RAM
-        const uint baseAddr = SystemMemory.IOP_RAM_BASE;
+        // Place program in IOP RAM, using the IOP's OWN native address for its RAM (0x0-0x1FFFFF)
+        // — not SystemMemory.IOP_RAM_BASE, which is the EE-side alias window (0x1C000000) used to
+        // reach the same physical IOP RAM chip from the EE's bus (e.g. Sif DMA transfers). Iop.cs's
+        // own accessors (IopRead32/IopWrite32) resolve addresses on the IOP's own bus, where its
+        // RAM is isolated at 0x0, not aliased onto the EE's address space (see SystemMemory.cs's
+        // IopRead32/IopWrite32 doc comment for why that isolation matters).
+        const uint baseAddr = 0x1000;
         // ADDIU rt,rs,imm = 001001 rs rt imm
         uint Addiu(uint rt, uint rs, short imm) =>
             (0x09u << 26) | (rs << 21) | (rt << 16) | (ushort)imm;

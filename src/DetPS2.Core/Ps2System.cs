@@ -127,6 +127,7 @@ public sealed class Ps2System : ISchedulable
         Iop = new Iop(Intc, Memory);
         Cdvd = new Cdvd();
         Sif = new Sif(Memory, Intc);
+        Memory.AttachSif(Sif);
         IopModules.BindMemCard(MemCard);
         Sif.BindServices(IopModules, Pad, Cdvd);
         Pipeline = new GsPipeline(Gs, Gif, Pcrtc);

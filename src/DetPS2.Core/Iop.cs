@@ -75,7 +75,7 @@ public sealed class Iop : ISchedulable
         int executed = 0;
         while ((ulong)executed < maxCycles && Running)
         {
-            uint opcode = _memory.Read32(PC);
+            uint opcode = _memory.IopRead32(PC);
             bool tookBranch = ExecuteInstruction(opcode);
             executed++;
             InstructionsExecuted++;
@@ -83,7 +83,7 @@ public sealed class Iop : ISchedulable
             if (tookBranch)
             {
                 // Delay slot
-                uint delay = _memory.Read32(PC + 4);
+                uint delay = _memory.IopRead32(PC + 4);
                 ExecuteInstruction(delay);
                 executed++;
                 InstructionsExecuted++;
@@ -314,13 +314,13 @@ public sealed class Iop : ISchedulable
     {
         uint rt = Rt(opcode);
         uint addr = EffectiveAddress(opcode);
-        if (rt != 0) _gprs[rt] = _memory.Read32(addr);
+        if (rt != 0) _gprs[rt] = _memory.IopRead32(addr);
         return false;
     }
 
     private bool StoreWord(uint opcode)
     {
-        _memory.Write32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
+        _memory.IopWrite32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
         return false;
     }
 
@@ -330,11 +330,11 @@ public sealed class Iop : ISchedulable
         uint rt = Rt(opcode);
         if (store)
         {
-            _memory.Write8(addr, (byte)_gprs[rt]);
+            _memory.IopWrite8(addr, (byte)_gprs[rt]);
         }
         else if (rt != 0)
         {
-            byte b = _memory.Read8(addr);
+            byte b = _memory.IopRead8(addr);
             _gprs[rt] = signed ? (uint)(sbyte)b : b;
         }
         return false;
@@ -346,12 +346,12 @@ public sealed class Iop : ISchedulable
         uint rt = Rt(opcode);
         if (store)
         {
-            _memory.Write8(addr, (byte)_gprs[rt]);
-            _memory.Write8(addr + 1, (byte)(_gprs[rt] >> 8));
+            _memory.IopWrite8(addr, (byte)_gprs[rt]);
+            _memory.IopWrite8(addr + 1, (byte)(_gprs[rt] >> 8));
         }
         else if (rt != 0)
         {
-            ushort h = (ushort)(_memory.Read8(addr) | (_memory.Read8(addr + 1) << 8));
+            ushort h = (ushort)(_memory.IopRead8(addr) | (_memory.IopRead8(addr + 1) << 8));
             _gprs[rt] = signed ? (uint)(short)h : h;
         }
         return false;
@@ -363,7 +363,7 @@ public sealed class Iop : ISchedulable
     public void LoadProgram(uint address, ReadOnlySpan<uint> words)
     {
         for (int i = 0; i < words.Length; i++)
-            _memory.Write32(address + (uint)(i * 4), words[i]);
+            _memory.IopWrite32(address + (uint)(i * 4), words[i]);
         PC = address;
         Running = true;
         InstructionsExecuted = 0;

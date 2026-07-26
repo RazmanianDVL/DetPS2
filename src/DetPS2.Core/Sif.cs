@@ -36,6 +36,22 @@ public sealed class Sif : ISchedulable
     public uint MsFlag { get; private set; }
     public uint SmFlag { get; private set; }
 
+    /// <summary>
+    /// Real ps2sdk (ee/kernel/include/sifdma.h) bit values for SIF_REG_SMFLAG, the register
+    /// real EE library code polls to learn the IOP's boot progress: sceSifInitCmd's own real
+    /// source (ee/kernel/src/sifcmd.c) literally reads
+    /// "while (!(sceSifGetReg(SIF_REG_SMFLAG) & SIF_STAT_CMDINIT))" before doing anything else.
+    /// This emulator's IOP core (Iop.cs) doesn't model real IOP-side hardware registers or
+    /// firmware execution faithfully enough for a real IOP kernel to ever set these for real
+    /// (see MaybeUnblockStarvedSema's doc comment and DEVELOPER_GUIDE.md 2026-07-26 for how that
+    /// was confirmed) — so, like a real BIOS handing off to a game only once its own boot is
+    /// actually complete, present these as already set from boot: SIFINIT (0x10000, basic SIF
+    /// up), CMDINIT (0x20000, cmd/rpc layer up), BOOTEND (0x40000, full IOP boot done).
+    /// </summary>
+    public const uint SifStatSifInit = 0x10000;
+    public const uint SifStatCmdInit = 0x20000;
+    public const uint SifStatBootEnd = 0x40000;
+
     /// <summary>Last RPC result written (for tests).</summary>
     public uint LastRpcResult { get; private set; }
 
@@ -61,7 +77,8 @@ public sealed class Sif : ISchedulable
         BytesTransferred = 0;
         RpcProcessed = 0;
         LastRpcResult = 0;
-        MsCom = SmCom = MsFlag = SmFlag = 0;
+        MsCom = SmCom = MsFlag = 0;
+        SmFlag = SifStatSifInit | SifStatCmdInit | SifStatBootEnd;
         _cmdQueue.Clear();
         _rpcPacketAddrs.Clear();
     }
