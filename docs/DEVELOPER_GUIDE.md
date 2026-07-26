@@ -1187,6 +1187,60 @@ enough to hit the real call site, or by synthesizing a plausible SIF RPC complet
 the semaphore-3 wait point using `RealSifRpc`'s existing service logic) is the next concrete step
 toward clearing the cached-logo-overlay plateau and producing genuinely new rendered content.
 
+**Architecture research + two real fixes (2026-07-26).** Given explicit go-ahead to research real
+PS2 architecture rather than keep guessing, pulled the real hardware docs (psdevwiki/ps2tek SIF
+register map) and the real ps2sdk source (`ee/kernel/src/sifrpc.c`, `sifcmd.c`, `sifdma.h`) to
+check our SIF model against the genuine protocol. Two findings, both fixed:
+
+1. **EE/IOP memory aliasing — a real, previously-unnoticed bug.** `Iop.cs` (the IOP R3000A
+   interpreter) called straight into the EE's own `SystemMemory.Read/Write` methods with the IOP's
+   raw address. On real hardware the two CPUs sit on separate physical buses; an IOP address like
+   `0x1000` is a byte in the IOP's own 2MB RAM, unrelated to the EE's identically-numbered RDRAM.
+   Confirmed empirically, not guessed: with a real retail BIOS loaded (`user-media.json`'s
+   `biosPath`, a genuine SCPH-70008 dump) and the IOP core genuinely stepping every cycle
+   alongside the EE, its PC settled at a stable address whose disassembly was unmistakably EE
+   R5900/MMI code (`padduw`, `sq`, 64-bit `sd`/`ld` — none of which exist on the IOP's 32-bit
+   R3000A). The "IOP" was silently misinterpreting the EE's own compiled game binary as firmware.
+   Fixed with a genuinely isolated `IopRead8/IopRead32/IopWrite8/IopWrite32` family on
+   `SystemMemory` (IOP RAM at IOP-physical `0x0`-`0x1FFFFF`, the shared BIOS ROM, the real
+   IOP-side SIF mailbox window at `0x1D000000` per ps2tek routed to the same `Sif` object the EE
+   reaches via `0x1000F200`, zero/no-op otherwise) and switching `Iop.cs` to use them. This does
+   NOT give the IOP a working real boot — that needs real IOP-side DMA/timer/interrupt-controller
+   register modeling, well out of scope — but it stops the two CPUs from corrupting/misreading each
+   other's memory, which is the actual bug. Post-fix, the IOP's PC free-runs into unmapped
+   (zero-returning) territory instead, which is honest: this emulator's SIF servicing has always
+   been HLE-based (`RealSifRpc`/`IopModuleHost`, dispatched directly from `Sif.Step()`), entirely
+   independent of whether `Iop.cs` itself executes anything meaningful — so this was never actually
+   the reason SIF completion never happens, just a real correctness bug worth fixing regardless.
+
+2. **`SIF_STAT_CMDINIT` et al. — real EE library code needs these and nothing ever set them.**
+   ps2sdk's actual `sceSifInitCmd` (`ee/kernel/src/sifcmd.c`) literally polls
+   `while (!(sceSifGetReg(SIF_REG_SMFLAG) & SIF_STAT_CMDINIT))` before doing anything else —
+   `sifdma.h`'s real values are `SIF_STAT_SIFINIT=0x10000`, `SIF_STAT_CMDINIT=0x20000`,
+   `SIF_STAT_BOOTEND=0x40000`. Since this emulator's IOP can't realistically complete a real kernel
+   boot to set these for real (see above), `Sif.Reset()` now presents `SmFlag` with all three
+   already set — the same way a real BIOS only hands control to a game once its own IOP-side boot
+   has genuinely finished. Cheap, correct, and removes a landmine for any future work that reaches
+   real EE library init code paths checking this.
+
+**Verified these don't change the current plateau, and pinned down why not.** `DETPS2_TRACE_SIFINIT=1`
+confirms the already-existing forced call to real `sceSifInitRpc` (`MaybeForceSifInit`, forcing
+`0x00482E98`) completes and returns in ~50,000 cycles both before and after these fixes — it was
+never stuck on the CMDINIT poll in the first place (its disassembly shows the real function doesn't
+gate on that the way stock ps2sdk's does, or reaches it satisfied already for other reasons). More
+significant: at the exact moment it fires (`cyc=1,500,000`), the interrupted context already shows
+`ra=0x6C6169726574616D` ("material" ASCII) and `PC=0x80000198` (mid-exception-vector) — the
+already-documented stack-buffer-overflow corruption (real library `strcpy`'s quadword copy
+overrunning its 32-byte destination, §7.4 above) has already happened by 1.5M cycles, well before
+any SIF work starts. **This reframes the standing wall precisely: it was never really "the SIF relay
+is missing or broken" — a working relay (`RealSifRpc`) already exists and a real call into real SIF
+init code already succeeds. The actual blocker is that the memory-corruption bug derails execution
+flow itself before the game ever reaches a real `sceSifBindRpc` call site.** Distinguishing this
+bug's two live hypotheses (genuine shipped-game bug vs. our own stack/heap layout letting through
+what real hardware never triggers) is the next concrete step, and now looks like the *real*
+priority — fixing it plausibly unblocks the SIF bind/call chain as a side effect, rather than the
+other way around.
+
 ---
 
 ## 8. Save states & determinism contracts
