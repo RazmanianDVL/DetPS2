@@ -230,11 +230,22 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         {
             if (!a.StartsWith("--trace-window=")) continue;
             ulong window = ulong.TryParse(a.AsSpan(15), out var w) ? w : 3000ul;
+            bool chrono = args.Contains("--trace-chrono");
             traceSys.Tracer.MaxEntries = (int)Math.Min(window + 16, int.MaxValue);
             traceSys.Tracer.Enable();
             traceSys.RunFor(window);
             traceSys.Tracer.Disable();
             Console.WriteLine($"  trace-window: {traceSys.Tracer.Count} entries captured after cycle {cycles}");
+            if (chrono)
+            {
+                // Entries are already in execution order (Tracer.Append is insertion-ordered) —
+                // unlike the deduped/address-sorted view below, this preserves control flow, so
+                // a bad jr/jalr/branch shows up as a visible discontinuity in the pc column.
+                Console.WriteLine("  chronological trace:");
+                foreach (var e in traceSys.Tracer.Entries)
+                    Console.WriteLine($"    cyc={e.Cycle,10} pc=0x{e.Pc:X8} op=0x{e.Opcode:X8}  {EeDisassembler.Disassemble((uint)e.Pc, e.Opcode)}");
+                continue;
+            }
             var pcCounts = new Dictionary<ulong, int>();
             foreach (var e in traceSys.Tracer.Entries) pcCounts[e.Pc] = pcCounts.GetValueOrDefault(e.Pc) + 1;
             Console.WriteLine($"  unique PCs in window: {pcCounts.Count}");

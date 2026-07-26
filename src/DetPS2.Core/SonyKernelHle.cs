@@ -19,6 +19,10 @@ public sealed class SonyKernelHle
     private uint _gsImr = 0xFF00;
     private bool _stubsInstalled;
     private const uint StubBase = 0x00081000;
+    // Top of usable RDRAM for heap purposes — leaves room below the top-of-RAM stack
+    // region real hardware reserves. Shared by SetupHeap (0x3D) and EndOfHeap (0x3E)
+    // so both syscalls agree on where the heap ends.
+    private const uint HeapTop = 0x01FFF000;
     private int _stubSlots;
     private readonly RealSifRpc _realRpc = new();
     public RealSifRpc RealRpc => _realRpc;
@@ -248,10 +252,17 @@ public sealed class SonyKernelHle
                 result = SetupThread(a0, a1, a2, a3);
                 break;
             case 0x3D: // SetupHeap
+                // NOTE: tried returning a real heap-end pointer here (matching EndOfHeap) on
+                // the theory that a null return corrupts newlib's malloc bookkeeping — tested
+                // empirically against the cyc~1,381,616 stack-corruption repro (see #7.4) and
+                // it made no difference (identical failure, same cycle, same PC), so the
+                // return value doesn't appear to be what's consumed here. Reverted to the
+                // known, unverified-but-harmless prior behavior rather than keep an unproven
+                // guess; left this note so the theory isn't silently retried later.
                 result = 0;
                 break;
             case 0x3E: // EndOfHeap — return top of usable RDRAM (titles poll this)
-                result = 0x01FFF000;
+                result = HeapTop;
                 break;
 
             // ---- Semaphores (Sony: a0 = ee_sema_t*) ----

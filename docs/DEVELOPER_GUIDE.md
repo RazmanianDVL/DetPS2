@@ -653,24 +653,39 @@ deep, previously-unreached game code (`0x00959AE4`+ by `cyc=2,000,000`, vs. neve
 `0x2062xx`/`0x483xxx` region before). Full smoke suite still green (no regression to the
 already-working assisted boot or anything else).
 
-**New blocker exposed (not yet fixed) — a wild jump into empty memory.** Around `cyc=1,381,616`
-execution starts fetching from a long stretch of zero-filled BSS as if it were code (harmless,
-since a zero word decodes as `nop`), drifting **forward in a straight line with no taken
-branches** for thousands of instructions (confirmed via `--trace-window`: PCs from `0x00723924`
-through past `0x007273B0` in one 4,000-cycle window, monotonically increasing, no loops).
-Whenever it crosses a stray non-zero byte it decodes as an unknown opcode, traps to the real EE
-exception vector (`0x80000200`, itself correctly implemented and executing real BIOS-style
-`mfc0`/`andi`/`eret` code — confirmed 63 exception entries in that same window), and `eret`
-resumes the same forward drift. This never self-corrects. The likely cause is a single bad
-`jr`/`jalr` (register-indirect jump/return) to a garbage or uninitialized address, taken once,
-well before `cyc≈1,381,616` — `--trace-window`'s output is sorted by address, not execution
-order, so pinpointing the exact originating jump needs either a much wider window read
-chronologically (the tracer itself doesn't currently expose ordering) or a `--pcbreak` bisection
-similar to the one that found the `main()`→ctor-table call chain in the finding above. Given how
-much *further* the boot now gets before failing, this is very likely a distinct, previously
-unreachable bug — not a consequence of the `ReferThreadStatus` fix's own correctness (which is
-straightforward and well-evidenced) — but that hasn't been proven yet and is the natural next
-thing to check (e.g. does disabling the newly-started SIF thread change where this occurs?).
+**New blocker found (2026-07-25, not yet fixed) — a corrupted return address, traced to its
+exact instruction.** `--trace-window` sorts by address, not execution order, which is misleading
+for control-flow bugs — added `--trace-window=N --trace-chrono` (dumps `Tracer.Entries` in true
+insertion/cycle order instead) specifically to unpick this. Using it plus a cycle-count bisection
+(binary-searching `--cycles=N` for the PC value at increasing N until the "steady linear PC drift,
+~3.75 bytes/cycle, no taken branches" signature starts) pinned the originating bad jump to a
+single `jr ra` at `0x00345B08`, inside a small audio/volume-calc function
+(`0x00345930`..`0x00345B08`, real prologue `sd ra,0(sp)` at `0x00345954`). Confirmed via
+`--pcbreak=345954`: entered at `cyc=985200` with `sp=0x01FFFE60`, `ra=0x0034D730` (the correct,
+legitimate caller) and `s0=0x0274C7C0` (its own "sound object" struct pointer — note this is
+*already* past the 32MB RDRAM boundary as a raw KUSEG address, aliasing back into range only via
+masking, which is at least unusual). By the matching `ld ra,0(sp)` / `jr ra` at
+`cyc=986628` (confirmed via `--trace-window=600 --trace-chrono --cycles=986500`), the value
+read back from that exact same stack slot (`0x01FFFE60`) is `0x005BA000` instead of the correct
+`0x0034D730` — something wrote into this function's own saved-`ra` stack slot while it was
+running. `0x01FFFE60` is a very commonly-reused address (confirmed via `--watch=1FFFE60`: dozens
+of unrelated functions save/restore `ra` there across a 200,000-cycle window, since it's near the
+top of the main thread's stack, reused every time call depth returns to the same level) — the
+exact corrupting write wasn't isolated before time ran out this session; the next step is
+`--watch=1FFFE60` scoped tightly to `cyc=985200..986628` (this function's own lifetime) to see
+literally every access in between and find which one clobbers it, then trace that write's own
+source register back to see whether it's an off-by-something in the same audio function's
+`13204`-`13224(s0)` struct-field stores (all relative to `s0`, which — see above — already looks
+suspicious) or something unrelated stomping the stack from a different call.
+
+**Investigated and ruled out**: `SetupHeap` (EE syscall `0x3D`) was *also* a no-op stub
+(`result = 0`) alongside the already-fixed `ReferThreadStatus`, and CRT0 calls it right after
+`SetupThread` — a very plausible way for a bad heap-end value to eventually corrupt an unrelated
+buffer's placement. Implemented a real return value (matching `EndOfHeap`'s existing
+`0x01FFF000` boundary) and re-ran the exact same repro: **identical failure, same cycle, same
+PC** — so this isn't what's consumed by whatever's going wrong here. Reverted to `result = 0`
+(unverified either way, but changing it demonstrably didn't help) with a comment recording the
+negative result so this doesn't get silently re-tried.
 `Cdvd.SectorsRead == 0` and the empty object-list loop (§7.4 "Bug C") should be re-checked against
 this new, much-further boot state rather than assumed still relevant.
 
@@ -697,7 +712,7 @@ general-purpose ones:
 
 | Command | Purpose |
 |---|---|
-| `blocker-trace <user-media.json> [--cycles=N] [--pcbreak=HEX] [--dump=ADDR:LEN] [--trace-window=N] [--no-assist\|--no-force-sif\|--no-unstick-waits\|--no-auto-complete]` | The main real-disc-boot diagnostic: boots the title(s) in `user-media.json`, runs N cycles, reports final PC/px/DMA/syscall counts. `--pcbreak` prints full GPR/COP0 state every time PC hits that address (careful — a tight spin loop can produce gigabytes of output in seconds; pipe through `head` or use a short `--cycles`). `--dump` disassembles/dumps raw memory at a fixed address. `--trace-window=N` captures the last N executed instructions once the run completes, useful for telling "genuinely stuck in a tight loop" apart from "just landed here when the cycle budget ran out" (see the PC=`0x480338` vs PC=`0x2062B4` investigation in git history for a worked example of this distinction mattering). The `--no-*` flags disable `MidwayBootAssist`'s synthetic hacks individually so you can measure how far *general* fixes alone get a boot — this is how the §4 interrupt-dispatch fixes were verified as real, not accidental. |
+| `blocker-trace <user-media.json> [--cycles=N] [--pcbreak=HEX] [--dump=ADDR:LEN] [--trace-window=N] [--trace-chrono] [--no-assist\|--no-force-sif\|--no-unstick-waits\|--no-auto-complete]` | The main real-disc-boot diagnostic: boots the title(s) in `user-media.json`, runs N cycles, reports final PC/px/DMA/syscall counts. `--pcbreak` prints full GPR/COP0 state every time PC hits that address (careful — a tight spin loop can produce gigabytes of output in seconds; pipe through `head` or use a short `--cycles`). `--dump` disassembles/dumps raw memory at a fixed address. `--trace-window=N` captures the next N executed instructions past `--cycles`, deduped and **sorted by address** — useful for telling "genuinely stuck in a tight loop" apart from "just landed here when the cycle budget ran out" (see the PC=`0x480338` vs PC=`0x2062B4` investigation in git history), but address-sorting hides actual control flow. Add `--trace-chrono` to instead dump the same window in true execution order (cycle-stamped, one line per instruction, no dedup) — this is what you want for "what jumped where" control-flow bugs (e.g. a corrupted return address); see the `0x00345B08` bad-`jr` finding in §7.4 for a worked example, found by bisecting `--cycles=N` until the "steady linear PC drift" signature first appears, then re-running with a tight `--trace-chrono` window right at that boundary. The `--no-*` flags disable `MidwayBootAssist`'s synthetic hacks individually so you can measure how far *general* fixes alone get a boot — this is how the §4 interrupt-dispatch fixes were verified as real, not accidental. |
 | `long-run --hours=N --log=PATH` | Unattended multi-hour soak: boots, runs in chunks, writes flushed timestamped checkpoints. For overnight/background investigation. |
 | `probe-frame [biosPath] [isoPath] [--watch=HEX]` | Boots MK Shaolin Monks specifically (hardcoded paths if omitted — pass positionally to override, flags starting with `--` are filtered out of positional matching), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Calls `ActiveQuirk?.OnHostPresent` every iteration (required for `MidwayBootAssist`'s FMV pacing to advance at all — see §7.4's "Bug B" for what happens if a tool forgets this). `--watch=HEX` reports every read/write to that address across the whole run (same mechanism as `blocker-trace`'s `--watch`). Useful for a quick visual sanity check without setting up `user-media.json`; convert the output PPM with `ffmpeg -i in.ppm -update 1 out.png` to view it. |
 | `extract-file <iso> <pathOrSubstring> <outPath>` | Pull a raw file (e.g. an `.IRX` module) off a mounted ISO for offline analysis. |
