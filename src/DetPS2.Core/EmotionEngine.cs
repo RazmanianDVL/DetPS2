@@ -413,6 +413,13 @@ public sealed class EmotionEngine : ISchedulable
             {
                 if (_cacheModelEnabled)
                     NoteICache(PC + 4);
+                // CurrentPcForWatch/WatchAddr still hold the branch's own PC from above (set
+                // before ExecuteInstruction(opcode) ran) — without refreshing it here, any store
+                // performed by the delay-slot instruction itself gets mis-attributed in
+                // SystemMemory.LastWriterLog/WatchHits to the branch instruction's address
+                // instead of the delay slot's, since a branch/jump can never itself write memory.
+                if (SystemMemory.WatchAddr.HasValue || SystemMemory.TrackLastWriter)
+                    SystemMemory.CurrentPcForWatch = (ulong)(PC + 4);
                 uint delayOpcode = _memory.Read32(PC + 4);
                 ExecuteInstruction(delayOpcode);
                 PC = _delaySlotTarget;

@@ -1781,6 +1781,54 @@ No source changes this entry — read-only investigation (`--host-present`, `--p
 necessarily unchanged. Full smoke suite green
 (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
 
+**Follow-up (2026-07-26) — the `--find-writer` ambiguity WAS a real tracer bug, now fixed; fixing it
+reframes (but does not yet close) the corruption question.** Resolved the concrete next step named
+above by reading `EmotionEngine`'s main loop directly (`EmotionEngine.cs` around line 385-421) rather
+than guessing: `SystemMemory.CurrentPcForWatch` is set once, right before `ExecuteInstruction(opcode)`
+runs for the instruction at the *branch's own* `PC`. When that instruction takes a branch (`tookBranch
+== true`), the loop then fetches and executes the delay-slot instruction at `PC+4` — but never
+refreshes `CurrentPcForWatch` first. Any store performed by the delay-slot instruction itself was
+therefore being logged under the *branch's* PC in `SystemMemory.LastWriterLog`/`WatchHits`, not its
+own — exactly matching the nonsensical "`jr ra` attributed as a writer" result from the entry above (a
+`jr` cannot itself store; the real store was in its delay slot and got mis-tagged). This is a real,
+general tracer-correctness bug, not specific to this investigation: **every prior `--find-writer` or
+`--watch` result in this file for a store executed in a branch/jump delay slot would have been
+off-by-one-instruction**, attributing the write to the branch/jump itself rather than the actual
+faulting instruction. Fixed in `EmotionEngine.cs`'s branch-taken path: `CurrentPcForWatch` is now
+refreshed to `PC+4` immediately before the delay-slot instruction executes, guarded by the same
+`WatchAddr.HasValue || TrackLastWriter` check the original assignment uses (zero cost, zero behavior
+change, when neither diagnostic is armed — confirmed the default assisted-boot baseline is bit-for-bit
+identical at 150M cycles: `px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`, smoke suite green).
+
+Re-ran `--find-writer=01FEFCB0:8 --track-writers --host-present --cycles=96250000` with the fix in
+place. The ambiguous `jr ra` result is gone; the real answer is `0x01FEFCB0: last written at
+cyc=96246464 pc=0x002022E0 value=0x00000002  sw v0, 0(a1)` — a genuine store, ~9 instructions (72
+cycle-units) before the fatal `jr ra` at `cyc=96246536`. Disassembling around `0x002022E0`
+(`disasm ./user-media.json 96250000 0020225C:C0`) shows it sits in a small, real, shared
+float-classification leaf (matches the already-documented "`0x002022B0` classification leaf" from an
+earlier entry in this section): `addiu v0,zero,2 / jr ra / sw v0,0(a1)` — i.e. "classify as case 2,
+write the result code through the caller-supplied output pointer `a1`, return." This is NOT the
+`0x0040AC48` prologue's own `sd ra,80(sp)` — it's a *different*, unrelated function writing an output
+parameter, whose destination address (`a1`) happens to be the exact same physical stack word this
+entry's (corrected) arithmetic identified as `0x0040AC48`'s saved-`ra` slot.
+
+**This does not yet prove corruption** — it could equally mean the earlier hand-computed identification
+of `0x01FEFCB0` as `0x0040AC48`'s `ra` slot is itself still off (a third instance of the same class of
+hand-arithmetic slip this section has already caught twice), and the classify leaf's `a1` legitimately
+targets its own caller's unrelated local variable at that address with no overlap at all. Distinguishing
+those two possibilities requires knowing, at `cyc=96246464`, whether `0x0040AC48`'s frame is currently
+*live* (pushed but not yet popped) — i.e. whether the classify call is nested inside it — which needs a
+call-stack/frame-liveness check this pass didn't do (e.g. `--trace-threads`-style bracketing, or
+`--pcbreak` on `0x0040AC48`'s entry and exit around this exact cycle to read `sp` directly and compare).
+**Concrete next step:** `--pcbreak=0040AC48:0040AD90` around `cyc≈96246000-96246600` to get `sp` at both
+the classify call and at `0x0040AC48`'s own entry, and confirm or refute frame overlap directly instead
+of by hand-subtracting hex offsets a fourth time.
+
+**Fixed and committed this entry:** the delay-slot `CurrentPcForWatch` attribution bug in
+`EmotionEngine.cs` — real, general, low-risk, valuable independent of whether it turns out to explain
+this specific crash. **Not fixed:** the game-logic corruption itself remains unconfirmed; per this
+file's conventions, no speculative fix was applied. Baseline unchanged, smoke suite green.
+
 ---
 
 ## 8. Save states & determinism contracts
