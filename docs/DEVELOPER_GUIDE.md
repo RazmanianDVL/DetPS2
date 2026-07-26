@@ -1713,6 +1713,74 @@ Full smoke suite green (`dotnet run --project Tests/DetPS2.Tests.csproj -c Relea
 this entry: `Program.cs` only (`--host-present` flag for `blocker-trace`, opt-in, `--pcbreak`
 diagnostics only — no behavior change to the emulator itself or to any default-path output).
 
+**Follow-up (2026-07-26) — bisected the `cyc≈96.2M` crash to the exact faulting instruction under
+`--host-present`; root cause narrowed but not fully pinned down, no fix applied.** Picked up the
+concrete next step named above: root-cause the wild-PC crash now confirmed to be what stops `main()`
+from ever reaching the `SifBindRpc` call sites.
+
+Binary-searched `--cycles=N` (plain `PC=` output only, cheap) on the **default boot path with
+`--host-present`** down to a 4,000-cycle window, then used `--trace-window=6000 --trace-chrono` to
+get a full chronological instruction trace across it. Found the exact faulting instruction:
+`0x0040AD88` (`jr ra`), executed at `cyc=96,246,536`, jumping to `ra=0x6237BBC0` — a value reloaded
+two instructions earlier by `ld ra, 80(sp)` at `0x0040AD74`. From there PC walks linearly upward
+through unmapped memory reading back all-zero words as `nop` (confirmed via `MmioBus.cs`'s
+`_unmappedFallback` path, `Telemetry.cs`'s `UnknownMmioRead`/`UnknownMmioWrite`: reads to addresses
+outside real RDRAM/known-MMIO silently return 0 rather than faulting, so a wild jump up there never
+crashes — it free-runs forever, which is why the PC "freezes" at a fixed value once the walk
+re-enters the periodic timer IRQ's `eret` and loops back into the same NOP stream).
+
+**The `ra` value `0x6237BBC0` is not obviously stack corruption — it's identical to a live
+"pointer" being computed nearby.** At the same cycle, the enclosing call chain
+(`0x0026D2A8`'s function → `0x0026B150` → `0x0040AC48`, the last of which contains the fatal `jr ra`)
+computes `s0 = *(a0+32) + a1` at `0x0026D2B0`-`B4` and passes it down as `a1`/`s1` through every
+nested call — and it equals `0x6237BBC0` for this exact invocation. `--pcbreak` sampling of `0x0040AC48`'s
+entry across the whole run (cyc≈9.6M through 96.2M) shows this same "voice pointer" argument was
+already implausibly large well before the fatal invocation (`0x7123AE80`, `0xFFFFFFFFB1954080`,
+`0x613BA7F0`, `0x3A938D00`, ...) — every sampled value across 90M+ cycles is far outside the real
+32MB RDRAM range, they just hadn't yet produced a jump target that got fed back through `ra` until
+this particular one. This is consistent with (though not proven to be caused by) the standing,
+repeatedly-confirmed finding that PS2RNA's audio/voice init never runs on this boot path (§7.4, the
+whole `SifBindRpc`-chasing arc above) — an uninitialized or never-populated voice table would produce
+exactly this "garbage-but-consistently-structured, used unconditionally" pattern.
+
+**Retracted a wrong turn before it went in as a finding**: initially suspected a genuine stack-frame
+overlap between `0x0026B150` (144-byte frame) and `0x0040AC48` (112-byte frame) — `0x0040AC48`'s `sp`
+at entry (`0x1FEFCD0`, confirmed via `--pcbreak=0040AC48`) is the *incoming*, pre-decrement value, and
+a hex-subtraction slip (`0x1FEFCD0 - 0x70` mis-computed as `0x1FEFCC0` instead of the correct
+`0x1FEFC60`) made `0x0040AC48`'s real `ra` slot (`sp+80`) appear to land on the same address as one of
+`0x0026B150`'s own saved-register slots. Redone correctly, `0x0040AC48`'s actual `ra` slot is
+`0x01FEFCB0`, entirely inside its own declared frame with no overlap with the caller's — the two
+frames do not collide. Recorded here specifically so this exact wrong path isn't re-walked.
+
+`--find-writer=01FEFCB0:8` on the corrected address returned an ambiguous result: last write
+attributed to `pc=0x002022DC` (a bare `jr ra`, which cannot itself write memory) with `value=0x2`.
+This is either a delay-slot PC-attribution artifact in `SystemMemory`'s `LastWriterLog` (the actual
+store may be in `0x002022DC`'s branch-delay slot and getting logged under the branch's own PC rather
+than the delay-slot instruction's), or something not yet understood — either way it is not a clean
+enough signal to name a faulting store instruction with confidence, and guessing further risked
+compounding an already-corrected arithmetic error with a second one.
+
+**Confirmed this crash is specific to the `--host-present`-driven boot path**: re-running to the same
+absolute cycle count (`96,246,536`) *without* `--host-present` lands at a perfectly ordinary PC
+(`0x00203818`, mid-way through the same audio-decompose helper chain, not the garbage band) — the
+default committed boot configuration does not reach this failure mode by this point, consistent with
+it never advancing FMV/logo pacing far enough to drive the code path that exhibits it.
+
+**No fix attempted.** The faulting instruction and its bad input are pinned down precisely, but the
+mechanism by which a `0x6237BBC0`-shaped value ends up in a stack `ra` slot — direct corruption via
+an unidentified out-of-bounds store, versus some other propagation this pass didn't find — is not.
+Patching around it (e.g., bounds-checking the `jr ra` target, or fabricating a plausible voice table)
+would mask rather than fix an unconfirmed root cause, which this file's conventions warn against.
+**Concrete next step:** resolve the `--find-writer` ambiguity first — check whether
+`SystemMemory.NoteLastWriter`'s call site records the PC of the branch or of its delay-slot
+instruction for stores executed in a delay slot, since that would explain the `jr ra` attribution
+directly and either confirm or rule out a real out-of-bounds store as the mechanism.
+
+No source changes this entry — read-only investigation (`--host-present`, `--pcbreak`, `--trace-window
+--trace-chrono`, `--find-writer`, `--track-writers`, all pre-existing `blocker-trace` flags). Baseline
+necessarily unchanged. Full smoke suite green
+(`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
+
 ---
 
 ## 8. Save states & determinism contracts
