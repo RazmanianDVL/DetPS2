@@ -805,6 +805,45 @@ waste time reading a diagnostic tool that isn't actually maintained):
   - Full smoke suite green throughout; `dotnet build` on Core, Tests, and Desktop all report
     0 warnings / 0 errors as of this pass.
 
+**FIXED (2026-07-26) — R5900's 3-operand `MULT`/`MULTU` extension was unimplemented.** Resumed the
+MK boot investigation and found a *new* class of `UnknownMmioWrite`/`UnknownMmioRead` garbage
+(addresses like `0x16B806AD`, `0x142001A5` — not in any real MMIO window) starting around
+`cyc≈1.85M`. Traced via `--pcbreak` + manual disassembly to a free-list/object-pool initializer
+(`0x00384980`-ish) being called with a wildly wrong base pointer. The actual root cause: real
+R5900 hardware extends `MULT`/`MULTU` (SPECIAL funct `0x18`/`0x19`) with a 3-operand form —
+`mult rd, rs, rt` (`rd != 0`) *also* writes the sign-extended low-32 product to a regular GPR, not
+just `HI`/`LO` — used constantly by compilers to skip a separate `mflo`. `EeDisassembler` doesn't
+render the third operand (cosmetic gap only), but the real problem was that `EmotionEngine`'s
+*base-pipeline* `MULT`/`MULTU` never wrote `rd` at all — even though the sibling pipeline-1 forms
+(`MULT1`/`MULTU1`) already did, correctly, a few hundred lines down in the same file. Any code
+using the 3-operand form to scale an array index (`mult t0, t0, v0` where `v0`=struct size) left
+`t0` stale, producing exactly this "index not actually multiplied" address-corruption shape. Fixed
+by adding the same `if (rd != 0) SetGpr(rd, ...)` write already used by `MULT1`/`MULTU1` to the
+base `MULT`/`MULTU` cases.
+
+While there, found the earlier "8 more instances" sign-extension audit (above) only ever covered
+the base pipeline — `MULT1`/`MULTU1`/`DIV1`/`DIVU1` and the MMI-table `MADD`/`MADDU`/`MADD1`/
+`MADDU1` still zero-extended `LO`/`HI` (`LO1`/`HI1`) instead of independently sign-extending each
+32-bit half, the exact same bug class. Fixed all of them to match the already-fixed base pipeline.
+
+**Effect, verified**: with both fixes, `dump-spine`/`blocker-trace` report **zero** `UnknownMmio*`
+events at all through `cyc=5,000,000` (previously 12 unique garbage addresses in that window) and
+`px=860160` at that point (previously `px=286720` — though not a strictly apples-to-apples
+comparison, since that earlier figure was measured at a smaller cycle budget). Full smoke suite
+green.
+
+**Not yet root-caused — a new, later instance of the same failure shape.** Pushing the cycle
+budget to 30M reveals the *same* garbage-base-pointer pattern recurring at `cyc≈29.77M`, in the
+same code region (`0x0026Bxxx`-`0x0026Dxxx` calling into the `0x00384980`-`0x00384D60` pool
+helpers), but this time the corrupted pointer (`s3`/`s0`, e.g. `0xFFFFFFFFB89096C0`) is *not* a
+live index-multiply result — it's a value read back from a stored struct field (`lw s0, 32(a0)`),
+meaning something wrote this garbage into memory further upstream, at some earlier point not yet
+traced. The MULT/MMI fixes above did not change this specific occurrence at all (byte-identical
+`cyc`/`px`/hit-count before and after), confirming it's a genuinely different root cause, not a
+residual case of the same bug. Next step: `--watch` on the exact struct field address (`a0+32` at
+the call site, `0x0026CAAC`) to find what write populates it, working backward from there — the
+same technique that found both fixes above.
+
 ---
 
 ## 8. Save states & determinism contracts

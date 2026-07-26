@@ -688,6 +688,12 @@ public sealed class EmotionEngine : ISchedulable
                     long res = (long)a * b;
                     LO = unchecked((ulong)(long)(int)res);
                     HI = unchecked((ulong)(res >> 32)); // arithmetic shift already yields the sign-extended high half
+                    // R5900 extension: MULT rd,rs,rt (rd != 0) ALSO writes the low-32 sign-extended
+                    // product to a regular GPR, not just HI/LO — compilers emit this constantly to
+                    // avoid a separate mflo. MULT1 (below) already did this; base MULT didn't, which
+                    // left rd holding a stale value wherever code relied on the 3-operand form
+                    // (e.g. array-index scaling: "mult t0,t0,v0" then immediately using t0).
+                    if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
                 }
                 break;
             case 0x19: // MULTU (unsigned 32) — Phase 20 accuracy
@@ -696,6 +702,7 @@ public sealed class EmotionEngine : ISchedulable
                     ulong res = (ulong)a * b;
                     LO = unchecked((ulong)(long)(int)(uint)res);
                     HI = unchecked((ulong)(long)(int)(uint)(res >> 32));
+                    if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO }); // same R5900 3-operand extension as MULT
                 }
                 break;
 
@@ -1152,8 +1159,10 @@ public sealed class EmotionEngine : ISchedulable
             {
                 long acc = unchecked((long)((uint)LO | ((ulong)(uint)HI << 32)));
                 long temp = acc + (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
-                LO = (ulong)(uint)temp;
-                HI = (ulong)(uint)(temp >> 32);
+                // Same sign-extension rule as MULT/DIV (see their comments): each 32-bit half
+                // is sign-extended independently, not zero-extended.
+                LO = unchecked((ulong)(long)(int)temp);
+                HI = unchecked((ulong)(temp >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
                 break;
             }
@@ -1161,8 +1170,8 @@ public sealed class EmotionEngine : ISchedulable
             {
                 ulong acc = (uint)LO | ((ulong)(uint)HI << 32);
                 ulong tempu = unchecked(acc + (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo);
-                LO = (ulong)(uint)tempu;
-                HI = (ulong)(uint)(tempu >> 32);
+                LO = unchecked((ulong)(long)(int)(uint)tempu);
+                HI = unchecked((ulong)(long)(int)(uint)(tempu >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO });
                 break;
             }
@@ -1190,40 +1199,43 @@ public sealed class EmotionEngine : ISchedulable
             case 0x18: // MULT1
             {
                 long res = (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
-                LO1 = (ulong)(uint)res;
-                HI1 = (ulong)(uint)(res >> 32);
+                // Same sign-extension rule as base-pipeline MULT — each 32-bit half is
+                // sign-extended independently (this "1"-pipeline family was missed by the
+                // earlier sign-extension audit, which only covered the base pipeline).
+                LO1 = unchecked((ulong)(long)(int)res);
+                HI1 = unchecked((ulong)(res >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
                 break;
             }
             case 0x19: // MULTU1
             {
                 ulong res = (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo;
-                LO1 = (ulong)(uint)res;
-                HI1 = (ulong)(uint)(res >> 32);
+                LO1 = unchecked((ulong)(long)(int)(uint)res);
+                HI1 = unchecked((ulong)(long)(int)(uint)(res >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
                 break;
             }
             case 0x1A: // DIV1
             {
                 int a = (int)(uint)GetGpr(rs).Lo, b = (int)(uint)GetGpr(rt).Lo;
-                if ((uint)a == 0x80000000u && b == -1) { LO1 = unchecked((ulong)(uint)0x80000000u); HI1 = 0; }
-                else if (b != 0) { LO1 = (ulong)(uint)(a / b); HI1 = (ulong)(uint)(a % b); }
-                else { LO1 = (ulong)(uint)(a < 0 ? 1 : -1); HI1 = (ulong)(uint)a; }
+                if ((uint)a == 0x80000000u && b == -1) { LO1 = unchecked((ulong)(long)(int)0x80000000u); HI1 = 0; }
+                else if (b != 0) { LO1 = unchecked((ulong)(long)(a / b)); HI1 = unchecked((ulong)(long)(a % b)); }
+                else { LO1 = unchecked((ulong)(long)(a < 0 ? 1 : -1)); HI1 = unchecked((ulong)(long)a); }
                 break;
             }
             case 0x1B: // DIVU1
             {
                 uint a = (uint)GetGpr(rs).Lo, b = (uint)GetGpr(rt).Lo;
-                if (b != 0) { LO1 = (ulong)(uint)(a / b); HI1 = (ulong)(uint)(a % b); }
-                else { LO1 = unchecked((ulong)(uint)(-1)); HI1 = (ulong)(uint)(int)a; }
+                if (b != 0) { LO1 = unchecked((ulong)(long)(int)(a / b)); HI1 = unchecked((ulong)(long)(int)(a % b)); }
+                else { LO1 = unchecked((ulong)(long)(int)(uint)(-1)); HI1 = unchecked((ulong)(long)(int)a); }
                 break;
             }
             case 0x20: // MADD1
             {
                 long acc = unchecked((long)((uint)LO1 | ((ulong)(uint)HI1 << 32)));
                 long temp = acc + (long)(int)GetGpr(rs).Lo * (int)GetGpr(rt).Lo;
-                LO1 = (ulong)(uint)temp;
-                HI1 = (ulong)(uint)(temp >> 32);
+                LO1 = unchecked((ulong)(long)(int)temp);
+                HI1 = unchecked((ulong)(temp >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
                 break;
             }
@@ -1231,8 +1243,8 @@ public sealed class EmotionEngine : ISchedulable
             {
                 ulong acc = (uint)LO1 | ((ulong)(uint)HI1 << 32);
                 ulong tempu = unchecked(acc + (ulong)(uint)GetGpr(rs).Lo * (uint)GetGpr(rt).Lo);
-                LO1 = (ulong)(uint)tempu;
-                HI1 = (ulong)(uint)(tempu >> 32);
+                LO1 = unchecked((ulong)(long)(int)(uint)tempu);
+                HI1 = unchecked((ulong)(long)(int)(uint)(tempu >> 32));
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO1 });
                 break;
             }
