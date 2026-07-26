@@ -159,6 +159,28 @@ public sealed class KernelState
         return 0;
     }
 
+    /// <summary>Real ExitThread/ExitDeleteThread semantics: the thread is done forever, back to
+    /// the same DORMANT state it was in before StartThread (ReferThreadStatus already reports
+    /// !Started as DORMANT — this makes that true again). Distinct from the plain SleepThread()
+    /// above (used for the real SleepThread syscall, a legitimate voluntary nap a thread expects
+    /// to be woken back up from) specifically to also clear WaitSemaId: a thread can exit while
+    /// still carrying a stale WaitSemaId from an EARLIER wait it already returned from, and
+    /// MidwayBootAssist.MaybeUnblockStarvedSema's starved-semaphore rescue (or any other future
+    /// SignalSema caller) matches purely on "Sleeping && WaitSemaId == id" with no way to tell an
+    /// exited thread from a genuinely-still-waiting one — confirmed exactly this: a worker thread
+    /// that had legitimately finished (called ExitThread once already) kept getting resurrected
+    /// every ~2M-cycle grace period because its stale WaitSemaId still matched, immediately
+    /// re-running its own tail and calling ExitThread again each time (261 calls by 100M cycles
+    /// in one trace, pure wasted scheduling churn since its real work was already done).</summary>
+    public void ExitCurrentThread()
+    {
+        var t = FindThread(_currentTid);
+        if (t == null) return;
+        t.Sleeping = true;
+        t.Started = false;
+        t.WaitSemaId = 0;
+    }
+
     public int WakeupThread(int id)
     {
         var t = FindThread(id);
@@ -246,6 +268,8 @@ public sealed class KernelState
     {
         var t = FindThread(id);
         if (t == null || !t.Alive) return false;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RESTORE1") == "1" && id == 1)
+            Console.Error.WriteLine($"[RESTORE1] cyc={CurrentCycle} wasStarted={t.Started} wasSleeping={t.Sleeping} savedPc=0x{t.SavedPc:X8}");
         _currentTid = id;
         ulong pc = t.SavedPc != 0 ? t.SavedPc : t.Entry;
         if (pc == 0) return false;
@@ -293,9 +317,19 @@ public sealed class KernelState
         int next = FindNextRunnable(_currentTid);
         if (next == _currentTid)
         {
-            // Nobody else — wake ourselves if we were sleeping so boot doesn't freeze
+            // Nobody else — wake ourselves if we were sleeping so boot doesn't freeze. But only
+            // for a genuine temporary wait (Started stays true): ExitCurrentThread deliberately
+            // sets Started=false for a real ExitThread/ExitDeleteThread, and that's permanent by
+            // design — reviving it here defeats the whole point and creates exactly the bug this
+            // guard is now written to avoid. Confirmed live: without the Started check, a thread
+            // that legitimately called exit(1) (a real error exit, not a hang) got silently
+            // un-slept every time SwitchToNext ran with nothing else runnable, so execution fell
+            // through past the syscall as if the exit had never happened and immediately hit the
+            // same exit call again on its next pass through whatever loop led there — 261 times
+            // by 100M cycles in one trace, masking the real underlying error as a fake loop
+            // instead of surfacing it.
             var cur = FindThread(_currentTid);
-            if (cur != null && cur.Sleeping)
+            if (cur != null && cur.Sleeping && cur.Started)
             {
                 cur.Sleeping = false;
                 cur.WaitSemaId = 0;
@@ -378,6 +412,8 @@ public sealed class KernelState
     {
         var t = FindThread(id);
         if (t == null || !t.Alive) return false;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RESTORE1") == "1" && id == 1)
+            Console.Error.WriteLine($"[RESTOREFULL1] cyc={CurrentCycle} wasStarted={t.Started} wasSleeping={t.Sleeping} hasFullSave={t.HasFullSave}");
         if (!t.HasFullSave || t.SavedGprFull == null)
             return RestoreContext(ee, id, fromSyscall: false);
 

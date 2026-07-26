@@ -207,7 +207,9 @@ public sealed class SonyKernelHle
                 break;
             case 0x23: // ExitThread
             case 0x24: // ExitDeleteThread
-                _kernel.SleepThread(); // mark done
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1")
+                    Console.Error.WriteLine($"[EXIT] tid={_kernel.CurrentThreadId} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8}");
+                _kernel.ExitCurrentThread(); // mark done, permanently — see its own doc comment
                 _kernel.SwitchToNext(ee);
                 result = 0;
                 break;
