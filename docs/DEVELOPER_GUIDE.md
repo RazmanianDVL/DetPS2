@@ -1019,20 +1019,39 @@ the *main* thread, at the exact cycle the worker thread itself is created (`cyc=
 `ra=0x480B34`) — a standard "create the sync primitive, then spawn the worker that waits on it"
 pattern. `--pcbreak` on the real `SignalSema` stub across the full 30,000,000-cycle run: fires
 exactly once, still only ever targeting semaphore `1` (the `InitLocks` mutex) — semaphore `3` is
-never signaled by anything. Meanwhile the main thread, after switching back from the newly-created
-(and now permanently blocked) worker, runs into a bounded copy loop at `0x00487830`
-(`while (a3 < a2) *a0++ = *a1++`) that — given `px`/`gifPath3`/`dmac` stay frozen for the rest of
-the 30M-cycle window — never reaches its own exit condition, suggesting its iteration count (`a2`)
-is itself wrong, quite possibly the same "reads a size that should have come from a real load that
-never happened" shape as everything else today.
+never signaled by anything.
+
+**A copy-loop hypothesis raised and then corrected before it got documented wrong**: the main
+thread, right after switching back from the newly-blocked worker, briefly runs a loop at
+`0x00487830` (`while (a3 < a2) *a0++ = *a1++`). First guess was that its bound (`a2`) was corrupted,
+based on seeing it repeat in one narrow trace snapshot. Checking the *caller* statically (no need to
+re-run anything) disproved that immediately: `a2=816` is a small, hardcoded constant at the call
+site (`0x004878B4`), not a dynamic/corrupted value — this loop is bounded to ~204 iterations and
+finishes fast. It was never the real stall; that was almost a repeat of the exact kind of
+misattribution today's diagnostic tools were built to prevent, caught by checking before writing it
+down instead of after.
+
+**What's actually happening, confirmed with a later trace-chrono snapshot** (`cyc≈5,000,000`,
+filtered to non-exception-vector PCs): **zero** real instructions execute — the main thread is
+purely cycling `0x80000180`-`0x8000019C` (the general exception vector's own `eret`-return path)
+with no real code running at all. This is the *exact same* livelock `--no-assist` alone was shown to
+hit much earlier this session (`s0`-`s3`/`ra` full of `"material"`-ASCII garbage, confirmed via
+`--pcbreak` back then). Both the fully-unassisted boot and this CRT0-redirect experiment
+independently converge on the identical failure mode once enough real code runs. That's strong
+evidence this is a **general, still-unexplained interpreter/exception-handling bug** — not specific
+to SIF RPC, CD loading, or any one subsystem — and it's the thing actually capping how much real
+code can run before things fall over, regardless of which path gets there.
 
 **Honest state at the end of this session**: the real IOP-side service layer is already built and
-was never the gap. What's actually blocking further progress is a genuinely deep chain within the
-game's own real CRT0/thread-startup path — a main-thread-created semaphore nothing signals, and a
-main-thread copy loop that appears not to terminate — that would need substantially more tracing to
-fully resolve, each layer no shallower than the last few uncovered today. Not a "build a new
-subsystem" task after all; more tracing of the same kind that produced today's four fixes, just
-several layers deeper than any of them individually were.
+was never the gap. What's actually blocking further progress on this specific experiment is the
+same general exception-vector livelock already flagged (but not yet root-caused) earlier in this
+document — recurring here as independent confirmation that it's a real, general bug worth
+prioritizing, not an artifact of the `--no-assist` test specifically. Next session's most
+leveraged target: root-cause *that* livelock (why do `s0`-`s3`/`ra` end up holding literal string
+bytes, and why does the exception vector then get entered in an unbreakable cycle) using the same
+`--track-writers`/`--trace-threads` tooling built today — solving it would very plausibly unblock
+both the SIF-worker-thread deadlock and whatever's beyond it, in one shot, rather than needing
+one force-call per gap the way today's four fixes did.
 
 ---
 
