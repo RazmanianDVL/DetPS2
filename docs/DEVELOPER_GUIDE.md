@@ -1504,6 +1504,88 @@ temporary real-CRT0-redirect testbed, reverted via `git checkout --` before any 
 every prior entry in this section. Full smoke suite green. No source changes this entry — read-only
 investigation plus this write-up.
 
+**Follow-up (2026-07-26) — took the previous entry's own "concrete next step" and found the actual
+common gate: both traced chains converge on a single per-player-object constructor, meaning
+`SifBindRpc` is legitimately match-start-gated, not boot-gated.** Picked this up exactly where it
+left off, using only the (pre-existing) `disasm` and `find-word` CLI modes — no execution/tracing
+needed for the static parts, since the ELF is fully resident in RDRAM right after `BootDiscFile`
+regardless of which boot path later executes it.
+
+First, a re-check worth recording: re-ran the two-wrapper-function hypothesis
+(`0x004842B0`/`0x00484E28`, the functions enclosing `0x4840CC`'s SIF-lib-internal bind) not just
+under the real-CRT0 testbed but also under the **plain default assisted-boot path** (no source
+edit at all — `blocker-trace user-media.json --cycles=150000000 --pcbreak=004842B0:00484F00`,
+which uses the committed `KickMidwayMainPath` fake-jump-to-main exactly as shipped). Zero hits
+across the full 150M-cycle run, with `px/gifPath3/dmac/syscalls` frozen at the exact baseline
+values the entire time. This matters because it rules out "the real-CRT0 testbed's own known
+brokenness (semaphore-3 deadlock, etc.) is why these sites look unreached" — they're equally
+unreached under the actually-best-performing, committed boot path.
+
+Then traced two of the 14 call sites' full static caller chains by hand, walking one level at a
+time: disassemble backward from each call site to find its enclosing function's prologue, compute
+that function's `jal` encoding (`0x0C000000 | (entry>>2)`), `find-word`-scan `0x100000`-`0x700000`
+for it, repeat on whatever calls that.
+
+- **`padOpen` chain** (`0x2062CC`/`0x206320`, already known from the previous entry to be a real
+  pad1/pad2 bind): `0x00206268` (the enclosing function) has exactly **one** static caller in the
+  whole binary, `0x002129A8`. That function (entry `0x00212990`) also has exactly one caller,
+  `0x002C6560`. That function (entry `0x00212990`'s caller's enclosing function, entry `0x002C6520`)
+  gates the whole thing on `lw v0,12(s3); beq v0,1,skip` — a plain "already initialized" flag check
+  on an object pointed to by its own first argument — and has exactly one caller: `0x002F7F84`.
+- **PS2RNA Midway-audio chain** (a previously-undocumented pair of real bind sites found while
+  disassembling the `0x462xxx` cluster: `0x00462790` binds service ID `0x534E4446` = ASCII `"SNDF"`,
+  and `0x00462804` binds `0x53465356`, both immediately preceded by `jal 0x00482E98` — the same
+  `sceSifInitRpc`-looking call `0x00484010`'s wrapper opens with — confirming these are genuine,
+  well-formed `sceSifBindRpc` calls for Midway's PS2RNA audio middleware, not padding): the
+  enclosing function `0x00462740` has exactly one caller, `0x00271534`. Its enclosing function
+  (`0x00271478`) has exactly one caller, `0x0037B500`. Its enclosing function (`0x0037B4F0`, a thin
+  one-argument trampoline) has exactly one caller: **`0x002F7FD0`** — 76 bytes from the pad chain's
+  `0x002F7F84`, i.e. **the same enclosing function**.
+
+**Both of the two fully-traced SifBindRpc call chains — one for controller ports, one for Midway's
+own licensed audio middleware — bottom out in the same single function.** Given it opens a
+player's pad AND binds that player's audio channel a few instructions apart, this is almost
+certainly a per-player (or per-match-participant) object constructor, called once when a player
+actually joins/starts a match — not boot-time code at all. This reframes the entire "why does the
+game never call real `SifBindRpc`" question from a mystery into an answered one: **it doesn't call
+it during boot because on real hardware it isn't supposed to** — PS2 games commonly bind
+controller/audio RPC ports per-match rather than at cold boot, and Shaolin Monks is simply doing
+that. Chasing SIF-init flags, IOP acks, or interrupt/DMAC handler registration as "the reason bind
+never fires" was the wrong frame; nothing needs to be fixed in the SIF layer itself to explain this
+absence.
+
+**Ruled out as a distraction:** a third caller into the general SIF-lib bind wrapper (`0x00484010`,
+reached from `0x00211784` with `a1=1`) traces back to a small helper (entry `0x00211718`) that
+checks a verbosity/debug flag before formatting a message — this is the assert/debug-print
+subsystem (the same one behind the already-documented PS2RNA fault-watchdog and
+`"assertion \"%s\" failed..."` format string), lazily binding a debug/Deci2 SIF channel on first
+use. It being unreached is expected and correct for a clean run with no assertions firing; it is
+not evidence of anything broken.
+
+**This does not mean the SIF/gameplay wall is solved — it relocates it.** The real remaining
+question is one level up: what needs to happen for the emulator to progress from where
+`MidwayBootAssist.MaybePostLogoAdvance` currently resumes real execution
+(`EE.PC = 0x00213218`, "after the dual wait loops... into main's later setup (pad/threads/movies)"
+per that method's own comment — i.e. genuine compiled code does keep running from there) all the
+way through attract-mode/menu/character-select into an actual match start, which is what would
+naturally trigger the per-player constructor found above. That is a large, multi-system piece of
+work (real menu-state-machine progression, plausibly synthesized pad input to navigate it), not a
+targeted flag flip, and was explicitly **not attempted** this entry — per this file's own
+conventions, synthesizing a fake call directly into the per-player constructor without first
+understanding what player/character/match state it assumes already exists would be exactly the
+speculative, unverified-fix pattern to avoid. **Concrete next step, if picked up:** trace what
+happens after `PC=0x00213218` under the default assisted-boot path — does execution reach a
+recognizable menu/attract-mode loop, and if so, is there a single global (a `GameState`-style enum,
+an "insert coin"/attract-mode timer, a "start pressed" flag) whose value gates leaving it? That
+would be the next target for a `MaybeStartLogo`-style unstick.
+
+No source changes this entry — read-only static analysis (no execution needed beyond one
+150M-cycle `blocker-trace` re-check under the plain default boot path, no CRT0-redirect edit
+required for the disassembly/`find-word` work). Verified neutral: default assisted-boot baseline
+unchanged (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`). Full smoke suite green
+(`dotnet run --project Tests/DetPS2.Tests.csproj -c Release` — note this project is a console app,
+not an SDK test project, so `dotnet test` builds it but silently runs nothing; use `dotnet run`).
+
 ---
 
 ## 8. Save states & determinism contracts
