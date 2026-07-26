@@ -623,19 +623,56 @@ speed problem, it's a permanent, well-formed deadlock:
    functions (semaphore/heap/module-table setup) that were spot-checked and don't write
    `pkt_table_len` either, though not every instruction of all seven has been read line-by-line.
 
-**So the honest open question is now narrow and concrete**: on real hardware this exact
-compiled binary doesn't deadlock here, so *something* makes `pkt_table_len` nonzero (or makes
-the first bind succeed some other way) before this constructor runs — and it is not any of the
-five now-identified call sites, not CRT0's dispatcher's obvious candidates, and not static ELF
-data. Candidates worth checking next: (a) full instruction-level read of all seven
-`0x00486228` subsystem-init callees (three of the eight found were only skimmed), in case one
-writes `rpc_data+8` via inlined stores rather than a call to the `sceSifInitRpc` symbol; (b) the
-possibility that this specific compiled function's `pkt_table_len` gate isn't actually gating on
-initialization-not-yet-run, but on a *different* precondition our struct-offset mapping has
-subtly wrong; (c) IOP-side timing/module-preload behavior real hardware provides that isn't
-reproduced here. This is now a well-scoped, disprovable hypothesis-testing task rather than an
-open-ended "why is this slow" question. `Cdvd.SectorsRead == 0` for 400M+ cycles straight and the
-empty object-list loop (§7.4 "Bug C") remain very likely downstream symptoms of this same gap.
+**FIXED (2026-07-25) — root cause was `ReferThreadStatus` (EE syscall `0x30`), a no-op stub.**
+Following the `0x00486228` CRT0 dispatcher lead: one of its seven subsystem-init calls
+(`0x00480AF0`) creates a second EE thread (`CreateThread`, entry `0x00480A18` — deep in the
+SIF-RPC library, almost certainly the real ps2sdk SIF-command dispatch/completion thread that
+`sceSifInitRpc` sets up) but does **not** start it directly. Instead, the very next function in
+that same init sequence (`0x00480D80`) immediately calls `ReferThreadStatus(id=2, &statusBuf)`
+and checks `statusBuf.status == THS_DORMANT (0x10)` — the correct, expected state for a thread
+that's been `CreateThread`'d but not yet `StartThread`'d — before it will proceed to actually
+call `StartThread` (`0x00480EA0`). Confirmed directly via `--pcbreak=480DA8`: `v1=0x0` (the value
+read back from the status buffer) never equals `v0=0x10`, so the game's own defensive check
+fails and takes the early-exit path, **permanently skipping `StartThread`** — our `SonyKernelHle`
+implementation of `ReferThreadStatus` was `result = 0; break;` with no write to the caller's
+buffer at all, so the check was reading uninitialized stack, not real thread state.
+
+Fixed in `SonyKernelHle.ReferThreadStatus` (new method): looks up the real `Thread` record and
+writes a proper `ee_thread_status_t` (`status`/`func`/`stack`/`stack_size`/`gp_reg`) to the
+caller's buffer, deriving `status` from the thread's actual `Started`/`Sleeping`/current-thread
+state (`DORMANT`/`RUN`/`WAIT`/`READY`). `KernelHle.Thread` gained a `StackSize` field and
+`CreateThread` an optional `stackSize` parameter so this has real data to report. This is a
+general engine fix, not a per-title assist — it corrects an unimplemented BIOS/kernel syscall to
+match real PS2 semantics, and any other title relying on this same pattern (very common:
+`CreateThread` → `ReferThreadStatus` sanity check → `StartThread`) benefits automatically.
+
+**Effect, verified**: with this fix and *no* `MidwayBootAssist` hacks active (`--no-assist`),
+`StartThread` now fires, `pkt_table_len` becomes reachable, and the padbind constructor's
+infinite retry loop (§7.4 above) is broken — PC moves from the permanently-frozen `0x2062B4` to
+deep, previously-unreached game code (`0x00959AE4`+ by `cyc=2,000,000`, vs. never leaving the
+`0x2062xx`/`0x483xxx` region before). Full smoke suite still green (no regression to the
+already-working assisted boot or anything else).
+
+**New blocker exposed (not yet fixed) — a wild jump into empty memory.** Around `cyc=1,381,616`
+execution starts fetching from a long stretch of zero-filled BSS as if it were code (harmless,
+since a zero word decodes as `nop`), drifting **forward in a straight line with no taken
+branches** for thousands of instructions (confirmed via `--trace-window`: PCs from `0x00723924`
+through past `0x007273B0` in one 4,000-cycle window, monotonically increasing, no loops).
+Whenever it crosses a stray non-zero byte it decodes as an unknown opcode, traps to the real EE
+exception vector (`0x80000200`, itself correctly implemented and executing real BIOS-style
+`mfc0`/`andi`/`eret` code — confirmed 63 exception entries in that same window), and `eret`
+resumes the same forward drift. This never self-corrects. The likely cause is a single bad
+`jr`/`jalr` (register-indirect jump/return) to a garbage or uninitialized address, taken once,
+well before `cyc≈1,381,616` — `--trace-window`'s output is sorted by address, not execution
+order, so pinpointing the exact originating jump needs either a much wider window read
+chronologically (the tracer itself doesn't currently expose ordering) or a `--pcbreak` bisection
+similar to the one that found the `main()`→ctor-table call chain in the finding above. Given how
+much *further* the boot now gets before failing, this is very likely a distinct, previously
+unreachable bug — not a consequence of the `ReferThreadStatus` fix's own correctness (which is
+straightforward and well-evidenced) — but that hasn't been proven yet and is the natural next
+thing to check (e.g. does disabling the newly-started SIF thread change where this occurs?).
+`Cdvd.SectorsRead == 0` and the empty object-list loop (§7.4 "Bug C") should be re-checked against
+this new, much-further boot state rather than assumed still relevant.
 
 ---
 

@@ -223,8 +223,8 @@ public sealed class SonyKernelHle
             case 0x2F: // GetThreadId
                 result = _kernel.CurrentThreadId;
                 break;
-            case 0x30: // ReferThreadStatus
-                result = 0;
+            case 0x30: // ReferThreadStatus(id, ee_thread_status_t* out)
+                result = ReferThreadStatus((int)a0, a1);
                 break;
             case 0x32: // SleepThread — switch to another runnable thread
                 _kernel.SleepThread();
@@ -641,6 +641,39 @@ public sealed class SonyKernelHle
     public uint LastCreatedThreadEntry { get; private set; }
     public uint LastCreatedThreadStack { get; private set; }
 
+    // ps2sdk ee_thread_status_t (36B): +0 status, +4 func, +8 stack, +C stack_size,
+    // +10 gp_reg, +14 initial_priority, +18 current_priority, +1C attr, +20 option.
+    // Real status bitmask (ee/kernel/include/kernel.h): RUN=0x01 READY=0x02 WAIT=0x04
+    // SUSPEND=0x08 DORMANT=0x10. Confirmed load-bearing: MK Shaolin Monks' own boot
+    // creates a worker thread (entry deep in the SIF-RPC library, likely the SIF command
+    // dispatch thread sceSifInitRpc sets up) then immediately calls ReferThreadStatus on
+    // it expecting DORMANT (0x10, "created but not started") before it will call
+    // StartThread — since this syscall used to be a no-op stub, that check always read
+    // stack garbage, took the game's own defensive error path, and StartThread was never
+    // called at all, permanently starving whatever that thread was meant to set up.
+    private int ReferThreadStatus(int id, uint statusAddr)
+    {
+        var t = _kernel.GetThread(id);
+        if (t == null) return -1;
+        uint status = !t.Started ? 0x10u
+            : id == _kernel.CurrentThreadId ? 0x01u
+            : t.Sleeping ? 0x04u
+            : 0x02u;
+        if (statusAddr != 0)
+        {
+            _system.Memory.Write32(statusAddr + 0, status);
+            _system.Memory.Write32(statusAddr + 4, t.Entry);
+            _system.Memory.Write32(statusAddr + 8, t.Stack);
+            _system.Memory.Write32(statusAddr + 12, t.StackSize);
+            _system.Memory.Write32(statusAddr + 16, t.Gp);
+            _system.Memory.Write32(statusAddr + 20, 0);
+            _system.Memory.Write32(statusAddr + 24, 0);
+            _system.Memory.Write32(statusAddr + 28, 0);
+            _system.Memory.Write32(statusAddr + 32, 0);
+        }
+        return 0;
+    }
+
     private int CreateThreadFromStruct(uint addr)
     {
         // ps2sdk ee_thread_t:
@@ -675,7 +708,7 @@ public sealed class SonyKernelHle
             sp = stack & ~0xFu;
         LastCreatedThreadEntry = func;
         LastCreatedThreadStack = sp;
-        return _kernel.CreateThread(func, gp, sp);
+        return _kernel.CreateThread(func, gp, sp, stackSize);
     }
 
     private int CreateSemaFromStruct(uint addr)

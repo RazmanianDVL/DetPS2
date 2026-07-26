@@ -188,6 +188,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             }
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
+        Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
         if (traceSys.Hle.Sony != null)
         {
             Console.WriteLine("  top syscalls:");
@@ -434,6 +435,39 @@ if (args.Length > 0 && args[0].Equals("find-word", StringComparison.OrdinalIgnor
 // detps2 disasm <media.json> <cycles> <addr>:<len> [titleIndex] — boot, run N cycles, then
 // disassemble a raw address range with EeDisassembler. Standalone tool for reading real-boot
 // code without going through blocker-trace's fuller (and slower) telemetry/tracer machinery.
+if (args.Length > 0 && args[0].Equals("scanmasked", StringComparison.OrdinalIgnoreCase))
+{
+    // Masked word scan — like scanword but ignores bits covered by 0-bits in <maskHex>.
+    // Useful for finding an instruction shape regardless of a specific register operand,
+    // e.g. "lui $any, 0x78" (pattern=0x3C000078, mask=0xFFE0FFFF ignores the rt field).
+    Console.WriteLine(VersionInfo.Banner);
+    if (args.Length < 6) { Console.WriteLine("usage: detps2 scanmasked <media.json> <patternHex> <maskHex> <startHex> <lenHex> [titleIndex]"); Environment.Exit(1); }
+    UserMediaConfig mcfg = UserMediaConfig.Load(args[1]);
+    uint mpattern = Convert.ToUInt32(args[2], 16);
+    uint mmask = Convert.ToUInt32(args[3], 16);
+    uint mstart = Convert.ToUInt32(args[4], 16);
+    uint mlen = Convert.ToUInt32(args[5], 16);
+    int mtitleIdx = args.Length > 6 && int.TryParse(args[6], out var mti) ? mti : 0;
+    if (mtitleIdx >= mcfg.Titles.Count) { Console.WriteLine("No such title index"); Environment.Exit(1); }
+    var mtitle = mcfg.Titles[mtitleIdx];
+    var msys = new Ps2System();
+    msys.LoadBios(mcfg.BiosPath!);
+    var mmsg = msys.BootDiscFile(mtitle.Path);
+    Console.WriteLine($"[{mtitle.Id}] {mmsg.Message}");
+    int mhits = 0;
+    for (uint addr = mstart; addr < mstart + mlen; addr += 4)
+    {
+        uint w = msys.Memory.Read32(addr);
+        if ((w & mmask) == mpattern)
+        {
+            Console.WriteLine($"  0x{addr:X8}: {w:X8}  {EeDisassembler.Disassemble(addr, w)}");
+            mhits++;
+        }
+    }
+    Console.WriteLine($"total matches: {mhits}");
+    Environment.Exit(0);
+}
+
 if (args.Length > 0 && args[0].Equals("scanword", StringComparison.OrdinalIgnoreCase))
 {
     // Finds every occurrence of a raw 32-bit word (e.g. a specific JAL encoding, to

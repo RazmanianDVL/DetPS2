@@ -20,6 +20,7 @@ public sealed class KernelState
         public uint Entry;
         public uint Gp;
         public uint Stack;
+        public uint StackSize;
         /// <summary>Saved PC when switched out (0 = never run / use Entry).</summary>
         public ulong SavedPc;
         public ulong SavedSp;
@@ -84,7 +85,7 @@ public sealed class KernelState
         _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0 });
     }
 
-    public int CreateThread(uint entry, uint gp, uint stack)
+    public int CreateThread(uint entry, uint gp, uint stack, uint stackSize = 0)
     {
         int id = ++_nextTid;
         _threads.Add(new Thread
@@ -96,6 +97,7 @@ public sealed class KernelState
             Entry = entry,
             Gp = gp,
             Stack = stack,
+            StackSize = stackSize,
             SavedPc = entry,
             SavedSp = stack,
             SavedGp = gp
