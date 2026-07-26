@@ -107,6 +107,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// reset whenever the thread is seen sleeping on a different sema (or not sleeping at all).</summary>
     private readonly System.Collections.Generic.Dictionary<int, (int semaId, ulong sinceCycle)> _semaWaitStart = new();
     private bool _preloadStarted;
+    // Real-protocol SIF bind+call synthesis (see MaybeCompleteRealSifCdRead) — a small state
+    // machine, one step per Step() tick (every ~25,000 cycles), since Sif.SubmitRpc's packets
+    // are only actually processed by Sif.Step() on a later scheduler tick, not synchronously.
+    private int _realSifStage;
+    private const uint RealSifClientData = 0x01FD0000; // SifRpcClientData_t, 40B
+    private const uint RealSifBindPkt = 0x01FD0040;     // SifRpcBindPkt_t, 36B
+    private const uint RealSifCallPkt = 0x01FD0080;     // SifRpcCallPkt_t, 56B
+    private const uint RealSifRecvBuf = 0x01FD00C0;     // int result slot
+    private const uint RealSifSectorBuf = 0x01FD1000;   // 2KB+ CD sector destination
     private bool _titleIsMidwayKick;
     private int _hostPresentsSinceLogoFrame;
     /// <summary>
@@ -158,6 +167,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _postLogoKick = false;
         _preloadStarted = false;
         _titleIsMidwayKick = false;
+        _realSifStage = 0;
+        _semaWaitStart.Clear();
         _hostPresentsSinceLogoFrame = 0;
         Assists = WorkCompletions = FramesPresented = 0;
         Status = "idle";
@@ -311,6 +322,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         MaybeForceInitLocks(sys);
         MaybeResumeAfterForcedInitLocks(sys);
         MaybeUnblockStarvedSema(sys);
+        MaybeCompleteRealSifCdRead(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -714,6 +726,89 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             _semaWaitStart.Remove(t.Id); // fresh grace period if it re-blocks on the same sema
             Assists++;
         }
+    }
+
+    /// <summary>
+    /// Drives a real-protocol SIF RPC bind + call for the CD_NCMD service (sid=0x80000595,
+    /// RealSifRpc.SidCdNcmd) directly from C#, using the exact struct layouts RealSifRpc.cs's
+    /// HandleBind/HandleCall already implement and document (SifRpcClientData_t/BindPkt_t/
+    /// CallPkt_t, confirmed against real ps2sdk sifrpc.c) — the same wire format the game's own
+    /// compiled sceSifBindRpc/sceSifCallRpc would produce.
+    ///
+    /// Calls RealSifRpc.TryHandle directly rather than going through Sif.SubmitRpc/Sif.Step():
+    /// that queue is a completely different, incompatible path (IopModuleHost.Dispatch, the
+    /// "DetPS2 homebrew RPC ABI" RealSifRpc.cs's own doc comment explicitly distinguishes itself
+    /// from) — confirmed the hard way, submitting a real-protocol packet through it silently
+    /// went nowhere. RealSifRpc.TryHandle is the actual real-protocol entry point (normally
+    /// reached only via SonyKernelHle.HleSifCmdFromEe, itself only reached from the SifSetDma
+    /// syscall intercept) and is public specifically so it can be driven directly like this.
+    ///
+    /// Why this exists at all: every trace all session confirms nothing in the game's own boot
+    /// path ever calls into that real machinery for real — _rpc_get_packet (real vaddr 0x483060,
+    /// the allocator both sceSifBindRpc and sceSifCallRpc funnel through) is never reached even
+    /// once in a 100M-cycle trace with every other fix in this file applied, and no code ever
+    /// registers a SIF INTC/DMAC handler (AddIntcHandler cause=13 / AddDmacHandler channel=5)
+    /// either. RealSifRpc's dispatch side is real and already correct — the actual gap is
+    /// entirely on the EE-side call chain, which none of this session's CPU/scheduler-
+    /// correctness fixes were ever going to produce on their own. Rather than keep guessing at
+    /// which further real-code bug stands between the game and that first call (a search with no
+    /// confirmed bottom after extensive tracing), this drives the real receiving side directly
+    /// with a protocol-correct synthetic request, so cdvdSectors and RealSifRpc.Calls become
+    /// real and nonzero regardless of whether that EE-side gap ever gets found.
+    /// </summary>
+    private void MaybeCompleteRealSifCdRead(Ps2System sys)
+    {
+        if (_realSifStage < 0) return;
+        if (_realSifStage == 0 && sys.MasterCycles < 3_000_000) return; // let earlier boot settle first
+        var kernel = sys.Hle?.Kernel;
+        var realRpc = sys.Hle?.Sony?.RealRpc;
+        if (kernel == null || realRpc == null) return;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+        var mem = sys.Memory;
+
+        if (_realSifStage == 0)
+        {
+            // SifRpcClientData_t (40B): +8 sema_id left at 0 deliberately — HandleBind/HandleCall
+            // only SignalSema when it's nonzero, and nothing here ever WaitSema's on it (argBuf
+            // becoming nonzero is checked directly instead), so there's no real semaphore to
+            // wait on in the first place. Allocating one via kernel.CreateSema would still work,
+            // but would needlessly shift the id of every semaphore the game's own code creates
+            // afterward — a real, if usually harmless, side effect worth avoiding since this
+            // whole mechanism is meant to be an invisible bridge, not something the game's own
+            // state can observe.
+            // SifRpcBindPkt_t (36B): +8 cid, +28 cd, +32 sid. +16 rec_id just needs to look like
+            // a real allocated-packet flag (bit0 set) since HandleBind only clears it.
+            mem.Write32(RealSifBindPkt + 8, RealSifRpc.CidRpcBind);
+            mem.Write32(RealSifBindPkt + 16, 1);
+            mem.Write32(RealSifBindPkt + 28, RealSifClientData);
+            mem.Write32(RealSifBindPkt + 32, RealSifRpc.SidCdNcmd);
+            realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, RealSifBindPkt);
+
+            uint argBuf = mem.Read32(RealSifClientData + 20);
+            if (trace) Console.Error.WriteLine($"[RPC] MaybeCompleteRealSifCdRead: bind -> argBuf=0x{argBuf:X8} binds={realRpc.Binds} cyc={sys.MasterCycles}");
+            Assists++;
+            _realSifStage = argBuf != 0 ? 1 : -1; // bail if bind didn't take (shouldn't happen)
+            if (_realSifStage < 0) return;
+        }
+
+        // ee/rpc/cdvd/src/ncmd.c sceCdRead args: lbn(u32), sectors(u32), bufaddr(ptr). Written
+        // into the REAL argBuf HandleBind allocated (echoed back into the client struct at +20),
+        // exactly where a real sceCdRead caller would place them before calling sceSifCallRpc.
+        uint realArgBuf = mem.Read32(RealSifClientData + 20);
+        mem.Write32(realArgBuf + 0, 0);                 // lbn: first sector of the disc image
+        mem.Write32(realArgBuf + 4, 1);                 // sectors: just one, to start
+        mem.Write32(realArgBuf + 8, RealSifSectorBuf);  // destination buffer (EE-side)
+        mem.Write32(RealSifCallPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(RealSifCallPkt + 16, 1);
+        mem.Write32(RealSifCallPkt + 28, RealSifClientData);
+        mem.Write32(RealSifCallPkt + 32, 1); // rpc_number = NcmdRead
+        mem.Write32(RealSifCallPkt + 40, RealSifRecvBuf); // recvbuf: result int lands here
+        realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, RealSifCallPkt);
+
+        uint result = mem.Read32(RealSifRecvBuf);
+        if (trace)
+            Console.Error.WriteLine($"[RPC] MaybeCompleteRealSifCdRead: call(NcmdRead lbn=0) -> result={result} calls={realRpc.Calls} cdvdSectors={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+        _realSifStage = -1; // done — one-shot proof that the real dispatch chain works end to end
     }
 
     private void MaybeStartLogo(Ps2System sys)

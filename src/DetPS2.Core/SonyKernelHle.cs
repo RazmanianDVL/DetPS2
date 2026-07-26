@@ -155,6 +155,8 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x10: // AddIntcHandler(cause, handler, next, arg, flag)
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_HANDLERS") == "1")
+                    Console.Error.WriteLine($"[ADDINTC] cause={a0} handler=0x{a1:X8}");
                 _intcHandlers[(int)a0] = a1;
                 result = (int)a0; // handler id
                 // KernelBootstrap deliberately leaves EE.TakeExceptions off after fast-boot
@@ -173,6 +175,8 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x12: // AddDmacHandler
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_HANDLERS") == "1")
+                    Console.Error.WriteLine($"[ADDDMAC] channel={a0} handler=0x{a1:X8}");
                 _dmacHandlers[(int)a0] = a1;
                 result = (int)a0;
                 break;
