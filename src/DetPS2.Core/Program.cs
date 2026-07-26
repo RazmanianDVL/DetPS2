@@ -409,6 +409,28 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
 
         foreach (var a in args)
         {
+            if (!a.StartsWith("--find-string=")) continue;
+            string needle = a.Substring("--find-string=".Length);
+            byte[] pat = System.Text.Encoding.ASCII.GetBytes(needle);
+            Console.WriteLine($"  find-string \"{needle}\" ({pat.Length} bytes) in RDRAM (0x00000000-0x01FFFFFF):");
+            int found = 0;
+            for (uint addr = 0; addr <= SystemMemory.RDRAM_SIZE - pat.Length && found < 100; addr++)
+            {
+                bool match = true;
+                for (int i = 0; i < pat.Length; i++)
+                    if (traceSys.Memory.Read8(addr + (uint)i) != pat[i]) { match = false; break; }
+                if (match)
+                {
+                    byte after = addr + (uint)pat.Length < SystemMemory.RDRAM_SIZE ? traceSys.Memory.Read8(addr + (uint)pat.Length) : (byte)0xFF;
+                    Console.WriteLine($"    0x{addr:X8} (next byte after match: 0x{after:X2})");
+                    found++;
+                }
+            }
+            if (found == 0) Console.WriteLine("    no match");
+        }
+
+        foreach (var a in args)
+        {
             if (!a.StartsWith("--trace-window=")) continue;
             ulong window = ulong.TryParse(a.AsSpan(15), out var w) ? w : 3000ul;
             bool chrono = args.Contains("--trace-chrono");

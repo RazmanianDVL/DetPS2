@@ -1394,7 +1394,22 @@ public sealed class EmotionEngine : ISchedulable
 
             // ---- 64-bit copy-mix ----
             case (14u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = b.Lo, Hi = a.Lo }); break; // PCPYLD
-            case (14u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = b.Hi, Hi = a.Hi }); break; // PCPYUD
+            // EXPERIMENT (2026-07-26): was Lo=b.Hi,Hi=a.Hi (mechanical "UD mirrors LD" symmetry
+            // with PCPYLD above, i.e. rd.Lo=rt.Hi/rd.Hi=rs.Hi). Testing rd.Lo=rs.Hi/rd.Hi=rt.Hi
+            // instead against a real, precisely-traced failure: the real library strcpy's
+            // hasless-zero-detection sequence (`psubb/pnor/pand/pand` -> v0, then
+            // `pcpyud a0,v0,t1` -> `or v1,v0,a0` -> `bne v1,zero,...`) needs a0.Lo to receive
+            // v0.Hi (the upper-half zero-detection result) so a scalar bne (which per real R5900
+            // semantics only ever examines the low 64 bits of a GPR) can see a zero byte that
+            // landed in the upper half of the 16-byte chunk. With the old assignment, a0.Lo got
+            // t1.Hi (raw source data) instead, which is generally not zero even when the byte
+            // data legitimately contains a null terminator there — so bne never fires, the loop
+            // never finds the terminator, and it walks off the end of the buffer indefinitely.
+            // Confirmed via `pcpyud a0, v0, t1` (rs=v0, rt=t1): with the old mapping,
+            // a0.Lo=t1.Hi=0 (irrelevant raw data) and a0.Hi=v0.Hi=0x8080808080808080 (the real
+            // detection signal, stuck where bne can't see it); with this mapping,
+            // a0.Lo=v0.Hi=0x8080808080808080 lands exactly where bne needs it.
+            case (14u << 6) | 0x29: SetGpr(rd, new Gpr128 { Lo = a.Hi, Hi = b.Hi }); break; // PCPYUD
 
             // ---- MMI1 (func=0x28) remaining entries ----
             case (1u << 6) | 0x28: // PABSW — operates on Rt, per-word signed abs with 0x80000000 clamp
