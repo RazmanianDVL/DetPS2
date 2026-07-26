@@ -984,6 +984,33 @@ unreachable one-time call, confirm via `scanword`/`--find-writer`/`--pcbreak` ex
 and why it's unreached, force-call it in the narrowest safe scope, verify zero regression before
 committing.
 
+**The `cyc≈97,888,448` overlay crash traces to the same root cause as the SIF-worker-thread
+deadlock — confirmed, not guessed.** The call into the broken `0x002022B0` slot is conditional on a
+global at `0x00584684` (`bne s0,zero,...` where `s0` is read from that address at function entry).
+`--find-writer=584684:4` across the full run: written exactly once, at `cyc=0` — meaning it's never
+touched by any real code, only by the ELF loader itself. Its ELF-compiled initial value is `1`, not
+`0` — this is a "needs (re)load" flag that starts dirty and is supposed to be cleared once whatever
+resource it guards has actually finished loading. `--find-writer=002022A0:40` on the slot itself:
+every word's last-writer is also `cyc=0` — genuinely never populated by anything. Both facts point
+the same way: the real load this flag is waiting on never happens, consistent with `cdvdSectors=0`
+holding at zero for the *entire* run (every trace this whole session, not just today) and with the
+confirmed-blocked SIF worker thread above. This isn't a second independent bug — it's the same
+"real IOP-side interaction never happens" gap, wearing a different face. Not a force-call target;
+force-calling the loader here would just be a second instance of trying to skip real hardware
+interaction the way the reverted CRT0 experiment did, and would need its own careful regression
+check the same way.
+
+**Where this leaves the investigation**: every currently-open thread (SIF-worker-thread deadlock,
+this overlay crash, and by extension `cdvdSectors=0` never moving in any trace all session) now
+traces to one well-evidenced, scoped root cause — real IOP-side SIF RPC / CD-streamed-module
+service handling doesn't exist. That's a genuine feature to build (real service dispatch for
+whatever SID(s) the game's RPC binds target, and/or real sector-read servicing that unblocks
+CD-dependent loads), not another one-function force-call. The four fixes above cleared out every
+gap that *was* reachable with that technique; what's left needs actual IOP-side implementation
+work. That's the honest state of the investigation at the end of this session's work — not a wall
+in the sense of "stuck," but a clear, evidence-backed handoff to what the next phase of work
+actually is.
+
 ---
 
 ## 8. Save states & determinism contracts
