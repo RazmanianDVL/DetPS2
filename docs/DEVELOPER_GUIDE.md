@@ -877,19 +877,67 @@ had time to complete) and the regression disappeared. **Verified**: zero `Unknow
 through the *entire* 30,000,000-cycle window (previously corrupted at `cyc≈29.77M`) — this specific
 bug is resolved. Full smoke suite green.
 
-**New frontier, not yet investigated: a genuine crash further out.** Pushing to 100M cycles: the
-same garbage-base-pointer shape recurs a third time around `cyc≈97.66M` (fresh addresses in the
-`0x18928xxx` range, same `0x00384980`-family pool code), and by `cyc=100,000,000` execution has
-gone fully off the rails — `PC=0xFFFFFFFFFFFFFFF4` (an invalid address, not a real jump target).
-`px`/`gifPath3`/`dmac`/`syscalls` stay completely frozen at their `cyc=5,000,000` values
-(`860160`/`1`/`4`/`41`) the entire way out to the crash — consistent with the already-documented
-"Bug C" (frame loop runs, produces no new GS/DMA activity) still being in effect, now with a harder
-failure at the far end instead of an infinite idle. Given the pattern (recurring instances of the
-same "null/garbage base pointer" shape, each traceable to a specific missing one-time init call)
-has held for three fixes running, the crash at `cyc≈97.66M` is a reasonable next target — same
-methodology: `--pcbreak` at the first corrupted PC, trace the bad register back to its source,
-`scanmasked`/`scanword` for the real writer, check whether it's unreachable the same way. Not yet
-started.
+**Correction (2026-07-26) — the cyc≈97.66M "corruption" above was a false lead, not a bug.**
+Pushing to 100M cycles initially looked like a fourth instance of the same garbage-pointer shape
+(fresh addresses in the `0x18928xxx`/`0x1Axxxxxx`/`0x12Dxxxxx` range, same `0x00384980`-family pool
+code). But the *same* pattern was found recurring continuously for dozens of unrelated slots across
+the whole run, not just one — which matches this file's own earlier "investigated and ruled out"
+note (§7.4, above): `MmioBus`'s unmapped-address fallback gives genuinely-unmapped addresses real
+write-then-read semantics, so this whole `0x10000000`-`0x1BFFFFFF` region round-trips correctly as
+an oversized pseudo-heap. Confirmed directly with the new `--find-writer` tool (see below): the one
+address chased in detail (`0x18928140`) turned out to be a **correctly-computed** pool-slot address
+whose fields were legitimately either untouched or written exactly once by real code — not
+corrupted at all. Don't re-chase this pattern; it's benign.
+
+**The real crash, found separately**: `PC=0xFFFFFFFFFFFFFFF4` at `cyc=100M` is the tail of a wild
+jump at `cyc≈97,888,448`, traced via binary search + `--trace-chrono` to a `jal 0x002022B0` from
+otherwise completely ordinary, correctly-compiled code at `0x002025E8`. `0x002022B0` decodes as
+nonsense (`sd zero,0(zero)`, `sllv zero,zero,v0`) — real ELF-file-backed data (confirmed within the
+PT_LOAD's file-backed range, not BSS), just not code, being executed as if it were a function. This
+is the signature of an overlay/dynamically-patched code slot that never got its real content
+written at runtime. Not yet confirmed why.
+
+**New diagnostics built same day, specifically to stop misattributing findings** (two false leads
+in a row — a bogus "material stack corruption" theory built by conflating two unrelated calls to
+the same shared `strcpy`, on top of the pseudo-heap false lead above — made clear that raw
+`--pcbreak`/`--trace-chrono` tracing alone wasn't enough):
+  - **`SystemMemory.LastWriterLog`** (`--track-writers`, `--find-writer=ADDR[:LEN]`,
+    `--find-value=VAL[:MASK]`) — a live "who last wrote this address" / "which address holds this
+    value" index, hooked into `Write32` and (after an initial gap was found and fixed) `Write8`/`SH`
+    too. Answers questions `--watch` structurally can't, since `--watch` requires knowing the
+    target address *before* it's written — useless when the corrupted address is itself computed
+    at runtime.
+  - **`KernelState.ThreadLog`** (`--trace-threads`, `--thread-at=CYCLE`) — a chronological log of
+    every thread lifecycle/switch event (Create/Start/Delete/SaveOut/SwitchTo/PreemptOut/PreemptIn),
+    each stamped with cycle/tid/pc/sp. Answers "which logical thread was actually active at cycle
+    N" directly instead of re-deriving it from call-chain guesswork.
+
+**Used immediately, with a decisive result: zero threads have ever been created, in any trace, all
+session.** `--thread-at` on the `cyc=1,500,000` "material"-garbage observation (see the
+`MaybeForceSifInit` trace above) shows only the initial `MainReset` event — no `Create`/`Start`/
+`SwitchTo`/`Preempt` event exists anywhere before it, confirmed across the *entire* 97.8M-cycle run,
+not just that one moment. This rules out "wrong thread's context got restored" as an explanation
+for anything observed today, and independently explains a fact visible in every trace all
+session but never investigated: `lastCreatedThread: entry=0x00000000` never changes.
+
+**Directly relevant to scoping the SIF RPC fix.** Fixed the syscall histogram's dead `>100` print
+threshold (useless on a 41-total-syscall run) to always show the top 30, which surfaced: `0x42`
+(SignalSema) and `0x44` (WaitSema) are called 6 times each, but `0x40` (CreateSema) is **never**
+called. Traced to `SonyKernelHle.cs`'s `case 0x44`: a documented "auto-create missing semas" safety
+net silently creates any semaphore `WaitSema` is called on but doesn't yet exist — **with initial
+count 0**. The chain this produces: `WaitSema` on a freshly auto-created, empty semaphore blocks
+immediately → looks for another thread to switch to → finds none (thread creation never succeeds,
+per the finding above) → falls back to "park until VBlank, then fabricate a signal" (a real,
+existing code path a few lines further in the same function). That fabricated-signal fallback keeps
+the boot from hanging outright, but is a synthetic stand-in for real synchronization, not evidence
+that whatever the real `CreateSema`/thread-start sequence was supposed to accomplish actually
+happened. **Not yet fixed** — the concrete next step is finding what *should* call the real
+`CreateSema` (syscall `0x40`) for this specific semaphore and why it's unreached, using the same
+`scanword`/reachability technique that found and fixed the manager-init gap above; it may turn out
+to be the same "`main()`'s own linear init sequence never gets reached" root cause wearing a third
+face, or a genuinely separate gap. Given the pattern (three real fixes today, each "a specific
+one-time call site is unreachable from the fast-boot path"), that's the leading hypothesis but is
+**not confirmed**.
 
 ---
 

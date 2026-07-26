@@ -297,9 +297,11 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         if (traceSys.Hle.Sony != null)
         {
             Console.WriteLine("  top syscalls:");
-            foreach (var kv in traceSys.Hle.Sony.SyscallHistogram)
-                if (kv.Value > 100)
-                    Console.WriteLine($"    0x{kv.Key:X2} x{kv.Value}");
+            // >100 hides everything on a low-syscall-count run (e.g. 41 total) where every
+            // individual number is well under that threshold but still the whole story —
+            // show the top 30 by count unconditionally, high-frequency ones are still first.
+            foreach (var kv in traceSys.Hle.Sony.SyscallHistogram.OrderByDescending(k => k.Value).Take(30))
+                Console.WriteLine($"    0x{kv.Key:X2} x{kv.Value}");
             var rpc = traceSys.Hle.Sony.RealRpc;
             Console.WriteLine($"  RealSifRpc: binds={rpc.Binds} calls={rpc.Calls} unknownServiceCalls={rpc.UnknownServiceCalls} unknownBindSids={rpc.UnknownBindSids}");
             foreach (var sid in rpc.UnknownSidsSeen)
