@@ -139,11 +139,32 @@ public sealed class SystemMemory
     public static readonly List<(ulong Pc, ulong Vaddr, uint Value, bool IsWrite)> WatchHits = new();
     public static ulong CurrentPcForWatch;
 
+    /// <summary>Diagnostic-only: when true, every 32-bit-aligned RDRAM write overwrites its slot
+    /// in <see cref="LastWriterLog"/> with (cycle, pc, value) — a live "who last touched this
+    /// address" index, queryable at any point (typically after the run, once a corrupted value
+    /// has been found) without needing to have set --watch on that exact address in advance.
+    /// Built specifically because --watch requires knowing the target address before it's
+    /// written, which doesn't work for tracing corruption whose destination address is itself
+    /// computed at runtime (see DEVELOPER_GUIDE.md §7.4, the cyc≈97.66M lead). Off by default —
+    /// a dictionary write per store is not free — opt-in via blocker-trace --track-writers.</summary>
+    public static bool TrackLastWriter;
+    public static readonly Dictionary<uint, (ulong Cycle, ulong Pc, uint Value)> LastWriterLog = new();
+    public static ulong CurrentCycleForWriterLog;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void NoteLastWriter(ulong vaddr, uint value)
+    {
+        if (!TrackLastWriter) return;
+        uint key = (uint)(vaddr & 0xFFFFFFFCUL);
+        LastWriterLog[key] = (CurrentCycleForWriterLog, CurrentPcForWatch, value);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write32(ulong vaddr, uint value)
     {
         if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
             WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
+        NoteLastWriter(vaddr, value);
         if (IsScratchpad(vaddr))
         {
             int off = (int)((vaddr - SPR_BASE) & (SPR_SIZE - 1));

@@ -163,12 +163,28 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
     if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;
     if (args.Contains("--no-auto-complete")) Ps2System.DisableAutoCompleteWorkItems = true;
+    // --track-writers + --find-writer=ADDR[:LEN]: a retroactive "who last wrote this address"
+    // index (see SystemMemory.LastWriterLog's own doc comment) — for tracing a corrupted value
+    // back to its source when you don't know the destination address until AFTER it's already
+    // been written (--watch requires knowing it in advance; this doesn't).
+    if (args.Contains("--track-writers")) SystemMemory.TrackLastWriter = true;
+    var findWriterRanges = new List<(uint start, uint len)>();
+    foreach (var a in args)
+        if (a.StartsWith("--find-writer="))
+        {
+            var parts = a.Substring(14).Split(':');
+            uint fwStart = Convert.ToUInt32(parts[0], 16);
+            uint fwLen = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 4u;
+            findWriterRanges.Add((fwStart, fwLen));
+            SystemMemory.TrackLastWriter = true; // implied
+        }
 
     if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
     foreach (var title in cfg.Titles)
     {
         if (!title.Exists) { Console.WriteLine($"[{title.Id}] missing: {title.Path}"); continue; }
         SystemMemory.WatchHits.Clear();
+        SystemMemory.LastWriterLog.Clear();
         var traceSys = new Ps2System();
         traceSys.Telemetry.Reset();
         traceSys.LoadBios(cfg.BiosPath);
@@ -201,6 +217,21 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             {
                 string kind = isWrite ? $"WROTE 0x{wval:X8}" : "READ ";
                 Console.WriteLine($"    pc=0x{wpc:X8} {kind} 0x{wvaddr:X8}  {EeDisassembler.Disassemble((uint)wpc, traceSys.Memory.Read32((uint)wpc))}");
+            }
+        }
+        if (findWriterRanges.Count > 0)
+        {
+            Console.WriteLine($"  last-writer log: {SystemMemory.LastWriterLog.Count} distinct address(es) tracked");
+            foreach (var (fwStart, fwLen) in findWriterRanges)
+            {
+                Console.WriteLine($"  find-writer 0x{fwStart:X8}..0x{fwStart + fwLen:X8}:");
+                for (uint addr = fwStart & ~3u; addr < fwStart + fwLen; addr += 4)
+                {
+                    if (SystemMemory.LastWriterLog.TryGetValue(addr, out var w))
+                        Console.WriteLine($"    0x{addr:X8}: last written at cyc={w.Cycle} pc=0x{w.Pc:X8} value=0x{w.Value:X8}  {EeDisassembler.Disassemble((uint)w.Pc, traceSys.Memory.Read32((uint)w.Pc))}");
+                    else
+                        Console.WriteLine($"    0x{addr:X8}: NEVER WRITTEN (current value=0x{traceSys.Memory.Read32(addr):X8})");
+                }
             }
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
