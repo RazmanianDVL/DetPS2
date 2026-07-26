@@ -69,6 +69,26 @@ public sealed class KernelState
     public int ThreadCount => _threads.Count;
     public int CurrentThreadId => _currentTid;
 
+    /// <summary>Diagnostic-only: a chronological log of every thread lifecycle/switch event —
+    /// built specifically to stop misattributing a register/stack observation at some cycle to
+    /// the wrong logical thread (the actual root cause of several false leads while tracing MK
+    /// Shaolin Monks on 2026-07-26 — see DEVELOPER_GUIDE.md §7.4). Given ONLY a raw PC trace, two
+    /// completely unrelated calls into the same shared library function are indistinguishable
+    /// from one continuous call; this answers "which thread, with what stack/entry, was actually
+    /// active at cycle N" directly, without re-deriving it from call-chain guesswork. Off by
+    /// default; opt-in via blocker-trace --trace-threads. EmotionEngine.Step() stamps
+    /// CurrentCycle before every instruction when this is on (see its own call site).</summary>
+    public static bool TraceThreads;
+    public static ulong CurrentCycle;
+    public readonly record struct ThreadEvent(ulong Cycle, string Kind, int ThreadId, ulong Pc, ulong Sp, string Detail);
+    public static readonly List<ThreadEvent> ThreadLog = new();
+
+    private void LogThreadEvent(string kind, int tid, ulong pc, ulong sp, string detail = "")
+    {
+        if (!TraceThreads) return;
+        ThreadLog.Add(new ThreadEvent(CurrentCycle, kind, tid, pc, sp, detail));
+    }
+
     public void Reset()
     {
         _threads.Clear();
@@ -83,6 +103,7 @@ public sealed class KernelState
         _cyclesSinceLastPreempt = 0;
         // Main thread — already running
         _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0 });
+        LogThreadEvent("MainReset", 1, 0, 0);
     }
 
     public int CreateThread(uint entry, uint gp, uint stack, uint stackSize = 0)
@@ -102,6 +123,7 @@ public sealed class KernelState
             SavedSp = stack,
             SavedGp = gp
         });
+        LogThreadEvent("Create", id, entry, stack, $"gp=0x{gp:X8} stackSize=0x{stackSize:X}");
         return id;
     }
 
@@ -110,6 +132,7 @@ public sealed class KernelState
         var t = FindThread(id);
         if (t == null) return -1;
         t.Alive = false;
+        LogThreadEvent("Delete", id, t.SavedPc, t.SavedSp);
         return 0;
     }
 
@@ -125,6 +148,7 @@ public sealed class KernelState
         t.SavedPc = t.Entry;
         if (t.SavedSp == 0)
             t.SavedSp = t.Stack != 0 ? t.Stack : 0x01F00000u - (uint)(id * 0x10000);
+        LogThreadEvent("Start", id, t.SavedPc, t.SavedSp, $"arg=0x{arg:X}");
         return 0;
     }
 
@@ -204,6 +228,7 @@ public sealed class KernelState
         t.SavedS7 = ee.GetGpr(23).Lo;
         t.SavedS8 = ee.GetGpr(30).Lo;
         t.SavedFp = ee.GetGpr(30).Lo;
+        LogThreadEvent("SaveOut", _currentTid, t.SavedPc, t.SavedSp, fromSyscall ? "fromSyscall" : "cooperative");
     }
 
     /// <summary>Switch EE execution to thread id (assumes SaveCurrentContext already done if needed).</summary>
@@ -245,6 +270,7 @@ public sealed class KernelState
         }
         t.Sleeping = false;
         t.Started = true;
+        LogThreadEvent("SwitchTo", id, pc, t.SavedSp, fromSyscall ? "fromSyscall" : "cooperative");
         return true;
     }
 
@@ -306,6 +332,7 @@ public sealed class KernelState
             t.SavedGprFull[i] = ee.GetGpr(i).Lo;
         t.HasFullSave = true;
         t.SavedPc = ee.PC; // preempted mid-stream: resume at the exact interrupted PC
+        LogThreadEvent("PreemptOut", _currentTid, t.SavedPc, ee.GetGpr(29).Lo);
     }
 
     /// <summary>Restore every GPR saved by <see cref="SaveFullContext"/>, or fall back to the
@@ -324,6 +351,7 @@ public sealed class KernelState
             ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
         t.Sleeping = false;
         t.Started = true;
+        LogThreadEvent("PreemptIn", id, t.SavedPc, t.SavedGprFull[29]);
         return true;
     }
 

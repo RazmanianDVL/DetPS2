@@ -178,6 +178,33 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             findWriterRanges.Add((fwStart, fwLen));
             SystemMemory.TrackLastWriter = true; // implied
         }
+    // --find-value=VALHEX[:MASKHEX]: reverse lookup — which address(es) last held this exact
+    // (or masked-match) value, for when you have a corrupted register/pointer value but don't
+    // know which memory address it was read from. Complements --find-writer (address -> writer).
+    var findValues = new List<(uint value, uint mask)>();
+    foreach (var a in args)
+        if (a.StartsWith("--find-value="))
+        {
+            var parts = a.Substring(13).Split(':');
+            uint fvVal = Convert.ToUInt32(parts[0], 16);
+            uint fvMask = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 0xFFFFFFFFu;
+            findValues.Add((fvVal, fvMask));
+            SystemMemory.TrackLastWriter = true; // implied
+        }
+    // --trace-threads: log every thread create/start/delete and every context switch (cooperative,
+    // syscall-boundary, or forced preemption) with (cycle, threadId, pc, sp) — see
+    // KernelState.ThreadLog's own doc comment for why this exists: a raw PC trace alone can't
+    // distinguish "two unrelated calls into the same shared function" from "one continuous call,"
+    // which is exactly what caused several false leads tracing MK Shaolin Monks. --thread-at=CYCLE
+    // answers "which thread was active at this cycle" directly instead of re-deriving it by hand.
+    if (args.Contains("--trace-threads")) KernelState.TraceThreads = true;
+    var threadAtCycles = new List<ulong>();
+    foreach (var a in args)
+        if (a.StartsWith("--thread-at=") && ulong.TryParse(a.AsSpan(12), out var tac))
+        {
+            threadAtCycles.Add(tac);
+            KernelState.TraceThreads = true; // implied
+        }
 
     if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
     foreach (var title in cfg.Titles)
@@ -185,6 +212,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         if (!title.Exists) { Console.WriteLine($"[{title.Id}] missing: {title.Path}"); continue; }
         SystemMemory.WatchHits.Clear();
         SystemMemory.LastWriterLog.Clear();
+        KernelState.ThreadLog.Clear();
         var traceSys = new Ps2System();
         traceSys.Telemetry.Reset();
         traceSys.LoadBios(cfg.BiosPath);
@@ -232,6 +260,36 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                     else
                         Console.WriteLine($"    0x{addr:X8}: NEVER WRITTEN (current value=0x{traceSys.Memory.Read32(addr):X8})");
                 }
+            }
+        }
+        foreach (var (fvVal, fvMask) in findValues)
+        {
+            Console.WriteLine($"  find-value 0x{fvVal:X8} mask=0x{fvMask:X8}:");
+            int fvHits = 0;
+            foreach (var kv in SystemMemory.LastWriterLog)
+            {
+                if ((kv.Value.Value & fvMask) != (fvVal & fvMask)) continue;
+                Console.WriteLine($"    addr=0x{kv.Key:X8} written at cyc={kv.Value.Cycle} pc=0x{kv.Value.Pc:X8} value=0x{kv.Value.Value:X8}  {EeDisassembler.Disassemble((uint)kv.Value.Pc, traceSys.Memory.Read32((uint)kv.Value.Pc))}");
+                if (++fvHits >= 50) { Console.WriteLine("    ...(truncated at 50)"); break; }
+            }
+            if (fvHits == 0) Console.WriteLine("    no address currently holds this value");
+        }
+        if (KernelState.TraceThreads)
+        {
+            Console.WriteLine($"  thread log: {KernelState.ThreadLog.Count} event(s)");
+            foreach (var ev in KernelState.ThreadLog)
+                Console.WriteLine($"    cyc={ev.Cycle,10} {ev.Kind,-10} tid={ev.ThreadId,3} pc=0x{ev.Pc:X8} sp=0x{ev.Sp:X8} {ev.Detail}");
+            foreach (var tac in threadAtCycles)
+            {
+                KernelState.ThreadEvent? last = null;
+                foreach (var ev in KernelState.ThreadLog)
+                {
+                    if (ev.Cycle > tac) break;
+                    last = ev;
+                }
+                Console.WriteLine(last.HasValue
+                    ? $"  thread-at cyc={tac}: most recent event was {last.Value.Kind} tid={last.Value.ThreadId} at cyc={last.Value.Cycle} pc=0x{last.Value.Pc:X8} sp=0x{last.Value.Sp:X8} {last.Value.Detail}"
+                    : $"  thread-at cyc={tac}: no thread event recorded before this cycle");
             }
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");

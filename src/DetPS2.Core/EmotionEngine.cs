@@ -380,6 +380,7 @@ public sealed class EmotionEngine : ISchedulable
                 SystemMemory.CurrentPcForWatch = (ulong)PC;
                 SystemMemory.CurrentCycleForWriterLog = cyc;
             }
+            if (KernelState.TraceThreads) KernelState.CurrentCycle = cyc;
             if (PcBreakGpr.HasValue && PC == PcBreakGpr.Value)
                 Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} " +
                     $"s0=0x{GetGpr(16).Lo:X} s1=0x{GetGpr(17).Lo:X} s2=0x{GetGpr(18).Lo:X} s3=0x{GetGpr(19).Lo:X} sp=0x{GetGpr(29).Lo:X} ra=0x{GetGpr(31).Lo:X} " +
