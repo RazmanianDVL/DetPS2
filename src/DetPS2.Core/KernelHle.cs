@@ -205,6 +205,7 @@ public sealed class KernelState
     }
 
     public Thread? GetThread(int id) => FindThread(id);
+    public IReadOnlyList<Thread> AllThreads => _threads;
 
     /// <summary>Save minimal context from EE into the current thread slot.</summary>
     /// <param name="fromSyscall">When true, resume at PC+4 (skip SYSCALL insn).</param>

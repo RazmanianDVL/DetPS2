@@ -102,6 +102,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong _lastAssistCycle;
     private int _spinHits;
     private bool _postLogoKick;
+    /// <summary>Tracks how long each (threadId, semaId) pair a thread is currently sleeping on
+    /// has been observed blocked, for <see cref="MaybeUnblockStarvedSema"/>. Keyed by thread id;
+    /// reset whenever the thread is seen sleeping on a different sema (or not sleeping at all).</summary>
+    private readonly System.Collections.Generic.Dictionary<int, (int semaId, ulong sinceCycle)> _semaWaitStart = new();
     private bool _preloadStarted;
     private bool _titleIsMidwayKick;
     private int _hostPresentsSinceLogoFrame;
@@ -306,6 +310,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         MaybeResumeAfterForcedManagerInit(sys);
         MaybeForceInitLocks(sys);
         MaybeResumeAfterForcedInitLocks(sys);
+        MaybeUnblockStarvedSema(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -662,6 +667,53 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _initLocksSavedGpr[i] });
         sys.LastGoodEePc = _initLocksSavedPc;
         _initLocksResumePending = false;
+    }
+
+    /// <summary>
+    /// Last-resort recovery for a real, legitimately-created semaphore that nothing ever
+    /// signals because the code that would signal it lives behind the still-unimplemented
+    /// real IOP-side SIF RPC handshake (see RealSifRpc.cs's own doc comments — binds/calls
+    /// stay 0 all session because the EE-side call chain that would exercise it is itself
+    /// unreachable). Confirmed via DETPS2_TRACE_RPC=1 on the real-CRT0-redirect experiment
+    /// (2026-07-26): the worker thread at entry 0x00480A18 blocks on sema id 3 — the third of
+    /// exactly three legitimate CreateSema calls this run, not an "auto-create missing sema"
+    /// artifact (that path only fires when WaitSema targets an id that doesn't exist yet; this
+    /// one already existed) — and nothing ever calls SignalSema(3) because the main thread
+    /// keeps running (SwitchToNext finds it runnable) without ever revisiting the worker.
+    ///
+    /// Unlike the other Maybe* helpers, this doesn't redirect execution anywhere or fake a
+    /// function's effect — it only flips a semaphore's count, exactly what a real signal would
+    /// do, after a generous cycle-based grace period (long enough that a thread merely blocked
+    /// on ordinary, soon-to-arrive work would have been signaled for real by then). Scoped to
+    /// MidwayBootAssist.Step, which already gates on SonyKernelMode, so this never touches
+    /// titles that aren't using the Sony kernel HLE path.
+    /// </summary>
+    private void MaybeUnblockStarvedSema(Ps2System sys)
+    {
+        const ulong graceCycles = 2_000_000;
+        var kernel = sys.Hle?.Kernel;
+        if (kernel == null) return;
+
+        foreach (var t in kernel.AllThreads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitSemaId == 0)
+            {
+                _semaWaitStart.Remove(t.Id);
+                continue;
+            }
+            if (!_semaWaitStart.TryGetValue(t.Id, out var w) || w.semaId != t.WaitSemaId)
+            {
+                _semaWaitStart[t.Id] = (t.WaitSemaId, sys.MasterCycles);
+                continue;
+            }
+            if (sys.MasterCycles - w.sinceCycle < graceCycles) continue;
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] force-unblocking starved sema={t.WaitSemaId} thread={t.Id} cyc={sys.MasterCycles}");
+            kernel.SignalSema(t.WaitSemaId);
+            _semaWaitStart.Remove(t.Id); // fresh grace period if it re-blocks on the same sema
+            Assists++;
+        }
     }
 
     private void MaybeStartLogo(Ps2System sys)
