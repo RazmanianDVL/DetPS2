@@ -797,7 +797,7 @@ public sealed class SonyKernelHle
                         int len = (int)(size - 0x0C);
                         var bytes = new byte[Math.Min(len, 256)];
                         for (int i = 0; i < bytes.Length; i++) bytes[i] = _system.Memory.Read8(dataAddr + 0x0C + (uint)i);
-                        Console.Error.WriteLine($"[DECI2] Send id={id}: {System.Text.Encoding.ASCII.GetString(bytes)}");
+                        Console.Error.WriteLine($"[DECI2] Send id={id} dataAddr=0x{dataAddr:X8} size=0x{size:X}: {System.Text.Encoding.ASCII.GetString(bytes)}");
                     }
                     _system.Memory.Write32(bufferAddr + 0x04, 0); // status0 = 0 (sent)
                 }
