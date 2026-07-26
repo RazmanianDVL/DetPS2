@@ -665,6 +665,7 @@ public static class SmokeTests
 
             // Phase 20
             Ee_MultuDivu_Dsll();
+            Ee_32BitOps_SignExtendAcrossBoundary();
             TitleCampaign_SyntheticPack();
 
             // Phase 21
@@ -2227,7 +2228,10 @@ public static class SmokeTests
     public static void Ee_MultuDivu_Dsll()
     {
         var sys = new Ps2System();
-        // MULTU: 0xFFFFFFFF * 2 = 0x1FFFFFFFE → LO=FFFFFFFE HI=1
+        // MULTU: 0xFFFFFFFF * 2 = 0x1FFFFFFFE → 32-bit halves LO=FFFFFFFE HI=1. Real MIPS64
+        // sign-extends BOTH halves into their 64-bit registers regardless of MULTU's multiply
+        // itself being unsigned (a real R-series quirk) — LO's low-32 pattern 0xFFFFFFFE has
+        // bit 31 set, so it sign-extends to 0xFFFFFFFFFFFFFFFE, not 0x00000000FFFFFFFE.
         sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFF });
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 2 });
         uint multu = (4u << 21) | (5u << 16) | 0x19; // multu rs,rt
@@ -2241,7 +2245,7 @@ public static class SmokeTests
         sys.Memory.Write32(0x00100008, mfhi);
         sys.EE.PC = 0x00100004;
         sys.EE.Step(2);
-        if (sys.EE.GetGpr(2).Lo != 0xFFFFFFFEUL) throw new Exception($"MULTU LO 0x{sys.EE.GetGpr(2).Lo:X}");
+        if (sys.EE.GetGpr(2).Lo != 0xFFFFFFFFFFFFFFFEUL) throw new Exception($"MULTU LO 0x{sys.EE.GetGpr(2).Lo:X}");
         if (sys.EE.GetGpr(3).Lo != 1UL) throw new Exception($"MULTU HI 0x{sys.EE.GetGpr(3).Lo:X}");
 
         // DIVU: 100 / 7
@@ -2265,6 +2269,77 @@ public static class SmokeTests
         if (sys.EE.GetGpr(2).Lo != 0x110UL) throw new Exception($"DSLL 0x{sys.EE.GetGpr(2).Lo:X}");
 
         Console.WriteLine("[Smoke] Ee_MultuDivu_Dsll OK");
+    }
+
+    /// <summary>Pins the fix for a whole class of bug found in the same investigation that
+    /// produced the LUI/LW sign-extension fixes above: every "32-bit" MIPS64/R5900 op
+    /// (ADD/ADDU/SUB/SUBU/ADDIU/SLL/SRL/SRA/(V) and MFC0/MFC1) must truncate its 32-bit
+    /// inputs, compute, then sign-extend the 32-bit RESULT into the 64-bit register — not
+    /// operate on/store the full 64-bit register value directly. Each case below is chosen to
+    /// cross the 32-bit sign boundary specifically, so a regression back to a raw 64-bit
+    /// op (or a zero-extending assignment) fails loudly instead of accidentally matching for
+    /// "clean" small-value test inputs.</summary>
+    public static void Ee_32BitOps_SignExtendAcrossBoundary()
+    {
+        var sys = new Ps2System();
+        uint pc = 0x00100000;
+        void Exec(uint opcode) { sys.Memory.Write32(pc, opcode); sys.EE.PC = pc; sys.EE.Step(1); pc += 4; }
+
+        // ADDU: 0x7FFFFFFF + 1 crosses into a 32-bit-negative result (0x80000000) — must
+        // sign-extend to 0xFFFFFFFF80000000, not zero-extend to 0x0000000080000000.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x7FFFFFFF });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 });
+        Exec((4u << 21) | (5u << 16) | (6u << 11) | 0x21); // addu $6, $4, $5
+        if (sys.EE.GetGpr(6).Lo != 0xFFFFFFFF80000000UL) throw new Exception($"ADDU 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // SUBU: 0x80000000 - 1 crosses back into positive (0x7FFFFFFF).
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x80000000 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 });
+        Exec((4u << 21) | (5u << 16) | (6u << 11) | 0x23); // subu $6, $4, $5
+        if (sys.EE.GetGpr(6).Lo != 0x000000007FFFFFFFUL) throw new Exception($"SUBU 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // ADDIU: same boundary as ADDU, via an immediate. This is the highest-impact case —
+        // ADDIU is among the most common instructions in any compiled MIPS binary.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x7FFFFFFF });
+        Exec((0x09u << 26) | (4u << 21) | (6u << 16) | 1); // addiu $6, $4, 1
+        if (sys.EE.GetGpr(6).Lo != 0xFFFFFFFF80000000UL) throw new Exception($"ADDIU 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // SLL: 1 << 31 produces a 32-bit-negative result from a positive input.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
+        Exec((4u << 16) | (6u << 11) | (31u << 6) | 0x00); // sll $6, $4, 31
+        if (sys.EE.GetGpr(6).Lo != 0xFFFFFFFF80000000UL) throw new Exception($"SLL 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // SRL: input register has dirty (non-sign-extended) upper 32 bits, matching what a
+        // buggy 64-bit-wide shift could have left behind. SRL must operate on (and reload from)
+        // only the low 32 bits: truncate 0x...FFFFFFFF to 0xFFFFFFFF, logical-shift right 4 =
+        // 0x0FFFFFFF (bit 31 now clear), sign-extends to itself since it's already positive.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFFFFFFFFFUL });
+        Exec((4u << 16) | (6u << 11) | (4u << 6) | 0x02); // srl $6, $4, 4
+        if (sys.EE.GetGpr(6).Lo != 0x000000000FFFFFFFUL) throw new Exception($"SRL 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // SRA: a clean sign-extended 32-bit-negative input must arithmetic-shift (replicating
+        // the sign bit) and remain sign-extended: 0x80000000 >> 4 (arithmetic) = 0xF8000000.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFF80000000UL });
+        Exec((4u << 16) | (6u << 11) | (4u << 6) | 0x03); // sra $6, $4, 4
+        if (sys.EE.GetGpr(6).Lo != 0xFFFFFFFFF8000000UL) throw new Exception($"SRA 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // MFC0: KSEG0 addresses (0x80000000+ — essentially all kernel/BIOS code, and every
+        // exception vector) have bit 31 set, so EPC after a real exception hits this constantly.
+        sys.EE.COP0_EPC = 0x80000180;
+        Exec((0x10u << 26) | (0x00u << 21) | (6u << 16) | (14u << 11)); // mfc0 $6, $14 (EPC)
+        if (sys.EE.GetGpr(6).Lo != 0xFFFFFFFF80000180UL) throw new Exception($"MFC0 0x{sys.EE.GetGpr(6).Lo:X}");
+
+        // MFC1: every negative float has IEEE754 bit 31 (the sign bit) set.
+        uint mtc1 = (0x11u << 26) | (0x04u << 21) | (4u << 16) | (0u << 11); // mtc1 $4, $f0
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = (uint)BitConverter.SingleToInt32Bits(-1.5f) });
+        Exec(mtc1);
+        uint mfc1 = (0x11u << 26) | (0x00u << 21) | (6u << 16) | (0u << 11); // mfc1 $6, $f0
+        Exec(mfc1);
+        uint expectedBits = (uint)BitConverter.SingleToInt32Bits(-1.5f);
+        ulong expected = unchecked((ulong)(long)(int)expectedBits);
+        if (sys.EE.GetGpr(6).Lo != expected) throw new Exception($"MFC1 0x{sys.EE.GetGpr(6).Lo:X} expected 0x{expected:X}");
+
+        Console.WriteLine("[Smoke] Ee_32BitOps_SignExtendAcrossBoundary OK");
     }
 
     public static void TitleCampaign_SyntheticPack()

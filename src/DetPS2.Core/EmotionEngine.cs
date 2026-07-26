@@ -622,14 +622,20 @@ public sealed class EmotionEngine : ISchedulable
 
         switch (function)
         {
-            case 0x00: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)sa }); break;
+            // SLL/SRL/SRA(V) are 32-bit MIPS ops: truncate rt to its low 32 bits, shift, then
+            // sign-extend the 32-bit RESULT into the 64-bit register — same class of bug as
+            // LUI/LW (see their comments). The old code shifted the full 64-bit register value
+            // directly with no truncation or result sign-extension, which is wrong whenever
+            // rt's upper 32 bits aren't a clean sign-extension of its low 32 (e.g. after any
+            // 64-bit D-op) and/or the 32-bit shift result has bit 31 set.
+            case 0x00: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)((int)GetGpr(rt).Lo << (int)sa)) }); break; // SLL
             case 0x01: break; // MOVCI / reserved — nop (seen in retail data-as-code fallthrough)
-            case 0x02: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)sa }); break;
-            case 0x03: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)sa) }); break;
+            case 0x02: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)GetGpr(rt).Lo >> (int)sa)) }); break; // SRL
+            case 0x03: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)((int)GetGpr(rt).Lo >> (int)sa)) }); break; // SRA
 
-            case 0x04: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo << (int)(GetGpr(rs).Lo & 0x1F) }); break;
-            case 0x06: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F) }); break;
-            case 0x07: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F)) }); break;
+            case 0x04: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)((int)GetGpr(rt).Lo << (int)(GetGpr(rs).Lo & 0x1F))) }); break; // SLLV
+            case 0x06: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F))) }); break; // SRLV
+            case 0x07: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)((int)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x1F))) }); break; // SRAV
 
             case 0x08: // JR — ignore jumps into low/vector page (uninitialized fptrs)
                 {
@@ -674,34 +680,38 @@ public sealed class EmotionEngine : ISchedulable
             case 0x12: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = LO }); break;
             case 0x13: LO = GetGpr(rs).Lo; break;
 
+            // MULT/MULTU/DIV/DIVU: real MIPS sign-extends BOTH LO and HI as independent 32-bit
+            // halves — including MULTU/DIVU, despite the multiply/divide itself being unsigned
+            // (a well-known R-series quirk). The old code zero-extended via `(uint)` casts, so
+            // e.g. a negative 32-bit quotient/product half read back as a huge positive 64-bit
+            // value instead — same bug class as SLL/SRL/ADD/SUB above.
             case 0x18: // MULT (signed 32)
                 {
                     int a = (int)(uint)GetGpr(rs).Lo; int b = (int)(uint)GetGpr(rt).Lo;
                     long res = (long)a * b;
-                    LO = (ulong)(uint)res;
-                    HI = (ulong)(uint)(res >> 32);
+                    LO = unchecked((ulong)(long)(int)res);
+                    HI = unchecked((ulong)(res >> 32)); // arithmetic shift already yields the sign-extended high half
                 }
                 break;
             case 0x19: // MULTU (unsigned 32) — Phase 20 accuracy
                 {
-                    ulong a = GetGpr(rs).Lo & 0xFFFFFFFFUL;
-                    ulong b = GetGpr(rt).Lo & 0xFFFFFFFFUL;
-                    ulong res = a * b;
-                    LO = res & 0xFFFFFFFFUL;
-                    HI = res >> 32;
+                    uint a = (uint)GetGpr(rs).Lo; uint b = (uint)GetGpr(rt).Lo;
+                    ulong res = (ulong)a * b;
+                    LO = unchecked((ulong)(long)(int)(uint)res);
+                    HI = unchecked((ulong)(long)(int)(uint)(res >> 32));
                 }
                 break;
 
             case 0x1A: // DIV (signed)
                 {
                     int a = (int)(uint)GetGpr(rs).Lo; int b = (int)(uint)GetGpr(rt).Lo;
-                    if (b != 0) { LO = (ulong)(uint)(a / b); HI = (ulong)(uint)(a % b); }
+                    if (b != 0) { LO = unchecked((ulong)(long)(a / b)); HI = unchecked((ulong)(long)(a % b)); }
                 }
                 break;
             case 0x1B: // DIVU (unsigned) — Phase 20 accuracy
                 {
                     uint a = (uint)GetGpr(rs).Lo; uint b = (uint)GetGpr(rt).Lo;
-                    if (b != 0) { LO = a / b; HI = a % b; }
+                    if (b != 0) { LO = unchecked((ulong)(long)(int)(a / b)); HI = unchecked((ulong)(long)(int)(a % b)); }
                 }
                 break;
 
@@ -718,12 +728,23 @@ public sealed class EmotionEngine : ISchedulable
             case 0x3F: // DSRA32
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(sa + 32)) }); break;
 
+            // ADD/ADDU are 32-bit ops: truncate both operands to 32 bits, add, sign-extend the
+            // 32-bit result — NOT a full 64-bit add of the raw register values. The old shared
+            // code with DADD/DADDU did a 64-bit add for all four, which silently diverges from
+            // real hardware any time the true 32-bit sum crosses the sign boundary (e.g.
+            // 0x7FFFFFFF+1), which is routine in real compiled loop counters/pointer math — the
+            // same bug class as SLL/SRL/MULT/DIV above, just far more common since ADD/ADDU are
+            // among the most-used instructions in any compiled MIPS binary.
             case 0x20: case 0x21: // ADD / ADDU (32-bit; HLE ignores overflow trap on ADD)
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)GetGpr(rs).Lo + (uint)GetGpr(rt).Lo)) });
+                break;
             case 0x2C: // DADD (64-bit) — was UnknownSpecial:0x2C storm on retail titles
             case 0x2D: // DADDU
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo + GetGpr(rt).Lo });
                 break;
-            case 0x22: case 0x23: // SUB / SUBU
+            case 0x22: case 0x23: // SUB / SUBU (32-bit — same truncate/sign-extend rule as ADD/ADDU)
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)GetGpr(rs).Lo - (uint)GetGpr(rt).Lo)) });
+                break;
             case 0x2E: // DSUB
             case 0x2F: // DSUBU
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo - GetGpr(rt).Lo });
@@ -846,9 +867,16 @@ public sealed class EmotionEngine : ISchedulable
 
     private void ExecuteAddiu(uint opcode)
     {
+        // ADDIU is a 32-bit op: truncate rs to its low 32 bits, add the sign-extended
+        // immediate as a 32-bit add, then sign-extend the 32-bit RESULT to 64 bits — not a
+        // raw 64-bit add of rs's full register value (that's DADDIU's job). The old code did
+        // exactly that raw 64-bit add, which is silently wrong whenever the true 32-bit sum
+        // crosses the sign boundary (e.g. computing a small negative offset via
+        // `addiu rt,rs,-N`) — the same bug class as LUI/LW/ADD/SLL (see their comments), and
+        // likely the highest-impact instance of it given how common ADDIU is in compiled code.
         uint rs = (opcode >> 21) & 0x1F; uint rt = (opcode >> 16) & 0x1F;
         short imm = (short)(opcode & 0xFFFF);
-        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = GetGpr(rs).Lo + (ulong)imm });
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = unchecked((ulong)(long)(int)((uint)GetGpr(rs).Lo + (uint)(int)imm)) });
     }
 
     private void ExecuteDaddi(uint opcode) => ExecuteDaddiu(opcode);
@@ -1611,8 +1639,12 @@ public sealed class EmotionEngine : ISchedulable
         switch (fmt)
         {
             case 0x00: // MFC1
+                // MIPS64 sign-extends the 32-bit FPU value's bit pattern into the 64-bit GPR.
+                // Every negative float has IEEE754 bit 31 (the sign bit) set, so this was
+                // zero-extending in a genuinely common case, not an edge case — same bug class
+                // as LUI/LW/ADD/SLL/MFC0 (see their comments).
                 if (ft != 0)
-                    SetGpr(ft, new Gpr128 { Lo = BitConverter.SingleToUInt32Bits(_fpr[fs]) });
+                    SetGpr(ft, new Gpr128 { Lo = unchecked((ulong)(long)(int)BitConverter.SingleToUInt32Bits(_fpr[fs])) });
                 break;
             case 0x04: // MTC1
                 _fpr[fs] = DeterministicFloat.Canonicalize(BitConverter.UInt32BitsToSingle((uint)GetGpr(ft).Lo));
@@ -1731,8 +1763,13 @@ public sealed class EmotionEngine : ISchedulable
         switch (rs)
         {
             case 0x00: // MFC0
+                // MIPS64 sign-extends the 32-bit COP0 value into the 64-bit GPR — matters a
+                // lot in practice since KSEG0/KSEG1 addresses (0x80000000+, i.e. essentially
+                // all kernel/BIOS code and every exception vector) have bit 31 set, so reading
+                // EPC/BadVAddr etc. after an exception hit this constantly. Same bug class as
+                // LUI/LW/ADD/SLL (see their comments) — the old code zero-extended instead.
                 if (rt != 0)
-                    SetGpr(rt, new Gpr128 { Lo = ReadCop0((int)rd) });
+                    SetGpr(rt, new Gpr128 { Lo = unchecked((ulong)(long)(int)ReadCop0((int)rd)) });
                 break;
             case 0x04: // MTC0
                 WriteCop0((int)rd, (uint)GetGpr(rt).Lo);

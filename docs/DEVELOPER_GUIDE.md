@@ -736,6 +736,40 @@ already-fixed `ReferThreadStatus`; implementing a real return value (matching `E
 recording the negative result. Thread preemption (`KernelState.MaybePreempt`) was also ruled out
 via `DETPS2_TRACE_PREEMPT=1` — no actual thread switch occurs anywhere in the relevant window.
 
+**FIXED (2026-07-25) — systemic audit found 8 more instances of the same bug class.** Given `LW`
+had already been bitten by this once (see its own comment in `EmotionEngine.cs`) and `LUI` just
+was, a full pass over every "32-bit" MIPS64/R5900 opcode found the pattern was genuinely
+widespread, not a one-off — the codebase had a general habit of operating on/storing full 64-bit
+register values for instructions the spec defines as strictly 32-bit (truncate inputs, compute,
+sign-extend the *result*). Fixed, all in `EmotionEngine.cs`:
+  - `ADD`/`ADDU`/`SUB`/`SUBU` — did a raw 64-bit add/sub of the full register values instead of
+    truncating to 32 bits first. Silently wrong whenever the true 32-bit result crosses the sign
+    boundary (e.g. `0x7FFFFFFF+1`) — routine in real loop counters and pointer arithmetic.
+  - `ADDIU` — same bug, and arguably the highest-impact instance found: it's among the single
+    most common instructions in any compiled MIPS binary (every small stack/offset adjustment).
+  - `SLL`/`SRL`/`SRA`/`SLLV`/`SRLV`/`SRAV` — shifted the full 64-bit register instead of the
+    low 32 bits, and didn't sign-extend the 32-bit result.
+  - `MULT`/`MULTU`/`DIV`/`DIVU` — `LO`/`HI` were zero-extended via `(uint)` casts instead of
+    independently sign-extended per 32-bit half. `MULTU`/`DIVU` still sign-extend `LO`/`HI`
+    despite the multiply/divide itself being unsigned — a genuine, easy-to-miss R-series quirk.
+  - `MFC0` — zero-extended the 32-bit COP0 value. High-impact in practice: KSEG0/KSEG1 addresses
+    (`0x80000000`+, i.e. essentially all kernel/BIOS code and every exception vector) have bit 31
+    set, so reading `EPC`/`BadVAddr` after any exception hit this constantly.
+  - `MFC1` — zero-extended the FPU value's bit pattern. Every *negative* float has IEEE754 bit 31
+    set, so this wasn't an edge case either.
+
+`ADDI`/`ANDI`/`ORI`/`XORI`/`SLTI`/`SLTIU`/`DADD(U)`/`DSUB(U)`/`DSLL(V)`/`DSRL(V)`/`DSRA(V)` were
+checked and are correct as-is (the `D`-prefixed forms are genuinely 64-bit ops with no truncation
+needed; `ANDI`/`ORI`/`XORI` are correctly zero-extending per spec; `SLTI`/`SLTIU`/`ADDI` already
+sign-extend correctly through C#'s `short→ulong` conversion rules). New regression test
+`Ee_32BitOps_SignExtendAcrossBoundary` (`Tests/SmokeTests.cs`) pins all 8 fixes with inputs chosen
+specifically to cross the 32-bit sign boundary, so a regression to a raw-64-bit or zero-extending
+implementation fails loudly instead of silently passing for "clean" small test values (exactly
+the trap that let these ship in the first place). Also required updating `Ee_MultuDivu_Dsll`'s
+existing `MULTU` expectation, which had encoded the old *incorrect* zero-extended value — the
+low-32 result (`0xFFFFFFFE`) was right, but real hardware sign-extends it (bit 31 is set) to
+`0xFFFFFFFFFFFFFFFE`, not `0x00000000FFFFFFFE`. Full smoke suite green throughout.
+
 ---
 
 ## 8. Save states & determinism contracts
