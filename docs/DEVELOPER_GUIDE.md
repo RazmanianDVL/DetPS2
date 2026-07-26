@@ -1423,6 +1423,87 @@ pixels — it may be more productive to focus on why the game's own code never r
 `SifBindRpc` call at all (§7.4 above), since fixing that would very plausibly make this whole
 class of PS2RNA fault-reporting moot rather than needing to be understood in detail.
 
+**Follow-up (2026-07-26) — enumerated every real call site to `sceSifBindRpc`, confirmed none
+fire, and precisely re-dated the late crash.** Picked up the exact thread the previous entry
+pointed at. Used the (pre-existing) `find-word` CLI mode to scan the whole loaded binary
+(0x100000–0x700000) for the `jal 0x004834E0` instruction word (`0x0C120D38`) rather than guessing
+— this is real static cross-referencing, not tracing: **14 real call sites**, at `0x2062CC`,
+`0x206320`, `0x3829F4`, `0x385DAC`, `0x3860DC`, `0x3863DC`, `0x386524`, `0x3869E8`, `0x41ED5C`,
+`0x462790`, `0x462804`, `0x4840CC`, `0x485494`, `0x48568C`. (Also found `_rpc_get_packet`'s two
+real callers, both inside `sceSifBindRpc`/`sceSifCallRpc` themselves, at `0x483510`/`0x483710` —
+confirming there are exactly two functions that ever reach the allocator, matching `RealSifRpc.cs`'s
+own model.)
+
+Disassembled two of the fourteen by hand to confirm they're genuine, meaningful call sites and not
+padding/dead code:
+- `0x2062CC`/`0x206320`: back-to-back `sceSifBindRpc(&client, 0x80000100, 0)` /
+  `sceSifBindRpc(&client, 0x80000101, 0)` — unmistakably `padOpen`'s real pad1/pad2 bind, each
+  followed by the exact retry-poll `lw v1,off(sX); beq v1,zero,...` pattern
+  `AutoCompleteWorkItems`'s own existing comment already named (`@ 0x2062D4` / `@ 0x206328`) as a
+  "tight wait" it fakes past by writing the completion field directly. **Confirms these two are
+  faked past, not genuinely satisfied** — which had been assumed but not verified against the
+  actual bind call itself until now.
+- `0x4840CC`: a generic-looking `sceSifBindRpc(&client, 0x80000001, 0)` **inside the SIF library's
+  own code** (0x484000–0x486000 range), immediately followed by more SIF-internal calls
+  (`0x483918`, `0x0047FEA0`) — almost certainly `sceSifLoadModule`'s own internal RPC bind to the
+  module-loader service, i.e. the single choke point every real IOP module load (PADMAN, SIO2MAN,
+  CRI_ADXI, ...) would have to pass through.
+
+Then re-ran the real-CRT0-redirect testbed (temporary edit, reverted after — see `git diff` in this
+entry's own commit, none survives) with `--pcbreak=00483000:00483600` (covering `_rpc_get_packet`,
+`sceSifBindRpc`'s and `sceSifCallRpc`'s entries, and the two allocator call sites) across a full
+**270,000,000-cycle** run — deliberately matching the exact cycle count an earlier entry (§7.4)
+used for its own "fires once in 270M cycles" observation under the *old*, destructive
+`MaybeForceSifInit`. Result under the *current* code (non-destructive SIF-init trampoline, PCPYUD
+fix, thread-desync fix, ExitThread fix, all already in place): **zero PCBREAK hits, not one, across
+the entire 270M cycles** — a stronger and more direct result than before: the whole SIF-library
+address range is never entered at all, not merely "abandoned mid-retry." This flips the earlier
+ambiguous read (that a destructive forced-jump might have been incidentally responsible for the one
+observed hit) into a clean negative result under the more faithful current testbed.
+
+**Bisected exactly when execution stops being trustworthy, since a wild jump could in principle
+explain "never reached" as "execution derailed before it got there" rather than "the natural boot
+path just doesn't call it."** Binary-searched `--cycles=N` checkpoints (each a ~20–30s run, so this
+was cheap) down to a 2,000-cycle window: PC is still valid, ordinary-looking code
+(`0x0040B9EC`-ish region — a float-to-int clamp helper, unremarkable) through `cyc=96,234,000`, and
+has landed in a narrow garbage band (`0x6237xxxx`–`0x623Axxxx`, ~300KB wide, not fully random —
+consistent with a corrupted-but-structured pointer being walked, the same signature as the
+already-documented stack-corruption bugs) by `cyc=96,236,000`. This precisely re-dates what an
+earlier entry only knew as "~cyc=98M... a different call site than the PCPYUD-fixed string-shaped
+bug" down to a 2,000-cycle window, and — more importantly — **establishes that this crash happens
+tens of millions of cycles after the 14 real bind call sites would have needed to fire and didn't**,
+so it is definitively not the reason they're unreached. The natural boot path runs cleanly (real
+audio synthesis progressing — `spu2Samples` climbing steadily the whole time, real per-frame MMIO
+traffic) for 96+ million consecutive cycles without ever calling into any of the 14 sites, then
+crashes into unrelated garbage. Root-causing that crash itself (which register, which instruction)
+was not pursued further this entry — it's real and worth fixing eventually, but chasing it will not
+unblock SIF bind, so it isn't the priority the previous entry hoped it might be.
+
+**Net conclusion, sharper than before: this is not a corruption-derails-execution problem, and not
+a "the retry gets abandoned" problem — it's that nothing in the game's own natural control flow
+ever branches into any of these 14 call sites during the entire observed clean-execution window.**
+The two pad-bind sites (`0x2062CC`/`0x206320`) sit inside what disassembles as a real `padOpen`
+routine that is itself simply never entered; the SIF-library-internal site (`0x4840CC`) that gates
+real IOP module loading is equally unreached. Whatever higher-level sequencing decides when to call
+`padOpen` / `sceSifLoadModule` (most plausibly the real logo/attract-mode sequencer, which
+`MidwayBootAssist.MaybeStartLogo`/`MaybePostLogoAdvance` currently substitute with entirely
+synthetic FMV pacing rather than executing) never reaches that decision point on this boot path.
+**Did not attempt a fix here** — synthesizing a plausible trigger for 14 different call sites across
+at least 3-4 distinct subsystems (pad, core SIF/module-loader, and whatever the `0x382xxx`–`0x386xxx`
+and `0x41Exxx`/`0x462xxx` clusters turn out to be) without first identifying their actual common
+caller would be exactly the kind of speculative, unverified fix this file's own conventions warn
+against. **Concrete next step, if picked up:** statically find the callers of `0x2062CC`'s enclosing
+function and of `0x4840CC`'s enclosing function (the same `find-word` technique used here, applied
+to whatever `jal`s target those two function *entries*, which weren't identified this pass) to see
+whether they share a single common gate — that would turn "14 unreached call sites" into "one
+unreached decision point," a much more tractable fix target than patching each site individually.
+
+Verified neutral: default assisted-boot baseline unchanged
+(`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`) — this entire investigation used the
+temporary real-CRT0-redirect testbed, reverted via `git checkout --` before any commit, same as
+every prior entry in this section. Full smoke suite green. No source changes this entry — read-only
+investigation plus this write-up.
+
 ---
 
 ## 8. Save states & determinism contracts
