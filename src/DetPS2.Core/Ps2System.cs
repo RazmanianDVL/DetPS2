@@ -374,6 +374,15 @@ public sealed class Ps2System : ISchedulable
         // semaphore-3 wall is independent of the INTC ack question. Re-disabling this redirect;
         // falling back to the fake-CRT0 jump below, which remains the better baseline until the
         // semaphore-3 (real IOP-side SIF worker) wall is separately addressed.
+        // RE-TESTED (2026-07-26) with the PCPYUD fix (the "material" corruption's real root
+        // cause) in place: no longer regresses -- px/gifPath3/dmac now match the fake-CRT0-jump
+        // baseline (860160/1/4) instead of the old 573440/0/0 -- but syscalls balloon to ~200,000
+        // by 40M cycles, almost entirely UnknownSyscall with garbage codes (e.g. 0xFFFFFFBD),
+        // consistent with execution wandering into a different corrupted/garbage region later in
+        // the run (PC observed at 0x4020C9C8, a valid-looking but implausible address for real
+        // game code at that point). A different bug than the one PCPYUD fixed, not yet traced.
+        // Still not enabling this path by default until that's understood -- the fake-CRT0-jump
+        // baseline below remains the known-good state.
         // Run CRT0 SetupThread/Heap if we haven't (needed for SP)
         if (pc < 0x0011C250)
         {
