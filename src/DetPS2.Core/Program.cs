@@ -210,6 +210,22 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             threadAtCycles.Add(tac);
             KernelState.TraceThreads = true; // implied
         }
+    // --track-transfers: log every DMAC channel start, SIF0/SIF1 EE<->IOP transfer, and GIF
+    // Path1/2/3 receive (EE->GS) — the actual bulk-transmission mechanisms on real hardware, as
+    // opposed to individual CPU store instructions (already covered by --track-writers). See
+    // TransferLog's own doc comment. --find-transfer=ADDR[:LEN] filters the dump to transfers
+    // whose source or dest falls in the given range, instead of printing every single one.
+    if (args.Contains("--track-transfers")) TransferLog.Enabled = true;
+    var findTransferRanges = new List<(uint start, uint len)>();
+    foreach (var a in args)
+        if (a.StartsWith("--find-transfer="))
+        {
+            var parts = a.Substring(16).Split(':');
+            uint ftStart = Convert.ToUInt32(parts[0], 16);
+            uint ftLen = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 4u;
+            findTransferRanges.Add((ftStart, ftLen));
+            TransferLog.Enabled = true; // implied
+        }
 
     if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
     foreach (var title in cfg.Titles)
@@ -218,6 +234,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         SystemMemory.WatchHits.Clear();
         SystemMemory.LastWriterLog.Clear();
         KernelState.ThreadLog.Clear();
+        TransferLog.Reset();
         var traceSys = new Ps2System();
         traceSys.Telemetry.Reset();
         traceSys.LoadBios(cfg.BiosPath);
@@ -260,7 +277,13 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 Console.WriteLine($"  find-writer 0x{fwStart:X8}..0x{fwStart + fwLen:X8}:");
                 for (uint addr = fwStart & ~3u; addr < fwStart + fwLen; addr += 4)
                 {
-                    if (SystemMemory.LastWriterLog.TryGetValue(addr, out var w))
+                    // Key by the same physical-or-scratchpad scheme LastWriterLog is stored
+                    // under (see SystemMemory.NoteLastWriter's own doc comment) — otherwise a
+                    // query via a different KSEG alias than the one the write actually used
+                    // would silently miss it.
+                    bool isScratch = addr is >= SystemMemory.SPR_BASE and < SystemMemory.SPR_BASE + SystemMemory.SPR_SIZE;
+                    uint key = isScratch ? addr : (uint)(traceSys.Memory.TranslateAddress(addr) & 0xFFFFFFFCUL);
+                    if (SystemMemory.LastWriterLog.TryGetValue(key, out var w))
                         Console.WriteLine($"    0x{addr:X8}: last written at cyc={w.Cycle} pc=0x{w.Pc:X8} value=0x{w.Value:X8}  {EeDisassembler.Disassemble((uint)w.Pc, traceSys.Memory.Read32((uint)w.Pc))}");
                     else
                         Console.WriteLine($"    0x{addr:X8}: NEVER WRITTEN (current value=0x{traceSys.Memory.Read32(addr):X8})");
@@ -295,6 +318,45 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 Console.WriteLine(last.HasValue
                     ? $"  thread-at cyc={tac}: most recent event was {last.Value.Kind} tid={last.Value.ThreadId} at cyc={last.Value.Cycle} pc=0x{last.Value.Pc:X8} sp=0x{last.Value.Sp:X8} {last.Value.Detail}"
                     : $"  thread-at cyc={tac}: no thread event recorded before this cycle");
+            }
+        }
+        if (TransferLog.Enabled)
+        {
+            Console.WriteLine($"  transfer log: {TransferLog.Events.Count} event(s)");
+            if (findTransferRanges.Count > 0)
+            {
+                foreach (var (ftStart, ftLen) in findTransferRanges)
+                {
+                    Console.WriteLine($"  find-transfer 0x{ftStart:X8}..0x{ftStart + ftLen:X8}:");
+                    int ftHits = 0;
+                    foreach (var ev in TransferLog.Events)
+                    {
+                        bool srcHit = ev.Source >= ftStart && ev.Source < ftStart + ftLen;
+                        bool dstHit = ev.Dest >= ftStart && ev.Dest < ftStart + ftLen;
+                        if (!srcHit && !dstHit) continue;
+                        Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-14} src=0x{ev.Source:X8} dst=0x{ev.Dest:X8} size=0x{ev.Size:X} {ev.Detail}");
+                        if (++ftHits >= 100) { Console.WriteLine("    ...(truncated at 100)"); break; }
+                    }
+                    if (ftHits == 0) Console.WriteLine("    no transfer touched this range");
+                }
+            }
+            else
+            {
+                // No filter given — dump is otherwise unbounded on a long run; show a bounded
+                // sample (first/last 25) rather than silently truncating with no indication.
+                int total = TransferLog.Events.Count;
+                int shown = 0;
+                foreach (var ev in TransferLog.Events)
+                {
+                    Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-14} src=0x{ev.Source:X8} dst=0x{ev.Dest:X8} size=0x{ev.Size:X} {ev.Detail}");
+                    if (++shown >= 25) break;
+                }
+                if (total > 50)
+                {
+                    Console.WriteLine($"    ...({total - 50} more, use --find-transfer=ADDR to filter)...");
+                    foreach (var ev in TransferLog.Events.Skip(Math.Max(0, total - 25)))
+                        Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-14} src=0x{ev.Source:X8} dst=0x{ev.Dest:X8} size=0x{ev.Size:X} {ev.Detail}");
+                }
             }
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");

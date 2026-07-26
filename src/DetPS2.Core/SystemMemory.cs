@@ -69,6 +69,7 @@ public sealed class SystemMemory
         if ((vaddr & 0xFFFFFFFFUL) is >= SPR_BASE and < SPR_BASE + SPR_SIZE)
         {
             _scratchpad[(vaddr - SPR_BASE) & (SPR_SIZE - 1)] = value;
+            if (TrackLastWriter) NoteLastWriterByteRegion(_scratchpad, (vaddr - SPR_BASE) & (SPR_SIZE - 1), (uint)SPR_BASE);
             return;
         }
 
@@ -77,31 +78,34 @@ public sealed class SystemMemory
             if (ProtectKernelVectors && paddr < 0x300)
                 return; // preserve exception vectors
             _rdram[paddr] = value;
-            if (TrackLastWriter) NoteLastWriterByte(paddr);
+            if (TrackLastWriter) NoteLastWriterByteRegion(_rdram, paddr, 0);
             return;
         }
 
         if (paddr >= IOP_RAM_BASE && paddr < IOP_RAM_BASE + (ulong)IOP_RAM_SIZE)
         {
             _iopRam[paddr - IOP_RAM_BASE] = value;
+            if (TrackLastWriter) NoteLastWriterByteRegion(_iopRam, paddr - IOP_RAM_BASE, IOP_RAM_BASE);
             return;
         }
 
         // BIOS ROM — ignore writes
     }
 
-    /// <summary>Reconstructs the containing word from raw RDRAM bytes (no watch side effects,
-    /// unlike Read32) so SB/SH writes update LastWriterLog with an accurate current value instead
-    /// of being invisible to it — Write32's NoteLastWriter alone missed any field a compiler
-    /// stored via SH/SB (see DEVELOPER_GUIDE.md §7.4, the cyc≈97.66M lead: this exact gap first
-    /// showed up as a false "never written" reading for a 16-bit field actually set via SH).</summary>
+    /// <summary>Reconstructs the containing word from raw bytes of the given region (no watch
+    /// side effects, unlike Read32) so SB/SH writes update LastWriterLog with an accurate current
+    /// value instead of being invisible to it — Write32's NoteLastWriter alone missed any field a
+    /// compiler stored via SH/SB (see DEVELOPER_GUIDE.md §7.4, the cyc≈97.66M lead: this exact gap
+    /// first showed up as a false "never written" reading for a 16-bit field actually set via SH).
+    /// Covers RDRAM, scratchpad, and IOP RAM — whichever region's backing array is passed in —
+    /// so byte/halfword stores to any of them are visible to --find-writer, not just RDRAM.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void NoteLastWriterByte(ulong paddr)
+    private void NoteLastWriterByteRegion(byte[] region, ulong regionOffset, uint keyBase)
     {
-        ulong wordBase = paddr & ~3UL;
-        if (wordBase + 3 >= (ulong)RDRAM_SIZE) return;
-        uint word = (uint)(_rdram[wordBase] | (_rdram[wordBase + 1] << 8) | (_rdram[wordBase + 2] << 16) | (_rdram[wordBase + 3] << 24));
-        LastWriterLog[(uint)wordBase] = (CurrentCycleForWriterLog, CurrentPcForWatch, word);
+        ulong wordBase = regionOffset & ~3UL;
+        if (wordBase + 3 >= (ulong)region.Length) return;
+        uint word = (uint)(region[wordBase] | (region[wordBase + 1] << 8) | (region[wordBase + 2] << 16) | (region[wordBase + 3] << 24));
+        LastWriterLog[keyBase + (uint)wordBase] = (CurrentCycleForWriterLog, CurrentPcForWatch, word);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -154,23 +158,34 @@ public sealed class SystemMemory
     public static readonly List<(ulong Pc, ulong Vaddr, uint Value, bool IsWrite)> WatchHits = new();
     public static ulong CurrentPcForWatch;
 
-    /// <summary>Diagnostic-only: when true, every 32-bit-aligned RDRAM write overwrites its slot
-    /// in <see cref="LastWriterLog"/> with (cycle, pc, value) — a live "who last touched this
+    /// <summary>Diagnostic-only: when true, every 32-bit-aligned write (any region — RDRAM,
+    /// scratchpad, IOP RAM, MMIO, SPU2 registers, all of it) overwrites its slot in
+    /// <see cref="LastWriterLog"/> with (cycle, pc, value) — a live "who last touched this
     /// address" index, queryable at any point (typically after the run, once a corrupted value
     /// has been found) without needing to have set --watch on that exact address in advance.
     /// Built specifically because --watch requires knowing the target address before it's
     /// written, which doesn't work for tracing corruption whose destination address is itself
     /// computed at runtime (see DEVELOPER_GUIDE.md §7.4, the cyc≈97.66M lead). Off by default —
-    /// a dictionary write per store is not free — opt-in via blocker-trace --track-writers.</summary>
+    /// a dictionary write per store is not free — opt-in via blocker-trace --track-writers.
+    ///
+    /// Keyed by *physical* address (post-KSEG-translation), not raw virtual address — the same
+    /// byte written via 0x00xxxxxx (KUSEG), 0x80xxxxxx (KSEG0, cached), or 0xA0xxxxxx (KSEG1,
+    /// uncached) must land in the same log entry, or a query using a different alias than the
+    /// one the write actually used would silently miss it. This was a real bug in the original
+    /// version of this tracker (Write32 keyed by raw vaddr, Write8's RDRAM path already keyed by
+    /// paddr — the two disagreed), fixed 2026-07-26 while extending logging coverage more
+    /// broadly. Scratchpad is the one exception: it's a genuinely separate address window with
+    /// no KSEG aliasing on real hardware, so it's keyed by its own fixed virtual window
+    /// (0x7000_0000+) directly, which can never collide with a translated physical key (physical
+    /// space tops out at 0x1FFF_FFFF).</summary>
     public static bool TrackLastWriter;
     public static readonly Dictionary<uint, (ulong Cycle, ulong Pc, uint Value)> LastWriterLog = new();
     public static ulong CurrentCycleForWriterLog;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void NoteLastWriter(ulong vaddr, uint value)
+    private static void NoteLastWriter(uint key, uint value)
     {
         if (!TrackLastWriter) return;
-        uint key = (uint)(vaddr & 0xFFFFFFFCUL);
         LastWriterLog[key] = (CurrentCycleForWriterLog, CurrentPcForWatch, value);
     }
 
@@ -179,18 +194,19 @@ public sealed class SystemMemory
     {
         if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
             WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
-        NoteLastWriter(vaddr, value);
         if (IsScratchpad(vaddr))
         {
             int off = (int)((vaddr - SPR_BASE) & (SPR_SIZE - 1));
             if (off + 3 < SPR_SIZE)
             {
                 Unsafe.WriteUnaligned(ref _scratchpad[off], value);
+                if (TrackLastWriter) NoteLastWriter((uint)(vaddr & 0xFFFFFFFCUL), value);
                 return;
             }
         }
 
         ulong paddr = TranslateAddress(vaddr);
+        if (TrackLastWriter) NoteLastWriter((uint)(paddr & 0xFFFFFFFCUL), value);
 
         if (paddr >= Spu2.PhysBase && paddr < Spu2.PhysBase + 0x800 && _spu2 != null)
         {

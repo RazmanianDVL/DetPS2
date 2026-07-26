@@ -93,6 +93,9 @@ public sealed class Dmac : ISchedulable
         ch.Mode = (int)((ch.CHCR >> 2) & 0x3);
         ch.OriginalQWC = ch.QWC;
         ch.StartMADR = ch.MADR;
+        if (TransferLog.Enabled)
+            TransferLog.Log("DMA:" + channel, ch.MADR, ch.TADR, ch.QWC * 16,
+                $"chcr=0x{ch.CHCR:X8} mode={ch.Mode} stalled={ch.Stalled}");
         if (ch.Stalled)
             ch.Active = false; // wait for stall release
     }

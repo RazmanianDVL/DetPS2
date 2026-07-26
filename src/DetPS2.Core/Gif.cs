@@ -107,6 +107,7 @@ public sealed class Gif : ISchedulable
     public void ReceivePath3Data(uint address, uint qwc)
     {
         _path3Transfers++;
+        if (TransferLog.Enabled) TransferLog.Log("GIF:Path3->GS", address, 0, qwc * 16);
         ProcessTransfer(address, qwc);
     }
 
@@ -114,6 +115,7 @@ public sealed class Gif : ISchedulable
     public void ReceivePath2Data(uint address, uint qwc)
     {
         _path2Transfers++;
+        if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
         ProcessTransfer(address, qwc);
     }
 
@@ -121,6 +123,7 @@ public sealed class Gif : ISchedulable
     public void ReceivePath1Data(uint address, uint qwc)
     {
         _path1Transfers++;
+        if (TransferLog.Enabled) TransferLog.Log("GIF:Path1->GS", address, 0, qwc * 16);
         ProcessTransfer(address, qwc);
     }
 

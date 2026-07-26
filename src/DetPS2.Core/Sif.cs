@@ -108,6 +108,12 @@ public sealed class Sif : ISchedulable
         Status |= 0x1;
 
         uint iopPhys = NormalizeIopAddr(iopAddr);
+        if (TransferLog.Enabled)
+        {
+            bool eeToIop = direction == DmaDirection.EeToIop;
+            TransferLog.Log(eeToIop ? "SIF:EE->IOP" : "SIF:IOP->EE",
+                eeToIop ? eeAddr : iopPhys, eeToIop ? iopPhys : eeAddr, size);
+        }
 
         for (uint i = 0; i < size; i++)
         {
