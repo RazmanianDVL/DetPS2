@@ -40,6 +40,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Placed near this file's other "top of RAM" scratch addresses (WorkItemsBase, the
     /// 0x01FF0000 stack safety net) with enough separation not to collide with either.</summary>
     private const uint SifInitReturnTrampoline = 0x01FE0000;
+    /// <summary>Same non-destructive force-call technique as MaybeForceSifInit, applied to a
+    /// second, independently-discovered gap (see MaybeForceManagerInit's own doc comment).
+    /// Distinct scratch address so the two forced calls can never collide even if their timing
+    /// windows somehow overlapped.</summary>
+    private const uint ManagerInitReturnTrampoline = 0x01FE0010;
+    /// <summary>Real vaddr of the object-manager initializer that populates the 4 consecutive
+    /// globals at 0x004EFE94..0x004EFEA0 (traced 2026-07-26 — see DEVELOPER_GUIDE.md §7.4). Its
+    /// sole real caller (0x0021338C, inside main() itself) is never reached because main()'s own
+    /// linear body diverges into a never-returning per-frame update loop earlier at 0x00213030,
+    /// so on the fast-boot path this function simply never runs and every later read of these
+    /// globals (there are tens of thousands, all expecting real pointers) sees zero.</summary>
+    private const uint ManagerInitFn = 0x00212DD0;
+    /// <summary>First of the 4 consecutive manager-pointer globals ManagerInitFn populates —
+    /// used purely as a "has this already run" guard, not because only this one slot matters.</summary>
+    private const uint ManagerInitGlobalSlot = 0x004EFE94;
 
     private bool _worklistPlanted;
     private bool _sifForced;
@@ -47,6 +62,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private bool _sifResumePending;
     private ulong _sifSavedPc;
     private ulong[]? _sifSavedGpr;
+    private bool _managerInitForced;
+    private bool _managerInitTrampolineWritten;
+    private bool _managerInitResumePending;
+    private ulong _managerInitSavedPc;
+    private ulong[]? _managerInitSavedGpr;
     private bool _logoPrepared;
     private bool _logoActive;
     private bool _midwayDone;
@@ -88,6 +108,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _sifResumePending = false;
         _sifSavedPc = 0;
         _sifSavedGpr = null;
+        _managerInitForced = false;
+        _managerInitTrampolineWritten = false;
+        _managerInitResumePending = false;
+        _managerInitSavedPc = 0;
+        _managerInitSavedGpr = null;
         _logoPrepared = false;
         _logoActive = false;
         _midwayDone = false;
@@ -251,6 +276,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeForceSifInit(sys);
             MaybeResumeAfterForcedSifInit(sys);
         }
+        MaybeForceManagerInit(sys);
+        MaybeResumeAfterForcedManagerInit(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
         // Desktop ticks and looks "frozen" on a single still.
@@ -473,6 +500,83 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         sys.LastGoodEePc = _sifSavedPc;
         _sifResumePending = false;
         Status = "sif-resumed";
+    }
+
+    /// <summary>Force-calls ManagerInitFn (0x212DD0) the same non-destructive way
+    /// MaybeForceSifInit force-calls sceSifInitRpc.
+    ///
+    /// Traced 2026-07-26, downstream of the same day's MULT/MULTU 3-operand and MMI
+    /// sign-extension fixes (see DEVELOPER_GUIDE.md §7.4): with those ALU bugs fixed, boot
+    /// telemetry goes fully clean through cyc=5,000,000, then a *new* garbage-pointer pattern
+    /// appears around cyc=29.77M, structurally identical to the ones the ALU fixes just cured
+    /// (a "this" pointer landing in a nonsense address, corrupting downstream array-index
+    /// arithmetic) but this time sourced from a stored field, not a live computation. Traced
+    /// through 3 call frames to a null `a0` reloaded from a fixed global slot, 0x004EFE94 —
+    /// one of 4 consecutive manager-object pointers only ManagerInitFn ever writes (confirmed:
+    /// `--watch=004EFE94` shows 78,389 reads and *zero* writes across a full 30M-cycle run).
+    /// ManagerInitFn's one real caller, 0x0021338C, sits inside main()'s own straight-line body
+    /// — but main() never reaches it: main() calls into 0x0024D128 much earlier, at 0x00213030,
+    /// and that call apparently never returns (it's the per-frame object-update loop this whole
+    /// session has been tracing), so everything main() would otherwise do afterward — including
+    /// this call — is dead on the fast-boot path. KickMidwayMainPath already synthesizes main()'s
+    /// entry from scratch (real CRT0 never ran either), so this is the same class of gap, not a
+    /// new kind of problem: force-run the one specific piece of "real init" that's missing,
+    /// exactly like the SIF fix does, rather than trying to make main()'s own body return from a
+    /// call it was never going to return from on this boot path either way.
+    /// </summary>
+    private void MaybeForceManagerInit(Ps2System sys)
+    {
+        if (_managerInitForced) return;
+        if (_sifResumePending) return; // never yank while another forced call is in flight
+        if (sys.MasterCycles < 3_000_000) return; // safely after KickMidwayMainPath + MaybeForceSifInit have settled
+        if (sys.Memory.Read32(ManagerInitGlobalSlot) != 0)
+        {
+            // Already populated (natural execution beat us to it, or a prior fix already did
+            // the job) — nothing to force, and no need to keep checking every Step().
+            _managerInitForced = true;
+            return;
+        }
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        if (pc is >= ManagerInitFn and < 0x00212FE0) return; // already inside it
+
+        if (!_managerInitTrampolineWritten)
+        {
+            sys.Memory.Write32(ManagerInitReturnTrampoline, 0x1000FFFFu); // beq zero,zero,self
+            sys.Memory.Write32(ManagerInitReturnTrampoline + 4, 0);       // nop (delay slot)
+            _managerInitTrampolineWritten = true;
+        }
+        _managerInitSavedPc = sys.EE.PC;
+        _managerInitSavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _managerInitSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MANAGERINIT") == "1")
+            Console.Error.WriteLine($"[MANAGERINIT] forcing call, savedPc=0x{_managerInitSavedPc:X8} cyc={sys.MasterCycles}");
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ManagerInitReturnTrampoline });
+        ulong sp = sys.EE.GetGpr(29).Lo;
+        if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        sys.EE.PC = ManagerInitFn;
+        _managerInitForced = true;
+        _managerInitResumePending = true;
+        Assists++;
+    }
+
+    /// <summary>Mirror of MaybeResumeAfterForcedSifInit for the manager-init forced call.</summary>
+    private void MaybeResumeAfterForcedManagerInit(Ps2System sys)
+    {
+        if (!_managerInitResumePending) return;
+        if ((uint)(sys.EE.PC & 0x1FFFFFFF) != ManagerInitReturnTrampoline) return;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MANAGERINIT") == "1")
+            Console.Error.WriteLine($"[MANAGERINIT] resuming at 0x{_managerInitSavedPc:X8} cyc={sys.MasterCycles}");
+        sys.EE.PC = _managerInitSavedPc;
+        if (_managerInitSavedGpr != null)
+            for (int i = 1; i < 32; i++) // skip $zero
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _managerInitSavedGpr[i] });
+        sys.LastGoodEePc = _managerInitSavedPc;
+        _managerInitResumePending = false;
     }
 
     private void MaybeStartLogo(Ps2System sys)

@@ -848,14 +848,48 @@ then reads whatever garbage happens to live at physical `0x20` (extremely low RA
 real array-base pointer. `a0` isn't set locally in this function; disassembling the caller
 (`0x0024DBC0`-`0x0024DC9C`) shows it's freshly reloaded from a fixed global slot,
 `lui v0,0x4F; lw a0,-364(v0)` → address `0x004EFE94`, right before nearly every sub-call in this
-routine — and that slot holds `0` at `cyc≈29.77M`. This strongly resembles the *already-documented*
-`MidwayBootAssist` forced-jump saga above (Bug A and the "resolved" analysis further down): if some
-earlier init routine is responsible for populating `0x004EFE94` and that routine's execution gets
-abandoned mid-flight the same way `sceSifBindRpc`/`_rpc_get_packet` were shown to be, this would be
-the exact same failure family wearing a different face, not a fourth independent bug. **Not
-confirmed** — would need `--watch=0x4EFE94` (or the equivalent virtual address) across the full run
-to find whether *anything* ever writes it, and if so, whether that write's own execution path gets
-cut short the same way. Next session should start there rather than re-deriving this trace.
+routine — and that slot holds `0` at `cyc≈29.77M`.
+
+**CONFIRMED and FIXED (2026-07-26).** `--watch=004EFE94` across a full 30M-cycle run: **78,389
+reads, zero writes** — nothing ever populates this global on the fast-boot path. `find-store`
+couldn't locate the writer (its lui+ori heuristic assumes the wrong compiler idiom for this
+`lui reg,hi; op reg,-offset` addressing style); a direct masked `scanmasked` for the `sw` opcode
+with immediate `0xFE94` found exactly one candidate: `0x00212E90: sw v0,-364(s4)`, inside a
+self-contained function at `0x00212DD0` that allocates and constructs 4 manager objects, storing
+their pointers into 4 consecutive globals (`0x004EFE94`/`98`/`9C`/`A0`) before returning via a real
+`jr ra`. Its **one** real caller is `0x0021338C` — inside `main()`'s own straight-line body — but
+`main()` never reaches it: `main()` calls into `0x0024D128` much earlier, at `0x00213030`, and that
+call never returns (it's the per-frame object-update loop this whole session has been tracing), so
+everything main() would otherwise do afterward, including this call, is dead on the fast-boot path.
+This is the exact same shape as the already-documented `MidwayBootAssist` forced-jump gaps above
+(Bug A / SIF-init) — a piece of real one-time init that the fast-boot path's synthesized entry into
+`main()` never naturally reaches — not a fourth independent bug class.
+
+Fixed with `MidwayBootAssist.MaybeForceManagerInit`/`MaybeResumeAfterForcedManagerInit`, the exact
+same non-destructive save-context/force-call/trampoline-resume technique as `MaybeForceSifInit`:
+force-call `0x00212DD0` once, resume the interrupted context exactly where it left off. **Timing
+mattered**: firing this at `cyc>200,000` (right after `KickMidwayMainPath` lands in `main()`, before
+`MaybeForceSifInit`'s own `cyc>1,500,000` gate) caused a severe regression — boot livelocked in the
+general exception vector (`PC` stuck cycling `0x80000180`-`0x8000019C`, `px=0`), the *same* signature
+`--no-assist` alone produces. Whatever this forced call depends on (heap state, SIF init, something
+else) isn't ready that early. Gated on `cyc>3,000,000` instead (safely after `MaybeForceSifInit` has
+had time to complete) and the regression disappeared. **Verified**: zero `UnknownMmio*` events
+through the *entire* 30,000,000-cycle window (previously corrupted at `cyc≈29.77M`) — this specific
+bug is resolved. Full smoke suite green.
+
+**New frontier, not yet investigated: a genuine crash further out.** Pushing to 100M cycles: the
+same garbage-base-pointer shape recurs a third time around `cyc≈97.66M` (fresh addresses in the
+`0x18928xxx` range, same `0x00384980`-family pool code), and by `cyc=100,000,000` execution has
+gone fully off the rails — `PC=0xFFFFFFFFFFFFFFF4` (an invalid address, not a real jump target).
+`px`/`gifPath3`/`dmac`/`syscalls` stay completely frozen at their `cyc=5,000,000` values
+(`860160`/`1`/`4`/`41`) the entire way out to the crash — consistent with the already-documented
+"Bug C" (frame loop runs, produces no new GS/DMA activity) still being in effect, now with a harder
+failure at the far end instead of an infinite idle. Given the pattern (recurring instances of the
+same "null/garbage base pointer" shape, each traceable to a specific missing one-time init call)
+has held for three fixes running, the crash at `cyc≈97.66M` is a reasonable next target — same
+methodology: `--pcbreak` at the first corrupted PC, trace the bad register back to its source,
+`scanmasked`/`scanword` for the real writer, check whether it's unreachable the same way. Not yet
+started.
 
 ---
 
