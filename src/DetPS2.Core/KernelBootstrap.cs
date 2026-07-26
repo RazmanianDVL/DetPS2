@@ -86,22 +86,20 @@ public static class KernelBootstrap
         if (skipFaulting)
         {
             // beq $k0, $zero, +4 insns (to eret path without skip) — if ExcCode==0, skip the skip
-            // From here: nop, mfc0, addiu, mtc0, [ack block], eret. Both paths converge on the
-            // ack block right before eret (word 7) — see AckIntc's own doc comment for why. The
-            // branch's target word index (7) is unchanged by inserting the ack block there (it
-            // just replaces what used to be "eret" at that slot, pushing the real eret to
-            // word 11), so this offset (+4) still lands correctly with no recalculation needed.
+            // From here: nop, mfc0, addiu, mtc0, eret = 5 words to eret if we want skip path
+            // beq k0, zero, 3  -> skip next 3*4? MIPS: offset is from delay slot
+            // PC at beq, delay slot, then offset*4. To jump to eret after mtc0:
             // Layout:
             // 0: mfc0 cause
             // 1: andi
-            // 2: beq k0,0,+4  -> target = 2+1+4 = 7
+            // 2: beq k0,0, +3  -> target = 2+1+3 = 6 -> eret if we put eret at 6
             // 3: nop
             // 4: mfc0 epc
             // 5: addiu epc,4
             // 6: mtc0 epc
-            // 7..10: ack block (4 words)
-            // 11: eret
-            // 12: nop
+            // 7: eret
+            // Wait for interrupt (code 0) we want eret without skip. beq to eret at word 7:
+            // at word 2, delay=3, target=2+1+X, want 7: X=4. beq k0,0,4
             Write32(mem, p, Beq(26, 0, 4)); p += 4;
             Write32(mem, p, 0); p += 4; // nop delay
             // mfc0 k0, EPC (rd=14)
@@ -110,50 +108,16 @@ public static class KernelBootstrap
             Write32(mem, p, Addiu(26, 26, 4)); p += 4;
             // mtc0 k0, EPC
             Write32(mem, p, Cop0Mtc(26, 14)); p += 4;
-            p = AckIntc(mem, p);
             // eret
             Write32(mem, p, Eret()); p += 4;
             Write32(mem, p, 0); // nop after eret
         }
         else
         {
-            // Interrupt: ack INTC, then ERET
-            p = AckIntc(mem, p);
+            // Interrupt: just ERET
             Write32(mem, p, Eret()); p += 4;
             Write32(mem, p, 0);
         }
-    }
-
-    /// <summary>
-    /// Real PS2 kernels always have at least a baseline VBlank/timer service routine installed
-    /// from boot — even before a game calls AddIntcHandler for its own subsystems, SOMETHING in
-    /// the real kernel's default dispatch always acknowledges INTC (clears I_STAT), or every
-    /// later interrupt would immediately re-fire the instant IE is set, permanently starving real
-    /// code. Our fast-boot deliberately skips full BIOS/kernel init (see InstallCommercialRuntime's
-    /// own comment: "without a full ISR that ACKs INTC, VBlank would storm the EE") and originally
-    /// relied on TakeExceptions staying false until a real handler was installed — but both
-    /// KickMidwayMainPath's forced COP0_Status write and real CRT0's own `ei` enable interrupts
-    /// well before any such handler exists, exactly triggering the storm the comment predicted.
-    /// Confirmed directly (2026-07-26): DETPS2_TRACE_INTC=1 shows VBlankStart raised only 3 times
-    /// in ~1M cycles (a perfectly normal rate), with the second raise already alreadyRaised=True —
-    /// the first was never acknowledged, so the CPU re-enters the exception vector every ~64
-    /// cycles forever, unable to make real progress (see DEVELOPER_GUIDE.md §7.4).
-    ///
-    /// Fix: give our own synthesized vector this same baseline behavior — read the real INTC
-    /// I_STAT register and write the same value back (write-1-to-clear is real INTC hardware
-    /// semantics, so this acks exactly the bits that were set, nothing else) right before every
-    /// eret. Uses $k0/$k1 ($26/$27), the MIPS-reserved kernel-scratch registers already used by
-    /// the rest of this handler, so nothing else needs saving/restoring.
-    /// </summary>
-    private static uint AckIntc(SystemMemory mem, uint p)
-    {
-        // lui k1, hi16(Intc.AddrStat) ; ori k1, k1, lo16(Intc.AddrStat)
-        Write32(mem, p, Lui(27, Intc.AddrStat >> 16)); p += 4;
-        Write32(mem, p, Ori(27, 27, Intc.AddrStat & 0xFFFF)); p += 4;
-        // lw k0, 0(k1) ; sw k0, 0(k1)  — read-then-write-back-same-value = ack whatever's pending
-        Write32(mem, p, Lw(26, 27, 0)); p += 4;
-        Write32(mem, p, Sw(26, 27, 0)); p += 4;
-        return p;
     }
 
     /// <summary>
@@ -164,7 +128,7 @@ public static class KernelBootstrap
         // Recovery routine at PhysRecovery:
         //   mfc0 k0, EPC
         //   addiu k0, 4
-        //   mtc0 k0, EPC  
+        //   mtc0 k0, EPC
         //   eret
         // If EPC is also low/bad, jump to a safe spin that waits for IRQ
         uint p = PhysRecovery;
@@ -278,16 +242,4 @@ public static class KernelBootstrap
 
     private static uint Beq(uint rs, uint rt, int offsetInsns) =>
         (0x04u << 26) | (rs << 21) | (rt << 16) | ((uint)offsetInsns & 0xFFFF);
-
-    private static uint Lui(uint rt, uint imm) =>
-        (0x0Fu << 26) | (rt << 16) | (imm & 0xFFFF);
-
-    private static uint Ori(uint rt, uint rs, uint imm) =>
-        (0x0Du << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF);
-
-    private static uint Lw(uint rt, uint rs, int offset) =>
-        (0x23u << 26) | (rs << 21) | (rt << 16) | ((uint)offset & 0xFFFF);
-
-    private static uint Sw(uint rt, uint rs, int offset) =>
-        (0x2Bu << 26) | (rs << 21) | (rt << 16) | ((uint)offset & 0xFFFF);
 }

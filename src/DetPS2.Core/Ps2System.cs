@@ -358,6 +358,21 @@ public sealed class Ps2System : ISchedulable
         // though it's more architecturally correct. Reverted. The finding is real and valuable
         // (concrete confirmation that real IOP-side SIF RPC service handling is the actual next
         // wall — not a maybe) but the code change itself made the boot worse right now.
+        //
+        // RE-TESTED (2026-07-26) with the VBlank/INTC synthesized-vector ack fix in place
+        // (commit bfc8463): got further (syscalls 43->139, PC reached the real SIF-library
+        // polling loop at 0x00480330 instead of deadlocking on semaphore 3) but then stalled
+        // at that poll instead — traced to the ack fix itself: TryDispatchRegisteredIntcHandler
+        // already acks every pending INTC source except VBlankStart on any unhandled dispatch
+        // (deliberately, so busy-poll code can see it stay sticky), and the synthesized vector's
+        // unconditional ack ran immediately afterward on the same fallback path, undoing that
+        // exclusion and clearing VBlankStart out from under the poll on effectively every
+        // interrupt from any other unmasked source. Reverted the vector-level ack (see
+        // KernelBootstrap.cs); with it removed, this experiment reproduces the exact same
+        // px=573440 semaphore-3 deadlock as the original 2026-07-26 attempt — confirming the
+        // semaphore-3 wall is independent of the INTC ack question. Re-disabling this redirect;
+        // falling back to the fake-CRT0 jump below, which remains the better baseline until the
+        // semaphore-3 (real IOP-side SIF worker) wall is separately addressed.
         // Run CRT0 SetupThread/Heap if we haven't (needed for SP)
         if (pc < 0x0011C250)
         {
