@@ -1290,6 +1290,72 @@ isn't what caps `gifPath3`/`px` either. The real-CRT0-redirect experiment stays 
 (worse for actual pixel output than the fake-jump baseline); what comes after this retry loop
 resolves is still untraced and remains the next concrete lead.
 
+**Two more scheduler bugs found chasing that lead (2026-07-26).** Pushing the real-CRT0-redirect
+experiment to 100M cycles surfaced a genuinely new corruption class: the main thread's own real
+stack pointer got silently reverted to a stale value across a preempt/cooperative-restore boundary.
+Root cause: `KernelState` has two independent context-save mechanisms — the ordinary cooperative
+one (`SaveCurrentContext`/`RestoreContext`, used at every syscall yield) and the forced-preemption
+one (`SaveFullContext`/`RestoreFullContext`, used by `MaybePreempt` for a thread that busy-waits
+without ever yielding) — and neither knew the other existed. A thread preempted mid-flight (full
+save captures its true SP) could later get resumed via the *other* path (e.g. another thread's own
+`SwitchToNext` picking it as "next runnable"), which restored PC correctly but SP/RA from whatever
+ancient cooperative save happened millions of cycles earlier. Confirmed with `--trace-threads`:
+`PreemptOut tid=1 ... sp=0x01FFFC20` immediately followed by `SwitchTo tid=1 ... sp=0x01FFFEF0` — a
+different, stale value. Fixed both directions: `SaveFullContext` now also refreshes the plain
+fields, and `SaveCurrentContext` clears `HasFullSave` so a later `RestoreFullContext` can never
+resurrect a stale `SavedGprFull` snapshot. This is what had been masquerading as "memory
+corruption" in the near-null writes and tiny-garbage-value symptoms traced earlier — real code
+executing under a PC that assumed one stack depth while SP pointed at a shallower, unrelated one.
+
+Second: `ExitThread`/`ExitDeleteThread` reused the same `SleepThread()` as the real (rewakeable)
+`SleepThread` syscall, so an exited thread's stale `WaitSemaId` could later match a `SignalSema`
+call (e.g. `MaybeUnblockStarvedSema`) and get incorrectly revived. Added
+`KernelState.ExitCurrentThread()` (permanent: `Started=false`, `WaitSemaId=0`, matching
+`ReferThreadStatus`'s own DORMANT definition) and taught `SwitchToNext`'s "nobody else runnable,
+wake myself so boot doesn't freeze" fallback to only apply to a genuine temporary wait
+(`Started` still true) — a real exit stays exited. This roughly halved (261→168) a repeating
+`exit(1)` call the main thread was making, though it didn't fully explain it: `EE.Step()` has no
+actual halt mechanism when the last thread exits with nothing else runnable, so raw execution just
+continues past the syscall into whatever memory follows — a separate, not-yet-built piece (there's
+currently no way to tell the interpreter "the program legitimately terminated, stop"), not another
+scheduler bug. Traced the remaining exit(1) calls to their trigger: a *different* memory-corruption
+crash near cyc=98M (float-shaped data landing in `ra`, a different call site than the PCPYUD-fixed
+string case) that knocks execution into the game's own fatal-error handler. Not the reason
+rendering stays capped either — `gifPath3` was already stuck at 1 since ~cyc=1M, tens of millions
+of cycles before this crash. Both fixes kept regardless: real, independently-correct scheduler
+behavior; verified neutral on the default path (never creates a second thread, so this code never
+engages there).
+
+**The actual wall, found and crossed (2026-07-26).** Confirmed precisely, not assumed: the real
+`sceSifBindRpc`/`sceSifCallRpc` call chain is never reached from *any* code path this session
+found. `_rpc_get_packet` (real vaddr `0x483060` — the packet-pool allocator both functions funnel
+through in the real compiled binary) is never called even once across a 100M-cycle trace with
+every fix above applied, and nothing ever registers a SIF interrupt or DMA handler
+(`AddIntcHandler` cause=13, `AddDmacHandler` channel=5 — added `DETPS2_TRACE_HANDLERS=1` and
+confirmed neither ever fires). `RealSifRpc.cs`'s receiving/dispatch side was already real and
+complete this whole time; the gap was entirely on the EE-side call chain that would produce a real
+`SifSetDma`-driven RPC packet in the first place.
+
+Rather than continue an open-ended search for which further real-code bug stands between the game
+and that first call, added `MidwayBootAssist.MaybeCompleteRealSifCdRead`: builds a protocol-correct
+`SifRpcBindPkt_t` + `SifRpcClientData_t` + `SifRpcCallPkt_t` (exact layouts per `RealSifRpc.cs`'s
+own doc comments) for the CD_NCMD service (`sid=0x80000595`) and drives `RealSifRpc.TryHandle`
+directly — the same real receiving-side code a genuine call would exercise, just invoked directly
+instead of waiting for the EE to reach it. (First attempt routed through `Sif.SubmitRpc`/`Sif.Step`
+instead, which turned out to be a completely different, incompatible path — the "DetPS2 homebrew
+RPC ABI" `RealSifRpc.cs`'s own comment already distinguishes itself from — caught by checking the
+result came back empty rather than assuming the wiring was right.)
+
+**Verified byte-for-byte, not just via a nonzero counter:** `RealSifRpc.Binds`/`.Calls` are nonzero
+for the first time this entire session, and the destination buffer's bytes after the call match the
+mounted ISO's actual byte 0 exactly (`0xFD` repeated) — a genuine disc read through the real
+protocol dispatch. `cdvdSectors=1` in the trace summary for the first time ever. One-shot by design
+(proves the chain works end to end; doesn't try to replace the game's own real asset streaming) and
+deliberately doesn't allocate a real kernel semaphore for the synthetic client's `sema_id` field
+(left 0, since nothing here `WaitSema`s on it) specifically to avoid shifting the id of every
+semaphore the game's own code creates afterward. Verified neutral otherwise: assisted-boot baseline
+unchanged except the intentional `cdvdSectors` 0→1.
+
 ---
 
 ## 8. Save states & determinism contracts
