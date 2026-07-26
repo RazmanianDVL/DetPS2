@@ -158,7 +158,12 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     foreach (var a in args)
         if (a.StartsWith("--watch-after=") && ulong.TryParse(a.AsSpan(14), out var wa)) watchAfter = wa;
     foreach (var a in args)
-        if (a.StartsWith("--pcbreak=")) EmotionEngine.PcBreakGpr = Convert.ToUInt32(a.Substring(10), 16);
+        if (a.StartsWith("--pcbreak="))
+        {
+            var pcbParts = a.Substring(10).Split(':');
+            EmotionEngine.PcBreakGpr = Convert.ToUInt32(pcbParts[0], 16);
+            EmotionEngine.PcBreakEnd = pcbParts.Length > 1 ? Convert.ToUInt32(pcbParts[1], 16) : (uint?)null;
+        }
     if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
     if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
     if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;

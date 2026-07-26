@@ -70,6 +70,15 @@ public sealed class EmotionEngine : ISchedulable
     /// <summary>Diagnostic-only: logs v0/v1/ra to stderr every time PC hits this address.
     /// Opt-in via blocker-trace --pcbreak=ADDR; null (default) costs one branch per Step().</summary>
     public static uint? PcBreakGpr;
+    /// <summary>End of an inclusive PC range for PcBreakGpr (opt-in via --pcbreak=START:END) —
+    /// dumps registers at EVERY instruction in the range, not just one address, so a loop's
+    /// register state can be seen evolving instruction-by-instruction instead of only at one
+    /// fixed point per iteration. Built specifically because --trace-chrono shows opcodes with
+    /// no register state and single-address --pcbreak shows register state at only one PC per
+    /// iteration — neither alone is enough to resolve a step-by-step register-flow question (see
+    /// DEVELOPER_GUIDE.md §7.4, the material-string self-overlapping-copy investigation).
+    /// Null (default) means single-address mode, matching the original behavior exactly.</summary>
+    public static uint? PcBreakEnd;
 
     /// <summary>MMI "pipeline 1" HI/LO — real R5900 HI/LO are 128-bit registers; regular
     /// MULT/DIV/MADD use the lower 64 bits (HI/LO above), MULT1/DIV1/MADD1/MFHI1/MTHI1/
@@ -381,8 +390,9 @@ public sealed class EmotionEngine : ISchedulable
                 SystemMemory.CurrentCycleForWriterLog = cyc;
             }
             if (KernelState.TraceThreads) KernelState.CurrentCycle = cyc;
-            if (PcBreakGpr.HasValue && PC == PcBreakGpr.Value)
-                Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} " +
+            if (PcBreakGpr.HasValue && PC >= PcBreakGpr.Value && PC <= (PcBreakEnd ?? PcBreakGpr.Value))
+                Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} a3=0x{GetGpr(7).Lo:X} " +
+                    $"t0=0x{GetGpr(8).Lo:X} t1=0x{GetGpr(9).Lo:X} t2=0x{GetGpr(10).Lo:X} " +
                     $"s0=0x{GetGpr(16).Lo:X} s1=0x{GetGpr(17).Lo:X} s2=0x{GetGpr(18).Lo:X} s3=0x{GetGpr(19).Lo:X} sp=0x{GetGpr(29).Lo:X} ra=0x{GetGpr(31).Lo:X} " +
                     $"COP0_Status=0x{COP0_Status:X8} COP0_Cause=0x{COP0_Cause:X8} InterruptPending={InterruptPending} takeExceptions={_takeExceptions} cyc={cyc}");
             _branchWasLikely = false;
