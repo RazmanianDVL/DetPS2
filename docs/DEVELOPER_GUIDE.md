@@ -840,9 +840,22 @@ live index-multiply result — it's a value read back from a stored struct field
 meaning something wrote this garbage into memory further upstream, at some earlier point not yet
 traced. The MULT/MMI fixes above did not change this specific occurrence at all (byte-identical
 `cyc`/`px`/hit-count before and after), confirming it's a genuinely different root cause, not a
-residual case of the same bug. Next step: `--watch` on the exact struct field address (`a0+32` at
-the call site, `0x0026CAAC`) to find what write populates it, working backward from there — the
-same technique that found both fixes above.
+residual case of the same bug.
+
+**One layer further, traced same day**: `--pcbreak=0x0026CA9C` shows `a0=0x0` on every hit — the
+pool function is being called with a **null** object pointer, and `lw s0, 32(a0)` at `0x0026CAAC`
+then reads whatever garbage happens to live at physical `0x20` (extremely low RAM) as if it were a
+real array-base pointer. `a0` isn't set locally in this function; disassembling the caller
+(`0x0024DBC0`-`0x0024DC9C`) shows it's freshly reloaded from a fixed global slot,
+`lui v0,0x4F; lw a0,-364(v0)` → address `0x004EFE94`, right before nearly every sub-call in this
+routine — and that slot holds `0` at `cyc≈29.77M`. This strongly resembles the *already-documented*
+`MidwayBootAssist` forced-jump saga above (Bug A and the "resolved" analysis further down): if some
+earlier init routine is responsible for populating `0x004EFE94` and that routine's execution gets
+abandoned mid-flight the same way `sceSifBindRpc`/`_rpc_get_packet` were shown to be, this would be
+the exact same failure family wearing a different face, not a fourth independent bug. **Not
+confirmed** — would need `--watch=0x4EFE94` (or the equivalent virtual address) across the full run
+to find whether *anything* ever writes it, and if so, whether that write's own execution path gets
+cut short the same way. Next session should start there rather than re-deriving this trace.
 
 ---
 
