@@ -2338,6 +2338,52 @@ title while Shaolin Monks remains the stated priority.
 No source changes this entry — read-only investigation across all three titles, plus one corrected
 (retracted) theory.
 
+**Follow-up, same day — four more genre-sibling reference titles (Vexx SLUS_203.83, Haven: Call of
+the King SLUS_205.17, Blood Omen 2 SLUS_200.24, Whiplash SLUS_206.84), same 3D-action genre as
+Shaolin Monks, added specifically to find genre-level similarities.** All four run through pure
+general emulation (no `GameQuirkRegistry` entry for any). Quick-checked each:
+
+- **Vexx**: by far the healthiest boot seen this whole investigation — `binds=62` real SIF
+  binds, heavy real `SifSetDma` traffic (`0x77` x94), substantial semaphore churn
+  (`CreateSema`/`DeleteSema` ~150 each). One `unknownBindSids` hit: SID `0x00000592` — note this is
+  NOT the already-known `SidCdBase=0x80000592` (`RealSifRpc.cs`) despite sharing the same low 16
+  bits; it's missing the `0x80000000` Sony-reserved prefix entirely, so it's very likely a
+  genuine custom/game-defined IOP service, not a masking bug in our own bind-comparison code
+  (verified: `HandleBind` compares the raw, unmasked 32-bit `sid` directly, no truncation). Not
+  investigated further — would need to know what Vexx's own custom service actually does to
+  handle it meaningfully, and guessing would be exactly the speculative-fix pattern this file
+  warns against.
+- **Haven**: looked stuck at 10M cycles (`PC` pinned inside a real bit-stream decompressor — a
+  classic bit-shift-and-test-carry unpacking loop, completely ordinary code, not a bug) but by
+  250M cycles reaches real syscalls (72), a real thread, real SIF traffic. Same "just needed more
+  cycles" pattern as Burnout 3 in the previous entry — decompressing whatever this is legitimately
+  takes tens of millions of cycles before real boot code runs.
+- **Blood Omen 2** / **Whiplash**: both show ordinary, healthy early-boot activity (real threads,
+  real syscalls, no obvious stalls) — not traced further this pass.
+- Also flagged, not implemented: `Haven`'s CRT0 executes a real REGIMM extension, `MTSAH`
+  (`rt=0x19`), which `EmotionEngine.ExecuteRegimm` doesn't implement (falls through as a silent
+  no-op — it only handles the 8 real branch `rt` values 0x00-0x03/0x10-0x13). `MTSAB`/`MTSAH` set
+  the R5900's SA (shift-amount) register that `QFSRV` (the quadword-granularity cousin of
+  LWL/SDL's word/dword unaligned-access problem) consumes — same bug *family* as the session's
+  biggest fix, potentially comparably valuable. **Deliberately not implemented this entry**: this
+  codebase's own `tbl_MMI` comment states it's verified against PCSX2's real opcode tables, and
+  that table has no free slot matching remembered candidates for QFSRV's real encoding — meaning
+  implementing `MTSAB`/`MTSAH` alone (without a correctly-encoded `QFSRV` to consume the SA
+  register) would add code that fixes nothing observable, and guessing `QFSRV`'s opcode wrong
+  risks live-locking or silently misdecoding some currently-correct instruction. Needs the same
+  authoritative-ISA-reference verification the LWL-family fix got before attempting.
+
+**Net takeaway for Shaolin Monks specifically**: none of these four genre siblings hit anything
+resembling Shaolin Monks' current text-layout-loop stall within the cycle ranges checked — all
+four reach real syscalls, real threads, and real SIF traffic noticeably faster and more
+extensively than Shaolin Monks does even after today's three fixes. This is a useful negative
+result: it suggests Shaolin Monks' remaining wall is more likely something specific to its own
+code/assets than a still-missing general architecture piece that would also be blocking these
+siblings — recalibrating priority toward directly continuing the text-layout loop trace (§7.6's
+last entry) rather than expecting another cross-title-style general fix to resolve it.
+
+No source changes this entry — read-only investigation across all four titles.
+
 ---
 
 ## 8. Save states & determinism contracts
