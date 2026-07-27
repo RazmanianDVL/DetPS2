@@ -434,6 +434,10 @@ public sealed class EmotionEngine : ISchedulable
                 }
                 Console.Error.WriteLine($"[MSGBUF] v1=0x{bufAddr:X8} cyc={CurrentCycle()} msg=\"{sb}\"");
             }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x004767B8)
+            {
+                Console.Error.WriteLine($"[MSGBUF-A0] a0=0x{GetGpr(4).Lo:X16} cyc={CurrentCycle()} ra={GetGpr(31).Lo:X8}");
+            }
 
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
