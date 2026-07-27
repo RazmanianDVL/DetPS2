@@ -710,6 +710,33 @@ public sealed class EmotionEngine : ISchedulable
             case 0x08: // JR — ignore jumps into low/vector page (uninitialized fptrs)
                 {
                     ulong t = GetGpr(rs).Lo;
+                    // `jr ra` (rs=31) with a target of EXACTLY 0 is not garbage to mask away
+                    // silently -- it's KernelState.RestoreContext's own documented convention
+                    // (see its "$ra = 0 so ExitThread path is clean" comment): a freshly-started
+                    // thread's ra is deliberately seeded to 0 so that a thread function naturally
+                    // returning (instead of calling ExitThread itself) can be detected as an
+                    // implicit exit. That detection was never actually wired up anywhere -- the
+                    // return just silently fell through into whatever code follows in memory,
+                    // including, confirmed via Mortal Kombat: Shaolin Monks, an entire table of
+                    // syscall trampolines each firing a real, unintended syscall as a side effect
+                    // (see docs/DEVELOPER_GUIDE.md's SifBindRpc-investigation follow-ups). Honor
+                    // the documented convention for real instead of masking its symptom.
+                    if (rs == 31 && t == 0 && _hle != null)
+                    {
+                        int exitingTid = _hle.Kernel.CurrentThreadId;
+                        _hle.Kernel.ExitCurrentThread();
+                        // Sets HleRedirectPc to the next runnable thread's entry (bypassing this
+                        // jr's own delay slot, which belongs to the exiting thread and must not
+                        // execute). If no other thread is runnable this is a harmless no-op and
+                        // execution falls through exactly as it did before this fix -- the
+                        // thread's Started/Sleeping state is still correctly marked exited for any
+                        // other code checking it, even though the CPU itself can't be halted (a
+                        // separate, already-documented limitation, not made worse here).
+                        bool switched = _hle.Kernel.SwitchToNext(this);
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_JREXIT") == "1")
+                            Console.Error.WriteLine($"[JREXIT] pc=0x{PC:X8} tid={exitingTid} switched={switched} newPc=0x{(switched ? HleRedirectPc ?? 0 : 0):X8} cyc={CurrentCycle()}");
+                        return false;
+                    }
                     // Guard entire low 64KB (vectors + trap + recovery), not just 4KB
                     if ((t & 0x1FFFFFFFUL) < 0x10000UL && !IsLegitimateVectorTarget(t))
                     {
