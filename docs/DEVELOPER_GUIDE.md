@@ -2935,6 +2935,60 @@ now, not general kernel/threading HLE.
 
 ---
 
+**2026-07-27 (continued) — one more real interrupt-storm fix (VBlankStart), then confirmed the
+system has reached a genuinely clean, healthy steady state — not a bug.** `--trace-threads` showed
+what looked like a second livelock (`ForcePreempt` ping-ponging threads 1/2 at an apparently frozen
+cycle count, e.g. `cyc=43416704` repeated for dozens of consecutive Preempt events). Added
+`DETPS2_TRACE_IRQLOOP` (counts consecutive interrupt-dispatch re-entries with no real instruction
+execution in between) to check whether this was a genuine zero-progress loop. It wasn't quite — but
+tracing it found a second instance of the DMAC-channel-5 storm's root pattern: **VBlankStart**
+(`pending=0x0004` consistently) re-firing roughly every 64-676 cycles for the rest of the run,
+because `TryDispatchRegisteredIntcHandler`'s own no-handler-found fallback deliberately excluded
+VBlankStart from auto-ack — a design meant to protect a game doing "busy-poll INTC_STAT with COP0
+interrupts masked off," which turns out to be structurally impossible to encounter at that exact
+call site: `Intc.GetPendingInterrupts()` (`Stat & Mask`) is already filtered by INTC's own
+per-source mask, and the method itself is only reached when COP0-level `_takeExceptions &&
+InterruptPending` was already true (the literal opposite of "masked off"). Removed the exclusion
+(`EmotionEngine.cs`).
+
+Verified: smoke suite green, 5M-cycle `px` unchanged, PC profiler shows the interrupt vector
+(`0x80000200`) drop out of the top-20 hotspots entirely. Re-ran `--trace-threads` afterward and
+found the earlier "livelock" was a **diagnostic artifact, not a real bug**: `MaybePreempt` runs on
+*every* `Step()` loop iteration (line 366, before the interrupt-dispatch branch), but
+`KernelState.CurrentCycle` — the timestamp `LogThreadEvent`/`--trace-threads` actually prints — is
+only stamped much later (line 418), reached *only* when execution falls through past the
+interrupt-dispatch `continue`. During a stretch where many consecutive iterations hit that branch,
+the printed timestamp simply stops advancing even though `_cyclesSinceLastPreempt` (a separate,
+per-call counter) keeps ticking and firing real switches — so the log shows the same `cyc` value
+dozens of times even though the underlying `MaybePreempt` calls are real and distinct. Confirmed
+with `DETPS2_TRACE_IRQLOOP` at the exact same point post-fix: `streak=1` always, `pending`
+alternates between real combinations of sources, `pc` visits dozens of distinct addresses, and
+`cyc` advances cleanly in ~250,000-cycle increments matching a *realistic* VBlank period (vs. the
+pre-fix ~64-676 cycle storm) — genuine, healthy, diverse forward progress, not a freeze.
+
+**Final state after this whole investigation's fixes**: ran to 3 billion cycles (~10 real seconds
+of PS2-hardware time) — `syscalls` and `px` are byte-for-byte identical to the 250M-cycle
+checkpoint; `spu2Samples` keeps growing correctly (continuous per-VBlank audio processing, exactly
+what a real idle/menu screen with background music would do). `probe-frame`'s own Start-button
+heuristic still produces no observable change even with every fix from today applied. This is
+a **clean, properly-paced idle steady state**, not a corruption or livelock — the system now
+behaves the way a real PS2 would if a game reached its title/menu screen and controller input
+simply isn't reaching whatever code polls for it. That's a **new, distinct investigation** (pad/
+SIO2 HLE reaching game input-polling logic), not a continuation of anything fixed today.
+
+**Session tally (2026-07-27, this whole thread)**: 9 real bugs found and fixed, all independently
+verified (smoke suite + `px` baseline unchanged at every step): the `ra=0` corruption cascade
+(false positive in `UnstickSifWaits`'s own guard), the sif-init wait handler never firing due to
+sampling misalignment, the sif-init wait's sawtooth (nudged instead of durably satisfied),
+`KickCommercialWorker` being fully-implemented dead code, `WakeupThread(0)` being a permanent
+no-op, a DMAC-channel-5 INTC-ack gap, missing `WaitEventFlag` blocking semantics (plus a follow-up
+bug in its own auto-create path), a scheduler self-check bug in `FindNextRunnable`, and the
+VBlankStart INTC-ack gap. Every one of these is a real, general emulation bug — none required a
+Shaolin-Monks-specific hack — directly matching the project's standing hypothesis that fixes found
+via this one title's boot path have broad value across the library.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
