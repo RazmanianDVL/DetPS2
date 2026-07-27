@@ -3521,6 +3521,19 @@ not yet explored this investigation, and the most promising concrete next step: 
 `EnterException`/`GetExceptionVector`/`ExecuteEret` for any path whose target computation could,
 under some COP0 state, produce `0x00475BA8`/`0x00476808` by accident rather than by design.
 
+**Checked immediately, came back clean**: `GetExceptionVector` returns one of four fixed constants
+(`0x80000000/0x80000180/0xBFC00200/0xBFC00380`, selected only by `BootExceptionVectors` and
+general-vs-specific) — nowhere near `0x00475BA8`/`0x00476808`, no dynamic computation that could
+misfire into game-code addresses. Not the direct mechanism. One thing worth flagging for whoever
+continues, spotted while reading this code but not yet chased down: `EnterException` unconditionally
+overwrites `COP0_EPC = PC` on *every* call, with no check for whether `COP0_Status`'s EXL bit is
+already set — i.e. no distinction between a fresh exception and a **nested** one while still inside
+an earlier, not-yet-`eret`'d exception. Real MIPS hardware routes a nested exception to `ErrorEPC`
+instead in that case; this code always uses the same field, which could lose an outer exception's
+real return address if a nested one ever fires before the first `eret`. Not confirmed to explain
+`ra=0` (nothing here touches `$ra`, and the specific PC-misdirection theory above didn't pan out),
+but a related-looking gap worth understanding rather than assuming benign.
+
 ---
 
 ## 8. Save states & determinism contracts
