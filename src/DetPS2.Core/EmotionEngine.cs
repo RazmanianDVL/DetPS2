@@ -534,7 +534,7 @@ public sealed class EmotionEngine : ISchedulable
             if (!found) continue;
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
-                Console.Error.WriteLine($"[INTC_DISPATCH] src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
+                Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
@@ -559,6 +559,32 @@ public sealed class EmotionEngine : ISchedulable
                     _intc.Acknowledge((Intc.InterruptSource)src);
         return false;
     }
+
+    /// <summary>
+    /// The JR/JALR "ignore jumps into the low vector page" guard masks off the kernel-segment
+    /// prefix before comparing against 0x10000 -- deliberately, so it catches BOTH a raw
+    /// near-zero garbage pointer (0x0, 0x400, ...) and the KSEG0-mirrored equivalent (0x80000000,
+    /// 0x80000400, ...) uniformly, since genuinely uninitialized memory can read as either shape.
+    /// But that same masking also catches the real, intentional KSEG0 exception vectors
+    /// (0x80000000/0x80000180/0x80000200 -- see KernelBootstrap's own constants) whenever code
+    /// legitimately jumps there, e.g. TryDispatchRegisteredIntcHandler deliberately points a
+    /// dispatched handler's `ra` at 0x80000200 so its own `jr ra` epilogue lands back on the
+    /// vector's `eret`. Without this exclusion, THAT jump gets silently swallowed by the same
+    /// guard it was relying on: the handler's `jr ra` becomes a no-op, `eret` never runs, EXL
+    /// never clears, and `_savedRaAcrossIntcDispatch`'s pushed value never gets popped -- COP0
+    /// stays permanently "mid-exception" and every later `jr`/`jalr` elsewhere in the program
+    /// keeps landing back in the vector page too (since InterruptPending is now permanently
+    /// blocked by the stuck EXL, so no *new* exception ever re-establishes a fresh EPC/ra
+    /// either). Confirmed via Mortal Kombat: Shaolin Monks: this exact sequence explained a
+    /// stale `ra=0x80000200` observed 38M cycles after the dispatch that set it, at the real,
+    /// legitimate exit(1) call this session's SifBindRpc investigation ultimately traced to (see
+    /// docs/DEVELOPER_GUIDE.md's "next wall" entry). These three addresses are OUR OWN
+    /// synthesized vector locations (KernelBootstrap.InstallExceptionVectors), not something a
+    /// game could coincidentally produce as garbage, so excluding exactly them (rather than
+    /// broadly loosening the guard) keeps its original uninitialized-pointer protection intact.
+    /// </summary>
+    private static bool IsLegitimateVectorTarget(ulong t) =>
+        t is KernelBootstrap.Kseg0Tlb or KernelBootstrap.Kseg0Common or KernelBootstrap.Kseg0Interrupt;
 
     private bool ExecuteInstruction(uint opcode)
     {
@@ -672,7 +698,7 @@ public sealed class EmotionEngine : ISchedulable
                 {
                     ulong t = GetGpr(rs).Lo;
                     // Guard entire low 64KB (vectors + trap + recovery), not just 4KB
-                    if ((t & 0x1FFFFFFFUL) < 0x10000UL)
+                    if ((t & 0x1FFFFFFFUL) < 0x10000UL && !IsLegitimateVectorTarget(t))
                     {
                         if (TraceJrGuard)
                             Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping");
@@ -685,7 +711,7 @@ public sealed class EmotionEngine : ISchedulable
                 {
                     ulong t = GetGpr(rs).Lo;
                     if (rd != 0) SetGpr(rd, new Gpr128 { Lo = PC + 8 });
-                    if ((t & 0x1FFFFFFFUL) < 0x10000UL)
+                    if ((t & 0x1FFFFFFFUL) < 0x10000UL && !IsLegitimateVectorTarget(t))
                     {
                         if (TraceJrGuard)
                             Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping (jalr)");
