@@ -973,19 +973,31 @@ public sealed class EmotionEngine : ISchedulable
                     // (see docs/DEVELOPER_GUIDE.md's SifBindRpc-investigation follow-ups). Honor
                     // the documented convention for real instead of masking its symptom.
                     //
-                    // Excludes thread 1: KernelHle.cs creates it synthetically at construction
-                    // (Started=true from the start, Entry=0) and it never goes through a real
-                    // StartThread/RestoreContext cycle -- the ONLY thing that deliberately seeds
-                    // ra=0 as an exit signal. Its ra=0 is just the raw CPU boot-state default,
-                    // unwritten because crt0 reaches this point via a chain of pure tail-jumps
-                    // with zero real `jal` calls yet, not a genuine "this thread's top-level
-                    // function returned" signal. Confirmed live (2026-07-27): applying this check
-                    // to thread 1 fired at cyc=1,350,000 -- far too early for the game's real main
-                    // thread to legitimately finish -- inside an ordinary, widely-reused syscall
-                    // trampoline (0x00480260) that returns to a perfectly real address on every
-                    // OTHER call; permanently freezing the EE right there (no other thread existed
-                    // yet to switch to) traded the original crash for an even earlier, silent hang.
-                    if (rs == 31 && t == 0 && _hle != null && _hle.Kernel.CurrentThreadId != 1)
+                    // Previously excluded thread 1 here (CurrentThreadId != 1), on the theory that
+                    // its ra=0 could only ever be the raw, never-overwritten CPU boot-state default
+                    // (KernelHle.cs creates thread 1 synthetically -- Started=true from
+                    // construction, Entry=0 -- so it never goes through a real StartThread/
+                    // RestoreContext cycle, the only thing that deliberately seeds ra=0 as an exit
+                    // signal). That exclusion was itself wrong: live-traced (2026-07-27, Mortal
+                    // Kombat: Shaolin Monks) a REAL, later occurrence of `jr ra` with ra==0 on
+                    // thread 1 at cyc≈28.5M -- deep into real execution, nowhere near boot, loaded
+                    // straight from a saved stack slot by a completely ordinary function epilogue.
+                    // With the exclusion in place, that fell through (see the JR-guard below) into
+                    // whatever code happened to follow in memory -- confirmed via
+                    // DETPS2_TRACE_JRGUARD to cascade through 40,000+ instructions including an
+                    // entire table of unrelated syscall trampolines, each firing a real, unintended
+                    // syscall, before coincidentally landing on the game's own fatal-error path and
+                    // triggering an `Exit(1)` that had nothing to do with any real error condition
+                    // -- a symptom of this exact garbage-execution bug class, not a real game panic.
+                    // Removing the exclusion avoids all of that: DETPS2_TRACE_JRGUARD shows zero
+                    // fallthrough events across the same run, and DETPS2_TRACE_JREXIT shows the
+                    // ra==0 case at cyc=1,350,000 (the same point that motivated the original
+                    // exclusion -- see docs/DEVELOPER_GUIDE.md) now genuinely stalls, then recovers
+                    // and reaches real, clean code well past where the old exclusion's replacement
+                    // theory assumed it would freeze forever. Verified via the full 9-title
+                    // `user-media.json`: identical results for every other title, so this wasn't
+                    // covering for some other thread-1-specific need elsewhere.
+                    if (rs == 31 && t == 0 && _hle != null)
                     {
                         int exitingTid = _hle.Kernel.CurrentThreadId;
                         _hle.Kernel.ExitCurrentThread();

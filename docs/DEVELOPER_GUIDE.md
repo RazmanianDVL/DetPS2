@@ -3627,16 +3627,55 @@ compiler. Concrete next step for whoever continues: `--find-word` scan for the e
 immediate-pair encodings of `0x5ae388`/`0x5d1`/`0x5ae3b0` to find every real call site by raw bytes
 rather than relying on Ghidra's reference graph a second time.
 
-**What this really means for playability**: `util_zlib.cpp` is the *game's own* bundled zlib (not
-anything DetPS2 emulates specially — confirmed via `grep -rn zlib src/DetPS2.Core`, nothing there
-touches game-facing decompression). A zlib assertion firing this deep into boot most plausibly means
-the compressed data DetPS2 is delivering to the game (via CDVD sector reads, SIF/IOP transfers, or
-some intermediate buffer) is subtly wrong — truncated, misaligned, or corrupted — by the time the
-game's own decompressor gets it. That's a concrete, scoped, and very plausibly fixable target (CD
-read path / DMA transfer correctness) rather than the open-ended "wild pointer somewhere" dead end
-the `ra=0` framing had become. Not yet traced to a specific DetPS2 subsystem — the next real step is
-finding what buffer the failing `inflate()`-equivalent call was decompressing and where DetPS2 last
-wrote to it (`--track-writers`/`--find-writer=` on that buffer address once found).
+**Correction, same session — the zlib string was a real red herring, not the cause.** Chasing "what
+calls the assert" further: `--pcbreak` on `0x00476808` itself (the abort/`Exit(1)` wrapper) caught
+the real, immediate caller's `$ra` — and it was **`0`**, not a valid return address. Ground-truth
+`disasm` (not Ghidra, which is untrustworthy for this address — see above) of the instructions
+immediately preceding `0x00476808` showed why: `0x004767F4: jr ra` (a completely ordinary function
+epilogue, `$ra` freshly loaded from its saved stack slot two instructions earlier) with `$ra==0`,
+hitting the exact same "ignore near-zero jump, fall through instead" guard documented at
+`IsLegitimateVectorTarget` — except this time on **thread 1**, which had been deliberately *excluded*
+from the genuine implicit-exit-stall mechanism since the thread-1 fix earlier this session (§7.6).
+Excluded from the real handling, this `jr ra` silently became a no-op and execution walked forward
+through raw memory instead — `DETPS2_TRACE_JRGUARD` confirmed **40,001** such fallthrough events
+before the crash, including a long cascade through an entire table of syscall trampolines (each
+firing a real, unintended syscall as a side effect — exactly the failure mode the original,
+non-thread-1 version of this fix was built to prevent), before coincidentally colliding with
+`FUN_00476808` purely because of where that walk happened to end up in memory. **The
+`util_zlib.cpp:1489` message was real data that genuinely got formatted and printed (traced
+end-to-end, ground truth) — but the `Exit(1)` it fed into was never a real zlib panic. It was
+another instance of the exact bug class fixed twice already this session (§7.6, §7.7): thread 1
+silently executing garbage instead of genuinely stalling.**
+
+**Real fix**: removed the `CurrentThreadId != 1` exclusion entirely (`EmotionEngine.cs`, the `JR`
+case). The original exclusion was based on a since-disproven premise — that thread 1's `ra==0` could
+only ever be the raw, never-overwritten CPU boot-state default. Live data now shows thread 1 reaching
+a **second, later, genuine** `ra==0` deep into real execution (cyc≈28.5M, loaded from a real stack
+slot by ordinary code, nothing to do with boot). Verified via `git stash`-style A/B and the full
+9-title `user-media.json`:
+- **Zero regressions**: every other title's `px`/`syscalls` at 5M cycles are byte-identical with the
+  fix in place; only Shaolin Monks changes (`syscalls` 122→113 — fewer, because the spurious
+  trampoline-storm syscalls are gone).
+- **No garbage cascade**: `DETPS2_TRACE_JRGUARD` shows **zero** fallthrough events across the whole
+  run with the fix applied (was 40,001 without it).
+- **No crash**: `exitRequested` stays `False` all the way out to 900M cycles (was `True`/`exitCode=1`
+  at ≈28.5M before).
+- **Genuine, stable new resting point**: PC settles at `0x00212DD0` — ground-truth `disasm` shows a
+  real, clean function entry (object/resource-registration-looking code, repeated calls to
+  `0x0020F058` with sequential-looking IDs) — and stays there, unmoving, from 5M cycles out to at
+  least 900M, while `spu2Samples` keeps growing (IOP/audio still ticking) and `px`/`syscalls`/`dmac`
+  stay exactly frozen. This is the new frontier for whoever continues: almost certainly a real
+  blocking wait (semaphore/event-flag/VBlank) that our HLE isn't satisfying, not another garbage-
+  execution artifact (confirmed clean via the zero-`JRGUARD` check above).
+
+**One loose end flagged, not chased down**: the stall-retry path in `Step()` (`if
+(_pendingThreadStall) { ...SwitchToNext(this)...}`) calls `SwitchToNext` with its default
+`fromSyscall: true` even though this call site is *not* a syscall — `SaveCurrentContext` then always
+computes `SavedPc = ee.PC + 4`, arguably wrong outside a real syscall context. `--trace-threads`
+shows an enormous number of these calls (3.65M `SaveOut` events in a 5M-cycle run) before thread 1
+eventually recovers from the cyc=1,350,000 stall — real inefficiency, and worth understanding
+properly before relying on `SavedPc` values from this path for anything precise, but not something
+this session chased further since it didn't block verifying the fix's own correctness.
 
 ---
 
