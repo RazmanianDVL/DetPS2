@@ -3291,6 +3291,72 @@ string there first and didn't. That's a caller-side stack-frame/data-flow questi
 caller (likely by finding what local variable this stack slot corresponds to in whatever function
 owns frame `sp≈0x01FF0120`) and what condition should have populated it.
 
+**Follow-up, same session: confirmed it's stale reused stack memory, not truly-never-written
+memory.** `--find-writer=01FFB6E0:20` (the last-writer index — see §10) shows the region genuinely
+was written once: `cyc=1,844,224`, `pc=0x004860A8`, matching exactly the bytes seen at the crash
+(`0x9C545D18`, `0x00008000`, …). But `0x004860A8` disassembles to a completely generic word-copy
+loop (`lw v1,0(a1); a1+=4; sw v1,0(a0); a0+=4; loop` — the SDK's `memcpy`), called from all over the
+program for unrelated purposes. So the real shape of the bug is: **some `memcpy` call, 26.7M cycles
+earlier and for an entirely unrelated purpose, happened to target this exact stack address as its
+destination; the address has been stack space belonging to some other, long-since-returned function
+ever since; and the bracket-scanner's caller at `cyc≈28.5M` is reading it as fresh input without
+ever writing its own data there first.** The address itself is suspicious: `0x01FFB6E0` is roughly
+`0xB5C0` (~46.5KB) *above* the crash-time `$sp` (`0x01FF0120`) — far too large an offset to be an
+ordinary local within one function's own small stack frame. Stacks grow downward on MIPS, so a much
+larger address than the current `$sp` sits *shallower* in the call stack, close to where the
+thread's stack was first set up — consistent with this being a pointer into a large scratch/work
+buffer allocated once, early, near the thread's own top-level frame, and passed down through many
+levels of nested calls rather than a normal per-function local.
+
+**Not yet found**: the specific instruction that computes this pointer and hands it to the
+bracket-scanner without first populating it — i.e. the actual C-level bug. Tracing it further needs
+either symbol/debug info this build doesn't have, or a purpose-built diagnostic that catches the
+*first* write to a1's target address relative to *this specific call*, not the whole program's
+last-writer history (which only shows the closest, but structurally irrelevant, memcpy).
+
+**Important reframing, same session**: `scanword` for the bracket-scanner's own address
+(`0x004766B8`), both as a `jal`/`j` call-target encoding *and* as raw data (a function-pointer-table
+entry), found **zero hits** — nothing anywhere in the loaded image calls it or references its
+address at all, despite it clearly executing in every trace captured. Combined with it sitting
+directly after the 800-byte-frame formatter's own epilogue (`0x004766A0-B4`, `0x00475BA8`'s own
+`jr ra`/`addiu sp,sp,800`), the most likely explanation is that **`0x004766B8` isn't a separate,
+externally-called function at all** — it's an internal continuation of `0x00475BA8`'s own body,
+reached via an ordinary internal conditional branch from somewhere earlier in that same function,
+not a distinct callee. That reframes the real entry point to trace as `0x00475BA8` itself (already
+instrumented — `[FMTENTRY]`, `DETPS2_TRACE_MSGBUF=1`) rather than continuing to look for "the
+bracket-scanner's caller," which may not exist as a separate concept. `[FMTENTRY]` shows zero hits
+anywhere near the `cyc≈28.5M` crash (only the two original hits near `cyc≈19.7M` from before this
+session even started) — worth checking directly next: whether this is genuinely the same,
+still-unreturned invocation from `cyc≈19.7M` continuing internally all this time (unlikely across
+~8.8M cycles and thousands of intervening syscalls, but not yet ruled out), or whether `[FMTENTRY]`
+itself is somehow missing a real second entry.
+
+**Resolved, same session**: a full disassembly of `0x00475BA8`'s body (`0x00475DA8` through
+`0x00476750`, previously only read in ~0x200-byte fragments) found the real answer.
+`0x004766A0-B4` shares the *exact same 800-byte stack frame size* as `0x00475BA8`'s own entry
+(`addiu sp,sp,-800`) — it's not a different function's epilogue, it's **`0x00475BA8`'s own normal
+return path**. And `0x004766B8` (the "bracket-scanner") is called from exactly one place, found by
+recomputing the `jal` encoding correctly this time (an earlier `scanword` pass in this same session
+mistakenly searched for the raw address as data instead of the encoded instruction — always
+encode the target as `0x0C000000 | ((target>>2) & 0x03FFFFFF)` before scanning, per §10's own
+`scanword` documentation): `0x00475E38: jal 0x004766B8`, itself inside `0x00475BA8`'s own body.
+So the entire chain — bracket-scanner, message-builder, abort wrapper — is genuinely all one
+continuous invocation of `0x00475BA8`, not several loosely-related functions falling through into
+each other.
+
+`0x00475BA8` itself has exactly one real caller in the whole image: `0x00475A20` (`jal`, `scanword`
+confirms zero other `jal`/`j` sites). This matches the *first* `[FMTENTRY]` capture from way back in
+this investigation **exactly** (`ra=0x00475A28` = `0x00475A20+8`) — that was the legitimate call.
+The second, anomalous, all-zero `[FMTENTRY]` capture 512 cycles later (`cyc=19,755,440`,
+`a0=a1=ra=0`) does **not** match this caller and was never explained: a `--trace-chrono` capture of
+that exact 512-cycle window (`cyc=19,754,900`-`19,755,476`) shows the formatter already deep inside
+its own character-processing loop (`0x00475C08-0x00475D18`) throughout, never showing `PC=0x00475BA8`
+again — meaning either the cycle-bucketed trace format is coalescing/hiding a genuine but
+extremely brief re-entry, or the second `[FMTENTRY]` firing is some other artifact not yet
+understood. Left unresolved — this is the boundary of what hand-tracing at this granularity can
+resolve without symbol/debug info or a purpose-built per-instruction (not per-cycle-bucket) capture
+tool.
+
 ---
 
 ## 8. Save states & determinism contracts
