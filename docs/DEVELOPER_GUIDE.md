@@ -2835,6 +2835,106 @@ affecting far more than Shaolin Monks) outweighed pushing further without more c
 
 ---
 
+**2026-07-27 (continued) — the COP0 roadblock resolved with precise instruction-level tracing
+(not a CPU bug), then two more real, general fixes found and landed.** Reran the exact
+mfc0-to-mtc0 window at `0x00486728`-`0x0048678C` with `--cycles=<N> --trace-window=15000
+--trace-chrono` (a genuinely precise instruction-by-instruction capture, unlike periodic
+`--pcbreak` sampling) and found the earlier hand-verification discrepancy's real cause: **a
+hardware interrupt fires mid-sequence** — not between the specific mfc0/mtc0 pair first suspected
+(that one ran cleanly, no interrupt), but between two *separate* calls to the same atomic
+MMIO-write helper (different trampoline entry points, `0x00486798` then `0x004867B8`), confirmed
+by `jr ra` at `0x00482DE0` landing directly on `0x80000200` (the interrupt vector) with zero gap.
+`EnterException` itself is clean (only sets EXL, doesn't touch IM bits) — the actual mechanism:
+
+- The interrupt is a real INTC "Sif" source, dispatched via `TryDispatchRegisteredIntcHandler`
+  through the game's own registered DMAC-channel-5 handler (`AddDmacHandler` cause, real ps2sdk
+  `_SifCmdIntHandler` pattern, confirmed via `DETPS2_TRACE_HANDLERS`).
+- That dispatch path never acknowledged the INTC source itself — correct for a direct
+  `AddIntcHandler` registration (real software handlers ack `INTC_STAT` as part of doing real
+  work), but wrong for the DMAC-channel-5 fallback specifically.
+- Our HLE raises the Sif INTC bit from several call sites (`Sif.cs`, `Iop.cs`,
+  `SonyKernelHle.cs`) whenever SIF DMA activity happens, without always populating the real
+  in-memory queue/flag data the game's handler inspects. When the handler finds nothing to do (a
+  legitimate outcome from its own perspective) it takes its own early-exit path and never reaches
+  the ack write buried in the "real work" branch — so the bit stays pending and re-fires on the
+  very next eligible instruction, forever: a genuine interrupt storm (confirmed: the handler's
+  `jr ra` returned straight to the vector every ~64 cycles with zero forward progress in between,
+  ~70% of a 250M-cycle run's instruction count concentrated in this exact 5-address loop).
+
+Fixed (`EmotionEngine.cs`, `TryDispatchRegisteredIntcHandler`) by acknowledging the Sif source
+specifically when routing through the DMAC-channel-5 fallback path (leaving the direct
+`AddIntcHandler` case untouched, since real DMAC channel completion is hardware-acknowledged
+unlike INTC sources needing explicit software ack). Verified: smoke suite green, 5M-cycle `px`
+unchanged, PC profiler's previous dominant hotspot (`0x00482CA0`'s loop) gone entirely, total
+executed instructions in the same 250M-cycle budget dropped from 214.9M to 35.65M samples (far
+less wasted re-firing, though still nonzero residual interrupt activity — a real reduction, not a
+full elimination). `px` itself stayed at `76,840,960` — the storm was real and is now fixed, but
+it wasn't the sole blocker.
+
+**Second finding, chasing why thread 1 stopped getting scheduled once thread 2's dispatch loop ran
+cleanly**: syscall `0x56` (`WaitEventFlag`) was a suspicious repeat entry in the post-storm-fix
+histogram. Its implementation (`SonyKernelHle.cs`) ignored its pattern (`a1`), wait mode (`a2`),
+and result-pointer (`a3`) arguments entirely, returning the raw current event-flag bits as if that
+were a status code, with **no blocking at all** — a caller checking `v0==0` for success against
+nonzero real bits would see a spurious "error" and retry immediately, forever, without ever
+yielding to another thread. Implemented real ps2sdk semantics (block until `(bits & pattern)`
+satisfies mode — OR = bit `0x01`, AND = default; clear-on-exit = bit `0x10`; write the satisfying
+bits to `*result_ptr`), mirroring `WaitSema`'s already-correct blocking pattern exactly (new
+`Thread.WaitEfId`/`WaitEfPattern`/`WaitEfMode`/`WaitEfResultAddr` fields; `SetEventFlag` re-checks
+and wakes parked waiters; same "fabricate the signal if nobody else is runnable" deadlock guard
+`WaitSema` already uses). A follow-up bug in the same change (the auto-create-missing-flag branch
+unconditionally returned "not satisfied" instead of checking pattern=0/AND-mode's trivial-true
+case against the fresh flag) was found via `DETPS2_TRACE_RPC` and fixed immediately after. Neither
+turned out to be the active blocker for this specific run (the 48 `WaitEventFlag` calls present
+all happened to already be satisfied), but both are real, general kernel-primitive bugs likely to
+matter for other titles using event flags for genuine synchronization.
+
+**Third finding, the actual scheduler bug**: added a thread-state dump to `blocker-trace`
+(`Program.cs`: id/alive/started/sleeping/waitSemaId) and found thread 1 sitting `alive=True
+sleeping=False` — clearly runnable — yet permanently never `currentThreadId` again once thread 2
+took over. Root cause in `KernelState.FindNextRunnable` (`KernelHle.cs`): the round-robin scan
+loop ran `for (int i = 1; i <= _threads.Count; i++)`, so its *last* iteration lands on
+`(idx + Count) % Count == idx` — i.e. it re-checks the **calling thread itself**. Since the
+calling thread trivially satisfies its own `Alive && Started && !Sleeping` condition (it's the one
+currently running), it gets returned as "the next runnable thread," `SwitchToNext` sees
+`next == current`, concludes "nobody else runnable," and **never reaches the very next lines**:
+the explicit "also allow main thread (id 1) even if `Started` flag never set" fallback that exists
+specifically to handle thread 1 (the primordial thread, which never goes through `StartThread` so
+its `Started` flag is permanently false). Any time thread 2 called a blocking primitive while
+happening to also satisfy its own next-runnable check, thread 1 was silently skipped — a real
+scheduler bug, not an HLE-completeness gap, and one with no title-specific trigger at all (it
+fires for any 2+-thread boot once the non-thread-1 thread stops needing genuine blocks). Fixed by
+bounding the loop to `i < Count` (check every *other* thread exactly once) instead of `i <= Count`.
+
+**Verified impact, all three fixes together**: smoke suite green throughout, no `px`/baseline
+regressions at any step. `--trace-threads` over a 250M-cycle run shows real, substantial change:
+thread 1 gets scheduled cooperatively at `cyc=19,750,000` (previously never again once thread 2
+took over) and the existing `ForcePreempt` mechanism (a *different*, already-existing forced
+timeslice mechanism, `_preemptQuantum = 0x10000`) keeps alternating both threads regularly
+afterward, with thread 1 reaching entirely new code (`0x474748C8` onward) never touched in any
+prior trace this session. `syscalls` still plateaus at `298` by 250M cycles with no further growth
+through 1B cycles, and `px` is still unchanged at `76,840,960` — real, deep, verified forward
+motion in *how much of the game's own code actually runs*, but not yet a full unblock. PC
+profiling at 250M cycles is numerically unchanged from immediately before the scheduler fix
+(dominated by the same big `memcpy`-style loop at `0x00486098`, ~1.96M hits, plus the residual
+interrupt-vector and strlen hotspots) — the new thread-1 activity is real (confirmed via
+`--trace-threads`) but small relative to that dominant loop's volume, so it doesn't show up in the
+profiler's top-20 view; it's folded into the `unique=32448` distinct-address count instead.
+
+**Where this stands**: `px` (`Gs.PixelsWritten`) appears to be a cumulative-since-boot counter
+that plateaus once the logo/boot-time rendering finishes and nothing further calls a GS drawing
+primitive — every fix landed today addressed a real, verified bug (corruption cascade, sawtooth,
+dead assist code, no-op wakeup target, interrupt storm, missing WaitEventFlag semantics, a
+scheduler self-check bug), and each individually produced genuine, measurable forward progress in
+*what the game's own code actually executes* — but none of them has yet been the specific gate for
+resuming GS activity. **Concrete next step**: with thread 1 now reaching `0x474748C8` onward
+(never explored this session), disassemble/trace forward from there to find whatever code path
+would normally issue the next real GS draw command, rather than continuing to chase kernel
+primitives — the remaining gap looks increasingly like it's in game-specific rendering/menu logic
+now, not general kernel/threading HLE.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
