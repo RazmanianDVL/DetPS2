@@ -17,6 +17,7 @@ using DetPS2.Core;
 //   detps2 elf-info [user-media.json]
 //   detps2 blocker-trace [user-media.json] [cycles] [--dump=ADDR:LEN] [--trace-window=N]
 //   detps2 disasm <user-media.json> <cycles> <addr>:<len> [titleIndex]
+//   detps2 pad-inject [user-media.json] --cycles=N [--press=BUTTON:CYCLE[:HOLD]]... [--sample-every=N] [--host-present]
 //   detps2 long-run <user-media.json> --hours=N [--log=PATH] [--checkpoint-seconds=S]
 
 if (args.Length > 0 && args[0].Equals("commercial-boot", StringComparison.OrdinalIgnoreCase))
@@ -507,6 +508,133 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             }
         }
     }
+    Environment.Exit(0);
+}
+
+// detps2 pad-inject [user-media.json] --cycles=N [--press=BUTTON:CYCLE[:HOLDCYCLES]]...
+//        [--sample-every=N] [--host-present]
+//   A real controller-input API for the CLI: schedules actual PadInput.Press/Release calls at
+//   specific cycle counts during a live run (not a heuristic auto-press loop), and prints a
+//   state sample (px/prims/syscalls/PC/exitRequested) immediately around every event plus on a
+//   regular cadence throughout — so "does pressing this button actually change anything" can be
+//   answered directly from observed state deltas, rather than inferred from code-shape guessing.
+// Built specifically to settle whether a given halt point is a menu genuinely waiting for input
+// or something else, by sending real button presses through the same Pad object the game's own
+// pad-polling code reads and watching what happens next.
+//   Button names match PadInput.Button: Select, L3, R3, Start, Up, Right, Down, Left, L2, R2,
+//   L1, R1, Triangle, Circle, Cross, Square.
+// Example: detps2 pad-inject user-media.json --cycles=300000000 --host-present
+//          --press=Start:22600000:100000 --press=Cross:25000000:100000 --sample-every=1000000
+if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine(VersionInfo.Banner);
+    UserMediaConfig picfg = args.Length > 1 && !args[1].StartsWith("--")
+        ? UserMediaConfig.Load(args[1])
+        : UserMediaConfig.LoadDefault();
+    ulong piCycles = 50_000_000;
+    foreach (var a in args)
+        if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) piCycles = c;
+    ulong sampleEvery = 1_000_000;
+    foreach (var a in args)
+        if (a.StartsWith("--sample-every=") && ulong.TryParse(a.AsSpan(15), out var se)) sampleEvery = se;
+    bool piHostPresent = args.Contains("--host-present");
+
+    var events = new List<(ulong pressAt, ulong releaseAt, PadInput.Button button, string name)>();
+    foreach (var a in args)
+    {
+        if (!a.StartsWith("--press=")) continue;
+        var parts = a.Substring(8).Split(':');
+        if (parts.Length < 2)
+        {
+            Console.WriteLine($"bad --press= arg (need BUTTON:CYCLE[:HOLD]): {a}");
+            continue;
+        }
+        if (!Enum.TryParse<PadInput.Button>(parts[0], ignoreCase: true, out var btn))
+        {
+            Console.WriteLine($"unknown button '{parts[0]}' — valid: {string.Join(",", Enum.GetNames(typeof(PadInput.Button)))}");
+            continue;
+        }
+        if (!ulong.TryParse(parts[1], out var pressAt))
+        {
+            Console.WriteLine($"bad cycle in --press= arg: {a}");
+            continue;
+        }
+        ulong hold = 50_000;
+        if (parts.Length > 2) ulong.TryParse(parts[2], out hold);
+        events.Add((pressAt, pressAt + hold, btn, parts[0]));
+    }
+    events.Sort((x, y) => x.pressAt.CompareTo(y.pressAt));
+
+    if (!picfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
+    var piTitle = picfg.Titles.FirstOrDefault(t => t.Exists);
+    if (piTitle == null) { Console.WriteLine("No existing title in user-media.json"); Environment.Exit(1); }
+
+    var piSys = new Ps2System();
+    piSys.LoadBios(picfg.BiosPath);
+    string piBootMsg = (piTitle.Kind ?? "iso").ToLowerInvariant() == "elf"
+        ? $"ELF entry=0x{piSys.LoadElf(File.ReadAllBytes(piTitle.Path)).Entry:X8}"
+        : piSys.BootDiscFile(piTitle.Path).Message;
+    Console.WriteLine($"[{piTitle.Id}] {piBootMsg}");
+    Console.WriteLine(events.Count > 0
+        ? $"scheduled: {string.Join(", ", events.Select(e => $"{e.name}@{e.pressAt}-{e.releaseAt}"))}"
+        : "scheduled: (no --press= events given — plain observation run)");
+    Console.WriteLine();
+    Console.WriteLine($"{"cyc",12}  {"PC",-10} {"px",10} {"prims",7} {"syscalls",8} {"exit",5}  note");
+
+    long prevPx = -1, prevPrims = -1;
+    ulong prevSyscalls = ulong.MaxValue;
+    ulong done = 0, nextSample = 0;
+    int eventIdx = 0;
+    var pending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
+    const ulong slice = 25_000; // fine enough to hit press/release cycle targets precisely
+
+    void Sample(string note)
+    {
+        long px = piSys.Gs.PixelsWritten, prims = piSys.Gs.PrimitivesDrawn;
+        ulong syscalls = piSys.Hle.SyscallCount;
+        bool changed = px != prevPx || prims != prevPrims || syscalls != prevSyscalls;
+        string mark = changed && prevSyscalls != ulong.MaxValue ? "  <-- CHANGED since last sample" : "";
+        Console.WriteLine($"{done,12}  0x{piSys.EE.PC:X8} {px,10} {prims,7} {syscalls,8} {piSys.Hle.ExitRequested,5}  {note}{mark}");
+        prevPx = px; prevPrims = prims; prevSyscalls = syscalls;
+    }
+
+    Sample("(initial)");
+    while (done < piCycles)
+    {
+        ulong step = Math.Min(slice, piCycles - done);
+        piSys.RunFor(step);
+        done += step;
+        if (piHostPresent) piSys.ActiveQuirk?.OnHostPresent(piSys);
+
+        bool fired = false;
+        while (eventIdx < events.Count && events[eventIdx].pressAt <= done)
+        {
+            var e = events[eventIdx++];
+            piSys.Pad.Press(e.button);
+            pending.Add((e.releaseAt, e.button, e.name));
+            Console.WriteLine($"  >>> cyc={done,12} PRESS   {e.name}");
+            fired = true;
+        }
+        for (int i = pending.Count - 1; i >= 0; i--)
+        {
+            if (pending[i].releaseAt > done) continue;
+            piSys.Pad.Release(pending[i].button);
+            Console.WriteLine($"  <<< cyc={done,12} RELEASE {pending[i].name}");
+            pending.RemoveAt(i);
+            fired = true;
+        }
+        if (fired)
+        {
+            Sample("(post-event)");
+            nextSample = done + sampleEvery;
+        }
+        else if (done >= nextSample)
+        {
+            Sample("");
+            nextSample = done + sampleEvery;
+        }
+    }
+    Sample("(final)");
     Environment.Exit(0);
 }
 
