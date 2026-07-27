@@ -2648,6 +2648,67 @@ No source changes this entry — read-only tracing. Baseline unaffected, full sm
 
 ---
 
+**2026-07-27 — the shared bottleneck's actual mechanism found: two bugs in
+`MidwayBootAssist.UnstickSifWaits` itself, not in the game's compiled code.** Following the prior
+entry's concrete next step (bisect the ~50,000-cycle gap around the `ra=0` onset), a
+`--trace-window=50000 --trace-chrono` starting at `cyc=1,350,000` reduced to unique PCs showed only
+**18 addresses total** cycling for the entire window: `0x00483000-0x00483018`,
+`0x00480260-0x00480268` (the trampoline), `0x00482FF8`/`0x00482FF0`, and `0x00482740-0x00482750`
+(`UnstickSifWaits`'s own defensive-guard region, previously examined and believed innocent). Two
+real bugs were found here, both fixed and committed:
+
+1. **The `0x00482740-0x00482760` guard was hijacking an unrelated leaf function.** Disassembly of
+   that range in this build shows an ordinary getter — `lui v0,0x78; sll a0,a0,2; addiu
+   v0,v0,-30720; addu a0,a0,v0; jr ra; lw v0,0(a0)` — i.e. `array[a0]` at base `0x00778800`, not a
+   wait loop. Unlike its sibling check three lines above (which validates the opcode is actually a
+   `beq`-on-`v0` before acting), this branch fired unconditionally on PC range alone. Every ~25,000
+   cycles `MidwayBootAssist.Step` samples the live PC; whenever it caught this getter mid-call, it
+   force-set `v0=1` (clobbering the real table value) and jumped straight to `ra`, skipping the
+   getter's own delay-slot `lw` — injecting a premature, garbage return value into a legitimate
+   accessor. This is the mechanism behind the `ra=0`/`"cdrom0:\"` corruption cascade traced across
+   the last several entries: not a bug in the game's code, and not a mystery CD-path/file-access
+   operation — a false positive in our own heuristic guard. Fixed by gating it on the same
+   opcode-is-a-branch-on-`v0` check its sibling uses (`MidwayBootAssist.cs`).
+
+2. **Once (1) stopped masking it, a second, real bug in the same function became visible.** The
+   genuine SIF-init wait this guard was originally meant to defend — `jal 0x00482740; daddu
+   a0,zero,zero; beq v0,zero,-3 @ 0x00482FF8` — already has its own dedicated handler a few lines
+   above (`pc is >= 0x00482FF0 and <= 0x00482FFC` → force `v0=1`, jump to `0x00483000`). That
+   handler never fires in practice: this loop's cycle period is fixed relative to the 25,000-cycle
+   sampling interval, so the periodic snapshot deterministically lands inside the *callee*
+   (observed consistently at `0x00482750`, the getter's own `jr ra`) rather than ever landing on
+   the caller's branch at `0x00482FF8`. Fixed by adding a companion check: when PC is inside
+   `0x00482740-0x00482760` **and** `$ra == 0x00482FF8` (the return address unique to this one call
+   site), apply the same resolution.
+
+**Verified impact of both fixes together** (`blocker-trace user-media.json --host-present`, full
+smoke suite green throughout, 0 failures at each step):
+- 5M cycles: `px` rises from the long-standing baseline `860160` to `3,153,920` (~3.7x), and
+  `syscalls` rises from 122 → 182 with real `SifSetReg`/`SifGetReg` activity now present instead of
+  the corruption-cascade's spurious syscall storm.
+- 210M cycles: `syscalls` rises from 122 (mostly spurious, cascade-driven) to 4,282, dominated by
+  4,176 real calls to `SifSetReg` (syscall `0x79`) — genuine SIF library activity, not corruption
+  artifacts. The corruption signatures (`ra=0`, the `"cdrom0:\"` byte pattern in `s0`) no longer
+  appear anywhere in the trace.
+- The final `px=76,840,960` ceiling at 210M cycles is **unchanged** from before these fixes, and
+  execution again settles at `PC=0x00482750` by the end of the run — but this is now a *different*,
+  *real* wait: forward progress happens first (thousands of legitimate `SifSetReg` calls), and only
+  after that does execution loop back into calling this same getter again, evidently from some
+  other, not-yet-identified call site (a different `$ra`, since the one call site this session
+  fixed is confirmed resolved). This is a genuinely improved bottleneck, not the same one — real
+  work now happens before the wall is hit — but the wall itself has not yet been fully cleared.
+
+**Concrete next step**: the `SifSetReg` ×4,176 retry pattern is the new lead. It's a real,
+fully-implemented HLE call (`SonyKernelHle.cs` case `0x79`, just stores a register value and
+returns success unconditionally) — so a caller retrying it thousands of times implies it's
+incidental to a genuine polling loop waiting on some *other* condition per iteration, not a stubbed
+call failing. Find that loop (likely another SIF handshake/bind retry, possibly involving
+`SifGetReg`'s `IopReady` flags at `SonyKernelHle.cs` line ~456) and determine what real IOP-side
+state it's waiting for that HLE never supplies. Also worth identifying the new call site reaching
+`0x00482740` at the very end of long runs — same getter, different `$ra`, not yet traced.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
