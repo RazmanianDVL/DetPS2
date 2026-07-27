@@ -956,6 +956,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         if (!_midwayDone || _postLogoKick) return;
         if (sys.MasterCycles < 8_000_000) return;
+
+        // Only force the jump when execution is genuinely, currently stuck in the two SIF wait
+        // loops this rescues from (0x2131E8-0x213217 -- see the two `beq v0,zero,...` retry
+        // loops just above 0x213218). Before the real LWL/LWR/SWL/SWR/LDL/LDR/SDL/SDR fix (see
+        // docs/DEVELOPER_GUIDE.md §7.6), these loops never completed on their own, so
+        // unconditionally forcing PC here every time was the only way forward. Now that they
+        // routinely DO complete naturally, unconditionally yanking PC back to 0x213218 with this
+        // function's hardcoded, synthetic register state -- regardless of where real execution
+        // currently is -- discards genuine forward progress and overwrites correct, freshly-
+        // computed state with stale guesses, which is worse than doing nothing. Deliberately no
+        // "force anyway after a timeout" fallback: since the underlying CPU bug that made the
+        // old unconditional force necessary is now fixed, a boot that isn't caught stuck in this
+        // exact loop is either past it already (don't touch it) or stuck somewhere else entirely
+        // (yanking PC to 0x213218 wouldn't fix that either -- it would just relocate the hang).
+        // Keeps checking every Step() (cheap, throttled to once per ~25,000 cycles) so a boot
+        // that DOES land in the loop still gets rescued promptly whenever that happens.
+        uint pcNow = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        bool stuckInWaitLoop = pcNow is >= 0x002131E8 and <= 0x00213217;
+        if (!stuckInWaitLoop) return;
         _postLogoKick = true;
 
         // Ensure worklist still healthy
