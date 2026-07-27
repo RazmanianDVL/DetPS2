@@ -2384,6 +2384,25 @@ last entry) rather than expecting another cross-title-style general fix to resol
 
 No source changes this entry — read-only investigation across all four titles.
 
+**Follow-up, same day — MTSAB/MTSAH/QFSRV implemented, closing the gap flagged just above.** Per the
+user's request, cloned the Play! PS2 emulator (`github.com/jpd002/Play-`) and its CodeGen library
+(`github.com/jpd002/Play--CodeGen`) to `C:/Windows` as a standing reference. Used it to settle
+exactly what the earlier entry left uncertain: Play!'s own `m_pOpMmi1` table places `QFSRV` at
+`sa=0x1B`, confirming our `func=0x28` MMI1 delegation (already correct in `ExecuteMmiFamily`) was
+the right family — the free slot at `(27u<<6)|0x28` was genuinely unclaimed. More importantly,
+rather than trust source-reading alone for the 256-bit shift semantics (concatenation order,
+bit-vs-byte shift units), found and hand-verified Play!'s own `CodeGen` test suite
+(`tests/MdTest.cpp`'s two `MD_Srl256` cases) byte-for-byte before writing any code — this is the
+same discipline the LWL-family fix used (a permanent regression test reproducing known-correct
+byte patterns, not just "looks right").
+
+Implemented all three (`MTSAB`, `MTSAH`, `QFSRV`) in `EmotionEngine.cs`, added a new `_sa` field
+for the shift-amount register, and added `Ee_Mtsab_Qfsrv_MatchesPlayReference` to
+`Tests/SmokeTests.cs`, reproducing `MdTest.cpp`'s exact two cases through the real
+`MTSAB`+`QFSRV` instruction pair — passed on the first real run. Verified: Shaolin Monks' default
+baseline unchanged (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full smoke suite
+green. Commit `d2687ed`.
+
 ---
 
 ## 8. Save states & determinism contracts
