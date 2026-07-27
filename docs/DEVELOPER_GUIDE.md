@@ -1914,6 +1914,72 @@ assisted-boot baseline unaffected (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvd
 reference point only). Full smoke suite green
 (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
 
+**Follow-up (2026-07-26) — attempted a fix based on a wrong model of `s4`; caught and reverted it
+before committing; the real corrupted read has at least one more layer of indirection than
+previously modeled.** Picked up the previous entry's own concrete next step directly (no subagent
+available this round — a session usage-limit notification interrupted an in-flight fork attempting
+this same step, so the rest of this entry was done via direct tool calls in the main session
+instead of a fork).
+
+Static disasm of the function containing the loop (`0x0024D900` onward) showed `lui s4,0x67` at
+`0x0024DA04`, which looked at first like `s4` was a fixed global (`0x00670000`) for the rest of the
+function — so `s4+444` would be the fixed address `0x006701BC`. Implemented a fix on that basis:
+`MidwayBootAssist.MaybeResetVoiceCursorSentinel`, zeroing `0x006701BC` once early in `Step()`
+(mirroring `MaybeForceManagerInit`'s established pattern, but as a plain one-time memory write, no
+trampoline needed since it's not a function call). Verified `--find-writer=006701BC:4` first: zero
+EE-instruction writers across a full run, confirming the shipped `0x7FFFFFCE` is raw on-disc ELF
+data, not emulator-side corruption — a real, deliberate constant, not a BSS-zeroing bug.
+
+Built, verified the default baseline unchanged (`px=860160/gifPath3=1/dmac=4/syscalls=62/
+cdvdSectors=1`), then re-ran the 150M-cycle `--host-present --pcbreak=0021338C:0021338C` crash
+repro to confirm the fix actually helped. **It didn't** — identical outcome, cycle-for-cycle:
+`PC=0x623A97F8` at the same final state as the unfixed build, 0 hits on the real bind call site.
+Rather than accept a "fix" that measurably changed nothing, re-checked whether the write was even
+landing on the right address by re-capturing `v1` at the very first `--pcbreak=0024DD88` hit: still
+`0x7FFFFFCE`, completely unaffected by the reset. That forced a proper look at what `s4` actually
+holds by the time the loop body runs, instead of trusting the static read.
+
+Disassembling the *rest* of the function (`0024DA80`-`0024DBD8`, not read the first pass) found
+`s4` gets **reloaded twice** before the loop body: `lq s4, 1552(sp)` at `0x0024DB48`, then `daddu
+s4, a0, zero` at `0x0024DB90` — i.e. by the time `lw v1,444(s4)` executes at `0x0024DD74`, `s4` is
+a per-item dynamic pointer (whatever `a0` was at that call), not the fixed global at all. The `lui
+s4,0x67` only holds for the earlier, different part of the function (`sw v0,10416(s4)` at
+`0x0024DA80`). This is ordinary, unremarkable register reuse across two different loop nests within
+one large function — nothing exotic, just something the first pass's narrower disasm window missed.
+**Reverted `MaybeResetVoiceCursorSentinel` entirely** (`git checkout --`) rather than leave a
+committed fix that provably does nothing.
+
+Added `s4`/`s5` to the existing `--pcbreak` diagnostic line in `EmotionEngine.cs` (same low-risk,
+general pattern as the earlier `op=` addition) and re-captured live: at the very first hit
+(`cyc=1390448`), `s4=0x400` — a tiny, near-null value, itself clearly not a legitimate heap/BSS
+struct pointer on a 32MB-RDRAM PS2 title. So `MEM[s4+444]` actually resolves to `MEM[0x5BC]`, not
+`MEM[0x6701BC]` — a completely different address than the one this whole sub-thread was built
+around. **Net effect: the real corruption chain has at least one more layer of indirection than
+modeled** — `s4` itself (≈ `a0` at `0x0024DB90`) is being read from some per-item array/list that
+holds near-null garbage instead of real per-voice struct pointers, one level upstream of everything
+this section has traced so far. That array's own populate-or-default-to-zero logic is the next real
+target, and it is very plausibly the same root gap already named twice (real PS2RNA/audio init
+never running) manifesting one layer earlier than assumed.
+
+**Considered, and deliberately did not implement, a general safety-net alternative**: rather than
+chase the per-item array's own init gap, refuse EE stores that land inside the loaded ELF's own
+`.text` segment (the actual, immediate mechanism of every crash in this whole sub-thread) and log
+instead of corrupting code. This would be genuinely general — not MK-specific — and would very
+plausibly rescue other titles with a similar shape of bug (uninitialized-pointer write aliasing
+into code). Deliberately not attempted this entry: it touches `SystemMemory`'s `Write8/16/32/64`
+family, the hottest path in the whole emulator, for every title, and changing memory-write
+semantics needs full-suite validation this environment can't provide (only one real commercial ISO
+is available to test against — see the earlier-documented search that confirmed no others exist in
+this environment) and carries real regression risk if scoped even slightly wrong (a silently
+dropped write is much harder to diagnose later than the corruption it prevents). Flagging this here
+as a concrete, larger candidate fix for a future dedicated pass, not attempting it under this
+entry's time/verification budget.
+
+**Committed this entry:** only the `s4`/`s5` `--pcbreak` diagnostic addition in `EmotionEngine.cs` —
+real, general, zero-risk, already useful for the next round of tracing. No game-logic fix landed.
+Verified: default baseline unaffected (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`),
+full smoke suite green (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
+
 ---
 
 ## 8. Save states & determinism contracts
