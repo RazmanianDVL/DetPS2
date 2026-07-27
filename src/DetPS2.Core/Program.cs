@@ -967,14 +967,20 @@ if (args.Length > 0 && args[0].Equals("probe-frame", StringComparison.OrdinalIgn
         // Test whether the post-logo black screen is a real "press start" wait: tap Start
         // every ~10 frames once we're past the logo (a single held press could be missed by
         // edge-triggered input handling; a real controller also releases between presses).
-        if (p.MidwayAssist.Status is "post-logo-main" && i % 10 < 2)
+        // Was gated on "post-logo-main" only -- with real code now reaching this point on its
+        // own (see docs/DEVELOPER_GUIDE.md's LWL/JR-guard fixes), MaybePostLogoAdvance's forced
+        // jump (the only thing that ever set Status to "post-logo-main") often never fires at
+        // all anymore, leaving Status parked at "logo-done" indefinitely even though real
+        // execution has genuinely moved past the logo -- widened to match so this tool's own
+        // "try pressing Start" heuristic still runs instead of silently going dead.
+        if (p.MidwayAssist.Status is "post-logo-main" or "logo-done" && i % 10 < 2)
             p.Pad.Press(PadInput.Button.Start);
         else
             p.Pad.Release(PadInput.Button.Start);
         Console.WriteLine($"  +{i + 1}M PC=0x{p.EE.PC:X8} px={p.Gs.PixelsWritten} prims={p.Gs.PrimitivesDrawn} " +
                           $"gifP3={p.Gif.Path3Transfers} cdvd={p.Cdvd.SectorsRead} " +
                           $"assist={p.MidwayAssist.Status} logo={p.MidwayAssist.LogoFrame}/{p.MidwayAssist.LogoFramesTotal} pres={p.MidwayAssist.FramesPresented}");
-        if (p.MidwayAssist.Status is "post-logo-main" && i % 50 == 0)
+        if (p.MidwayAssist.Status is "post-logo-main" or "logo-done" && i % 50 == 0)
             p.Gs.SaveFramebufferAsPPM(outPpm.Replace(".ppm", $"-post{i}.ppm"));
         if (p.MidwayAssist.Status is "logo-done" or "synthetic-logo" or "post-logo-main")
         {
