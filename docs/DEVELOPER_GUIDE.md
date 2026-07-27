@@ -3357,6 +3357,81 @@ understood. Left unresolved — this is the boundary of what hand-tracing at thi
 resolve without symbol/debug info or a purpose-built per-instruction (not per-cycle-bucket) capture
 tool.
 
+### 7.7 Ghidra + real R5900 decompilation — a new, permanent tool for this investigation
+
+Installed Ghidra 12.1.2 (`C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC`) plus the community
+`chaoticgd/ghidra-emotionengine-reloaded` extension (real R5900 Sleigh spec — `sq`/`lq`/MMI/COP2,
+which stock Ghidra's generic MIPS spec doesn't implement at all and dies on immediately). Processor
+ID: `r5900:LE:32:default`. A `ShaolinMonks` project already exists at
+`C:\Users\xxraz\ghidra\projects` with `shaolin_boot.elf` (extracted via `extract-file` from the ISO,
+`SLUS_210.87` per `SYSTEM.CNF`'s `BOOT2` line — **not** the first ISO file matching a loose `SLUS`
+substring search, which pulled a different, unrelated executable, `SURREAL/SLUS_211.89`, the first
+time) imported and fully auto-analyzed. Drive it headlessly (no GUI control available in this
+environment):
+
+```
+cd C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC\support
+./analyzeHeadless.bat "C:/Users/xxraz/ghidra/projects" ShaolinMonks -process shaolin_boot.elf -noanalysis -scriptPath "C:/Users/xxraz/ghidra/scripts" -postScript DecompileTargets.java
+```
+
+`C:\Users\xxraz\ghidra\scripts\DecompileTargets.java` is a small reusable GhidraScript — edit its
+`targets` list (hex addresses) and rerun; it writes pseudo-C for each containing function to
+`C:\Users\xxraz\ghidra\decompiled_targets.txt`. This is dramatically faster than hand-disassembling:
+what follows was found in minutes, not hours.
+
+**`0x00475BA8` is `vsscanf`.** The switch on format-specifier characters (`%d %f %s %[ %x %o %c %n
+%p %u`, length modifiers `%l`/`%h`) is textbook scanf-family dispatch, consuming input via a refill
+callback (`FUN_004757b0`) and writing parsed values through a `va_list`-style output-pointer array
+(`param_3`). This finally properly identifies the whole subsystem chased since long before this
+session — it was never really a generic "formatter."
+
+**Confirmed the one real caller can never produce the observed bug.** `0x00475BA8`'s single static
+caller (`FUN_004759a0` @ `0x00475A20`) always calls it with `param_1 = &uStack_f0` — the address of
+its own local stack variable. That's simple SP-relative arithmetic; it can never be `0` or `11`. So
+the anomalous crash-path entry (§7.6) is now **proven**, not just suspected, to bypass this legitimate
+call entirely.
+
+**`0x004766B8`'s real job**: build the `%[...]` scanset membership table *from the format string*,
+not scan arbitrary input — called from inside `0x00475BA8`'s own body at `0x00475E38` (real `jal`,
+confirmed both by Ghidra's decompilation and independently by `scanword` once the `jal` encoding was
+computed correctly).
+
+**New, likely more important lead: a Timer0 interrupt storm freezing forward progress for 26+
+million cycles**, found via `DETPS2_TRACE_INTC_DISPATCH=1` (now extended with stack-depth and full
+register logging). Timer0 (`Intc.InterruptSource.Timer0` = source 9) dispatches to a real, short,
+clean handler (`FUN_001d1748` @ `0x001D17A0`, decompiled — two calls then `return 1`, nothing stuck
+inside it) but re-fires **every ~64 cycles**, hundreds of thousands of times by the crash cycle
+(409,750 dispatches by `cyc=28,542,000` alone). `_savedRaAcrossIntcDispatch`'s push/pop stays
+perfectly balanced throughout (ruling out the "orphaned stack entry corrupts an unrelated `eret`"
+theory this diagnostic was built to test) — so this is not the direct source of the `ra=0` signature,
+but it's a severe, real bug in its own right.
+
+Early in the run (`cyc≈2.31M`) the interrupted code roams across many different addresses between
+storm hits — genuine progress is happening. Starting around `cyc≈2,314,016` it converges into a
+tiny ~24-byte range (`0x001CCA6C-0x001CCA84`, disassembled directly: the inner-loop increment/exit
+check of a bounded 6×20-entry table linear search, `slti a2,20` / `bne ...,0x001CCA50`) and **never
+escapes for the next 26+ million cycles** — every single dispatch interrupts it at one of exactly
+three addresses in that range. Captured full registers across dozens of consecutive storm hits:
+`a1=0x01FEFF5C`, `a2=0x00010000`, `t0=0x00000080`, `t1=0x00000000` are **bit-for-bit identical every
+time**, even though `0x001CCA6C` is literally `addiu a1,a1,20` (the loop's own advance step) — i.e.
+the search makes zero measurable progress across the entire 26M-cycle span. Note `a2=0x10000`
+(65536) is itself already inconsistent with the loop's own bound check (`slti v0,a2,20`) if this
+really is a fresh, correctly-executing pass of the search — worth resolving directly (is `a2` here
+genuinely the search's own loop counter, or is register-index-to-source-variable mapping wrong for
+this specific capture point?) before deciding whether this is a starvation problem (interrupt
+overhead consuming the entire 64-cycle slice, no register corruption needed) or a genuine
+register-clobbering bug in the dispatch mechanism.
+
+**Concrete next step**: pin down exactly why these registers never change — either (a) the ~64-cycle
+interrupt period is simply shorter than the interrupt-handling overhead itself, so the interrupted
+loop never gets a big-enough slice to execute even one iteration (in which case the real fix is the
+Timer0 storm itself — find why it's configured/reloading at ~64 cycles when even audio-rate timers
+need ~6144, almost certainly an `EeTimers.cs` compare/reload bug), or (b) something in the dispatch/
+return path is failing to preserve these specific registers across the interrupt (in which case the
+fix is in `TryDispatchRegisteredIntcHandler`/`ExecuteEret` themselves). Use Ghidra to decompile
+`FUN_001d1748`'s own callees (`FUN_00321738`, `FUN_0020f330`) next to check whether either one
+plausibly consumes anywhere near 64 cycles — if so, that settles it in favor of (a) directly.
+
 ---
 
 ## 8. Save states & determinism contracts
@@ -3481,6 +3556,19 @@ Many `probe-*` commands in `Program.cs` (`probe-mk`, `probe-worker`, `probe-stru
 investigation sessions, hardcoded to MK Shaolin Monks' addresses — not a maintained, stable tool
 surface. Don't build on them; if you need similar tooling for a new title, write a new one-off or
 generalize `blocker-trace`'s options instead.
+
+**Ghidra (installed 2026-07-27, see §7.7 for the full setup)** at
+`C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC`, with the `chaoticgd/ghidra-emotionengine-reloaded`
+extension for real R5900 support (stock Ghidra's generic MIPS spec doesn't know `sq`/`lq`/MMI and
+dies immediately on function prologues that use them — nearly all of them). Reach for this **before**
+hand-disassembling anything non-trivial — decompiling to pseudo-C answers "what does this do" in
+seconds instead of hours of manual opcode reading, as demonstrated in §7.7 (identified `0x00475BA8`
+as `vsscanf` and proved its one real caller can never produce the observed bug, both in one pass).
+Drive it headlessly via `analyzeHeadless.bat` + a `GhidraScript` (`C:\Users\xxraz\ghidra\scripts\
+DecompileTargets.java` is a ready-made, reusable one — edit its address list and rerun) since there's
+no GUI control in this environment. The `ShaolinMonks` project (import of the real boot ELF,
+extracted via `extract-file` using the exact `SYSTEM.CNF` `BOOT2` path, not a loose substring match)
+already exists and is fully analyzed — no need to reimport for future sessions.
 
 `Debugger.AddBreakpoint(addr)` + `Tracer.Enable()` (`Debugger.cs`, `Tracer.cs`) are the
 programmatic (non-CLI) equivalents, usable from C# tests or a REPL-style investigation.
