@@ -2966,15 +2966,51 @@ alternates between real combinations of sources, `pc` visits dozens of distinct 
 `cyc` advances cleanly in ~250,000-cycle increments matching a *realistic* VBlank period (vs. the
 pre-fix ~64-676 cycle storm) — genuine, healthy, diverse forward progress, not a freeze.
 
-**Final state after this whole investigation's fixes**: ran to 3 billion cycles (~10 real seconds
-of PS2-hardware time) — `syscalls` and `px` are byte-for-byte identical to the 250M-cycle
-checkpoint; `spu2Samples` keeps growing correctly (continuous per-VBlank audio processing, exactly
-what a real idle/menu screen with background music would do). `probe-frame`'s own Start-button
-heuristic still produces no observable change even with every fix from today applied. This is
-a **clean, properly-paced idle steady state**, not a corruption or livelock — the system now
-behaves the way a real PS2 would if a game reached its title/menu screen and controller input
-simply isn't reaching whatever code polls for it. That's a **new, distinct investigation** (pad/
-SIO2 HLE reaching game input-polling logic), not a continuation of anything fixed today.
+**Correction — the "clean idle steady state" conclusion below was wrong.** Ran to 3 billion cycles
+(~10 real seconds of PS2-hardware time) and found `syscalls`/`px` byte-for-byte identical to the
+250M-cycle checkpoint, with `spu2Samples` still growing; concluded this was a healthy idle loop
+waiting on input. It isn't. Added `EE.exitRequested`/`exitCode`/`PC` to `blocker-trace`'s summary
+(`Program.cs`) to double-check, and it showed `exitRequested=True exitCode=1` — **the EE genuinely
+called `Exit(1)` and has executed zero further instructions since**; `IOP`/`SPU2` are clocked
+independently of the EE and kept advancing on their own, which is exactly what created the "still
+running" illusion (`EmotionEngine.Step()`'s own loop does `if (_hle.ExitRequested) break;` as its
+very first real check per call, so every subsequent `Step()` invocation, however many billions of
+cycles requested, executes nothing).
+
+Added `DETPS2_TRACE_EXIT` to `SonyKernelHle.cs`'s case `0x04` (the real Sony-kernel `Exit` syscall,
+distinct from `ExitThread`/case `0x23`) and found the exact call: `code=1 pc=0x0047FA84
+ra=0x00476818 tid=1 cyc=22,560,048` — matching precisely the cycle where `--trace-threads`'
+`ForcePreempt` output appeared to "freeze" in the prior entry (that appearance was `KernelState.
+CurrentCycle`, a diagnostic-only timestamp, simply never being restamped again once the EE stopped
+executing — not a separate bug). Traced the call chain backward with `--trace-window`/
+`--trace-chrono`: `0x0047FA80` is the `Exit` syscall trampoline, called via `j` (not `jal` — a tail
+call) from `0x004865D8`, itself reached from a small unconditional wrapper at `0x00476808`
+(`addiu a0,zero,1` in its own delay slot — i.e. this helper always exits with code 1 regardless of
+its caller, a generic `abort()`/`fatal_error()`-style routine), which is the fall-through
+continuation after returning from a call chain rooted at `0x004767C0` — a function that builds a
+520-byte-tagged struct (`addiu v0,zero,520`) and calls `0x00479D38`, a `vsnprintf`-style formatter
+(itself using the `0x00476A20` locale/encoding-search routine from earlier entries as one of its
+format-specifier handlers) to build a string into a caller-supplied buffer, then NUL-terminates it
+before falling into the exit helper. **This is a genuine, deliberate "format an error message, then
+abort" pattern — a real game-level assertion failure, not a hang, corruption, or livelock.**
+
+**Not yet resolved**: what specifically fails the assertion, or what the formatted message says.
+Attempted to read the message buffer directly (`a3`, copied from `a0` at `0x004767B8` just before
+the 520-byte-struct setup) but got an inconsistent reading — one `--pcbreak` capture suggested the
+buffer pointer held `0x401A68xx` (suspiciously matching the interrupt vector's own first
+instruction word, `mfc0 k0,$c0_13` at `0x80000200`), while a closer look at the surrounding
+character-scanning loop (`0x00476708`-`0x00476744`, which uses `a0` as an output-buffer base
+throughout) suggests `a0`/`a3` should instead trace back to a real caller-supplied buffer further
+up the stack, not vector bytes — the two readings don't reconcile, most likely because manual
+`--pcbreak`/`disasm` cross-referencing at this depth (matching exact `sp` values across separate
+process invocations, several stack frames deep, past a `addiu sp,sp,-112` frame change) is
+error-prone without better tooling. **Concrete next step for whoever picks this up**: build (or
+find) a way to dump the actual formatted message string reliably — e.g. a one-shot C# test that
+boots the title, runs to `cyc≈22,560,000`, and reads `RDRAM` at the real buffer address captured
+via a single consistent in-process register snapshot (not cross-process `--pcbreak`/`disasm`
+comparisons) — since the message text itself would very likely name the failing resource/check in
+plain language and settle this immediately, versus continuing to reverse-engineer the calling
+convention by hand.
 
 **Session tally (2026-07-27, this whole thread)**: 9 real bugs found and fixed, all independently
 verified (smoke suite + `px` baseline unchanged at every step): the `ra=0` corruption cascade
@@ -2985,7 +3021,12 @@ no-op, a DMAC-channel-5 INTC-ack gap, missing `WaitEventFlag` blocking semantics
 bug in its own auto-create path), a scheduler self-check bug in `FindNextRunnable`, and the
 VBlankStart INTC-ack gap. Every one of these is a real, general emulation bug — none required a
 Shaolin-Monks-specific hack — directly matching the project's standing hypothesis that fixes found
-via this one title's boot path have broad value across the library.
+via this one title's boot path have broad value across the library. **Current frontier**: with all
+nine fixed, the game runs dramatically further than at session start (full logo, both threads
+scheduled correctly, healthy VBlank pacing) before hitting a genuine, deliberate `Exit(1)` from
+what looks like a real assertion failure in the game's own code at `cyc≈22.56M` — not a bug in the
+emulator's threading/interrupt/scheduler layer, as far as this session traced. Reading the actual
+formatted error message (see above) is the fastest path to identifying the real next gap.
 
 ---
 
