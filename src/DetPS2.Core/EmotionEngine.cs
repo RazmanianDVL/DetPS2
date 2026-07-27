@@ -724,6 +724,27 @@ public sealed class EmotionEngine : ISchedulable
             if (!found) continue;
             if (viaDmacFallback) _intc.Acknowledge((Intc.InterruptSource)src);
 
+            // Traced (2026-07-27, Mortal Kombat: Shaolin Monks): the same interrupt-storm class
+            // documented above for the SIF/DMAC-fallback case also hits Timer0-3, but via a
+            // different mechanism. A real, directly-registered Timer0 handler (confirmed via
+            // Ghidra decompilation to be short and complete normally every single time — two
+            // calls, then return) still left the game trapped for 26+ million cycles: dispatched
+            // every ~64 executed instructions (this method's own caller polls that often), with
+            // the interrupted code's registers frozen bit-for-bit identical across dozens of
+            // consecutive dispatches -- zero measurable progress the entire time. Unlike SIF's
+            // "handler checks a queue, finds nothing, legitimately takes an early-exit path that
+            // never reaches its own ack" scenario, a periodic timer-tick ISR has no such "nothing
+            // to do" case -- it unconditionally does its short, fixed amount of work every time it
+            // runs, so there's no legitimate reason for repeated dispatch to mean anything other
+            // than "the real ack write this handler should have reached (or that a real BIOS-level
+            // ISR wrapper we don't emulate would have done first) never happened." Acknowledging
+            // here for Timer sources specifically -- not a blanket change to every "found=true"
+            // dispatch, which the comment above explains would be wrong for SIF -- matches real
+            // hardware's actual behavior for a periodic timer tick and breaks the storm.
+            if (src is (int)Intc.InterruptSource.Timer0 or (int)Intc.InterruptSource.Timer1
+                    or (int)Intc.InterruptSource.Timer2 or (int)Intc.InterruptSource.Timer3)
+                _intc.Acknowledge((Intc.InterruptSource)src);
+
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
                 Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedRaAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
