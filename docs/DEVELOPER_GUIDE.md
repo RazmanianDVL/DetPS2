@@ -2014,6 +2014,94 @@ to crash the boot regardless of which uninitialized array eventually causes it.
 
 ---
 
+### 7.5 Cross-title validation: telling Shaolin-Monks-specific fixes apart from general ones
+
+**2026-07-26 — the user supplied two more real, commercial Mortal Kombat ISOs (Deadly Alliance,
+SLUS_204.23; Deception, SLUS_208.81) specifically to test the "how much of this is general vs.
+Shaolin-Monks-specific" question this whole section had been unable to answer on its own** (every
+prior entry in §7.4 explicitly noted no other real PS2 ISO was available). Neither title has a
+`GameQuirkRegistry` entry (only `SLUS_210.87` does), so both run through **pure general
+emulation — zero Shaolin-Monks-specific scaffolding** (`MidwayBootAssist` never runs for them at
+all). This is about as clean a test as this project can get for the "does a general fix actually
+help other titles" hypothesis.
+
+**Methodology**: local, gitignored `user-media-mkfamily.json`/`user-media-deception.json` configs
+(same schema as `user-media.json`, pattern-matched by `.gitignore`'s new `user-media-*.json` rule)
+point `blocker-trace --host-present` at the two new ISOs. No source changes needed to add a title —
+`GameQuirkRegistry.Resolve` returning `null` for an unregistered serial is the designed, common
+case.
+
+**Finding 1 — `FindAddressScan` (syscall `0x83`) infinite-loop bug, confirmed general, fixed.**
+Deception spun 226,976 times on this syscall in a 5M-cycle window (`DETPS2_TRACE_FINDADDR=1`:
+identical `start`/`end`/`needle`/`result` every call, `start` already one word past the returned
+hit) — the implementation cached by `needle` alone and always scanned from physical address 0,
+ignoring `start` entirely, so any title enumerating multiple occurrences of the same needle (`find
+the next X after the one I just processed`, calling with the same needle but an advancing `start`)
+got the same stale first hit forever. Fixed: cache key is now `(needle, start)`, and the scan
+honors `start` as its real lower bound. **Result: Deception's `0x83` calls dropped from 226,978 to
+3 in the same window, total syscalls from 226,984 to 71, and it now creates a real thread and
+reaches a later PC.** Shaolin Monks' own default baseline is untouched (`px=860160/gifPath3=1/
+dmac=4/syscalls=62/cdvdSectors=1`) — its committed fast-boot path barely exercises this syscall.
+Commit `961fc3b`.
+
+**Finding 2 — negative ("fast"/`i`-prefixed) syscall numbers never normalized, confirmed general,
+fixed.** `BiosHle.HandleSyscall` read the syscall number (`v1`) raw, with no sign handling. Real
+ps2sdk/libkernel commonly invokes the interrupt-context-safe (`i`-prefixed) variant of a kernel
+call by negating its syscall number (`li v1,-N`) — the real BIOS negates it back before dispatch;
+this HLE didn't, so every negative-encoded call silently fell through as unhandled regardless of
+which one it was. Deception issues raw `v1=0xFFFFFFAB`/`0xFFFFFFA8` (`-0x55`/`-0x58`). Fixed by
+normalizing the sign before dispatch, plus adding the two specific positive cases that had no
+handler either (`0x55` `iClearEventFlag`, `0x58` `iPollEventFlag`, aliased to their existing
+`ClearEventFlag`/`PollEventFlag` handlers — the same pattern already used for `0x52`/`0x53`).
+Verified neutral on both other titles' behavior (Shaolin Monks baseline unchanged; Deadly
+Alliance's own unrelated stuck point unaffected). Commit `3291940`.
+
+**Finding 3 — `WaitEventFlag` (syscall `0x56`) has no real semantics, general, NOT fixed this
+pass.** After Finding 2, Deception's remaining syscall traffic is dominated by `0x56` (196 calls in
+30M cycles) instead of the noise Finding 2 removed. The current handler only reads `a0` (the flag
+id) and calls the same `PollEventFlag` that `0x57` (`PollEventFlag`, genuinely non-blocking) uses —
+it ignores `a1`/`a2`/`a3` (the real syscall's requested bitmask, AND/OR wait mode, and
+result-pointer), and critically **never blocks-and-yields the way `WaitSema` (`0x44`) already
+does**. A title that expects `WaitEventFlag` to actually suspend the calling thread until the flag
+condition is met just busy-polls it from userspace instead, forever, if the flag never becomes
+satisfied. Not fixed this pass: correctly implementing AND/OR mode, clear-on-exit, and
+blocking+yield (mirroring `WaitSema`'s already-tuned pattern, including its "nobody else runnable →
+park on VBlank" fallback) is real work that deserves its own verification pass, not a rushed patch
+riding on this entry's remaining budget. **Concrete next step for whoever picks this up:** give
+`KernelState` a `WaitEventFlagBlocking`-style primitive analogous to `WaitSemaBlocking`, wire cases
+`0x56`/`0x58` through it the way `0x44` already works, and verify against both Deception (should
+progress further) and the Shaolin Monks baseline (must stay identical).
+
+**Finding 4 — Deadly Alliance is hard-parked on a documented, pre-existing architectural gap; not
+attempted this pass.** Deadly Alliance's `PC` is bit-for-bit identical (`0x0010E670`) at 6M, 17M,
+25M, and 30M cycles — a genuine hard park, not sampling coincidence. `--pcbreak` at that PC shows
+`InterruptPending=True` but `takeExceptions=False`, held constant. This isn't a new bug — it's
+already self-documented in `SonyKernelHle.cs` at the `AddIntcHandler` case (`0x10`): `KernelBootstrap`
+deliberately starts `EE.TakeExceptions = false` after fast-boot (to avoid an unacknowledged VBlank
+"storming" the EE before any handler exists) and only the game's own call to `AddIntcHandler` turns
+it back on. Deadly Alliance's boot never calls `AddIntcHandler` (absent from its own syscall
+histogram, unlike `AddDmacHandler` which it does call once) before it needs an interrupt-driven
+wakeup — so it's permanently stuck waiting for an interrupt DetPS2 is deliberately withholding.
+**Not attempted**: the comment's own "storm" concern is real and explicit — this gates the hottest
+possible source of spurious re-entry (every title's exception path) and needs a properly-scoped fix
+(most plausibly: a default/BIOS-level ACK-only handler for any cause with no game-registered
+handler, so `TakeExceptions` can safely default to on, matching how real hardware's BIOS always
+acknowledges interrupts regardless of whether a game handler exists) plus full-suite validation
+before it's safe to land — explicitly the same category of "large, systemic, needs its own pass"
+change as the `.text`-write-protection idea floated in the previous section, not something to rush
+here.
+
+**Standing conclusion of this cross-title pass**: at least two of four findings this round are
+unambiguously general — found via a title with zero Shaolin-Monks-specific scaffolding, fixed, and
+verified not to regress Shaolin Monks' own baseline. This is the first direct, empirical evidence
+this whole investigation has had for the user's original "fixing general bugs helps a meaningful
+slice of the library" hypothesis, rather than an inference from code-reading alone. The other two
+findings (Deadly Alliance's interrupt gate, Deception's `WaitEventFlag` gap) are equally general in
+nature but need more careful, better-tested fixes than this pass's remaining budget allowed —
+prioritized here, in order, as the highest-leverage next steps for whoever continues this thread.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
