@@ -3037,22 +3037,30 @@ real "should have produced a valid pointer" logic lives, and is the actual next 
 understand (likely a failed lookup or missing HLE-provided resource, matching this whole session's
 pattern, rather than a genuine bug in Shaolin Monks' own shipped code).
 
-**Follow-up: extended the search back to the start of the run.** `s2` genuinely has been `0` since
-`cyc=3,130,720` (`pc=0x00212F48`, right in the `main()`-jump region from much earlier boot-path
-entries in this file) — over 18.7 million cycles before the crash, every subsequent touch a
-save/restore pair keeping it at that same `0`, never a fresh non-zero assignment. Two readings
-remain open, not yet distinguished: (a) `s2`'s "should be a valid struct/list-node pointer" framing
-from the entry above is simply wrong — it may genuinely be a shared scratch register across many
-unrelated functions, each locally responsible for setting it before use, in which case the *real*
-bug is specifically in whatever code path reaches `0x00475D1C`-`0x00475D24` without first
-populating `s2` itself (a much more locally-scoped fix than "trace one register to its origin");
-or (b) `0x00212F48`'s `s2=0` write is itself already the symptom of something upstream (worth
-checking against this file's own much earlier real-CRT0-vs-fake-jump-to-main() entries, since
-`main()` is reached differently depending on which boot path is active). Given the ambiguity, the
-next productive step is probably reading the actual disassembly *around* `0x00475D1C` and its
-caller's caller with fresh eyes (what real ps2sdk/library function is this — a `sceSif`-family
-lookup, a linked-list walk, something else) rather than continuing the register-write trace
-further, since the trace alone can no longer distinguish which of the two readings is correct.
+**Follow-up: read `0x00475BA8`'s full function body directly instead of continuing the register
+trace, which resolved the framing ambiguity above — and corrects a conflation in the entry
+before it.** `0x00475BA8` is the entry point of the `vsnprintf`-style formatter itself (the
+800-byte-frame function referenced throughout this whole thread): its own prologue does
+`daddu s2,a0,zero` at `0x00475BBC` — **`s2` is simply this function's own first parameter**, i.e.
+the output buffer pointer, freshly reassigned on every single call. So the "`s2` has been 0 since
+`cyc=3,130,720`" finding above was following the *aggregate* history of one physical register
+across *many unrelated calls* to this shared formatter throughout the whole program, not one
+persistent variable — a real methodology mistake, not a real finding; retracted.
+
+Correcting the actual chain: the corrupting `bgtzl`/`lw a0,0(s2)` at `0x00475D24` (`cyc=21,858,000`,
+`s2=0`) fires **inside one specific call** to this formatter — not the fatal one. `DETPS2_TRACE_
+MSGBUF`'s `a0` capture at `0x004767B8` (`cyc=22,553,520`, ~695,000 cycles *later*) shows the exact
+same corrupted value being used as the buffer for a **separate, later** invocation. So the real
+mechanism is: one formatter call (cyc≈21.86M) internally dereferences its own NULL-ish state via
+the branch-likely idiom, produces `a0=0x401A6800` as a side effect, and that value survives —
+through some return value or shared/global storage not yet identified — to be reused nearly
+700,000 cycles later as the *buffer pointer* for the specific formatter call that leads to
+`Exit(1)`. **Concrete next step**: find how a formatter call's internal state (specifically
+whatever produces `0x00475D24`'s `s2` — a *different*, nested pointer, not the function's own `a0`
+parameter — one level deeper than traced so far) ends up feeding the *next* unrelated call's `a0`;
+likely a shared global/static buffer-management structure (an allocator, a string-table cursor, or
+similar) that legitimately holds pointers across calls, one of which is getting corrupted rather
+than the formatter's own locals.
 
 **Session tally (2026-07-27, this whole thread)**: 9 real bugs found and fixed, all independently
 verified (smoke suite + `px` baseline unchanged at every step): the `ra=0` corruption cascade
