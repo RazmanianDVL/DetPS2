@@ -379,9 +379,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             return;
         }
 
-        // Wait loop in sif-init: jal; beqz v0, back @ 0x482FF8
+        // Wait loop in sif-init: jal; beqz v0, back @ 0x482FF8. Traced (2026-07-27) to
+        // sceSifInitRpc's (real vaddr 0x482E98) own internal RPC-queue-ready check: it polls
+        // array[0] at base 0x00778800 — the getter at 0x00482740 computes (a0<<2)+0x00778800 —
+        // which real IOP-side interrupt processing would normally set once the queue-registration
+        // DMA packet built by 0x00482AE8/kicked via SifSetDma is acknowledged. Our HLE's
+        // PerformSifSetDma/HleSifCmdFromEe path doesn't drive that specific flag, so besides
+        // force-resolving THIS call (the register/PC nudge below, needed because periodic sampling
+        // can catch execution anywhere in the loop), also durably satisfy the underlying memory
+        // check so every future natural (non-assisted) call to this getter for index 0 succeeds on
+        // its own — without this, PC profiling showed ~70% of all executed instructions spent
+        // re-entering this exact loop over a 210M-cycle run, sawtoothing on periodic assist hits
+        // instead of the real condition ever being met.
         if (pc is >= 0x00482FF0 and <= 0x00482FFC)
         {
+            sys.Memory.Write32(0x00778800, 1);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
             sys.EE.PC = 0x00483000;
             Assists++;
@@ -397,6 +409,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // exact jal, and resolve identically.
         if (pc is >= 0x00482740 and < 0x00482760 && (uint)sys.EE.GetGpr(31).Lo == 0x00482FF8)
         {
+            sys.Memory.Write32(0x00778800, 1);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
             sys.EE.PC = 0x00483000;
             Assists++;
