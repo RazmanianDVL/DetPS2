@@ -3473,6 +3473,54 @@ been directly confirmed. This is the honest boundary of what static+live tracing
 either a full instruction-level replay/rewind capability (to walk backward from the crash instant
 without re-deriving cycle windows by trial and error) or symbol/debug info this build doesn't have.
 
+### 7.9 A real, structural explanation for `ra=0` found — then exhausted as the specific mechanism
+
+Went back to §7.8's "ruled out all five known assert sites" work and found the actual gap: the
+original `scanword` sweep (way earlier this investigation) found **six** static call sites to
+`0x00476808`, not five — `0x00201100` was in that original list and never got decompiled. Fixed
+that, and separately ran Ghidra's own `ReferenceManager.getReferencesTo()` (authoritative — reflects
+Ghidra's full disassembly/control-flow analysis, not just a raw `jal`/`j`-encoding byte scan) against
+both `0x00475BA8` and `0x00476808` to make sure nothing was missed either way. `0x00475BA8` still has
+exactly one reference (confirming §7.7's finding independently). `0x00476808` has exactly the same
+seven `UNCONDITIONAL_CALL` references the manual scan already found (the six original plus
+`0x00201100`) — Ghidra's analysis agrees precisely, no eighth site.
+
+**`0x00201100` turned out to be genuinely structurally important, just not the direct answer.**
+It's `FUN_002010f8`: unconditionally calls `FUN_00476808()`, no condition at all — a plain "always
+abort" stub. Tracing *its* references found the real mechanism behind `ra=0`: a mutable global
+function-pointer slot, `PTR_FUN_004ec8f8` @ `0x004EC8F8`, whose default/initial value **is**
+`0x002010F8` (this stub). It's called through by two small dispatch functions,
+`FUN_00201108`/`0x00201108` and `FUN_00202e40`/`0x00202E40` — and critically, **their own bodies are
+pure tail calls**: call through the pointer, then `return`, nothing else. A pure tail call compiles
+to a plain `j`/`jr`, not `jal` — it never touches `$ra`. So if either dispatch function is entered
+via a real `jal` (Ghidra confirms both are, from 8 and 14 distinct call sites respectively — a
+generic panic/fatal-error utility used all over the runtime, not tied to one subsystem) but the
+pointer still holds its unconfigured default, `$ra` survives completely unchanged from whichever of
+those many real callers invoked it, all the way down through the stub and into `0x00476808` —
+**structurally explaining exactly how `ra=0` could appear at a site with zero calls that
+individually look untraceable, without any actual corruption.**
+
+**Checked live and it doesn't fire.** Added `[PANIC-DISPATCH-A]`/`[PANIC-DISPATCH-B]` at both
+dispatch functions' own entries (`EmotionEngine.cs`) — neither ever fires before the crash. Also
+re-checked the one earlier-found tail-jump site (`0x0020448C`, inside the lookup-or-die function at
+`0x00204430`, from way back in §7.4/§7.6) against the current code state, since this session's other
+EE fixes changed the execution path leading up to the same crash cycle — `[LOOKUP-ENTRY]`/
+`[LOOKUP-TAILJUMP]` don't fire either.
+
+**Bottom line**: every real, statically-and-dynamically-discoverable call path to `0x00476808` has
+now been checked — the one legitimate `vsscanf` caller, the two now-decompiled unconditional-abort
+dispatch functions and their real callers, all seven direct `jal`/`j` sites Ghidra's own reference
+analysis confirms (matching the manual scan exactly), and the tail-jump site inside the lookup-or-die
+function. **None of them fire before the crash.** Whatever reaches `0x00476808` with `ra=0` is not
+reachable through any reference Ghidra's control-flow analysis can resolve, meaning it's either a
+genuine runtime-computed indirect jump through a register value Ghidra can't determine statically
+(a real wild pointer, from corrupted or never-initialized data — worth revisiting once its exact
+source is known), or something in the emulator's own exception/interrupt-vector handling landing PC
+here unintentionally rather than anything in the game's compiled code at all — a genuinely new angle
+not yet explored this investigation, and the most promising concrete next step: audit
+`EnterException`/`GetExceptionVector`/`ExecuteEret` for any path whose target computation could,
+under some COP0 state, produce `0x00475BA8`/`0x00476808` by accident rather than by design.
+
 ---
 
 ## 8. Save states & determinism contracts
