@@ -2403,6 +2403,53 @@ for the shift-amount register, and added `Ee_Mtsab_Qfsrv_MatchesPlayReference` t
 baseline unchanged (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full smoke suite
 green. Commit `d2687ed`.
 
+**Follow-up, same day — the text-layout loop's exact stuck mechanism found, precisely.** Returned to
+the standing priority per explicit instruction. First cheaply tested whether this loop was like
+Haven/Burnout 3's "just needs more cycles" decompression stalls: ran the default boot to
+**1 billion cycles** — `gifPath3`/`dmac`/`sifBytes`/`syscalls`/`cdvdSectors` are all still frozen at
+their 200M-cycle values (only `spu2Samples` keeps climbing, confirming ongoing but unproductive
+CPU work). This is a genuine permanent stall, not a slow-but-real one.
+
+Systematically mapped the enclosing function's control flow (`0x475BA8`-`0x475F94`, dumped whole and
+grepped for every branch/jump) rather than continuing to guess at windows — found multiple loop-back
+edges converging on `0x475C08`/`0x475C0C`, confirming a real inner loop distinct from the function's
+own (rarely-hit, cleanly-returning) top-level entry and exit. Added `s6`/`s7` to `--pcbreak` (not
+previously exposed) specifically to check the loop's own counter register directly, rather than
+inferring it indirectly. Traced precisely, in order:
+
+1. `s6` reads as `0x0` at every single sampled iteration of the dominant loop-back check
+   (`blez s6, 0x475C08` at `0x475D18`) — the branch is taken every time, which is why this loop-back
+   edge dominates over the (rarely reached) clean-exit paths found earlier.
+2. `s6` is set from the return value (`v0`) of `jal 0x00476A20`, called at the top of the loop
+   (`0x475C08`-`0x475C20`) with `a2` loaded from a stack-local field at the caller's `616(sp)`.
+3. Captured `0x00476A20`'s real parameters live: `a2=0x0` at every sample. `0x00476A20`'s own
+   prologue does `beq s0,zero,0x476A60` where `s0=a2` — with `a2` always zero, this branch is always
+   taken, and the function returns `0` (or a value that ultimately still yields `s6=0`) essentially
+   immediately, without doing any real work.
+4. Traced the accumulator this feeds: `a0 += s6` happens right after the call (`addu a0,a0,s6` at
+   `0x475C34`), then gets written straight back to the SAME `616(sp)` slot
+   (`sw a0,616(sp)` at `0x475C3C`). With `s6=0`, `a0` never changes, so `616(sp)` is written back
+   with the exact same `0` it started with.
+
+**Net finding: `616(sp)` — whatever count/position field this represents — is a closed,
+self-perpetuating zero loop.** It started at `0`, gets fed into `0x476A20` as `a2`, which (because
+`a2==0`) returns a value that keeps `s6=0`, which keeps the accumulator from ever changing, which
+writes the exact same `0` straight back into the field that started the whole cycle. There's nothing
+externally *wrong* being detected each iteration — the loop's own logic treats `616(sp)==0` as a
+completely self-consistent (if unproductive) state, so it never trips any error path; it just spins
+forever with no way to break its own cycle from the inside.
+
+**Not yet found**: what `616(sp)` is actually *supposed* to represent, and where its correct
+initial value should come from (most likely computed once from the function's real parameters —
+`s2`/`s5`, i.e. the original `a0`/`a2` at `0x475BA8`'s own entry — near the top of the function,
+before this loop begins, in code not yet disassembled this pass). That's the concrete next step:
+disassemble `0x475BA8`'s body between its prologue and `0x475C08` (not yet read in full) to find
+where `616(sp)` is first written and why that computation yields `0` instead of a real count.
+
+No source changes this entry beyond the already-committed `3e44605` (`s6`/`s7` `--pcbreak` fields).
+Baseline reconfirmed unaffected (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full
+smoke suite green.
+
 ---
 
 ## 8. Save states & determinism contracts
