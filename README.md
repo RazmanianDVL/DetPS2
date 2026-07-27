@@ -2,16 +2,26 @@
 
 **Goal**: A clean-slate PlayStation 2 emulator written entirely in modern C# (.NET 9), with **determinism as a core design principle**.
 
-## Status — **v3.1.0 Completeness** (July 2026)
+## Status — **v0.1.0 Foundation** (July 2026)
 
-**What is done**: deterministic pure-C# PS2 foundation through Phase **56** — synthetic gates green, dump spine ready, play-path/majority/netplay cert tooling, real ALU JIT (S1), accelerated present.  
-**What is not done**: commercial majority on **your** games, native Vulkan, full MPEG IPU.  
+**Versioning policy**: the version number tracks real, user-visible commercial playability —
+**not** internal engineering completeness. **`1.0.0` is reserved for ≥10% of
+[docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md)'s titles fully playable start-to-finish with no
+errors.** As of `v0.1.0`, **zero** commercial titles have even reached a main menu — an earlier
+version scheme reached "v3.1.0" purely from finishing internal/synthetic engineering phases, which
+was a misleading way to represent that, and has been retired (see `src/DetPS2.Core/VersionInfo.cs`).
+
+**What is done**: a deterministic pure-C# PS2 engineering foundation — EE/IOP interpreters + real
+ALU JIT, software GS, kernel HLE, save states, netplay/rollback infrastructure, and CLI/Desktop
+tooling — all verified only against synthetic fixtures and homebrew, not real commercial play.
+**What is not done**: any commercial title reaching its main menu, let alone being playable.
 **Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
 
-**Active work (post-v3.1.0, not phase-numbered)**: real commercial bring-up against user-supplied
-dumps, using Mortal Kombat: Shaolin Monks (`SLUS_210.87`) as the case study for finding general
-emulation/HLE bugs — see **[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** for the dated
-investigation log. Also added: a virtual HDD (APA + PFS) and a `pad-inject` CLI tool for scripted
+**Active work**: real commercial bring-up against user-supplied dumps, using Mortal Kombat: Shaolin
+Monks (`SLUS_210.87`) as the case study for finding general emulation/HLE bugs — see
+**[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** for the dated investigation log, and
+[GitHub Issues](https://github.com/RazmanianDVL/DetPS2/issues) for current blockers and priority
+order. Also added: a virtual HDD (APA + PFS) and a `pad-inject` CLI tool for scripted
 controller-input testing.
 
 ```bash
@@ -31,9 +41,9 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dump paths
 | [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Start here to contribute** — full subsystem map, HLE layering, interrupt system, GameQuirks SDK, and the dated log of ongoing commercial bring-up work |
 | [COMPLETENESS.md](COMPLETENESS.md) | **Honest done vs open** |
 | [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md) | Title list for majority math |
-| [RELEASE_NOTES.md](RELEASE_NOTES.md) | v3.1.0 release notes |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | v0.1.0 release notes |
 | [ROADMAP.md](ROADMAP.md) | Full phase-by-phase history (0–56) |
-| [NEXT_PLAN.md](NEXT_PLAN.md) | Pointer to current (post-v3.1.0) focus |
+| [NEXT_PLAN.md](NEXT_PLAN.md) | Pointer to current focus |
 | [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE_FREEZE.md](ARCHITECTURE_FREEZE.md) | Contracts |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What runs |
 | [FLOAT_POLICY.md](FLOAT_POLICY.md) | Deterministic float rules |

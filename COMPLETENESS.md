@@ -1,8 +1,10 @@
 # DetPS2 Completeness Status
 
-**Product**: **v3.1.0 Completeness** — Phases **0–56** + **MP1 media library UI**  
+**Product**: **v0.1.0 Foundation** — 0 commercial titles reach a main menu; engineering phases
+**0–56** done on synthetic/homebrew fixtures only (`v1.0.0` is reserved for real playability — see
+`src/DetPS2.Core/VersionInfo.cs` for the policy)  
 **Smoke**: `dotnet run --project Tests -c Release`  
-**Checklist**: `commercial-checklist` → 11/11  
+**Checklist**: `commercial-checklist` → 11/11 (synthetic gates; not a playability claim)  
 **Play guide**: [PLAY.md](PLAY.md) · `pwsh ./launch.ps1`
 
 This file is the **single source of truth** for what is complete vs open.
@@ -58,7 +60,7 @@ title's boot path, not a catalog pass.
 
 ---
 
-## CLI (v3.1)
+## CLI
 
 ```bash
 dotnet run --project src/DetPS2.Core -c Release -- dump-spine
@@ -93,4 +95,4 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dumps.
 | 53 Dump boot spine | Done (infra); commercial P0 open |
 | 54 Play-path campaign | Done (synthetic gate) |
 | 55 Majority catalog | Done (synthetic gate) |
-| 56 Netplay cert + v3.1 | Done (synthetic cert) |
+| 56 Netplay cert | Done (synthetic cert) |

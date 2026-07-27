@@ -2,6 +2,14 @@
 
 **Goal**: Build a clean-slate, deterministic PlayStation 2 emulator from the ground up in pure modern C#.
 
+**A note on the version numbers below**: phases in this file historically shipped under product
+versions up to "v3.1.0," reached purely from finishing internal/synthetic engineering phases while
+**zero commercial titles could be played at all**. That versioning scheme was retired 2026-07-27 —
+see `src/DetPS2.Core/VersionInfo.cs` and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the new policy
+(current version **v0.1.0**). The phase numbers and "Delivered" lists below are left as an accurate
+engineering history; the "Product version" lines are kept for that historical record only and no
+longer reflect current versioning.
+
 ---
 
 ## Phase 0: Foundation
@@ -248,12 +256,13 @@ See **[NEXT_PLAN.md](NEXT_PLAN.md)**.
 
 **Product version**: **v3.0.0** — synthetic commercial gates green; real-catalog majority needs user dumps.
 
-### Completeness campaign (Phases 50–56, v3.1.0)
+### Completeness campaign (Phases 50–56)
 **Status**: Complete (synthetic gates) — see [NEXT_PLAN.md](NEXT_PLAN.md) / [COMPLETENESS.md](COMPLETENESS.md) for the phase table.
 
-**Product version**: **v3.1.0 Completeness**.
+**Product version at the time**: was called "v3.1.0 Completeness" — see the versioning note at the
+top of this file; current version is **v0.1.0**.
 
-## Since v3.1.0 (not phase-numbered)
+## Since Phase 56 (not phase-numbered)
 
 Work continues on real commercial bring-up against user-supplied dumps rather than further
 numbered phases — see [NEXT_PLAN.md](NEXT_PLAN.md) for the current focus and

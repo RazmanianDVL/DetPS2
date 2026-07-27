@@ -1,4 +1,4 @@
-# Netplay-Certified Titles (v3.1.0)
+# Netplay-Certified Titles (synthetic fixtures only — no commercial title certified)
 
 Det mode + rollback soaks for **synthetic** fixtures.  
 Commercial certification requires user dumps and a longer 2P session.

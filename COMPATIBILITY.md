@@ -2,7 +2,7 @@
 
 **Last updated**: 2026-07-27 (real commercial bring-up in progress — see `docs/DEVELOPER_GUIDE.md`)
 
-This document tracks boot/runtime compatibility. DetPS2 **v3.0** ships production tooling for dumps and netplay; **retail game majority is not claimed** without your legal BIOS/ISOs. Entries describe automated tests and synthetic fixtures only (no copyrighted dumps).
+This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships engineering tooling for dumps and netplay; **no commercial title has reached its main menu yet**. Most entries below describe automated tests and synthetic fixtures only (no copyrighted dumps) — the one real-dump attempt in progress is called out explicitly.
 
 ## Legend
 

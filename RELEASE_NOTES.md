@@ -1,39 +1,50 @@
-# DetPS2Sharp v3.1.0 — Release Notes
+# DetPS2Sharp v0.1.0 — Release Notes
 
-**Date**: 2026-07-24  
-**Codename**: Completeness  
-**Baseline**: Phases **0–56**
-
----
-
-## What v3.1 is
-
-v3.0 foundation **plus** the completeness campaign (Phases 50–56):
-
-| Phase | Delivered |
-|-------|-----------|
-| 50 | Integrity pass — honest labels, Vif1→Vif, WinMM audio |
-| 51 | Real EE ALU JIT; **S1 ≥10×** on synthetic self-loop |
-| 52 | `AcceleratedFramePresenter` (parallel CPU upscale) |
-| 53 | `DumpBootSpine` — media discovery, readiness, blocker rank |
-| 54 | `PlayPathCampaign` — VIF unpack modes, GS/pad/audio/VU pack |
-| 55 | `MajorityCatalog` — scored majority + DX publish |
-| 56 | `NetplayCertification` — multi-title synthetic cert |
-
-**Checklist**: 11/11 required items green without dumps.
+**Date**: 2026-07-27
+**Codename**: Foundation
 
 ---
+
+## Versioning correction
+
+Earlier releases reached version numbers up to **v3.1.0 ("Completeness")** purely from finishing
+internal, synthetic engineering phases — while **zero commercial titles could be played at all**,
+not even to a main menu. That was a misleading way to represent project status: a "v3" number
+reads as mature/shippable, and this project was not.
+
+**New policy** (see `src/DetPS2.Core/VersionInfo.cs`): the version number now tracks only real,
+user-visible commercial playability. Pre-1.0 versions bump on real playability milestones (first
+title reaches a main menu, first title fully playable, etc.), never on engineering-phase
+completion. **`v1.0.0` is reserved for at least 10% of `docs/TARGET_CATALOG.md`'s titles fully
+playable start-to-finish with no errors.** As of this release, that count is **0**.
+
+## What v0.1.0 is
+
+The engineering foundation everything else builds on — EE/IOP interpreters and a real ALU JIT,
+software GS, kernel HLE, save states, netplay/rollback infrastructure, and CLI/Desktop tooling.
+All of it is verified against synthetic fixtures and homebrew only; **none of it has been shown to
+make a real commercial game playable yet**. Internally this corresponds to what was previously
+called "Phases 0–56" — see [ROADMAP.md](ROADMAP.md) for that full history.
 
 ## Honest limits
 
 | Claim | Status |
 |-------|--------|
-| Commercial games majority | **Needs your BIOS/ISOs** (`user-media.json`) |
+| Any commercial title reaches a main menu | **No** — actively being worked on, see below |
+| Commercial games majority | **No** — needs a title to be playable first |
 | Native Vulkan | **Not wired** — use AcceleratedParallel |
 | Full MPEG IPU | Stub + SkipFMV |
-| Commercial netplay 10‑min | Synthetic cert only |
+| Commercial netplay | Synthetic cert only |
 
 See [COMPLETENESS.md](COMPLETENESS.md).
+
+## Active work
+
+Real commercial bring-up against a user-supplied dump: Mortal Kombat: Shaolin Monks (`SLUS_210.87`)
+boots past its logo into real gameplay/menu-adjacent code, currently blocked on a traced
+runtime-library registry-lookup bug. See `docs/DEVELOPER_GUIDE.md` for the dated investigation log
+and [GitHub Issues](https://github.com/RazmanianDVL/DetPS2/issues) for current blockers and
+priority order.
 
 ---
 

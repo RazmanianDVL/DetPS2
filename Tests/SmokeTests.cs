@@ -757,7 +757,7 @@ public static class SmokeTests
             MemCardManager_ExportImport();
 
             // Phase 38 / 39
-            VersionInfo_IsV2();
+            EngineeringPhase_Reached38();
             NetplayCertified_SyntheticList();
             DxTracker_PromoteAndSave();
             MajorityGate_SyntheticHeld();
@@ -808,7 +808,7 @@ public static class SmokeTests
             Ipu_RescoreNotTopDx();
 
             // Phase 49
-            VersionInfo_IsV3();
+            EngineeringPhase_Reached49();
             CommercialChecklist_AllRequired();
             NetplayCertified_SoakList();
 
@@ -829,7 +829,7 @@ public static class SmokeTests
             PlayPath_CampaignGate();
             MajorityCatalog_Gate();
             NetplayCert_ProductionGate();
-            VersionInfo_IsV31();
+            VersionInfo_ReflectsHonestPlayability();
 
             // Media library / large ISO / pad
             DiscImage_FileBacked_RoundTrip();
@@ -3284,7 +3284,7 @@ public static class SmokeTests
     {
         var cfg = new EmulatorConfig
         {
-            Version = "3.1.0",
+            Version = VersionInfo.Version,
             GamesFolder = "C:\\Games",
             BiosPath = "C:\\BIOS\\bios.bin",
             DefaultFrameLimit = true,
@@ -3379,26 +3379,32 @@ public static class SmokeTests
 
     // -------------------- Phase 38 / 39 --------------------
 
-    public static void VersionInfo_IsV2()
+    public static void EngineeringPhase_Reached38()
     {
-        // Kept for history: v3 still reports CommercialPhaseComplete ≥ 38
+        // Kept for history under its old call site; tracks internal engineering-phase
+        // completion only, deliberately unrelated to the product Version (see VersionInfo.cs).
         if (VersionInfo.CommercialPhaseComplete < 38) throw new Exception("phase");
-        Console.WriteLine($"[Smoke] VersionInfo_IsV2 OK (compat; banner={VersionInfo.Banner})");
+        Console.WriteLine($"[Smoke] EngineeringPhase_Reached38 OK (banner={VersionInfo.Banner})");
     }
 
-    public static void VersionInfo_IsV3()
+    public static void EngineeringPhase_Reached49()
     {
-        if (!VersionInfo.Version.StartsWith("3.")) throw new Exception(VersionInfo.Version);
         if (VersionInfo.CommercialPhaseComplete < 49) throw new Exception("phase");
-        Console.WriteLine($"[Smoke] VersionInfo_IsV3 OK (compat; banner={VersionInfo.Banner})");
+        Console.WriteLine($"[Smoke] EngineeringPhase_Reached49 OK (banner={VersionInfo.Banner})");
     }
 
-    public static void VersionInfo_IsV31()
+    public static void VersionInfo_ReflectsHonestPlayability()
     {
-        if (!VersionInfo.Version.StartsWith("3.1")) throw new Exception(VersionInfo.Version);
+        // Guardrail against the exact drift that made this test necessary: the product
+        // Version previously climbed to "3.1.0" / "Completeness" purely from internal
+        // engineering-phase completion while zero commercial titles could be played at all.
+        // Per the policy documented on VersionInfo, a 1.x/2.x/3.x version asserts real
+        // playability that isn't there yet while TitlesFullyPlayable is 0.
+        if (VersionInfo.TitlesFullyPlayable == 0 &&
+            (VersionInfo.Version.StartsWith("1.") || VersionInfo.Version.StartsWith("2.") || VersionInfo.Version.StartsWith("3.")))
+            throw new Exception($"Version {VersionInfo.Version} implies playability milestones not yet met");
         if (VersionInfo.CommercialPhaseComplete < 56) throw new Exception("phase");
-        if (VersionInfo.Codename != "Completeness") throw new Exception("codename");
-        Console.WriteLine($"[Smoke] VersionInfo_IsV31 OK ({VersionInfo.Banner})");
+        Console.WriteLine($"[Smoke] VersionInfo_ReflectsHonestPlayability OK ({VersionInfo.Banner})");
     }
 
     public static void NetplayCertified_SyntheticList()

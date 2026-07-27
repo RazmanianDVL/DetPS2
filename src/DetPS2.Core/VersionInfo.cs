@@ -1,17 +1,35 @@
 namespace DetPS2.Core;
 
-/// <summary>Product version (Phase 56 completeness ship).</summary>
+/// <summary>
+/// Product version. Versioning policy (adopted 2026-07-27, replacing an earlier scheme that
+/// tied the product version to internal engineering-phase completion and reached "3.1.0"
+/// while zero commercial titles could be played at all): pre-1.0 versions track only real,
+/// user-visible commercial playability milestones. <c>1.0.0</c> is reserved for at least 10%
+/// of <c>docs/TARGET_CATALOG.md</c>'s titles being fully playable start-to-finish with no
+/// errors — not for any amount of internal/synthetic engineering completeness. Bump
+/// <see cref="Version"/> only when a real playability milestone is met (see
+/// <see cref="TitlesFullyPlayable"/> / <see cref="TitlesReachMainMenu"/>), never for
+/// finishing an engineering phase.
+/// </summary>
 public static class VersionInfo
 {
-    public const string Version = "3.1.0";
-    public const string Codename = "Completeness";
-    public const string ReleaseDate = "2026-07-24";
-    /// <summary>Highest completed numbered phase.</summary>
+    public const string Version = "0.1.0";
+    public const string Codename = "Foundation";
+    public const string ReleaseDate = "2026-07-27";
+    /// <summary>
+    /// Highest completed internal engineering phase (synthetic gates: JIT, netplay
+    /// infrastructure, save states, tooling, etc.). Deliberately NOT coupled to
+    /// <see cref="Version"/> — see the versioning policy above.
+    /// </summary>
     public const int ParityPhaseComplete = 56;
     public const int CommercialPhaseComplete = 56;
+    /// <summary>Commercial titles (real user-supplied dumps) that have reached their main menu with functional input.</summary>
+    public const int TitlesReachMainMenu = 0;
+    /// <summary>Commercial titles fully playable start-to-finish with no errors.</summary>
+    public const int TitlesFullyPlayable = 0;
 
     public static string Banner =>
-        $"DetPS2Sharp v{Version} ({Codename}) — phases 0–{CommercialPhaseComplete} — {ReleaseDate}";
+        $"DetPS2Sharp v{Version} ({Codename}) — engineering phases 0–{CommercialPhaseComplete} (synthetic) — {TitlesFullyPlayable} commercial titles fully playable — {ReleaseDate}";
 }
 
 /// <summary>
