@@ -2709,6 +2709,87 @@ state it's waiting for that HLE never supplies. Also worth identifying the new c
 
 ---
 
+**2026-07-27 (continued) — durable fix for `sceSifInitRpc`'s own wait, then the user directly
+reported the resulting symptom from their own play-testing** ("cycles keep going but the pixel
+count freezes... deadlocked waiting for a response thread") — confirming from an independent
+angle what `DETPS2_PROFILE_PC=1` had already shown: ~70% of all 147M instructions executed over a
+210M-cycle run were spent re-entering the `0x00482740`/`0x00482FF0` getter loop from the previous
+entry. Fixed durably rather than just nudged: both `UnstickSifWaits` handlers for this call site
+now also write `MEM[0x00778800]=1` (the flag `sceSifInitRpc`'s own `array[0]` check polls) the
+first time either fires, so every subsequent *natural* (non-assisted) call succeeds on its own.
+Verified: PC profiler's total executed-instruction count rose from 147M to 182M in the same 210M
+cycle budget (far less wasted spinning), and a real second thread (`entry=0x00480A18`, the SIF-RPC
+dispatch worker `sceSifInitRpc` sets up) gets created for the first time in this boot path.
+
+That thread creation immediately exposed the user's reported deadlock precisely. Added a thread-
+state dump to `blocker-trace` (`Program.cs`: id/alive/started/sleeping/waitSemaId per thread) to
+inspect it directly, and traced a **chain of two more real bugs**, both fixed:
+
+1. **`KickCommercialWorker` (`Ps2System.cs`) was fully implemented but never called from
+   anywhere — dead code.** `SonyKernelHle.cs`'s own `CreateThread` case (`0x20`) comment already
+   documented the gap: *"Do not auto-start: Midway's worker needs globals filled first. StartThread
+   (if called) or a late commercial assist will start it."* The worker thread was being created
+   (confirmed via the new thread dump: `alive=True started=False` indefinitely, even past 1B
+   cycles) but the game's own code never reached its own `StartThread` call for it, and the "late
+   commercial assist" meant to cover that gap was simply never wired in. Wired it into `RunFor`'s
+   per-slice loop: once a thread `id>=2` is observed alive-but-not-started, wait 200,000 cycles
+   (letting whatever globals the case-`0x20` comment refers to get filled in), then fire once.
+
+2. **Once the worker thread actually started running, its own dispatch loop turned out to call
+   `WakeupThread(0)` — a permanent no-op**, since thread ids start at 1 and thread 1 (the
+   primordial boot thread) predates the normal `CreateThread`/`GetThreadId` flow, so nothing ever
+   recorded its real id anywhere the worker could read it back from. Confirmed via a temporary
+   `DETPS2_TRACE_WAKEUP` diagnostic (`SonyKernelHle.cs` case `0x33`): every single `WakeupThread`
+   call across a 50M-cycle sample targeted id 0. Thread 1 had `SleepThread`'d itself expecting the
+   worker to wake it once real, and slept forever even though the worker was genuinely alive and
+   correctly looping on its own `WaitSema`/`WakeupThread` dispatch. Fixed with a direct sibling to
+   the existing `MaybeUnblockStarvedSema`: `MaybeUnblockStarvedSleep` force-wakes any thread that's
+   been `Sleeping` with `WaitSemaId==0` and not `WaitVblank` for over 2,000,000 cycles — same
+   shape, same grace period, the `SleepThread` analogue of the `WaitSema` case.
+
+**Verified impact of this whole sub-round** (full smoke suite green throughout every step, 5M-cycle
+`px` checkpoint unchanged at each commit — no regressions): at 250M cycles, thread 1 is genuinely
+running again (`started=True sleeping=False`, `currentThreadId=1`) and thread 2 is correctly
+blocked on a real semaphore (`waitSemaId=11`) instead of both being stuck in incompatible states.
+This is the user's reported deadlock, confirmed root-caused and fixed.
+
+**What's left — a new, distinct bottleneck, now clearly exposed rather than masked by threading
+bugs**: `px` is *still* frozen at `76,840,960` even at 1B cycles, because thread 1, once properly
+awake, goes straight back into a pre-existing, unrelated stall: a character-by-character text
+dispatcher at `0x00475CE0`/`0x00475D14` (jump table on byte value, reading via a pointer chain
+through `sp+616`) that calls into a nested search function at `0x00476A20`. Traced with
+`--pcbreak` sampling at multiple points along this chain:
+
+- The caller at `0x0047B1A8` (`jal 0x00476A20`) sits in an outer loop bounded by a fixed count of
+  37 (`addiu s2,zero,37` at `0x0047B18C`, loop condition `bne v0,s2,0x0047B190`) — i.e. "process up
+  to 37 items." Over 250M cycles this outer loop's exit-check point (`0x0047B1B8`) was hit only
+  **221 times total** (vs. millions of hits inside the nested search), meaning nearly all CPU time
+  is spent *inside* a single call to `0x00476A20`, not cycling the outer loop.
+- `v0` at that exit-check (loaded from a stack slot, the outer loop's own progress counter) reads
+  `0x1` at every single one of those 221 samples, from the very first (`cyc=302,752`) to deep into
+  the run — the counter that should climb toward 37 to let this finish never advances past its
+  first real value.
+- Inside `0x00476A20` itself: a nested index (`s0`) does count up (0, 1, 2, 3, ...) interleaved
+  with a constant `-2` (`0xFFFFFFFFFFFFFFFE`) sentinel value on alternating calls — a linear search
+  through candidates that, on the evidence so far, never matches (each candidate check is a
+  `strcmp`/`strlen` pair against byte-range logic that looks like Shift-JIS/multi-byte lead-byte
+  detection — `(byte-0x40)<0x3F`, `(byte-0x80)<0x7D` — i.e. this may be Japanese-text/font-glyph
+  support code the US release still links but rarely exercises).
+
+Net read: a font/text precompute step is stuck re-searching for something at index 1 of a
+37-item table that it never finds, so item 1 never completes and items 2-37 are never reached.
+Not yet identified: what the "needle" being searched for actually is, why it's absent (a missing
+HLE-provided resource/string returning null or wrong data upstream, most likely — worth checking
+what feeds `s0`/`a0` into `0x00476A20` from further up the call chain), or whether it's Shaolin
+Monks-specific glyph/locale data our HLE doesn't supply. **Concrete next step**: trace the actual
+first argument into `0x0047B1A8`'s call chain (walk up one more level from `0x0047B140` to find
+what supplies the item being searched for) and read the literal candidate strings each `strcmp` in
+`0x00476A20` compares against (disassemble the `lui a1,0x5B`-prefixed literal-string loads at
+`0x00476A90`-`0x00476B18` and dump the actual bytes at each resulting address) to determine what
+value would need to match for this search to ever succeed.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
