@@ -3677,6 +3677,71 @@ eventually recovers from the cyc=1,350,000 stall — real inefficiency, and wort
 properly before relying on `SavedPc` values from this path for anything precise, but not something
 this session chased further since it didn't block verifying the fix's own correctness.
 
+### 7.11 Cross-title triage (2026-07-27) and a new ground-truth tool: PCSX2's PINE interface
+
+After the `Exit(1)` fix above, re-tested all 9 titles in `user-media.json` to 100M+ cycles to find
+the next best target instead of continuing to dig into Shaolin Monks' own new `0x00212DD0` stall.
+Full results on the wiki (per-title pages + `Home.md`) and `COMPATIBILITY.md`. Headline finding:
+**Burnout 3: Takedown, MK: Deadly Alliance, and MK: Deception — two unrelated developers — are all
+stuck on the byte-for-byte identical shared SN Systems ProDG SDK routine**: a getter/setter pair for
+a simple flag table (`lw v0,0(base+idx*4); jr ra` / `sw a1,0(base+idx*4); jr ra`), polled forever by
+a caller one level up (`jal <getter>; beq v0,zero,<retry>`) that never sees the flag become nonzero.
+Table bases: Burnout 3 `0x004E4140`, MK: Deadly Alliance `0x0040C780`, MK: Deception `0x005D8840`
+(all index 0). Vexx remains the single most active title (274K+ syscalls, 5.8MB real SIF traffic)
+before its own eventual stall ~100M-200M cycles — corrected from an earlier "still growing" read;
+pushed to 400M and it's frozen too, just later than everything else.
+
+**New tool: PCSX2's PINE interface, enabled and verified working this session.** The user gave
+explicit permission to edit PCSX2's own config and run it from this admin console directly (no
+GUI/computer-use needed for this part). `EnablePINE = true` in
+`C:\Users\xxraz\Documents\PCSX2\inis\PCSX2.ini` (`PINESlot = 28011` already present, just off).
+Verified end-to-end: `pcsx2-qtx64.exe -batch -- <iso path>` (⚠ `-nogui` specifically hung
+indefinitely with a real ISO in this version — memory stayed flat at ~64MB and the PINE port never
+opened; `-batch` with a visible window works fine and is what actually got used) then a raw TCP
+client to `127.0.0.1:28011` sends `[4-byte LE size incl. itself][1-byte opcode][payload]` and gets
+back `[4-byte LE size][1-byte status: 0=OK/0xFF=FAIL][data]`. Opcodes (from
+`github.com/PCSX2/pcsx2/blob/master/pcsx2/PINE.cpp`): `MsgRead8/16/32/64`=0-3, `MsgWrite8/16/32/64`=
+4-7, `MsgVersion`=8, `MsgSaveState`=9, `MsgLoadState`=0xA, `MsgTitle`=0xB, `MsgID`=0xC, `MsgUUID`=0xD,
+`MsgGameVersion`=0xE, `MsgStatus`=0xF (0=Running/1=Paused/2=Shutdown). **Confirmed limitation**: PINE
+is memory-only (`vtlb_ramRead`/`vtlb_ramWrite`, same virtual address space the game itself sees) —
+no EE GPR/PC/COP0 access, no breakpoints, no stepping. Good for "what's really at this address on
+real hardware," not a substitute for register-level debugging.
+
+**Used it immediately to cross-check the shared SDK bug theory against real hardware.** Booted each
+of the three affected titles for real in PCSX2 and read the exact table-base address found via
+DetPS2's own `disasm`:
+
+| Title | Address | Real PCSX2 value |
+|---|---|---|
+| Burnout 3: Takedown | `0x004E4140` | `0x00000001` |
+| MK: Deadly Alliance | `0x0040C780` | `0x00000001` |
+| MK: Deception | `0x005D8840` | `0x00000001` |
+
+All three: **nonzero on real hardware.** This proves the poll loop genuinely resolves on a real PS2
+(or accurate LLE) and isn't a legitimately-infinite wait — DetPS2 is definitely missing something
+that's supposed to set this flag, for all three titles, via the same underlying SDK mechanism.
+
+**Caught and fixed two address-transcription errors in the process**: initial hand-computed addresses
+for MK: Deadly Alliance and MK: Deception (`0x0041C780`/`0x005E8840`) were off by one hex digit from
+the real values (`0x0040C780`/`0x005D8840`) — a `lui`+negative-`addiu` reconstruction mistake, the
+same error class flagged earlier this session (§7.7's `vsscanf` string decode, etc.). Caught only
+because the PINE read against the wrong address returned `0x00000000` inconsistently with Burnout 3's
+result, prompting a recheck of the arithmetic rather than assuming "still stalled" — a good example
+of why cross-checking against a second, independent oracle catches this class of error that
+single-source static analysis won't.
+
+**Tried to find the setter's actual caller, came up empty by static means.** `scanword` for the
+`jal`-encoding of the setter's address, and separately for the raw address as data (a function-
+pointer table entry), both returned **zero matches** for Burnout 3. So it's neither a plain direct
+call nor a static function-pointer table entry — the caller constructs the target via runtime
+register computation (`lui`/`ori` pair building an address, then an indirect `jalr`), the same
+general shape as the panic-dispatch mechanism found and traced in §7.9. Since the setter never fires
+in DetPS2 at all (that's the bug — a live trace on the DetPS2 side has nothing to observe), and PINE
+has no execution-tracing capability, **finding the exact trigger needs one of**: (a) PCSX2's real
+instruction-level debugger (GUI/computer-use access, not yet available — this is the concrete
+scenario that motivates it), or (b) further static indirect-dispatch tracing on the DetPS2/Ghidra
+side, hunting for the `lui`/`ori` pair that constructs this exact setter address.
+
 ---
 
 ## 8. Save states & determinism contracts
