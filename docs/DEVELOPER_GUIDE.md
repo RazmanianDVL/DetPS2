@@ -3562,6 +3562,82 @@ Not chased further since it's a metric-housekeeping question, not a playability 
 commits touching the EE/scheduler should treat **`860160` at 5M cycles** as the current baseline to
 diff against, not the stale `3,153,920`.
 
+### 7.10 The `ra=0` mystery is dead — the real `Exit(1)` is a live, legitimate zlib assertion
+
+**The whole §7.4-§7.9 investigation was chasing an artifact of bugs that are now fixed.** With the
+thread-1 exclusion, Timer0 storm ack, and nested-EPC fixes all in place, re-ran the crash live
+(isolated single-title config — see the cross-title static-`PcBreakGpr` pitfall below) and the
+`Exit(1)` call is now reached through completely clean, real code with a **non-zero, correct `$ra`**
+and a **real, non-garbage exit code** — not the `ra=0`/corrupted-register signature this whole prior
+investigation was built around chasing.
+
+**Pitfall hit and worked around**: `blocker-trace` against the full 9-title `user-media.json` boots
+every title in one process, and `EmotionEngine.PcBreakGpr`/`PcBreakEnd` are `static` — a `--pcbreak`
+hit from title 2's own unrelated code at the same virtual address (different games, different link
+layouts, same coincidental address) is easy to misattribute to Shaolin Monks. Also: the printed
+per-title `after N cyc: PC=... / EE: exitRequested=...` summary line for title *N* is followed by
+title *N+1*'s own boot banner *before* its own summary prints (see `Program.cs`'s per-title loop —
+boot banner prints immediately, but `exitRequested` prints only after all of that title's own
+diagnostic sections run) — so blindly grepping for the nearest `exitRequested=True` after a
+`--trace-window` block can attribute the wrong title's crash to Shaolin Monks. **Always use a
+single-title scratch `user-media.json` for `--pcbreak`/exact-cycle work on one specific game.**
+
+**New crash cycle**: `28,547,726` (isolated single-title run), up slightly from the old `28,547,680`
+— a small, expected shift from the cumulative fixes changing exact timing, confirmed via binary
+search on `exitRequested`.
+
+**Live-verified real call chain** (ground truth via `disasm`, not Ghidra's decompilation, which
+mis-analyzed `FUN_00476808`'s body — see below):
+- `--pcbreak=47FA80` (the `_Exit` SDK wrapper, `0047fa80 _Exit` per the FID database) on the
+  isolated run hits exactly once, at `cyc=28547680`, with **`a0=0x1`** (the real exit code) and
+  **`ra=0x476818`** (a real, valid return address — not `0`).
+- `disasm ... 476790:80` / `476810:60` (ground truth, our own memory) shows `0x00476808` is a tiny
+  4-instruction wrapper (`addiu sp,-16; sd ra,0(sp); jal 0x0011C2B0; addiu a0,zero,1` — i.e. **this
+  whole "abort wrapper" this investigation spent §7.4-§7.9 chasing is just `Exit(1)`**), called from
+  `0x00476840` (`jal 0x00476808`, inside the next function up), which is itself preceded by
+  `0x00476838: jal 0x0047E630` (the formatter) with `a1` pointing at a real format string and
+  `a3`/`a0` holding two data addresses.
+- Dumped those two addresses directly from memory (`--dump=5ae388:80` / `--dump=5ae3b0:60`,
+  decoding the little-endian words byte-by-byte as ASCII): `0x005AE388` = the **NUL-terminated
+  C string `"c:/Projects/Utility/util_zlib.cpp"`**; the second immediate arg baked into the one
+  known static caller (`FUN_004675e8`, decompiled: `FUN_00476818(0x5ae388, 0x5d1, 0x5ae3b0); return
+  0xffffffff;`) is `0x5d1` = **line 1489**; `0x005AE3B0` decodes to the single-character string
+  `"0"`. This is the exact shape of an SDK `ASSERT(0, file, line)` / `panic(file, line, expr)` macro
+  expansion, with the file/line pointing at **the game's own bundled zlib wrapper, line 1489.**
+
+**Ghidra decompilation caveat found along the way**: Ghidra's decompiled body for `FUN_00476808`
+(via `DecompileTargets.java`) shows a large function with a malloc-list-append loop and — bizarrely —
+a call to itself (`FUN_00476808();` inside its own decompilation). This is wrong; ground-truth
+`disasm` of the same address shows a real, tiny 4-instruction function. Whatever produced that
+decompilation (likely a stale/bad function-boundary call from the earlier FID Analyzer pass merging
+adjacent unrelated code) should not be trusted for this address — always cross-check Ghidra
+decompilation against `disasm`'s raw bytes for any function this investigation leans on again.
+
+**Not yet resolved**: exactly what calls into this assert. Ghidra's static reference search found
+only one caller of `FUN_00476818` (`0x00467604`, inside `FUN_004675e8`, matching the exact literal
+args found above) — but live `--pcbreak` at `0x004675e8`, `0x00467604`, and `0x00476818` itself all
+recorded **zero hits** before the crash, even though the assert with those exact literal args
+definitely fired (confirmed via the format-string dump above). Since `_Exit` never returns, `ra`
+pointing at `0x476818` only proves the `jal 0x0011C2B0` at `0x476810` executed — it does *not* prove
+`0x476818`'s own first instruction (`addiu sp,sp,-16`) was ever fetched, so the apparent contradiction
+(body executes, but its own entry point + only known static caller show zero hits) likely means
+there's a second, real call site with the identical three literal arguments that Ghidra's reference
+search didn't surface, or the assert macro gets inlined at more than one call site by the original
+compiler. Concrete next step for whoever continues: `--find-word` scan for the exact `lui/ori`
+immediate-pair encodings of `0x5ae388`/`0x5d1`/`0x5ae3b0` to find every real call site by raw bytes
+rather than relying on Ghidra's reference graph a second time.
+
+**What this really means for playability**: `util_zlib.cpp` is the *game's own* bundled zlib (not
+anything DetPS2 emulates specially — confirmed via `grep -rn zlib src/DetPS2.Core`, nothing there
+touches game-facing decompression). A zlib assertion firing this deep into boot most plausibly means
+the compressed data DetPS2 is delivering to the game (via CDVD sector reads, SIF/IOP transfers, or
+some intermediate buffer) is subtly wrong — truncated, misaligned, or corrupted — by the time the
+game's own decompressor gets it. That's a concrete, scoped, and very plausibly fixable target (CD
+read path / DMA transfer correctness) rather than the open-ended "wild pointer somewhere" dead end
+the `ra=0` framing had become. Not yet traced to a specific DetPS2 subsystem — the next real step is
+finding what buffer the failing `inflate()`-equivalent call was decompressing and where DetPS2 last
+wrote to it (`--track-writers`/`--find-writer=` on that buffer address once found).
+
 ---
 
 ## 8. Save states & determinism contracts
