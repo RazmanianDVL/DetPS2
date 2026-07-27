@@ -2557,6 +2557,43 @@ viable, return to hand-tracing the specific stack-corruption instruction in the 
 Verified this entry's fix: default baseline unchanged
 (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full smoke suite green.
 
+**Follow-up, same day — re-tested the real-CRT0 redirect with everything from today in place.**
+Temporarily redirected `KickMidwayMainPath` to `0x0011C200` (the same target every prior same-day
+re-test round used), measured, then reverted via `git checkout --` per the established protocol
+(confirmed clean afterward — `git diff` empty).
+
+**Result: dramatically more real underlying activity, but the exact same rendering ceiling.** At
+5M cycles the real path already shows `sifBytes=269,396` (vs the fake path's `272`) and
+`RealSifRpc binds=2,966` (vs `2`) — genuine, extensive real SIF/IOP module-loading activity, on
+the order of what Vexx (this session's healthiest reference boot) showed. But `gifPath3`/`dmac`
+are `5`/`7` at every measurement point, identical to the fake path. By 210M cycles — the same
+cycle count the fake path was measured at — activity has plateaued (`binds` frozen at `3,843`
+since ~40M, `syscalls` frozen at `23,253`) and, most tellingly, **`px=76,840,960` is byte-for-byte
+identical to the fake path's own final `px` value at the same cycle count.** Also present and not
+further chased this entry: a large, still-growing `unknown sid=0x00000000` count
+(`unknownBindSids` reached `1,206`) — a new symptom not mentioned in any prior same-day re-test
+round, most likely a retry loop binding with a not-yet-populated service-ID field; whether this is
+the old semaphore-3 wall manifesting differently or something new wasn't determined.
+
+**Conclusion: switching the default boot path is not, by itself, the fix.** The identical final
+`px` across two structurally very different execution histories (a fake single-jump vs. real CRT0
+with a genuine second thread and thousands of real SIF binds) is strong evidence that whatever
+gates `gifPath3` past `5` is a **shared bottleneck below both boot paths** — most plausibly the
+same "game never leaves attract-mode/menu into a real per-frame loop" class of gap this whole
+investigation keeps converging on, not something either boot path's own mechanics would fix by
+being switched. Given this, redirecting the default remains not worthwhile right now (matches the
+standing precedent — "leaving this path disabled by default" — for a new, sharper reason: not
+"it's worse," but "it's different work reaching the identical wall"). **Revised next step**: the
+shared bottleneck itself (whatever decides "reached", not the boot path used to reach it) is now
+the highest-value target — worth checking directly against the `0x00213218`/post-logo resumption
+point and the text-layout loop already traced in earlier entries, since both paths presumably
+funnel through the same later game-logic code once boot noise settles, rather than continuing to
+alternate between the two boot-path experiments.
+
+No source changes this entry (`Ps2System.cs`'s redirect was reverted, confirmed empty `git diff`
+before the default rebuild). Baseline reconfirmed identical to before this experiment
+(`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`).
+
 ---
 
 ## 8. Save states & determinism contracts
