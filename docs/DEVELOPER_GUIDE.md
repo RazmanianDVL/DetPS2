@@ -3432,6 +3432,47 @@ fix is in `TryDispatchRegisteredIntcHandler`/`ExecuteEret` themselves). Use Ghid
 `FUN_001d1748`'s own callees (`FUN_00321738`, `FUN_0020f330`) next to check whether either one
 plausibly consumes anywhere near 64 cycles — if so, that settles it in favor of (a) directly.
 
+**Resolved (a): fixed, and it's a separate bug from `Exit(1)`.** Decompiled the two callees:
+`FUN_0020f330` is a genuine `free()`-style allocator (linked-list free-block coalescing across a
+128-pool table); `FUN_001ce0e8`/`FUN_001ce380` (the functions whose own logic contains the stuck
+6×20 search) are large (560–660 bytes), call a dozen-plus other functions each, and use a
+1440-byte local buffer — nowhere near completing in 64 cycles. This matches the SIF/DMAC-fallback
+storm class already documented above, just via a different trigger: a periodic timer-tick ISR has
+no legitimate "found nothing, don't ack" case the way SIF's queue-check does, so repeated dispatch
+can only mean the real ack (that a BIOS-level ISR wrapper we don't emulate would normally have done)
+never happened. Fixed by acknowledging INTC for Timer0–3 specifically at dispatch time
+(`EmotionEngine.cs`, `TryDispatchRegisteredIntcHandler`) — verified: dispatch count over the same
+window drops from 409,750 to 55,108 (~7×).
+
+**But the `Exit(1)` crash happens at the exact same cycle (`28,547,680`) with or without this fix.**
+So the Timer0 storm and the `Exit(1)` crash are separate, coexisting bugs — not cause-and-effect as
+hypothesized. The storm fix is real and kept; the `Exit(1)` investigation continues independently.
+
+### 7.8 Ruled out every known real call path to the crash
+
+Used Ghidra to decompile all five statically-known in-game call sites to the abort wrapper
+(`0x00476808`), found via `scanword` much earlier this investigation: `0x00201844`
+(`FUN_002017d0` — a linked-list tag-byte walk, aborts if the terminal tag isn't exactly `1`),
+`0x00203A2C`/`0x00203A54` (both inside `FUN_00203a08` — two internal-count consistency checks,
+`puVar12[1] != param_2` and `puVar12[1]+puVar12[3] != iVar6`), `0x002043E4` (`FUN_00204070` — a
+compact binary-format decoder with an opcode-byte switch, `default: FUN_00476808()` for any
+unrecognized byte — classic "malformed resource data" guard), and `0x00476840` (`FUN_00476818` —
+builds a formatted message via `FUN_0047e630` first, then falls into the bare abort). All five are
+genuine `jal`-based calls, which would set `$ra` to a real, specific, nonzero return address at
+`0x00476808`'s entry. Every crash occurrence captured this whole investigation shows `ra=0`.
+**This rules out all five as the trigger, on top of the one legitimate `vsscanf` caller (§7.7) and
+the function-pointer-table/indirect-call searches (§7.4).** Every traceable, `jal`/`j`/data-reference
+based mechanism has now been checked and excluded.
+
+**What's left**: either (a) a genuinely wild/indirect call through a corrupted or uninitialized
+function-pointer variable that happens to hold `0x00475BA8`, or (b) fallthrough from whatever
+precedes `0x00475BA8` in memory — Ghidra's own function-boundary analysis recognizes `0x00475BA8` as
+a clean, distinct function start (real `addiu sp,sp,-800` prologue), which argues against (b) unless
+something is jumping *past* that recognized boundary rather than truly falling into it. Neither has
+been directly confirmed. This is the honest boundary of what static+live tracing can resolve without
+either a full instruction-level replay/rewind capability (to walk backward from the crash instant
+without re-deriving cycle windows by trial and error) or symbol/debug info this build doesn't have.
+
 ---
 
 ## 8. Save states & determinism contracts
