@@ -195,7 +195,6 @@ See **[NEXT_PLAN.md](NEXT_PLAN.md)**.
 - BootTrace v2 JSON + telemetry blockers
 - `CompatEntry` schema + majority % helper
 - [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md) — **301** titles
-- Master plan: [PARITY_PLAN.md](PARITY_PLAN.md) (Phases 21–38)
 
 ### Phases 22–26 (v2.0 foundation)
 **Status**: Complete (implementation + smoke)
@@ -248,6 +247,19 @@ See **[NEXT_PLAN.md](NEXT_PLAN.md)**.
 - **49** **v3.0.0** Commercial ship (checklist, notes, publish)
 
 **Product version**: **v3.0.0** — synthetic commercial gates green; real-catalog majority needs user dumps.
+
+### Completeness campaign (Phases 50–56, v3.1.0)
+**Status**: Complete (synthetic gates) — see [NEXT_PLAN.md](NEXT_PLAN.md) / [COMPLETENESS.md](COMPLETENESS.md) for the phase table.
+
+**Product version**: **v3.1.0 Completeness**.
+
+## Since v3.1.0 (not phase-numbered)
+
+Work continues on real commercial bring-up against user-supplied dumps rather than further
+numbered phases — see [NEXT_PLAN.md](NEXT_PLAN.md) for the current focus and
+[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for the dated, detailed investigation log
+(general emulation/HLE bugs found and fixed via real commercial boot paths, a virtual HDD
+foundation, and CLI tooling for scripted input testing).
 
 ## Guiding Principles
 

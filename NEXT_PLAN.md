@@ -1,112 +1,32 @@
 # DetPS2 Next Plan
 
-**Created**: 2026-07-22  
-**Updated**: 2026-07-23  
-**Status**: **v1.0 shipped** (Phases 0–20). **v2.0 majority-play plan active** — see **[PARITY_PLAN.md](PARITY_PLAN.md)** (Phases 21–38).
+**Created**: 2026-07-22
+**Updated**: 2026-07-27
 
-**Rule (unchanged)**: Finish one full phase (definition of done + green tests + docs) before reporting.
+**Status**: **v3.1.0 Completeness** shipped — Phases 0–56 done (synthetic gates). Full phase-by-phase
+history lives in [ROADMAP.md](ROADMAP.md); done-vs-open status lives in
+[COMPLETENESS.md](COMPLETENESS.md) — both are the authoritative references, not this file.
 
-**Status**: **v3.1.0 Completeness** — Phases **50–56** done (synthetic gates).  
-**Authoritative**: [COMPLETENESS.md](COMPLETENESS.md).  
-**Next**: Your dumps via `user-media.json` → real commercial P0/majority/netplay cert.
+**Current focus (post-v3.1.0, not phase-numbered)**: real commercial bring-up on user-supplied
+dumps, using Mortal Kombat: Shaolin Monks (`SLUS_210.87`) as the representative case study — the
+hypothesis being that general emulation/HLE fixes found via one commercial title's boot path have
+broad value across the library (borne out repeatedly so far: every bug found this way has been a
+general bug, not a title-specific one). Dated, detailed investigation notes for this work live in
+[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md), not here — that file is the log; this file is
+just a pointer.
 
----
-
-## Progress
-
-| Phase | Status |
-|-------|--------|
-| 12 EE Kernel & Exceptions | **Complete** |
-| 13 SIF RPC & IOP modules | **Complete** |
-| 14 Kernel HLE & BIOS path | **Complete** |
-| 15 EE/VU/GS accuracy | **Complete** |
-| 16 ISO/CDVD/Pad | **Complete** |
-| 17 Audio sink + SPU2 | **Complete** |
-| 18 Netplay transport + tape UX | **Complete** |
-| 19 Hardware / GPU present | **Complete** |
-| 20 Compatibility campaign + v1.0 | **Complete** |
-
----
-
-## Phase 18 — Netplay Transport + Replay UX
-
-**Completed**: 2026-07-23
-
-### Delivered
-- `NetplayFrameMsg` fixed 16-byte wire format  
-- `INetplayTransport` + `InMemoryNetplayTransport` + `TcpNetplayTransport`  
-- `DesyncDetector` (MasterCycles^PC^pad hash)  
-- `NetplaySession.ExchangeLockstep` / `AdvanceNetworked`  
-- Desktop: Record/Play `.inpr` tape; Netplay Host/Client menus  
-
-### Smoke
-- `Netplay_InMemory_LockstepSync`  
-- `Netplay_DesyncDetector_FlagsMismatch`  
-- `Netplay_FrameMsg_RoundTrip`  
-- `InputTape_SerializeDeserialize`  
-
----
-
-## Phase 19 — Hardware Present Path
-
-**Completed**: 2026-07-23
-
-### Delivered
-- `GpuFramePresenter` (texture staging + upload stats)  
-- `PresentPipeline.DeterminismMode` always keeps software snapshot for hashes  
-- Desktop View → Present Software / GPU  
-
-### Smoke
-- `Present_Gpu_UploadsAndDeterminismMode`  
-- `Present_HashAlwaysSoftwareGs`  
-
----
-
-## Phase 20 — Title Compatibility Campaign + v1.0 ship
-
-**Completed**: 2026-07-23
-
-### Delivered
-- `TitleFixtures` synthetic campaign (homebrew, ISO boot, multi-dir, replay)  
-- EE: MULTU/DIVU correct, DSLL/DSRL/DSRA/DSLL32/…, likely branches (BEQL/…)  
-- [RELEASE_NOTES.md](RELEASE_NOTES.md), README v1.0 section, COMPATIBILITY update  
-
-### Smoke
-- `Ee_MultuDivu_Dsll`  
-- `TitleCampaign_SyntheticPack`  
-
----
-
-## Commercial Phases 40–49 (done — v3.0)
-
-**Completed**: 2026-07-23
-
-| Phase | Delivered |
-|-------|-----------|
-| 40–45 | Dump harness, boot spine, play path, audio, Vulkan staging, IL JIT |
-| 46 | UDP netplay, frame advantage, netgraph, desync dump, soak cert |
-| 47 | Scored majority campaign, TITLE_HACKS, DxTracker reports |
-| 48 | IPU IQ/MPEG/SkipFMV, IPU not mass-DX policy |
-| 49 | **v3.0.0** checklist, RELEASE_NOTES, publish |
-
-### Completeness campaign (50–56)
-
-| Phase | Focus | Status |
-|-------|--------|--------|
-| **50** | Integrity: honest labels, Vif1→Vif, WinMM audio | **Done** |
-| **51** | Real EE ALU JIT + S1 ≥10× | **Done** |
-| **52** | Accelerated parallel present (CPU) | **Done** |
-| **53** | Dump boot spine + readiness/discovery | **Done** (infra; commercial open) |
-| **54** | Play-path campaign (VIF/GS/pad/audio) | **Done** (synthetic gate) |
-| **55** | Majority catalog + DX publish | **Done** (synthetic gate) |
-| **56** | Netplay cert runner + **v3.1.0** | **Done** (synthetic cert) |
+Also added since v3.1.0: a virtual HDD (APA + PFS, real on-disk format — see
+`docs/DEVELOPER_GUIDE.md` §9) and a `pad-inject` CLI tool for scripted controller-input testing
+against a running boot.
 
 ---
 
 ## Post–v1.0 ideas (not blocking)
 
-1. OS audio device on `RingBufferAudioSink`  
-2. Real Vulkan/OpenGL upload behind `GpuFramePresenter`  
-3. IRX ELF loader + more kernel HLE  
-4. Full likely-branch nullify  
-5. Expand compatibility matrix with user-run homebrew notes  
+1. OS audio device on `RingBufferAudioSink`
+2. Real Vulkan/OpenGL upload behind `GpuFramePresenter`
+3. IRX ELF loader + more kernel HLE
+4. Full likely-branch nullify
+5. Expand compatibility matrix with user-run homebrew notes
+6. Wire the virtual HDD (APA/PFS) to game-facing I/O (SIF RPC service, IOP device HLE) — currently
+   foundation-only, unit-tested in isolation

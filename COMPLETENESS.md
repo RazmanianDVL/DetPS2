@@ -13,7 +13,15 @@ This file is the **single source of truth** for what is complete vs open.
 - Boot selected / double-click; File → Load ISO; Load ELF uses `Ps2System.LoadElf`  
 - Memcard path defaults to `{GamesFolder}\memcards\` (usage later)
 
-### L1/L2 commercial play — **Open** (needs your BIOS + ISO + blocker fixes)
+### L1/L2 commercial play — **In progress** (real bring-up active, not just tooling)
+
+Using a real BIOS + Mortal Kombat: Shaolin Monks (`SLUS_210.87`) as the case study: boots past the
+logo into real gameplay/menu-adjacent code (hundreds of millions of cycles of genuine SIF activity),
+currently blocked on a specific runtime-library registry-lookup bug (traced to instruction level —
+see `docs/DEVELOPER_GUIDE.md`'s dated entries). Every blocker fixed this way so far has been a
+general emulation/HLE bug, not a title-specific one, matching the project's standing hypothesis that
+this work has broad value across the library. Not yet at a general "majority" gate — this is one
+title's boot path, not a catalog pass.
 
 ---
 
@@ -32,6 +40,8 @@ This file is the **single source of truth** for what is complete vs open.
 | Netplay certification runner | ≥1 synthetic certified soak |
 | WinMM host audio (Windows) | Real OS output |
 | Desktop + publish script | Avalonia shell |
+| Virtual HDD (APA + PFS) | Real on-disk format, unit-tested; not yet wired to game-facing I/O |
+| `pad-inject` CLI | Scripted controller-input testing against a running boot |
 
 ---
 
@@ -39,7 +49,7 @@ This file is the **single source of truth** for what is complete vs open.
 
 | Area | Status |
 |------|--------|
-| **Commercial BIOS/ISO P0+** | No `user-media.json` in CI — run `dump-spine` after adding media |
+| **Commercial BIOS/ISO P0+** | In progress against a real dump (see L1/L2 above); not yet closed |
 | **Commercial majority P2%** | Tooling done; results need real titles |
 | **Native Vulkan/D3D device** | CPU AcceleratedParallel only |
 | **Full MPEG IPU** | Stub + SkipFMV |

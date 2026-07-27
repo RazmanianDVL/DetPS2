@@ -32,7 +32,7 @@ dotnet run --project src/DetPS2.Desktop -c Release
 | `Tests` | Smoke / regression suite |
 | `docs/DEVELOPER_GUIDE.md` | Full architecture map + how to integrate (start here) |
 | `docs/TITLE_HACKS.md` | Log of per-title workarounds and why a general fix wasn't possible |
-| `BUILD_PLAN.md` | Full phase plan to completion |
+| `ROADMAP.md` | Full phase history (0–56) |
 | `ARCHITECTURE.md` | Contracts and registration order |
 | `COMPATIBILITY.md` | Title / path tracker |
 
@@ -59,5 +59,5 @@ The following are **stable contracts** — change only with a migration note:
 
 ## Pull requests
 
-- Keep diffs focused; update ROADMAP/BUILD_PLAN when completing a phase item
+- Keep diffs focused; log dated findings in `docs/DEVELOPER_GUIDE.md` when investigating a bug or bring-up blocker
 - Do not add P/Invoke to the core hot path without an issue discussion

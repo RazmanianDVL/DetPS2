@@ -1,6 +1,6 @@
 # DetPS2 Compatibility Tracker
 
-**Last updated**: 2026-07-23 (v3.0.0 — commercial campaign complete on synthetic gates)
+**Last updated**: 2026-07-27 (real commercial bring-up in progress — see `docs/DEVELOPER_GUIDE.md`)
 
 This document tracks boot/runtime compatibility. DetPS2 **v3.0** ships production tooling for dumps and netplay; **retail game majority is not claimed** without your legal BIOS/ISOs. Entries describe automated tests and synthetic fixtures only (no copyrighted dumps).
 
@@ -24,9 +24,10 @@ This document tracks boot/runtime compatibility. DetPS2 **v3.0** ships productio
 | Input tape replay | Tooling | **Pass** | Identical FB hash. `InputReplay_IdenticalHash`, campaign |
 | Stub BIOS harness | BIOS stub | **Pass** | `RunBiosHarness` / BootTrace |
 | In-memory netplay lockstep | Netplay | **Pass** | `Netplay_InMemory_LockstepSync` |
-| Real PS2 BIOS dump | BIOS | **Partial / Untested** | Load path + expanded HLE; no CI dump |
+| Real PS2 BIOS dump | BIOS | **Partial** | Load path + expanded HLE; verified against a real user-supplied dump |
 | Public domain / ps2dev homebrew | Homebrew | **Partial** | Loader + HLE + more ISA; title-dependent |
-| Commercial game ISOs | Retail | **Fail / Untested** | Missing full kernel, IRX, SPU2 voices, GS accuracy |
+| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Boots past logo into real gameplay/menu-adjacent code (100M+ cycles of genuine SIF activity); blocked on a traced runtime-library registry bug — see `docs/DEVELOPER_GUIDE.md` |
+| Other commercial game ISOs | Retail | **Untested** | Not yet attempted; fixes found via Shaolin Monks are general (kernel/HLE), so likely to help broadly |
 
 ## Subsystems
 

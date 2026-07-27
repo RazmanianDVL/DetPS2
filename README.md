@@ -8,6 +8,12 @@
 **What is not done**: commercial majority on **your** games, native Vulkan, full MPEG IPU.  
 **Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
 
+**Active work (post-v3.1.0, not phase-numbered)**: real commercial bring-up against user-supplied
+dumps, using Mortal Kombat: Shaolin Monks (`SLUS_210.87`) as the case study for finding general
+emulation/HLE bugs — see **[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** for the dated
+investigation log. Also added: a virtual HDD (APA + PFS) and a `pad-inject` CLI tool for scripted
+controller-input testing.
+
 ```bash
 dotnet run --project src/DetPS2.Core -c Release -- dump-spine
 dotnet run --project src/DetPS2.Core -c Release -- play-path
@@ -22,15 +28,12 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dump paths
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Start here to contribute** — full subsystem map, HLE layering, interrupt system, GameQuirks SDK |
+| [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | **Start here to contribute** — full subsystem map, HLE layering, interrupt system, GameQuirks SDK, and the dated log of ongoing commercial bring-up work |
 | [COMPLETENESS.md](COMPLETENESS.md) | **Honest done vs open** |
-| [COMMERCIAL_PLAN.md](COMMERCIAL_PLAN.md) | Phases 40–49 (synthetic campaign) |
-| [PARITY_PLAN.md](PARITY_PLAN.md) | v2.0 parity plan (Phases 21–39) |
 | [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md) | Title list for majority math |
-| [RELEASE_NOTES.md](RELEASE_NOTES.md) | v3.0 release notes |
-| [BUILD_PLAN.md](BUILD_PLAN.md) | Phases 0–11 product arc |
-| [ROADMAP.md](ROADMAP.md) | Phase status summary |
-| [NEXT_PLAN.md](NEXT_PLAN.md) | Pointer + phase status |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | v3.1.0 release notes |
+| [ROADMAP.md](ROADMAP.md) | Full phase-by-phase history (0–56) |
+| [NEXT_PLAN.md](NEXT_PLAN.md) | Pointer to current (post-v3.1.0) focus |
 | [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE_FREEZE.md](ARCHITECTURE_FREEZE.md) | Contracts |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What runs |
 | [FLOAT_POLICY.md](FLOAT_POLICY.md) | Deterministic float rules |
