@@ -2494,6 +2494,69 @@ byte-exact regression test before trusting a boot trace).
 No source changes this entry — read-only tracing. Baseline unaffected (nothing executed
 differently), full smoke suite green (unchanged from the entry above).
 
+**Follow-up, same day — the ra=0 cascade's true first cause found and (partially) fixed; the
+remaining question reframed entirely.** Broadened `DETPS2_TRACE_JRGUARD` across a longer window and
+found the cascade isn't isolated to the text-layout function — it spans **dozens** of unrelated `jr
+ra` sites from `0x480230` through `0x475BA0`, all reading the same stale `ra=0`. Disassembled the
+start of that range: it's a **syscall trampoline table** (`li v1,N; syscall; jr ra`, one block per
+syscall number, 16 bytes apart) — meaning once `ra` first becomes 0, execution doesn't just get
+stuck, it **free-runs through the entire trampoline table issuing dozens of real, completely
+unintended syscalls** as a side effect of each one's own masked `jr ra` falling through to the next.
+
+Traced the true origin via `KernelState.RestoreContext`'s own doc comment (`"$ra = 0 so ExitThread
+path is clean"`): a freshly-started thread's `ra` is *deliberately* seeded to 0, intending that a
+thread function naturally returning (rather than calling `ExitThread`) be detected as an implicit
+exit — but nothing ever implemented that detection. **Fixed** (commit `e48a854`): `jr ra` with
+`rs=31` and a target of exactly `0` now calls `KernelState.ExitCurrentThread()` +
+`SwitchToNext()`, honoring the documented convention for real. Verified via a new
+`DETPS2_TRACE_JREXIT=1` diagnostic that the fix fires correctly — but `SwitchToNext` finds no other
+runnable thread, because **Shaolin Monks' entire run, this whole investigation, has only ever had
+one thread** (`--trace-threads`: `MainReset tid=1` at `cyc=0`, no `CreateThread` ever observed).
+This doesn't change Shaolin Monks' own observable outcome (nothing to switch to → same fall-through
+as before, the pre-existing "no CPU halt" gap, not made worse) but is a correct, general fix in its
+own right for any boot state with a real second thread, and it reframes the standing question
+entirely: **why does the game only ever have one thread, and why does that thread try to return so
+early (`cyc≈1.4M`)?**
+
+**Answer, found in `Ps2System.cs`'s own accumulated comments on `KickMidwayMainPath` (written
+earlier the same day, across multiple re-test rounds): this is already a known, deliberate
+tradeoff, not a new discovery.** The default boot path fakes a jump straight to `main()`
+(`EE.PC = 0x00212F70`, `ra` set correctly to the real CRT0 return trampoline `0x0011C2A8`) instead
+of running real CRT0. An alternate path — redirecting into genuine CRT0 (`0x0011C070`) — was tried
+and re-tried multiple times this same day: it **does** create a real second worker thread (entry
+`0x00480A18`, in the SIF-RPC library region), but that thread immediately blocks forever on
+semaphore id 3, which nothing in the whole run ever signals — "permanently blocked on something
+only genuine IOP-side interaction would ever satisfy." Each re-test after a same-day fix (PCPYUD,
+then presumably more) showed measurable improvement (px/gifPath3/dmac reaching parity with the fake
+path; a `Deci2Call` storm self-resolving after a real fix), but the semaphore-3 deadlock has kept
+it worse overall each time, so the fake path remains the committed default.
+
+**Given how many additional fixes have landed today since that last re-test** (the LWL-family fix
+that unblocked real `SifBindRpc` entirely, the JR-guard vector fix, this entry's `ra=0`/`ExitThread`
+fix, `MTSAB`/`MTSAH`/`QFSRV`) — **re-testing the real-CRT0 path again is the single most promising
+next experiment**, not further hand-tracing of the specific stack-corruption instruction inside
+`0x475B88`'s call chain (which — for the record, since it was actively being chased when this
+broader cause was found — narrows to somewhere in `0x475B88 → 0x0047E1F0 →
+0x00480520`/`0x004805E0`, a genuine stack-imbalance in that nested chain, same corruption class as
+the original `LWL`/`SDL` fix; not yet pinpointed to the exact instruction). If the real-CRT0 path's
+worker thread's semaphore-3 wait is now resolvable (or if it's now a *better* baseline even with
+that thread still parked, given everything else that's improved), switching the default away from
+the synthetic fake-jump would be a far more architecturally sound fix than chasing one more
+instance of stack corruption in a code path (`KickMidwayMainPath`'s fake boot) that's fundamentally
+a workaround to begin with.
+
+**Concrete next step, in priority order**: (1) re-test the real-CRT0 redirect
+(`KickMidwayMainPath`'s already-present, currently-disabled alternate path) with all of today's
+fixes in place, using the exact same measure-and-revert methodology as its own prior re-test
+rounds; (2) if it's now competitive or better, investigate the semaphore-3 deadlock specifically
+(what should signal it, and whether that's a synthesizable `MidwayBootAssist`-style completion,
+matching the `MaybeCompleteRealSifCdRead` precedent); (3) only if the real-CRT0 path is still not
+viable, return to hand-tracing the specific stack-corruption instruction in the fake path's
+`0x475B88` call chain.
+
+Verified this entry's fix: default baseline unchanged
+(`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full smoke suite green.
+
 ---
 
 ## 8. Save states & determinism contracts
