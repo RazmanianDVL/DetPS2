@@ -467,8 +467,53 @@ public sealed class EmotionEngine : ISchedulable
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x004767B8)
             {
-                Console.Error.WriteLine($"[MSGBUF-A0] a0=0x{GetGpr(4).Lo:X16} cyc={CurrentCycle()} ra={GetGpr(31).Lo:X8}");
+                ulong a1v = GetGpr(5).Lo;
+                var fsb = new System.Text.StringBuilder();
+                for (int i = 0; i < 300 && a1v + (ulong)i < 0x2000000; i++)
+                {
+                    byte b = _memory.Read8((uint)(a1v + (ulong)i));
+                    if (b == 0) break;
+                    fsb.Append(b is >= 0x20 and < 0x7F ? (char)b : '.');
+                }
+                Console.Error.WriteLine($"[MSGBUF-A0] a0=0x{GetGpr(4).Lo:X16} a1=0x{a1v:X8} a2=0x{GetGpr(6).Lo:X8} cyc={CurrentCycle()} ra={GetGpr(31).Lo:X8} a1text=\"{fsb}\"");
             }
+            // Diagnostic-only (DETPS2_TRACE_MSGBUF, temporary): log every entry into the
+            // vsnprintf-style formatter (0x00475BA8) with its buffer (a0) and format-string (a1)
+            // arguments, reading a1 as text where it looks plausible — the format string itself
+            // should reveal what assertion/message the game is actually building, without needing
+            // to fully resolve the formatter's own internal NULL-deref mechanics.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x00475BA8)
+            {
+                ulong a0 = GetGpr(4).Lo, a1 = GetGpr(5).Lo, a2 = GetGpr(6).Lo, ra = GetGpr(31).Lo;
+                var sb = new System.Text.StringBuilder();
+                for (int i = 0; i < 200 && a1 + (ulong)i < 0x2000000; i++)
+                {
+                    byte b = _memory.Read8((uint)(a1 + (ulong)i));
+                    if (b == 0) break;
+                    sb.Append(b is >= 0x20 and < 0x7F ? (char)b : '.');
+                }
+                Console.Error.WriteLine($"[FMTENTRY] a0(buf)=0x{a0:X16} a1(fmt)=0x{a1:X8} a2=0x{a2:X8} ra=0x{ra:X8} cyc={CurrentCycle()} fmt=\"{sb}\"");
+            }
+
+            // Shaolin Monks: guard a NULL-buffer dereference inside the vsnprintf-style
+            // formatter's own count-check (0x00475D24: bgtzl v0,+6, in the function entered at
+            // 0x00475BA8). Traced precisely (2026-07-27, see DEVELOPER_GUIDE.md): the formatter
+            // is legitimately called with a0=0 (buf=NULL) as part of normal nested format-
+            // specifier processing (confirmed via a clean --trace-window capture — no wild jump,
+            // no register corruption, ra/a0/a1 all genuinely 0 from a real, deterministic call
+            // chain). Its own s2 (=a0, the buffer) is then dereferenced via MEM[s2+4] without a
+            // NULL guard; on a system where address 0-8 is genuinely blank, that read is 0 and
+            // this branch-likely correctly doesn't fire, safely skipping the buggy delay slot
+            // (MEM[s2+0], which corrupts a0 for a much later, unrelated formatter call, cascading
+            // into a real Exit(1) about 695,000 cycles afterward). Real R5900 hardware has actual
+            // TLB-Refill vector code at physical address 0 too (KernelBootstrap.cs installs it
+            // there for the same architectural reason), so this specific NULL-buffer code path
+            // may simply never be reached on a real console for reasons not yet understood upstream
+            // of this point — matched here at the exact crash site instead, gated on both the PC
+            // and the literal opcode bytes (bgtzl v0,+6) to keep the false-positive risk for any
+            // other title landing on this same physical address at essentially zero.
+            if ((PC & 0x1FFFFFFF) == 0x00475D24 && _memory.Read32(PC) == 0x5C400006 && GetGpr(18).Lo == 0)
+                SetGpr(2, new Gpr128 { Lo = 0 }); // v0 = 0, so bgtzl correctly doesn't take the branch
 
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
