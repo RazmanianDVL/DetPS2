@@ -301,12 +301,26 @@ public sealed class EmotionEngine : ISchedulable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Gpr128 GetGpr(uint index) => _gprs[(int)index & 0x1F];
 
+    /// <summary>Diagnostic-only (DETPS2_TRACE_REGWRITE=1, DETPS2_TRACE_REGWRITE_IDX=N to pick the
+    /// register, default 4=a0): logs every write to one specific GPR anywhere in the program,
+    /// with the writing PC. General-purpose — built to trace a specific corrupted register back
+    /// to its source instruction when a manual --trace-window binary search becomes impractical
+    /// (the register hadn't been touched for over 13,000 cycles before the point it was found
+    /// corrupted, i.e. its true origin is far outside any reasonably-sized trace window).</summary>
+    public static readonly bool TraceRegWrite = Environment.GetEnvironmentVariable("DETPS2_TRACE_REGWRITE") == "1";
+    public static readonly int TraceRegWriteIdx =
+        int.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_REGWRITE_IDX"), out var _tprIdx) ? _tprIdx : 4;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetGpr(int index, Gpr128 value)
     {
         int reg = index & 0x1F;
         if (reg != 0)
+        {
+            if (TraceRegWrite && reg == TraceRegWriteIdx && value.Lo != _gprs[reg].Lo)
+                Console.Error.WriteLine($"[REGWRITE] pc=0x{PC:X8} reg={reg} old=0x{_gprs[reg].Lo:X16} new=0x{value.Lo:X16} cyc={CurrentCycle()}");
             _gprs[reg] = value;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
