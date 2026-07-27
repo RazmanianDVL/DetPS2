@@ -2994,23 +2994,48 @@ format-specifier handlers) to build a string into a caller-supplied buffer, then
 before falling into the exit helper. **This is a genuine, deliberate "format an error message, then
 abort" pattern — a real game-level assertion failure, not a hang, corruption, or livelock.**
 
-**Not yet resolved**: what specifically fails the assertion, or what the formatted message says.
-Attempted to read the message buffer directly (`a3`, copied from `a0` at `0x004767B8` just before
-the 520-byte-struct setup) but got an inconsistent reading — one `--pcbreak` capture suggested the
-buffer pointer held `0x401A68xx` (suspiciously matching the interrupt vector's own first
-instruction word, `mfc0 k0,$c0_13` at `0x80000200`), while a closer look at the surrounding
-character-scanning loop (`0x00476708`-`0x00476744`, which uses `a0` as an output-buffer base
-throughout) suggests `a0`/`a3` should instead trace back to a real caller-supplied buffer further
-up the stack, not vector bytes — the two readings don't reconcile, most likely because manual
-`--pcbreak`/`disasm` cross-referencing at this depth (matching exact `sp` values across separate
-process invocations, several stack frames deep, past a `addiu sp,sp,-112` frame change) is
-error-prone without better tooling. **Concrete next step for whoever picks this up**: build (or
-find) a way to dump the actual formatted message string reliably — e.g. a one-shot C# test that
-boots the title, runs to `cyc≈22,560,000`, and reads `RDRAM` at the real buffer address captured
-via a single consistent in-process register snapshot (not cross-process `--pcbreak`/`disasm`
-comparisons) — since the message text itself would very likely name the failing resource/check in
-plain language and settle this immediately, versus continuing to reverse-engineer the calling
-convention by hand.
+**Follow-up, same day: root-caused precisely, using new general-purpose tooling.** The earlier
+`--pcbreak`/`disasm` cross-process reading was inconsistent because manually matching exact `sp`
+values across separate invocations several stack frames deep is genuinely error-prone — resolved
+by building two small, reusable, *in-process* diagnostics instead of continuing to hand-trace:
+
+- `DETPS2_TRACE_MSGBUF` (`EmotionEngine.cs`): reads RDRAM directly at `v1` right before the
+  fatal-exit path's NUL-terminate write (`0x004767F0: sb zero,0(v1)`). Confirms the buffer really
+  is corrupted, not a reading mistake: `v1=0x401A6802`, and the bytes there are binary noise, not
+  text.
+- `DETPS2_TRACE_REGWRITE` (`EmotionEngine.cs`, hooks `SetGpr` directly): logs every write to one
+  specific GPR (`DETPS2_TRACE_REGWRITE_IDX`, default 4/`a0`) across a full run, with the writing
+  PC. Built because the corrupting write turned out to be *far* outside any reasonably-sized
+  `--trace-window` capture (over 13,000 cycles untouched before the crash reads it) — a general
+  tool for exactly this class of problem, reusable for any future register-corruption hunt.
+
+Traced `a0` to its exact corrupting instruction: `pc=0x00475D24` (`bgtzl v0,0x00475D40` — a
+*branch-likely*), at `cyc=21,858,048`, with `s2=0` (a NULL pointer) and `v0=MEM[s2+4]=0x335A007C`
+(nonzero). Because `v0>0`, the branch is taken, which for a "likely" branch means its delay slot
+*executes* (`0x00475D28: lw a0,0(s2)` → `a0=MEM[0]=0x401A6800`) — corrupting `a0` with whatever
+real bytes sit at physical address 0. That's not an emulator placement bug: `KernelBootstrap.cs`
+installs the TLB-Refill exception vector at `PhysTlbRefill=0x00000000`, which is the
+architecturally-correct real R5900 address for it — real PS2 hardware also has genuine, non-zero
+vector code there, not blank memory. So the actual bug is upstream of this instruction: **`s2`
+should hold a real pointer here (its use, `MEM[s2+0]`/`MEM[s2+4]`, matches a struct/list-node
+pattern) and is NULL instead**, and the branch-likely idiom (skip the load unless the "count"
+field is `>0`) only reads safely on hardware where a NULL pointer's neighborhood is genuinely
+blank — which the real EE kernel-reserved low-memory region is not, on real hardware either. This
+strongly suggests the compiler's assumption here depends on `s2` never legitimately being NULL at
+this point, i.e. something upstream failed to set it.
+
+Traced `s2` (`DETPS2_TRACE_REGWRITE_IDX=18`) backward through several layers, each one turning out
+to be a callee-saved-register save/restore around an unrelated inner call (the locale-search
+function's own `0x00476A44`/`0x00476D44` prologue/epilogue, the big `vsnprintf`-style formatter's
+800-byte-frame epilogue at `0x00476690`) rather than a fresh assignment — `s2`'s *true* origin (the
+point where it should have been set to a real struct/list-node pointer and wasn't) is at least one
+more layer further back than reached this session. **Concrete next step**: continue the same
+`DETPS2_TRACE_REGWRITE_IDX=18` approach from progressively earlier `--cycles` cutoffs (each save/
+restore pair found so far bounds the search further back) until a write to `s2` is found that
+isn't immediately explained by a matching save/restore pair — that write's caller is where the
+real "should have produced a valid pointer" logic lives, and is the actual next thing to
+understand (likely a failed lookup or missing HLE-provided resource, matching this whole session's
+pattern, rather than a genuine bug in Shaolin Monks' own shipped code).
 
 **Session tally (2026-07-27, this whole thread)**: 9 real bugs found and fixed, all independently
 verified (smoke suite + `px` baseline unchanged at every step): the `ra=0` corruption cascade
