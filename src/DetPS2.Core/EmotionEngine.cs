@@ -33,6 +33,10 @@ public sealed class EmotionEngine : ISchedulable
     private Intc? _intc;
     private BiosHle? _hle;
     private bool _takeExceptions;
+    /// <summary>Diagnostic-only (DETPS2_TRACE_IRQLOOP): counts consecutive Step() loop iterations
+    /// that re-enter the interrupt-dispatch branch without ever reaching real instruction
+    /// execution in between — used to detect a genuine unacknowledged-interrupt re-entry loop.</summary>
+    private ulong _irqLoopStreak;
     private bool _preferHleSyscalls = true;
     private int _cop2StallRemaining;
     private bool _cacheModelEnabled;
@@ -379,11 +383,18 @@ public sealed class EmotionEngine : ISchedulable
             // Exception vectoring for external / compare IRQs
             if (_takeExceptions && InterruptPending)
             {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IRQLOOP") == "1")
+                {
+                    _irqLoopStreak++;
+                    if (_irqLoopStreak % 1000 == 1)
+                        Console.Error.WriteLine($"[IRQLOOP] streak={_irqLoopStreak} pc=0x{PC:X8} pending=0x{_intc?.GetPendingInterrupts():X4} status=0x{COP0_Status:X8} cause=0x{COP0_Cause:X8} cyc={CurrentCycle()}");
+                }
                 if (!TryDispatchRegisteredIntcHandler())
                     EnterException(GetExceptionVector(general: true), causeExcCode: 0); // Int
                 executed++;
                 continue;
             }
+            _irqLoopStreak = 0;
 
             if (_hle != null && _hle.ExitRequested)
                 break;
@@ -586,14 +597,30 @@ public sealed class EmotionEngine : ISchedulable
         // user code installs its own handler; our synthesized vector is a bare eret with no
         // such bookkeeping, so leaving these unacked would re-raise the same interrupt on
         // the very next instruction fetch forever, pinning PC in place. Ack them exactly
-        // like a minimal no-op default ISR would — but NOT VBlankStart: Pcrtc.Step()
-        // deliberately leaves that bit sticky ("games poll/ACK via INTC_STAT write-1-clear")
-        // specifically so code can busy-poll INTC_STAT directly with COP0 interrupts masked
-        // off, exactly as real hardware requires; auto-acking it here on behalf of some
-        // unrelated co-pending source would steal the event out from under that poll.
+        // like a minimal no-op default ISR would.
+        //
+        // Previously excluded VBlankStart specifically, on the theory that Pcrtc.Step()
+        // deliberately leaves that bit sticky so code can busy-poll INTC_STAT directly with
+        // COP0 interrupts masked off, and auto-acking here would steal the event out from
+        // under that poll. Traced (2026-07-27): that scenario cannot actually occur at this
+        // exact point. `pending` (Intc.GetPendingInterrupts() = Stat & Mask) is already
+        // filtered by INTC's own per-source Mask register, so VBlankStart only appears here
+        // when its INTC-level mask is enabled — a game doing "masked polling" would leave
+        // that bit disabled, so its VBlankStart would never show up in `pending` at all.
+        // Separately, this whole method is only reached when the OUTER `_takeExceptions &&
+        // InterruptPending` check was true, which requires COP0-level IE/IM to be unmasked -
+        // directly contradicting "COP0 interrupts masked off". Both conditions the exclusion
+        // was protecting against are the opposite of how we got here, making it dead
+        // protection that never actually helps its own stated scenario, while confirmed (via
+        // DETPS2_TRACE_IRQLOOP) to cause a real, severe re-interrupt storm: VBlankStart
+        // staying permanently unacknowledged (since Pcrtc.Step() only sets it, never clears
+        // it, expecting a real handler's INTC_STAT write) re-raises via this exact fallback
+        // roughly every ~64-676 cycles for the rest of a run once no handler ever gets
+        // installed in time, starving the interrupted code of anything but a handful of
+        // instructions between re-entries, forever.
         if (pending != 0)
             for (int src = 0; src < 15; src++)
-                if ((pending & (1u << src)) != 0 && src != (int)Intc.InterruptSource.VBlankStart)
+                if ((pending & (1u << src)) != 0)
                     _intc.Acknowledge((Intc.InterruptSource)src);
         return false;
     }
