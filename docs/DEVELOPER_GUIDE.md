@@ -2178,6 +2178,52 @@ thread but landed just before it), `091ea76` (the LWL-family fix + regression te
 advancing past 5, reaching an actual rendered frame, etc.) — this fix only just landed. That's the
 immediate next step, continuing to prioritize Shaolin Monks per explicit instruction.
 
+**Follow-up, same day — pushed the trace further; found the next wall precisely.** At 150M-400M
+cycles, `PC`/`RealSifRpc`/`gifP3`/`dmac` all freeze identically (`gifP3=5`, `binds=2/calls=2`,
+final `PC=0x0047FA88`) while `px`/`spu2Samples` keep climbing — the signature of a genuine, stable
+per-frame loop, not a fresh crash. Captured a real frame via `probe-frame`: a well-formed Midway
+logo render (clean gradients, no garbage) — though `prims`/`px` are frozen by then, so this is very
+likely the pre-existing synthetic logo output, not new content.
+
+Traced the toggle between `0x00213218` (the post-logo resumption point) and `0x0047FA88` (a
+`syscall 0x04`/`Exit` trampoline). First hypothesized `MaybePostLogoAdvance`'s unconditional forced
+jump to `0x00213218` was yanking PC backward from real progress — confirmed via `--pcbreak` that
+the real SIF wait loops just above it now genuinely complete on their own (PC reaches `0x213218`
+naturally before the 8M-cycle threshold even fires), so tightened that function to only force the
+jump when actually caught stuck inside the loop range (`0x2131E8`-`0x213217`), never as a blind
+timeout (commit `fb41737`). **Empirically this changed nothing for the current stall** (identical
+150M-cycle outcome with or without the guard) — a clean negative result that disproves this
+specific hypothesis while still being a correct, worthwhile change in its own right (the old
+unconditional force is now a real liability given how often natural completion succeeds).
+
+Captured `ra` at the `Exit` trampoline directly: `ra=0x476818`, `a0=1` — a real, sane address, not
+garbage. `0x00476808` is a small "print error, call real exit(1)" wrapper (`jal 0x0011C2B0` — and
+`0x0011C2B0` is literally 8 bytes past `0x0011C2A8`, the exact synthetic `ra` `MaybePostLogoAdvance`
+already uses, confirming `0x0011C2A8`/`0x0011C2B0` is CRT0's own real "call main(), then exit(return
+value)" wrapper). So this is a **real, legitimate exit(1) path** — not corruption, not a masked
+crash — main()/some subsystem is genuinely calling this "fatal error" helper. Found 6 static callers
+of `0x00476808` (`0x00201100`, `0x00201844`, `0x00203A2C`, `0x00203A54`, `0x002043E4`, and a
+recursive one inside `0x00476840`) via `find-word`; captured which one fired live: `ra=0x80000200` —
+**the real general exception vector**, with `COP0_Cause=0x00000400` decoding to `ExcCode=0`
+(a genuine hardware interrupt, not a fault/trap) and `IP2` set (the EE's single catch-all line for
+every peripheral interrupt source).
+
+Disassembled `0x00000200` (the vector itself) expecting a real dispatcher: it's just
+`mfc0 k0,$c0_13; andi k0,k0,0x7C; eret` — three instructions, reads Cause, masks it into a scratch
+register, returns immediately. **No handler lookup, no INTC_STAT acknowledgment, no real dispatch
+at all.** This strongly suggests whatever's supposed to install a real interrupt dispatcher at (or
+reachable from) this vector never ran — the same standing theme as nearly everything else in this
+whole file: real kernel/IOP-side initialization that depends on a boot sequence this fast-boot path
+doesn't fully execute. **Concrete next step, not yet pursued:** determine whether DetPS2 supports
+COP0 `EBase`-relocated or otherwise-chained exception vectors at all, and if the real BIOS install
+its actual handler somewhere else this stub should be jumping to (rather than returning) — that
+would explain both "interrupts appear to go essentially unhandled" and, downstream, why some code
+path treats that as fatal and calls `exit(1)`.
+
+No source changes this entry beyond the already-committed `fb41737` guard — the rest is read-only
+tracing. Default baseline reconfirmed unaffected by the guard change specifically; the LWL-family
+fix's own baseline impact is already documented above.
+
 ---
 
 ## 8. Save states & determinism contracts
