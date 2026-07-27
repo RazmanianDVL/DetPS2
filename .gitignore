@@ -9,6 +9,7 @@
 # User-supplied media (NEVER commit)
 user-media.json
 user-media.local.json
+user-media-*.json
 **/bios/
 **/dumps/
 **/isos/

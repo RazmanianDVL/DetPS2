@@ -498,6 +498,8 @@ public sealed class SonyKernelHle
                 break;
             case 0x83: // FindAddress — commercial code uses (start, end, needle) memory scan
                 result = FindAddressScan(a0, a1, a2);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_FINDADDR") == "1")
+                    Console.Error.WriteLine($"[FINDADDR] start=0x{a0:X8} end=0x{a1:X8} needle=0x{a2:X8} -> 0x{result:X8} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8}");
                 break;
             case 0x85: // SetMemoryMode
             case 0x86: // GetMemoryMode
@@ -872,23 +874,43 @@ public sealed class SonyKernelHle
             return AllocStub();
         }
 
-        if (_findCache.TryGetValue(needle, out uint cached))
+        // Cache key includes `start`, not just `needle` -- a title enumerating multiple
+        // occurrences of the same needle (e.g. "find the next export after the one I just
+        // processed") calls this repeatedly with the same needle but an advancing `start`
+        // (typically the previous hit + a few bytes). Caching by needle alone made every such
+        // call after the first return the same stale first-ever hit forever, regardless of
+        // `start` — an infinite loop for any title using this enumerate-forward idiom (confirmed
+        // via DETPS2_TRACE_FINDADDR against Mortal Kombat: Deception, SLUS_208.81: 226,976 calls
+        // in a 5M-cycle window, same start=/end=/needle=/result= every time, start already past
+        // the returned hit). Caching by (needle, start) keeps the original fast-path behavior for
+        // the common "poll the same start/needle until the answer changes" idiom (unaffected: the
+        // key is identical every retry) while letting an advancing `start` produce a fresh scan.
+        ulong key = ((ulong)needle << 32) | start;
+        if (_findCache.TryGetValue(key, out uint cached))
             return cached;
 
         uint vbase = (start & 0xE0000000u) != 0 ? (start & 0xE0000000u) : 0x80000000u;
+        uint physCap = (uint)Math.Min(SystemMemory.RDRAM_SIZE, 0x01000000);
+        // Honor `start` as the real scan lower bound (previously always scanned from physical 0,
+        // silently ignoring `start` for anything but computing `vbase` — the other half of the
+        // enumerate-forward bug above: even a fresh, uncached scan would re-find the same first
+        // occurrence instead of the next one). Clamp a `start` above our fixed scan ceiling back
+        // to 0 rather than skip the scan outright, so a title whose runtime addresses this
+        // scanner doesn't otherwise understand still gets a best-effort answer instead of none.
+        uint physStart = start & 0x1FFFFFFFu;
+        if (physStart >= physCap) physStart = 0;
 
-        // Search RDRAM once per needle (window is often too small — e.g. only 512KB kseg0)
-        long hit = ScanPhysRange(0, (uint)Math.Min(SystemMemory.RDRAM_SIZE, 0x01000000), needle, vbase);
-        _findCache[needle] = (uint)hit;
+        long hit = ScanPhysRange(physStart, physCap, needle, vbase);
+        _findCache[key] = (uint)hit;
 
         // Midway-style pair fixup: export tables often need (addrA - 524) == (addrB - 360).
         // When we know both pointers, plant a synthetic slot so commercial init loops exit.
         MaybePlantMidwayPair(vbase);
 
-        return _findCache.TryGetValue(needle, out cached) ? cached : hit;
+        return _findCache.TryGetValue(key, out cached) ? cached : hit;
     }
 
-    private readonly Dictionary<uint, uint> _findCache = new();
+    private readonly Dictionary<ulong, uint> _findCache = new();
     private bool _midwayPairPlanted;
 
     private void MaybePlantMidwayPair(uint vbase) => ForcePlantMidwayPair();
