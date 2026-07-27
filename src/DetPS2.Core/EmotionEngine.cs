@@ -419,6 +419,22 @@ public sealed class EmotionEngine : ISchedulable
             if (_cacheModelEnabled)
                 NoteICache(PC);
 
+            // Diagnostic-only (DETPS2_TRACE_MSGBUF, temporary): read the formatted error-message
+            // string just before it's NUL-terminated at Shaolin Monks' fatal-exit call site
+            // (0x004767F0: sb zero,0(v1)), to identify what assertion is actually failing there.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x004767F0)
+            {
+                ulong bufAddr = GetGpr(3).Lo; // v1
+                var sb = new System.Text.StringBuilder();
+                for (int i = 0; i < 512; i++)
+                {
+                    byte b = _memory.Read8((uint)(bufAddr + (ulong)i));
+                    if (b == 0) break;
+                    sb.Append(b is >= 0x20 and < 0x7F ? (char)b : '.');
+                }
+                Console.Error.WriteLine($"[MSGBUF] v1=0x{bufAddr:X8} cyc={CurrentCycle()} msg=\"{sb}\"");
+            }
+
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
             if (SystemMemory.WatchAddr.HasValue || SystemMemory.TrackLastWriter)
