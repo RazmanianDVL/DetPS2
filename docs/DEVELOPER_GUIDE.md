@@ -2911,7 +2911,7 @@ regressions at any step. `--trace-threads` over a 250M-cycle run shows real, sub
 thread 1 gets scheduled cooperatively at `cyc=19,750,000` (previously never again once thread 2
 took over) and the existing `ForcePreempt` mechanism (a *different*, already-existing forced
 timeslice mechanism, `_preemptQuantum = 0x10000`) keeps alternating both threads regularly
-afterward, with thread 1 reaching entirely new code (`0x474748C8` onward) never touched in any
+afterward, with thread 1 reaching entirely new code (`0x004748C8` onward) never touched in any
 prior trace this session. `syscalls` still plateaus at `298` by 250M cycles with no further growth
 through 1B cycles, and `px` is still unchanged at `76,840,960` — real, deep, verified forward
 motion in *how much of the game's own code actually runs*, but not yet a full unblock. PC
@@ -2927,7 +2927,7 @@ primitive — every fix landed today addressed a real, verified bug (corruption 
 dead assist code, no-op wakeup target, interrupt storm, missing WaitEventFlag semantics, a
 scheduler self-check bug), and each individually produced genuine, measurable forward progress in
 *what the game's own code actually executes* — but none of them has yet been the specific gate for
-resuming GS activity. **Concrete next step**: with thread 1 now reaching `0x474748C8` onward
+resuming GS activity. **Concrete next step**: with thread 1 now reaching `0x004748C8` onward
 (never explored this session), disassemble/trace forward from there to find whatever code path
 would normally issue the next real GS draw command, rather than continuing to chase kernel
 primitives — the remaining gap looks increasingly like it's in game-specific rendering/menu logic
