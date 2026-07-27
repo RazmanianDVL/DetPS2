@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 
 namespace DetPS2.Core;
 
@@ -51,6 +52,8 @@ public sealed class Ps2System : ISchedulable
     /// <summary>Last EE PC in game/code space — used to recover from low-memory thrash.</summary>
     public ulong LastGoodEePc { get; set; }
     private bool _commercialSifInitKicked;
+    private bool _commercialWorkerKicked;
+    private ulong? _commercialWorkerSeenNotStartedAtCycle;
     /// <summary>Diagnostic-only escape hatch to test whether the real boot now proceeds
     /// without the Midway forced-jump assists, now that several real EE/SIF-RPC bugs have
     /// been fixed. Opt-in via blocker-trace/etc --no-assist or DETPS2_DISABLE_MIDWAY_ASSIST=1.</summary>
@@ -303,6 +306,33 @@ public sealed class Ps2System : ISchedulable
                 // disabling quirk modules for other titles in general.
                 if (ActiveQuirk != null && !(ActiveQuirk is MidwayBootAssist && DisableMidwayAssist))
                     ActiveQuirk.Step(this);
+
+                // KickCommercialWorker wire-up (2026-07-27): case 0x20 (CreateThread)'s own
+                // comment documents that Midway's SIF-RPC dispatch worker is deliberately never
+                // auto-started at creation time ("needs globals filled first") and expects either
+                // a real StartThread call or "a late commercial assist" to start it — but
+                // KickCommercialWorker (below) was written to be that assist and never actually
+                // wired up anywhere, leaving the worker thread permanently Alive-but-not-Started.
+                // Traced (2026-07-27): with this session's other SIF fixes landed, the game's own
+                // code never reaches its own StartThread call for this thread (thread dump at any
+                // point past creation shows started=false indefinitely) — the main thread is busy
+                // elsewhere and nothing else ever starts it. Fire once, a short grace period after
+                // first observing a created-but-not-started worker thread (id>=2), to let whatever
+                // globals the comment refers to get filled in first rather than racing thread
+                // creation itself.
+                if (!DisableMidwayAssist && !_commercialWorkerKicked && ActiveQuirk is MidwayBootAssist)
+                {
+                    var worker = Hle.Kernel.AllThreads.FirstOrDefault(t => t.Id >= 2 && t.Alive && !t.Started);
+                    if (worker != null)
+                    {
+                        _commercialWorkerSeenNotStartedAtCycle ??= MasterCycles;
+                        if (MasterCycles - _commercialWorkerSeenNotStartedAtCycle.Value > 200_000)
+                        {
+                            KickCommercialWorker();
+                            _commercialWorkerKicked = true;
+                        }
+                    }
+                }
 
                 ulong n = left > slice ? slice : left;
                 Scheduler.RunFor(n);
@@ -561,6 +591,8 @@ public sealed class Ps2System : ISchedulable
         UseJit = false;
         LastGoodEePc = 0;
         _commercialSifInitKicked = false;
+        _commercialWorkerKicked = false;
+        _commercialWorkerSeenNotStartedAtCycle = null;
         // The fallback MidwayAssist instance (used when no quirk is active) is never
         // stepped/touched, so it never accumulates real state and needs no reset here.
         ActiveQuirk?.Reset();

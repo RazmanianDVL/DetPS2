@@ -384,6 +384,13 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
         Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
+        if (traceSys.Hle.Sony != null)
+        {
+            Console.WriteLine("  threads:");
+            foreach (var t in traceSys.Hle.Kernel.AllThreads)
+                Console.WriteLine($"    id={t.Id} alive={t.Alive} started={t.Started} sleeping={t.Sleeping} waitSemaId={t.WaitSemaId}");
+            Console.WriteLine($"  currentThreadId={traceSys.Hle.Kernel.CurrentThreadId}");
+        }
         Console.WriteLine($"  IOP: pc=0x{traceSys.Iop.PC:X8}");
         if (traceSys.Hle.Sony != null)
         {
