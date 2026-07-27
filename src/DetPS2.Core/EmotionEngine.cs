@@ -529,16 +529,34 @@ public sealed class EmotionEngine : ISchedulable
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00476808)
                 Console.Error.WriteLine($"[ABORT-CALLER] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
 
-            // Diagnostic-only (DETPS2_TRACE_EXIT, temporary): the registry insert/lookup case
-            // blocks at 0x004898DC/0x004898F4 have no static jal/j callers anywhere in the loaded
-            // image (scanword confirmed this) — they must be reached via an indirect jump (jalr)
-            // through a function-pointer table, matching MEM[0x00565B90]=0x004898F4 found earlier.
-            // Log every real entry to each, with $ra and $sp, to find the true caller empirically
-            // and see whether the insert case ever fires at all before the fatal lookup.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x004898DC)
-                Console.Error.WriteLine($"[REG-INSERT] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x004898F4)
-                Console.Error.WriteLine($"[REG-LOOKUP] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
+            // Diagnostic-only (DETPS2_TRACE_EXIT, temporary): found via Ghidra's own reference
+            // analysis (2026-07-27, see docs/DEVELOPER_GUIDE.md) -- the real mechanism behind the
+            // ra=0 signature at [ABORT-CALLER]. 0x00476808 is reached from a mutable global
+            // function-pointer slot (0x004EC8F8, PTR_FUN_004ec8f8) whose default/initial value IS
+            // the abort path (0x002010F8, itself a plain `FUN_00476808(); return;` stub) -- called
+            // through via two small dispatch functions, 0x00201108 and 0x00202E40, whose own
+            // bodies are pure tail calls (the pointer's target, then return) with nothing else in
+            // between. A pure tail call is a plain `j`/`jr`, not `jal` -- it never touches $ra --
+            // so $ra survives unchanged all the way from FUN_00201108/FUN_00202E40's own entry
+            // down through the pointer call and into 0x00476808, explaining why ra=0 shows up
+            // there even though every step in between is a real, findable function. Unlike
+            // 0x00476808 itself, THESE two functions are reached via genuine `jal`s (confirmed via
+            // Ghidra's reference manager, not just byte-pattern scanword matching) from 14-22
+            // distinct call sites each -- logging $ra here is the only way to find out which one.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00201108)
+                Console.Error.WriteLine($"[PANIC-DISPATCH-A] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00202E40)
+                Console.Error.WriteLine($"[PANIC-DISPATCH-B] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
+            // Re-check (2026-07-27, after this session's other EE fixes changed the execution
+            // path leading up to the same crash cycle): does the one confirmed tail-jump (j, not
+            // jal -- preserves whatever $ra already held) call site to 0x00476808 found much
+            // earlier this investigation, inside the lookup-or-die function at 0x00204430, fire
+            // now? Log entry to the function itself (0x00204430) and the exact tail-jump
+            // instruction (0x0020448C) separately.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00204430)
+                Console.Error.WriteLine($"[LOOKUP-ENTRY] a0=0x{GetGpr(4).Lo:X8} ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x0020448C)
+                Console.Error.WriteLine($"[LOOKUP-TAILJUMP] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
 
             // Shaolin Monks: guard a NULL-buffer dereference inside the vsnprintf-style
             // formatter's own count-check (0x00475D24: bgtzl v0,+6, in the function entered at
