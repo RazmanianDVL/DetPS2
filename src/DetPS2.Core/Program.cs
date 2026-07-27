@@ -392,6 +392,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             Console.WriteLine($"  currentThreadId={traceSys.Hle.Kernel.CurrentThreadId}");
         }
         Console.WriteLine($"  IOP: pc=0x{traceSys.Iop.PC:X8}");
+        Console.WriteLine($"  EE: exitRequested={traceSys.Hle.ExitRequested} exitCode={traceSys.Hle.ExitCode} PC=0x{traceSys.EE.PC:X8}");
         if (traceSys.Hle.Sony != null)
         {
             Console.WriteLine("  top syscalls:");
