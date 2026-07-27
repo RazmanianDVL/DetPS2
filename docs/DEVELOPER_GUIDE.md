@@ -3121,6 +3121,25 @@ locale/config value read very early in boot, possibly from a resource our CDVD/f
 serve, or a static-initializer table this emulator doesn't fully walk before `main()`), and determine
 what condition should have made it take the *register* case before the *lookup* case is ever reached.
 
+**Ruled out: this is not a missing-static-constructor problem.** `ElfLoader.cs` only ever processes
+`PT_LOAD`/`PT_MIPS_REGINFO` program headers (no section-header/`.init_array`/`.ctors` handling
+at all — confirmed by reading the whole file), which raised the obvious hypothesis that C++ global
+constructors simply never run. Disassembling the game's own crt0 at its ELF entry (`0x0011C070`)
+rules this out directly: after the standard GPR/FPR zero-init and two BSS-clear loops, it sets `$gp`
+and `$sp` via two syscalls (`v1=60` then `v1=61` — heap/stack init), then at `0x0011C260-0x0011C274`
+does the textbook linker-resolved-optional-symbol idiom — `lui/addiu s0,0x00205DE8; beq s0,zero,skip;
+jalr s0` — i.e. **it does call a real init/constructor-runner routine, unconditionally, in the first
+few hundred thousand cycles of boot**, well before any of the ~476M cycles of real gameplay/menu code
+that run before the eventual crash. So static C++ initialization (or whatever `0x00205DE8` is) does
+execute; it isn't skipped by an emulator-side loader gap. The missing self-registration must instead
+be triggered by some later, in-game code path (e.g. first use of a specific locale/format feature,
+possibly gated behind a resource our CDVD/SIF HLE doesn't yet serve) — not a boot-time omission. Also
+visible in this same crt0 disassembly, for whoever picks this up next: `0x0011C288: jal 0x00476848`
+(another conditional init call, `a0=0x00205DF0`) and `0x0011C2A0: jal 0x00212F70` (called with
+`a0=MEM[0x005B9C00]`, `a1=v0+4` right after `ei` — almost certainly the real `main()`), followed by a
+tail-jump to `0x00202068` (`exit(main_result)`-shaped). Useful landmarks for the next session instead
+of re-deriving crt0 from scratch.
+
 ---
 
 ## 8. Save states & determinism contracts
