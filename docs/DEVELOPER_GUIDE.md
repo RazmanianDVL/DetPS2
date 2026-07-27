@@ -3259,6 +3259,38 @@ find what supplies its buffer/input argument in the first place (likely a heap/s
 call that's returning near-zero garbage specifically when invoked from thread 1's early, tail-jump-
 heavy execution context), not another attempt at walking `ra` back through more tail-jumps.
 
+**Follow-up, same session: the "input string" being scanned isn't a string at all.** `--pcbreak` on
+the bracket-scanner's own character-read instruction (`0x00476720: lb a3,0(a1)`) at the new
+`cyc=28,541,600` crash caught `a1` walking `0x01FFB6DF → E0 → E1 → …` (a stack address, one byte at
+a time, matching the loop). `--dump=01FFB6C0:80` on that exact region shows **mostly zero bytes and
+small binary values** — `9C545D18 00008000 00001000 00002000 00002000 00000080 01FEFE00` — not
+readable text. This matches the one incidental printable byte already seen in the earlier
+`[MSGBUF-A0] a1text="T."` capture (`0x54`='T', sitting inside `0x9C545D18` at the right offset) —
+that was never a real format string with one garbage byte, it was **uninitialized stack memory**
+with one byte that happened to be printable. So this isn't corruption of a real value, and it isn't
+a real message/format string either — it's the scanner being handed a pointer to memory that was
+simply **never written** before this call, and reading whatever leftover bytes happen to be there
+as if they were meaningful input.
+
+Also notable, same PCBREAK capture: `s0=0x5C3A306D6F726463` — byte-decoded, `"cdrom0:\"` — the exact
+byte pattern flagged as a "corruption signature" in the very first investigation round of this whole
+saga (predating this session, described back then as part of a `ra=0` corruption cascade later
+found to be a false positive in a different guard). Given everything learned this session, that
+characterization should probably be revisited too: `s0` isn't touched anywhere in the bracket-
+scanner's own body, so it's almost certainly just a leftover, unrelated value from some earlier,
+completely legitimate CD-ROM path operation (opening `cdrom0:\SLUS_210.87;1` or similar) still
+sitting in a callee-saved register — not evidence of anything wrong at this call site. Worth keeping
+in mind if it resurfaces: it's very likely a red herring, not a clue.
+
+**Where this leaves the investigation**: the call site itself (bracket-scanner → message-builder →
+abort) is now very well understood, and known to be a real, general, recurring bug — not a red
+herring, not title-specific. What's still unknown is *why* whatever calls into this chain hands it a
+pointer to memory that was never initialized, i.e. what upstream logic should have written a real
+string there first and didn't. That's a caller-side stack-frame/data-flow question, not something
+`$ra`-chasing through more tail-jumps will resolve — it needs someone to identify the actual C-level
+caller (likely by finding what local variable this stack slot corresponds to in whatever function
+owns frame `sp≈0x01FF0120`) and what condition should have populated it.
+
 ---
 
 ## 8. Save states & determinism contracts
