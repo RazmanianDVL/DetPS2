@@ -250,6 +250,8 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x33: // WakeupThread
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_WAKEUP") == "1")
+                    Console.Error.WriteLine($"[WAKEUP] from tid={_kernel.CurrentThreadId} target={a0} cyc={_system.MasterCycles}");
                 result = _kernel.WakeupThread((int)a0);
                 break;
             case 0x35: // CancelWakeupThread

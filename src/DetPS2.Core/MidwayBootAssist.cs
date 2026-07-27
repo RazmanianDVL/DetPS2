@@ -106,6 +106,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// has been observed blocked, for <see cref="MaybeUnblockStarvedSema"/>. Keyed by thread id;
     /// reset whenever the thread is seen sleeping on a different sema (or not sleeping at all).</summary>
     private readonly System.Collections.Generic.Dictionary<int, (int semaId, ulong sinceCycle)> _semaWaitStart = new();
+    /// <summary>Same idea as <see cref="_semaWaitStart"/>/<see cref="MaybeUnblockStarvedSema"/>,
+    /// for the sibling case of a thread parked via plain SleepThread (WaitSemaId==0, not
+    /// WaitVblank) rather than WaitSema — see <see cref="MaybeUnblockStarvedSleep"/>.</summary>
+    private readonly System.Collections.Generic.Dictionary<int, ulong> _sleepWaitStart = new();
     private bool _preloadStarted;
     // Real-protocol SIF bind+call synthesis (see MaybeCompleteRealSifCdRead) — a small state
     // machine, one step per Step() tick (every ~25,000 cycles), since Sif.SubmitRpc's packets
@@ -322,6 +326,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         MaybeForceInitLocks(sys);
         MaybeResumeAfterForcedInitLocks(sys);
         MaybeUnblockStarvedSema(sys);
+        MaybeUnblockStarvedSleep(sys);
         MaybeCompleteRealSifCdRead(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
@@ -764,6 +769,46 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 Console.Error.WriteLine($"[RPC] force-unblocking starved sema={t.WaitSemaId} thread={t.Id} cyc={sys.MasterCycles}");
             kernel.SignalSema(t.WaitSemaId);
             _semaWaitStart.Remove(t.Id); // fresh grace period if it re-blocks on the same sema
+            Assists++;
+        }
+    }
+
+    /// <summary>
+    /// Sibling rescue to <see cref="MaybeUnblockStarvedSema"/>, for a thread parked via plain
+    /// SleepThread (WaitSemaId==0, not WaitVblank) rather than WaitSema. Traced (2026-07-27): once
+    /// KickCommercialWorker actually starts Shaolin Monks' SIF-RPC dispatch worker (thread id>=2),
+    /// that worker runs a real WaitSema/WakeupThread dispatch loop indefinitely, but every
+    /// WakeupThread call it makes targets id=0 — a no-op, since no thread has id 0 (ids start at 1,
+    /// and thread 1 - the primordial boot thread - predates the normal CreateThread/GetThreadId
+    /// flow, so nothing ever recorded its real id anywhere the worker reads it back from). The main
+    /// thread (id 1), which had SleepThread'd itself expecting the worker to wake it once real,
+    /// therefore sleeps forever even though the worker is genuinely alive and running. Force-wakes
+    /// any such starved thread after the same grace period as the sema case.
+    /// </summary>
+    private void MaybeUnblockStarvedSleep(Ps2System sys)
+    {
+        const ulong graceCycles = 2_000_000;
+        var kernel = sys.Hle?.Kernel;
+        if (kernel == null) return;
+
+        foreach (var t in kernel.AllThreads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitSemaId != 0 || t.WaitVblank)
+            {
+                _sleepWaitStart.Remove(t.Id);
+                continue;
+            }
+            if (!_sleepWaitStart.TryGetValue(t.Id, out var since))
+            {
+                _sleepWaitStart[t.Id] = sys.MasterCycles;
+                continue;
+            }
+            if (sys.MasterCycles - since < graceCycles) continue;
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] force-waking starved sleep thread={t.Id} cyc={sys.MasterCycles}");
+            kernel.WakeupThread(t.Id);
+            _sleepWaitStart.Remove(t.Id); // fresh grace period if it re-sleeps
             Assists++;
         }
     }
