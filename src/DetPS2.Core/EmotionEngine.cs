@@ -505,6 +505,17 @@ public sealed class EmotionEngine : ISchedulable
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00476808)
                 Console.Error.WriteLine($"[ABORT-CALLER] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
 
+            // Diagnostic-only (DETPS2_TRACE_EXIT, temporary): the registry insert/lookup case
+            // blocks at 0x004898DC/0x004898F4 have no static jal/j callers anywhere in the loaded
+            // image (scanword confirmed this) — they must be reached via an indirect jump (jalr)
+            // through a function-pointer table, matching MEM[0x00565B90]=0x004898F4 found earlier.
+            // Log every real entry to each, with $ra and $sp, to find the true caller empirically
+            // and see whether the insert case ever fires at all before the fatal lookup.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x004898DC)
+                Console.Error.WriteLine($"[REG-INSERT] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x004898F4)
+                Console.Error.WriteLine($"[REG-LOOKUP] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
+
             // Shaolin Monks: guard a NULL-buffer dereference inside the vsnprintf-style
             // formatter's own count-check (0x00475D24: bgtzl v0,+6, in the function entered at
             // 0x00475BA8). Traced precisely (2026-07-27, see DEVELOPER_GUIDE.md): the formatter

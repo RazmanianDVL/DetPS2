@@ -3140,6 +3140,69 @@ visible in this same crt0 disassembly, for whoever picks this up next: `0x0011C2
 tail-jump to `0x00202068` (`exit(main_result)`-shaped). Useful landmarks for the next session instead
 of re-deriving crt0 from scratch.
 
+**Correction to the above** (2026-07-27, later the same day): `0x00205DE8` — the address `jalr s0`
+actually calls at `0x0011C270` — disassembles to just `jr ra; nop`. It's an **empty stub**, not real
+constructor logic as claimed above. Confirmed by reading it directly rather than inferring from the
+`jalr` firing. Its sibling `0x00205DF0` (passed as an argument to `0x00476848` at `0x0011C288`,
+not called directly) is the same empty stub. The *real* logic nearby, `0x00205DF8`, walks a
+NULL-terminated function-pointer list via `jalr` in a loop — but it turned out to be an
+**atexit/destructor walker**, not a constructor runner: its only caller (`0x00202068`, found via
+`scanword`) tail-jumps straight into the `exit()` trampoline (`0x0011C2B0`) right after calling it,
+i.e. it runs at shutdown, not startup. So static-constructor execution remains ruled out as the
+cause here, just not for the reason originally given — there's no evidence of any real per-game
+constructor-runner being invoked at all in this path, empty or otherwise, and no evidence it's
+needed (nothing else pointed at C++ static init specifically).
+
+### 7.5 Live-traced correction to the `0x00565B9C` registry-lookup theory
+
+The `0x00204430` lookup-or-die / `0x00565B9C` registry-insert mechanism documented above (§7.4
+final entries, and filed as [GitHub issue #1](https://github.com/RazmanianDVL/DetPS2/issues/1)) was
+derived **entirely from static disassembly** — never confirmed against a live run. Added two new
+`DETPS2_TRACE_EXIT`-gated diagnostics to check it directly: `[REG-INSERT]` at `0x004898DC` (the
+registration case) and `[REG-LOOKUP]` at `0x004898F4` (the lookup case), both logging `$ra`/`$sp`/
+cycle on every real entry (`EmotionEngine.cs`).
+
+**Result, across the full run to the known crash cycle (476,734,304)**: `[REG-INSERT]` fires
+**exactly once**, very early (`cyc=150,000`, `ra=0x00205EE4` — inside the same function-pointer-list
+walker discussed above, a *third*, distinct list-walking function at `0x00205E50-0x00205EF8`, not
+the atexit one). `[REG-LOOKUP]` **never fires at all** — zero hits in ~476.7M cycles. So the
+registration genuinely happens, and the specific lookup-or-die path traced statically is **not**
+what triggers this crash. That theory is retracted as the live mechanism; issue #1 needs updating.
+
+**What actually happens, confirmed via `--trace-chrono` right at the `[ABORT-CALLER]` cycle
+(`cyc=476,728,204`)**: entry to the abort wrapper (`0x00476808`) is reached by genuine, clean
+straight-line fall-through from the tail end of the message-building function at `0x004767A8`
+(`jr ra` at `0x004767A0` returns into `0x004767A8` itself — the same "compiler lays adjacent
+functions out so one's epilogue return address is literally the next function's entry" pattern
+documented earlier in this file, not corruption). Following it back with `$a0` logged at
+`0x004767A8`'s own entry (existing `[MSGBUF-A0]` diagnostic, `DETPS2_TRACE_MSGBUF=1`):
+
+```
+[MSGBUF-A0] a0=0x000000000000000B a1=0x0077F809 a2=0x0000005D cyc=476727904 ra=00000000
+[MSGBUF]    v1=0x0000000C cyc=476728224 msg=""
+```
+
+`a0=0x0B` (**11**, decimal) is the buffer pointer this message-builder is called with — an absurdly
+small value for a real pointer, clearly a small integer being used where a buffer address is
+expected (matches `v1=0xC` at the later NUL-terminate step: `0xB+1`, one byte written then
+advanced). `a1=0x0077F809` looks like a genuine, plausible format-string address (same region
+flagged earlier this whole investigation as "the closest thing to a readable message string ever
+captured"). `ra=0` again — the same signature seen at the *original* crash occurrence much earlier
+in this investigation (`cyc≈19,755,440`, also `a0=0`/`a1=0`/`ra=0`), suggesting this isn't a one-off:
+whatever caller reaches this error/message-reporting path consistently does so with `ra=0` (i.e.
+via a chain of tail-jumps all the way back to some root context that itself was entered without a
+`jal` — a fresh thread entry or similar) and a **degenerate buffer argument**, at least twice, in
+two structurally similar but not identical ways (`0x401A6800` corrupted-word-as-pointer the first
+time; a raw small integer `11` this time).
+
+**Concrete next step**: find what calls the message-builder chain (ultimately reachable from
+`0x004766B8`'s bracket/charset scanner, itself entered via more tail-jumps) with `a0=11` — since
+`$ra=0` can't distinguish *which* root caller this is (every hop in between is a `j`, not `jal`, so
+`$ra` never changes), tracing needs a different signal: which thread is executing at
+`cyc=476,727,904` (`KernelState.CurrentThreadId` or equivalent) and where that thread's own entry
+point is, since `ra=0` strongly implies we're still within a context that has never made a real
+`jal`-based call of its own.
+
 ---
 
 ## 8. Save states & determinism contracts
