@@ -1,6 +1,7 @@
 # DetPS2 Compatibility Tracker
 
-**Last updated**: 2026-07-27 (real commercial bring-up in progress — see `docs/DEVELOPER_GUIDE.md`)
+**Last updated**: 2026-07-27 (real commercial bring-up in progress — see `docs/DEVELOPER_GUIDE.md`;
+full per-title status and cross-title triage on the [GitHub wiki](https://github.com/RazmanianDVL/DetPS2/wiki))
 
 This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships engineering tooling for dumps and netplay; **no commercial title has reached its main menu yet**. Most entries below describe automated tests and synthetic fixtures only (no copyrighted dumps) — the one real-dump attempt in progress is called out explicitly.
 
@@ -26,8 +27,16 @@ This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships enginee
 | In-memory netplay lockstep | Netplay | **Pass** | `Netplay_InMemory_LockstepSync` |
 | Real PS2 BIOS dump | BIOS | **Partial** | Load path + expanded HLE; verified against a real user-supplied dump |
 | Public domain / ps2dev homebrew | Homebrew | **Partial** | Loader + HLE + more ISA; title-dependent |
-| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Boots past logo into real gameplay/menu-adjacent code (100M+ cycles of genuine SIF activity); blocked on a traced runtime-library registry bug — see `docs/DEVELOPER_GUIDE.md` |
-| Other commercial game ISOs | Retail | **Untested** | Not yet attempted; fixes found via Shaolin Monks are general (kernel/HLE), so likely to help broadly |
+| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Its long-standing `Exit(1)` crash is fixed (was a garbage-execution artifact, not a real panic); now stalls at a real wait (`0x00212DD0`), unchanged 5M-900M cycles — see `docs/DEVELOPER_GUIDE.md` §7.10-7.11 |
+| Vexx (`SLUS_203.83`) | Retail | **In progress** | Most active title tested — 274K+ syscalls, 5.8MB real SIF traffic (entirely from *general* fixes, no Vexx-specific work) before stalling ~100M-200M cycles |
+| Blood Omen 2 (`SLUS_200.24`) | Retail | **In progress** | Real `Exit(1)` crash before 20M cycles (confirmed distinct from Shaolin Monks' now-fixed mechanism), untraced |
+| Burnout 3: Takedown (`SLUS_210.50`) | Retail | **In progress** | Stalls ~20M cycles on a shared SN Systems ProDG SDK wait-flag routine — same bug also affects MK: Deadly Alliance and MK: Deception |
+| God of War (`SCUS_973.99`) | Retail | **In progress** | Stalls ~20M cycles on one identified, unimplemented MMI instruction — likely the cheapest fix of any title tested |
+| Haven: Call of the King (`SLUS_205.17`) | Retail | **In progress** | Real progress to 100M cycles, then stalls, untraced |
+| Mortal Kombat: Deadly Alliance (`SLUS_204.23`) | Retail | **In progress** | Same shared SDK wait-flag bug as Burnout 3 |
+| Mortal Kombat: Deception (`SLUS_208.81`) | Retail | **In progress** | Same shared SDK wait-flag bug as Burnout 3 |
+| Whiplash (`SLUS_206.84`) | Retail | **In progress** | Stalls ~20M cycles, no rendering activity, untraced |
+| Other commercial game ISOs | Retail | **Untested** | Fixes found via Shaolin Monks are general (kernel/HLE), so likely to help broadly |
 
 ## Subsystems
 
