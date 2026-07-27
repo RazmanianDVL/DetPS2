@@ -2594,6 +2594,58 @@ No source changes this entry (`Ps2System.cs`'s redirect was reverted, confirmed 
 before the default rebuild). Baseline reconfirmed identical to before this experiment
 (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`).
 
+**Follow-up, same day — traced the `ra=0` cascade's actual origin one layer further; found it
+predates today's fixes and is already partially, defensively anticipated.** Re-verified (important,
+since the immediately preceding entry temporarily redirected the boot path) that the default
+fake-jump path was cleanly restored — `git status`/`git diff` empty, baseline metrics matched
+exactly — before continuing.
+
+Captured every hit of the syscall trampoline at `0x480268` (real `SifSetReg`, syscall `0x79`)
+across the run's first ~1.4M cycles: the first several hits (`cyc=1,316,768`-`1,350,000`) all show
+**sane, varied, legitimate return addresses** (`0x485DF0`, `0x485E0C`, ..., `0x48298C`,
+`0x482FF8`) — genuinely different real callers, ordinary SIF register-configuration traffic. The
+*first* bad hit (`ra=0x0`) appears at `cyc=1,400,000`, with `s0` already holding the `"cdrom0:\"`
+byte pattern — the same recurring signature found at every corrupted capture point traced back
+through this whole sub-investigation (see the entry above naming the call chain
+`0x475B88 → 0x47E1F0 → 0x480520`/`0x4805E0`), strongly suggesting the true origin involves a real
+CD/file-path operation gone wrong, not a generic pointer-arithmetic slip.
+
+A chronological trace (`--trace-window --trace-chrono`) right around this cycle shows execution
+spending the entire captured window in a **separate, already-documented** tight poll —
+`0x00480330`: `lw v0,0(v1); andi v0,v0,0x4; beq v0,zero,0x00480330` — matching
+`Ps2System.cs`'s own prior-round comment naming this exact address "the real SIF-library polling
+loop." Confirmed via the already-known later-cycle sampling (`0x474EE4`/`0x475000`/`0x475D14`,
+traced in earlier entries) that this specific spin **does** eventually get left behind — it is not
+itself the permanent stall, just an early, transient one this run passes through before eventually
+reaching the far-later text-layout loop.
+
+**Checked `MidwayBootAssist.UnstickSifWaits` for an active role in the corruption and found the
+opposite — it already defends against exactly this scenario.** Its handler for
+`0x00482740`-`0x00482760` reads: `if (ra >= 0x100000) sys.EE.PC = ra;` — i.e. it explicitly
+**refuses** to force a jump through `ra` when `ra` doesn't look like a sane code address, leaving
+PC untouched (real CPU execution continues normally from wherever it already is) rather than
+following a bad pointer. This is a defensive guard an earlier round of this same investigation
+already added, meaning: **the game's own compiled code, independent of anything touched today,
+already reaches a state where `ra` is corrupted/zero around this SIF-poll/give-up sequence** — this
+predates every fix landed this session and was already known (if not root-caused) before today's
+work began.
+
+**Net position on the shared bottleneck**: real, concrete progress narrowing it (exact cycle of
+first onset, exact recurring data signature, confirmed pre-existing and already-defended-against
+rather than newly introduced), but not a root cause or a fix. The corruption most plausibly
+originates inside the real CD-path/SIF-give-up handling that runs once the `0x00480330` poll is
+abandoned — tracing the *exact* instruction that first corrupts `ra` (as opposed to where it's
+first *observed* corrupted) needs the same painstaking, verified-at-every-step methodology the
+original `LWL`/`SDL` fix took multiple rounds to complete, not a single additional pass.
+**Concrete next step**: disassemble the SIF-poll abandonment/timeout path immediately following
+`0x00480330` (what code runs once that loop's own real exit condition is met, or what — if
+anything — currently forces an exit from it) and trace forward from there byte-exactly, the same
+way `0x0024C800`'s `sdl`/`sdr` pair was found for the original bug, rather than continuing to
+work backward from already-corrupted state as this entry did.
+
+No source changes this entry — read-only tracing. Baseline unaffected, full smoke suite green
+(unchanged).
+
 ---
 
 ## 8. Save states & determinism contracts
