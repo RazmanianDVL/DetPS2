@@ -37,6 +37,16 @@ public sealed class EmotionEngine : ISchedulable
     /// that re-enter the interrupt-dispatch branch without ever reaching real instruction
     /// execution in between — used to detect a genuine unacknowledged-interrupt re-entry loop.</summary>
     private ulong _irqLoopStreak;
+    /// <summary>Set when a thread implicitly exits via `jr ra` with ra==0 (see the JR case below)
+    /// but SwitchToNext finds no other runnable thread. Real hardware has nothing meaningful left
+    /// to execute in that state; without a genuine stall here, the interpreter previously fell
+    /// through and started executing whatever raw bytes happened to sit at the delay slot and
+    /// beyond as if they were real instructions, producing nonsense register values (e.g. a small
+    /// integer where a pointer was expected) and eventually a spurious, unintended syscall —
+    /// confirmed via Mortal Kombat: Shaolin Monks (see docs/DEVELOPER_GUIDE.md, the
+    /// `[MSGBUF-A0] a0=0xB ra=0` / `[ABORT-CALLER] ra=0` traces). Checked at the top of Step();
+    /// cleared automatically the moment SwitchToNext finds a real thread to run.</summary>
+    private bool _pendingThreadStall;
     private bool _preferHleSyscalls = true;
     private int _cop2StallRemaining;
     private bool _cacheModelEnabled;
@@ -393,6 +403,18 @@ public sealed class EmotionEngine : ISchedulable
                 continue;
             }
 
+            // See _pendingThreadStall's doc comment: a thread implicitly exited via jr ra (ra==0)
+            // with nothing else runnable, so there is genuinely nothing correct left to execute.
+            // Keep retrying SwitchToNext every cycle (cheap — O(thread count)) until another
+            // thread becomes runnable, instead of falling through into raw memory.
+            if (_pendingThreadStall)
+            {
+                if (_hle != null && _hle.Kernel.SwitchToNext(this))
+                    _pendingThreadStall = false;
+                executed++;
+                continue;
+            }
+
             // Kernel thread preemption (see KernelState.MaybePreempt): real hardware
             // timeslices threads via a periodic timer tick even if they never yield
             // voluntarily (e.g. a bind-retry loop with a local software delay and no
@@ -475,7 +497,9 @@ public sealed class EmotionEngine : ISchedulable
                     if (b == 0) break;
                     fsb.Append(b is >= 0x20 and < 0x7F ? (char)b : '.');
                 }
-                Console.Error.WriteLine($"[MSGBUF-A0] a0=0x{GetGpr(4).Lo:X16} a1=0x{a1v:X8} a2=0x{GetGpr(6).Lo:X8} cyc={CurrentCycle()} ra={GetGpr(31).Lo:X8} a1text=\"{fsb}\"");
+                int tid = _hle?.Kernel.CurrentThreadId ?? -1;
+                uint tidEntry = tid >= 0 ? (_hle?.Kernel.GetThread(tid)?.Entry ?? 0) : 0;
+                Console.Error.WriteLine($"[MSGBUF-A0] a0=0x{GetGpr(4).Lo:X16} a1=0x{a1v:X8} a2=0x{GetGpr(6).Lo:X8} cyc={CurrentCycle()} ra={GetGpr(31).Lo:X8} tid={tid} tidEntry=0x{tidEntry:X8} a1text=\"{fsb}\"");
             }
             // Diagnostic-only (DETPS2_TRACE_MSGBUF, temporary): log every entry into the
             // vsnprintf-style formatter (0x00475BA8) with its buffer (a0) and format-string (a1)
@@ -895,16 +919,17 @@ public sealed class EmotionEngine : ISchedulable
                     {
                         int exitingTid = _hle.Kernel.CurrentThreadId;
                         _hle.Kernel.ExitCurrentThread();
-                        // Sets HleRedirectPc to the next runnable thread's entry (bypassing this
-                        // jr's own delay slot, which belongs to the exiting thread and must not
-                        // execute). If no other thread is runnable this is a harmless no-op and
-                        // execution falls through exactly as it did before this fix -- the
-                        // thread's Started/Sleeping state is still correctly marked exited for any
-                        // other code checking it, even though the CPU itself can't be halted (a
-                        // separate, already-documented limitation, not made worse here).
                         bool switched = _hle.Kernel.SwitchToNext(this);
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_JREXIT") == "1")
                             Console.Error.WriteLine($"[JREXIT] pc=0x{PC:X8} tid={exitingTid} switched={switched} newPc=0x{(switched ? HleRedirectPc ?? 0 : 0):X8} cyc={CurrentCycle()}");
+                        // If no other thread is runnable, do NOT fall through and execute whatever
+                        // raw bytes happen to sit at this jr's delay slot and beyond as if they
+                        // were real instructions (see _pendingThreadStall's doc comment for the
+                        // real crash this caused). Genuinely stall instead — Step()'s top-of-loop
+                        // check keeps retrying SwitchToNext every cycle until something elsewhere
+                        // (IOP/SIF progress, a timer, etc.) makes another thread runnable.
+                        if (!switched)
+                            _pendingThreadStall = true;
                         return false;
                     }
                     // Guard entire low 64KB (vectors + trap + recovery), not just 4KB
