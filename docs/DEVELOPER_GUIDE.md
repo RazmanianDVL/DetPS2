@@ -2301,6 +2301,43 @@ correctly, or whether this loop is itself gated on some flag/counter that a stil
 subsystem — audio callback completion? a specific pad-read variant? — is supposed to advance).
 Flagging as the concrete next step for whoever continues this thread, rather than guessing.
 
+**Follow-up, same day — chased and disproved a plausible-looking "CD read starvation" theory
+before it got oversold.** Traced the text-layout loop's own caller (`0x00475BA8`, entered via
+`--pcbreak` capturing `ra=0x475A28`): found TWO invocations clustered around cyc≈17.58M (the same
+window as the earlier SIF interrupt dispatch), the second showing `s0=0x5C3A306D6F726463` — decoded
+as the ASCII bytes `"cdrom0:\"`, the classic PS2 CD-ROM device path prefix. Combined with
+`cdvdSectors` having been frozen at `1` (the single synthetic sector from `MaybeCompleteRealSifCdRead`)
+for this entire multi-day investigation, this looked like a strong, well-motivated lead: the game
+stuck trying to enumerate/read more files from the disc than our HLE ever delivers.
+
+**Checked before committing to it, and it didn't hold up.** Dumped the actual memory this
+function's parameters (`a0=0x1FF0030`, `a2=0x1FF00F0`) point to: it's ordinary compiled MIPS
+*code* (`lw`/`jal`/`mult`/`div`/`mtc1`/`cvt.s.w` — real floating-point conversion instructions),
+not a CD file/directory table at all — these addresses just happen to sit in the same
+stack-adjacent region (`0x1FEFxxx`-`0x1FF0xxx`) every `sp` value throughout this whole session has
+lived in, i.e. they're ordinary local-struct-by-reference parameters, not evidence of anything
+CD-related. The `"cdrom0:\"` string in `s0` was very likely just unrelated leftover register
+content from an earlier, real disc-mount operation during boot, not something this specific loop
+is currently working with. Documenting this explicitly so it isn't independently re-derived and
+re-believed by whoever picks this up next — the CD-starvation theory is a dead end as stated, not
+a lead to continue.
+
+**Also checked two more reference titles the user added this session — God of War (SCUS_973.99)
+and Burnout 3: Takedown (SLUS_210.50)** — both run through pure general emulation, no
+`GameQuirkRegistry` entry for either. Burnout 3 looked stuck at only 10M cycles (`PC` pinned inside
+an ordinary CRT0 BSS-zeroing loop, zero syscalls attempted) but turned out not to be a bug at all —
+by 60M cycles it clears the loop naturally and starts making real progress (71 syscalls, a real
+thread, real SIF traffic): it just needed more cycles, a useful negative result. God of War
+surfaced one genuine, specific gap: an unimplemented MMI3-family instruction
+(`(sa=0x13)<<6 | func=0x08`, falling through the default case of the `PCPYH`/`PEXCW`-style switch
+in `EmotionEngine.cs` around line 1560) — VU-heavy titles exercise more of that instruction family
+than Shaolin Monks does. Not implemented this entry: correctly identifying and implementing it
+needs the same real-ISA-verified rigor as the LWL-family fix, not a rushed drive-by on a reference
+title while Shaolin Monks remains the stated priority.
+
+No source changes this entry — read-only investigation across all three titles, plus one corrected
+(retracted) theory.
+
 ---
 
 ## 8. Save states & determinism contracts
