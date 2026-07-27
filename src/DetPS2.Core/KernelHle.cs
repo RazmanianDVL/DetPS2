@@ -219,7 +219,17 @@ public sealed class KernelState
         int idx = 0;
         for (int i = 0; i < _threads.Count; i++)
             if (_threads[i].Id == afterId) { idx = i; break; }
-        for (int i = 1; i <= _threads.Count; i++)
+        // i < Count (not <=): must NOT wrap around to re-check afterId itself. With <=, the last
+        // iteration lands back on (idx + Count) % Count == idx, i.e. the calling thread — which
+        // trivially satisfies its own Alive/Started/!Sleeping check (it's the one currently
+        // running), so it got returned as "the next runnable thread" before ever reaching the
+        // main-thread special case below. SwitchToNext then sees next==afterId and concludes
+        // "nobody else runnable," permanently starving thread 1 (whose Started flag is never set,
+        // since it's the primordial thread and never goes through StartThread) any time the
+        // current thread happened to satisfy its own criteria — confirmed live (2026-07-27):
+        // thread 2's own dispatch loop never yielded back to thread 1 once it stopped needing to
+        // genuinely block, even though thread 1 was Alive and !Sleeping the whole time.
+        for (int i = 1; i < _threads.Count; i++)
         {
             var t = _threads[(idx + i) % _threads.Count];
             if (t.Alive && t.Started && !t.Sleeping && !t.WaitVblank)
