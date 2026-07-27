@@ -577,10 +577,12 @@ public sealed class KernelState
     public bool EventFlagSatisfied(int id, uint pattern, uint mode)
     {
         if (!_flags.TryGetValue(id, out var f))
-        {
-            _flags[id] = new EventFlag { Id = id, Bits = 0 };
-            return false;
-        }
+            _flags[id] = f = new EventFlag { Id = id, Bits = 0 };
+        // AND mode (default) with pattern=0 is trivially satisfied ((bits & 0) == 0 always) -
+        // a real, legitimate case (e.g. a fresh CreateEventFlag+WaitEventFlag(0, AND) pairing
+        // used purely as a rendezvous point), not something that should ever block. The
+        // auto-create branch above previously short-circuited to "not satisfied" unconditionally
+        // for a just-created flag, forcing a needless block/SwitchToNext on every such call.
         bool or = (mode & 0x01) != 0;
         return or ? (f.Bits & pattern) != 0 : (f.Bits & pattern) == pattern;
     }
