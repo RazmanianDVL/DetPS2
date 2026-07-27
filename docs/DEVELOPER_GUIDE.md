@@ -3730,17 +3730,57 @@ result, prompting a recheck of the arithmetic rather than assuming "still stalle
 of why cross-checking against a second, independent oracle catches this class of error that
 single-source static analysis won't.
 
-**Tried to find the setter's actual caller, came up empty by static means.** `scanword` for the
+**First static attempt came up empty, corrected with proper Ghidra tooling.** `scanword` for the
 `jal`-encoding of the setter's address, and separately for the raw address as data (a function-
-pointer table entry), both returned **zero matches** for Burnout 3. So it's neither a plain direct
-call nor a static function-pointer table entry — the caller constructs the target via runtime
-register computation (`lui`/`ori` pair building an address, then an indirect `jalr`), the same
-general shape as the panic-dispatch mechanism found and traced in §7.9. Since the setter never fires
-in DetPS2 at all (that's the bug — a live trace on the DetPS2 side has nothing to observe), and PINE
-has no execution-tracing capability, **finding the exact trigger needs one of**: (a) PCSX2's real
-instruction-level debugger (GUI/computer-use access, not yet available — this is the concrete
-scenario that motivates it), or (b) further static indirect-dispatch tracing on the DetPS2/Ghidra
-side, hunting for the `lui`/`ori` pair that constructs this exact setter address.
+pointer table entry), both returned zero matches — a flawed search, since neither method can find a
+`lui`+`addiu` pair (each instruction's own operand only ever holds *half* the final address, never
+the combined value). Set up a full Ghidra project for Burnout 3 (`extract-file` the real boot ELF via
+its `SYSTEM.CNF` `BOOT2` path, import with the R5900 processor + FID database as a `-preScript`,
+same recipe as Shaolin Monks — see §7.7) and wrote a proper scan: every `lui` with immediate `0x4E`,
+checked against the following `addiu`/`ori` for a combined address landing in the flag table's page.
+This is the method to reuse for any future "who touches this address" question — raw byte/data
+scanning misses split-immediate address construction entirely.
+
+### 7.12 Full root cause found: DetPS2 never delivers a real SIF/IOP response payload
+
+The proper scan surfaced `FUN_0010e120` referencing the flag table's exact base — a SIF-init routine
+that, via Ghidra's decompiler, turned out to *not* be about the setter at all. Full trace, in order:
+
+1. **`FUN_0010e880`** (the function containing the stuck poll) calls `FUN_0010e120`, which performs
+   real `sceSifGetReg`/`sceSifSetReg` calls against **software-defined "virtual" register IDs**
+   (`0xffffffff80000000`-`0xffffffff80000002` — the high bit as a namespace marker, not real SIF
+   hardware register indices 0-31) and, critically, calls the real kernel syscall
+   `AddDmacHandler(5, 0x10e688, 0)` — registering a completion callback on **DMAC channel 5, the
+   real SIF0 (IOP→EE) receive channel**.
+2. **Found and fixed a real, separate bug along the way**: `SonyKernelHle.cs`'s `SifSetReg`/`SifGetReg`
+   HLE (`case 0x79`/`0x7A`) only handles register IDs `< _sifRegs.Length` (a 32-element array) — any
+   ID with the `0x80000000` marker bit set (exactly what this SDK convention uses) silently no-ops on
+   write and always reads back `0`. Real bug, doesn't happen to be what blocks *this* specific poll
+   (see below), but affects any title using this same virtual-register convention.
+3. **Confirmed live that the DMAC-5 handler DOES fire** — `--pcbreak=10E688` hits twice
+   (`cyc=13,724,640` and `13,724,960`), correctly dispatched through DetPS2's existing DMAC/INTC
+   machinery. So the dispatch infrastructure (already hardened this session for Shaolin Monks) works
+   correctly here too.
+4. **The real bug: the handler reads garbage instead of a real response.** Decompiled
+   `FUN_0010e688`: it reads a length-prefix byte from a fixed receive buffer (`0x4E3F98`) and, if
+   nonzero, copies that many bytes into a local buffer and dispatches through a function-pointer
+   table using bytes from the copied data as an index. `--find-writer=4E3F98:8` shows this address
+   was written **exactly once**, at `cyc=13,723,936` — the SDK's own one-time static initialization
+   (`puRam004e3f98 = &DAT_204e3ec0`, storing a pointer constant there) — and **never again**. No real
+   SIF/IOP response payload is ever delivered. When the handler fires, it reads the leftover
+   initialization pointer bytes as if they were a real received packet, and processes that garbage
+   instead of a genuine response — never reaching whatever real-response code path would eventually
+   set the flag table slot the poll loop needs.
+
+**Bottom line**: DetPS2 correctly fires the SIF0/DMAC-5 completion interrupt (matching real hardware
+timing/dispatch behavior), but has no HLE that synthesizes an actual, correctly-formatted response
+payload for whatever specific SIF service this SDK's init sequence is calling. This is the real,
+final blocker — not a missing interrupt, not a missing callback registration, but a missing *payload*.
+**Not yet fixed**: doing so correctly requires knowing the exact response format this SDK's IOP-side
+module expects, which is not derivable from the EE-side binary alone. This is exactly the kind of gap
+PCSX2's real debugger (or its IOP-side module disassembly) would resolve directly — the next concrete
+step once GUI/computer-use access to PCSX2 is available: trace what real IOP firmware writes into the
+equivalent buffer for the equivalent request, and replicate that shape in DetPS2's SIF HLE.
 
 ---
 

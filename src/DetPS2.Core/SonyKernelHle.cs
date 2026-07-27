@@ -15,6 +15,17 @@ public sealed class SonyKernelHle
     private readonly Dictionary<int, uint> _intcHandlers = new();
     private readonly Dictionary<int, uint> _dmacHandlers = new();
     private readonly uint[] _sifRegs = new uint[32];
+    /// <summary>SifSetReg/SifGetReg with the high bit set (id | 0x80000000) is a distinct,
+    /// software-defined "virtual register" namespace some SDKs build on top of real SIF
+    /// registers (confirmed live in Burnout 3/MK: Deadly Alliance/MK: Deception's shared SDK SIF
+    /// init routine — e.g. `sceSifSetReg(0xffffffff80000000, val)`) — not real SIF hardware
+    /// register indices 0-31. Previously these silently no-op'd on write and always read 0
+    /// (`a0 < _sifRegs.Length` fails for any 0x80000000+ id), since `a0` is a plain `uint` array
+    /// index with no headroom for that marker bit. Kept separate from `_sifRegs` rather than
+    /// merged in (even after masking off the marker bit) to avoid aliasing real hardware register
+    /// semantics — e.g. `_sifRegs[3]` mirrors onto real SIF MMIO below, which a virtual id 3 must
+    /// not touch.</summary>
+    private readonly uint[] _sifVirtualRegs = new uint[32];
     private readonly Dictionary<uint, uint> _customSyscalls = new();
     private uint _gsImr = 0xFF00;
     private bool _stubsInstalled;
@@ -63,6 +74,7 @@ public sealed class SonyKernelHle
         _intcHandlers.Clear();
         _dmacHandlers.Clear();
         Array.Clear(_sifRegs);
+        Array.Clear(_sifVirtualRegs);
         _customSyscalls.Clear();
         _findCache.Clear();
         _midwayPairPlanted = false;
@@ -498,7 +510,8 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x79: // SifSetReg(reg, val)
-                if (a0 < _sifRegs.Length) _sifRegs[a0] = a1;
+                if ((a0 & 0x80000000u) != 0) _sifVirtualRegs[(a0 & 0x1F)] = a1;
+                else if (a0 < _sifRegs.Length) _sifRegs[a0] = a1;
                 // Mirror MSFLAG onto SIF MMIO (offset 0x20). Do not write MAINADDR
                 // through MsCom (that would enqueue a fake SBUS command).
                 if (a0 == 3) _system.Sif.WriteRegister(0x20, a1);
@@ -520,6 +533,7 @@ public sealed class SonyKernelHle
                         result = IopReady;
                         break;
                     }
+                    if ((a0 & 0x80000000u) != 0) { result = _sifVirtualRegs[(a0 & 0x1F)]; break; }
                     if (a0 < _sifRegs.Length) result = _sifRegs[a0];
                     else result = 0;
                 }
