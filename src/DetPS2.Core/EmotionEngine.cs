@@ -279,7 +279,11 @@ public sealed class EmotionEngine : ISchedulable
                 _cop0Compare = value;
                 COP0_Cause &= ~(1u << 15); // clear timer IP on compare write
                 break;
-            case Cop0Status: COP0_Status = value; break;
+            case Cop0Status:
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_COP0STATUS") == "1" && value != COP0_Status)
+                    Console.Error.WriteLine($"[COP0STATUS] pc=0x{PC:X8} old=0x{COP0_Status:X8} new=0x{value:X8} cyc={CurrentCycle()}");
+                COP0_Status = value;
+                break;
             case Cop0Cause: COP0_Cause = (COP0_Cause & 0xB000FF00) | (value & ~0xB000FF00u); break; // keep RO-ish bits simple
             case Cop0Epc: COP0_EPC = value; break;
             case Cop0Config: _cop0Config = value; break;
