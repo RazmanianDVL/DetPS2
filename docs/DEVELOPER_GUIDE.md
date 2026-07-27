@@ -2224,6 +2224,53 @@ No source changes this entry beyond the already-committed `fb41737` guard — th
 tracing. Default baseline reconfirmed unaffected by the guard change specifically; the LWL-family
 fix's own baseline impact is already documented above.
 
+**Follow-up, same day — the exit(1) mystery fully resolved.** Checked whether DetPS2's interrupt
+dispatch actually reaches a game-registered handler at all: it turns out it already does —
+`EmotionEngine.TryDispatchRegisteredIntcHandler` (a real, previously-built, fully-documented
+mechanism, wired into the main loop at the `_takeExceptions && InterruptPending` check) looks up
+`SonyKernelHle`'s `AddIntcHandler`/`AddDmacHandler` tables and, if a handler is registered for a
+currently-pending source, redirects `PC` straight to it (`a0`=cause), pointing the handler's own
+`ra` at `KernelBootstrap.Kseg0Interrupt` (`0x80000200`) so its ordinary `jr ra` epilogue lands back
+on the vector's `eret`. `DETPS2_TRACE_INTC_DISPATCH=1` (extended this entry with a `cyc=` field)
+confirmed a REAL handler at `0x00482CA0` (src=13, SIF) dispatches twice around cyc≈17.58M — and
+`--pcbreak` on that handler showed both invocations taking a completely benign, correct early-exit
+path (empty mailbox, `jr ra` at `0x00482DE0`). So the dispatch mechanism itself works, and the
+handler itself behaves correctly. The mystery was: why did `ra=0x80000200` still show up
+**38 million cycles later**, at the real exit(1) call?
+
+Answer: `KSeg0Interrupt` (`0x80000200`), once masked by the JR/JALR "ignore jumps into the low
+vector page" guard's `& 0x1FFFFFFF`, evaluates to `0x200` — under the same `0x10000` threshold the
+guard uses to catch uninitialized function pointers. **The guard was silently swallowing the
+handler's own `jr ra` return to the vector.** `eret` never ran, `EXL` never cleared,
+`_savedRaAcrossIntcDispatch`'s pushed original `ra` never got popped back — COP0 stayed
+permanently "mid-exception" for the rest of the run, `InterruptPending` was permanently blocked
+(gated on `!EXL`), and the stale `ra=0x80000200` just sat in register 31 untouched (since nothing
+after that point had reason to overwrite it) until some much later, unrelated code path happened
+to read it as *its own* return address. Fixed by excluding the three known, synthesized KSEG0
+vector addresses from the guard specifically (`IsLegitimateVectorTarget`, `EmotionEngine.cs`) —
+not by loosening the guard generally, since a game could still plausibly produce a coincidentally
+small garbage pointer that these three exact addresses can't be confused with.
+
+**Impact, verified**: default baseline unchanged. At 150M cycles the repeated-exit(1) storm is
+gone — `syscalls` dropped from `370` to `181` (no more toggling into the exit trampoline), and `PC`
+settles into ordinary, real code (a jump-table dispatch + byte-comparison loop around
+`0x00474EE4`-`0x00475D14`) instead. `spu2Samples` keeps climbing steadily through 500M cycles
+(real ongoing audio work), but `gifPath3`/`px` stay frozen from ~200M cycles onward — no crash, no
+error loop, but also no new rendering yet. Tried widening `probe-frame`'s "press Start" heuristic
+(previously gated on `Status == "post-logo-main"`, a string that — now that real execution mostly
+doesn't need `MaybePostLogoAdvance`'s forced jump at all — was staying parked at `"logo-done"`
+forever) to also fire on `"logo-done"`: pressing Start now genuinely reaches the game, but PC keeps
+cycling through the exact same 3 addresses regardless — a useful negative result ruling out "this
+loop is a press-start wait" as the explanation.
+
+**Commits this entry**: `52c1403` (the JR-guard fix — the real headline fix), `524f490`
+(`probe-frame` heuristic widening + the negative result above).
+
+**Concrete next step**: disassemble the `0x00474EE4`/`0x00475000`/`0x00475D14` loop in full to
+determine what it's actually doing and, critically, what condition would let it exit — this is now
+the real, current wall for Shaolin Monks, three fixes past where the session's original "why does
+main() never reach SifBindRpc" investigation started.
+
 ---
 
 ## 8. Save states & determinism contracts
