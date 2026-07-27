@@ -403,10 +403,22 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
             if (pc is >= 0x00482740 and < 0x00482760)
             {
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                uint ra = (uint)sys.EE.GetGpr(31).Lo;
-                if (ra >= 0x100000)
-                    sys.EE.PC = ra;
+                // Only treat this as a stuck poll if the instruction here is actually a
+                // conditional branch testing v0 (beq/bne, rs=$v0). In Shaolin Monks' build this
+                // address range is occupied by an unrelated leaf getter (lui/sll/addiu/addu/jr ra),
+                // not a wait loop — blindly forcing v0=1 and jumping through $ra here was hijacking
+                // that getter's return path mid-call, clobbering its real result and corrupting
+                // $ra propagation downstream.
+                uint waitOp = sys.Memory.Read32(pc);
+                bool isV0Branch = ((waitOp & 0xFC000000) == 0x10000000 || (waitOp & 0xFC000000) == 0x14000000)
+                                  && ((waitOp >> 21) & 0x1F) == 2;
+                if (isV0Branch)
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                    uint ra = (uint)sys.EE.GetGpr(31).Lo;
+                    if (ra >= 0x100000)
+                        sys.EE.PC = ra;
+                }
             }
         }
     }
