@@ -2271,6 +2271,36 @@ determine what it's actually doing and, critically, what condition would let it 
 the real, current wall for Shaolin Monks, three fixes past where the session's original "why does
 main() never reach SifBindRpc" investigation started.
 
+**Follow-up, same day — the loop identified precisely; confirmed rendering is genuinely dead, not
+just slow.** `0x00474EE4`/`0x00475000` turned out to be a real, standard SIMD `strlen()` (the
+classic zero-byte-in-word bit trick, vectorized with MMI `pcpyld`/`psubb`/`pnor`/`pand`/`pcpyud`,
+falling back to a scalar byte loop at `0x00475000` for the tail) — completely ordinary library
+code, not a bug. Traced its caller via `--pcbreak`: `a0=0x005AEFA8`, a string whose first byte is
+`0x43` (`'C'`) immediately followed by a null — i.e. `strlen()` is being called on the literal
+one-character string `"C"`. That caller (`0x00476A40`) is itself a Shift-JIS-aware
+text-processing routine (explicit `[0x81-0x9F]`/`[0xE0-0xEF]` double-byte-lead-byte range checks —
+real, standard Shift-JIS detection logic), and *its* caller (`0x00475C08`-`0x00475CBC`) is a
+character-attribute-table-driven loop (`lbu ...; andi ...,0x8` — testing a per-character flag bit,
+classic font/text-layout "measure this string" code) that re-enters roughly every 100 cycles —
+tight enough that this is a genuine busy loop, not once-per-simulated-frame UI work.
+
+Used `--track-transfers` to check the higher-level question directly rather than continuing to
+trace deeper into font internals: **zero DMA/GIF/SIF transfer events occur between cyc≈1,318,176
+and cyc=210,000,000** (18 total events, all clustered in the first ~1.3M cycles — the last is a
+SIF `EE->IOP` transfer at cyc=1,318,176; nothing at all after that for 208M+ more cycles). This
+confirms unambiguously: the game is not slowly-but-surely rendering new frames at a low rate — it
+is genuinely, permanently stuck in a CPU-only loop (text/font layout, working on a trivial `"C"`
+string) that never reaches whatever step would submit a new GS command list. `gifPath3=5` is this
+run's *final* count, not a snapshot of an ongoing rate.
+
+**Not pursued further this entry** — determining exactly what this text-layout loop's own exit
+condition is (what would let it finish measuring `"C"` and move on) requires either much deeper
+disassembly of the surrounding function than done so far, or a different diagnostic angle (e.g.
+checking what real per-character-class table this consults and whether DetPS2 populates it
+correctly, or whether this loop is itself gated on some flag/counter that a still-missing
+subsystem — audio callback completion? a specific pad-read variant? — is supposed to advance).
+Flagging as the concrete next step for whoever continues this thread, rather than guessing.
+
 ---
 
 ## 8. Save states & determinism contracts
