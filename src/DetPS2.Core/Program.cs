@@ -583,10 +583,22 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
 
     long prevPx = -1, prevPrims = -1;
     ulong prevSyscalls = ulong.MaxValue;
-    ulong done = 0, nextSample = 0;
+    ulong done = 0, nextSample = 0, nextHostPresent = 1_000_000;
     int eventIdx = 0;
     var pending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
-    const ulong slice = 25_000; // fine enough to hit press/release cycle targets precisely
+    // OnHostPresent must fire at EXACTLY the same 1,000,000-cycle boundaries blocker-trace's own
+    // --host-present uses (its slice is 1,000,000 for both RunFor stepping and the OnHostPresent
+    // call, every iteration) — MidwayBootAssist paces the logo/FMV sequence by counting *calls*,
+    // not cycles, so firing it at a different offset measurably changes timing. An early version
+    // of this tool used a fixed, finer RunFor step (25,000) for event precision and called
+    // OnHostPresent independently on its own 1,000,000-cycle counter — that still desynced from
+    // blocker-trace (different px/syscalls/exit trajectory at the same --cycles) because the
+    // very first OnHostPresent call landed at cyc=1,025,000 instead of exactly 1,000,000, and the
+    // drift compounded from there. Fixed by computing each step size adaptively: run exactly up
+    // to whichever is nearer, the next host-present boundary or the next scheduled press/release
+    // event, so OnHostPresent's cycle alignment is bit-for-bit identical to blocker-trace's while
+    // press/release events still land at their exact requested cycle (2026-07-27).
+    const ulong hostPresentPeriod = 1_000_000;
 
     void Sample(string note)
     {
@@ -601,10 +613,19 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
     Sample("(initial)");
     while (done < piCycles)
     {
-        ulong step = Math.Min(slice, piCycles - done);
+        ulong nextBoundary = piHostPresent ? nextHostPresent : piCycles;
+        if (eventIdx < events.Count) nextBoundary = Math.Min(nextBoundary, events[eventIdx].pressAt);
+        foreach (var p in pending) nextBoundary = Math.Min(nextBoundary, p.releaseAt);
+        nextBoundary = Math.Min(nextBoundary, piCycles);
+        ulong step = nextBoundary > done ? nextBoundary - done : 1;
+        step = Math.Min(step, piCycles - done);
         piSys.RunFor(step);
         done += step;
-        if (piHostPresent) piSys.ActiveQuirk?.OnHostPresent(piSys);
+        if (piHostPresent && done >= nextHostPresent)
+        {
+            piSys.ActiveQuirk?.OnHostPresent(piSys);
+            nextHostPresent = done + hostPresentPeriod;
+        }
 
         bool fired = false;
         while (eventIdx < events.Count && events[eventIdx].pressAt <= done)
