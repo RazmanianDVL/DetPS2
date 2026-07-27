@@ -1980,6 +1980,38 @@ real, general, zero-risk, already useful for the next round of tracing. No game-
 Verified: default baseline unaffected (`px=860160/gifPath3=1/dmac=4/syscalls=62/cdvdSectors=1`),
 full smoke suite green (`dotnet run --project Tests/DetPS2.Tests.csproj -c Release`).
 
+**Addendum, same day — traced the indirection one further layer via static disasm (no live trace
+needed).** The function containing the corrupting read (real entry `0x0024DB78`: `addiu sp,sp,-192`
+then `daddu s4,a0,zero` — confirms `s4` is literally this function's own first argument, nothing more
+exotic) has exactly two static callers, both inside a larger per-frame object-list-processing routine
+around `0x0025A600`-`0x0025A930` (found via `find-word` for the `jal 0x0024DB78` encoding
+`0x0C0936DE`: hits at `0x0025A91C` and `0x0025AB44`). At both sites, `a0` is set immediately before
+the call via `daddu a0,s1,zero` — so the "per-item pointer" is literally `s1` at the call site,
+passed straight through. Tracing `s1` itself further back in the same function: `0x0025A764: lw
+s1,0(v0)`, where `v0` was computed just before as an array-base-plus-index (`addu v0,v0,v1` at
+`0x0025A760`) — i.e. `s1` is loaded straight out of what disassembles as a genuine array of object
+pointers, with no visible null/sanity check on the loaded value before it gets used. This is a
+completely ordinary "iterate the active-object list, process each one" pattern; the bug isn't in this
+function or its caller, it's that *the array itself* holds at least one near-null, garbage entry
+(`0x400`, observed live) instead of either a real object pointer or a value this code path
+explicitly guards against.
+
+Did not chase the array's own populate/allocate site this entry — it's a genuinely open-ended
+next step (which array, populated by what, and why one slot holds `0x400` specifically) rather than
+a single next disasm read, and this entry is already a full session's worth of layered tracing.
+**Restating the standing, most load-bearing conclusion for whoever picks this up next:** every layer
+traced so far (the corrupting write, the function that performs it, the loop that calls it, the array
+it iterates) is *itself* ordinary, correct code — the defect is upstream, in whatever should have
+populated this array with valid data and hasn't, on this boot path, most plausibly because it's gated
+behind real PS2RNA/audio init (the same closed loop this whole investigation keeps landing back on:
+audio init needs `sceSifLoadModule`/`sceSifBindRpc`, which need `main()` to survive past this exact
+corruption to reach them). Breaking that circularity — rather than chasing one more array — is
+probably the highest-leverage next move: either (a) find and safely synthesize whatever minimal real
+state the array's populate routine needs (the `MidwayBootAssist` pattern), or (b) implement the
+general `.text`-write-protection safety net floated above, properly scoped and validated, so this
+entire class of corruption (however many layers deep its root cause turns out to be) stops being able
+to crash the boot regardless of which uninitialized array eventually causes it.
+
 ---
 
 ## 8. Save states & determinism contracts
