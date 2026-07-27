@@ -2450,6 +2450,50 @@ No source changes this entry beyond the already-committed `3e44605` (`s6`/`s7` `
 Baseline reconfirmed unaffected (`px=860160/gifPath3=5/dmac=7/sifBytes=272/syscalls=122`), full
 smoke suite green.
 
+**Follow-up, same day — found `616(sp)`'s real source: `0x475BA8`'s own second argument (`a1`),
+written straight through in the function's own prologue (`sw a1, 616(sp)` at `0x475BF0`) with no
+computation at all.** So the question sharpens to: what does `0x475BA8`'s caller pass as `a1`?
+
+Captured both real invocations of `0x475BA8`'s entry directly (only two exist in the whole run, both
+near cyc≈17.58M, confirming again this function is a true one-shot top-level call whose *internal*
+loop-back edges are the entire ongoing stall — not repeated top-level re-entry):
+
+- Invocation 1 (`cyc=17,580,208`, `ra=0x475A28`): `a1=0xB` — a real, sane-looking value from a
+  legitimate caller (the `sprintf`-style wrapper at `0x4759A0` traced in an earlier entry).
+- Invocation 2 (`cyc=17,580,720`, **`ra=0x0`**): `a1=0x0` — this is the one that seeds the eternal
+  zero loop.
+
+**`ra=0x0` at function entry is not a real call — it's the exact same masked-fall-through signature
+found earlier this session for the `exit(1)` mystery (§7.6's `52c1403` entry).** Confirmed directly
+via `DETPS2_TRACE_JRGUARD=1`: the guard fires at `pc=0x00475BA0`, `rs=31` (`ra`), `target=0x0` — a
+tiny wrapper function immediately before `0x475BA8` in memory (`0x475B88`-`0x475BA4`: save `ra`,
+call `0x0047E1F0`, restore `ra`, `jr ra`) has a **genuinely corrupted, zero saved return address on
+its own stack**, the guard correctly suppresses the resulting jump-to-low-page, and execution falls
+straight through into `0x475BA8`'s prologue with whatever garbage happened to be in `a0`/`a1` at
+that moment (`0`/`0`) — which becomes the eternal-zero-loop's seed.
+
+This is the same corruption-class signature (a stack-saved `ra` that's wrong, silently masked by the
+guard, landing in unrelated adjacent code with garbage arguments) as the original `cyc~96.2M` crash
+root-caused via `LWL`/`SDL` (§7.6). Whether this is a *second, distinct* instance of unaligned-access
+corruption (possibly not fully covered by the `091ea76` fix) or a downstream consequence of something
+else was not determined this entry — briefly checked the one function the wrapper calls
+(`0x0047E1F0`, which itself just calls `0x00480520`) for an obviously-analogous unaligned-write
+pattern near its own stack frame and found none in the immediately visible code, meaning the actual
+corruption site is at least one more call layer deep (inside `0x00480520`, or further) and would need
+the same kind of methodical tracing the original bug took multiple rounds to fully pin down.
+
+**Deliberately stopping the deep-dive here rather than open-endedly continuing** — this has the
+shape of a second multi-round investigation, not a quick follow-up, and this entry already
+represents a full, precisely-evidenced hand-off: the exact fall-through PC, the exact corrupted
+register, and the exact call chain (`0x475B88` → `0x47E1F0` → `0x480520`) needing further tracing.
+**Concrete next step**: disassemble `0x00480520` for an unaligned `SDL`/`SDR`/`QFSRV`-style write
+landing near a saved-`ra` stack slot in one of its callers, using the exact same methodology as the
+original fix (bisect via `--pcbreak`, confirm via `--find-writer`, verify any fix with a
+byte-exact regression test before trusting a boot trace).
+
+No source changes this entry — read-only tracing. Baseline unaffected (nothing executed
+differently), full smoke suite green (unchanged from the entry above).
+
 ---
 
 ## 8. Save states & determinism contracts
