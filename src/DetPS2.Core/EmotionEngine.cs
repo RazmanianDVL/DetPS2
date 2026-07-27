@@ -725,7 +725,7 @@ public sealed class EmotionEngine : ISchedulable
             if (viaDmacFallback) _intc.Acknowledge((Intc.InterruptSource)src);
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
-                Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
+                Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedRaAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
@@ -2180,7 +2180,12 @@ public sealed class EmotionEngine : ISchedulable
         EretCount++;
         PC = target - 4;
         if (_savedRaAcrossIntcDispatch.Count > 0)
-            SetGpr(31, new Gpr128 { Lo = _savedRaAcrossIntcDispatch.Pop() });
+        {
+            ulong poppedRa = _savedRaAcrossIntcDispatch.Pop();
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
+                Console.Error.WriteLine($"[ERET-POP] cyc={CurrentCycle()} poppedRa=0x{poppedRa:X8} stackDepthAfterPop={_savedRaAcrossIntcDispatch.Count} newPc=0x{PC:X8}");
+            SetGpr(31, new Gpr128 { Lo = poppedRa });
+        }
     }
 
     private void ExecuteLd(uint opcode)
