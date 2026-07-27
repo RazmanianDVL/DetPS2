@@ -365,6 +365,24 @@ public sealed class EmotionEngine : ISchedulable
             // COP0 Count advances with executed EE cycles (deterministic)
             _cop0Count++;
 
+            // Diagnostic-cycle stamp, computed and applied unconditionally on every loop
+            // iteration, so --trace-threads and other cycle-keyed diagnostics stay accurate
+            // across stretches dominated by early-continue branches below (interrupt dispatch,
+            // VBlank wait, COP2 stall) that never reach the "normal" instruction-fetch path
+            // further down. Previously this was only stamped there, so a run cycling through
+            // (say) repeated interrupt dispatch showed the SAME stale cycle number in
+            // --trace-threads output for thousands of real iterations — looking exactly like a
+            // frozen livelock (ForcePreempt ping-ponging at one "frozen" cyc value) when real
+            // time was actually advancing normally underneath it. Confirmed as a real diagnostic
+            // accuracy bug, not a genuine emulation issue, while investigating Shaolin Monks
+            // (2026-07-27 — see DEVELOPER_GUIDE.md's IRQLOOP/interrupt-storm entries, where this
+            // exact artifact briefly looked like a second livelock before DETPS2_TRACE_IRQLOOP
+            // showed cyc genuinely advancing underneath the stale --trace-threads timestamps).
+            ulong cyc = _cycleSource?.Invoke() ?? 0;
+            if (KernelState.TraceThreads) KernelState.CurrentCycle = cyc;
+            if (TransferLog.Enabled) TransferLog.CurrentCycle = cyc;
+            if (Intc.TraceRaise) Intc.CurrentCycleForTrace = cyc;
+
             if ((executed & 0x3F) == 0)
                 SyncInterruptsFromIntc();
 
@@ -413,7 +431,6 @@ public sealed class EmotionEngine : ISchedulable
             if (_hle != null && _hle.ExitRequested)
                 break;
 
-            ulong cyc = _cycleSource?.Invoke() ?? 0;
             if (_debugger != null && _debugger.ShouldHaltBefore(PC, cyc))
                 break;
 
@@ -460,9 +477,10 @@ public sealed class EmotionEngine : ISchedulable
                 SystemMemory.CurrentPcForWatch = (ulong)PC;
                 SystemMemory.CurrentCycleForWriterLog = cyc;
             }
-            if (KernelState.TraceThreads) KernelState.CurrentCycle = cyc;
-            if (TransferLog.Enabled) { TransferLog.CurrentCycle = cyc; TransferLog.CurrentPc = (ulong)PC; }
-            if (Intc.TraceRaise) Intc.CurrentCycleForTrace = cyc;
+            // KernelState.CurrentCycle/TransferLog.CurrentCycle/Intc.CurrentCycleForTrace are now
+            // stamped unconditionally at the top of the loop (see comment there) — only the
+            // PC pairing for TransferLog is real-instruction-specific and belongs here.
+            if (TransferLog.Enabled) TransferLog.CurrentPc = (ulong)PC;
             if (PcProfiler.Enabled) PcProfiler.Sample((ulong)PC);
             if (PcBreakGpr.HasValue && PC >= PcBreakGpr.Value && PC <= (PcBreakEnd ?? PcBreakGpr.Value))
                 Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} op=0x{opcode:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} a3=0x{GetGpr(7).Lo:X} " +

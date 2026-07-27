@@ -282,7 +282,25 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         {
             traceSys.RunFor(remaining);
         }
-        Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} hits={traceSys.Telemetry.TotalHits} unique={traceSys.Telemetry.UniqueKeys}");
+        // telemetryHits/telemetryUniqueKeys (previously printed as bare "hits"/"unique" right next
+        // to "PC=..." — easy to misread as a PC-visit or loop-iteration counter, which it is NOT;
+        // confirmed a real point of confusion investigating Shaolin Monks 2026-07-27, see
+        // DEVELOPER_GUIDE.md). This is Telemetry.TotalHits/UniqueKeys: how many *notable/unknown*
+        // events (e.g. UnknownMmioRead) have been recorded, and how many distinct keys among them.
+        // It freezing does NOT mean the EE stopped executing or is stuck looping — it means no NEW
+        // unknown/notable event has fired since; check EE.exitRequested/px/syscalls (printed below)
+        // for whether real execution is actually progressing.
+        Console.WriteLine($"  after {cycles} cyc: PC=0x{traceSys.EE.PC:X8} telemetryHits={traceSys.Telemetry.TotalHits} telemetryUniqueKeys={traceSys.Telemetry.UniqueKeys}");
+        // Printed immediately, right after the header line, rather than buried further down —
+        // this is the single most important "is the run actually still doing anything" signal
+        // (EmotionEngine.Step's very first real check every call is `if (ExitRequested) break;`,
+        // so once this is true every subsequent cycle of however large a --cycles budget executes
+        // literally nothing further for the EE, while IOP/SPU2 keep advancing independently and
+        // can make a halted run look deceptively "still alive" via growing spu2Samples/IOP.pc).
+        // Confirmed a real, costly point of confusion investigating Shaolin Monks 2026-07-27 — a
+        // "clean idle steady state" was wrongly diagnosed for one whole investigation round before
+        // this exact flag was checked directly. See DEVELOPER_GUIDE.md.
+        Console.WriteLine($"  EE: exitRequested={traceSys.Hle.ExitRequested} exitCode={traceSys.Hle.ExitCode}");
         if (SystemMemory.WatchAddr.HasValue)
         {
             Console.WriteLine($"  watch 0x{SystemMemory.WatchAddr.Value:X8}: {SystemMemory.WatchHits.Count} access(es)");
@@ -392,7 +410,6 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             Console.WriteLine($"  currentThreadId={traceSys.Hle.Kernel.CurrentThreadId}");
         }
         Console.WriteLine($"  IOP: pc=0x{traceSys.Iop.PC:X8}");
-        Console.WriteLine($"  EE: exitRequested={traceSys.Hle.ExitRequested} exitCode={traceSys.Hle.ExitCode} PC=0x{traceSys.EE.PC:X8}");
         if (traceSys.Hle.Sony != null)
         {
             Console.WriteLine("  top syscalls:");
