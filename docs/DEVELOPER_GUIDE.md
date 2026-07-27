@@ -2778,15 +2778,60 @@ through `sp+616`) that calls into a nested search function at `0x00476A20`. Trac
 
 Net read: a font/text precompute step is stuck re-searching for something at index 1 of a
 37-item table that it never finds, so item 1 never completes and items 2-37 are never reached.
-Not yet identified: what the "needle" being searched for actually is, why it's absent (a missing
-HLE-provided resource/string returning null or wrong data upstream, most likely — worth checking
-what feeds `s0`/`a0` into `0x00476A20` from further up the call chain), or whether it's Shaolin
-Monks-specific glyph/locale data our HLE doesn't supply. **Concrete next step**: trace the actual
-first argument into `0x0047B1A8`'s call chain (walk up one more level from `0x0047B140` to find
-what supplies the item being searched for) and read the literal candidate strings each `strcmp` in
-`0x00476A20` compares against (disassemble the `lui a1,0x5B`-prefixed literal-string loads at
-`0x00476A90`-`0x00476B18` and dump the actual bytes at each resulting address) to determine what
-value would need to match for this search to ever succeed.
+
+**Follow-up (2026-07-27, same day): identified the "needle" precisely, then hit a genuine
+roadblock in verifying the actual cause.** Read the literal candidate bytes at the `strcmp` targets
+in `0x00476A20` directly (remembering EE is little-endian — a word's low-address byte is its LSB,
+not its first-printed hex digit): they spell out **`"C-SJIS"`, `"C-EUCJP"`, `"C-JIS"`** — this is an
+iconv-style character-encoding-name lookup table, not font/glyph data as first suspected. The
+"needle" (`MEM[s1+52]` → `MEM[0x563504]` → `0x005AEFA8`, confirmed via `--track-writers
+--find-writer=0x00563504` to be written exactly once, at `cyc=0`, i.e. it's static ELF-compiled
+data, never touched by any executed instruction across the full 250M-cycle run) is a single-byte
+string: `"C\0"`. `"C"` is the standard POSIX default locale name — a real, valid, and likely
+*intentional* value for a US release (no special encoding requested). Since none of the three
+candidates is a bare `"C"`, the search legitimately never matches — which is almost certainly
+*correct*, expected behavior; the real bug must be in what the **outer loop** does with a
+legitimate "not found" result (never advancing past index 1) rather than in the search itself.
+
+Chasing why the outer loop never advances led to a COP0-level finding, added
+`DETPS2_TRACE_COP0STATUS` (`EmotionEngine.cs`, logs every `MTC0` write to Status) to investigate:
+`COP0_Status` starts the run properly enabled (`0x00018401`) but reads as `0x00790000` throughout
+the entire stall — decoded, that's IM bits (8-15, the per-source interrupt mask) **fully zeroed**,
+meaning no INTC-sourced interrupt (VBlank, DMA, timer, ...) can reach the CPU at all. If this
+loop's real completion is interrupt-driven (plausible — a lot of PS2 kernel synchronization is),
+a fully-masked interrupt state would explain the permanent stall precisely.
+
+Tracing where this happens: only **3 total `MTC0` writes to Status across the whole 250M-cycle
+run**, all at `pc=0x00486778`, clustered around `cyc≈17,575,088-17,575,152`
+(`old=0x00008401 new=0x00780004`, `old=0x00780000 new=0x00780004` ×2). Disassembling
+`0x00486728-0x0048678C` (reached via three call-site trampolines at `0x00486798`-`0x004867C8`
+targeting real physical MMIO addresses `0xB0001000`/`0xB0001010`/`0xB0001020`) shows a textbook
+ps2sdk-style atomic hardware-register-write helper: read Status, conditionally `di`-and-verify,
+compute a new Status value via `ori`/`xori`/`or` against the saved EIE bit, `mtc0` it, do the
+protected `sw`, save `ra` into `ErrorEPC` (`mtc0 ra,$c0_30`), `eret`. This is legitimate, ordinary
+kernel code used for many unrelated purposes — nothing Shaolin-Monks-specific about the function
+itself.
+
+**Where this became a genuine roadblock rather than a fix**: hand-computing the expected `mtc0`
+value from this disassembly (tracing the branch that skips the `di`-verify loop, since the saved
+EIE bit read as 0) gives `v0 = ((0x8401 | 0x6) ^ 0x2) | 0 = 0x8405` — which does **not** match the
+actually-observed write of `0x00780004`. That's not a rounding/detail mismatch — the two values
+share almost no bits. Two honest explanations remain open: (a) a genuine emulation bug in one of
+`mfc0`/`ori`/`xori`/`or`/`beq`/`mtc0`/`di` for this specific case, or (b) a real interrupt fires
+*during* this short instruction sequence (between the `mfc0` read and the `mtc0` write, both only
+a handful of instructions apart) and its own exception-entry Status manipulation is what's actually
+being observed — `--pcbreak`-style periodic sampling and single-write-event tracing can't
+distinguish these without full instruction-level tracing across the exact window, which no existing
+tool in this codebase does yet (`--trace-window`/`--trace-chrono` exists but wasn't run precisely
+enough across this ~10-instruction span in this pass). **Decision point for whoever picks this up
+next**: either build/use finer-grained instruction tracing to resolve (a) vs (b) definitively before
+changing anything COP0-related (high confidence, more work), or add a conservative periodic assist
+that snapshots Status before it's observed going to all-IM-zero and restores it if stuck too long
+with no forward progress (matches this session's established `MaybeUnblockStarvedSema`/
+`MaybeUnblockStarvedSleep` pattern, but with meaningfully lower confidence than those two since the
+root mechanism here isn't yet understood, only its symptom). Did not attempt either during this
+session — the risk of a wrong COP0-level fix (which could silently mask a real CPU-emulation bug
+affecting far more than Shaolin Monks) outweighed pushing further without more certainty.
 
 ---
 
