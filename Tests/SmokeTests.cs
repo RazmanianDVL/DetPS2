@@ -612,6 +612,7 @@ public static class SmokeTests
             Vu_BroadcastAndDestMask();
             Ee_Mmi_PandPor();
             Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr();
+            Ee_Mtsab_Qfsrv_MatchesPlayReference();
             BusContention_ScalesEeBudget();
             DeterministicFloat_CanonicalNaN();
             Scheduler_PerfBaseline();
@@ -1422,6 +1423,65 @@ public static class SmokeTests
         }
 
         Console.WriteLine("[Smoke] Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr OK");
+    }
+
+    /// <summary>
+    /// MTSAB/MTSAH (real R5900 REGIMM extensions) and QFSRV (the quadword-granularity cousin of
+    /// the LWL/SDL-family unaligned-access problem) were previously silently unimplemented —
+    /// MTSAB/MTSAH fell through ExecuteRegimm's default (a no-op), and QFSRV's opcode slot
+    /// (sa=27/func=0x28 in the MMI1 sub-table) had no case, so it never produced any real
+    /// funnel-shift result. Found via Haven: Call of the King (SLUS_205.17) hitting MTSAH during
+    /// CRT0. Implemented using semantics verified byte-for-byte against the Play! PS2 emulator's
+    /// own JIT (github.com/jpd002/Play-, Source/ee/MA_EE.cpp) and its CodeGen test suite
+    /// (github.com/jpd002/Play--CodeGen, tests/MdTest.cpp) rather than guessed. This test
+    /// reproduces MdTest.cpp's own two MD_Srl256 cases exactly (same src0/src1 byte patterns,
+    /// same shift amounts, same expected outputs) but driven through the real MIPS instruction
+    /// sequence (MTSAB to set SA, then QFSRV to consume it) rather than calling the shift
+    /// primitive directly, so this exercises the full real instruction pair a title would use.
+    /// </summary>
+    public static void Ee_Mtsab_Qfsrv_MatchesPlayReference()
+    {
+        static uint RegimmType(uint rt, uint rs, ushort imm) =>
+            (0x01u << 26) | (rs << 21) | (rt << 16) | imm;
+        static uint MmiType(uint rs, uint rt, uint rd, uint sa, uint func) =>
+            (0x1Cu << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | func;
+
+        var sys = new Ps2System();
+        uint pc = 0x9000;
+
+        // src0[i]=i (bytes 0x00..0x0F), src1[i]=i<<4 (bytes 0x00,0x10,0x20,...,0xF0) — identical
+        // to MdTest.cpp's own test fixture.
+        var src0 = new EmotionEngine.Gpr128 { Lo = 0x0706050403020100UL, Hi = 0x0F0E0D0C0B0A0908UL };
+        var src1 = new EmotionEngine.Gpr128 { Lo = 0x7060504030201000UL, Hi = 0xF0E0D0C0B0A09080UL };
+
+        // Case 1: SA=48 bits (byte offset 6). MTSAB rs=t0(8),imm with GPR(t0)=0: SA=(0^imm)<<3,
+        // so imm=6 gives SA=48. QFSRV rd=t3(11), rs=t1(9)=src0, rt=t2(10)=src1.
+        sys.EE.SetGpr(8, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(9, src0);
+        sys.EE.SetGpr(10, src1);
+        sys.Memory.Write32(pc, RegimmType(0x18, 8, 6));           // mtsab t0, 6
+        sys.Memory.Write32(pc + 4, MmiType(9, 10, 11, 27, 0x28)); // qfsrv t3, t1, t2
+        sys.Memory.Write32(pc + 8, 0);
+        sys.EE.PC = pc;
+        sys.EE.Step(2);
+        var r1 = sys.EE.GetGpr(11);
+        // Expected dstSrl256_1 (MdTest.cpp): 60 70 80 90 A0 B0 C0 D0 E0 F0 00 01 02 03 04 05
+        ulong expLo1 = 0xD0C0B0A090807060UL, expHi1 = 0x050403020100F0E0UL;
+        if (r1.Lo != expLo1 || r1.Hi != expHi1)
+            throw new Exception($"QFSRV SA=48: expected Lo=0x{expLo1:X16} Hi=0x{expHi1:X16}, got Lo=0x{r1.Lo:X16} Hi=0x{r1.Hi:X16}");
+
+        // Case 2: SA=16 bits (byte offset 2). imm=2 gives SA=(0^2)<<3=16.
+        sys.EE.SetGpr(8, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.Memory.Write32(pc, RegimmType(0x18, 8, 2));           // mtsab t0, 2
+        sys.EE.PC = pc;
+        sys.EE.Step(2);
+        var r2 = sys.EE.GetGpr(11);
+        // Expected dstSrl256_2 (MdTest.cpp): 20 30 40 50 60 70 80 90 A0 B0 C0 D0 E0 F0 00 01
+        ulong expLo2 = 0x9080706050403020UL, expHi2 = 0x0100F0E0D0C0B0A0UL;
+        if (r2.Lo != expLo2 || r2.Hi != expHi2)
+            throw new Exception($"QFSRV SA=16: expected Lo=0x{expLo2:X16} Hi=0x{expHi2:X16}, got Lo=0x{r2.Lo:X16} Hi=0x{r2.Hi:X16}");
+
+        Console.WriteLine("[Smoke] Ee_Mtsab_Qfsrv_MatchesPlayReference OK");
     }
 
     public static void BusContention_ScalesEeBudget()

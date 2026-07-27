@@ -95,6 +95,19 @@ public sealed class EmotionEngine : ISchedulable
     public ulong LO1 { get; set; }
     public ulong HI1 { get; set; }
 
+    /// <summary>Real R5900 "SA" register — a byte-granular shift amount set by the REGIMM
+    /// extensions MTSAB (rt=0x18) / MTSAH (rt=0x19) and consumed by QFSRV (a 256-bit funnel
+    /// shift used by real compiled code for unaligned quadword-granularity memory copies, the
+    /// same class of problem LWL/LWR/SWL/SWR/LDL/LDR/SDL/SDR solve at word/dword granularity —
+    /// see docs/DEVELOPER_GUIDE.md §7.6 for that fix). Stored in BITS (not bytes) to match the
+    /// real hardware register directly: MTSAB shifts its computed 0-15 value left by 3 (byte
+    /// granularity, ×8), MTSAH shifts its computed 0-7 value left by 4 (halfword granularity,
+    /// ×16) — both land in the same underlying bit-unit register. Semantics for both this field
+    /// and QFSRV verified byte-for-byte against the Play! PS2 emulator's own JIT implementation
+    /// (github.com/jpd002/Play-, Source/ee/MA_EE.cpp's MTSAB/MTSAH/QFSRV) and its CodeGen test
+    /// suite (github.com/jpd002/Play--CodeGen, tests/MdTest.cpp's MD_Srl256 cases), not guessed.</summary>
+    private uint _sa;
+
     public uint COP0_Status { get; set; }
     public uint COP0_Cause { get; set; }
     public ulong COP0_EPC { get; set; }
@@ -875,6 +888,24 @@ public sealed class EmotionEngine : ISchedulable
             if (cond) { _delaySlotTarget = target; return true; }
             return false;
         }
+
+        // MTSAB/MTSAH — real R5900 REGIMM extensions (not branches) that set the SA register
+        // QFSRV consumes. Semantics verified against Play!'s CMA_EE::MTSAB/MTSAH (see _sa's own
+        // doc comment): SA = ((GPR[rs] & mask) XOR (imm & mask)) << shift, byte-granular for
+        // MTSAB (mask=0xF, shift=3) and halfword-granular for MTSAH (mask=0x7, shift=4) — both
+        // land in the same underlying bit-unit SA register QFSRV reads directly.
+        if (rt == 0x18) // MTSAB
+        {
+            uint imm = opcode & 0xFFFFu;
+            _sa = (((uint)GetGpr(rs).Lo & 0xFu) ^ (imm & 0xFu)) << 3;
+            return false;
+        }
+        if (rt == 0x19) // MTSAH
+        {
+            uint imm = opcode & 0xFFFFu;
+            _sa = (((uint)GetGpr(rs).Lo & 0x7u) ^ (imm & 0x7u)) << 4;
+            return false;
+        }
         return false;
     }
 
@@ -1506,6 +1537,22 @@ public sealed class EmotionEngine : ISchedulable
                 var ab = ExtractB(a); var bb = ExtractB(b);
                 var r = new byte[16];
                 for (int i = 0; i < 8; i++) { r[i * 2] = bb[8 + i]; r[i * 2 + 1] = ab[8 + i]; }
+                SetGpr(rd, PackB(r));
+                break;
+            }
+            case (27u << 6) | 0x28: // QFSRV — 256-bit funnel shift right by _sa bits (set via MTSAB/MTSAH)
+            {
+                // combined = {rt (bytes 0-15), rs (bytes 16-31)} — this concatenation order (rt
+                // first/low, rs second/high) and the byte-shift semantics are both verified
+                // against Play!'s CodeGen test suite (MdTest.cpp's MD_Srl256 cases), not guessed
+                // — see _sa's own doc comment.
+                var ab = ExtractB(a); var bb = ExtractB(b);
+                var combined = new byte[32];
+                Array.Copy(bb, 0, combined, 0, 16);
+                Array.Copy(ab, 0, combined, 16, 16);
+                int byteShift = (int)(_sa >> 3);
+                var r = new byte[16];
+                Array.Copy(combined, byteShift, r, 0, 16);
                 SetGpr(rd, PackB(r));
                 break;
             }
