@@ -665,10 +665,28 @@ public sealed class EmotionEngine : ISchedulable
 
     private void EnterException(ulong vector, uint causeExcCode)
     {
-        COP0_EPC = PC;
+        // Real MIPS: EPC (and Cause.BD, which only describes what EPC points at) are captured
+        // once per exception "episode" — if Status.EXL is already set, we're taking a *nested*
+        // exception while still inside an earlier, not-yet-eret'd handler, and the hardware does
+        // NOT touch EPC again, since doing so would overwrite the outer exception's real return
+        // address with nothing left to restore it. Software is expected to detect EXL-already-set
+        // in its own handler and cope (real BIOS/kernel code does this; we don't emulate a BIOS
+        // exception dispatcher, so this only matters for our synthesized/direct vectoring path).
+        // Flagged 2026-07-27 while exhausting the Exit(1)/ra=0 investigation (DEVELOPER_GUIDE.md
+        // §7.9) as a real, unconfirmed gap: an AdEL (misaligned-PC) exception below bypasses the
+        // usual InterruptPending/blocked gate entirely, so a wild jump landing on a misaligned
+        // address WHILE already mid-exception (EXL=1) could previously clobber the outer
+        // exception's EPC here, corrupting its eventual eret target.
+        bool nested = (COP0_Status & 0x2) != 0; // EXL already set
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_NESTED_EXC") == "1" && nested)
+            Console.Error.WriteLine($"[NESTED-EXC] cyc={CurrentCycle()} pc=0x{PC:X8} excCode={causeExcCode} epc(unchanged)=0x{COP0_EPC:X8}");
+        if (!nested)
+        {
+            COP0_EPC = PC;
+            if (_inDelaySlot) COP0_Cause |= 1u << 31;
+            else COP0_Cause &= ~(1u << 31);
+        }
         COP0_Cause = (COP0_Cause & ~0x7Cu) | ((causeExcCode & 0x1F) << 2);
-        if (_inDelaySlot) COP0_Cause |= 1u << 31;
-        else COP0_Cause &= ~(1u << 31);
         COP0_Status |= 0x2; // EXL
         InterruptPending = false;
         ExceptionCount++;

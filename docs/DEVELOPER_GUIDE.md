@@ -3534,6 +3534,34 @@ real return address if a nested one ever fires before the first `eret`. Not conf
 `ra=0` (nothing here touches `$ra`, and the specific PC-misdirection theory above didn't pan out),
 but a related-looking gap worth understanding rather than assuming benign.
 
+**Fixed and checked live (2026-07-27) — real bug, ruled out as the `Exit(1)` mechanism.**
+`EnterException` now matches real MIPS semantics: `COP0_EPC`/`Cause.BD` are only captured when
+`Status.EXL` is not already set, exactly like a real CPU refusing to clobber an outer, not-yet-
+`eret`'d exception's return address with a nested one's. Added `DETPS2_TRACE_NESTED_EXC=1` to log
+every time this path is actually taken (i.e. a nested exception occurs at all) and reran the full
+boot to the crash cycle: **zero nested exceptions fire anywhere before `cyc=28,547,680`.** So this
+gap was real (worth fixing on its own correctness merits — some *other* title or a later Shaolin
+Monks milestone could easily hit it once nested exceptions start happening at all) but conclusively
+not the source of this specific `ra=0` signature, joining every other mechanism exhausted in this
+section. Verified via `git stash` A/B: `blocker-trace --cycles=5000000` produces byte-identical
+output with and without this fix (expected, since the fixed path is provably never exercised in
+this run) — a true no-op for Shaolin Monks specifically, kept anyway because it's architecturally
+correct.
+
+**Housekeeping note on the `px` baseline number**: this section previously cited `5,000,000-cycle
+px baseline unchanged (3,153,920)` as of the thread-1 exclusion fix. The *later* Timer0 storm fix
+(§7.7) legitimately changes execution up to cycle 5M as well (removing ~354,000 wasted re-dispatch
+cycles changes exactly how far real game code gets by any fixed cycle count) — confirmed via the
+same `git stash` A/B method that current `HEAD~1` (pre-nested-EPC-fix, post-Timer0-fix) already
+reports `px=860160` at 5M cycles, not `3,153,920`, and that this fix does not change it further.
+`860160` also happens to be the same number cited earlier in this section as the *pre-thread-fix*
+"long-standing baseline" (§7.6-era) — almost certainly coincidental convergence from a differently-
+shaped execution path landing on the same synthetic per-frame `px` ceiling, not a reintroduced bug
+(smoke suite is green, thread-1/Timer0 fixes are both still present and independently verified).
+Not chased further since it's a metric-housekeeping question, not a playability one — but future
+commits touching the EE/scheduler should treat **`860160` at 5M cycles** as the current baseline to
+diff against, not the stale `3,153,920`.
+
 ---
 
 ## 8. Save states & determinism contracts
