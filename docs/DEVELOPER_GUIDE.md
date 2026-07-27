@@ -2102,6 +2102,84 @@ prioritized here, in order, as the highest-leverage next steps for whoever conti
 
 ---
 
+### 7.6 The cyc~96.2M crash, actually root-caused: LWL/LWR/SWL/SWR/LDL/LDR/SDL/SDR were fake
+
+**2026-07-26 — the user redirected priority explicitly back to Shaolin Monks** ("the other 3
+titles aren't priority they are simply there for reference"), closing out §7.5's cross-title
+detour and resuming the still-open thread from §7.4/the `edafcbb`/`b24cd79` entries: find where
+the per-item object-pointer array (that fed the garbage `s1`/`0x400` value chased for hours) is
+actually populated.
+
+**Picked up exactly where that left off** — disassembled backward from the `lw s1,0(v0)` array
+lookup (found: `v0 = MEM[0x006664A8] + index*4`, `count = MEM[0x006664B0]`, a real, fixed global
+"list descriptor" at `0x006662A8`) and confirmed via `--find-writer` that both fields are still
+`0` (raw ELF-load value, never written). Since a `blez` guard skips the whole per-item loop when
+`count<=0`, this loop should be dead code at cyc~1.39M — directly contradicting the fact that the
+corrupting write (`0x0024DD88`) had already fired 67,888 times by then. **That contradiction was
+the actual break in the case.**
+
+Captured `ra` live at the corrupting function's real entry (`0x0024DB78`) via `--pcbreak`: it held
+`0x4A010000000000` — not a plausible return address at all, and structurally identical in shape to
+an already-flagged-but-never-root-caused "float-shaped ra corruption" finding from much earlier
+this session. Since `jal`/`jalr` are a hardware guarantee to set `$ra` correctly regardless of
+what the caller's own registers hold, a garbage `ra` at function entry meant this function was
+never really *called* — confirmed via `--trace-window --trace-chrono`: the preceding function's own
+`jr ra` at `0x0024DB70` executes, and control falls straight through into `0x0024DB78` (the next
+instruction in memory) instead of jumping anywhere. This is `EmotionEngine`'s own JR/JALR
+"ignore jumps into the low vector page" safety guard (added earlier this session to catch
+uninitialized function pointers) silently no-opping a broken `jr ra` and letting execution
+free-fall into unrelated code with whatever garbage happened to be sitting in that code's argument
+registers — the "per-item object array" was a complete red herring; nothing was ever iterating it.
+
+Added a `DETPS2_TRACE_JRGUARD=1` diagnostic (log every guard firing) and found the *first*
+occurrence resolves to an exact, reproducible constant every time: `target=0x004A010000000000` —
+which decodes precisely as a real, plausible 32-bit code address (`0x004A0100`) shifted left by 32
+bits into the wrong half of a 64-bit register. That's the exact signature of a `DSLL32`-style
+64-bit-shift result landing somewhere it shouldn't — or, as it turned out, of an **unaligned 64-bit
+store performed as a full aligned one**, overwriting an adjacent saved register.
+
+Disassembled the actual corruption site: a small function at `0x0024C800`+ doing a classic
+unaligned struct-copy idiom (`ldl/ldr` pairs to load, `sdl/sdr` pairs to store) immediately
+followed by `ld ra,16(sp)` and the fatal `jr ra`. The second `sdl`/`sdr` pair (`sdl v1,15(sp)` /
+`sdr v1,8(sp)`) is supposed to write only bytes 8-15 of the stack frame. **Checked
+`ExecuteSdl`/`ExecuteSdr` in `EmotionEngine.cs` and found both literally aliased to the full,
+aligned `ExecuteSd`** ("behave like aligned for now" — an explicit, flagged simplification from
+earlier in the project). `sdl v1,15(sp)` therefore performed a full 8-byte store *starting at*
+offset 15 (bytes 15-22), directly through the saved `ra` at offset 16. Checked the other six
+"left/right" instructions (`LWL`/`LWR`/`SWL`/`SWR`/`LDL`/`LDR`) and found the *entire family*
+had the same issue — every one aliased to its full-width counterpart.
+
+**Fixed all 8 with real MIPS64 little-endian semantics**, derived and triple-verified by hand
+against the standard `Xxl rt,(N-1)(base); Xxr rt,0(base)` paired-use compiler idiom at every
+possible alignment (the byte-lane formula is `b = (vAddr & (N-1)) XOR (N-1)`; `*L` affects the top
+`N-b` register bytes from `mem[alignedAddr+(j-b)]`, `*R` affects the bottom `b+1` bytes from
+`mem[alignedAddr+(j+N-1-b)]`), implemented as explicit byte loops (not a shift+mask formula) to
+avoid any shift-count edge-case risk. Added a permanent regression test,
+`Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr` in `Tests/SmokeTests.cs`, checking exact
+byte-for-byte correctness at every alignment (0-3 word, 0-7 doubleword) for both load and store —
+it passed on the first real run, matching the hand-derivation.
+
+**Impact, verified against the real boot, not just the CRT0-redirect testbed**: the default
+assisted-boot baseline — frozen at `px=860160/gifPath3=1/dmac=4/syscalls=62/sifBytes=0/
+cdvdSectors=1` for this entire investigation — now reaches `gifPath3=5/dmac=7/sifBytes=272/
+syscalls=122` at the same 5M cycles. At 150M cycles, `RealSifRpc` reports `binds=2/calls=2`, up
+from the synthetic-only `binds=1/calls=1` this session's `MaybeCompleteRealSifCdRead` milestone
+established — **a second, genuine bind+call pair, meaning the game's own compiled code actually
+executed a real `sceSifBindRpc`/`sceSifCallRpc` sequence**, closing the "why does `main()` never
+reach real SifBindRpc" question for real (commits `4921491` through `b24cd79` had only explained
+the mechanism, not fixed it). Execution ends the 150M-cycle window at `0x0047FA88`, an entirely
+ordinary `jr ra` right after a syscall trampoline stub — ordinary library code, not distress.
+
+Commits: `961fc3b`/`3291940` (the two cross-title general fixes from §7.5, unrelated to this
+thread but landed just before it), `091ea76` (the LWL-family fix + regression test, EmotionEngine.cs
++ Tests/SmokeTests.cs).
+
+**Not yet done**: pushing the trace further to see how much *more* progress this unlocks (gifPath3
+advancing past 5, reaching an actual rendered frame, etc.) — this fix only just landed. That's the
+immediate next step, continuing to prioritize Shaolin Monks per explicit instruction.
+
+---
+
 ## 8. Save states & determinism contracts
 
 - Magic `0x44505332`, versioned header, optional deflate envelope (v4).
