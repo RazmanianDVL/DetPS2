@@ -3071,12 +3071,55 @@ no-op, a DMAC-channel-5 INTC-ack gap, missing `WaitEventFlag` blocking semantics
 bug in its own auto-create path), a scheduler self-check bug in `FindNextRunnable`, and the
 VBlankStart INTC-ack gap. Every one of these is a real, general emulation bug — none required a
 Shaolin-Monks-specific hack — directly matching the project's standing hypothesis that fixes found
-via this one title's boot path have broad value across the library. **Current frontier**: with all
-nine fixed, the game runs dramatically further than at session start (full logo, both threads
-scheduled correctly, healthy VBlank pacing) before hitting a genuine, deliberate `Exit(1)` from
-what looks like a real assertion failure in the game's own code at `cyc≈22.56M` — not a bug in the
-emulator's threading/interrupt/scheduler layer, as far as this session traced. Reading the actual
-formatted error message (see above) is the fastest path to identifying the real next gap.
+via this one title's boot path have broad value across the library.
+
+**Update: the NULL-buffer guard at `0x00475D24` only delayed the crash — it recurs, at a different
+site, and its real trigger has now been found.** With the guard in place, the game runs *dramatically*
+further: it reaches the `px=76,840,960` plateau by `cyc≈181M` (vs. never before) and keeps doing real
+`SifSetReg` work for hundreds of millions more cycles, but still calls the same hardcoded `Exit(1)`
+wrapper (`0x00476808`) at `cyc=476,734,304` this time. `[EXIT-SYSCALL]`'s `ra` always reads
+`0x00476818` regardless of caller (it's the return address of the wrapper's own internal
+`jal 0x0011C2B0`, overwritten on every call, not useful for finding *its* caller) — a new
+`DETPS2_TRACE_EXIT`-gated `[ABORT-CALLER]` log was added at `0x00476808`'s own entry to capture `$ra`
+*before* that overwrite happens.
+
+**Root cause, precisely identified**: `scanword` found every static call site to `0x00476808` across
+the whole loaded image — five inside game code (`0x00201844`, `0x00203A2C`, `0x00203A54`,
+`0x002043E4`, plus `0x00476840` inside the shared formatter chain), none matching the observed
+`ra=0x00000000`. A `j`-encoding scan (tail-calls, which don't touch `$ra`) found exactly one more:
+`0x0020448C`, inside a small linked-list *lookup-or-die* function at `0x00204430` — walks a global
+singly-linked registry (head pointer `MEM[0x0064E5C8]`, node layout `{next@0, ..., key@8, arg@12,
+..., altNext@20}`) comparing each node's key against the caller's `a0`; if the list is empty or the
+walk falls off the end without a match, it restores the (already-zero) saved `$ra` and tail-jumps
+straight into `0x00476808` — i.e. **"look up resource X in the registry; if not registered, abort."**
+`$ra=0` here is simply the correctly-restored value from whatever called `0x00204430`, meaning *that*
+caller was itself reached without ever going through a `jal` either.
+
+Tracing one level further: `0x00204430` has **zero `jal` callers anywhere in the image** — it's
+reached only via one more tail-jump, from `0x004898F8`, which is a `case` block inside a
+jump-table-dispatched handler at `0x00489868` (locale/codeset-conversion helper cluster — same
+neighborhood as the `sscanf`-style `%[...]` scanset engine at `0x00475BA8` traced earlier). The key
+passed to the lookup is a **hardcoded constant, `a0=0x00565B9C`** (a fixed address in the runtime's
+own static data, not a runtime-computed value) — and the *sibling* case block at `0x004898DC`, a few
+instructions earlier in the same dispatcher, **registers that exact same key** (`a0=0x00565B9C`) into
+the identical list via a matching *insert* function at `0x00204408` (`node.key@8 = a0`, storage at a
+fixed slot `a1=0x0077F5F0`, pushed onto the `MEM[0x0064E5C8]` list head). `0x0077F5F0` is in the same
+data region as `0x0077F809`, the closest thing to a readable message string ever captured from this
+whole investigation (see above) — the same neighborhood, not a coincidence.
+
+**So the actual bug is a missing self-registration, not a NULL-pointer bug**: something is supposed
+to reach the `0x004898DC` "register codeset/locale `0x00565B9C`" case *before* anything reaches the
+`0x004898F4` "look it up" case, and in this emulator's execution it doesn't — matching this whole
+session's pattern exactly (every prior bug here was a missing or incomplete piece of kernel/IOP-level
+support, never a genuine game bug). The original NULL-buffer guard at `0x00475D24` was real and
+correct (it fixed one deterministic crash on real-hardware-equivalent memory semantics), but it was
+never the root cause — it just happened to fire on the way to what's actually a much bigger, separate
+gap: whatever code path is supposed to trigger this locale/codeset registration during boot never
+runs. **Concrete next step**: find every caller of the `0x00489868`-family dispatcher (the selector
+value picking the `0x004898DC` vs. `0x004898F4` case is the real thing to trace — likely driven by a
+locale/config value read very early in boot, possibly from a resource our CDVD/file HLE doesn't yet
+serve, or a static-initializer table this emulator doesn't fully walk before `main()`), and determine
+what condition should have made it take the *register* case before the *lookup* case is ever reached.
 
 ---
 

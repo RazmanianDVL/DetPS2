@@ -495,6 +495,16 @@ public sealed class EmotionEngine : ISchedulable
                 Console.Error.WriteLine($"[FMTENTRY] a0(buf)=0x{a0:X16} a1(fmt)=0x{a1:X8} a2=0x{a2:X8} ra=0x{ra:X8} cyc={CurrentCycle()} fmt=\"{sb}\"");
             }
 
+            // Diagnostic-only (DETPS2_TRACE_EXIT, temporary): log $ra at entry to the hardcoded
+            // abort()-style wrapper (0x00476808: unconditionally builds a0=1 and calls into
+            // 0x0011C2B0, which issues the Exit syscall without returning). The [EXIT-SYSCALL]
+            // trace in SonyKernelHle.cs always reports ra=0x00476818 regardless of caller, since
+            // that's the return address the wrapper's own internal jal sets right before the
+            // syscall fires — it can never identify who called the wrapper itself. Capturing ra
+            // here, before it's overwritten, is the only way to find the real caller.
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00476808)
+                Console.Error.WriteLine($"[ABORT-CALLER] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
+
             // Shaolin Monks: guard a NULL-buffer dereference inside the vsnprintf-style
             // formatter's own count-check (0x00475D24: bgtzl v0,+6, in the function entered at
             // 0x00475BA8). Traced precisely (2026-07-27, see DEVELOPER_GUIDE.md): the formatter
