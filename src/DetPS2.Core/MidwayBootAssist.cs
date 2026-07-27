@@ -388,6 +388,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             return;
         }
 
+        // Same sif-init wait loop, but sampled while PC is mid-call inside the getter it invokes
+        // (0x00482740, a leaf: lui/sll/addiu/addu/jr ra/lw v0,0(a0)). This loop's period is fixed
+        // relative to the 25,000-cycle assist sampling interval, so the periodic PC snapshot
+        // consistently lands inside the callee (observed at 0x00482750) rather than ever landing
+        // on the caller's beqz-v0 branch at 0x00482FF8 above - meaning that handler never fires for
+        // this specific call site. Detect it via $ra, which is 0x00482FF8 for calls made from this
+        // exact jal, and resolve identically.
+        if (pc is >= 0x00482740 and < 0x00482760 && (uint)sys.EE.GetGpr(31).Lo == 0x00482FF8)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x00483000;
+            Assists++;
+            return;
+        }
+
         // SIF / cmd range after logo: force v0 success on beqz-v0 polls
         if (pc is (>= 0x00482000 and < 0x00487000) or (>= 0x00485E00 and < 0x00487000))
         {
