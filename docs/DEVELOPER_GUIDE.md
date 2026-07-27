@@ -3203,6 +3203,62 @@ time; a raw small integer `11` this time).
 point is, since `ra=0` strongly implies we're still within a context that has never made a real
 `jal`-based call of its own.
 
+### 7.6 A real fix found and applied, then a false-positive discovered and corrected in the same fix
+
+Followed the "which thread" lead from §7.5 directly (`_hle.Kernel.CurrentThreadId` is reachable
+from `EmotionEngine`) and found something concrete: at the crash cycle, `tid=1` (the game's main
+thread) with `Entry=0`. Checking why led to `KernelHle.cs`'s existing `jr ra`-with-`ra==0` implicit-
+thread-exit detection (`EmotionEngine.cs`, added in an earlier session): when it fires and no other
+thread is runnable, it had no way to actually halt the CPU — it just returned `false` and the `Step()`
+loop fell through to execute whatever raw bytes sat at the delay slot and beyond as if they were real
+instructions. **This is confirmed to be the real, general mechanism behind the whole `Exit(1)`
+investigation**: it explains the `ra=0` signature seen at every single occurrence traced this session
+(cyc≈19.76M, cyc≈476.7M) and the nonsense register values (`a0=11`, `a0=0`) — execution wasn't
+following real program logic at all, it was interpreting arbitrary memory as code.
+
+**First fix attempt**: added a `_pendingThreadStall` flag, checked at the top of `Step()` exactly
+like the existing `WaitingVblank` stall, that keeps retrying `SwitchToNext` every cycle instead of
+falling through. Verified via a full run: `Exit(1)` no longer fires at all through 500,000,000
+cycles — but further checking (`DETPS2_TRACE_JREXIT=1`) showed why: the implicit-exit condition
+fired exactly **once**, at `cyc=1,350,000` — far too early for the game's real main thread to
+legitimately finish — inside `0x00480260`, an ordinary, widely-reused syscall-trampoline leaf
+function (`addiu v1,N; syscall; jr ra; nop`, one of many in a table) that returns to a perfectly
+real address on every *other* call throughout the run. The EE was left **permanently frozen** at
+that point (no other thread existed yet to switch to), just re-presenting a static frame to inflate
+`px` to the same long-familiar `76,840,960` ceiling — arguably a worse outcome than the original
+crash for reaching a menu, even though the fix's own logic (don't execute garbage) was correct.
+
+**Root cause of the false positive**: thread 1 is created synthetically in `KernelHle.cs`
+(`Started=true` from construction, `Entry=0`) and never goes through a real `StartThread`/
+`RestoreContext` cycle — the *only* mechanism that deliberately seeds `ra=0` as an exit signal per
+the kernel convention this whole detector is built on. Thread 1's `ra=0` at the syscall trampoline
+was just the raw CPU boot-state default, never yet overwritten because crt0 reaches that point via
+a long chain of pure tail-jumps (`j`) with zero real `jal` calls of its own — not a genuine
+"top-level function returned" signal. **Fix, refined**: gate the whole detector on
+`CurrentThreadId != 1`. Verified: smoke suite green, 5,000,000-cycle `px` baseline unchanged
+(`3,153,920`), `syscalls` back to the original `122` (0 `JREXIT` events through a full run now).
+
+**Honest result**: the game still hits `Exit(1)` — but now at `cyc=28,547,680`, dramatically
+*earlier* than the original `cyc≈476,734,304` (only 254 syscalls accumulated by then, vs. 2,550+ in
+the old buggy trajectory). This is expected, not a regression: removing a bug that was masking real
+program state (a permanent freeze that looked like success) simply exposed the *next* thing in line
+sooner. Both fixes are correct and kept — they measurably improved emulator correctness (the game no
+longer executes memory as code, no longer silently freezes on a false-positive thread exit) — but
+neither is the root cause of `Exit(1)` itself.
+
+**Traced the new, earlier occurrence with the exact same toolkit**: identical signature —
+`[MSGBUF-A0] a0=0x0 a1=0x01FFB6E2 ra=0x0 tid=1` at `cyc=28,541,216`, reached via the *same*
+bracket-scanner (`0x004766B8`) → message-builder (`0x004767A8`) fall-through chain traced in §7.5,
+just at a different cycle. **This exact mechanism has now recurred, identically, at three separate
+points across this whole investigation** (cyc≈19.76M originally, cyc≈28.5M now, cyc≈476.7M with the
+old NULL-guard patch): same near-zero/null buffer argument, same `ra=0`, same thread (1), same code
+path. This stopped looking like "find the one caller" and started looking like a *systemic* property
+of this call path — worth internalizing before the next session burns more time on static tracing
+here: **the productive next step is almost certainly upstream of the bracket-scanner entirely** —
+find what supplies its buffer/input argument in the first place (likely a heap/scratch-allocator
+call that's returning near-zero garbage specifically when invoked from thread 1's early, tail-jump-
+heavy execution context), not another attempt at walking `ra` back through more tail-jumps.
+
 ---
 
 ## 8. Save states & determinism contracts
