@@ -611,6 +611,7 @@ public static class SmokeTests
             Vu_MicroProgram_Runs();
             Vu_BroadcastAndDestMask();
             Ee_Mmi_PandPor();
+            Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr();
             BusContention_ScalesEeBudget();
             DeterministicFloat_CanonicalNaN();
             Scheduler_PerfBaseline();
@@ -1314,6 +1315,113 @@ public static class SmokeTests
             throw new Exception($"PMAXH expected 0x0009000A got {(uint)sys.EE.GetGpr(13).Lo:X8}");
 
         Console.WriteLine("[Smoke] Ee_Mmi_PandPor OK");
+    }
+
+    /// <summary>
+    /// LWL/LWR/SWL/SWR/LDL/LDR/SDL/SDR were previously aliased straight to the full aligned
+    /// LW/SW/LD/SD ("behave like aligned for now") -- silently wrong for any unaligned address.
+    /// Root-caused via Mortal Kombat: Shaolin Monks: an `sdl v1,15(sp)` performing a full 8-byte
+    /// store starting AT offset 15 (instead of a partial store confined to bytes 8-15) stomped a
+    /// saved `ra` at offset 16, corrupting a return address and masking a crash as a silent
+    /// jr-guard fallthrough into unrelated code. This test exercises the real
+    /// `Xxl rt,(N-1)(base); Xxr rt,0(base)` paired-use idiom (the standard compiler-emitted
+    /// "unaligned N-byte access at `base`" pattern) at every possible alignment of `base`, for
+    /// both the word (N=4) and doubleword (N=8) forms, checking the loaded/stored bytes exactly
+    /// match a known pattern -- not just "didn't crash".
+    /// </summary>
+    public static void Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr()
+    {
+        static uint Itype(uint op, uint rs, uint rt, short imm) =>
+            (op << 26) | (rs << 21) | (rt << 16) | (uint)(ushort)imm;
+
+        var sys = new Ps2System();
+        uint dataAddr = 0x2000;
+        uint pc = 0x4000;
+        for (int i = 0; i < 16; i++) sys.Memory.Write8((ulong)(dataAddr + i), (byte)(0xA0 + i));
+
+        // Word (4-byte) unaligned LOAD: for each base alignment 0..3, `lwl v0,3(a0); lwr v0,0(a0)`
+        // with a0 = dataAddr+align must produce the 4 bytes at dataAddr+align, byte-for-byte.
+        for (int align = 0; align < 4; align++)
+        {
+            uint baseAddr = dataAddr + (uint)align;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = baseAddr });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFFFFFFFFFUL }); // v0 poisoned
+            sys.Memory.Write32(pc, Itype(0x22, 4, 2, 3));      // lwl v0,3(a0)
+            sys.Memory.Write32(pc + 4, Itype(0x26, 4, 2, 0));  // lwr v0,0(a0)
+            sys.Memory.Write32(pc + 8, 0);
+            sys.EE.PC = pc;
+            sys.EE.Step(2);
+            uint expected = (uint)(0xA0 + align) | ((uint)(0xA0 + align + 1) << 8) |
+                            ((uint)(0xA0 + align + 2) << 16) | ((uint)(0xA0 + align + 3) << 24);
+            uint got = (uint)sys.EE.GetGpr(2).Lo;
+            if (got != expected)
+                throw new Exception($"LWL/LWR align={align}: expected 0x{expected:X8} got 0x{got:X8}");
+        }
+
+        // Word unaligned STORE: `swl v0,3(a0); swr v0,0(a0)` with a known v0 pattern must write
+        // exactly those 4 bytes at dataAddr+align, leaving neighbors untouched.
+        uint storeBase = 0x2100;
+        for (int align = 0; align < 4; align++)
+        {
+            for (int i = 0; i < 8; i++) sys.Memory.Write8((ulong)(storeBase + i), 0xEE);
+            uint baseAddr = storeBase + (uint)align;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = baseAddr });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x44332211UL });
+            sys.Memory.Write32(pc, Itype(0x2A, 4, 2, 3));      // swl v0,3(a0)
+            sys.Memory.Write32(pc + 4, Itype(0x2E, 4, 2, 0));  // swr v0,0(a0)
+            sys.Memory.Write32(pc + 8, 0);
+            sys.EE.PC = pc;
+            sys.EE.Step(2);
+            byte[] expectBytes = { 0x11, 0x22, 0x33, 0x44 };
+            for (int i = 0; i < 4; i++)
+            {
+                byte got = sys.Memory.Read8((ulong)(baseAddr + i));
+                if (got != expectBytes[i])
+                    throw new Exception($"SWL/SWR align={align} byte{i}: expected 0x{expectBytes[i]:X2} got 0x{got:X2}");
+            }
+        }
+
+        // Doubleword (8-byte) unaligned LOAD: `ldl v0,7(a0); ldr v0,0(a0)` at every alignment 0..7.
+        for (int align = 0; align < 8; align++)
+        {
+            uint baseAddr = dataAddr + (uint)align;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = baseAddr });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFFFFFFFFFUL });
+            sys.Memory.Write32(pc, Itype(0x1A, 4, 2, 7));      // ldl v0,7(a0)
+            sys.Memory.Write32(pc + 4, Itype(0x1B, 4, 2, 0));  // ldr v0,0(a0)
+            sys.Memory.Write32(pc + 8, 0);
+            sys.EE.PC = pc;
+            sys.EE.Step(2);
+            ulong expected = 0;
+            for (int i = 0; i < 8; i++) expected |= (ulong)(0xA0 + align + i) << (8 * i);
+            ulong got = sys.EE.GetGpr(2).Lo;
+            if (got != expected)
+                throw new Exception($"LDL/LDR align={align}: expected 0x{expected:X16} got 0x{got:X16}");
+        }
+
+        // Doubleword unaligned STORE: `sdl v0,7(a0); sdr v0,0(a0)`.
+        uint dstoreBase = 0x2200;
+        for (int align = 0; align < 8; align++)
+        {
+            for (int i = 0; i < 16; i++) sys.Memory.Write8((ulong)(dstoreBase + i), 0xEE);
+            uint baseAddr = dstoreBase + (uint)align;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = baseAddr });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x8877665544332211UL });
+            sys.Memory.Write32(pc, Itype(0x2C, 4, 2, 7));      // sdl v0,7(a0)
+            sys.Memory.Write32(pc + 4, Itype(0x2D, 4, 2, 0));  // sdr v0,0(a0)
+            sys.Memory.Write32(pc + 8, 0);
+            sys.EE.PC = pc;
+            sys.EE.Step(2);
+            byte[] expectBytes = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+            for (int i = 0; i < 8; i++)
+            {
+                byte got = sys.Memory.Read8((ulong)(baseAddr + i));
+                if (got != expectBytes[i])
+                    throw new Exception($"SDL/SDR align={align} byte{i}: expected 0x{expectBytes[i]:X2} got 0x{got:X2}");
+            }
+        }
+
+        Console.WriteLine("[Smoke] Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr OK");
     }
 
     public static void BusContention_ScalesEeBudget()

@@ -80,6 +80,15 @@ public sealed class EmotionEngine : ISchedulable
     /// Null (default) means single-address mode, matching the original behavior exactly.</summary>
     public static uint? PcBreakEnd;
 
+    /// <summary>Diagnostic-only: logs every time the JR/JALR "ignore jumps into the low vector
+    /// page" guard fires (i.e. an uninitialized/garbage function pointer would otherwise have
+    /// sent PC into the BIOS vector page, so the jump is silently dropped and execution falls
+    /// through into whatever code happens to sit immediately after the jr/jalr instead). Opt-in
+    /// via DETPS2_TRACE_JRGUARD=1 — used to find the true root cause of a corrupted `ra`/function
+    /// pointer, since the guard itself only hides the symptom (a would-be crash) rather than
+    /// explaining why the register was bad in the first place.</summary>
+    public static readonly bool TraceJrGuard = Environment.GetEnvironmentVariable("DETPS2_TRACE_JRGUARD") == "1";
+
     /// <summary>MMI "pipeline 1" HI/LO — real R5900 HI/LO are 128-bit registers; regular
     /// MULT/DIV/MADD use the lower 64 bits (HI/LO above), MULT1/DIV1/MADD1/MFHI1/MTHI1/
     /// MFLO1/MTLO1 use this independent upper-64-bit lane.</summary>
@@ -664,7 +673,11 @@ public sealed class EmotionEngine : ISchedulable
                     ulong t = GetGpr(rs).Lo;
                     // Guard entire low 64KB (vectors + trap + recovery), not just 4KB
                     if ((t & 0x1FFFFFFFUL) < 0x10000UL)
+                    {
+                        if (TraceJrGuard)
+                            Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping");
                         break; // nop: stay sequential
+                    }
                     _delaySlotTarget = t;
                     return true;
                 }
@@ -673,7 +686,11 @@ public sealed class EmotionEngine : ISchedulable
                     ulong t = GetGpr(rs).Lo;
                     if (rd != 0) SetGpr(rd, new Gpr128 { Lo = PC + 8 });
                     if ((t & 0x1FFFFFFFUL) < 0x10000UL)
+                    {
+                        if (TraceJrGuard)
+                            Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping (jalr)");
                         break;
+                    }
                     _delaySlotTarget = t;
                     return true;
                 }
@@ -1890,14 +1907,142 @@ public sealed class EmotionEngine : ISchedulable
         SetGpr(rt, new Gpr128 { Lo = w, Hi = 0 });
     }
 
-    // Unaligned load/store simplified: behave like aligned LW/SW/LD/SD for now
-    // (LDL/LDR added after real-boot telemetry showed R5900-compiled retail code hits them)
-    private void ExecuteLwl(uint opcode) => ExecuteLw(opcode);
-    private void ExecuteLwr(uint opcode) => ExecuteLw(opcode);
-    private void ExecuteSwl(uint opcode) => ExecuteSw(opcode);
-    private void ExecuteSwr(uint opcode) => ExecuteSw(opcode);
-    private void ExecuteSdl(uint opcode) => ExecuteSd(opcode);
-    private void ExecuteSdr(uint opcode) => ExecuteSd(opcode);
-    private void ExecuteLdl(uint opcode) => ExecuteLd(opcode);
-    private void ExecuteLdr(uint opcode) => ExecuteLd(opcode);
+    // Real unaligned load/store (word and doubleword "left"/"right" pairs). These were
+    // previously aliased straight to the full aligned LW/SW/LD/SD ("behave like aligned for
+    // now") -- silently WRONG for any unaligned address, since e.g. `sdl v1,15(sp)` would
+    // perform a full 8-byte store starting AT offset 15 instead of a partial store confined to
+    // its own aligned word, happily stomping whatever sits at offset 16-22 (a live saved `ra`
+    // slot, another local, anything). Root-caused via Mortal Kombat: Shaolin Monks
+    // (SLUS_210.87): a `ldl/ldr` + `sdl/sdr` unaligned-copy idiom at 0x0024C828-0x0024C848
+    // (immediately followed by `ld ra,16(sp)`) was corrupting its own function's saved return
+    // address, causing a masked `jr ra` (see EE.TraceJrGuard/DETPS2_TRACE_JRGUARD) to silently
+    // fall through into a wholly unrelated function with garbage argument registers -- the
+    // apparent "uninitialized voice pointer" a much earlier investigation chased for hours was
+    // actually this: real, correct game code executing with corrupted inputs because ITS OWN
+    // caller's return address had already been destroyed one level up. See
+    // docs/DEVELOPER_GUIDE.md's "cyc~96.2M crash" investigation for the full trace.
+    //
+    // Real MIPS little-endian LWL/LWR/SWL/SWR/LDL/LDR/SDL/SDR semantics (per the MIPS64 ISA
+    // manual's ReverseEndian-adjusted pseudocode, verified here against the standard paired-use
+    // identity `Xxl rt,(N-1)(base); Xxr rt,0(base)` == a full unaligned N-byte access at `base`,
+    // for base at every alignment 0..N-1): let `b = (vAddr & (N-1)) XOR (N-1)` (the byte-lane
+    // adjustment big-endian-terminology "left/right" needs on a little-endian target) and
+    // `alignedAddr = vAddr & ~(N-1)`. LWL/SWL affect the TOP `(N-b)` bytes of the register
+    // (indices b..N-1), sourced from/written to `mem[alignedAddr + (j-b)]` for each byte index
+    // j in that range. LWR/SWR affect the BOTTOM `(b+1)` bytes (indices 0..b), at
+    // `mem[alignedAddr + (j+N-1-b)]`. Implemented as explicit byte loops rather than a
+    // shift+mask formula -- slower, but eliminates all shift-count edge-case risk (e.g. C#
+    // masking a shift-by-32 down to shift-by-0) for an instruction family that's cheap to get
+    // subtly wrong and expensive to debug once it is.
+    private void ExecuteLwl(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~3UL;
+        int b = (int)(vAddr & 3) ^ 3;
+        uint word = rt != 0 ? (uint)GetGpr(rt).Lo : 0;
+        for (int j = b; j <= 3; j++)
+        {
+            uint val = _memory.Read8(alignedAddr + (ulong)(j - b));
+            word = (word & ~(0xFFu << (8 * j))) | (val << (8 * j));
+        }
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = unchecked((ulong)(long)(int)word) });
+    }
+
+    private void ExecuteLwr(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~3UL;
+        int b = (int)(vAddr & 3) ^ 3;
+        uint word = rt != 0 ? (uint)GetGpr(rt).Lo : 0;
+        for (int j = 0; j <= b; j++)
+        {
+            uint val = _memory.Read8(alignedAddr + (ulong)(j + 3 - b));
+            word = (word & ~(0xFFu << (8 * j))) | (val << (8 * j));
+        }
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = unchecked((ulong)(long)(int)word) });
+    }
+
+    private void ExecuteSwl(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~3UL;
+        int b = (int)(vAddr & 3) ^ 3;
+        uint word = (uint)GetGpr(rt).Lo;
+        for (int j = b; j <= 3; j++)
+            _memory.Write8(alignedAddr + (ulong)(j - b), (byte)(word >> (8 * j)));
+    }
+
+    private void ExecuteSwr(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~3UL;
+        int b = (int)(vAddr & 3) ^ 3;
+        uint word = (uint)GetGpr(rt).Lo;
+        for (int j = 0; j <= b; j++)
+            _memory.Write8(alignedAddr + (ulong)(j + 3 - b), (byte)(word >> (8 * j)));
+    }
+
+    private void ExecuteLdl(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~7UL;
+        int b = (int)(vAddr & 7) ^ 7;
+        ulong dw = rt != 0 ? GetGpr(rt).Lo : 0;
+        for (int j = b; j <= 7; j++)
+        {
+            ulong val = _memory.Read8(alignedAddr + (ulong)(j - b));
+            dw = (dw & ~(0xFFUL << (8 * j))) | (val << (8 * j));
+        }
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = dw });
+    }
+
+    private void ExecuteLdr(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~7UL;
+        int b = (int)(vAddr & 7) ^ 7;
+        ulong dw = rt != 0 ? GetGpr(rt).Lo : 0;
+        for (int j = 0; j <= b; j++)
+        {
+            ulong val = _memory.Read8(alignedAddr + (ulong)(j + 7 - b));
+            dw = (dw & ~(0xFFUL << (8 * j))) | (val << (8 * j));
+        }
+        if (rt != 0) SetGpr(rt, new Gpr128 { Lo = dw });
+    }
+
+    private void ExecuteSdl(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~7UL;
+        int b = (int)(vAddr & 7) ^ 7;
+        ulong dw = GetGpr(rt).Lo;
+        for (int j = b; j <= 7; j++)
+            _memory.Write8(alignedAddr + (ulong)(j - b), (byte)(dw >> (8 * j)));
+    }
+
+    private void ExecuteSdr(uint opcode)
+    {
+        uint rs = (opcode >> 21) & 0x1F, rt = (opcode >> 16) & 0x1F;
+        short off = (short)(opcode & 0xFFFF);
+        ulong vAddr = GetGpr(rs).Lo + (ulong)(int)off;
+        ulong alignedAddr = vAddr & ~7UL;
+        int b = (int)(vAddr & 7) ^ 7;
+        ulong dw = GetGpr(rt).Lo;
+        for (int j = 0; j <= b; j++)
+            _memory.Write8(alignedAddr + (ulong)(j + 7 - b), (byte)(dw >> (8 * j)));
+    }
 }
