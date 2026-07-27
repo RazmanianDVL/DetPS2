@@ -357,10 +357,12 @@ public sealed class SonyKernelHle
                 result = _kernel.SetEventFlag((int)a0, a1);
                 break;
             case 0x54: // ClearEventFlag
+            case 0x55: // iClearEventFlag
                 result = _kernel.ClearEventFlag((int)a0, a1);
                 break;
             case 0x56: // WaitEventFlag — succeed immediately
             case 0x57: // PollEventFlag
+            case 0x58: // iPollEventFlag
                 result = (long)_kernel.PollEventFlag((int)a0);
                 break;
 

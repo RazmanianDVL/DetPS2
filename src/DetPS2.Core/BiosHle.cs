@@ -119,6 +119,14 @@ public sealed class BiosHle
     {
         SyscallCount++;
         uint num = (uint)ee.GetGpr(3).Lo;
+        // Real PS2 SDKs commonly encode a syscall number negated (li v1,-N instead of li v1,N)
+        // as the standard "fast syscall" convention (documented ps2sdk/libkernel behavior) --
+        // same syscall, just dispatched without certain BIOS-side checks. The real BIOS negates
+        // it back before dispatch; this HLE didn't, so every negative-encoded syscall silently
+        // fell through as unhandled regardless of which one it was. Confirmed via Mortal Kombat:
+        // Deception (SLUS_208.81, no game-specific quirks registered) issuing raw v1=0xFFFFFFAB/
+        // 0xFFFFFFA8 (i.e. -0x55/-0x58) that never matched any positive case.
+        if ((num & 0x80000000u) != 0) num = (uint)(-(int)num);
         uint a0 = (uint)ee.GetGpr(4).Lo;
         uint a1 = (uint)ee.GetGpr(5).Lo;
         uint a2 = (uint)ee.GetGpr(6).Lo;
