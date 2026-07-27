@@ -17,6 +17,12 @@ public sealed class KernelState
         public bool WaitVblank;
         public bool Started;
         public int WaitSemaId;
+        /// <summary>0 = not waiting on an event flag. See WaitEventFlag/SetEventFlag in
+        /// SonyKernelHle.cs and KernelState.EventFlagSatisfied/ConsumeEventFlag/ParkOnEventFlag.</summary>
+        public int WaitEfId;
+        public uint WaitEfPattern;
+        public uint WaitEfMode;
+        public uint WaitEfResultAddr;
         public uint Entry;
         public uint Gp;
         public uint Stack;
@@ -562,6 +568,46 @@ public sealed class KernelState
 
     public uint PollEventFlag(int id) =>
         _flags.TryGetValue(id, out var f) ? f.Bits : 0;
+
+    /// <summary>Real WaitEventFlag semantics (ps2sdk EventFlagMode): mode bit 0x01 selects
+    /// OR (any pattern bit set satisfies) vs AND (all pattern bits set, the default); mode bit
+    /// 0x10 requests the matched bits be cleared on successful wait. Auto-creates a missing flag
+    /// (id 0 bits) rather than erroring, matching WaitSema's existing race-tolerant auto-create —
+    /// titles sometimes Wait before Create races under HLE timing.</summary>
+    public bool EventFlagSatisfied(int id, uint pattern, uint mode)
+    {
+        if (!_flags.TryGetValue(id, out var f))
+        {
+            _flags[id] = new EventFlag { Id = id, Bits = 0 };
+            return false;
+        }
+        bool or = (mode & 0x01) != 0;
+        return or ? (f.Bits & pattern) != 0 : (f.Bits & pattern) == pattern;
+    }
+
+    /// <summary>Reads the satisfying bits and applies clear-on-exit (mode bit 0x10). Caller must
+    /// have already confirmed EventFlagSatisfied for the same id/pattern/mode.</summary>
+    public uint ConsumeEventFlag(int id, uint pattern, uint mode)
+    {
+        if (!_flags.TryGetValue(id, out var f)) return 0;
+        uint result = f.Bits;
+        if ((mode & 0x10) != 0) f.Bits &= ~pattern;
+        return result;
+    }
+
+    /// <summary>Marks a thread as blocked waiting on an event flag — mirrors WaitSemaBlocking's
+    /// own Sleeping=true/WaitSemaId=id side effect, but for event flags. SetEventFlag re-checks
+    /// every parked thread's condition and wakes any that are now satisfied.</summary>
+    public void ParkOnEventFlag(int threadId, int efId, uint pattern, uint mode, uint resultAddr)
+    {
+        var t = FindThread(threadId);
+        if (t == null) return;
+        t.Sleeping = true;
+        t.WaitEfId = efId;
+        t.WaitEfPattern = pattern;
+        t.WaitEfMode = mode;
+        t.WaitEfResultAddr = resultAddr;
+    }
 
     private Thread? FindThread(int id)
     {

@@ -357,12 +357,64 @@ public sealed class SonyKernelHle
             case 0x52: // SetEventFlag
             case 0x53: // iSetEventFlag
                 result = _kernel.SetEventFlag((int)a0, a1);
+                // Wake any threads parked in WaitEventFlag (case 0x56 below) whose condition is
+                // now satisfied by this update — mirrors SignalSema's own "wake matching waiters"
+                // step, since KernelState.SetEventFlag itself has no memory access to perform the
+                // *result_ptr write real WaitEventFlag callers expect on wake.
+                foreach (var t in _kernel.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping || t.WaitEfId != (int)a0) continue;
+                    if (!_kernel.EventFlagSatisfied(t.WaitEfId, t.WaitEfPattern, t.WaitEfMode)) continue;
+                    uint bits = _kernel.ConsumeEventFlag(t.WaitEfId, t.WaitEfPattern, t.WaitEfMode);
+                    if (t.WaitEfResultAddr != 0) _system.Memory.Write32(t.WaitEfResultAddr, bits);
+                    t.WaitEfId = 0;
+                    _kernel.WakeupThread(t.Id);
+                }
                 break;
             case 0x54: // ClearEventFlag
             case 0x55: // iClearEventFlag
                 result = _kernel.ClearEventFlag((int)a0, a1);
                 break;
-            case 0x56: // WaitEventFlag — succeed immediately
+            case 0x56: // WaitEventFlag(ef_id, pattern, mode, result_ptr) — real ps2sdk semantics:
+                       // block until (bits & pattern) satisfies mode (OR = mode bit 0x01, AND =
+                       // default; clear-on-exit = mode bit 0x10), writing the satisfying bits to
+                       // *result_ptr. Previously ignored a1 (pattern)/a2 (mode)/a3 (result_ptr)
+                       // entirely and returned the raw current bits as a status code with no
+                       // blocking - a caller checking v0==0 for success against nonzero real bits
+                       // would see a spurious "error" and retry immediately, forever, without ever
+                       // yielding to another thread: a busy spin (confirmed via PC profiling as
+                       // this session's remaining bottleneck after the interrupt-storm fix above).
+                {
+                    bool satisfied = _kernel.EventFlagSatisfied((int)a0, a1, a2);
+                    if (satisfied)
+                    {
+                        uint bits = _kernel.ConsumeEventFlag((int)a0, a1, a2);
+                        if (a3 != 0) _system.Memory.Write32(a3, bits);
+                        result = 0;
+                    }
+                    else
+                    {
+                        _kernel.ParkOnEventFlag(_kernel.CurrentThreadId, (int)a0, a1, a2, a3);
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine($"[RPC] WaitEventFlag BLOCKED ef={a0} pattern=0x{a1:X} mode=0x{a2:X} pc=0x{ee.PC:X8}");
+                        if (!_kernel.SwitchToNext(ee))
+                        {
+                            // Nobody else runnable: fabricate satisfaction like WaitSema's own
+                            // fallback does, rather than deadlocking the whole system over one
+                            // thread's wait.
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                                Console.Error.WriteLine($"[RPC] WaitEventFlag FABRICATING signal for ef={a0} (no runnable thread)");
+                            _kernel.SetEventFlag((int)a0, a1);
+                            uint bits = _kernel.ConsumeEventFlag((int)a0, a1, a2);
+                            if (a3 != 0) _system.Memory.Write32(a3, bits);
+                            var self = _kernel.GetThread(_kernel.CurrentThreadId);
+                            if (self != null) { self.Sleeping = false; self.WaitEfId = 0; }
+                            _kernel.WakeupThread(_kernel.CurrentThreadId);
+                        }
+                        result = 0; // pre-set for when this thread's context is restored on wake
+                    }
+                }
+                break;
             case 0x57: // PollEventFlag
             case 0x58: // iPollEventFlag
                 result = (long)_kernel.PollEventFlag((int)a0);
