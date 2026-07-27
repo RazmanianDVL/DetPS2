@@ -540,15 +540,36 @@ public sealed class EmotionEngine : ISchedulable
             // e.g. ps2sdk's sceSifInitCmd installs _SifCmdIntHandler this way — not through
             // AddIntcHandler. Fall back to the DMAC table for that channel when there's no
             // direct INTC handler for this source.
+            // Traced (2026-07-27): dispatching here does NOT itself acknowledge the INTC "Sif"
+            // bit — by design, for a real AddIntcHandler registration, since real software-owned
+            // handlers ack INTC_STAT themselves as part of doing real work. But our HLE raises
+            // this bit (Sif.cs/Iop.cs/SonyKernelHle.cs, several call sites) whenever SIF DMA
+            // activity happens, without necessarily also populating whatever real in-memory
+            // queue/flag data the game's registered handler inspects to decide there's real work
+            // to do. When the handler finds nothing (a real, legitimate outcome from its own
+            // perspective — e.g. ps2sdk's _SifCmdIntHandler checking an empty queue) it takes its
+            // own early-exit path and never reaches the ack write buried in the "real work"
+            // branch — so the bit stays pending and this dispatch fires again on the very next
+            // eligible instruction, forever: a genuine interrupt storm (confirmed via
+            // DETPS2_TRACE_INTC_DISPATCH re-firing every ~64 cycles with zero forward progress in
+            // between) that starves everything else, not a one-off harmless spin. Real DMAC
+            // channel completion is hardware-acknowledged (the DMAC's own STR/completion state
+            // clears itself once the transfer is done — unlike INTC sources, which need explicit
+            // software ack), so acknowledging here for the DMAC-channel-5 fallback path
+            // specifically (not the direct AddIntcHandler case, which may have different, correct
+            // semantics already) matches real hardware and breaks the storm.
+            bool viaDmacFallback = false;
             if (!found && src == (int)Intc.InterruptSource.Sif &&
                 sony.TryGetDmacHandler(5, out uint dmacHandlerAddr) && dmacHandlerAddr != 0)
             {
                 handlerAddr = dmacHandlerAddr;
                 handlerArg = 5; // DMA_CHANNEL_SIF0
                 found = true;
+                viaDmacFallback = true;
             }
 
             if (!found) continue;
+            if (viaDmacFallback) _intc.Acknowledge((Intc.InterruptSource)src);
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
                 Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
