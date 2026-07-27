@@ -915,7 +915,20 @@ public sealed class EmotionEngine : ISchedulable
                     // syscall trampolines each firing a real, unintended syscall as a side effect
                     // (see docs/DEVELOPER_GUIDE.md's SifBindRpc-investigation follow-ups). Honor
                     // the documented convention for real instead of masking its symptom.
-                    if (rs == 31 && t == 0 && _hle != null)
+                    //
+                    // Excludes thread 1: KernelHle.cs creates it synthetically at construction
+                    // (Started=true from the start, Entry=0) and it never goes through a real
+                    // StartThread/RestoreContext cycle -- the ONLY thing that deliberately seeds
+                    // ra=0 as an exit signal. Its ra=0 is just the raw CPU boot-state default,
+                    // unwritten because crt0 reaches this point via a chain of pure tail-jumps
+                    // with zero real `jal` calls yet, not a genuine "this thread's top-level
+                    // function returned" signal. Confirmed live (2026-07-27): applying this check
+                    // to thread 1 fired at cyc=1,350,000 -- far too early for the game's real main
+                    // thread to legitimately finish -- inside an ordinary, widely-reused syscall
+                    // trampoline (0x00480260) that returns to a perfectly real address on every
+                    // OTHER call; permanently freezing the EE right there (no other thread existed
+                    // yet to switch to) traded the original crash for an even earlier, silent hang.
+                    if (rs == 31 && t == 0 && _hle != null && _hle.Kernel.CurrentThreadId != 1)
                     {
                         int exitingTid = _hle.Kernel.CurrentThreadId;
                         _hle.Kernel.ExitCurrentThread();
