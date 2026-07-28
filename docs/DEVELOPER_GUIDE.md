@@ -3969,9 +3969,65 @@ strongest signal here: this isn't another relocated stall, it's genuine continue
 Verified safe across all 9 titles in `user-media.json`: zero change to the other 8 (this fix's
 address-range detection is Shaolin-Monks-specific, matching every other `MidwayBootAssist.cs` branch).
 
-**Not yet found**: where (if anywhere) it settles next past 300M cycles, or whether it reaches a
-real menu. The PCSX2 remote debugger is the natural next tool to reach for once a new resting point
-(if any) is found — same side-by-side methodology as this section and §7.13.
+**Update, same day — found where it settles, and it's real, not another stall bug.** §7.15's own
+"still climbing at 300M cycles" measurement turned out to be misleading: it came from `blocker-trace`
+runs that don't drive `OnHostPresent`, the mechanism that paces logo/FMV playback and real frame
+presentation (`MidwayBootAssist.OnHostPresent`'s own doc comment already flags this exact gap — see
+§10's `probe-frame` entry). Re-checked with `probe-frame` (which does drive it, matching the desktop
+app's real per-tick `RunFor`+`OnHostPresent`+`PresentFrame` pattern) and the user independently
+confirmed the same thing from a manual desktop-app run: **the Midway logo plays correctly (real,
+growing `px` in lockstep with real frame presents), then the instant the logo-hold sequence finishes
+(`assist` transitions `logo-hold N` → `logo-done`, `cyc≈163M`), `px` and frame presentation both go
+completely flat — confirmed unmoving out to 500M+ cycles.**
+
+Traced with `--host-present --trace-threads`: the EE is not deadlocked (syscalls climb past 1.2
+million, a third thread now exists — `logo-done`'s transition code fires a blanket
+`SignalSema(1..32)`, per `MidwayBootAssist.cs`, waking whatever it can). PC cycles between a few
+addresses including a genuine infinite `nop`-spin (`beq zero,zero,<5 instructions back>`, no internal
+exit condition — the kind of construct only an interrupt/preemption is meant to break).
+
+**Decompiled the real cause via Ghidra** (`FUN_0041ed18`, the function containing that spin): it's a
+real, intentional **fatal-error handler**, not a bug in itself —
+
+```c
+while (true) {
+    lVar2 = FUN_004834e0(0x53ddf0, DAT_0053d554, 0);
+    if (lVar2 < 0) {
+        FUN_004157d0(0x5a6820);   // format + log a fatal error message
+        do { } while (true);      // intentional, permanent halt
+    }
+    if (DAT_0053de14 != 0) break;  // success path
+    for (iVar1 = 0xfffb; iVar1 != -1; iVar1 += -4) { }  // real delay, then retry
+}
+```
+
+Dumped the error string at `0x5a6820` directly from memory: `"E0092101: DTX_Init bind err[or]"`.
+**`FUN_004834e0` is `sceSifBindRpc` itself** — confirmed beyond doubt by a literal embedded string in
+its own decompiled body (`"SceSifrpcBind"`). Its logic: call `_rpc_get_packet` (`0x483060`, the same
+function identified in this investigation's much earlier `SifBindRpc` arc), `CreateSema`, send the
+bind request through the **same SIF-command-queue registration mechanism found missing for Burnout 3**
+(`FUN_00482c20(0xffffffff8000000N, ...)`, matching §7.14's exact convention), then `WaitSema` for the
+real IOP response.
+
+Live `--pcbreak=4834E0` confirmed **825 real `sceSifBindRpc` calls** for many different RPC service
+IDs (`0x80000001`, `0x80000003`, `0x80000592`, `0x90000200`, plus FourCC-style custom service names
+like `"SNDF"`/`"SFSV"`) — the game legitimately binds many services during startup. Calls stop
+entirely after `cyc≈93M` (the last one, for service `0x80000001`), matching where the fatal-error
+path fires.
+
+**Conclusion: this is the same root gap as §7.14, found independently from a second, completely
+different title.** Shaolin Monks' own `sceSifBindRpc` fails (returns negative) because the real
+SIF/IOP RPC-bind response never arrives — DetPS2 has no SIF command-queue implementation to deliver
+it, exactly the gap scoped (not implemented) in §7.14. The game's own code correctly detects this
+failure and halts (a real, designed fatal-error path, not corruption or an EE-emulation bug) — so
+there is nothing to "fix" in `EmotionEngine.cs`/`MidwayBootAssist.cs` here; the real work is the SIF
+command-queue subsystem itself, which would very plausibly unblock both titles (and likely others)
+at once — a second, independent confirmation of this session's own "general fixes have broad payoff"
+thesis, found before any fix was even attempted.
+
+**Not implemented this session**, consistent with §7.14's own reasoning: a real subsystem (real SIF
+queue semantics, real packet framing per RPC service, real per-service response generation) is not a
+quick patch, and there's now good reason to build it generally rather than per-title.
 
 ---
 
