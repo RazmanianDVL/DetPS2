@@ -4707,13 +4707,34 @@ exercised by the other 8 titles at all).
 so the measured improvement most plausibly comes from this service no longer leaving `recvBuf+4`
 (the `modres` field) as stale/uninitialized garbage — the old generic fallback path only ever wrote
 the first 4 bytes of the reply. The refcount gate reaching exactly 1 and stopping suggests one more
-real completion is still needed and hasn't been traced down yet; a longer run (400M+ cycles) was
-launched to check whether a real `LF_F_MOD_BUF_LOAD` call eventually fires once the game reaches
-further into its own boot sequence. Next step for whoever picks this up: `DETPS2_TRACE_RPC=1
-blocker-trace shaolin-only.json --cycles=<N>` past 150M to find that call if/when it happens, and if
-it doesn't, trace what else could still be gating `0x534124`'s last decrement (worth checking whether
-it's driven by something entirely outside the RPC layer, e.g. a directly-polled `IopModuleHost` state
-check with no RPC involved at all).
+real completion is still needed.
+
+**Extended the run to 400M cycles to check — this is a genuine plateau, not a "just needs more
+cycles" situation.** `px` grew only marginally further (72.8M → 76.8M, vs. 11.7M → 72.8M over the
+first 150M — clearly flattening), and critically `RealSifRpc.Calls` stayed at exactly **62** between
+the 150M and 400M checkpoints — zero new SIF RPC activity in that entire 250M-cycle window.
+
+**Corrected the counter's direction via `--find-writer=534124 --track-writers`**: only *one* write to
+`0x534124` happens in the entire 150M-cycle run (`cyc=2438400`, `pc=0x00414EC4`,
+`sw v0, 0(v1)`, value written `= 1`). Disassembling that function shows it's `v0 = [v1]+1; [v1]=v0` —
+an **increment**, not a decrement as this session's earlier §7.19-7.21 analysis assumed. So the real
+shape of this gate is: some init step increments `0x534124` once (0→1, confirmed — happened this
+run), registering one piece of outstanding async work, and a *separate*, not-yet-located decrement
+function is supposed to fire once that work completes, bringing it back to 0 and triggering
+`FUN_00414ed0`'s six flag writes. That decrement never happens once in the whole 400M-cycle run —
+the real gap is a missing *completion*, not a missing decrement-then-check mechanism. Started tracing
+the increment call's own context (`0x00414D80`-`0x00414E20`, which sets up a small struct at
+`0x534130`+ with fields that look like a job/request descriptor — command byte 24/25, size fields
+8/16/18/24 — before the increment) but did not finish identifying which specific async operation this
+represents or where its completion callback should be wired in.
+
+Next step for whoever picks this up: don't extend the cycle count further (already tried, confirmed
+flat) — instead disassemble `0x00414D80` backward to find this function's real name/parameters (it's
+called from somewhere with the struct-descriptor pattern above), identify what kind of request it's
+registering (worth checking whether it's yet another SIF RPC this session didn't trace — the
+`RealSifRpc.Calls=62` ceiling suggests not, but a request could also be queued through the "DetPS2 RPC
+ABI" in `SifRpc.cs`, which is separate from `RealSifRpc.cs` and wasn't audited this session), and find
+or add whatever should decrement `0x534124` back to 0 on its completion.
 
 ---
 
