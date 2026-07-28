@@ -4029,6 +4029,113 @@ thesis, found before any fix was even attempted.
 queue semantics, real packet framing per RPC service, real per-service response generation) is not a
 quick patch, and there's now good reason to build it generally rather than per-title.
 
+### 7.16 Correction: §7.15's "missing SIF command queue" conclusion was wrong. The real bug was interrupt-context register corruption — fixed, and it unblocked ~500M cycles of real progress
+
+Picking this back up later the same day, re-verification (fresh code reads and fresh live traces,
+deliberately not trusting §7.15's own summarized conclusion) found it didn't hold up: `RealSifRpc.cs`
+already answers real `sceSifBindRpc`/`sceSifCallRpc` packets — including the exact CRI ADX/DTX bind
+call §7.15 pointed at — unconditionally and correctly. A live trace with `DETPS2_TRACE_RPC` across a
+full 100M-cycle run showed hundreds of real binds and calls succeeding throughout, which directly
+contradicts "no SIF command-queue implementation to deliver a response."
+
+**The real freeze is much earlier than §7.15 believed: cyc≈1.48M, not cyc≈93M.** Everything §7.15
+measured past that point — the logo playing, `px` climbing into the hundreds of thousands, worker
+threads running — is scripted boot-assist/other-thread activity, not real main-thread game progress.
+Thread 1 itself never recovered from a bind at cyc≈1.48M; it just kept getting round-robin
+timesliced against other still-productive threads, masking the fact that it was permanently stuck.
+
+**Root-caused via instruction-level tracing, not summarized decompiles** — every prior finding was
+re-derived live rather than assumed correct:
+1. `--pcbreak=4834E0:483600` plus a fresh `DETPS2_TRACE_RPC` line added to `RealSifRpc.HandleBind`
+   confirmed the CRI ADX bind (`cd=0x53DDF0`, `sid=0x90000200`) really does get a successful
+   `HandleBind` response (real data written, semaphore signaled) — twice, at cyc≈1.48M and
+   cyc≈86.87M.
+2. A fresh Ghidra decompile of `FUN_0041ed18` (the `"DTX_Init bind error"` handler) plus a raw disasm
+   of `0x0041ED18-0x0041ED98` located the exact branch: `bgezl v0,0x0041ED98` right after
+   `jal 0x004834E0` (`sceSifBindRpc`) — taken on success, falls through to the permanent
+   `beq zero,zero,self` halt on failure.
+3. `DETPS2_TRACE_SIFSETDMA` (new, instrumented directly at the `PerformSifSetDma` call site) proved
+   the underlying `sceSifSetDma` syscall (0x77) genuinely computes a successful, nonzero return
+   (`result=2`) for the exact DMA call feeding this bind, at cyc=1,481,744.
+4. Yet a `--pcbreak=41ED64` (the unique, single-call-site return-check point) trace showed
+   **`v0=0xFFFFFFFFFFFFFFFE` (-2)** at cyc=1,481,808 — only 64 cycles later — reproduced twice,
+   independently.
+5. A full-chain `--pcbreak=480220:483600` trace, walked instruction-by-instruction, found the real
+   moment of divergence: right after the `syscall` opcode at `0x00480224` (which correctly returns
+   2, confirmed via the `DETPS2_TRACE_SIFSETDMA` line printed at the identical cycle), execution
+   jumped to **`0x00482CA0` with `ra=0x80000200`** — `KernelBootstrap.Kseg0Interrupt`, the common
+   interrupt vector — instead of falling straight through to `jr ra` at `0x00480228`. A real SIF
+   interrupt (raised synchronously as part of completing the DMA) fired and dispatched into the
+   game's own registered ISR *before* the syscall's caller ever got to read `$v0`. Tracing forward
+   from there, the ISR's own body (`0x482CA0-0x482DE0`) legitimately uses `$v0` as scratch
+   (`lbu v0,0(a3)` etc.) — and when it returns via `eret`, execution resumes at `0x00480228` with
+   **`v0=0`**, not the `2` the syscall actually computed.
+
+**Root cause, finally located precisely**: `EmotionEngine.TryDispatchRegisteredIntcHandler` — the
+code that redirects execution into a game-registered `AddIntcHandler`/`AddDmacHandler` callback
+without hand-writing a real BIOS-style dispatcher — only ever saved and restored `$ra` around that
+jump (`_savedRaAcrossIntcDispatch`, a `Stack<ulong>`). On real hardware, an interrupt is transparent
+to every register: the interrupted code never "called" the ISR, so it had no chance to save its own
+caller-saved registers the way a real function call's caller would, and the actual BIOS-level
+exception dispatcher (a hand-written asm trampoline neither DetPS2 nor this synthesized shortcut
+implements) always saves all 32 GPRs to the kernel exception frame before calling into the
+registered C-level handler — which is then free to clobber `$v0`/`$v1`/`$a0-$a3`/`$t0-$t9` exactly
+like any ordinary C function would, since its caller (the real BIOS trampoline) already preserved
+them. DetPS2's shortcut skipped that save/restore, so **any register a dispatched handler touched
+was permanently corrupted in the interrupted code's context** — not a rare edge case, since ordinary
+handler code uses scratch registers constantly. This is the exact same bug *class*
+`KernelHle.SaveFullContext`/`RestoreFullContext` already solved for thread preemption (2026-07-26/27,
+via `MaybePreempt`) — it just was never applied to interrupt dispatch.
+
+**Fixed** (`EmotionEngine.cs`): replaced the `$ra`-only `_savedRaAcrossIntcDispatch` with
+`_savedGprAcrossIntcDispatch` (`Stack<ulong[]>`) — `TryDispatchRegisteredIntcHandler` now snapshots
+all 32 GPRs before redirecting into the handler, and `ExecuteEret` restores the full snapshot
+(instead of popping and restoring only `$ra`) when the handler's own `jr ra` reaches the vector's
+`eret`. Verified directly: re-running the identical `--pcbreak=41ED64` trace after the fix shows
+`v0=0x0` (a valid, non-negative success return, matching `FUN_004834e0`'s own `uVar2 = 0;` success
+path) instead of `-2`; a fresh `disasm 2000000` run (which previously landed mid-way through the
+permanent halt spin by cyc=2M) now shows real, different forward progress
+(`PC=0x004803DC`, not `0x0041ED78`).
+
+**Verified safe**: full smoke suite (`Tests/DetPS2.Tests.csproj`) passes with zero failures both
+before and after. Cross-title check across all 9 titles in `user-media.json` at 20M cycles shows
+identical per-title `px`/`syscalls`/`sifBytes`/`dmac` figures to the pre-fix baseline for every title
+other than Shaolin Monks — zero measurable regression, as expected for a strictly-additive
+correctness fix (it can only make previously-corrupted register state correct; nothing was ever
+correctly relying on the old corruption).
+
+**Result — real, substantial, verified forward progress**: with the fix in place, Shaolin Monks no
+longer halts at cyc≈1.5M. `px` (real GS pixel output) climbs to ~77M by cyc=200M (`--host-present`,
+matching the real desktop app's pacing) and plateaus there through cyc=500M — a genuine new resting
+point, not a still-climbing figure this time (checked explicitly, learning from §7.15's earlier
+"still climbing" overstatement). Along the way, unblocking this exposed two small, real, genuinely
+general follow-on gaps rather than another catastrophic halt:
+
+- Real syscall `0x31` (`iReferThreadStatus`, the interrupt-safe variant of the already-implemented
+  `0x30`/`ReferThreadStatus`) was simply unimplemented in `SonyKernelHle.cs`. Added `case 0x31:`
+  alongside the existing `case 0x30:` — identical semantics, real fix, not a stub.
+- Real syscall `0x34` (`iWakeupThread`, the interrupt-safe variant of the already-implemented
+  `0x33`/`WakeupThread`) was likewise unimplemented. Added `case 0x34:` alongside `case 0x33:`, and
+  added `0x34` to `IsHleForcedSyscall`'s forced-HLE list (matching `0x33`'s own entry there) so a
+  game-installed `SetSyscall` hook can't silently take over just the interrupt-safe variant while the
+  direct one stays HLE'd.
+
+Both were re-verified independently: smoke suite still passes after each addition, and the 9-title
+cross-title check shows no fallout.
+
+**Where it settles at cyc=500M**: thread 1 is genuinely `sleeping=True waitSemaId=0` (a plain
+`SleepThread`, not blocked on anything) with `syscalls=183,480`, `sifBytes=15,732`, `dmac=7`,
+`gifPath3=5`. This is a new, distinct plateau — not yet investigated — and the natural next target
+with the same methodology (live `--pcbreak`/`--trace-threads` tracing, PCSX2 comparison if needed).
+
+**Broader significance**: this fix is general, not Shaolin-Monks-specific — any title that takes a
+real interrupt shortly after a syscall whose return value its caller then reads (a very ordinary
+pattern) was at risk of exactly this kind of silent, hard-to-diagnose register corruption. This is a
+substantially better candidate for "the general fix with wide catalog payoff" than the abandoned
+SIF-command-queue theory ever was, and it was found by refusing to build further on a
+not-independently-re-verified conclusion from earlier the same day — worth remembering as its own
+methodology lesson alongside §4's "always re-verify against a full run" one.
+
 ---
 
 ## 8. Save states & determinism contracts
