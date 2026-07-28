@@ -696,6 +696,7 @@ public static class SmokeTests
 
             // Phase 22
             Irx_LoadMinimal_IntoIopRam();
+            Irx_RealRelocation_ProducesCorrectAddresses();
             IopModules_DefaultsIncludeMcmanLibsd();
             MemCard_FormatWriteRead();
 
@@ -2747,6 +2748,60 @@ public static class SmokeTests
         uint w = sys.Memory.Read32(r.Entry);
         if ((w & 0x3F) != 0x08) throw new Exception($"code 0x{w:X}");
         Console.WriteLine($"[Smoke] Irx_LoadMinimal_IntoIopRam OK (entry=0x{r.Entry:X8})");
+    }
+
+    /// <summary>Real MIPS ELF-REL relocation processing, verified against hand-computed expected
+    /// instruction words (not a copyrighted real IRX -- see IrxLoader.BuildRelocatableTestIrx's
+    /// own doc comment). Ground-truthed originally against real disc files (IOP/CDVDSTM.IRX,
+    /// PADMAN.IRX) during development; this test is the permanent, committable regression check
+    /// for that same logic, including the R_MIPS_26 low-28-bit-vs-full-address bug this loader
+    /// had on the first pass (a jal computed with the full runtime address landed completely
+    /// outside the module's own loaded window -- 0x100140C4 instead of 0x1C0140C4).</summary>
+    public static void Irx_RealRelocation_ProducesCorrectAddresses()
+    {
+        var sys = new Ps2System();
+        const uint jalTarget = 0x100;   // module-relative
+        const uint hiLoTarget = 0x300;  // module-relative
+        byte[] irx = IrxLoader.BuildRelocatableTestIrx("testmod", jalTarget, hiLoTarget);
+        var r = sys.LoadIrx(irx, null);
+        if (!r.Success) throw new Exception(r.Message);
+        // IopModuleHost.LoadIrx intentionally uppercases registered names (real Sony module
+        // registries are effectively case-insensitive) -- verify the raw .iopmod parse
+        // separately, via IrxLoader.Load directly, so this test isn't coupled to that wrapper
+        // behavior for what it's actually trying to check (relocation correctness).
+        var rawResult = IrxLoader.Load(irx, new SystemMemory());
+        if (rawResult.ModuleName != "testmod") throw new Exception($".iopmod name parse failed: {rawResult.ModuleName}");
+
+        uint iopLoadBase = r.LoadBase; // full runtime address (IOP_RAM_BASE + local base)
+        uint low28Base = iopLoadBase & 0x0FFFFFFF;
+
+        uint jalWord = sys.Memory.Read32(r.LoadBase + 0);
+        uint expectedJalField = ((jalTarget + low28Base) >> 2) & 0x03FFFFFF;
+        uint expectedJalWord = (3u << 26) | expectedJalField;
+        if (jalWord != expectedJalWord)
+            throw new Exception($"R_MIPS_26: got 0x{jalWord:X8} expected 0x{expectedJalWord:X8}");
+        // The reconstructed full jump target (top 4 bits from the PC, matching real MIPS J-type
+        // semantics) must land inside the module's own loaded window, not some unrelated address.
+        uint reconstructedTarget = (r.LoadBase & 0xF0000000) | (expectedJalField << 2);
+        if (reconstructedTarget != iopLoadBase + jalTarget)
+            throw new Exception($"reconstructed jal target 0x{reconstructedTarget:X8} != expected 0x{iopLoadBase + jalTarget:X8}");
+
+        uint luiWord = sys.Memory.Read32(r.LoadBase + 4);
+        uint addiuWord = sys.Memory.Read32(r.LoadBase + 8);
+        uint expectedAddr = hiLoTarget + iopLoadBase;
+        uint expectedHi = (expectedAddr + 0x8000u) >> 16;
+        uint expectedLo = expectedAddr & 0xFFFF;
+        if ((luiWord & 0xFFFF) != (expectedHi & 0xFFFF))
+            throw new Exception($"R_MIPS_HI16: got 0x{luiWord & 0xFFFF:X4} expected 0x{expectedHi & 0xFFFF:X4}");
+        if ((addiuWord & 0xFFFF) != expectedLo)
+            throw new Exception($"R_MIPS_LO16: got 0x{addiuWord & 0xFFFF:X4} expected 0x{expectedLo:X4}");
+        // Recombining hi/lo (per real lui+addiu semantics: (hi<<16) + sign_extend16(lo)) must
+        // reproduce the intended full address exactly.
+        uint recombined = unchecked(((luiWord & 0xFFFF) << 16) + (uint)(short)(addiuWord & 0xFFFF));
+        if (recombined != expectedAddr)
+            throw new Exception($"recombined hi/lo 0x{recombined:X8} != expected 0x{expectedAddr:X8}");
+
+        Console.WriteLine($"[Smoke] Irx_RealRelocation_ProducesCorrectAddresses OK (jal=0x{reconstructedTarget:X8} hilo=0x{recombined:X8})");
     }
 
     public static void IopModules_DefaultsIncludeMcmanLibsd()

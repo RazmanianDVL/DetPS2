@@ -4469,6 +4469,98 @@ HLE shortcut that fires this exact reference-counted gate directly once the know
 is done — the latter being a scoped, much smaller task if a clean trigger point can be identified, at
 the cost of being a hack rather than a real fix (worth flagging honestly as such if pursued).
 
+### 7.22 Real IOP module (IRX) execution — Phase 1 (relocation) done, ground-truthed against real files
+
+Follow-up, same session — explicit user direction to start on real IRX execution ("something that's
+been screwing us for a while"). Scoped into three phases before writing any code:
+1. Real MIPS ELF-REL relocation processing (this section).
+2. Cross-module import/export linking.
+3. Actually executing loaded modules on the IOP interpreter + validating against Shaolin Monks.
+
+**Found existing, working infrastructure first, rather than assuming a from-scratch build.**
+`Ps2System.cs` already scans the real mounted disc for `.IRX` files under `IOP/` and loads their real
+bytes via `IrxLoader.Load` (`Ps2System.cs` ~line 495-531) — this was already wired to actual retail
+files. What was missing: `IrxLoader.cs` only ever did a plain PT_LOAD byte copy with **zero relocation
+processing** — every address-bearing instruction in a real loaded module was wrong the moment it was
+ever executed. Nothing had ever caught this because nothing ever executed loaded IOP module code.
+
+**Ground-truthed the real file format against actual disc files, not memory/guesswork.** Extracted
+`IOP/CDVDSTM.IRX` and `IOP/PADMAN.IRX` from Shaolin Monks' own disc (`extract-file` CLI command) and
+byte-decoded them with a standalone Python script before writing any C#. Findings:
+- `e_type = 0xFF80` — a Sony-specific relocatable type, not standard `ET_EXEC`.
+- Real, substantial `.rel.text`/`.rel.data` sections (`.rel.text` was 14KB for 17KB of `.text` in the
+  CDVDSTM sample) using **standard MIPS o32 ABI relocation types**: `R_MIPS_26` (type 4, J/JAL 26-bit
+  shifted targets), `R_MIPS_HI16` (type 5), `R_MIPS_LO16` (type 6) — confirmed by decoding real
+  relocation table entries directly.
+- Every real relocation entry had `r_sym == 0` (the reserved null symbol) — not because nothing needs
+  relocating, but because Sony's toolchain uses the null symbol uniformly for "this address is
+  module-relative; the loader's own load-base substitutes for a symbol lookup" (S=0 in the standard ELF
+  relocation formula, with the *loader* supplying the base rather than `.symtab`). Real cross-module
+  imports use a completely different, proprietary stub-table mechanism — not `.rel.*` sections at all —
+  which is why every observed local-fixup relocation could use the null symbol without being useless.
+- Sections carry `sh_addr` values that are already correctly module-relative and contiguous (`.text` at
+  0, `.rodata` immediately after, `.data` after that, `.sbss`/`.bss` last) — real IRX loading should be
+  section-based, not PT_LOAD-based; PT_LOAD headers in these files were found live not to cover the
+  full section range and are unreliable for real loading (confirmed on `PADMAN.IRX`: `PT_LOAD[1]`
+  filesz was smaller than the sum of the sections it supposedly covered).
+- Found and byte-decoded the real `.iopmod` section (module-info struct): confirmed field layout
+  `[0] next [4] entry [8] gp [12] text_size [16] data_size [20] bss_size [24] version_minor
+  [25] version_major [26] name (NUL-terminated ASCII)` — verified because the `entry` field matched
+  `e_entry` exactly and the name field decoded to the real, correct module name (`"cdvd_st_driver"`,
+  `"padman"`).
+
+**Rewrote `IrxLoader.cs`** to parse real section headers, load every `SHF_ALLOC` section at
+`moduleBase + sh_addr`, and apply real `R_MIPS_26`/`R_MIPS_HI16`/`R_MIPS_LO16` relocation patching
+(HI16/LO16 processed as ABI-standard buffered pairs — a queue of pending HI16 entries flushed against
+the next LO16, correctly handling the common 1:1 compiler pattern). The legacy PT_LOAD-only path is
+kept for the synthetic `BuildMinimalIrx` test fixture, which has no section headers at all.
+
+**Two real bugs found and fixed via empirical verification against the actual extracted files —
+exactly the kind of thing that would have silently corrupted every loaded module without catching
+them:**
+1. `R_MIPS_26` used the *full* runtime address as its base at first, producing `jal 0x100140C4`
+   instead of the correct `0x1C0140C4` — landing completely outside the module's own loaded IOP RAM
+   window. Root cause: real MIPS J-type instructions only ever encode the low 28 bits of a jump
+   target; hardware reconstructs the full address at execution time as
+   `(currentPC & 0xF0000000) | (field << 2)`, taking the top 4 bits from wherever the instruction
+   itself is running, never from the encoded field. Fixed by using only the *low 28 bits* of the
+   runtime base for `R_MIPS_26` (`R_MIPS_HI16`/`LO16` correctly use the full address, since they encode
+   a complete 32-bit value with no implicit segment trick).
+2. `.iopmod`'s real section type constant was guessed as `0x70000000`; the real value (confirmed by
+   decoding the actual section header byte-for-byte) is `0x70000080`, off by `0x80`. This silently made
+   `.iopmod` parsing always fail (falling back to a generic "IRX" module name) without erroring.
+
+**Verified**: full smoke suite (0 failures) including a new permanent regression test,
+`Irx_RealRelocation_ProducesCorrectAddresses`, using a hand-built synthetic IRX (`IrxLoader.
+BuildRelocatableTestIrx`) with independently-computed expected relocated instruction words — a real
+extracted IRX can't be committed to this repo (copyrighted retail content), so this is the committable
+proof the fix above holds, re-derived from first principles rather than just re-running against the
+same file that exposed the bug. 9-title cross-check at 20M cycles: byte-identical to the established
+baseline for all 9 titles — expected, since nothing executes loaded module code yet (Phase 3); this
+phase only makes the *bytes already sitting in IOP RAM* correct.
+
+**The scope-changing discovery for Phase 2**: the real BIOS ROM's own ROMDIR table (already confirmed
+present and scanned correctly this session, §7.4/7.16) contains **every core IOP kernel module as a
+real, separately-named, already-compiled entry** — `SYSMEM`, `LOADCORE`, `EXCEPMAN`, `INTRMANP`/`I`,
+`DMACMAN`, `THREADMAN`, `SIFMAN`, `SIFCMD`, `LOADFILE`, `IOMAN`, `MODLOAD`, `SIO2MAN`, and dozens more
+(confirmed by parsing the real ROMDIR table directly out of the BIOS file with a Python script — every
+entry name, extinfo size, and cumulative data offset). This means Phase 2 does **not** need a
+hand-written reimplementation of Sony's proprietary cross-module stub-linking algorithm: extract,
+relocate (Phase 1, done), and let the **real, already-compiled `LOADCORE` module's own code** do the
+linking, exactly as it does on real hardware — the R3000A interpreter (already extended this session
+with real exception handling) just needs to execute it correctly. The only new C# work needed is for
+the lowest-level hardware traps that must interface with DetPS2's own emulated hardware model (real
+DMA channel programming, real SIF register semantics) — not the kernel API or linker logic itself,
+which can be real, executed code. Confirmed there's no shortcut available instead:
+`IopModuleHost.RegisterModule` (the only existing model of "a module finished loading") is a
+synchronous dictionary insert with no callback of any kind — there is no way to fake this convincingly
+without real execution.
+
+**Not yet done**: Phase 2 (extract the BIOS-resident kernel modules via the real ROMDIR offsets, load
++ relocate them with this session's new loader, find the real data blob's exact base address within
+the BIOS file) and Phase 3 (start real IOP execution at each module's entry point, in real boot order,
+and validate against Shaolin Monks' reference-counted init gate from §7.19-7.21).
+
 ---
 
 ## 8. Save states & determinism contracts

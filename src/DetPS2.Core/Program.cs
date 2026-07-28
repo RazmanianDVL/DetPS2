@@ -1071,6 +1071,29 @@ if (args.Length > 0 && args[0].Equals("elf-sections", StringComparison.OrdinalIg
     Environment.Exit(0);
 }
 
+// detps2 load-irx <filePath> [--dump=ADDR:LEN] — load a real IRX file through IrxLoader into a
+// scratch SystemMemory and report the result, including a real relocation processing pass.
+// Standalone from any BIOS/disc boot so a single extracted module can be verified in isolation.
+if (args.Length > 0 && args[0].Equals("load-irx", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 load-irx <filePath> [--dump=ADDR:LEN]"); Environment.Exit(1); }
+    byte[] elf = File.ReadAllBytes(args[1]);
+    var mem = new SystemMemory();
+    var result = IrxLoader.Load(elf, mem);
+    Console.WriteLine($"success={result.Success} msg={result.Message}");
+    Console.WriteLine($"name={result.ModuleName} entry=0x{result.Entry:X8} gp=0x{result.Gp:X8} loadBase=0x{result.LoadBase:X8} segs={result.Segments} version={result.VersionMajor}.{result.VersionMinor}");
+    foreach (var a in args)
+    {
+        if (!a.StartsWith("--dump=")) continue;
+        var parts = a.Substring(7).Split(':');
+        uint dstart = Convert.ToUInt32(parts[0], 16);
+        uint dlen = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 0x40u;
+        for (uint o = 0; o < dlen; o += 4)
+            Console.WriteLine($"  0x{dstart + o:X8}: 0x{mem.Read32(dstart + o):X8}  {EeDisassembler.Disassemble(dstart + o, mem.Read32(dstart + o))}");
+    }
+    Environment.Exit(result.Success ? 0 : 1);
+}
+
 // detps2 iop-disasm <filePath> <fileOffsetHex>:<lenHex> — disassemble raw bytes from any file
 // as R3000A/IOP code (see IopDisassembler.cs). Operates on raw file offsets, not a running
 // system's memory — used to read real IOP module (.IRX) code extracted from the disc.
