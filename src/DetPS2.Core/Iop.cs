@@ -27,6 +27,10 @@ public sealed class Iop : ISchedulable
     public bool Running { get; private set; } = true;
     public ulong InstructionsExecuted { get; private set; }
 
+    public static readonly bool TracePc = Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP") == "1";
+    public static readonly ulong TracePcLimit =
+        ulong.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_LIMIT"), out var lim) ? lim : 2000;
+
     private readonly SystemMemory _memory;
     private uint _branchTarget;
     private bool _pendingVectorJump;
@@ -80,6 +84,8 @@ public sealed class Iop : ISchedulable
         while ((ulong)executed < maxCycles && Running)
         {
             uint opcode = _memory.IopRead32(PC);
+            if (TracePc && InstructionsExecuted < TracePcLimit)
+                Console.Error.WriteLine($"[IOPTRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8}");
             bool tookBranch = ExecuteInstruction(opcode);
             executed++;
             InstructionsExecuted++;

@@ -4212,6 +4212,85 @@ execution of arbitrary game-supplied IRX modules, which is what a full hardware-
 Limitations" section is updated to state both facts precisely — what's now modeled honestly (relay
 timing) and what still isn't (the IOP's own module execution).
 
+### 7.18 The async relay fix's own self-inflicted regression, then the real WaitSema fabrication bug underneath it
+
+§7.17's fix immediately exposed two more bugs, both downstream of the same root cause (an EE-side
+syscall handler that used to get an instant answer no longer does) and both fixed the same night.
+
+**Bug 1 — real RPC packet pool exhaustion.** A live `--pcbreak` trace (5.6GB output) caught thread 1
+calling `sceSifBindRpc` for `sid=0x80000592` (the CDVD bind) *millions* of times in a tight retry loop.
+Root cause: the real, retail `sifrpc.c` EE-side packet pool is small and fixed-size, freed only when a
+real IOP response clears `PACKET_F_ALLOC`. §7.17's once-per-scheduler-tick drain couldn't keep up with
+a retry loop that can issue many bind attempts within a single tick, so the pool exhausted for real —
+not a DetPS2 hang, a genuine, hardware-accurate retry storm caused by *too slow* a drain. Fixed via
+generation-tagging: `Sif._realRpcQueue` entries are now tagged with `Ps2System.SchedulerGeneration`
+(incremented once per `ISchedulable.Step()` call — `MasterCycles` alone can't distinguish "this tick"
+from "an earlier tick", since it only advances once per whole `RunFor` slice). `TryDequeueRealRpc`
+refuses an entry from the *current* generation (preserving "never answered within the same
+instruction") but drains anything strictly older whenever called — and `PerformSifSetDma` now also
+opportunistically drains mid-`EE.Step()`, so a tight in-game retry loop frees up older packets during
+its own execution instead of waiting for the tick boundary. Verified: the retry storm is gone from a
+live re-trace (clean, incrementing `WaitSema BLOCKED`/`FABRICATING` pairs replaced the millions of
+duplicate binds).
+
+**Bug 2 — the real one underneath.** Even after Bug 1's fix, Shaolin Monks still plateaued at the exact
+same PC (`0x0048350C`, inside `sceSifBindRpc`) and the exact same `px≈76,840,960` ceiling by 300M
+cycles. Found it in `SonyKernelHle.cs`'s `case 0x44` (WaitSema): when `WaitSemaBlocking` genuinely
+blocks a thread (correctly setting `Sleeping=true`/`WaitSemaId=id`) and `SwitchToNext` finds nothing
+else runnable, the *existing* code called `WaitSemaVblank()` (a real, correct stall) immediately
+followed, in the same synchronous call, by `SignalSema()` + `WakeupThread()` — **faking success
+instantly, undoing its own stall before the real async response (§7.17's new relay) ever had a chance
+to arrive.** This was invisible before §7.17 (the real response always landed synchronously, before
+`WaitSema` was ever reached), and became a live, active bug the moment SIF responses became
+asynchronous: the game read stale/uninitialized bind-result data, correctly judged the bind unresolved,
+and retried forever.
+
+A second, subtler trap made this harder to fix than "just don't fabricate": `SwitchToNext` itself
+(`KernelHle.cs`) has its *own* built-in fallback — "wake ourselves if sleeping and nothing else is
+runnable, so boot doesn't freeze" — that unconditionally clears `Sleeping`/`WaitSemaId` the moment it's
+called with nothing else to switch to, regardless of whether a real completion is actually pending.
+Reusing the existing `_pendingThreadStall` retry-`SwitchToNext`-every-cycle pattern (built earlier this
+session for a different scenario — implicit thread-exit via `jr ra` with `ra==0`) would have hit this
+same fallback and re-woken the thread immediately, defeating the fix before it started.
+
+**Fixed**: `SonyKernelHle.cs`'s WaitSema handler now checks `Sif.RealRpcQueueCount > 0` before doing
+anything else. If a real SIF RPC is already queued (meaning a real completion — and a real `SignalSema`
+call — is genuinely coming), it skips `SwitchToNext` entirely (avoiding its auto-wake fallback) and
+calls a new `EmotionEngine.RequestSemaStall()`, which sets a new `_pendingSemaStall` field. The main
+interpreter loop (same location as the existing `WaitingVblank`/`_pendingThreadStall` checks) stalls
+every cycle while `_pendingSemaStall` is set, polling whether the current thread is still `Sleeping` —
+cleared the instant the real `DrainRealRpcQueue → RealSifRpc.TryHandle → SignalSema` path fires for
+real and wakes it (`SignalSema` already correctly finds the specific `Sleeping` thread whose
+`WaitSemaId` matches). When `RealRpcQueueCount == 0` (no SIF RPC involved — some other, unrelated wait),
+the original `SwitchToNext`-then-fabricate safety net is preserved unchanged, so nothing about the many
+other titles' non-SIF wait paths changes at all.
+
+**Verified**: full smoke suite passes (0 failures; also fixed one unrelated stale assertion in
+`Tests/SmokeTests.cs`'s `Iop_HandAssembledLoop_Deterministic` — it asserted the IOP halts on `SYSCALL`,
+which was true under the old halt-on-syscall behavior but stale after §7.17's real R3000A
+exception-vectoring fix; updated to assert `Cop0Epc`/`Cop0Cause` ExcCode instead, which is what
+actually changed). A quick 30M-cycle Shaolin Monks re-trace with `DETPS2_TRACE_RPC=1` shows the new
+`WaitSema STALLING for real completion` path firing cleanly across many distinct semaphores (`0x1`
+through `0x10`+) with zero fallback to fabrication, and **real forward progress past the old plateau**:
+final PC moved from `0x0048350C` (stuck in `sceSifBindRpc`) to `0x0024E740`, a different part of the
+boot sequence entirely, with `px=17,489,920` at that checkpoint.
+
+9-title cross-check at 20M cycles, baseline (pre-fix, via a temporary `git stash`) vs fixed, same
+config/seed: all 8 other titles produced **byte-identical** `px`/`gifPath3`/`dmac`/`sifBytes`/`syscalls`
+between the two runs — zero regression. Shaolin Monks itself: `px` identical at this checkpoint
+(11,755,520 both runs — same amount of real GS work landed by 20M cycles either way), but
+`syscalls` dropped from 205 → 116 and `sifBytes` from 2048 → 640 with the fix — exactly the expected
+signature of the retry storm being replaced by genuine, single-shot stalls instead of repeated
+fabricate-then-retry cycles.
+
+**New frontier found, not yet fixed**: past the old plateau, the same 30M-cycle trace shows a large,
+linear sweep of `UnknownMmioRead` telemetry across `0x13607F8C`–`0x13608xxx`+ (incrementing by 4 bytes
+each read). `MmioBus.cs`'s mapped ranges are all within `0x10000000`–`0x1000FFFF` and
+`0x12000000`–`0x12002000` — real PS2 hardware has nothing legitimate at `0x1360xxxx`, so this reads
+like either a genuinely wild/garbage pointer being dereferenced, or an address-translation bug
+somewhere upstream, not a real hardware register sweep. Not investigated further this session — the
+next concrete lead for continuing the Shaolin Monks push.
+
 ---
 
 ## 8. Save states & determinism contracts

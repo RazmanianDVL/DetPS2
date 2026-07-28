@@ -47,6 +47,18 @@ public sealed class EmotionEngine : ISchedulable
     /// `[MSGBUF-A0] a0=0xB ra=0` / `[ABORT-CALLER] ra=0` traces). Checked at the top of Step();
     /// cleared automatically the moment SwitchToNext finds a real thread to run.</summary>
     private bool _pendingThreadStall;
+
+    /// <summary>Set by SonyKernelHle's WaitSema handler when a thread genuinely blocks on a
+    /// semaphore AND there is a real, already-queued SIF RPC (Sif.RealRpcQueueCount &gt; 0) that
+    /// will eventually resolve it via DrainRealRpcQueue -> RealSifRpc.TryHandle -> SignalSema.
+    /// Unlike _pendingThreadStall's retry loop, this does NOT call SwitchToNext each cycle —
+    /// SwitchToNext's own "wake ourselves if nothing else runnable" fallback (KernelHle.cs)
+    /// would immediately undo WaitSemaBlocking's Sleeping=true/WaitSemaId=id bookkeeping before
+    /// the real async response ever had a chance to arrive, which is exactly the fabrication bug
+    /// this field exists to avoid (see DEVELOPER_GUIDE.md, 2026-07-28). Instead this just polls
+    /// whether the current thread is still Sleeping — cleared the moment the real SignalSema
+    /// call (fired for real, not fabricated) wakes it.</summary>
+    private bool _pendingSemaStall;
     private bool _preferHleSyscalls = true;
     private int _cop2StallRemaining;
     private bool _cacheModelEnabled;
@@ -191,6 +203,11 @@ public sealed class EmotionEngine : ISchedulable
     public void SetTracer(Tracer tracer) => _tracer = tracer;
     public void SetTelemetry(Telemetry? telemetry) => _telemetry = telemetry;
     public void SetCycleSource(Func<ulong> source) => _cycleSource = source;
+
+    /// <summary>See _pendingSemaStall's doc comment. Called by SonyKernelHle's WaitSema handler
+    /// instead of fabricating an instant signal, when a real SIF RPC is already queued to resolve
+    /// this wait for real.</summary>
+    public void RequestSemaStall() => _pendingSemaStall = true;
 
     /// <summary>When true, pending IRQs vector through EnterException.</summary>
     public bool TakeExceptions
@@ -434,6 +451,26 @@ public sealed class EmotionEngine : ISchedulable
                 }
                 executed++;
                 continue;
+            }
+
+            // See _pendingSemaStall's doc comment: genuinely wait for a real, already-queued SIF
+            // RPC to resolve this semaphore via SignalSema, instead of calling SwitchToNext (whose
+            // own "wake ourselves" fallback would undo the Sleeping state before the real response
+            // ever arrives) or fabricating a fake signal.
+            if (_pendingSemaStall)
+            {
+                var stalledThread = _hle?.Kernel.GetThread(_hle.Kernel.CurrentThreadId);
+                if (stalledThread == null || !stalledThread.Sleeping)
+                {
+                    _pendingSemaStall = false;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                        Console.Error.WriteLine($"[STALLCLEAR-SEMA] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle?.Kernel.CurrentThreadId}");
+                }
+                else
+                {
+                    executed++;
+                    continue;
+                }
             }
 
             // Kernel thread preemption (see KernelState.MaybePreempt): real hardware

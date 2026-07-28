@@ -343,10 +343,29 @@ public sealed class SonyKernelHle
                     {
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                             Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8}");
-                        if (!_kernel.SwitchToNext(ee))
+                        if (_system.Sif.RealRpcQueueCount > 0)
                         {
-                            // Nobody else runnable: park on VBlank instead of busy-spin.
-                            // Next PCRTC VBlank wakes us so the frame loop can progress.
+                            // A real SIF RPC is already queued to resolve this (or some other)
+                            // semaphore for real via DrainRealRpcQueue -> RealSifRpc.TryHandle ->
+                            // SignalSema. Do NOT call SwitchToNext here: with nothing else
+                            // runnable, its own fallback (KernelHle.cs) would immediately undo
+                            // WaitSemaBlocking's Sleeping=true/WaitSemaId=a0 bookkeeping, and the
+                            // old code then fabricated a fake signal on top of that — faking
+                            // success before the real response ever had a chance to land, so the
+                            // game read stale/uninitialized data and retried forever (confirmed
+                            // live via Shaolin Monks' sceSifBindRpc retry storm, 2026-07-28).
+                            // Genuinely stall instead; EmotionEngine's _pendingSemaStall clears
+                            // itself the moment the real SignalSema call wakes this thread.
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                                Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
+                            ee.RequestSemaStall();
+                            wr = 0;
+                        }
+                        else if (!_kernel.SwitchToNext(ee))
+                        {
+                            // Nobody else runnable and no real SIF RPC pending: park on VBlank
+                            // instead of busy-spin. Next PCRTC VBlank wakes us so the frame loop
+                            // can progress. Preserved as-is for waits unrelated to SIF RPC.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no runnable thread)");
                             _kernel.WaitSemaVblank();

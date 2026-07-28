@@ -373,8 +373,18 @@ public static class SmokeTests
             throw new Exception($"IOP r3 expected 5 got {sys.Iop.GetGpr(3)}");
         if (sys.Iop.GetGpr(2) != 5)
             throw new Exception("IOP r2 expected 5");
-        if (sys.Iop.Running)
-            throw new Exception("IOP should have stopped on SYSCALL");
+        // Real R3000A hardware exception-vectors on SYSCALL (COP0 EPC/Cause updated, PC
+        // redirected to the BEV-selected vector) rather than halting outright — Iop.cs was
+        // corrected to match (see EnterException's doc comment), so a bare, no-BIOS-loaded
+        // synthetic program keeps running (executing whatever's at the vector) instead of
+        // stopping. Assert the exception actually fired: EPC captured the SYSCALL's own
+        // address (baseAddr+20 = 0x1014, not in a delay slot) and Cause's ExcCode is Syscall.
+        const uint syscallAddr = baseAddr + 20;
+        if (sys.Iop.Cop0Epc != syscallAddr)
+            throw new Exception($"IOP Cop0Epc expected 0x{syscallAddr:X} got 0x{sys.Iop.Cop0Epc:X}");
+        uint excCode = (sys.Iop.Cop0Cause >> 2) & 0x1F;
+        if (excCode != 8)
+            throw new Exception($"IOP Cop0Cause ExcCode expected 8 (Syscall) got {excCode}");
 
         // Determinism: second run identical
         var sys2 = new Ps2System();
