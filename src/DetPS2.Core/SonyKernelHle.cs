@@ -252,6 +252,7 @@ public sealed class SonyKernelHle
                 result = _kernel.CurrentThreadId;
                 break;
             case 0x30: // ReferThreadStatus(id, ee_thread_status_t* out)
+            case 0x31: // iReferThreadStatus — same semantics, interrupt-safe variant
                 result = ReferThreadStatus((int)a0, a1);
                 break;
             case 0x32: // SleepThread — switch to another runnable thread
@@ -264,6 +265,7 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x33: // WakeupThread
+            case 0x34: // iWakeupThread — same semantics, interrupt-safe variant
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_WAKEUP") == "1")
                     Console.Error.WriteLine($"[WAKEUP] from tid={_kernel.CurrentThreadId} target={a0} cyc={_system.MasterCycles}");
                 result = _kernel.WakeupThread((int)a0);
@@ -505,6 +507,8 @@ public sealed class SonyKernelHle
             case 0x77: // SifSetDma(SifDmaTransfer_t* sdd, int count)
                 SifDmaCalls++;
                 result = PerformSifSetDma(a0, a1);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SIFSETDMA") == "1")
+                    Console.Error.WriteLine($"[SIFSETDMA] a0=0x{a0:X8} a1={a1} result={result} tid={_kernel.CurrentThreadId} cyc={_system.MasterCycles}");
                 break;
             case 0x78: // SifSetDChain
                 result = 0;
@@ -598,7 +602,7 @@ public sealed class SonyKernelHle
     private static bool IsHleForcedSyscall(uint num) => num switch
     {
         0x20 or 0x21 or 0x22 or 0x23 or 0x24 or 0x25 => true, // threads create/start/exit
-        0x2B or 0x2F or 0x32 or 0x33 => true, // rotate/id/sleep/wakeup
+        0x2B or 0x2F or 0x32 or 0x33 or 0x34 => true, // rotate/id/sleep/wakeup(+i)
         0x3C or 0x3D or 0x3E => true, // SetupThread/Heap
         0x40 or 0x41 or 0x42 or 0x44 or 0x45 => true, // semas
         0x64 => true, // FlushCache
@@ -620,7 +624,12 @@ public sealed class SonyKernelHle
     /// </summary>
     private long PerformSifSetDma(uint listAddr, uint count)
     {
-        if (listAddr == 0 || count == 0) return 0;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_SIFSETDMA") == "1";
+        if (listAddr == 0 || count == 0)
+        {
+            if (trace) Console.Error.WriteLine($"[SIFSETDMA] EARLY-ZERO listAddr=0x{listAddr:X8} count={count} cyc={_system.MasterCycles}");
+            return 0;
+        }
         if (count > 32) count = 32; // safety
 
         Span<uint> srcs = stackalloc uint[32];
