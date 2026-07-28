@@ -4415,6 +4415,60 @@ where an index is expected in that one code path — likely a DetPS2-side regist
 bug *class* as this session's earlier interrupt-dispatch corruption fix) rather than a real defect in
 retail-shipped code.
 
+### 7.21 The `0x00427518` hypothesis ruled out; the real chain almost certainly bottoms out on real IOP module execution, the already-known, already-scoped-out limitation
+
+Immediate follow-up, same session. Checked §7.20's own next step directly rather than leaving it
+open: `0x00130138`'s literal address (`0x00130138`) only ever appears at exactly one memory location
+(`0x004AF3A0`), and that location's own last-writer record shows `cyc=0, pc=0x00000000` — i.e. it's a
+**static value baked into the ELF's data section at load time**, not something any runtime code writes.
+Confirmed with Ghidra: zero static XREFs to `0x004AF3A0` at all. Confirmed live with a full-run memory
+watchpoint (`--watch=004AF3A0`, 90M cycles): **zero reads, zero writes, for the entire run.** Whatever
+this static table slot is for, nothing in the traced boot path ever touches it — ruling out §7.20's
+"maybe it's `0x00427518`'s dispatcher table" guess specifically (wrong table, or a table nothing reads
+yet either way).
+
+**While chasing that dead end, something more important surfaced.** A `--find-value`/`--track-writers`
+run's own thread dump (printed automatically at end of run) showed **5 threads now exist** —
+`id=1..5`, all `alive=true, started=true` — not the single thread §7.19 found before the
+`SchedulerGeneration` fix. A `--trace-threads` run over the full 90M cycles confirmed the scheduler
+itself is working correctly: `KernelState.MaybePreempt` (the forced-preemption safety net for threads
+that never yield voluntarily) genuinely fires every `_preemptQuantum` (0x10000 ≈ 65,536) cycles and
+round-robins between threads 1-4 exactly as designed — this is not a scheduling bug.
+
+**What actually happens: thread 2's own `PreemptOut` PC (`0x004145A0`) lands inside the *exact same*
+`0x004145A8` wait-loop function traced in §7.19 for thread 1.** All the worker threads created during
+boot (2 through 5) run the same generic "poll my own readiness flag, then `ExitDeleteThread`" template
+— almost certainly each one polling a different one of the six flags `FUN_00414ed0` sets in a single
+shot (`0x5341D8`, `E8`, `F8`, `208`, `218`, `228` — six flags, and not coincidentally, roughly the same
+count as worker threads). The scheduler correctly gives every one of them CPU time; every one of them
+spends it finding their own flag still zero and going back to sleep. This isn't five separate bugs —
+it's five threads all blocked on the exact same upstream gate from §7.20 (`FUN_00414f20`'s
+reference-counted "wait for N completions" initializer).
+
+**Checked what could plausibly deliver that Nth completion.** `IopModuleHost.RegisterModule`
+(`SifRpc.cs`) — the only place DetPS2 models "a module finished loading" — is a synchronous
+dictionary insert with no callback, no notification, no event of any kind fired back into game code.
+There is no mechanism anywhere in this codebase that could deliver a real "IOP module init actually
+ran and called back" completion the way genuine IRX execution would. This lines up exactly with the
+`0x00130138`/`FUN_00370860`/`FUN_0026f288` chain's own shape (a large, real, register-heavy
+initialization function with no findable static or dynamic caller) and with this project's own
+long-standing, explicitly-documented limitation: **DetPS2 does not execute real IOP module (IRX) code
+— `IopModuleHost.LoadIrx` copies module bytes into IOP RAM and records metadata; `Dispatch` is a
+hand-written, per-service C# approximation of what each real module would compute, not the module's
+own code actually running** (see §7.17's own "Not done" section, and `ARCHITECTURE.md`'s Current
+Limitations).
+
+**Conclusion for this session's Shaolin Monks push**: the full observable chain has now been traced,
+address by address, from "game visibly frozen" all the way down to this architectural boundary — a
+callback that would only ever exist if real IOP module code actually ran and called back into EE-side
+game code once its own initialization genuinely completed. That's not a bug fixable by more tracing;
+it's the same "much bigger next step" this project has flagged since §7.17. Getting further on Shaolin
+Monks specifically now most plausibly requires either (a) real R3000A execution of the game's actual
+IRX modules (a large, general engine capability, not a title-specific fix), or (b) a title-specific
+HLE shortcut that fires this exact reference-counted gate directly once the known-equivalent HLE work
+is done — the latter being a scoped, much smaller task if a clean trigger point can be identified, at
+the cost of being a hack rather than a real fix (worth flagging honestly as such if pursued).
+
 ---
 
 ## 8. Save states & determinism contracts
