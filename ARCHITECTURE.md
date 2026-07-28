@@ -106,13 +106,33 @@ redirects straight to whatever the game installed via `AddIntcHandler`/`AddDmacH
 of a no-op vector). This replaced an earlier state where `TakeExceptions` was permanently off
 after fast-boot and Cause was flagged but never actually delivered.
 
+### EE↔IOP relay (updated 2026-07-28)
+
+Confirmed against the real SCPH-30000-series service manual block diagram (SECTION 3, D
+type — see `docs/DEVELOPER_GUIDE.md` for the schematic-driven write-up): the EE and IOP are
+separate chips joined *only* by a narrow 32-bit SIF bus. CDVD, SPU2, the pad/memcard front
+terminal, and Boot ROM are all wired to the **IOP's own sub-bus** — the EE has no physical
+path to any of them except by relay through the IOP. Real (retail-compiled sifrpc.c)
+bind/call traffic is now queued (`Sif._realRpcQueue`) and drained once per ambient
+scheduler tick (`SonyKernelHle.DrainRealRpcQueue`, called from `Ps2System.ISchedulable.Step`
+right after `Iop.Step`) instead of being answered synchronously inside the EE's own
+`SifSetDma` syscall handler — so a response is never visible within the same EE instruction
+that issued the request, the way it would be if these were genuinely separate,
+independently-timed processors. `RealSifRpc.cs`'s actual per-service response logic is
+unchanged; only *when* it runs changed.
+
 ### Current Limitations
 
 - Fixed-slice round-robin (no event queue yet)
 - Many components use simplified / instantaneous timing
 - DMA/VIF/GS timing are not cycle-accurate
 - GS texturing is a PSMCT32/local-mem subset (not full CLUT/swizzle)
-- IOP is HLE'd (module RPC surfaces stubbed/emulated), not real R3000A execution of every module
+- IOP is HLE'd (module RPC surfaces stubbed/emulated), not real R3000A execution of every
+  module — loaded IRX module bytes land in IOP RAM (`IopModuleHost.LoadIrx`) but are never
+  actually executed; real per-service behavior is hand-approximated in `RealSifRpc.cs`/
+  `IopModuleHost.Dispatch` rather than falling out of genuinely running the module's own
+  code. The EE↔IOP *relay timing* is now modeled honestly (see above); the IOP's own
+  internal module execution still isn't.
 - Full commercial BIOS/game boot is Phase 9+; see `docs/DEVELOPER_GUIDE.md` for current real-disc status
 
 This architecture prioritizes **determinism and clean integration** over raw accuracy in early phases.

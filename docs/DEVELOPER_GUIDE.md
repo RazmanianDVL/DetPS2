@@ -4136,6 +4136,82 @@ SIF-command-queue theory ever was, and it was found by refusing to build further
 not-independently-re-verified conclusion from earlier the same day — worth remembering as its own
 methodology lesson alongside §4's "always re-verify against a full run" one.
 
+### 7.17 The real architectural gap behind all of it: the EE was reaching devices it can't physically touch
+
+Even after §7.16's fix, Shaolin Monks still visibly froze on the Midway logo for the user (screenshot:
+`PC=0x004145D8`, `cycles=177,000,000`) — the same symptom, just later. Live-traced this new freeze the
+same way as before and found thread 2 permanently spinning in `FUN_004145a8`
+(`while (DAT_005341d8 == 0) { FUN_00414590(); }`, a real, ordinary thread that's supposed to clean up
+and exit once some completion flag arrives) via a rebuilt custom PCSX2 (this session's remote-debugger
+extension, further extended with a real, non-blocking file-based execution/memcheck tracer —
+`CBreakPoints::TraceLog`/`AddTracePoint`, `pcsx2/DebugTools/Breakpoints.{h,cpp}` +
+`pcsx2/x86/ix86-32/iR5900.cpp` — after discovering the existing `MemCheck::Action`'s `MEMCHECK_BREAK`
+path is a stub in this PCSX2 version, and that the recompiler's *actual* memcheck hit handler is a
+completely separate, unrelated function, `dynarecMemcheck`, that never calls it).
+
+**Direct memory polling (PINE `MsgRead32`, no pause needed) settled it**: `DAT_005341d8` never becomes
+nonzero — not in 30 seconds of real time, not even after the game reaches genuine running gameplay
+(`PC=0x00274790`, the real VSync wait, confirmed at the same instant). Thread 2 is stuck on real
+hardware too, forever, while the rest of the game runs normally around it — **it was never the actual
+blocker**. Chasing it further this session (a write-watch, execution breakpoints on every statically-
+found writer) was chasing a red herring; the real divergence had to be some other thread.
+
+**The user, who provided the real PS2 hardware service manual for this exact question, pointed at the
+right root cause directly**: DetPS2 wasn't actually simulating the EE and IOP as separate, physically
+distinct processors relaying information across a real bus — it was letting the EE-side syscall
+handler answer for both. Read the actual schematic (`sony-ps2-scph-39001.pdf`, SECTION 3 BLOCK DIAGRAM
+for D type, SCPH-30002D/30003D/30004D service manual) to confirm exactly what that means in hardware
+terms: **the EE and IOP are separate chips joined only by a narrow 32-bit `AD0-31` bus** (SIF is drawn
+as a sub-block *inside* the EE package — the EE's own gateway onto that bus, not a separate chip).
+**CD/DVD (DSP + mecha-con), SPU2, Boot ROM, and the pad/memcard front terminal are all wired to the
+IOP's own "SUB DATA BUS / SUB ADDRESS BUS / SYSTEM CONTROL BUS"** — the EE has *no physical connection*
+to any of them. The only way the EE can ever read a sector, play audio, or read a controller is by
+sending a message across that bus to the IOP, which does the real work on its own bus and relays the
+result back.
+
+Confirmed DetPS2's code violated this directly: `Ps2System.cs` wires `Cdvd`/`Spu2`/`PadInput` as
+top-level objects the EE-side dispatcher (`RealSifRpc.cs`, `SonyKernelHle.cs`) holds direct references
+to and calls into synchronously, from *within* the same EE instruction (`SifSetDma`, syscall 0x77)
+that issued the request — collapsing the real hardware's cross-chip relay into a single function call.
+This is architecturally impossible on real hardware and is the real, general root cause behind the
+whole session's recurring "a real IOP-mediated completion never arrives" bug class (Burnout 3's stuck
+wait-flag, Shaolin Monks' DTX bind, and — per the above — thread 2's flag too, even though that one
+turned out to be benign): none of these could ever be modeled correctly by an instant, synchronous
+shortcut, regardless of how many individual per-service response bytes get hand-tuned.
+
+**Fixed** (not just scoped): `Sif.cs` already had a working async queue+drain pattern
+(`_rpcPacketAddrs`/`Step()`), just wired only to DetPS2's own synthetic homebrew RPC ABI (`SifRpc.cs`),
+never to the real commercial-game protocol (`RealSifRpc.cs`), which was invoked synchronously and
+directly from `SonyKernelHle.HleSifCmdFromEe` — called from inside `PerformSifSetDma`, the `SifSetDma`
+syscall's own handler. Added a parallel `_realRpcQueue`: `HleSifCmdFromEe` now calls
+`Sif.SubmitRealRpc(eePacket)` (after a cheap peek, `RealSifRpc.IsRealRpcPacket`, to recognize a real
+bind/call cid without processing it early) instead of calling `RealSifRpc.TryHandle` directly. The new
+`SonyKernelHle.DrainRealRpcQueue()` does the actual dispatch, called once per ambient scheduler tick
+from `Ps2System.ISchedulable.Step` (right after `Iop.Step`, matching the real ordering: IOP processes
+its own queued work on its own turn) — never from inside `PerformSifSetDma` itself. A response is now
+never visible until at least the next scheduler slice after the request was issued, not within the
+same EE instruction, the way it would be if the EE and IOP genuinely were separate, independently-timed
+chips.
+
+**Verified**: full smoke suite passes (0 failures). 9-title cross-check at 20M cycles shows zero
+regression for the 8 other titles — identical `px`/`syscalls`/`sifBytes`/`dmac` to the pre-change
+baseline for every one of them. Shaolin Monks itself still reaches the same ~77M `px` ceiling with
+real, non-crashing, non-exiting progress at both 200M and 600M cycles — the boot timeline shifted
+(worker threads that used to appear by 20M cycles hadn't spawned yet in the same window, since SIF
+calls that used to resolve instantly now cost at least one real scheduler tick each), which is the
+expected, intended effect of modeling real cross-chip latency instead of a regression.
+
+**Not done, explicitly out of scope tonight**: this fixes the *relay timing* — the EE can no longer get
+an instant, same-instruction answer from a device it has no real bus access to. It does **not** make
+the IOP actually execute loaded IRX module code (`IopModuleHost.LoadIrx` still just copies module
+bytes into IOP RAM and records metadata; `IopModuleHost.Dispatch`/`RealSifRpc.Dispatch` are still
+hand-written, per-service C# approximations of what each real module would compute, not the real
+module's own code actually running). That remains the honest, much larger follow-on: real R3000A
+execution of arbitrary game-supplied IRX modules, which is what a full hardware-accurate emulator
+(PCSX2 included) actually does instead of per-service HLE guessing. `ARCHITECTURE.md`'s "Current
+Limitations" section is updated to state both facts precisely — what's now modeled honestly (relay
+timing) and what still isn't (the IOP's own module execution).
+
 ---
 
 ## 8. Save states & determinism contracts
