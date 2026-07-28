@@ -3909,6 +3909,70 @@ rather than rushing a narrow/wrong implementation — this is documented as a co
 starting point for whoever picks it up next (the DMA-level trace tool above makes re-deriving this
 exact data trivial for other titles too, not just re-reading this writeup).
 
+### 7.15 Back to Shaolin Monks with the new tooling: the `0x00212DD0` stall was a real bug, fixed
+
+Per this session's own standing methodology (§4, the "domino effect" thesis), pointed the new
+PCSX2 remote debugger (§7.13) at Shaolin Monks' own stall (`PC=0x00212DD0`, stable 5M-900M cycles,
+§7.10-7.11) the same way it was used on Burnout 3.
+
+**Real hardware never stalls at all.** A breakpoint at `0x00212DD0` never triggered even after 150+
+real seconds of PCSX2 running (dynarec speed, so this covers vastly more than 5M EE cycles worth of
+real game time). Pausing and reading the live PC found real hardware happily executing a completely
+different, much later region (`0x00274790`) — ground-truth disasm confirmed this is a **completely
+normal, expected per-frame VSync field-parity wait** (`ld` from the real GS `CSR` register at
+`0x12001000`, extract the FIELD bit, spin until it flips) — real hardware reached an actual running
+game loop, presenting real frames.
+
+**The `0x00212DD0` address itself turned out to be a red herring — an artifact of a boot-assist
+hack, not a genuine EE resting point.** Re-running with `--no-assist` etc. produced a *completely
+different* final PC (`0x00480330`), proving `0x00212DD0` only appears when the assist layer is
+active. Confirmed directly with a new diagnostic (`DETPS2_TRACE_STALLCLEAR`, logs every time
+`_pendingThreadStall` clears): **zero clears in the whole run** — the implicit-thread-exit stall
+(`_pendingThreadStall`, §7.6/§7.11) triggers once, at `cyc=1,350,000`, and never recovers. So
+`0x00212DD0` was never reached by real execution at all; something in the assist layer must be
+writing `PC` directly.
+
+**Traced the real corruption with `DETPS2_TRACE_REGWRITE_IDX=31`** (the existing "trace one GPR's
+write history" tool, built earlier this session): the last real write to `$ra` before the stall sets
+it to `0x00482FF8`, inside a known, already-documented `MidwayBootAssist.cs` "SIF-init wait unstick"
+hack (`UnstickSifWaits`, targeting Shaolin Monks' own `0x00482740`/`0x00482FF0` polling loop). **Live
+cross-check against real hardware nailed the exact bug**: set a breakpoint at the loop's real
+`SifSetReg`-trampoline return point (`0x00480268`) — real hardware has `ra=0x00485DF0` (a completely
+valid return address, from an entirely ordinary `jal 0x00480260` at `0x00485DE8`); DetPS2 has `ra=0`.
+
+Ground-truth `disasm` of the assist's own jump target (`0x00482FF0`-`0x00483020`) found the exact
+gap: both unstick branches set `sys.EE.PC = 0x00483000` directly, **skipping the real instruction
+at `0x00482FFC`** (`ld ra,48(sp)`) that the natural, unassisted code path would have executed right
+there, immediately before tail-jumping into the same `SifSetReg` trampoline
+(`0x00483018: j 0x00480260`). Skipping it left `$ra` holding a stale mid-loop value instead of a
+real caller's address — surfacing, cycles later, as thread 1's own `jr ra` (`ra==0`) implicit-exit
+firing with nothing else runnable, permanently stalling the EE. This is the exact same bug *class*
+already fixed twice this session (§7.6, §7.11) — not a new mechanism, just a third source feeding it
+(a boot-assist hack that bypasses a real instruction's effect, rather than a genuinely-corrupted game
+register).
+
+**Fixed** (`MidwayBootAssist.cs`): read the real saved `$ra` from `sp+48` before jumping, matching
+the skipped instruction's effect exactly, rather than the raw `PC =` assignment. Keeps the assist's
+own intent (skip the wait, land at `0x483000`) without bypassing a real instruction.
+
+**Result, verified**: `DETPS2_TRACE_JREXIT` shows **zero** implicit-exit events in a 100M-cycle run
+(was one, permanent). Real, sustained forward progress instead of a resting point:
+
+| Cycles | `px` | `syscalls` | `sifBytes` |
+|---|---|---|---|
+| 5M (old) | 860,160 | 113 | 272 |
+| 100M (new) | 1,433,600 | 101,364 | 68,673 |
+| 300M (new) | 2,293,760 | 1,314,960 | 68,673 (plateaued) |
+
+`px` climbing well past its old ceiling — real, *new* GS rendering, not a static frame — is the
+strongest signal here: this isn't another relocated stall, it's genuine continued execution.
+Verified safe across all 9 titles in `user-media.json`: zero change to the other 8 (this fix's
+address-range detection is Shaolin-Monks-specific, matching every other `MidwayBootAssist.cs` branch).
+
+**Not yet found**: where (if anywhere) it settles next past 300M cycles, or whether it reaches a
+real menu. The PCSX2 remote debugger is the natural next tool to reach for once a new resting point
+(if any) is found — same side-by-side methodology as this section and §7.13.
+
 ---
 
 ## 8. Save states & determinism contracts
