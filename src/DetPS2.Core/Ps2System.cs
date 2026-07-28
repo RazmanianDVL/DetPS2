@@ -627,8 +627,16 @@ public sealed class Ps2System : ISchedulable
         return Memory.Read32(pkt + 12);
     }
 
+    /// <summary>Increments once per Ps2System.ISchedulable.Step() call (NOT tied to
+    /// MasterCycles, which only advances once per whole Scheduler.RunFor slice and so can't
+    /// distinguish "this tick" from "an earlier tick"). Used to tag real SIF RPC queue
+    /// entries (Sif.cs's _realRpcQueue) so they're never drained within the same tick they
+    /// were submitted in, while still being drainable on any later tick.</summary>
+    public ulong SchedulerGeneration { get; private set; }
+
     int ISchedulable.Step(ulong maxCycles)
     {
+        SchedulerGeneration++;
         if (UseJit && EeJit.Enabled)
             EeJit.Execute(maxCycles);
         else
@@ -650,7 +658,7 @@ public sealed class Ps2System : ISchedulable
         // comment for why this ordering matters (EE and IOP are separate chips on real
         // hardware, joined only by a narrow SIF bus; answering instantly within the same EE
         // instruction that issued the request can't model that at all).
-        Hle.Sony?.DrainRealRpcQueue();
+        Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
         Cdvd.Step(maxCycles);
         Sif.Step(maxCycles);
         Spu2.Step(maxCycles);

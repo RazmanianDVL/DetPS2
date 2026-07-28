@@ -36,8 +36,22 @@ public sealed class Sif : ISchedulable
     /// SonyKernelHle.DrainRealRpcQueue, called once per ambient scheduler tick (Ps2System's
     /// ISchedulable.Step) — never from inside PerformSifSetDma itself — so a response is
     /// never visible until at least the next scheduler slice after the request was issued.
+    ///
+    /// Each entry is tagged with the scheduler "generation" (Ps2System's own tick counter,
+    /// NOT MasterCycles — MasterCycles only advances once per whole RunFor slice, so it can't
+    /// distinguish "this tick" from "an earlier tick" the way a per-Step()-call counter can)
+    /// it was submitted in, so TryDequeueRealRpc can refuse to hand back an entry from the
+    /// *current* generation — preserving "never answered within the same instruction that
+    /// issued it" — while still draining anything older whenever it's called, not just once
+    /// per generation. That distinction matters: a title whose own retry loop can issue many
+    /// bind attempts within a single scheduler slice (confirmed live, 2026-07-28 — Shaolin
+    /// Monks' sceSifBindRpc retrying its CDVD bind, sid=0x80000592, millions of times) will
+    /// exhaust the real, small, fixed-size EE-side RPC packet pool if packets from *earlier*
+    /// generations aren't freed before the retry loop gets another turn — draining strictly
+    /// once per generation isn't enough on its own if PerformSifSetDma is also given a chance
+    /// to opportunistically drain older entries mid-slice (see its own call site).
     /// </summary>
-    private readonly Queue<uint> _realRpcQueue = new();
+    private readonly Queue<(uint addr, ulong generation)> _realRpcQueue = new();
 
     private IopModuleHost? _modules;
     private PadInput? _pad;
@@ -113,19 +127,26 @@ public sealed class Sif : ISchedulable
         _intc?.Raise(Intc.InterruptSource.Sif);
     }
 
-    /// <summary>Queue a real (retail sifrpc.c) bind/call packet for the next scheduler
-    /// tick's IOP-side processing — see the field's own doc comment for why this must not
-    /// be drained synchronously from within the EE's own SifSetDma syscall handler.</summary>
-    public void SubmitRealRpc(uint eePacketAddr) => _realRpcQueue.Enqueue(eePacketAddr);
+    /// <summary>Queue a real (retail sifrpc.c) bind/call packet for later IOP-side
+    /// processing, tagged with the scheduler generation it was submitted in — see the
+    /// field's own doc comment for why this must not be drained synchronously from within
+    /// the EE's own SifSetDma syscall handler, and why "later" means "any generation after
+    /// this one", not strictly "only the very next one".</summary>
+    public void SubmitRealRpc(uint eePacketAddr, ulong generation) => _realRpcQueue.Enqueue((eePacketAddr, generation));
 
-    public bool TryDequeueRealRpc(out uint eePacketAddr)
+    /// <summary>Dequeues the oldest real RPC packet, but only if it's from a strictly
+    /// earlier generation than <paramref name="currentGeneration"/> — refuses to hand back
+    /// something submitted in the same generation as the caller's own current one, so a
+    /// request is never answered within the same instruction (or even the same scheduler
+    /// tick) that issued it.</summary>
+    public bool TryDequeueRealRpc(ulong currentGeneration, out uint eePacketAddr)
     {
-        if (_realRpcQueue.Count == 0)
+        if (_realRpcQueue.Count == 0 || _realRpcQueue.Peek().generation >= currentGeneration)
         {
             eePacketAddr = 0;
             return false;
         }
-        eePacketAddr = _realRpcQueue.Dequeue();
+        eePacketAddr = _realRpcQueue.Dequeue().addr;
         return true;
     }
 

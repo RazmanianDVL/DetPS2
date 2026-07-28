@@ -42,13 +42,22 @@ public sealed class SonyKernelHle
     private readonly (uint device, uint bufferAddr)?[] _deci2Handlers = new (uint, uint)?[8];
     public RealSifRpc RealRpc => _realRpc;
 
-    /// <summary>Drains real (retail sifrpc.c) bind/call packets queued by HleSifCmdFromEe —
-    /// called once per ambient scheduler tick (Ps2System.ISchedulable.Step), never from
-    /// inside PerformSifSetDma itself, so a response is never visible within the same EE
-    /// instruction that submitted the request. See Sif.cs's _realRpcQueue doc comment.</summary>
-    public void DrainRealRpcQueue()
+    /// <summary>Drains real (retail sifrpc.c) bind/call packets queued by HleSifCmdFromEe
+    /// that are strictly older than <paramref name="currentGeneration"/> — called once per
+    /// ambient scheduler tick (Ps2System.ISchedulable.Step) with that tick's own generation,
+    /// so a response is never visible within the same EE instruction (or even the same
+    /// scheduler tick) that submitted the request. Also called opportunistically from
+    /// PerformSifSetDma itself (with the SAME current generation, so it still can't drain
+    /// this tick's own fresh submissions) — a title whose own retry loop can issue many bind
+    /// attempts within a single EE.Step() call needs older packets freed *during* that call,
+    /// not just once at the end of the tick, or it can exhaust the real, small, fixed-size
+    /// EE-side RPC packet pool before the ambient drain ever gets a turn (confirmed live,
+    /// 2026-07-28 — Shaolin Monks' CDVD bind, sid=0x80000592, retried literally millions of
+    /// times once the queue's answer was delayed by even one tick). See Sif.cs's
+    /// _realRpcQueue doc comment for the full mechanism.</summary>
+    public void DrainRealRpcQueue(ulong currentGeneration)
     {
-        while (_system.Sif.TryDequeueRealRpc(out uint addr))
+        while (_system.Sif.TryDequeueRealRpc(currentGeneration, out uint addr))
         {
             if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, addr))
                 _system.Intc.Raise(Intc.InterruptSource.Sif);
@@ -672,6 +681,12 @@ public sealed class SonyKernelHle
             HleSifCmdFromEe(srcs[(int)i], sizes[(int)i]);
         }
 
+        // Opportunistically free up any real RPC packets queued in an *earlier* generation
+        // than this one — see DrainRealRpcQueue's own doc comment for why a title's own
+        // tight bind-retry loop needs this mid-EE.Step() drain, not just the once-per-tick
+        // ambient one, to avoid exhausting the real EE-side packet pool.
+        DrainRealRpcQueue(_system.SchedulerGeneration);
+
         _system.Sif.Step(64);
         // Mark SMFLAG that IOP saw the transfer (retail polls this)
         _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | 0x10000u);
@@ -694,7 +709,7 @@ public sealed class SonyKernelHle
         // _realRpcQueue doc comment) instead of handling it here.
         if (size >= 16 && RealSifRpc.IsRealRpcPacket(_system.Memory, eePacket))
         {
-            _system.Sif.SubmitRealRpc(eePacket);
+            _system.Sif.SubmitRealRpc(eePacket, _system.SchedulerGeneration);
             return;
         }
 
