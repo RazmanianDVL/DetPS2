@@ -400,7 +400,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         {
             sys.Memory.Write32(0x00778800, 1);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-            sys.EE.PC = 0x00483000;
+            RestoreRaThenJumpTo0x483000(sys);
             Assists++;
             return;
         }
@@ -416,7 +416,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         {
             sys.Memory.Write32(0x00778800, 1);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-            sys.EE.PC = 0x00483000;
+            RestoreRaThenJumpTo0x483000(sys);
             Assists++;
             return;
         }
@@ -454,6 +454,29 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Both sif-init-wait-unstick branches above jump straight to `0x00483000`, skipping the real
+    /// instruction at `0x00482FFC` (`ld ra,48(sp)`) that the natural, unassisted code path would
+    /// have executed there. That instruction restores $ra to whatever called this whole wait
+    /// routine, right before it tail-jumps into SifSetReg (`j 0x00480260`) -- so skipping it leaves
+    /// $ra holding a stale mid-loop value (0x00482FF8, this wait's own internal retry address)
+    /// instead of a real caller. Confirmed live (2026-07-27, Mortal Kombat: Shaolin Monks, found via
+    /// a real hardware/DetPS2 side-by-side comparison using a custom PCSX2 remote debugger — see
+    /// docs/DEVELOPER_GUIDE.md): real hardware has a genuine, valid $ra at the equivalent
+    /// SifSetReg-trampoline return point; DetPS2 had 0 -- eventually surfacing, cycles later, as
+    /// thread 1's own `jr ra` (ra==0) implicit-exit path firing with nothing else runnable,
+    /// permanently stalling the EE. Restoring the real stack read here (rather than just jumping)
+    /// keeps this assist's own intent (skip the wait, land at 0x483000) while no longer bypassing
+    /// a real instruction's effect.
+    /// </summary>
+    private static void RestoreRaThenJumpTo0x483000(Ps2System sys)
+    {
+        ulong sp = sys.EE.GetGpr(29).Lo;
+        uint realRa = sys.Memory.Read32((uint)sp + 48);
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = realRa });
+        sys.EE.PC = 0x00483000;
     }
 
     private void AutoCompleteWorkItems(Ps2System sys)

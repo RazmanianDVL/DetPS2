@@ -410,7 +410,11 @@ public sealed class EmotionEngine : ISchedulable
             if (_pendingThreadStall)
             {
                 if (_hle != null && _hle.Kernel.SwitchToNext(this))
+                {
                     _pendingThreadStall = false;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                        Console.Error.WriteLine($"[STALLCLEAR] cyc={CurrentCycle()} newPc=0x{PC:X8} tid={_hle.Kernel.CurrentThreadId}");
+                }
                 executed++;
                 continue;
             }
