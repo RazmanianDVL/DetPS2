@@ -153,7 +153,12 @@ public sealed class RealSifRpc
         uint cdPtr = mem.Read32(pktAddr + 28);
         uint sid = mem.Read32(pktAddr + 32);
         Binds++;
-        if (cdPtr == 0) return;
+        if (cdPtr == 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] HandleBind sid=0x{sid:X8} cdPtr=NULL (dropped, no reply) eePC=0x{SystemMemory.CurrentPcForWatch:X8}");
+            return;
+        }
 
         uint argBuf = AssignSlot();
         uint ctrlBuf = AssignSlot();
@@ -175,6 +180,9 @@ public sealed class RealSifRpc
 
         uint semaId = mem.Read32(cdPtr + 8);
         if (semaId != 0) kernel.SignalSema((int)semaId);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine($"[RPC] HandleBind sid=0x{sid:X8} cdPtr=0x{cdPtr:X8} semaId={semaId} argBuf=0x{argBuf:X8} eePC=0x{SystemMemory.CurrentPcForWatch:X8}");
 
         // Same pool-leak fix as HandleCall — bind packets come from the same
         // rpc_data->pkt_table and must be released the same way.

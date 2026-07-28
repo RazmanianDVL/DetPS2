@@ -144,8 +144,25 @@ public sealed class EmotionEngine : ISchedulable
     /// this silently corrupted arbitrary in-flight return addresses (confirmed: MK Shaolin
     /// Monks' CRT0 static-constructor walker returned into garbage because of exactly this).
     /// Push the real value before clobbering; ExecuteEret pops and restores it, so this is
-    /// invisible to any code that wasn't relying on the synthesized dispatch's own return path.</summary>
-    private readonly Stack<ulong> _savedRaAcrossIntcDispatch = new();
+    /// invisible to any code that wasn't relying on the synthesized dispatch's own return path.
+    ///
+    /// Extended (2026-07-27, MK Shaolin Monks): saving only $ra wasn't enough. Real hardware
+    /// interrupts are transparent to every register — the interrupted code never "called" the
+    /// ISR, so it had no chance to save its own caller-saved registers ($v0/$v1/$a0-$a3/$t0-$t9)
+    /// the way a normal function call's caller would. On real hardware this is safe because the
+    /// BIOS-level exception dispatcher (a hand-written asm trampoline) saves all 32 GPRs to the
+    /// kernel exception frame before ever calling into the registered C-level handler, and
+    /// restores them all before `eret`. TryDispatchRegisteredIntcHandler jumps straight into that
+    /// C-level handler with no such save/restore, so any register it uses as scratch — which is
+    /// nearly all of them, since ordinary C calling convention lets a callee clobber caller-saved
+    /// regs freely — permanently corrupts the interrupted code's in-flight state. Confirmed
+    /// concretely: a `sceSifSetDma` syscall's return value (in $v0) was overwritten to 0 by a
+    /// registered SIF interrupt handler firing in the few cycles between the syscall completing
+    /// and its caller reading $v0, making a successful DMA submission look like a failure and
+    /// permanently halting the game's own real fatal-error path. Now saves/restores the full
+    /// GPR file (same approach as KernelHle's SaveFullContext/RestoreFullContext for thread
+    /// preemption, which already gets this right) instead of just $ra.</summary>
+    private readonly Stack<ulong[]> _savedGprAcrossIntcDispatch = new();
     private bool _branchWasLikely;
 
     // COP1 FPU (Phase 25) — 32 single regs, Det policy
@@ -786,11 +803,18 @@ public sealed class EmotionEngine : ISchedulable
                 _intc.Acknowledge((Intc.InterruptSource)src);
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
-                Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedRaAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
+                Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedGprAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
+            // Snapshot the full GPR file before handing off to the registered handler — real
+            // hardware's BIOS-level dispatcher would do this too (see the field's own doc
+            // comment). Must happen before the a0/ra overwrites below so it captures the true
+            // interrupted-context values, not the ones we're about to synthesize for the handler.
+            var savedGpr = new ulong[32];
+            for (int i = 0; i < 32; i++)
+                savedGpr[i] = GetGpr(i).Lo;
+            _savedGprAcrossIntcDispatch.Push(savedGpr);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
-            _savedRaAcrossIntcDispatch.Push(GetGpr(31).Lo);
             SetGpr(31, new Gpr128 { Lo = KernelBootstrap.Kseg0Interrupt }); // ra = vector's eret
             return true;
         }
@@ -839,7 +863,7 @@ public sealed class EmotionEngine : ISchedulable
     /// dispatched handler's `ra` at 0x80000200 so its own `jr ra` epilogue lands back on the
     /// vector's `eret`. Without this exclusion, THAT jump gets silently swallowed by the same
     /// guard it was relying on: the handler's `jr ra` becomes a no-op, `eret` never runs, EXL
-    /// never clears, and `_savedRaAcrossIntcDispatch`'s pushed value never gets popped -- COP0
+    /// never clears, and `_savedGprAcrossIntcDispatch`'s pushed frame never gets popped -- COP0
     /// stays permanently "mid-exception" and every later `jr`/`jalr` elsewhere in the program
     /// keeps landing back in the vector page too (since InterruptPending is now permanently
     /// blocked by the stuck EXL, so no *new* exception ever re-establishes a fresh EPC/ra
@@ -2252,12 +2276,13 @@ public sealed class EmotionEngine : ISchedulable
         InterruptPending = false;
         EretCount++;
         PC = target - 4;
-        if (_savedRaAcrossIntcDispatch.Count > 0)
+        if (_savedGprAcrossIntcDispatch.Count > 0)
         {
-            ulong poppedRa = _savedRaAcrossIntcDispatch.Pop();
+            ulong[] savedGpr = _savedGprAcrossIntcDispatch.Pop();
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
-                Console.Error.WriteLine($"[ERET-POP] cyc={CurrentCycle()} poppedRa=0x{poppedRa:X8} stackDepthAfterPop={_savedRaAcrossIntcDispatch.Count} newPc=0x{PC:X8}");
-            SetGpr(31, new Gpr128 { Lo = poppedRa });
+                Console.Error.WriteLine($"[ERET-POP] cyc={CurrentCycle()} poppedRa=0x{savedGpr[31]:X8} poppedV0=0x{savedGpr[2]:X8} stackDepthAfterPop={_savedGprAcrossIntcDispatch.Count} newPc=0x{PC:X8}");
+            for (int i = 1; i < 32; i++) // skip $zero
+                SetGpr(i, new Gpr128 { Lo = savedGpr[i] });
         }
     }
 
