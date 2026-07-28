@@ -4556,10 +4556,74 @@ which can be real, executed code. Confirmed there's no shortcut available instea
 synchronous dictionary insert with no callback of any kind — there is no way to fake this convincingly
 without real execution.
 
-**Not yet done**: Phase 2 (extract the BIOS-resident kernel modules via the real ROMDIR offsets, load
-+ relocate them with this session's new loader, find the real data blob's exact base address within
-the BIOS file) and Phase 3 (start real IOP execution at each module's entry point, in real boot order,
-and validate against Shaolin Monks' reference-counted init gate from §7.19-7.21).
+**Not yet done** (at the time this section was first written): Phase 2 (extract the BIOS-resident
+kernel modules via the real ROMDIR offsets) and Phase 3 (real execution). Phase 2 is now done — see
+§7.23.
+
+### 7.23 Real IOP module (IRX) execution — Phase 2 (extraction) done: the ROMDIR packing puzzle solved empirically, all 22 core kernel modules extract and relocate cleanly
+
+Follow-up, same session — explicit user direction ("do phase 2"). §7.22 found the ROMDIR table
+correctly (name/extinfo_size/size for every entry, via string search for `RESET\0`), but assumed
+entry *data* was packed at the naive cumulative-offset (sum of preceding entries' sizes) — wrong.
+
+**The naive hypothesis failed, and so did a first "fixed alignment" guess.** `SYSMEM`'s real ELF
+magic was found 35 bytes past its naive offset, landing on a 64-byte boundary — but applying "round
+up to the next 64-byte boundary" cumulatively across 10 modules (`SYSMEM`, `LOADCORE`, `EXCEPMAN`,
+`INTRMANP`, `DMACMAN`, `THREADMAN`, `SIFMAN`, `SIFCMD`, `LOADFILE`, `SIO2MAN`) failed for **all 10**
+— no fixed-stride or fixed-alignment closed-form formula reproduces the real packing.
+
+**The fix: stop trying to derive a formula, search for the ground truth instead.** For each ROMDIR
+entry, search forward from its naive cumulative offset for the real `\x7fELF` magic bytes, widening
+the window (256/512/1024/4096 bytes) until found. This is robust to whatever the real packing rule
+actually is (variable padding, possibly per-entry alignment hints from the unparsed `extinfo` region
+— never fully reverse-engineered, and not necessary to) because it verifies against the one thing
+that's unambiguous: real files start with real ELF magic. Applied across all 22 core IOP kernel
+modules needed for a real boot (`SYSMEM`, `LOADCORE`, `EXCEPMAN`, `INTRMANP`, `INTRMANI`, `DMACMAN`,
+`THREADMAN`, `SIFMAN`, `SIFCMD`, `LOADFILE`, `IOMAN`, `MODLOAD`, `SIO2MAN`, `STDIO`, `SYSCLIB`,
+`HEAPLIB`, `TIMEMANP`, `TIMEMANI`, `SSBUSC`, `VBLANK`, `ROMDRV`, `ADDDRV`): **all 22 found**, with
+observed real deltas from naive ranging +35 to +396 bytes, monotonically increasing with cumulative
+file position but not fitting any single stride — confirming this really is empirical padding, not
+something a formula should have been expected to capture.
+
+**Forward-only search, not both directions — found via a test that caught a real latent bug.** The
+first `RomdirExtractor.FindRealOffset` implementation searched the window both before *and* after
+the naive offset. A synthetic regression test (`Romdir_ParseAndExtract_HandlesInterEntryPadding`,
+using a fabricated BIOS-shaped blob since a real BIOS can't be committed) with two small,
+closely-spaced fake modules caught this immediately: searching for the second module's magic found
+the *first* module's magic instead, because the first module's data fell inside the second's search
+window and appeared earlier in the byte stream. This can't happen with real, several-KB kernel
+modules (confirmed: all 22 real extractions still matched identically after the fix), but it's a
+real correctness gap in the algorithm as originally written, not just a test artifact — real padding
+deltas are always positive (data starts *after* the naive offset, never before, since the naive
+offset is itself a lower bound built from cumulative real sizes), so restricting the search to
+forward-only is both more correct and closes the collision risk for any future title/BIOS where
+modules happen to be smaller or more tightly packed.
+
+**Productionized as `RomdirExtractor.cs`** (`ParseRomdir`, `FindRealOffset`, `ExtractModule`) plus two
+new CLI commands (`romdir-list <biosPath>`, `romdir-extract <biosPath> <moduleName> <outPath>`) — the
+original Python analysis was scratch-only and is not part of the repo. Verified the C# port is
+byte-identical to the original Python extraction for all 22 modules before replacing it.
+
+**Verified all 22 real extracted modules load and relocate cleanly** through the (already Phase-1
+verified) `IrxLoader.Load`, via `load-irx`: every module's `.iopmod` name decodes to a real, sensible
+Sony kernel module name (`System_Memory_Manager`, `Module_Manager` for `LOADCORE`,
+`Multi_Thread_Manager` for `THREADMAN`, `IOP_SIF_manager`/`IOP_SIF_rpc_interface` for
+`SIFMAN`/`SIFCMD`, `sio2man`, `LoadModuleByEE` for `LOADFILE`, etc.) — strong independent confirmation
+that both the extraction offsets and the Phase-1 relocation logic are correct, since a wrong offset
+or broken relocation would produce garbage or a parse failure, not real, meaningful strings.
+
+**Verified**: full smoke suite (0 failures, including the new `Romdir_ParseAndExtract_
+HandlesInterEntryPadding` test). 9-title cross-check at 20M cycles: identical to the established
+baseline (`RomdirExtractor`/`romdir-list`/`romdir-extract` are new, additive code with no call sites
+in the boot/run path — nothing could regress). Extracted module bytes and the BIOS image itself are
+not committed (copyrighted); only the extraction *tooling* is.
+
+**Not yet done**: Phase 3 — actually executing these loaded modules on the IOP R3000A interpreter, in
+real boot order, so the real `LOADCORE` code performs its own cross-module linking (as scoped in
+§7.22), and validating that this finally satisfies Shaolin Monks' reference-counted init gate
+(`FUN_00414f20` / `0x534124`, §7.19-7.21). This is the architecturally significant remaining piece —
+it means real IOP kernel code becomes live and executing (not just HLE'd), which is a bigger surface
+than Phases 1-2 and should be scoped/tested carefully rather than rushed.
 
 ---
 
@@ -4672,6 +4736,9 @@ general-purpose ones:
 | `long-run --hours=N --log=PATH` | Unattended multi-hour soak: boots, runs in chunks, writes flushed timestamped checkpoints. For overnight/background investigation. |
 | `probe-frame [biosPath] [isoPath] [--watch=HEX]` | Boots MK Shaolin Monks specifically (hardcoded paths if omitted — pass positionally to override, flags starting with `--` are filtered out of positional matching), runs until the boot-logo FMV resolves or times out, saves a PPM of the framebuffer. Calls `ActiveQuirk?.OnHostPresent` every iteration (required for `MidwayBootAssist`'s FMV pacing to advance at all — see §7.4's "Bug B" for what happens if a tool forgets this). `--watch=HEX` reports every read/write to that address across the whole run (same mechanism as `blocker-trace`'s `--watch`). Useful for a quick visual sanity check without setting up `user-media.json`; convert the output PPM with `ffmpeg -i in.ppm -update 1 out.png` to view it. |
 | `extract-file <iso> <pathOrSubstring> <outPath>` | Pull a raw file (e.g. an `.IRX` module) off a mounted ISO for offline analysis. |
+| `load-irx <filePath> [--dump=ADDR:LEN]` | Load a real IRX ELF file standalone into a scratch `SystemMemory`, report name/entry/gp/loadBase/segments/version, optionally dump+disassemble a memory range. Used to verify `IrxLoader`'s real relocation processing against real extracted files (§7.22). |
+| `romdir-list <biosPath>` | Parse a BIOS ROM's ROMDIR table and print every entry's name/size/naive offset/real (ELF-magic-verified) offset (§7.23). |
+| `romdir-extract <biosPath> <moduleName> <outPath>` | Extract a single named ROMDIR module's raw ELF bytes from a BIOS ROM image (§7.23) — never commit the output; BIOS images and extracted module bytes are copyrighted. |
 | `elf-sections <file>` / `elf-info <file>` | Dump ELF/IRX section headers. |
 | `iop-disasm <file> <fileOffsetHex>:<lenHex>` | Disassemble raw IOP (R3000A) bytes — used for reverse-engineering real `.IRX` modules extracted via `extract-file` (see §5.3). |
 | `iop-find-word <file> <wordHex> [start] [end]` | Exact-word scan over raw IOP module bytes — e.g. finding import-stub headers or `jal` call sites. |

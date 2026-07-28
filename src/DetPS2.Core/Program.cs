@@ -1094,6 +1094,37 @@ if (args.Length > 0 && args[0].Equals("load-irx", StringComparison.OrdinalIgnore
     Environment.Exit(result.Success ? 0 : 1);
 }
 
+// detps2 romdir-list <biosPath> — parse the BIOS ROMDIR table and print every entry's
+// name/size/naive offset/real (ELF-magic-verified) offset (IRX Phase 2 tooling).
+if (args.Length > 0 && args[0].Equals("romdir-list", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 romdir-list <biosPath>"); Environment.Exit(1); }
+    byte[] bios = File.ReadAllBytes(args[1]);
+    var entries = RomdirExtractor.ParseRomdir(bios);
+    Console.WriteLine($"{entries.Count} ROMDIR entries found");
+    foreach (var e in entries)
+    {
+        long realOff = RomdirExtractor.FindRealOffset(bios, e);
+        string tag = realOff < 0 ? "?" : realOff.ToString();
+        Console.WriteLine($"  {e.Name,-12} size={e.Size,-8} naive={e.NaiveOffset,-8} real={tag}");
+    }
+    Environment.Exit(0);
+}
+
+// detps2 romdir-extract <biosPath> <moduleName> <outPath> — extract a single named ROMDIR
+// module's raw ELF bytes from a BIOS ROM image (IRX Phase 2 tooling). Never commit BIOS
+// images or extracted module bytes to the repo — this is a diagnostic tool only.
+if (args.Length > 0 && args[0].Equals("romdir-extract", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 4) { Console.WriteLine("usage: detps2 romdir-extract <biosPath> <moduleName> <outPath>"); Environment.Exit(1); }
+    byte[] bios = File.ReadAllBytes(args[1]);
+    byte[]? mod = RomdirExtractor.ExtractModule(bios, args[2]);
+    if (mod == null) { Console.WriteLine($"module '{args[2]}' not found or ELF magic not located nearby"); Environment.Exit(1); }
+    File.WriteAllBytes(args[3], mod);
+    Console.WriteLine($"wrote {mod.Length} bytes to {args[3]}");
+    Environment.Exit(0);
+}
+
 // detps2 iop-disasm <filePath> <fileOffsetHex>:<lenHex> — disassemble raw bytes from any file
 // as R3000A/IOP code (see IopDisassembler.cs). Operates on raw file offsets, not a running
 // system's memory — used to read real IOP module (.IRX) code extracted from the disc.

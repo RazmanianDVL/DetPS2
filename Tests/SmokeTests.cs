@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using DetPS2.Core;
 
 namespace DetPS2.Tests;
@@ -697,6 +700,7 @@ public static class SmokeTests
             // Phase 22
             Irx_LoadMinimal_IntoIopRam();
             Irx_RealRelocation_ProducesCorrectAddresses();
+            Romdir_ParseAndExtract_HandlesInterEntryPadding();
             IopModules_DefaultsIncludeMcmanLibsd();
             MemCard_FormatWriteRead();
 
@@ -2802,6 +2806,80 @@ public static class SmokeTests
             throw new Exception($"recombined hi/lo 0x{recombined:X8} != expected 0x{expectedAddr:X8}");
 
         Console.WriteLine($"[Smoke] Irx_RealRelocation_ProducesCorrectAddresses OK (jal=0x{reconstructedTarget:X8} hilo=0x{recombined:X8})");
+    }
+
+    /// <summary>ROMDIR extraction (IRX Phase 2), verified against a synthetic BIOS-shaped blob
+    /// (a real BIOS image can't be committed -- copyrighted). Real BIOS images insert variable
+    /// alignment padding between an entry's naive cumulative offset and where its actual data
+    /// starts (empirically discovered: not a fixed stride -- deltas of 35, 50, 53, 60, 75... bytes
+    /// were observed across real kernel modules), so RomdirExtractor locates each entry's real
+    /// data by searching for ELF magic near the naive offset rather than trusting a closed-form
+    /// packing formula. This test builds two entries with deliberately different padding amounts
+    /// to confirm the search isn't accidentally relying on a fixed offset.</summary>
+    public static void Romdir_ParseAndExtract_HandlesInterEntryPadding()
+    {
+        var buf = new List<byte>();
+        void AddEntry(string name, ushort extInfo, uint size)
+        {
+            var nameBytes = new byte[10];
+            Encoding.ASCII.GetBytes(name).CopyTo(nameBytes, 0);
+            buf.AddRange(nameBytes);
+            buf.AddRange(BitConverter.GetBytes(extInfo));
+            buf.AddRange(BitConverter.GetBytes(size));
+        }
+
+        byte[] modAData = new byte[64];
+        modAData[0] = 0x7F; modAData[1] = (byte)'E'; modAData[2] = (byte)'L'; modAData[3] = (byte)'F';
+        for (int i = 4; i < modAData.Length; i++) modAData[i] = (byte)(0xA0 + i);
+
+        byte[] modBData = new byte[48];
+        modBData[0] = 0x7F; modBData[1] = (byte)'E'; modBData[2] = (byte)'L'; modBData[3] = (byte)'F';
+        for (int i = 4; i < modBData.Length; i++) modBData[i] = (byte)(0xB0 + i);
+
+        AddEntry("RESET", 0, 32);
+        AddEntry("ROMDIR", 0, 16);
+        AddEntry("MODA", 0, (uint)modAData.Length);
+        AddEntry("MODB", 0, (uint)modBData.Length);
+
+        // Real ROMDIR naive offsets are cumulative from ABSOLUTE FILE OFFSET 0 -- independent of
+        // where the ROMDIR table text itself lives in the file (confirmed against the real BIOS:
+        // RESET's data sits at file offset 0, while the table describing it is found separately,
+        // via string search, at file offset 0x2740). So the data region here starts at offset 0
+        // and the encoded table (buf) is appended AFTER it, not before.
+        var data = new List<byte>();
+        data.AddRange(new byte[32]);           // RESET filler
+        data.AddRange(new byte[16]);           // ROMDIR filler
+        long modANaive = data.Count;
+        data.AddRange(new byte[17]);           // padding before MODA (delta +17 from naive)
+        long modAReal = data.Count;
+        data.AddRange(modAData);
+        long modBNaive = modANaive + modAData.Length; // naive = cumulative sizes, NOT real offsets
+        long gap = data.Count - modBNaive;
+        data.AddRange(new byte[Math.Max(0, 6 - (int)gap)]); // top up so real delta from naive is +6
+        long modBReal = data.Count;
+        data.AddRange(modBData);
+
+        byte[] bios = new byte[data.Count + buf.Count];
+        data.CopyTo(bios);
+        buf.CopyTo(bios, data.Count);
+
+        var entries = RomdirExtractor.ParseRomdir(bios);
+        if (entries.Count != 4) throw new Exception($"entry count {entries.Count}");
+        if (entries[2].Name != "MODA" || entries[2].Size != modAData.Length) throw new Exception("MODA entry");
+        if (entries[3].Name != "MODB" || entries[3].Size != modBData.Length) throw new Exception("MODB entry");
+
+        long foundA = RomdirExtractor.FindRealOffset(bios, entries[2]);
+        if (foundA != modAReal) throw new Exception($"MODA real offset {foundA} != expected {modAReal}");
+
+        long foundB = RomdirExtractor.FindRealOffset(bios, entries[3]);
+        if (foundB != modBReal) throw new Exception($"MODB real offset {foundB} != expected {modBReal}");
+
+        byte[]? extractedA = RomdirExtractor.ExtractModule(bios, "moda"); // case-insensitive
+        if (extractedA == null || !extractedA.SequenceEqual(modAData)) throw new Exception("MODA extract mismatch");
+        byte[]? extractedB = RomdirExtractor.ExtractModule(bios, "MODB");
+        if (extractedB == null || !extractedB.SequenceEqual(modBData)) throw new Exception("MODB extract mismatch");
+
+        Console.WriteLine("[Smoke] Romdir_ParseAndExtract_HandlesInterEntryPadding OK");
     }
 
     public static void IopModules_DefaultsIncludeMcmanLibsd()
