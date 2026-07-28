@@ -27,7 +27,7 @@ This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships enginee
 | In-memory netplay lockstep | Netplay | **Pass** | `Netplay_InMemory_LockstepSync` |
 | Real PS2 BIOS dump | BIOS | **Partial** | Load path + expanded HLE; verified against a real user-supplied dump |
 | Public domain / ps2dev homebrew | Homebrew | **Partial** | Loader + HLE + more ISA; title-dependent |
-| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Its long-standing `Exit(1)` crash is fixed (was a garbage-execution artifact, not a real panic); now stalls at a real wait (`0x00212DD0`), unchanged 5M-900M cycles — see `docs/DEVELOPER_GUIDE.md` §7.10-7.11 |
+| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Two major fixes: its long-standing `Exit(1)` crash, then the `0x00212DD0` stall that replaced it (a boot-assist bug found via live comparison against real hardware). Real, sustained progress now — `px` still climbing past 300M cycles, next resting point (if any) not yet found — see `docs/DEVELOPER_GUIDE.md` §7.10-7.15 |
 | Vexx (`SLUS_203.83`) | Retail | **In progress** | Most active title tested — 274K+ syscalls, 5.8MB real SIF traffic (entirely from *general* fixes, no Vexx-specific work) before stalling ~100M-200M cycles |
 | Blood Omen 2 (`SLUS_200.24`) | Retail | **In progress** | Real `Exit(1)` crash before 20M cycles (confirmed distinct from Shaolin Monks' now-fixed mechanism), untraced |
 | Burnout 3: Takedown (`SLUS_210.50`) | Retail | **In progress** | Stalls ~20M cycles on a shared SN Systems ProDG SDK wait-flag routine — same bug also affects MK: Deadly Alliance and MK: Deception |
