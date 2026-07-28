@@ -287,15 +287,27 @@ public sealed class RealSifRpc
 
         // CRI Middleware's ADX codec driver (CRI_ADXI.IRX, sid=0x90000200) — extracted and
         // disassembled since CRI never published this integration's RPC wire protocol. Its
-        // registered callback (real vaddr 0x720) only special-cases fno 2 and 3; every other
-        // fno (observed: 0x400/0x403/0x40A/0x40C/0x422, i.e. "0x400 + subcommand") falls
-        // through a chain of not-taken branches straight to the exit, where v0 still holds
-        // the delay-slot-set `s0` (the callback's own `buffer` argument) — real SifRpcFunc_t
-        // callbacks return a pointer to their reply data, so for these fno values the real
-        // reply IS the caller's own request buffer, unmodified. Anything else (a fixed
-        // int like this file's usual fallback) would overwrite bytes the real driver leaves
-        // untouched.
-        if (sid == SidCriAdx && rpcNumber != 2 && rpcNumber != 3 && recvBuf != 0 && argBuf != 0)
+        // registered callback (real vaddr 0x720) special-cases fno 2 and 3 (each validates 3
+        // packed request words for alignment via `andi ...,0x1F`/`0x3F`, erroring through a
+        // logging helper on failure, then calls a further processing helper whose result gets
+        // stored back into the request buffer's own first word before the callback loops to
+        // process what looks like a queue of further entries — real vaddr 0x9D0/0xAE8, not
+        // fully traced). Every other fno (observed: 0x400/0x403/0x40A/0x40C/0x422, i.e.
+        // "0x400 + subcommand") falls through a chain of not-taken branches straight to the
+        // exit, where v0 still holds the delay-slot-set `s0` (the callback's own `buffer`
+        // argument) — real SifRpcFunc_t callbacks return a pointer to their reply data, so for
+        // these fno values the real reply IS the caller's own request buffer, unmodified.
+        // Extended to also cover fno 2/3 here (2026-07-28): this title's boot creates a
+        // dedicated worker thread that polls CRI ADX init to completion (see
+        // DEVELOPER_GUIDE.md §7.24's decompiled FUN_004147f8/FUN_00414d40) via exactly these
+        // two function numbers, and the previous behavior (falling to this file's generic
+        // "unknown service -> hardcoded 1" fallback) overwrote request-buffer bytes the real
+        // driver reads back on its own next queued-entry iteration with a value that has no
+        // relationship to the real 0x9D0/0xAE8 processing result. Echoing the caller's own data
+        // back unchanged doesn't correctly emulate the real validation+processing logic, but is
+        // a strictly smaller deviation from real behavior than substituting an unrelated fixed
+        // int over data the real driver would have read on its next pass.
+        if (sid == SidCriAdx && recvBuf != 0 && argBuf != 0)
         {
             uint echoLen = Math.Min(sendSize, recvSize);
             for (uint i = 0; i < echoLen; i++)

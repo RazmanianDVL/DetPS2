@@ -4728,13 +4728,50 @@ the increment call's own context (`0x00414D80`-`0x00414E20`, which sets up a sma
 8/16/18/24 — before the increment) but did not finish identifying which specific async operation this
 represents or where its completion callback should be wired in.
 
-Next step for whoever picks this up: don't extend the cycle count further (already tried, confirmed
-flat) — instead disassemble `0x00414D80` backward to find this function's real name/parameters (it's
-called from somewhere with the struct-descriptor pattern above), identify what kind of request it's
-registering (worth checking whether it's yet another SIF RPC this session didn't trace — the
-`RealSifRpc.Calls=62` ceiling suggests not, but a request could also be queued through the "DetPS2 RPC
-ABI" in `SifRpc.cs`, which is separate from `RealSifRpc.cs` and wasn't audited this session), and find
-or add whatever should decrement `0x534124` back to 0 on its completion.
+**Followed this lead with Ghidra decompilation** (targeted `DecompileTargets.java` at the relevant
+addresses rather than continuing hand-disassembly): `FUN_00414d40` (the function containing the
+`0x00414EC4` increment) is confirmed to be **CRI ADX audio system init** — it references the literal
+string `"ADXPS2 Ver 2.60 Build Jun 16 200..."` and, on its first-ever call (`0x534124==0`), calls
+`CreateThread`+friends to spawn a dedicated worker thread (entry `0x004147F8`, decompiled) that loops
+`while (DAT_00534218 == 0) { ... FUN_00427678(); ... }` — repeatedly pumping the same "group 6"
+callback-table dispatcher investigated earlier (§7.24's dead-end `0x00427518` hypothesis was a
+*different* group; this one is real and live). The init function also calls
+`FUN_00427410(6, 0x414568, 0)`, registering `0x414568` as one of that group's callback slots.
+`0x534124` is this audio subsystem's own reference count.
+
+**Traced the real CRI ADX RPC callback's `fno=2`/`fno=3` handlers** in the extracted `CRI_ADXI.IRX`
+(real vaddr `0x720`/file offset `0x7C0`, then vaddr `0x9D0`/file offset `0xA70` for the validation
+helper `fno=2` calls) — unlike every other `fno` on this service (already handled as a verbatim
+buffer echo, see `SidCriAdx`'s declaration comment), `fno=2` validates three packed request words for
+16/32/64-byte alignment (`andi ...,0x1F`/`0x3F`, erroring through a logging helper on failure), then
+calls a further processing helper whose result gets written back into the request buffer's own first
+word, then the callback loops back to process what looks like a queue of further entries. Did not
+fully trace the processing helper (`0xAE8`) or what a "success" result value actually looks like —
+this is real, proprietary CRI middleware internals with no public documentation, and this could be a
+multi-session reverse-engineering effort on its own.
+
+**Applied a bounded, well-reasoned partial fix rather than continue the full trace**: extended the
+existing fno-agnostic echo behavior (previously excluding fno 2/3 specifically, since they were known
+to not be simple echoes) to also cover fno 2/3, on the reasoning that echoing the caller's own request
+data back unchanged — while not correctly emulating the real validation+processing logic — is a
+strictly smaller deviation from real behavior than the previous fallback (a hardcoded, unrelated `1`
+overwriting bytes the real driver reads back on its own next queued-entry iteration).
+
+**Measured, mixed result**: `unknownServiceCalls` dropped to 0 and the CRI ADX polling loop converges
+with far fewer round-trips (`RealSifRpc.Calls` 62→15, `sifBytes` 13044→2348 at the same 150M-cycle
+checkpoint) — a real reduction in retry-storm noise, and a genuine protocol-correctness improvement
+(no longer corrupting request-buffer bytes the real driver depends on). However `px` stayed exactly
+flat and `0x534124` is still stuck at 1 — this fix alone does not resolve the root blocker. 9-title
+cross-check confirmed zero regression on the other 8 titles.
+
+**Next step for whoever picks this up**: the real remaining work is reverse-engineering `0xAE8`
+(file-offset `0xB88` in `CRI_ADXI.IRX`) and the group-6 handler at EE vaddr `0x414568` to understand
+what actual "audio ready" signal the polling worker thread (`FUN_004147f8`) is waiting for, then
+either implement that signal for real or find why it's never satisfied. Also worth checking whether a
+request could be queued through the older "DetPS2 RPC ABI" in `SifRpc.cs` (separate from
+`RealSifRpc.cs`, not audited this session) instead of `RealSifRpc`. Don't extend the cycle count
+further — already tried to 400M cycles and confirmed a genuine plateau, not a "just needs more time"
+situation.
 
 ---
 
