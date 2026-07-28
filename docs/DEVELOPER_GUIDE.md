@@ -4358,9 +4358,62 @@ flag, then self-terminate this thread" pattern, not a bug in itself. The flag at
 becomes nonzero across a 90M-cycle run because nothing in the current simulation would ever set it — no
 second thread exists, and no interrupt handler is registered (confirmed via `--trace-threads` and
 `DETPS2_TRACE_HANDLERS`). Pad input (Start/Cross, five separate injection points across the run) has no
-effect on this loop either. Next concrete lead: find what real hardware event is supposed to set
-`0x5341D8` — likely a VSync/PCRTC-interrupt-driven counter reaching a target, given the loop's own
-per-iteration counter-increment pattern, but not yet confirmed live.
+effect on this loop either.
+
+### 7.20 Traced who's actually supposed to set `0x5341D8`, via Ghidra XREF analysis on the real game ELF (not the BIOS)
+
+Follow-up, same session. §7.19 guessed VSync as the likely mechanism; wrong guess, corrected by asking
+the right tool the right question instead of continuing to speculate. A `ShaolinMonks.gpr` Ghidra
+project for the real `shaolin_boot.elf` already existed from earlier work — wrote three small headless
+scripts (`FindFlagXrefs.java`, `FindCallers.java`/`FindCallers2/3/4.java`, all in
+`C:\Users\xxraz\ghidra\scripts\`) to walk `ReferenceManager.getReferencesTo()` instead of guessing from
+raw disassembly, and cross-checked every step live against `disasm`/`--pcbreak`.
+
+**Found real, unconditional writers.** `0x5341D8` (and five neighboring flags, `0x5341E8`
+through `0x534228`, 16 bytes apart) are set to `1` by a straight-line function at `0x00414ED0`
+(`FUN_00414ed0`) — no branches, no conditions, just six `sd` stores. Not a red herring like §7.19's
+first guess (VSync) would have been.
+
+**Found the real gate in front of it: a reference-counted "last one out" initializer, not a VSync
+wait.** `FUN_00414ed0` (and a sibling initializer, `FUN_00415298`) are called only from
+`FUN_00414f20`, which does exactly this:
+```
+v1 = &counter (0x534124)
+v0 = *v1 - 1
+if (v0 != 0) return          // more completions still expected — bail without initializing
+*v1 = v0                     // v0 == 0 here: this was the last one
+call FUN_00414ED0            // now, and only now, mark every subsystem "ready"
+call FUN_00414FC0, FUN_00415160, FUN_00415090, FUN_00415298
+... more real init work ...
+```
+A classic "wait for N async completions, then finish init" pattern — the same *shape* of problem as
+§7.19's WaitSema chain, just one level higher: instead of a kernel semaphore, it's the game's own
+plain-memory reference count.
+
+**Traced the call chain upward, confirming every link is real but none of it ever runs.**
+`FUN_00414f20`'s only static caller is `FUN_0026f288`, called only from `FUN_00370860`, called only
+from `FUN_00130138` — a large (480-byte stack frame, saves `s0`-`s7`+`fp`) function that itself has
+**zero static callers** anywhere in the binary. Live `--pcbreak` traces over a full 90M-cycle run
+confirm the whole chain — `FUN_00130138`, `FUN_00370860`(implied), `FUN_0026f288`(implied),
+`FUN_00414f20` — is never entered even once: this isn't a case of "runs but doesn't finish," it's never
+reached at all.
+
+**Most likely connection to §7.18's other open finding.** `FUN_00130138` having zero *static* callers
+while clearly being real, substantial, deliberately-written code (not dead weight — six-plus register
+saves, multiple sub-calls) strongly suggests it's invoked *indirectly* — through a function pointer, not
+a plain `jal`/`j` a linker-level XREF pass can see. §7.18's own callback-table dispatcher at `0x00427518`
+(`s0 = tableBase + a0*72`, then `jalr` through up to 5 slots) is exactly that kind of indirect-call site,
+and was already caught reading its table from a wild, pointer-sized `a0` (`~0x54E5F0`) in some call
+paths, landing in unmapped `0x1856xxxx` — not yet proven to be *this specific* table, but the shape
+matches closely enough to be the leading hypothesis, not a coincidence worth ignoring.
+
+**Not yet fixed — next concrete step**: confirm whether `0x00427518`'s dispatcher is really the
+indirect entry point for `FUN_00130138` (a targeted live check: watch what gets written into the
+`0x76xxxx`-based table slots via the `SetCallback`-style setters at `0x004274E8`/`0x00427500`, and
+compare against `0x00130138`'s address), and if confirmed, find why the caller passes a raw pointer
+where an index is expected in that one code path — likely a DetPS2-side register-corruption bug (same
+bug *class* as this session's earlier interrupt-dispatch corruption fix) rather than a real defect in
+retail-shipped code.
 
 ---
 
