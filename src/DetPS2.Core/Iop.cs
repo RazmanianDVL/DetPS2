@@ -29,6 +29,8 @@ public sealed class Iop : ISchedulable
 
     private readonly SystemMemory _memory;
     private uint _branchTarget;
+    private bool _pendingVectorJump;
+    private uint _vectorTarget;
 
     public Iop(Intc intc, SystemMemory memory)
     {
@@ -51,6 +53,8 @@ public sealed class Iop : ISchedulable
         Running = true;
         InstructionsExecuted = 0;
         _branchTarget = 0;
+        _pendingVectorJump = false;
+        _vectorTarget = 0;
     }
 
     public uint GetGpr(int index) => _gprs[index & 0x1F];
@@ -80,7 +84,16 @@ public sealed class Iop : ISchedulable
             executed++;
             InstructionsExecuted++;
 
-            if (tookBranch)
+            if (_pendingVectorJump)
+            {
+                // Real exception entry (SYSCALL/BREAK) — jumps straight to the vector, no
+                // delay-slot fetch of its own (the exception replaces normal sequential
+                // control flow at this point; whatever follows the faulting instruction in
+                // memory is not executed until/unless the handler itself returns there).
+                _pendingVectorJump = false;
+                PC = _vectorTarget;
+            }
+            else if (tookBranch)
             {
                 // Delay slot
                 uint delay = _memory.IopRead32(PC + 4);
@@ -199,12 +212,11 @@ public sealed class Iop : ISchedulable
                 uint target = _gprs[rs];
                 if (rd != 0) _gprs[rd] = ret;
                 return BranchTo(target);
-            case 0x0C: // SYSCALL — halt for tests / HLE hook
-                Cop0Cause |= 1u << 8;
-                Running = false;
+            case 0x0C: // SYSCALL — real R3000A exception entry (ExcCode 8), not a halt.
+                EnterException(8);
                 break;
-            case 0x0D: // BREAK
-                Running = false;
+            case 0x0D: // BREAK (ExcCode 9)
+                EnterException(9);
                 break;
             case 0x10: if (rd != 0) _gprs[rd] = HI; break; // MFHI
             case 0x11: HI = _gprs[rs]; break; // MTHI
@@ -282,11 +294,38 @@ public sealed class Iop : ISchedulable
             case 0x04: // MTC0
                 WriteCop0(rd, _gprs[rt]);
                 break;
-            case 0x10: // RFE-ish — clear EXL in status
-                Cop0Status &= ~0x2u;
+            case 0x10: // RFE — real R3000A return-from-exception: shift the KUp/IEp pair
+                       // (bits 3:2) back down into KUc/IEc (bits 1:0), restoring the mode/
+                       // interrupt-enable state the exception handler was entered under. The
+                       // R3000A has no EXL bit (that's a later-MIPS/R5900 feature) — it's a
+                       // real 3-deep current/previous/old shift-register stack instead.
+                Cop0Status = (Cop0Status & ~0xFu) | ((Cop0Status & 0x3Cu) >> 2);
                 break;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Real R3000A exception entry: EPC = faulting PC, Cause.ExcCode set, the KU/IE stack
+    /// shifted left (current pair becomes previous, new current pair forced to kernel-mode/
+    /// interrupts-disabled), PC redirected to the BEV-selected vector. This is what lets the
+    /// real IOP BIOS ROM's own exception dispatcher (present in the same BIOS dump already
+    /// used for the EE side — confirmed 0xBFC00000 maps to real BIOS_BASE=0x1FC00000 data,
+    /// not a synthesized stub) actually run for real instead of the interpreter just halting
+    /// on the first SYSCALL it hits. Simplification: EPC always = PC (no delay-slot/BD-bit
+    /// tracking yet, since Step()'s delay-slot handling doesn't expose "is this instruction
+    /// itself in a delay slot" to ExecuteInstruction) -- correct for the overwhelmingly common
+    /// case of a syscall not in a delay slot, wrong in the rare case it is.
+    /// </summary>
+    private void EnterException(uint excCode, uint badVAddr = 0)
+    {
+        bool bev = (Cop0Status & (1u << 22)) != 0;
+        Cop0Epc = PC;
+        Cop0Cause = (Cop0Cause & ~0x7Cu) | ((excCode & 0x1Fu) << 2);
+        if (excCode == 4 || excCode == 5) Cop0BadVAddr = badVAddr; // AdEL/AdES
+        Cop0Status = (Cop0Status & ~0x3Fu) | ((Cop0Status & 0xFu) << 2);
+        _vectorTarget = bev ? 0xBFC00180u : 0x80000080u;
+        _pendingVectorJump = true;
     }
 
     private uint ReadCop0(uint reg) => reg switch
