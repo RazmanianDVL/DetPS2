@@ -3880,6 +3880,35 @@ synthesize the correct response for *any* registration of this shape, not just t
 instance. The PCSX2 remote-debugger extension built this session is reusable for that next step, and
 for any future "what does real hardware actually do here" question on any title.
 
+### 7.14 The missing data identified as a standard SIF command-queue drain — scoped for a future fix
+
+Extended the PCSX2 debugger further with a DMA-level trace: `Sif0.cpp`'s two transfer functions
+(`WriteFifoToEE`/`WriteIOPtoFifo`) now log every SIF0 (IOP→EE) transfer's source/dest/size into a
+128-entry ring buffer, exposed over PINE (`MsgGetSif0Trace`=0x2C) — genuinely new information PCSX2's
+GUI debugger itself doesn't surface (it shows CPU execution, not DMA-engine-level transfers).
+`Console.WriteLn` doesn't reach stdout in `-batch` mode, which is why a PINE-exposed ring buffer was
+used instead of a log line.
+
+**The trace resolves the last open question**: `0x4E3EC0` is repeatedly written by **48-byte
+(12-word) packets from a sequentially-incrementing IOP source address** (`0x00072DF0`, `+0x30` each
+time — `0x00072E20`, `0x00072E50`, ... ) interleaved with several other fixed-size transfers to
+unrelated destinations. A fixed-size packet drained one-at-a-time from a monotonically-advancing IOP
+source address is the textbook shape of a **SIF command queue drain** — a standard PS2 SDK mechanism
+(EE-side code enqueues/registers, IOP-side kernel code appends fixed-size reply packets to a ring
+buffer as things complete, and periodically DMAs the next pending entry over to the EE), not
+something specific to this SDK or this game. The captured 48-byte payload for Burnout 3's case
+matches this exactly: `{0, 0, 0x80000001, 0, 0, 1, 0x80000001, 0, 0x8000000A, 0, 0, 0}` — the
+`index=0, value=1` pair the setter reads, surrounded by more of the same virtual-register-ID values
+(`0x80000000|N`) already established in §7.12's `SifSetReg`/`SifGetReg` fix.
+
+**Scoped, not implemented.** `RealSifRpc.cs`/`Sif.cs` have no SIF-command-queue concept at all today
+— building one correctly (real queue semantics, real packet framing, real per-service dispatch) is a
+genuine subsystem, not a quick patch, and hardcoding the one captured 48-byte packet for this one
+registration would be exactly the single-game hack §7.12 already ruled out. Deliberately stopped here
+rather than rushing a narrow/wrong implementation — this is documented as a concrete, well-scoped
+starting point for whoever picks it up next (the DMA-level trace tool above makes re-deriving this
+exact data trivial for other titles too, not just re-reading this writeup).
+
 ---
 
 ## 8. Save states & determinism contracts
