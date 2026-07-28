@@ -63,6 +63,18 @@ public sealed class RealSifRpc
     public const uint SidSndf = 0x534E4446;
     private const uint SndfInitAudio = 0x1300;
 
+    // SNDFI.IRX's second registered service, "SFSV" as the same fourCC-in-register convention
+    // as SidSndf (registered at real vaddr 0xC2C8, same module/.iopmod as SNDF_Driver). Bound
+    // early but not called until real forward progress unblocks the code path that reaches it
+    // (confirmed live: 2026-07-28, only reached after the LOADFILE/sid=0x80000006 fix below let
+    // the boot sequence's reference-counted init gate get its first real decrements). Only
+    // fno=0x8000 observed so far; not independently disassembled the way SNDF's fno=0x1300 was,
+    // but same module/toolchain ("MW MIPS C Compiler") as SNDF_Driver and SDRDRV, both confirmed
+    // to use a 0-for-success convention -- applying that same convention here rather than this
+    // file's generic "unknown service -> 1" fallback, since the latter comes from a different,
+    // unrelated toolchain assumption that's already been shown wrong for this module's siblings.
+    public const uint SidSfsv = 0x53465356;
+
     // CRI Middleware's ADX audio codec IOP driver (CRI_ADXI.IRX) — extracted from the disc
     // and disassembled; sid read directly out of its .data section (a runtime variable, not
     // a compile-time constant, unlike Midway's own SNDF/SFSV services) at the call site for
@@ -82,6 +94,32 @@ public sealed class RealSifRpc
     private const uint SysmemAlloc = 1; // SifAllocIopHeap(size) -> addr
     private const uint SysmemFree = 2;  // SifFreeIopHeap(addr) -> result
     private const uint SysmemLoad = 3;  // SifLoadIopHeap(path, addr) -> result
+
+    // Real ps2sdk IOP module loader RPC service (ee/kernel/src/loadfile.c: SifLoadFileInit
+    // binds sid=0x80000006 unconditionally; verified against the real ps2sdk source,
+    // github.com/ps2dev/ps2sdk). This is the service SifLoadModule/SifLoadModuleBuffer/
+    // SifExecModuleBuffer all ultimately call through -- the real, general mechanism for "load
+    // and start an IRX module", as opposed to the disc-file preload path
+    // (Ps2System.PreloadIopModulesFromDisc) which only covers files already sitting under IOP/
+    // on the mounted ISO. Games that bundle their own IRX modules inside EE-side data (loaded via
+    // SifExecModuleBuffer, which DMAs the bytes to an IOP heap allocation via SidSysmem/
+    // SysmemAlloc first, then calls this service's LF_F_MOD_BUF_LOAD) were completely unhandled --
+    // this sid fell through to the generic "unknown service" fallback, which returns a bare `1`
+    // and never populates the real 8-byte { result, modres } reply struct real callers read.
+    // Function numbers and arg struct layout (common/include/loadfile-common.h) confirmed
+    // directly against real ps2sdk source, not guessed.
+    public const uint SidLoadFile = 0x80000006;
+    private const uint LfModLoad = 0;           // SifLoadModule(path, ...) -- struct _lf_module_load_arg
+    private const uint LfSearchModByName = 9;    // SifSearchModuleByName(name) -- struct _lf_search_module_by_name_arg
+    private const uint LfModBufLoad = 6;         // SifLoadModuleBuffer/SifExecModuleBuffer -- struct _lf_module_buffer_load_arg
+    private const int LfPathMax = 252;
+    // Real IOP RAM module bytes are self-describing (ELF/IRX section headers carry their own
+    // sizes) -- copying a generous upper bound and letting IrxLoader.Load parse only what it
+    // actually needs avoids having to duplicate ELF-header size computation here. Real driver
+    // IRX modules on this title's disc top out around 100KB (THREADMAN, the largest BIOS-
+    // resident kernel module, is 36KB -- see RomdirExtractor's Phase 2 findings); 512KB comfortably
+    // covers any real game-bundled module without reading past the 2MB IOP RAM window.
+    private const int LfModuleCopyCap = 0x80000;
 
     // Simple bump allocator carved out of IOP RAM below the bind-scratch region (0x1F0000+),
     // so real titles calling SifAllocIopHeap during boot get back an address that's actually
@@ -163,13 +201,13 @@ public sealed class RealSifRpc
 
     /// <summary>Recognizes and handles a real RPC bind/call packet. Returns false for
     /// anything else (caller falls back to existing system-cid / heuristic handling).</summary>
-    public bool TryHandle(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, uint pktAddr)
+    public bool TryHandle(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, IopModuleHost iopModules, uint pktAddr)
     {
         uint cid = mem.Read32(pktAddr + 8);
         switch (cid)
         {
             case CidRpcBind: HandleBind(mem, kernel, pktAddr); return true;
-            case CidRpcCall: HandleCall(mem, kernel, cdvd, pad, pktAddr); return true;
+            case CidRpcCall: HandleCall(mem, kernel, cdvd, pad, iopModules, pktAddr); return true;
             default: return false;
         }
     }
@@ -207,7 +245,7 @@ public sealed class RealSifRpc
         _cdToSid[cdPtr] = sid;
         _cdToArgBuf[cdPtr] = argBuf;
 
-        if (sid != SidCdScmd && sid != SidCdNcmd && sid != SidPad1 && sid != SidPad2 && sid != SidMcServ && sid != SidCdBase && sid != SidSysmem && sid != SidSndf && sid != SidCriAdx && sid != SidSdReg)
+        if (sid != SidCdScmd && sid != SidCdNcmd && sid != SidPad1 && sid != SidPad2 && sid != SidMcServ && sid != SidCdBase && sid != SidSysmem && sid != SidSndf && sid != SidCriAdx && sid != SidSdReg && sid != SidLoadFile && sid != SidSfsv)
         {
             UnknownBindSids++;
             _unknownSidsSeen.Add(sid);
@@ -233,7 +271,7 @@ public sealed class RealSifRpc
         mem.Write32(pktAddr + 24, 0);
     }
 
-    private void HandleCall(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, uint pktAddr)
+    private void HandleCall(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, IopModuleHost iopModules, uint pktAddr)
     {
         // SifRpcCallPkt_t (56B): +0 sifcmd(16) +16 rec_id +20 pkt_addr +24 rpc_id +28 cd(ptr)
         //   +32 rpc_number +36 send_size +40 recvbuf(ptr) +44 recv_size +48 rmode +52 sd(ptr)
@@ -272,6 +310,24 @@ public sealed class RealSifRpc
             return;
         }
 
+        // LOADFILE (sid=0x80000006) — real ps2sdk replies with a { result, modres } pair
+        // (8 bytes, struct _lf_module_buffer_load_arg's `p`/`q` union fields), not the single
+        // int word every other service here returns, so it's special-cased directly rather
+        // than routed through Dispatch. See SidLoadFile's declaration comment for the source
+        // verification and HandleLoadFile for the per-function-number behavior.
+        if (sid == SidLoadFile)
+        {
+            HandleLoadFile(mem, iopModules, rpcNumber, argBuf, recvBuf);
+            uint lfSemaId = cdPtr != 0 ? mem.Read32(cdPtr + 8) : 0;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] HandleCall sid=0x{sid:X8} fno=0x{rpcNumber:X} LOADFILE recvBuf=0x{recvBuf:X8} semaId={lfSemaId} eePC=0x{SystemMemory.CurrentPcForWatch:X8}");
+            if (lfSemaId != 0) kernel.SignalSema((int)lfSemaId);
+            uint lfRecId = mem.Read32(pktAddr + 16);
+            mem.Write32(pktAddr + 16, lfRecId & ~1u);
+            mem.Write32(pktAddr + 24, 0);
+            return;
+        }
+
         int result = Dispatch(mem, cdvd, pad, sid, rpcNumber, argBuf, recvBuf);
 
         if (recvBuf != 0)
@@ -294,6 +350,115 @@ public sealed class RealSifRpc
         uint recId = mem.Read32(pktAddr + 16);
         mem.Write32(pktAddr + 16, recId & ~1u);
         mem.Write32(pktAddr + 24, 0);
+    }
+
+    /// <summary>Real LOADFILE service (sid=0x80000006). Handles the function numbers this
+    /// title's boot actually calls; unhandled function numbers report a load failure (negative
+    /// result) rather than a bare "success" -- unlike the single-int Dispatch fallback's "assume
+    /// success" reasoning, a caller checking a genuine module-load result for success/failure is
+    /// exactly the case where silently claiming success would be actively misleading (game code
+    /// may branch on the returned module id).</summary>
+    private void HandleLoadFile(SystemMemory mem, IopModuleHost iopModules, uint fno, uint argBuf, uint recvBuf)
+    {
+        int result;
+        int modres = 0;
+        switch (fno)
+        {
+            case LfModBufLoad:
+            {
+                uint ptr = argBuf != 0 ? mem.Read32(argBuf) : 0;
+                result = TryLoadModuleFromMemory(mem, iopModules, ptr, null);
+                break;
+            }
+            case LfModLoad:
+            {
+                string path = argBuf != 0 ? ReadCString(mem, argBuf + 8, LfPathMax) : "";
+                string name = StripDevicePrefix(path);
+                result = iopModules.TryGetModule(name, out int existingId)
+                    ? existingId
+                    : iopModules.RegisterModule(name);
+                break;
+            }
+            case LfSearchModByName:
+            {
+                string name = argBuf != 0 ? ReadCString(mem, argBuf + 8, LfPathMax) : "";
+                result = iopModules.TryGetModule(StripDevicePrefix(name), out int foundId) ? foundId : -1;
+                break;
+            }
+            case 0xFF: // LF_F_GET_VERSION -- confirmed called live by this title (not part of
+                // any public ps2sdk client wrapper; called directly). Unlike the module-load
+                // functions below, a version query has no real "did the wrong thing load"
+                // failure mode -- the risk calculus that justifies returning -1 for unhandled
+                // load functions doesn't apply here, and an unexpected negative "version" is
+                // exactly the kind of value that could make defensive client code refuse to use
+                // the service at all. Plausible placeholder (encoded like a packed major.minor)
+                // rather than a value shaped like an error.
+                result = 0x00020000;
+                break;
+
+            default:
+                // LF_F_ELF_LOAD/SET_ADDR/GET_ADDR/MG_*/MOD_STOP/MOD_UNLOAD/SEARCH_BY_ADDRESS --
+                // not observed in this title's boot path, not independently verified. Negative
+                // (failure) rather than this file's usual optimistic "1": real callers of a
+                // module-load-shaped RPC branch on success/failure of the returned id/result,
+                // so a wrong-but-positive value risks worse downstream behavior than an honest
+                // "didn't handle this" failure.
+                result = -1;
+                break;
+        }
+        if (recvBuf != 0)
+        {
+            mem.Write32(recvBuf, unchecked((uint)result));
+            mem.Write32(recvBuf + 4, unchecked((uint)modres));
+        }
+    }
+
+    /// <summary>Copies a generous window of real module bytes out of IOP RAM starting at
+    /// <paramref name="ptr"/> and loads it through the existing, Phase-1/2-verified
+    /// IrxLoader/IopModuleHost pipeline. Returns a positive module id on success, -1 on
+    /// failure (bad pointer, load/relocation error).</summary>
+    private int TryLoadModuleFromMemory(SystemMemory mem, IopModuleHost iopModules, uint ptr, string? nameOverride)
+    {
+        if (ptr < SystemMemory.IOP_RAM_BASE) return -1;
+        uint offset = ptr - SystemMemory.IOP_RAM_BASE;
+        if (offset >= SystemMemory.IOP_RAM_SIZE) return -1;
+        int len = Math.Min(LfModuleCopyCap, SystemMemory.IOP_RAM_SIZE - (int)offset);
+        var span = mem.GetIopRamSpan().Slice((int)offset, len);
+        byte[] elf = span.ToArray();
+        try
+        {
+            var r = iopModules.LoadIrx(elf, mem, nameOverride);
+            return r.Success ? (iopModules.TryGetModule(r.ModuleName, out int id) ? id : 1) : -1;
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
+    private static string ReadCString(SystemMemory mem, uint addr, int maxLen)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < maxLen; i++)
+        {
+            byte b = mem.Read8(addr + (uint)i);
+            if (b == 0) break;
+            sb.Append((char)b);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Strips a PS2 device prefix ("cdrom0:", "rom0:", "host0:", etc.) and any
+    /// trailing ";version" suffix, so the remaining path component reaches IopModuleHost's own
+    /// NormalizeName (which only strips slashes/extension, not the colon-delimited device
+    /// scheme) as a plain, comparable module name.</summary>
+    private static string StripDevicePrefix(string path)
+    {
+        int colon = path.IndexOf(':');
+        if (colon >= 0) path = path[(colon + 1)..];
+        int semi = path.IndexOf(';');
+        if (semi >= 0) path = path[..semi];
+        return path;
     }
 
     private int Dispatch(SystemMemory mem, Cdvd cdvd, PadInput pad, uint sid, uint fno, uint argBuf, uint recvBuf)
@@ -392,6 +557,9 @@ public sealed class RealSifRpc
 
             case SidSdReg:
                 return 0; // see SidSdReg's declaration comment
+
+            case SidSfsv:
+                return 0; // see SidSfsv's declaration comment
 
             default:
                 // Generic fallback for a genuinely unrecognized service: return a

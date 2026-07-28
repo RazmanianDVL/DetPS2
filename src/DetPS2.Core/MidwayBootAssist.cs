@@ -890,7 +890,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             mem.Write32(RealSifBindPkt + 16, 1);
             mem.Write32(RealSifBindPkt + 28, RealSifClientData);
             mem.Write32(RealSifBindPkt + 32, RealSifRpc.SidCdNcmd);
-            realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, RealSifBindPkt);
+            realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, sys.IopModules, RealSifBindPkt);
 
             uint argBuf = mem.Read32(RealSifClientData + 20);
             if (trace) Console.Error.WriteLine($"[RPC] MaybeCompleteRealSifCdRead: bind -> argBuf=0x{argBuf:X8} binds={realRpc.Binds} cyc={sys.MasterCycles}");
@@ -911,7 +911,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         mem.Write32(RealSifCallPkt + 28, RealSifClientData);
         mem.Write32(RealSifCallPkt + 32, 1); // rpc_number = NcmdRead
         mem.Write32(RealSifCallPkt + 40, RealSifRecvBuf); // recvbuf: result int lands here
-        realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, RealSifCallPkt);
+        realRpc.TryHandle(mem, kernel, sys.Cdvd, sys.Pad, sys.IopModules, RealSifCallPkt);
 
         uint result = mem.Read32(RealSifRecvBuf);
         if (trace)

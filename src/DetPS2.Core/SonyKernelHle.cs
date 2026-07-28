@@ -60,7 +60,7 @@ public sealed class SonyKernelHle
     {
         while (_system.Sif.TryDequeueRealRpc(currentGeneration, out uint addr))
         {
-            if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, addr))
+            if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, _system.IopModules, addr))
                 _system.Intc.Raise(Intc.InterruptSource.Sif);
         }
     }

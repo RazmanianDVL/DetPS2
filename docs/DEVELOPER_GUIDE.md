@@ -4618,12 +4618,102 @@ baseline (`RomdirExtractor`/`romdir-list`/`romdir-extract` are new, additive cod
 in the boot/run path — nothing could regress). Extracted module bytes and the BIOS image itself are
 not committed (copyrighted); only the extraction *tooling* is.
 
-**Not yet done**: Phase 3 — actually executing these loaded modules on the IOP R3000A interpreter, in
-real boot order, so the real `LOADCORE` code performs its own cross-module linking (as scoped in
-§7.22), and validating that this finally satisfies Shaolin Monks' reference-counted init gate
-(`FUN_00414f20` / `0x534124`, §7.19-7.21). This is the architecturally significant remaining piece —
-it means real IOP kernel code becomes live and executing (not just HLE'd), which is a bigger surface
-than Phases 1-2 and should be scoped/tested carefully rather than rushed.
+**Not yet done** (at the time this section was written): Phase 3 — actually executing these loaded
+modules on the IOP R3000A interpreter. Phase 3 as originally scoped turned out to be the wrong
+target — see §7.24.
+
+### 7.24 Phase 3 reconsidered: the real blocker wasn't missing IOP execution, it was a missing real SIF RPC service — `sid=0x80000006` (LOADFILE)
+
+Follow-up, same session — user said "go straight into it" for Phase 3. Investigating what real
+execution would actually require surfaced two hard blockers to literal Phase 3: `Iop.cs`'s R3000A
+interpreter is a single-PC/single-register-file core with no thread-context-switch model (real IOP
+"threads" are a software illusion `THREADMAN`'s own code builds, not something the interpreter
+provides), and the real Sony IRX cross-module import/stub-linking format was never ground-truthed
+(only relocation was, in §7.22). Both are solvable but represent a much bigger, less-certain
+undertaking than Phases 1-2.
+
+**Re-examined what this codebase's own established, working methodology actually is** (`RealSifRpc.cs`'s
+doc comment says it outright: "a transport-level shim, not real IOP CPU emulation"). Every previously
+-fixed IOP-adjacent blocker this project has solved (CDVD, pad, the WaitSema fix, SNDF/CRI_ADX/SDRDRV)
+used the same pattern: ground-truth the real protocol (via disassembly or real source), hand-write a
+correct HLE responder, answer for real. Literal kernel execution was never actually the load-bearing
+fix anywhere else in this codebase — so before committing to it, went looking for a missed real
+service using that same proven pattern.
+
+**Traced a live 90M-cycle Shaolin Monks run's `UnknownMmioRead` telemetry to a dead end first**: a
+recurring sweep at `0x1856xxxx` from EE vaddr `0x00427518` (the same "wild-pointer callback
+dispatcher" §7.21 investigated and set aside) turned out to be genuinely harmless — full
+disassembly (`0x00427518`'s 8 static tail-call trampolines, found via `scanword` for both `jal`/`j`
+encodings of its address, all passing a compile-time-constant small index 0-7) confirmed the wild
+`a0` value seen live doesn't originate from any legitimate caller of this function; since the
+dispatcher's own logic treats a zero/garbage function pointer as "empty slot, skip" (`beq
+v0,zero,...`), and `MmioBus` returns 0 for unmapped reads, this is a no-op red herring exactly like
+the earlier-dismissed `0x1360xxxx` sweep (§7.19) — not investigated further.
+
+**The real lead: `blocker-trace`'s `unknown sid=` list.** `RealSifRpc.cs` already tracks every SIF RPC
+service id a title binds that it doesn't recognize. A 90M-cycle Shaolin Monks trace showed
+`unknownBindSids=2`: `sid=0x80000006` and `sid=0x53465356` ("SFSV"). Checked the real ps2sdk source
+directly (`curl` against github.com/ps2dev/ps2sdk, matching this project's established "verify
+against real source, don't guess" rule) — `ee/kernel/src/loadfile.c` confirmed `0x80000006` is
+**LOADFILE**: the real service behind `SifLoadModule`/`SifLoadModuleBuffer`/`SifExecModuleBuffer`,
+i.e. the actual "load and start an IRX module" mechanism — completely unhandled in this codebase,
+falling through to the generic "unknown service → return 1" fallback, which only ever writes a single
+4-byte word to the reply buffer.
+
+**This is very likely the real root of the "no callback for a module finishing loading" gap** §7.21
+diagnosed (`IopModuleHost.RegisterModule` being a bare dictionary insert was correctly identified as
+symptomatic, but the actual missing piece was the real *RPC* completion for the game's own
+`SifExecModuleBuffer`-style calls, not IOP-side execution semantics).
+
+**Fetched the exact protocol from real source** (`common/include/loadfile-common.h`): function
+numbers (`LF_F_MOD_LOAD=0`, `LF_F_MOD_BUF_LOAD=6`, `LF_F_SEARCH_MOD_BY_NAME=9`,
+`LF_F_GET_VERSION=0xFF`, etc.) and exact struct layouts (`_lf_module_buffer_load_arg`:
+`{ptr/result, arg_len/modres, unused[252], args[252]}`, real reply is only the first 8 bytes: a
+`{result, modres}` pair — unlike every other service in this file, which replies with a single int).
+
+**Implemented `SidLoadFile` in `RealSifRpc.cs`**, special-cased in `HandleCall` (matching the existing
+`SidCriAdx` echo precedent, since the 8-byte dual-field reply doesn't fit the generic single-int
+`Dispatch` signature): `LF_F_MOD_BUF_LOAD` copies real module bytes straight out of IOP RAM
+(`SystemMemory.GetIopRamSpan()`, real address arithmetic against `IOP_RAM_BASE`) and feeds them
+through the already-verified `IopModuleHost.LoadIrx` → `IrxLoader.Load` pipeline from Phases 1-2 —
+real extraction and relocation, reused as-is, no new format work needed. `LF_F_MOD_LOAD`/
+`LF_F_SEARCH_MOD_BY_NAME` resolve against modules already preloaded by
+`Ps2System.PreloadIopModulesFromDisc`. `LF_F_GET_VERSION` returns a plausible placeholder rather than
+this file's usual "unhandled → -1": a version query has no real "wrong module loaded" failure mode,
+so the risk calculus that justifies -1 for genuinely-unimplemented load functions doesn't apply, and
+an error-shaped value here risks defensive client code refusing to use the service at all. New
+`IopModuleHost` parameter threaded through `TryHandle`/`HandleCall` (two other call sites in
+`MidwayBootAssist.cs` updated to match).
+
+**Also fixed `sid=0x53465356` ("SFSV")**, the second unknown sid — same module (`SNDFI.IRX`) and
+toolchain ("MW MIPS C Compiler") as the already-verified `SNDF`/`SDRDRV` services, both confirmed to
+use a 0-for-success convention; applied the same convention here instead of the generic fallback's 1.
+
+**Verified, real, measured impact** (`blocker-trace` against a single-title `shaolin-only.json`,
+150M cycles): `syscalls` more than doubled (35,948 → 77,586 by 150M, vs. the pre-fix plateau's 35,948
+ceiling), `px` grew 6.2x (11.7M → 72.8M) and kept climbing across the run rather than sitting flat,
+`PC` moved off the old plateau addresses entirely, and — most tellingly — threads 1 and 2 (of the 5
+seen stuck in the identical "poll flag, self-terminate" template in §7.21) are now genuinely alive and
+NOT sleeping, vs. all 5 being asleep-or-dead-ended before. The reference-counted init gate at
+`0x534124` (§7.19-7.21) now reads **1**, not whatever higher/stuck value it held before — i.e. it *is*
+receiving real decrements now, just not yet enough to reach zero. `unknownBindSids` dropped to 0.
+Full smoke suite green (0 failures); 9-title cross-check at 20M cycles byte-identical to baseline for
+all 9 titles (the divergence only appears later in Shaolin Monks' own boot, past where this session's
+usage of `blocker-trace`'s single-title config caps out at 20M — the new code paths simply aren't
+exercised by the other 8 titles at all).
+
+**Not yet fully resolved**: a 150M-cycle trace with `DETPS2_TRACE_RPC=1` shows only *one* real
+`LOADFILE` call in the whole run (`fno=0xFF`, `GET_VERSION` — never an actual `LF_F_MOD_BUF_LOAD`),
+so the measured improvement most plausibly comes from this service no longer leaving `recvBuf+4`
+(the `modres` field) as stale/uninitialized garbage — the old generic fallback path only ever wrote
+the first 4 bytes of the reply. The refcount gate reaching exactly 1 and stopping suggests one more
+real completion is still needed and hasn't been traced down yet; a longer run (400M+ cycles) was
+launched to check whether a real `LF_F_MOD_BUF_LOAD` call eventually fires once the game reaches
+further into its own boot sequence. Next step for whoever picks this up: `DETPS2_TRACE_RPC=1
+blocker-trace shaolin-only.json --cycles=<N>` past 150M to find that call if/when it happens, and if
+it doesn't, trace what else could still be gating `0x534124`'s last decrement (worth checking whether
+it's driven by something entirely outside the RPC layer, e.g. a directly-polled `IopModuleHost` state
+check with no RPC involved at all).
 
 ---
 
