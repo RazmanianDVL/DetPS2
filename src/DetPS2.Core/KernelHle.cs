@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -110,6 +111,143 @@ public sealed class KernelState
         // Main thread — already running
         _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0 });
         LogThreadEvent("MainReset", 1, 0, 0);
+    }
+
+    /// <summary>Full thread/semaphore/event-flag state for SaveState.cs — a save/load mid-boot
+    /// on a multi-thread title needs every thread's saved context (SwitchToNext/RestoreContext
+    /// only resume a thread correctly if its SavedPc/SavedSp/... and Sleeping/WaitSemaId are
+    /// intact) and every semaphore's live count, not just the currently-running thread's own
+    /// register file (which is all the EE.PC/GPR fields SaveState.cs saved before this existed).
+    /// Without this, loading a save mid-wait silently resumed with the wrong scheduler state —
+    /// e.g. a thread genuinely WaitSema-blocked would come back Sleeping=false (a fabricated,
+    /// wrong resume) since nothing recreated its wait.</summary>
+    public void WriteState(BinaryWriter w)
+    {
+        w.Write(_nextTid);
+        w.Write(_nextSema);
+        w.Write(_nextEf);
+        w.Write(_currentTid);
+        w.Write(WaitingVblank);
+        w.Write(VblankWaits);
+        w.Write(_cyclesSinceLastPreempt);
+
+        w.Write(_threads.Count);
+        foreach (var t in _threads)
+        {
+            w.Write(t.Id);
+            w.Write(t.Alive);
+            w.Write(t.Sleeping);
+            w.Write(t.WaitVblank);
+            w.Write(t.Started);
+            w.Write(t.WaitSemaId);
+            w.Write(t.WaitEfId);
+            w.Write(t.WaitEfPattern);
+            w.Write(t.WaitEfMode);
+            w.Write(t.WaitEfResultAddr);
+            w.Write(t.Entry);
+            w.Write(t.Gp);
+            w.Write(t.Stack);
+            w.Write(t.StackSize);
+            w.Write(t.SavedPc);
+            w.Write(t.SavedSp);
+            w.Write(t.SavedGp);
+            w.Write(t.SavedRa);
+            w.Write(t.SavedS0); w.Write(t.SavedS1); w.Write(t.SavedS2); w.Write(t.SavedS3);
+            w.Write(t.SavedS4); w.Write(t.SavedS5); w.Write(t.SavedS6); w.Write(t.SavedS7); w.Write(t.SavedS8);
+            w.Write(t.SavedFp);
+            w.Write(t.StartArg);
+            w.Write(t.FreshStart);
+            w.Write(t.HasFullSave);
+            if (t.HasFullSave && t.SavedGprFull != null)
+            {
+                w.Write(t.SavedGprFull.Length);
+                foreach (var v in t.SavedGprFull) w.Write(v);
+            }
+            else w.Write(0);
+        }
+
+        w.Write(_semas.Count);
+        foreach (var kv in _semas)
+        {
+            w.Write(kv.Value.Id);
+            w.Write(kv.Value.Count);
+            w.Write(kv.Value.MaxCount);
+        }
+
+        w.Write(_flags.Count);
+        foreach (var kv in _flags)
+        {
+            w.Write(kv.Value.Id);
+            w.Write(kv.Value.Bits);
+        }
+    }
+
+    public void ReadState(BinaryReader r)
+    {
+        _threads.Clear();
+        _semas.Clear();
+        _flags.Clear();
+
+        _nextTid = r.ReadInt32();
+        _nextSema = r.ReadInt32();
+        _nextEf = r.ReadInt32();
+        _currentTid = r.ReadInt32();
+        WaitingVblank = r.ReadBoolean();
+        VblankWaits = r.ReadUInt64();
+        _cyclesSinceLastPreempt = r.ReadUInt64();
+
+        int threadCount = r.ReadInt32();
+        for (int i = 0; i < threadCount; i++)
+        {
+            var t = new Thread
+            {
+                Id = r.ReadInt32(),
+                Alive = r.ReadBoolean(),
+                Sleeping = r.ReadBoolean(),
+                WaitVblank = r.ReadBoolean(),
+                Started = r.ReadBoolean(),
+                WaitSemaId = r.ReadInt32(),
+                WaitEfId = r.ReadInt32(),
+                WaitEfPattern = r.ReadUInt32(),
+                WaitEfMode = r.ReadUInt32(),
+                WaitEfResultAddr = r.ReadUInt32(),
+                Entry = r.ReadUInt32(),
+                Gp = r.ReadUInt32(),
+                Stack = r.ReadUInt32(),
+                StackSize = r.ReadUInt32(),
+                SavedPc = r.ReadUInt64(),
+                SavedSp = r.ReadUInt64(),
+                SavedGp = r.ReadUInt64(),
+                SavedRa = r.ReadUInt64(),
+                SavedS0 = r.ReadUInt64(), SavedS1 = r.ReadUInt64(), SavedS2 = r.ReadUInt64(), SavedS3 = r.ReadUInt64(),
+                SavedS4 = r.ReadUInt64(), SavedS5 = r.ReadUInt64(), SavedS6 = r.ReadUInt64(), SavedS7 = r.ReadUInt64(), SavedS8 = r.ReadUInt64(),
+                SavedFp = r.ReadUInt64(),
+                StartArg = r.ReadUInt64(),
+                FreshStart = r.ReadBoolean(),
+                HasFullSave = r.ReadBoolean()
+            };
+            int fullLen = r.ReadInt32();
+            if (fullLen > 0)
+            {
+                t.SavedGprFull = new ulong[fullLen];
+                for (int j = 0; j < fullLen; j++) t.SavedGprFull[j] = r.ReadUInt64();
+            }
+            _threads.Add(t);
+        }
+
+        int semaCount = r.ReadInt32();
+        for (int i = 0; i < semaCount; i++)
+        {
+            var s = new Sema { Id = r.ReadInt32(), Count = r.ReadInt32(), MaxCount = r.ReadInt32() };
+            _semas[s.Id] = s;
+        }
+
+        int flagCount = r.ReadInt32();
+        for (int i = 0; i < flagCount; i++)
+        {
+            var f = new EventFlag { Id = r.ReadInt32(), Bits = r.ReadUInt32() };
+            _flags[f.Id] = f;
+        }
     }
 
     public int CreateThread(uint entry, uint gp, uint stack, uint stackSize = 0)

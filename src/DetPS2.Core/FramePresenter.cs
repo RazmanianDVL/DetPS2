@@ -41,24 +41,6 @@ public sealed class SoftwareFramePresenter : IFramePresenter
 }
 
 /// <summary>
-/// Placeholder hardware present path (Phase 11). Kept for compatibility.
-/// </summary>
-public sealed class HardwarePresentStub : IFramePresenter
-{
-    private readonly SoftwareFramePresenter _fallback = new();
-
-    public string Name => "HardwareStub";
-    public bool BackendReady => false;
-    public ulong PresentCount => _fallback.PresentCount;
-    public uint[]? LastFrame => _fallback.LastFrame;
-
-    public void Present(ReadOnlySpan<uint> framebuffer, int width, int height) =>
-        _fallback.Present(framebuffer, width, height);
-
-    public void Reset() => _fallback.Reset();
-}
-
-/// <summary>
 /// GPU-style presenter (Phase 19): stages software FB into a "GPU texture" buffer
 /// and tracks upload stats. Real Vulkan/OpenGL can replace the staging step later
 /// without changing <see cref="PresentPipeline"/> consumers.
@@ -132,7 +114,6 @@ public sealed class PresentPipeline
 {
     public IFramePresenter Active { get; private set; }
     public SoftwareFramePresenter Software { get; } = new();
-    public HardwarePresentStub HardwareStub { get; } = new();
     public GpuFramePresenter Gpu { get; } = new();
     public VulkanFramePresenter Vulkan { get; } = new();
     public AcceleratedFramePresenter Accelerated { get; } = new();
@@ -154,12 +135,6 @@ public sealed class PresentPipeline
     {
         Mode = PresentMode.Software;
         Active = Software;
-    }
-
-    public void UseHardwareStub()
-    {
-        Mode = PresentMode.HardwareStub;
-        Active = HardwareStub;
     }
 
     public void UseGpu()
@@ -186,7 +161,6 @@ public sealed class PresentPipeline
         switch (mode)
         {
             case PresentMode.Software: UseSoftware(); break;
-            case PresentMode.HardwareStub: UseHardwareStub(); break;
             case PresentMode.Gpu: UseGpu(); break;
             case PresentMode.Vulkan: UseVulkan(); break;
             case PresentMode.Accelerated: UseAccelerated(); break;
@@ -230,7 +204,6 @@ public sealed class PresentPipeline
     public void Reset()
     {
         Software.Reset();
-        HardwareStub.Reset();
         Gpu.Reset();
         Vulkan.Reset();
         Accelerated.Reset();
@@ -244,7 +217,6 @@ public sealed class PresentPipeline
 public enum PresentMode
 {
     Software = 0,
-    HardwareStub = 1,
     Gpu = 2,
     Vulkan = 3,
     Accelerated = 4

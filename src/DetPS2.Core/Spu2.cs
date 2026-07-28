@@ -100,6 +100,82 @@ public sealed class Spu2 : ISchedulable
         _transferAddr = 0;
     }
 
+    /// <summary>SPU2 state for SaveState.cs — previously not saved at all, so a load resumed
+    /// with every voice silent and the 2MB SPU RAM (ADPCM sample data games DMA in once and
+    /// re-key-on repeatedly, not re-upload every playback) empty, breaking audio playback
+    /// after any load until the game happened to re-upload samples on its own.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        for (int i = 0; i < _regs.Length; i++) w.Write(_regs[i]);
+        w.Write(_cycleAccum);
+        w.Write(_phase);
+        w.Write(Writes); w.Write(Reads);
+        w.Write(Enabled);
+        w.Write(SamplesGenerated); w.Write(AdpcmBlocksDecoded); w.Write(VoiceEnds);
+        w.Write(ToneFrequencyHz); w.Write(ToneAmplitude);
+        w.Write(UseSimpleToneFallback);
+        w.Write(ReverbEnabled); w.Write(ReverbDelaySamples); w.Write(ReverbFeedback);
+        for (int i = 0; i < _reverbL.Length; i++) w.Write(_reverbL[i]);
+        for (int i = 0; i < _reverbR.Length; i++) w.Write(_reverbR[i]);
+        w.Write(_reverbPos);
+        w.Write(_spuRam.Length);
+        w.Write(_spuRam);
+        for (int i = 0; i < _voiceSsa.Length; i++) w.Write(_voiceSsa[i]);
+        w.Write(_transferAddr);
+
+        w.Write(_voices.Length);
+        foreach (var v in _voices)
+        {
+            w.Write(v.KeyOn); w.Write(v.Playing); w.Write(v.SamplePos);
+            w.Write(v.Pcm != null);
+            if (v.Pcm != null) { w.Write(v.Pcm.Length); foreach (var s in v.Pcm) w.Write(s); }
+            w.Write(v.VolumeL); w.Write(v.VolumeR); w.Write(v.Pitch);
+            w.Write(v.AdsrPhase); w.Write(v.Envelope);
+            w.Write(v.AttackRate); w.Write(v.DecayRate); w.Write(v.SustainLevel); w.Write(v.ReleaseRate);
+            w.Write(v.EndIrq);
+        }
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        for (int i = 0; i < _regs.Length; i++) _regs[i] = r.ReadUInt32();
+        _cycleAccum = r.ReadUInt64();
+        _phase = r.ReadInt32();
+        Writes = r.ReadUInt64(); Reads = r.ReadUInt64();
+        Enabled = r.ReadBoolean();
+        SamplesGenerated = r.ReadUInt64(); AdpcmBlocksDecoded = r.ReadUInt64(); VoiceEnds = r.ReadUInt64();
+        ToneFrequencyHz = r.ReadInt32(); ToneAmplitude = r.ReadInt16();
+        UseSimpleToneFallback = r.ReadBoolean();
+        ReverbEnabled = r.ReadBoolean(); ReverbDelaySamples = r.ReadInt32(); ReverbFeedback = r.ReadInt32();
+        for (int i = 0; i < _reverbL.Length; i++) _reverbL[i] = r.ReadInt16();
+        for (int i = 0; i < _reverbR.Length; i++) _reverbR[i] = r.ReadInt16();
+        _reverbPos = r.ReadInt32();
+        int spuLen = r.ReadInt32();
+        byte[] spu = r.ReadBytes(spuLen);
+        Buffer.BlockCopy(spu, 0, _spuRam, 0, Math.Min(spuLen, _spuRam.Length));
+        for (int i = 0; i < _voiceSsa.Length; i++) _voiceSsa[i] = r.ReadUInt32();
+        _transferAddr = r.ReadUInt32();
+
+        int n = r.ReadInt32();
+        for (int i = 0; i < n && i < _voices.Length; i++)
+        {
+            var v = _voices[i];
+            v.KeyOn = r.ReadBoolean(); v.Playing = r.ReadBoolean(); v.SamplePos = r.ReadInt32();
+            bool hasPcm = r.ReadBoolean();
+            if (hasPcm)
+            {
+                int pcmLen = r.ReadInt32();
+                v.Pcm = new short[pcmLen];
+                for (int j = 0; j < pcmLen; j++) v.Pcm[j] = r.ReadInt16();
+            }
+            else v.Pcm = null;
+            v.VolumeL = r.ReadInt32(); v.VolumeR = r.ReadInt32(); v.Pitch = r.ReadInt32();
+            v.AdsrPhase = r.ReadInt32(); v.Envelope = r.ReadInt32();
+            v.AttackRate = r.ReadInt32(); v.DecayRate = r.ReadInt32(); v.SustainLevel = r.ReadInt32(); v.ReleaseRate = r.ReadInt32();
+            v.EndIrq = r.ReadBoolean();
+        }
+    }
+
     public uint ReadRegister(uint address)
     {
         Reads++;

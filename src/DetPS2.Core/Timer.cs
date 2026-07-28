@@ -36,6 +36,22 @@ public sealed class TimerChannel
         _prescaleAccum = 0;
     }
 
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(Count); w.Write(Mode); w.Write(Compare);
+        w.Write(CompareIrqRaised); w.Write(OverflowIrqRaised);
+        w.Write(GateOpen);
+        w.Write(_prescaleAccum);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        Count = r.ReadUInt32(); Mode = r.ReadUInt32(); Compare = r.ReadUInt32();
+        CompareIrqRaised = r.ReadBoolean(); OverflowIrqRaised = r.ReadBoolean();
+        GateOpen = r.ReadBoolean();
+        _prescaleAccum = r.ReadUInt64();
+    }
+
     public bool Enabled => (Mode & 0x80) != 0;
     public bool CompareIrqEnable => (Mode & 0x100) != 0;
     public bool OverflowIrqEnable => (Mode & 0x200) != 0;
@@ -144,6 +160,16 @@ public sealed class EeTimers : ISchedulable
     public void Reset()
     {
         foreach (var t in _all) t.Reset();
+    }
+
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        foreach (var t in _all) t.WriteState(w);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        foreach (var t in _all) t.ReadState(r);
     }
 
     public int Step(ulong maxCycles)

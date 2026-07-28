@@ -44,6 +44,17 @@ public sealed class EmulatorConfig
     public string GamesFolder { get; set; } = "";
     /// <summary>Memory card path; prefer under GamesFolder\memcards\ (browser later).</summary>
     public string MemCardPath { get; set; } = "";
+    /// <summary>Memory cards are the primary, always-on save path (Sio2 attaches a MemoryCard
+    /// unconditionally in Ps2System — see its constructor). The virtual HDD (ApaDisk/PfsVolume,
+    /// VirtualHdd.cs) is a real, working alternative with far larger capacity, but is opt-in:
+    /// off by default, and only created/mounted when both EnableVirtualHdd is true AND
+    /// VirtualHddPath is set (see Ps2System.TryEnableVirtualHdd). Games only ever see it if a
+    /// title's save-path code explicitly checks Ps2System.Hdd, which stays null otherwise.</summary>
+    public bool EnableVirtualHdd { get; set; }
+    /// <summary>Host file backing the virtual HDD image. Created fresh (VirtualHddSizeMb) if it
+    /// doesn't exist yet when EnableVirtualHdd is turned on.</summary>
+    public string VirtualHddPath { get; set; } = "";
+    public int VirtualHddSizeMb { get; set; } = 8192; // 8GB — real "fat" PS2 HDDs ranged 40-160GB, this is a practical default
     public string LastGameId { get; set; } = "";
     public bool DefaultFrameLimit { get; set; } = true;
     public int DefaultTargetFps { get; set; } = 60;

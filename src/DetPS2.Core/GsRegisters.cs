@@ -101,6 +101,34 @@ public sealed class GsRegisters
         _regs.Clear();
     }
 
+    /// <summary>GS register state for SaveState.cs. _regs already records every raw register
+    /// write by address (WriteRegister64 populates both it and the named properties above), so
+    /// replaying it through WriteRegister64 on load reconstructs every named property too —
+    /// simpler and less error-prone than serializing ~35 individual properties by hand. Without
+    /// this, a load resumed drawing with PRIM/TEX0/ALPHA/scissor/etc all back at Reset()
+    /// defaults even though the game had configured real rendering state long before the save.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(_regs.Count);
+        foreach (var kv in _regs) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(PMODE); w.Write(SMODE2); w.Write(DISPLAY1); w.Write(DISPLAY2); w.Write(DISPFB1); w.Write(DISPFB2);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        Reset();
+        int n = r.ReadInt32();
+        for (int i = 0; i < n; i++)
+        {
+            uint addr = r.ReadUInt32();
+            ulong val = r.ReadUInt64();
+            WriteRegister64(addr, val);
+        }
+        PMODE = r.ReadUInt64(); SMODE2 = r.ReadUInt64();
+        DISPLAY1 = r.ReadUInt64(); DISPLAY2 = r.ReadUInt64();
+        DISPFB1 = r.ReadUInt64(); DISPFB2 = r.ReadUInt64();
+    }
+
     public static ulong PackScissor(int x0, int x1, int y0, int y1) =>
         ((ulong)(uint)(x0 & 0x7FF))
         | ((ulong)(uint)(x1 & 0x7FF) << 16)

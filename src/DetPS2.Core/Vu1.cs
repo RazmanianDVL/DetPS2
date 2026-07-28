@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -53,6 +54,31 @@ public sealed class Vu1 : VectorUnit, ISchedulable
         }
 
         return base.Step(maxCycles) + processed;
+    }
+
+    public override void WriteState(BinaryWriter w)
+    {
+        base.WriteState(w);
+        w.Write(_incomingData.Count);
+        foreach (var v in _incomingData) w.Write(v);
+        w.Write(_currentQuadwordWordCount);
+        w.Write(_xgkickAddr);
+        w.Write(_xgkickQwc);
+        w.Write(XgKicks);
+        w.Write(MscalRuns);
+    }
+
+    public override void ReadState(BinaryReader r)
+    {
+        base.ReadState(r);
+        _incomingData.Clear();
+        int n = r.ReadInt32();
+        for (int i = 0; i < n; i++) _incomingData.Enqueue(r.ReadUInt32());
+        _currentQuadwordWordCount = r.ReadUInt32();
+        _xgkickAddr = r.ReadUInt32();
+        _xgkickQwc = r.ReadUInt32();
+        XgKicks = r.ReadUInt64();
+        MscalRuns = r.ReadUInt64();
     }
 
     public void ReceiveFromVif1(uint data) => _incomingData.Enqueue(data);

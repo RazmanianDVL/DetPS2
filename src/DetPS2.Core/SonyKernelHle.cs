@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -69,6 +70,11 @@ public sealed class SonyKernelHle
     public bool TryGetIntcHandler(int cause, out uint handlerAddr) =>
         _intcHandlers.TryGetValue(cause, out handlerAddr);
 
+    /// <summary>Same registration the AddIntcHandler syscall (case 0x10) performs — exposed
+    /// directly for callers that already know the (cause, handler) pair without going through
+    /// a syscall dispatch (e.g. save-state round-trip tests).</summary>
+    public void RegisterIntcHandler(int cause, uint handlerAddr) => _intcHandlers[cause] = handlerAddr;
+
     /// <summary>Looks up a game-registered AddDmacHandler entry (keyed by DMA channel, e.g.
     /// DMA_CHANNEL_SIF0=5) — real hardware routes DMA-channel completion here, not through
     /// AddIntcHandler; e.g. ps2sdk's sceSifInitCmd installs _SifCmdIntHandler this way.</summary>
@@ -109,6 +115,80 @@ public sealed class SonyKernelHle
         Array.Clear(RecentSyscalls);
         _syscallHistogram.Clear();
         _realRpc.Reset();
+    }
+
+    /// <summary>Game-registered handler tables + SIF register state for SaveState.cs.
+    /// _intcHandlers/_dmacHandlers are what let EmotionEngine dispatch a real interrupt
+    /// straight into a game's own AddIntcHandler/AddDmacHandler callback instead of a
+    /// synthesized no-op vector — without saving these, a load would resume with every
+    /// future interrupt going nowhere, even though the game registered real handlers long
+    /// before the save point (see this session's Shaolin Monks work: this dispatch path is
+    /// load-bearing for real commercial titles, not an edge case).
+    /// _findCache/_midwayPairPlanted are intentionally NOT saved — pure perf caches /
+    /// one-time boot-assist scan state that's safe to recompute, not correctness-affecting.</summary>
+    public void WriteState(BinaryWriter w)
+    {
+        w.Write(_intcHandlers.Count);
+        foreach (var kv in _intcHandlers) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(_dmacHandlers.Count);
+        foreach (var kv in _dmacHandlers) { w.Write(kv.Key); w.Write(kv.Value); }
+        for (int i = 0; i < _sifRegs.Length; i++) w.Write(_sifRegs[i]);
+        for (int i = 0; i < _sifVirtualRegs.Length; i++) w.Write(_sifVirtualRegs[i]);
+        w.Write(_customSyscalls.Count);
+        foreach (var kv in _customSyscalls) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(_gsImr);
+        w.Write(_stubsInstalled);
+        w.Write(_stubSlots);
+        w.Write(_deci2Handlers.Length);
+        foreach (var h in _deci2Handlers)
+        {
+            w.Write(h.HasValue);
+            if (h.HasValue) { w.Write(h.Value.device); w.Write(h.Value.bufferAddr); }
+        }
+        w.Write(Handled); w.Write(Unknown);
+        for (int i = 0; i < RecentSyscalls.Length; i++) w.Write(RecentSyscalls[i]);
+        w.Write(_recentSyscallIdx);
+        w.Write(SifDmaCalls); w.Write(SifGetRegCalls);
+        w.Write(_syscallHistogram.Count);
+        foreach (var kv in _syscallHistogram) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(LastCreatedThreadEntry);
+        w.Write(LastCreatedThreadStack);
+        _realRpc.WriteState(w);
+    }
+
+    public void ReadState(BinaryReader r)
+    {
+        _intcHandlers.Clear();
+        int nInt = r.ReadInt32();
+        for (int i = 0; i < nInt; i++) { int k = r.ReadInt32(); uint v = r.ReadUInt32(); _intcHandlers[k] = v; }
+        _dmacHandlers.Clear();
+        int nDma = r.ReadInt32();
+        for (int i = 0; i < nDma; i++) { int k = r.ReadInt32(); uint v = r.ReadUInt32(); _dmacHandlers[k] = v; }
+        for (int i = 0; i < _sifRegs.Length; i++) _sifRegs[i] = r.ReadUInt32();
+        for (int i = 0; i < _sifVirtualRegs.Length; i++) _sifVirtualRegs[i] = r.ReadUInt32();
+        _customSyscalls.Clear();
+        int nCustom = r.ReadInt32();
+        for (int i = 0; i < nCustom; i++) { uint k = r.ReadUInt32(); uint v = r.ReadUInt32(); _customSyscalls[k] = v; }
+        _gsImr = r.ReadUInt32();
+        _stubsInstalled = r.ReadBoolean();
+        _stubSlots = r.ReadInt32();
+        int deciLen = r.ReadInt32();
+        for (int i = 0; i < deciLen && i < _deci2Handlers.Length; i++)
+        {
+            bool has = r.ReadBoolean();
+            if (has) { uint dev = r.ReadUInt32(); uint buf = r.ReadUInt32(); _deci2Handlers[i] = (dev, buf); }
+            else _deci2Handlers[i] = null;
+        }
+        Handled = r.ReadUInt64(); Unknown = r.ReadUInt64();
+        for (int i = 0; i < RecentSyscalls.Length; i++) RecentSyscalls[i] = r.ReadUInt32();
+        _recentSyscallIdx = r.ReadInt32();
+        SifDmaCalls = r.ReadUInt64(); SifGetRegCalls = r.ReadUInt64();
+        _syscallHistogram.Clear();
+        int nHist = r.ReadInt32();
+        for (int i = 0; i < nHist; i++) { uint k = r.ReadUInt32(); int v = r.ReadInt32(); _syscallHistogram[k] = v; }
+        LastCreatedThreadEntry = r.ReadUInt32();
+        LastCreatedThreadStack = r.ReadUInt32();
+        _realRpc.ReadState(r);
     }
 
     public bool TryHandle(EmotionEngine ee, uint num, out long result)

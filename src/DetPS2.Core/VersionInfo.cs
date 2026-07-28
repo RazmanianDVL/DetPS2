@@ -213,7 +213,7 @@ public static class CommercialSmokeChecklist
             r.Items.Add(new Item
             {
                 Id = "netplay-cert",
-                Name = "Netplay certification gate",
+                Name = "Netplay rollback soak (synthetic/homebrew only)",
                 Passed = cert.ProductionGateMet,
                 Notes = $"certified={cert.CertifiedCount}"
             });

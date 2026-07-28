@@ -435,24 +435,26 @@ public sealed class BiosHle
                 result = 0;
                 break;
 
-            // Sony SIF helpers (numbers that don't collide with homebrew HLE ABI)
-            case 0x74: // often SifSetDChain / related
-            case BootBlockerFixes.SonySifSetDma:
-                _system.Sif.Step(32);
-                result = 1;
-                break;
+            // Sony SIF helpers (numbers that don't collide with homebrew HLE ABI). Real numbers
+            // per BootBlockerFixes.SonySifDmaStat's own doc comment — this whole block used to
+            // have SetDma/DmaStat swapped and SetReg/GetReg off by one; fixed to match the same
+            // confirmed ABI SonyKernelHle.cs uses (this path only runs for homebrew titles not
+            // in Sony-kernel mode; SonyKernelHle.TryHandle already handles the real numbers
+            // first for every commercial title). SonySifLoadModule (the old case here) is gone
+            // — a real sceSifLoadModule is an RPC call to the IOP's loadfile service (see
+            // RealSifRpc.cs), not a raw EE syscall; SysSifLoadModuleBuffer below is the real,
+            // already-correct mechanism for the homebrew path.
             case BootBlockerFixes.SonySifDmaStat:
                 result = -1; // complete
+                break;
+            case BootBlockerFixes.SonySifSetDma:
+            case BootBlockerFixes.SonySifSetDChain:
+                _system.Sif.Step(32);
+                result = 1;
                 break;
             case BootBlockerFixes.SonySifSetReg:
             case BootBlockerFixes.SonySifGetReg:
                 result = 0;
-                break;
-            case BootBlockerFixes.SonySifLoadModule:
-                {
-                    string name = ReadCString(a0, 64);
-                    result = string.IsNullOrEmpty(name) ? -1 : _system.IopModules.RegisterModule(name);
-                }
                 break;
 
             case SysDeci2Call:

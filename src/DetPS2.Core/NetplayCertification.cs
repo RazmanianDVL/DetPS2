@@ -6,7 +6,16 @@ using System.Text;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Phase 56: production netplay certification runner — extended soak, markdown cert list.
+/// Phase 56: rollback-netcode soak runner — extended soak, markdown result list.
+///
+/// Naming note: despite "Certification"/"ProductionGateMet" in this class's names (kept as-is
+/// to avoid a wider rename across Program.cs/VersionInfo.cs/SmokeTests.cs for a naming-only
+/// fix), every soak Run() executes is synthetic or homebrew — a fixed rollback simulation, the
+/// input-replay determinism check, and a homebrew GS demo 2-player rollback sim. None of these
+/// exercise a real commercial title's netcode; "certified"/"production gate" here means "this
+/// project's own rollback/determinism mechanics hold up under a synthetic soak," not "this real
+/// game works over real netplay." Read CertResult.TitleId in any report: "homebrew-*"/
+/// "synthetic *"/"input-replay-determinism" are exactly what's covered, always.
 /// </summary>
 public static class NetplayCertification
 {
@@ -25,6 +34,10 @@ public static class NetplayCertification
     {
         public List<CertResult> Results { get; } = new();
         public int CertifiedCount { get; set; }
+        /// <summary>True once at least one synthetic/homebrew soak passes — an internal
+        /// engineering health check (rollback/determinism mechanics work), not evidence any
+        /// real commercial title has been verified over netplay. See this class's own doc
+        /// comment.</summary>
         public bool ProductionGateMet => CertifiedCount >= 1;
         public string Version { get; set; } = VersionInfo.Version;
     }
@@ -93,8 +106,8 @@ public static class NetplayCertification
     public static string Format(Report r)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"=== Netplay Certification (Phase 56) v{r.Version} ===");
-        sb.AppendLine($"certified={r.CertifiedCount}/{r.Results.Count} productionGate={r.ProductionGateMet}");
+        sb.AppendLine($"=== Netplay Rollback Soak (synthetic/homebrew only, Phase 56) v{r.Version} ===");
+        sb.AppendLine($"passed={r.CertifiedCount}/{r.Results.Count} internalGateMet={r.ProductionGateMet}");
         foreach (var c in r.Results)
             sb.AppendLine($"  [{(c.Certified ? "CERT" : "FAIL")}] {c.TitleId} f={c.Frames} sync={c.Sync} rb={c.Rollbacks} — {c.Notes}");
         return sb.ToString();
@@ -103,9 +116,13 @@ public static class NetplayCertification
     public static string FormatMarkdown(Report r)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Netplay-Certified Titles (v{r.Version})");
+        sb.AppendLine($"# Netplay Rollback Soak Results (v{r.Version})");
         sb.AppendLine();
-        sb.AppendLine("Det mode + rollback soaks. Commercial names only when legally documentable.");
+        sb.AppendLine("Det mode + rollback soaks against synthetic/homebrew fixtures only — an");
+        sb.AppendLine("internal check that this project's own rollback/determinism mechanics hold");
+        sb.AppendLine("up under soak, not a claim that any real commercial title has been verified");
+        sb.AppendLine("over netplay. See each row's id: homebrew-*/synthetic */input-replay-* is");
+        sb.AppendLine("exactly what's covered.");
         sb.AppendLine();
         sb.AppendLine("| id | Frames | Sync | Certified | Notes |");
         sb.AppendLine("|----|--------|------|-----------|-------|");

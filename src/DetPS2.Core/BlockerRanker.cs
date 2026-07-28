@@ -91,11 +91,25 @@ public static class BootBlockerFixes
     public const uint SonyPollSema = 0x46;
     public const uint SonyFlushCache = 0x64;
     public const uint SonyGsSetCrt = 0x02;
-    public const uint SonySifSetDma = 0x76;
-    public const uint SonySifDmaStat = 0x77;
-    public const uint SonySifSetReg = 0x78;
-    public const uint SonySifGetReg = 0x79;
-    public const uint SonySifLoadModule = 0x7A;
+    /// <summary>SifDmaStat/SifSetDma/SifSetDChain/SifSetReg/SifGetReg (0x76-0x7A) — corrected
+    /// against SonyKernelHle.cs's own confirmed real Sony EE kernel syscall ABI (psdevwiki /
+    /// ps2sdk syscallnr.h, cited in that file's own doc comment; SonyKernelHle.cs's case labels
+    /// for this exact range were cross-checked live against real disassembly multiple times
+    /// this session, e.g. WaitSema=0x44). This table previously had all five numbers wrong —
+    /// SetDma/DmaStat were swapped, SetReg/GetReg were each off by one, and 0x7A ("LoadModule")
+    /// doesn't correspond to any real syscall in this range at all (a real sceSifLoadModule is
+    /// an RPC call to the IOP's loadfile service — see RealSifRpc.cs — not a raw EE syscall);
+    /// this class's own SysSifLoadModuleBuffer (0x84) is the actual, already-correct mechanism
+    /// for that. Harmless for every commercial (SonyKernelMode) title today, since
+    /// SonyKernelHle.TryHandle already handles 0x76-0x7A itself and is tried first (BiosHle.cs)
+    /// — this table's own case block (below) is only ever reached for homebrew titles that
+    /// aren't in Sony-kernel mode, but a wrong mapping there is still a real bug worth fixing
+    /// rather than leaving in place because it "doesn't currently matter."</summary>
+    public const uint SonySifDmaStat = 0x76;
+    public const uint SonySifSetDma = 0x77;
+    public const uint SonySifSetDChain = 0x78;
+    public const uint SonySifSetReg = 0x79;
+    public const uint SonySifGetReg = 0x7A;
 
     public static readonly HashSet<uint> KnownSafeSyscalls = new()
     {
@@ -103,7 +117,7 @@ public static class BootBlockerFixes
         SysGsPutDrawEnv, SysGsPutDisplayEnv,
         SysSifLoadModuleBuffer, SysSifCheckStatModule,
         SysDeci2Call, SysKSeg0, SysFindAddress, SysSetMemoryMode,
-        SonyFlushCache, SonyGsSetCrt, SonySifDmaStat, SonySifSetReg, SonySifGetReg,
+        SonyFlushCache, SonyGsSetCrt, SonySifDmaStat, SonySifSetDChain, SonySifSetReg, SonySifGetReg,
         SonyExitThread, SonySleepThread
     };
 }

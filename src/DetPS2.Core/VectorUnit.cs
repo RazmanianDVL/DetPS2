@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 
 namespace DetPS2.Core;
@@ -89,6 +90,51 @@ public abstract class VectorUnit
 
     public bool IsEfuBusy => _efuStallRemaining > 0;
     public bool IsCop2Interlocked => _cop2InterlockCycles > 0 || IsEfuBusy;
+
+    /// <summary>Full VU state for SaveState.cs — shared by VU0 and VU1. Prior to this only
+    /// VU0's micro memory + PC/running flag were saved (and even that was never restored for
+    /// VU1 at all — see SaveState.cs's own doc history). Vector/integer register files (_vf/
+    /// _vi), ACC/Q/status/MAC/etc, and the interlock counters all matter for correctly
+    /// resuming mid-microprogram, which real 3D games are in almost constantly during actual
+    /// gameplay (as opposed to boot).</summary>
+    public virtual void WriteState(BinaryWriter w)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            w.Write(_vf[i].X); w.Write(_vf[i].Y); w.Write(_vf[i].Z); w.Write(_vf[i].W);
+        }
+        for (int i = 0; i < 16; i++) w.Write(_vi[i]);
+        w.Write(ACC.X); w.Write(ACC.Y); w.Write(ACC.Z); w.Write(ACC.W);
+        w.Write(Status); w.Write(MAC); w.Write(Clipping); w.Write(R); w.Write(I); w.Write(Q); w.Write(P);
+        w.Write(PC);
+        w.Write(LocalCycles);
+        for (int i = 0; i < MicroMemWords; i++) w.Write(_microMem[i]);
+        w.Write(_branchPending);
+        w.Write(_pendingBranchTarget);
+        w.Write(_efuStallRemaining);
+        w.Write(_cop2InterlockCycles);
+        w.Write(RunningMicro);
+        w.Write(MicroOpsExecuted);
+    }
+
+    public virtual void ReadState(BinaryReader r)
+    {
+        for (int i = 0; i < 32; i++)
+            _vf[i] = new VuReg128 { X = r.ReadSingle(), Y = r.ReadSingle(), Z = r.ReadSingle(), W = r.ReadSingle() };
+        for (int i = 0; i < 16; i++) _vi[i] = r.ReadInt16();
+        ACC = new VuReg128 { X = r.ReadSingle(), Y = r.ReadSingle(), Z = r.ReadSingle(), W = r.ReadSingle() };
+        Status = r.ReadUInt32(); MAC = r.ReadUInt32(); Clipping = r.ReadUInt32();
+        R = r.ReadUInt32(); I = r.ReadUInt32(); Q = r.ReadUInt32(); P = r.ReadUInt32();
+        PC = r.ReadUInt32();
+        LocalCycles = r.ReadUInt64();
+        for (int i = 0; i < MicroMemWords; i++) _microMem[i] = r.ReadUInt32();
+        _branchPending = r.ReadBoolean();
+        _pendingBranchTarget = r.ReadUInt32();
+        _efuStallRemaining = r.ReadInt32();
+        _cop2InterlockCycles = r.ReadInt32();
+        RunningMicro = r.ReadBoolean();
+        MicroOpsExecuted = r.ReadUInt64();
+    }
 
     public void LoadMicroProgram(ReadOnlySpan<uint> words, uint startPc = 0)
     {

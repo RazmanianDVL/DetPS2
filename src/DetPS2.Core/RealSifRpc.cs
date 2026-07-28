@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -125,6 +126,39 @@ public sealed class RealSifRpc
         _iopHeapNext = IopHeapBase;
         Binds = Calls = UnknownServiceCalls = UnknownBindSids = 0;
         _unknownSidsSeen.Clear();
+    }
+
+    /// <summary>In-flight bind state for SaveState.cs — _cdToSid/_cdToArgBuf track which
+    /// service each EE-side "cd" struct is bound to and which scratch slot answers its calls;
+    /// without this a save/load between a real sceSifBindRpc and its first sceSifCallRpc would
+    /// resume with the binding forgotten, and the next call would look unbound.</summary>
+    public void WriteState(BinaryWriter w)
+    {
+        w.Write(_cdToSid.Count);
+        foreach (var kv in _cdToSid) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(_cdToArgBuf.Count);
+        foreach (var kv in _cdToArgBuf) { w.Write(kv.Key); w.Write(kv.Value); }
+        w.Write(_nextSlot);
+        w.Write(_iopHeapNext);
+        w.Write(Binds); w.Write(Calls); w.Write(UnknownServiceCalls); w.Write(UnknownBindSids);
+        w.Write(_unknownSidsSeen.Count);
+        foreach (var sid in _unknownSidsSeen) w.Write(sid);
+    }
+
+    public void ReadState(BinaryReader r)
+    {
+        _cdToSid.Clear();
+        int n1 = r.ReadInt32();
+        for (int i = 0; i < n1; i++) { uint k = r.ReadUInt32(); uint v = r.ReadUInt32(); _cdToSid[k] = v; }
+        _cdToArgBuf.Clear();
+        int n2 = r.ReadInt32();
+        for (int i = 0; i < n2; i++) { uint k = r.ReadUInt32(); uint v = r.ReadUInt32(); _cdToArgBuf[k] = v; }
+        _nextSlot = r.ReadInt32();
+        _iopHeapNext = r.ReadUInt32();
+        Binds = r.ReadUInt64(); Calls = r.ReadUInt64(); UnknownServiceCalls = r.ReadUInt64(); UnknownBindSids = r.ReadUInt64();
+        _unknownSidsSeen.Clear();
+        int n3 = r.ReadInt32();
+        for (int i = 0; i < n3; i++) _unknownSidsSeen.Add(r.ReadUInt32());
     }
 
     /// <summary>Recognizes and handles a real RPC bind/call packet. Returns false for

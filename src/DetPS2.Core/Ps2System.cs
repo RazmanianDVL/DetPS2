@@ -30,6 +30,10 @@ public sealed class Ps2System : ISchedulable
     public Sio2 Sio2 { get; }
     public Multitap Multitap { get; }
     public MemoryCard MemCard { get; }
+    /// <summary>Optional virtual HDD — see EmulatorConfig.EnableVirtualHdd's doc comment. Null
+    /// unless TryEnableVirtualHdd was called and succeeded; memory cards (MemCard above) are
+    /// the always-on primary save path regardless of this.</summary>
+    public VirtualHdd? Hdd { get; private set; }
     public BiosHle Hle { get; }
     public BootTrace BootTrace { get; }
     public BusContention Bus { get; }
@@ -41,8 +45,6 @@ public sealed class Ps2System : ISchedulable
     public Telemetry Telemetry { get; }
     public Ipu Ipu { get; }
     public EeJit EeJit { get; }
-    public IopJit IopJit { get; }
-    public VuAccelerator VuAccel { get; }
     public SnapshotEngine Snapshots { get; }
 
     public Scheduler Scheduler { get; }
@@ -137,8 +139,6 @@ public sealed class Ps2System : ISchedulable
         BootTrace = new BootTrace();
         Ipu = new Ipu();
         EeJit = new EeJit(EE, Memory);
-        IopJit = new IopJit(Iop, Memory);
-        VuAccel = new VuAccelerator();
         Snapshots = new SnapshotEngine();
 
         Dmac.SetGif(Gif);
@@ -202,6 +202,29 @@ public sealed class Ps2System : ISchedulable
     public byte[] SaveState() => DetPS2.Core.SaveState.Save(this);
     public byte[] SaveState(bool compress) => DetPS2.Core.SaveState.Save(this, compress);
     public bool LoadState(byte[] data) => DetPS2.Core.SaveState.Load(this, data);
+
+    /// <summary>Opt-in virtual HDD setup — call only when EmulatorConfig.EnableVirtualHdd is
+    /// true. Opens the image at path if it already exists; otherwise creates a fresh one at
+    /// sizeMb. Memory cards remain the primary save path regardless (MemCard above is always
+    /// created, unconditionally, in the constructor) — this only ever adds Hdd as an
+    /// additional, optional option a title's own save-path code would need to explicitly use.
+    /// Returns false (and leaves Hdd null) on any failure — a bad/missing HDD path should never
+    /// prevent the rest of the system from booting normally on memory cards alone.</summary>
+    public bool TryEnableVirtualHdd(string path, long sizeBytes)
+    {
+        try
+        {
+            Hdd = File.Exists(path) ? VirtualHdd.OpenFile(path) : VirtualHdd.CreateNewFile(path, sizeBytes);
+            return true;
+        }
+        catch
+        {
+            Hdd = null;
+            return false;
+        }
+    }
+
+    public void DisableVirtualHdd() => Hdd = null;
 
     public void LoadBios(string path)
     {
@@ -585,8 +608,6 @@ public sealed class Ps2System : ISchedulable
         Telemetry.Reset();
         Ipu.Reset();
         EeJit.Reset();
-        IopJit.Reset();
-        VuAccel.Reset();
         Snapshots.Reset();
         UseJit = false;
         LastGoodEePc = 0;
@@ -648,10 +669,7 @@ public sealed class Ps2System : ISchedulable
         Gs.Step(maxCycles);
         Pcrtc.Step(maxCycles);
         Intc.Step(maxCycles);
-        if (UseJit && IopJit.Enabled)
-            IopJit.Execute(maxCycles);
-        else
-            Iop.Step(maxCycles);
+        Iop.Step(maxCycles);
         // Real (retail sifrpc.c) bind/call packets queued by this tick's (or an earlier
         // tick's) EE-side SifSetDma syscall get answered here, on the IOP's own turn — never
         // synchronously inside the syscall handler itself. See Sif.cs's _realRpcQueue doc

@@ -61,6 +61,39 @@ public sealed class Iop : ISchedulable
         _vectorTarget = 0;
     }
 
+    /// <summary>Full IOP core state for SaveState.cs, including LO/HI (no public setters —
+    /// the old SaveState.cs saved GPRs/PC directly via GetGpr/PC but never had a way to
+    /// restore LO/HI, or the COP0 exception state added this session's real R3000A exception
+    /// work — a load would silently resume mid-MULT/DIV or mid-exception-handler with wrong
+    /// register state.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(PC);
+        for (int i = 0; i < 32; i++) w.Write(_gprs[i]);
+        w.Write(LO); w.Write(HI);
+        w.Write(Cop0Status); w.Write(Cop0Cause); w.Write(Cop0Epc); w.Write(Cop0BadVAddr);
+        w.Write(SifMbxFromEE); w.Write(SifMbxToEE);
+        w.Write(Running);
+        w.Write(InstructionsExecuted);
+        w.Write(_branchTarget);
+        w.Write(_pendingVectorJump);
+        w.Write(_vectorTarget);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        PC = r.ReadUInt32();
+        for (int i = 0; i < 32; i++) _gprs[i] = r.ReadUInt32();
+        LO = r.ReadUInt32(); HI = r.ReadUInt32();
+        Cop0Status = r.ReadUInt32(); Cop0Cause = r.ReadUInt32(); Cop0Epc = r.ReadUInt32(); Cop0BadVAddr = r.ReadUInt32();
+        SifMbxFromEE = r.ReadUInt32(); SifMbxToEE = r.ReadUInt32();
+        Running = r.ReadBoolean();
+        InstructionsExecuted = r.ReadUInt64();
+        _branchTarget = r.ReadUInt32();
+        _pendingVectorJump = r.ReadBoolean();
+        _vectorTarget = r.ReadUInt32();
+    }
+
     public uint GetGpr(int index) => _gprs[index & 0x1F];
     public void SetGpr(int index, uint value)
     {

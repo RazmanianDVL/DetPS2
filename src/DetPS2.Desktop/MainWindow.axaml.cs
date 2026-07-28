@@ -112,6 +112,12 @@ public partial class MainWindow : Window
             }
             else
                 Log("BIOS not set — File → Load BIOS (required for many retail discs)");
+
+            if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath) && _system != null)
+            {
+                bool ok = _system.TryEnableVirtualHdd(_config.VirtualHddPath, _config.VirtualHddSizeMb * 1024L * 1024L);
+                Log(ok ? $"Virtual HDD restored: {_config.VirtualHddPath}" : "Virtual HDD path saved but failed to open/create");
+            }
         }
         catch (Exception ex)
         {
@@ -589,6 +595,17 @@ public partial class MainWindow : Window
         var verify = new CheckBox { Content = "Verify media on boot (serial/hash)", IsChecked = _config.VerifyMediaOnBoot };
         var frameLimit = new CheckBox { Content = "Frame limit ~60 FPS", IsChecked = _frameLimit.Enabled };
 
+        // Memory cards are always on and are the primary save path — nothing to configure here.
+        // The virtual HDD is optional, larger-capacity storage a title's own save code would
+        // need to explicitly use; off by default until enabled here.
+        var hddLabel = new TextBlock
+        {
+            Text = string.IsNullOrEmpty(_config.VirtualHddPath) ? "No virtual HDD file selected" : _config.VirtualHddPath,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 11
+        };
+        var enableHdd = new CheckBox { Content = "Enable virtual HDD (optional — memory cards remain the primary save)", IsChecked = _config.EnableVirtualHdd };
+
         var win = new Window
         {
             Title = "Settings",
@@ -627,12 +644,39 @@ public partial class MainWindow : Window
         var ctrlBtn = new Button { Content = "Controllers (P1/P2)…", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch, Padding = new Thickness(10, 8) };
         ctrlBtn.Click += (_, __) => OnControllersClick(sender, e);
 
+        var pickHddBtn = new Button { Content = "Choose virtual HDD file…", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch, Padding = new Thickness(10, 8) };
+        pickHddBtn.Click += async (_, __) =>
+        {
+            var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+            {
+                Title = "Virtual HDD file (created if it doesn't exist yet)",
+                SuggestedFileName = "detps2_hdd.img",
+                FileTypeChoices = new[] { new FilePickerFileType("HDD image") { Patterns = new[] { "*.img", "*.bin" } } }
+            });
+            if (file == null) return;
+            string path = file.TryGetLocalPath() ?? file.Path.LocalPath;
+            hddLabel.Text = path;
+            _config.VirtualHddPath = path;
+        };
+
         var save = new Button { Content = "Save & close", Width = 120, IsDefault = true };
         save.Click += (_, __) =>
         {
             _config.AutoRunAfterBoot = autoRun.IsChecked == true;
             _config.VerifyMediaOnBoot = verify.IsChecked == true;
             _frameLimit.Enabled = frameLimit.IsChecked == true;
+
+            _config.EnableVirtualHdd = enableHdd.IsChecked == true;
+            if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath) && _system != null)
+            {
+                bool ok = _system.TryEnableVirtualHdd(_config.VirtualHddPath, _config.VirtualHddSizeMb * 1024L * 1024L);
+                Log(ok ? $"Virtual HDD enabled: {_config.VirtualHddPath}" : "Virtual HDD failed to open/create — check the path");
+            }
+            else
+            {
+                _system?.DisableVirtualHdd();
+            }
+
             int si = speed.SelectedIndex;
             switch (si)
             {
@@ -658,6 +702,12 @@ public partial class MainWindow : Window
                 new Separator(),
                 new TextBlock { Text = "Controllers", FontWeight = FontWeight.Bold },
                 ctrlBtn,
+                new Separator(),
+                new TextBlock { Text = "Storage", FontWeight = FontWeight.Bold },
+                new TextBlock { Text = "Memory cards are always on and are the primary save.", FontSize = 11, Foreground = Brushes.Gray },
+                enableHdd,
+                hddLabel,
+                pickHddBtn,
                 new Separator(),
                 new TextBlock { Text = "Emulation", FontWeight = FontWeight.Bold },
                 new TextBlock { Text = "Speed" },

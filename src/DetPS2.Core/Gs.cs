@@ -105,6 +105,103 @@ public sealed class Gs : ISchedulable
     /// <summary>TEXFLUSH — invalidate texture cache (stat only; soft GS samples local mem live).</summary>
     public void TexFlush() => TexFlushCount++;
 
+    /// <summary>Full GS state for SaveState.cs. Previously SaveState.cs wrote the framebuffer
+    /// pixels out but never wrote them back on load (read-and-discarded, dead code) and never
+    /// touched anything else here at all — not the depth buffer, not GsRegisters (PRIM/TEX0/
+    /// ALPHA/scissor/etc), and critically not _localMem, the GS's actual 4MB VRAM that
+    /// SampleTexel/CLUT reads sample from live. A load without _localMem would resume with
+    /// every texture/CLUT the game had already uploaded silently gone, breaking textured
+    /// rendering until the game happened to re-upload. Also covers in-flight vertex assembly
+    /// (_verts/_stripCount) — a save mid-triangle-strip needs this or the strip breaks.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        Registers.WriteState(w);
+        w.Write(_framebuffer.Length);
+        foreach (var p in _framebuffer) w.Write(p);
+        w.Write(_depthBuffer.Length);
+        foreach (var d in _depthBuffer) w.Write(d);
+        w.Write(_localMem.Length);
+        w.Write(_localMem);
+        w.Write(_hostOverlayActive);
+        if (_hostOverlayActive && _hostOverlay != null)
+        {
+            w.Write(_hostOverlay.Length);
+            foreach (var p in _hostOverlay) w.Write(p);
+        }
+        else w.Write(0);
+
+        w.Write(_currentPrim);
+        w.Write(_currentRgbaq);
+        w.Write(_lastU); w.Write(_lastV); w.Write(_lastS); w.Write(_lastT); w.Write(_lastQ);
+        w.Write(_lastFog);
+        w.Write(_texWidth); w.Write(_texHeight); w.Write(_texBase);
+        w.Write(_useProceduralTexture);
+        w.Write(_clutBase);
+        foreach (var c in _clut) w.Write(c);
+        w.Write(_hasClut);
+
+        w.Write(_verts.Count);
+        foreach (var v in _verts)
+        {
+            w.Write(v.X); w.Write(v.Y); w.Write(v.Z); w.Write(v.Color);
+            w.Write(v.U); w.Write(v.V); w.Write(v.S); w.Write(v.T); w.Write(v.Q);
+            w.Write(v.Fog);
+        }
+        w.Write(_stripCount);
+
+        w.Write(PrimitivesDrawn); w.Write(PixelsWritten); w.Write(FragmentsTested); w.Write(FragmentsRejectedDepth);
+        w.Write(FragmentsRejectedAlpha); w.Write(TexFlushCount);
+        w.Write(BilinearFilter); w.Write(BilinearSamples);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        Registers.ReadState(r);
+        int fbLen = r.ReadInt32();
+        for (int i = 0; i < fbLen && i < _framebuffer.Length; i++) _framebuffer[i] = r.ReadUInt32();
+        int dbLen = r.ReadInt32();
+        for (int i = 0; i < dbLen && i < _depthBuffer.Length; i++) _depthBuffer[i] = r.ReadSingle();
+        int lmLen = r.ReadInt32();
+        byte[] lm = r.ReadBytes(lmLen);
+        Buffer.BlockCopy(lm, 0, _localMem, 0, Math.Min(lmLen, _localMem.Length));
+
+        _hostOverlayActive = r.ReadBoolean();
+        int ovLen = r.ReadInt32();
+        if (ovLen > 0)
+        {
+            _hostOverlay = new uint[ovLen];
+            for (int i = 0; i < ovLen; i++) _hostOverlay[i] = r.ReadUInt32();
+        }
+        else _hostOverlay = null;
+
+        _currentPrim = r.ReadUInt32();
+        _currentRgbaq = r.ReadUInt32();
+        _lastU = r.ReadSingle(); _lastV = r.ReadSingle(); _lastS = r.ReadSingle(); _lastT = r.ReadSingle(); _lastQ = r.ReadSingle();
+        _lastFog = r.ReadSingle();
+        _texWidth = r.ReadInt32(); _texHeight = r.ReadInt32(); _texBase = r.ReadUInt32();
+        _useProceduralTexture = r.ReadBoolean();
+        _clutBase = r.ReadUInt32();
+        for (int i = 0; i < _clut.Length; i++) _clut[i] = r.ReadUInt32();
+        _hasClut = r.ReadBoolean();
+
+        _verts.Clear();
+        int vn = r.ReadInt32();
+        for (int i = 0; i < vn; i++)
+        {
+            _verts.Add(new Vertex
+            {
+                X = r.ReadInt32(), Y = r.ReadInt32(), Z = r.ReadSingle(), Color = r.ReadUInt32(),
+                U = r.ReadSingle(), V = r.ReadSingle(), S = r.ReadSingle(), T = r.ReadSingle(), Q = r.ReadSingle(),
+                Fog = r.ReadSingle()
+            });
+        }
+        _stripCount = r.ReadInt32();
+
+        PrimitivesDrawn = r.ReadInt64(); PixelsWritten = r.ReadInt64(); FragmentsTested = r.ReadInt64(); FragmentsRejectedDepth = r.ReadInt64();
+        FragmentsRejectedAlpha = r.ReadInt64(); TexFlushCount = r.ReadInt64();
+        BilinearFilter = r.ReadBoolean(); BilinearSamples = r.ReadInt64();
+    }
+
     // ===================== GIF / register writes =====================
 
     public void WriteGsRegister(uint reg, ulong value)
@@ -1037,6 +1134,28 @@ public sealed class Gs : ISchedulable
 
     /// <summary>Zero-copy view of the software raster buffer (game draws).</summary>
     public ReadOnlySpan<uint> GetFramebufferSpan() => _framebuffer;
+
+    /// <summary>Raw local-VRAM byte access (textures/CLUTs live here — see SwizzleOffset32/
+    /// SampleTexel). Exposed directly for tooling/tests that need to verify _localMem's
+    /// contents without going through the full UploadTexture+draw+sample path.</summary>
+    public byte[] ReadLocalMem(int offset, int length)
+    {
+        var buf = new byte[length];
+        Array.Copy(_localMem, offset, buf, 0, Math.Min(length, _localMem.Length - offset));
+        return buf;
+    }
+
+    public void WriteLocalMem(int offset, ReadOnlySpan<byte> data) =>
+        data.CopyTo(_localMem.AsSpan(offset));
+
+    /// <summary>Restores framebuffer pixels from an old (pre-v5) save state — those versions
+    /// only ever saved the pixel bytes, not any of the rest of GS state WriteState now covers,
+    /// so this is a narrow, backward-compat-only helper, not part of the current save format.</summary>
+    public void RestoreFramebuffer(ReadOnlySpan<uint> pixels)
+    {
+        int n = Math.Min(pixels.Length, _framebuffer.Length);
+        pixels.Slice(0, n).CopyTo(_framebuffer);
+    }
 
     /// <summary>
     /// What the host should show: host FMV/boot overlay if active, else software FB.

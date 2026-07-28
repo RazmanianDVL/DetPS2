@@ -261,6 +261,84 @@ public sealed class EmotionEngine : ISchedulable
     public float GetFpr(int i) => _fpr[i & 31];
     public void SetFpr(int i, float v) => _fpr[i & 31] = DeterministicFloat.Canonicalize(v);
 
+    /// <summary>Full EE core state for SaveState.cs. The prior version saved PC/GPRs/LO/HI/
+    /// three COP0 fields directly in SaveState.cs and stopped there — missing LO1/HI1 (the
+    /// MMI 128-bit-multiply extended registers), every FPU register, the rest of COP0 (Count/
+    /// Compare/BadVAddr/ErrorEpc/Config), and critically the branch-delay-slot state
+    /// (_inDelaySlot/_delaySlotTarget/_branchWasLikely) and the interrupt-dispatch register
+    /// save stack (_savedGprAcrossIntcDispatch — this session's own interrupt-corruption fix;
+    /// without it, a save taken while inside a dispatched interrupt handler would resume with
+    /// the wrong "return to" register state once the handler returns). Also covers the
+    /// WaitSema genuine-stall flags (_pendingThreadStall/_pendingSemaStall) this session added
+    /// — a save taken mid-stall needs to resume stalled, not silently start executing.
+    /// Deliberately NOT saved: cache-model hit/miss counters and _irqLoopStreak (pure
+    /// diagnostics, safe to reset) and _sa (single-instruction scratch, never live across
+    /// instruction boundaries).</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(PC);
+        for (int i = 0; i < 32; i++) { w.Write(_gprs[i].Lo); w.Write(_gprs[i].Hi); }
+        w.Write(LO); w.Write(HI);
+        w.Write(LO1); w.Write(HI1);
+        w.Write(COP0_Status); w.Write(COP0_Cause); w.Write(COP0_EPC);
+        w.Write(_cop0Count); w.Write(_cop0Compare); w.Write(_cop0BadVAddr); w.Write(_cop0ErrorEpc); w.Write(_cop0Config);
+        for (int i = 0; i < 32; i++) w.Write(_fpr[i]);
+        w.Write(_fcr31);
+        w.Write(InterruptPending);
+        w.Write(ExceptionCount); w.Write(EretCount);
+        w.Write(_inDelaySlot);
+        w.Write(_delaySlotTarget);
+        w.Write(_branchWasLikely);
+        w.Write(_takeExceptions);
+        w.Write(_pendingThreadStall);
+        w.Write(_pendingSemaStall);
+        w.Write(_preferHleSyscalls);
+        w.Write(_cop2StallRemaining);
+        w.Write(HleRedirectPc.HasValue);
+        if (HleRedirectPc.HasValue) w.Write(HleRedirectPc.Value);
+
+        w.Write(_savedGprAcrossIntcDispatch.Count);
+        // Stack<T> enumerates top-to-bottom; reverse so ReadState can Push in the same order
+        // and end up with an identical top-of-stack.
+        var frames = _savedGprAcrossIntcDispatch.ToArray();
+        for (int i = frames.Length - 1; i >= 0; i--)
+            foreach (var v in frames[i]) w.Write(v);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        PC = r.ReadUInt64();
+        for (int i = 0; i < 32; i++) _gprs[i] = new Gpr128 { Lo = r.ReadUInt64(), Hi = r.ReadUInt64() };
+        LO = r.ReadUInt64(); HI = r.ReadUInt64();
+        LO1 = r.ReadUInt64(); HI1 = r.ReadUInt64();
+        COP0_Status = r.ReadUInt32(); COP0_Cause = r.ReadUInt32(); COP0_EPC = r.ReadUInt64();
+        _cop0Count = r.ReadUInt32(); _cop0Compare = r.ReadUInt32(); _cop0BadVAddr = r.ReadUInt32();
+        _cop0ErrorEpc = r.ReadUInt32(); _cop0Config = r.ReadUInt32();
+        for (int i = 0; i < 32; i++) _fpr[i] = r.ReadSingle();
+        _fcr31 = r.ReadUInt32();
+        InterruptPending = r.ReadBoolean();
+        ExceptionCount = r.ReadUInt64(); EretCount = r.ReadUInt64();
+        _inDelaySlot = r.ReadBoolean();
+        _delaySlotTarget = r.ReadUInt64();
+        _branchWasLikely = r.ReadBoolean();
+        _takeExceptions = r.ReadBoolean();
+        _pendingThreadStall = r.ReadBoolean();
+        _pendingSemaStall = r.ReadBoolean();
+        _preferHleSyscalls = r.ReadBoolean();
+        _cop2StallRemaining = r.ReadInt32();
+        bool hasRedirect = r.ReadBoolean();
+        HleRedirectPc = hasRedirect ? r.ReadUInt64() : (ulong?)null;
+
+        _savedGprAcrossIntcDispatch.Clear();
+        int frameCount = r.ReadInt32();
+        for (int i = 0; i < frameCount; i++)
+        {
+            var frame = new ulong[32];
+            for (int j = 0; j < 32; j++) frame[j] = r.ReadUInt64();
+            _savedGprAcrossIntcDispatch.Push(frame);
+        }
+    }
+
     /// <summary>
     /// Mirror INTC pending into COP0 Cause IP bits.
     /// Status bit0 = IE, bit16 = EIE (simplified: either enables recognition).

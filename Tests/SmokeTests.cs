@@ -614,6 +614,7 @@ public static class SmokeTests
             Spu2_StubAcceptsWrites();
             BiosStub_TraceNoCrash();
             SaveState_StableAcrossBiosRun();
+            SaveState_FullSubsystemRoundTrip();
 
             // Phase 10
             Scheduler_EventQueue_MasterCyclesExact();
@@ -741,7 +742,6 @@ public static class SmokeTests
             // Phase 32
             EeJit_ParityWithInterp();
             EeJit_CompilesBlocks();
-            VuAccel_Runs();
 
             // Phase 33
             Snapshot_FullRoundTrip();
@@ -854,6 +854,7 @@ public static class SmokeTests
             Pfs_NestedDirectories();
             Pfs_DeleteReclaimsSpace();
             VirtualHdd_SaveFileRoundTripAcrossReopen();
+            Ps2System_VirtualHddOptInWiring();
 
             Console.WriteLine("\n=== ALL SMOKE TESTS PASSED (Phase 56 + media) ===");
             return 0;
@@ -1033,6 +1034,37 @@ public static class SmokeTests
         Console.WriteLine("[Smoke] VirtualHdd_SaveFileRoundTripAcrossReopen OK");
     }
 
+    /// <summary>Verifies the opt-in wiring itself: Ps2System.Hdd is null (and MemCard fully
+    /// functional) until TryEnableVirtualHdd is explicitly called, matching "memory card is
+    /// the primary save, virtual HDD is optional and must be turned on" — not just that
+    /// VirtualHdd's own file format works (that's VirtualHdd_SaveFileRoundTripAcrossReopen).</summary>
+    public static void Ps2System_VirtualHddOptInWiring()
+    {
+        var sys = new Ps2System();
+        if (sys.Hdd != null) throw new Exception("Hdd should be null until explicitly enabled");
+        if (!sys.MemCard.Formatted) throw new Exception("MemCard should work regardless of Hdd state");
+        sys.MemCard.WriteFile("PRIMARY", new byte[] { 9, 9, 9 });
+        if (!sys.MemCard.HasFile("PRIMARY")) throw new Exception("MemCard write failed while Hdd disabled");
+
+        string path = Path.Combine(Path.GetTempPath(), "detps2_hdd_" + Guid.NewGuid().ToString("N") + ".img");
+        try
+        {
+            if (!sys.TryEnableVirtualHdd(path, TestDiskSize)) throw new Exception("TryEnableVirtualHdd failed");
+            if (sys.Hdd == null) throw new Exception("Hdd still null after enabling");
+            sys.Hdd.WriteSaveFile("SLUS_210.87", "opt-in.bin", new byte[] { 1, 2, 3 });
+            if (!sys.MemCard.HasFile("PRIMARY")) throw new Exception("MemCard state disturbed by enabling Hdd");
+
+            sys.DisableVirtualHdd();
+            if (sys.Hdd != null) throw new Exception("Hdd should be null after DisableVirtualHdd");
+            if (!sys.MemCard.HasFile("PRIMARY")) throw new Exception("MemCard state disturbed by disabling Hdd");
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* ignore */ }
+        }
+        Console.WriteLine("[Smoke] Ps2System_VirtualHddOptInWiring OK");
+    }
+
     private static bool BytesEqual(byte[] a, byte[] b)
     {
         if (a.Length != b.Length) return false;
@@ -1158,6 +1190,57 @@ public static class SmokeTests
         if (sys.MasterCycles == 0 || sys2.MasterCycles == 0)
             throw new Exception("cycles zero");
         Console.WriteLine("[Smoke] SaveState_StableAcrossBiosRun OK");
+    }
+
+    /// <summary>Real round-trip check for the state v4 never saved at all: threads/semaphores,
+    /// VU1 registers + micro mem, GS local VRAM (texture data), and a SonyKernelHle-registered
+    /// interrupt handler. SaveState_MasterCyclesRoundTrip/StableAcrossBiosRun only ever checked
+    /// MasterCycles — passing did not mean any of this actually survived a save/load.</summary>
+    public static void SaveState_FullSubsystemRoundTrip()
+    {
+        var sys = new Ps2System();
+
+        int tid = sys.Hle.Kernel.CreateThread(0x00110000, 0, 0x01000000, 0x4000); // Sleeping=true, not started
+        int sema = sys.Hle.Kernel.CreateSema(0, 1);
+        int currentTid = sys.Hle.Kernel.CurrentThreadId;
+        sys.Hle.Kernel.WaitSemaBlocking(sema); // blocks the CURRENT thread (still tid 1), not the new one above
+
+        sys.Vu1.WriteMicroWord(0, 0xDEADBEEF);
+        sys.Vu1.SetViRegister(1, 1234);
+        sys.Vu1.PC = 0x40;
+
+        sys.Gs.WriteGsRegister(0x00, 7); // PRIM, so Registers round-trip is covered too
+        var texBytes = new byte[64];
+        for (int i = 0; i < texBytes.Length; i++) texBytes[i] = (byte)(i * 3 + 1);
+        sys.Gs.WriteLocalMem(0x2000, texBytes);
+
+        sys.Hle.EnableSonyKernel();
+        sys.Hle.Sony!.RegisterIntcHandler((int)Intc.InterruptSource.Sif, 0x00123400);
+
+        byte[] state = sys.SaveState();
+
+        var loaded = new Ps2System();
+        if (!loaded.LoadState(state)) throw new Exception("LoadState failed");
+
+        var blockedThread = loaded.Hle.Kernel.GetThread(currentTid);
+        if (blockedThread == null || !blockedThread.Sleeping || blockedThread.WaitSemaId != sema)
+            throw new Exception($"blocked-thread state lost: t={(blockedThread == null ? "null" : $"sleeping={blockedThread.Sleeping} waitSema={blockedThread.WaitSemaId}")}");
+        var newThread = loaded.Hle.Kernel.GetThread(tid);
+        if (newThread == null || newThread.Started) throw new Exception("newly-created thread state lost");
+
+        if (loaded.Vu1.ReadMicroWord(0) != 0xDEADBEEF) throw new Exception("VU1 micro mem lost");
+        if (loaded.Vu1.PC != 0x40) throw new Exception("VU1 PC lost");
+        if (loaded.Vu1.GetViRegister(1) != 1234) throw new Exception("VU1 vi reg lost");
+
+        if (loaded.Gs.Registers.PRIM != 7) throw new Exception("GS PRIM register lost");
+        byte[] readBack = loaded.Gs.ReadLocalMem(0x2000, texBytes.Length);
+        for (int i = 0; i < texBytes.Length; i++)
+            if (readBack[i] != texBytes[i]) throw new Exception($"GS local VRAM byte {i} lost");
+
+        if (!loaded.Hle.Sony!.TryGetIntcHandler((int)Intc.InterruptSource.Sif, out uint handlerAddr) || handlerAddr != 0x00123400)
+            throw new Exception("registered INTC handler lost");
+
+        Console.WriteLine("[Smoke] SaveState_FullSubsystemRoundTrip OK");
     }
 
     // -------------------- Phase 10 --------------------
@@ -1655,8 +1738,6 @@ public static class SmokeTests
             throw new Exception("present count");
         if (sys.Present.Software.LastFrame == null || sys.Present.Software.LastFrame.Length == 0)
             throw new Exception("no frame");
-        sys.Present.UseHardwareStub();
-        sys.PresentFrame();
         Console.WriteLine("[Smoke] PresentPipeline_Software OK");
     }
 
@@ -3142,18 +3223,6 @@ public static class SmokeTests
         Console.WriteLine($"[Smoke] EeJit_CompilesBlocks OK (compiled={sys.EeJit.BlocksCompiled}, hits={sys.EeJit.CacheHits})");
     }
 
-    public static void VuAccel_Runs()
-    {
-        var sys = new Ps2System();
-        sys.Vu0.LoadMicroProgram(new uint[] { 0, 0x80000000 }, 0);
-        sys.Vu0.StartMicro(0);
-        sys.VuAccel.Enabled = true;
-        int n = sys.VuAccel.Run(sys.Vu0, 16);
-        if (sys.VuAccel.MicroBatches < 1) throw new Exception("batches");
-        if (n < 1 && sys.Vu0.MicroOpsExecuted < 1) throw new Exception("ops");
-        Console.WriteLine($"[Smoke] VuAccel_Runs OK (batches={sys.VuAccel.MicroBatches})");
-    }
-
     // -------------------- Phase 33 --------------------
 
     public static void Snapshot_FullRoundTrip()
@@ -3371,14 +3440,20 @@ public static class SmokeTests
     {
         var card = new MemoryCard();
         card.WriteFile("SAVE01", new byte[] { 1, 2, 3, 4 });
+        card.WriteFile("SAVE02", new byte[600]); // spans more than one page
         string path = Path.Combine(Path.GetTempPath(), "detps2_mc_" + Guid.NewGuid().ToString("N") + ".ps2");
         try
         {
             MemCardManager.SaveToFile(card, path);
             if (!File.Exists(path)) throw new Exception("no file");
             var loaded = MemCardManager.LoadFromFile(path);
-            if (!loaded.HasFile("__RAW__") && loaded.FileCount < 1)
-                throw new Exception("import empty");
+            // Real round-trip check: both named files survive save->load with correct
+            // identity and content, not collapsed into an opaque blob.
+            if (loaded.FileCount != 2) throw new Exception($"file count {loaded.FileCount}, expected 2");
+            byte[]? s1 = loaded.ReadFile("SAVE01");
+            if (s1 == null || s1.Length != 4 || s1[2] != 3) throw new Exception("SAVE01 mismatch");
+            byte[]? s2 = loaded.ReadFile("SAVE02");
+            if (s2 == null || s2.Length != 600) throw new Exception("SAVE02 mismatch");
         }
         finally
         {

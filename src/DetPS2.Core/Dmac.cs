@@ -58,6 +58,43 @@ public sealed class Dmac : ISchedulable
         ChainTagsProcessed = 0;
     }
 
+    /// <summary>Per-channel DMA state for SaveState.cs — previously not saved at all, so a
+    /// load mid-transfer (extremely common; a real game is mid-DMA constantly) resumed with
+    /// every channel back at Active=false/QWC=0, silently dropping whatever transfer was in
+    /// flight instead of continuing it.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(DStat); w.Write(DMask); w.Write(DCtrl); w.Write(DPcr); w.Write(DEnabler);
+        w.Write(MfifoBase); w.Write(MfifoEnd); w.Write(MfifoWptr); w.Write(MfifoRptr);
+        w.Write(TransfersCompleted); w.Write(ChainTagsProcessed);
+        w.Write(ActiveChannelCount);
+        w.Write(DrainCyclesPerQw);
+        w.Write(_channels.Length);
+        foreach (var ch in _channels)
+        {
+            w.Write(ch.MADR); w.Write(ch.QWC); w.Write(ch.CHCR); w.Write(ch.TADR);
+            w.Write(ch.Active); w.Write(ch.Mode); w.Write(ch.OriginalQWC); w.Write(ch.StartMADR);
+            w.Write(ch.Stalled);
+        }
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        DStat = r.ReadUInt32(); DMask = r.ReadUInt32(); DCtrl = r.ReadUInt32(); DPcr = r.ReadUInt32(); DEnabler = r.ReadUInt32();
+        MfifoBase = r.ReadUInt32(); MfifoEnd = r.ReadUInt32(); MfifoWptr = r.ReadUInt32(); MfifoRptr = r.ReadUInt32();
+        TransfersCompleted = r.ReadUInt64(); ChainTagsProcessed = r.ReadUInt64();
+        ActiveChannelCount = r.ReadInt32();
+        DrainCyclesPerQw = r.ReadUInt32();
+        int n = r.ReadInt32();
+        for (int i = 0; i < n && i < _channels.Length; i++)
+        {
+            var ch = _channels[i];
+            ch.MADR = r.ReadUInt32(); ch.QWC = r.ReadUInt32(); ch.CHCR = r.ReadUInt32(); ch.TADR = r.ReadUInt32();
+            ch.Active = r.ReadBoolean(); ch.Mode = r.ReadInt32(); ch.OriginalQWC = r.ReadUInt32(); ch.StartMADR = r.ReadUInt32();
+            ch.Stalled = r.ReadBoolean();
+        }
+    }
+
     public enum Channel
     {
         VIF0 = 0, VIF1 = 1, GIF = 2,

@@ -10,31 +10,19 @@ public static class MemCardManager
 {
     public const int DefaultSize = MemoryCard.DefaultPages * MemoryCard.PageSize;
 
-    public static void SaveToFile(MemoryCard card, string path)
-    {
-        // Export via page dump
-        using var fs = File.Create(path);
-        var page = new byte[MemoryCard.PageSize];
-        int pages = card.SizeBytes / MemoryCard.PageSize;
-        for (int i = 0; i < pages; i++)
-        {
-            card.ReadPage(i, page);
-            fs.Write(page, 0, page.Length);
-        }
-    }
+    public static void SaveToFile(MemoryCard card, string path) =>
+        File.WriteAllBytes(path, card.ToRawBytes());
 
+    /// <summary>Loads a card image previously written by SaveToFile. The directory
+    /// table lives inside the image itself (see MemoryCard.cs's own doc comment), so
+    /// this recovers every named file exactly as it was saved — no raw-blob fallback
+    /// needed for DetPS2's own images. A file with the wrong magic (not one of ours)
+    /// comes back as a freshly formatted, empty card rather than misread garbage.</summary>
     public static MemoryCard LoadFromFile(string path)
     {
         if (!File.Exists(path))
             return new MemoryCard();
-        byte[] data = File.ReadAllBytes(path);
-        int pages = Math.Max(1, data.Length / MemoryCard.PageSize);
-        var card = new MemoryCard(pages);
-        // Reconstruct: write raw into card by formatting then file entries unknown —
-        // store as single blob file "__RAW__"
-        card.Format();
-        card.WriteFile("__RAW__", data.AsSpan(0, Math.Min(data.Length, card.SizeBytes - MemoryCard.PageSize)));
-        return card;
+        return new MemoryCard(File.ReadAllBytes(path));
     }
 
     public static bool TryImportFile(MemoryCard card, string name, string hostFile)

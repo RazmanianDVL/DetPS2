@@ -5,13 +5,31 @@ using System.IO.Compression;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Save state v4 (Phase 11): deflate compression, GS FB + VU micro snapshot.
-/// No host clocks. Magic DPS2.
+/// Save state v5: deflate compression, full-system snapshot.
+///
+/// v4 and earlier saved a narrow slice of state: EE/IOP GPRs and three COP0 fields each, raw
+/// RAM, the GS framebuffer's pixel *bytes* (written but never read back on load — dead code,
+/// so a load never actually restored the picture on screen), and VU0's micro memory + PC. Not
+/// saved at all: KernelHle thread/semaphore/event-flag state (a load resumed every thread as
+/// if freshly booted, even mid-game with a dozen threads genuinely blocked), VU1 (nothing —
+/// the unit real 3D games use for actual per-frame vertex work), GS registers/local VRAM/depth
+/// buffer (a load lost every uploaded texture and drawing-context register), per-channel DMAC
+/// state, SPU2 (silence after every load), CDVD's in-flight read, EE/IOP timers, or
+/// SonyKernelHle's game-registered interrupt/DMA handler tables (without which a load makes
+/// every future real interrupt dispatch into a game's own handler go nowhere). A save/load
+/// mid-boot on a multi-thread commercial title would silently resume with badly wrong
+/// scheduler and hardware state instead of failing loudly — worse than not supporting save
+/// states at all. Each subsystem now owns its own WriteState/ReadState (see e.g. Gs.cs,
+/// KernelHle.cs, VectorUnit.cs) and this file just sequences them.
+///
+/// v3/v4 files still load (LoadV3OrV4) for backward compatibility, but only ever restored what
+/// they saved — loading an old file into a running multi-thread game has the same gaps the old
+/// writer did, inherently, since the extra state was never captured.
 /// </summary>
 public static class SaveState
 {
     private const uint Magic = 0x44505332; // 'DPS2'
-    private const uint CurrentVersion = 4;
+    private const uint CurrentVersion = 5;
 
     public static byte[] Save(Ps2System system) => Save(system, compress: true);
 
@@ -35,41 +53,33 @@ public static class SaveState
             writer.Write(spr.Length);
             writer.Write(spr);
 
-            writer.Write(system.EE.PC);
-            for (int i = 0; i < 32; i++)
-            {
-                var gpr = system.EE.GetGpr(i);
-                writer.Write(gpr.Lo);
-                writer.Write(gpr.Hi);
-            }
-            writer.Write(system.EE.LO);
-            writer.Write(system.EE.HI);
-            writer.Write(system.EE.COP0_Status);
-            writer.Write(system.EE.COP0_Cause);
-            writer.Write(system.EE.COP0_EPC);
-
-            writer.Write(system.Iop.PC);
-            for (int i = 0; i < 32; i++)
-                writer.Write(system.Iop.GetGpr(i));
+            system.EE.WriteState(writer);
+            system.Iop.WriteState(writer);
 
             writer.Write(system.Sif.DmaBusy ? 1u : 0u);
             writer.Write(system.Sif.LastCommand);
             writer.Write(system.Sif.GetStatus());
 
             writer.Write(system.Pad.Buttons);
+            writer.Write(system.Pad.Lx); writer.Write(system.Pad.Ly);
+            writer.Write(system.Pad.Rx); writer.Write(system.Pad.Ry);
+            writer.Write(system.Pad.AnalogMode);
 
-            var fb = system.Gs.GetFramebufferSpan();
-            writer.Write(fb.Length);
-            for (int i = 0; i < fb.Length; i++)
-                writer.Write(fb[i]);
-
-            writer.Write(system.Vu0.PC);
-            writer.Write(system.Vu0.RunningMicro ? 1u : 0u);
-            for (uint i = 0; i < 256; i++)
-                writer.Write(system.Vu0.ReadMicroWord(i));
+            system.Gs.WriteState(writer);
+            system.Vu0.WriteState(writer);
+            system.Vu1.WriteState(writer);
 
             writer.Write(system.Intc.Stat);
             writer.Write(system.Intc.Mask);
+
+            system.Dmac.WriteState(writer);
+            system.Cdvd.WriteState(writer);
+            system.Spu2.WriteState(writer);
+            system.Timers.WriteState(writer);
+
+            system.Hle.Kernel.WriteState(writer);
+            writer.Write(system.Hle.Sony != null);
+            system.Hle.Sony?.WriteState(writer);
         }
 
         byte[] payload = raw.ToArray();
@@ -144,6 +154,61 @@ public static class SaveState
                 system.Memory.Write8(SystemMemory.SPR_BASE + (uint)i, spr[i]);
         }
 
+        bool ok = version >= 5
+            ? LoadV5(system, reader)
+            : LoadV3OrV4(system, reader, version);
+        if (!ok) return false;
+
+        system.Scheduler.SetMasterCycles(savedMasterCycles);
+        return true;
+    }
+
+    private static bool LoadV5(Ps2System system, BinaryReader reader)
+    {
+        system.EE.ReadState(reader);
+        system.Iop.ReadState(reader);
+
+        reader.ReadUInt32(); // Sif.DmaBusy
+        reader.ReadUInt32(); // Sif.LastCommand
+        reader.ReadUInt32(); // Sif.GetStatus() — Sif itself has no restore hook; these three
+                              // fields settle back out within a tick or two of real traffic,
+                              // same as v3/v4 always treated them.
+
+        system.Pad.SetButtons(reader.ReadUInt32());
+        byte lx = reader.ReadByte(), ly = reader.ReadByte(), rx = reader.ReadByte(), ry = reader.ReadByte();
+        bool analog = reader.ReadBoolean();
+        system.Pad.SetLeftStick(lx, ly);
+        system.Pad.SetRightStick(rx, ry);
+        if (!analog) system.Pad.AnalogMode = false;
+
+        system.Gs.ReadState(reader);
+        system.Vu0.ReadState(reader);
+        system.Vu1.ReadState(reader);
+
+        uint stat = reader.ReadUInt32();
+        uint mask = reader.ReadUInt32();
+        system.Intc.RestoreState(stat, mask);
+
+        system.Dmac.ReadState(reader);
+        system.Cdvd.ReadState(reader);
+        system.Spu2.ReadState(reader);
+        system.Timers.ReadState(reader);
+
+        system.Hle.Kernel.ReadState(reader);
+        bool hasSony = reader.ReadBoolean();
+        if (hasSony)
+        {
+            if (system.Hle.Sony == null) system.Hle.EnableSonyKernel();
+            system.Hle.Sony?.ReadState(reader);
+        }
+        return true;
+    }
+
+    /// <summary>Backward-compat path for files saved by the v3/v4 writer — unchanged from
+    /// before v5 existed. Only ever restores what those versions saved (see this class's own
+    /// doc comment for the gaps that were always there).</summary>
+    private static bool LoadV3OrV4(Ps2System system, BinaryReader reader, uint version)
+    {
         system.EE.PC = reader.ReadUInt64();
         for (int i = 0; i < 32; i++)
         {
@@ -170,8 +235,10 @@ public static class SaveState
             system.Pad.SetButtons(reader.ReadUInt32());
 
             int fbLen = reader.ReadInt32();
+            var fb = new uint[fbLen];
             for (int i = 0; i < fbLen; i++)
-                reader.ReadUInt32();
+                fb[i] = reader.ReadUInt32();
+            system.Gs.RestoreFramebuffer(fb);
 
             uint vuPc = reader.ReadUInt32();
             bool runMicro = reader.ReadUInt32() != 0;
@@ -198,7 +265,6 @@ public static class SaveState
                 reader.ReadUInt32();
         }
 
-        system.Scheduler.SetMasterCycles(savedMasterCycles);
         return true;
     }
 }

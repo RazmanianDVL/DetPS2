@@ -60,6 +60,62 @@ public sealed class Cdvd : ISchedulable
         // Do not dispose disc on soft reset mid-boot; use Unmount for full clear
     }
 
+    /// <summary>CDVD controller state for SaveState.cs. Deliberately does NOT save/restore
+    /// the mounted disc itself (_disc) — that's boot media, set up from the user's media
+    /// config when a title is loaded, not runtime state; a save file isn't expected to carry
+    /// disc bytes. What matters at runtime is where the drive currently is (LastSector, an
+    /// in-flight async read's countdown/target, tray state) so a load mid-read resumes the
+    /// same read instead of silently dropping it and leaving the game waiting forever for a
+    /// completion that will never come.</summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(DiscPresent);
+        w.Write(DiscId);
+        w.Write(TrayOpen);
+        w.Write(DiscType);
+        w.Write(LastSector);
+        w.Write(SectorsRead);
+        w.Write(ReadPending);
+        w.Write(Completions);
+        w.Write(LayerBreakLba);
+        w.Write(StreamCursor);
+        w.Write(StreamBytes);
+        w.Write(SectorLatencyCycles);
+        w.Write(MechaconStatus);
+        w.Write(_pendingLba);
+        w.Write(_readCyclesLeft);
+        w.Write(_pendingCount);
+        w.Write(TocTracks);
+        w.Write(TocLeadOutSector);
+        w.Write(_sectorBuffer.Length);
+        w.Write(_sectorBuffer);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        DiscPresent = r.ReadBoolean();
+        DiscId = r.ReadString();
+        TrayOpen = r.ReadBoolean();
+        DiscType = r.ReadUInt32();
+        LastSector = r.ReadUInt32();
+        SectorsRead = r.ReadUInt64();
+        ReadPending = r.ReadBoolean();
+        Completions = r.ReadUInt64();
+        LayerBreakLba = r.ReadUInt32();
+        StreamCursor = r.ReadUInt32();
+        StreamBytes = r.ReadUInt64();
+        SectorLatencyCycles = r.ReadUInt32();
+        MechaconStatus = r.ReadUInt32();
+        _pendingLba = r.ReadUInt32();
+        _readCyclesLeft = r.ReadUInt64();
+        _pendingCount = r.ReadUInt32();
+        TocTracks = r.ReadUInt32();
+        TocLeadOutSector = r.ReadUInt32();
+        int bufLen = r.ReadInt32();
+        byte[] buf = r.ReadBytes(bufLen);
+        Buffer.BlockCopy(buf, 0, _sectorBuffer, 0, Math.Min(bufLen, _sectorBuffer.Length));
+    }
+
     public void Unmount()
     {
         try { _disc?.Dispose(); } catch { /* ignore */ }
