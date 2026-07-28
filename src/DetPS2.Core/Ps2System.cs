@@ -644,6 +644,13 @@ public sealed class Ps2System : ISchedulable
             IopJit.Execute(maxCycles);
         else
             Iop.Step(maxCycles);
+        // Real (retail sifrpc.c) bind/call packets queued by this tick's (or an earlier
+        // tick's) EE-side SifSetDma syscall get answered here, on the IOP's own turn — never
+        // synchronously inside the syscall handler itself. See Sif.cs's _realRpcQueue doc
+        // comment for why this ordering matters (EE and IOP are separate chips on real
+        // hardware, joined only by a narrow SIF bus; answering instantly within the same EE
+        // instruction that issued the request can't model that at all).
+        Hle.Sony?.DrainRealRpcQueue();
         Cdvd.Step(maxCycles);
         Sif.Step(maxCycles);
         Spu2.Step(maxCycles);

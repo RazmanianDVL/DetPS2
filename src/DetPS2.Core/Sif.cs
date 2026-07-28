@@ -20,6 +20,25 @@ public sealed class Sif : ISchedulable
     private readonly Queue<uint> _cmdQueue = new();
     private readonly Queue<uint> _rpcPacketAddrs = new();
 
+    /// <summary>
+    /// Real, retail-compiled sifrpc.c bind/call packets (cid 0x80000009/0x8000000A), queued
+    /// for the IOP's own scheduler tick to drain instead of being answered synchronously
+    /// inside the EE's own SifSetDma syscall handler. On real hardware the EE and IOP are
+    /// separate chips joined only by a narrow 32-bit SIF bus (confirmed against the real
+    /// SCPH-30000-series service manual block diagram, 2026-07-28) — CDVD/SPU2/pad/memcard
+    /// are wired to the IOP's own sub-bus, physically unreachable from the EE except by
+    /// relay through the IOP. Answering synchronously within the same EE instruction that
+    /// issued the request collapses that relay to a single function call, so anything
+    /// depending on genuine cross-chip latency (a real async completion, not just "the
+    /// current value") could never be modeled correctly — the root cause behind a whole
+    /// class of bugs this project kept re-finding under different names (see
+    /// DEVELOPER_GUIDE.md's Shaolin Monks / Burnout 3 write-ups). Drained by
+    /// SonyKernelHle.DrainRealRpcQueue, called once per ambient scheduler tick (Ps2System's
+    /// ISchedulable.Step) — never from inside PerformSifSetDma itself — so a response is
+    /// never visible until at least the next scheduler slice after the request was issued.
+    /// </summary>
+    private readonly Queue<uint> _realRpcQueue = new();
+
     private IopModuleHost? _modules;
     private PadInput? _pad;
     private Cdvd? _cdvd;
@@ -81,6 +100,7 @@ public sealed class Sif : ISchedulable
         SmFlag = SifStatSifInit | SifStatCmdInit | SifStatBootEnd;
         _cmdQueue.Clear();
         _rpcPacketAddrs.Clear();
+        _realRpcQueue.Clear();
     }
 
     public void SendCommand(uint command)
@@ -92,6 +112,24 @@ public sealed class Sif : ISchedulable
         MsFlag |= 1;
         _intc?.Raise(Intc.InterruptSource.Sif);
     }
+
+    /// <summary>Queue a real (retail sifrpc.c) bind/call packet for the next scheduler
+    /// tick's IOP-side processing — see the field's own doc comment for why this must not
+    /// be drained synchronously from within the EE's own SifSetDma syscall handler.</summary>
+    public void SubmitRealRpc(uint eePacketAddr) => _realRpcQueue.Enqueue(eePacketAddr);
+
+    public bool TryDequeueRealRpc(out uint eePacketAddr)
+    {
+        if (_realRpcQueue.Count == 0)
+        {
+            eePacketAddr = 0;
+            return false;
+        }
+        eePacketAddr = _realRpcQueue.Dequeue();
+        return true;
+    }
+
+    public int RealRpcQueueCount => _realRpcQueue.Count;
 
     /// <summary>Queue an EE RPC packet address for IOP-side processing.</summary>
     public void SubmitRpc(uint packetEeAddr)

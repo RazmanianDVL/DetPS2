@@ -140,6 +140,14 @@ public sealed class RealSifRpc
         }
     }
 
+    /// <summary>Cheap peek (no state mutation) so the caller can decide whether to queue
+    /// this packet for real, IOP-tick-scheduled handling without processing it early.</summary>
+    public static bool IsRealRpcPacket(SystemMemory mem, uint pktAddr)
+    {
+        uint cid = mem.Read32(pktAddr + 8);
+        return cid == CidRpcBind || cid == CidRpcCall;
+    }
+
     private uint AssignSlot()
     {
         uint off = ScratchBase + (uint)(_nextSlot % ScratchSlots) * ScratchSlotSize;

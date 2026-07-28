@@ -42,6 +42,19 @@ public sealed class SonyKernelHle
     private readonly (uint device, uint bufferAddr)?[] _deci2Handlers = new (uint, uint)?[8];
     public RealSifRpc RealRpc => _realRpc;
 
+    /// <summary>Drains real (retail sifrpc.c) bind/call packets queued by HleSifCmdFromEe —
+    /// called once per ambient scheduler tick (Ps2System.ISchedulable.Step), never from
+    /// inside PerformSifSetDma itself, so a response is never visible within the same EE
+    /// instruction that submitted the request. See Sif.cs's _realRpcQueue doc comment.</summary>
+    public void DrainRealRpcQueue()
+    {
+        while (_system.Sif.TryDequeueRealRpc(out uint addr))
+        {
+            if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, addr))
+                _system.Intc.Raise(Intc.InterruptSource.Sif);
+        }
+    }
+
     /// <summary>Looks up a game-registered AddIntcHandler entry so EmotionEngine can
     /// dispatch directly to it instead of the synthesized (no-op) interrupt vector.</summary>
     public bool TryGetIntcHandler(int cause, out uint handlerAddr) =>
@@ -674,11 +687,14 @@ public sealed class SonyKernelHle
     private void HleSifCmdFromEe(uint eePacket, uint size)
     {
         // Real RPC bind/call (cid 0x80000009/0x8000000A) — the protocol retail-compiled
-        // sifrpc.c actually speaks. Handled fully (response written + semaphore signaled),
-        // so nothing else in this method should run for it.
-        if (size >= 16 && _realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, eePacket))
+        // sifrpc.c actually speaks. On real hardware this can only ever be answered by the
+        // IOP, a separate chip reachable solely over the narrow SIF bus — never instantly,
+        // never within the same instruction that issued the request. Queue it for
+        // DrainRealRpcQueue (called once per ambient scheduler tick, see Sif.cs's
+        // _realRpcQueue doc comment) instead of handling it here.
+        if (size >= 16 && RealSifRpc.IsRealRpcPacket(_system.Memory, eePacket))
         {
-            _system.Intc.Raise(Intc.InterruptSource.Sif);
+            _system.Sif.SubmitRealRpc(eePacket);
             return;
         }
 
