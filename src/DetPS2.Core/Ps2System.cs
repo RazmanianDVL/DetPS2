@@ -7,7 +7,7 @@ namespace DetPS2.Core;
 /// <summary>
 /// Top-level PS2 system (Phase 11 tooling / netplay foundation).
 /// </summary>
-public sealed class Ps2System : ISchedulable
+public sealed class Ps2System
 {
     public SystemMemory Memory { get; }
     public EmotionEngine EE { get; }
@@ -360,11 +360,29 @@ public sealed class Ps2System : ISchedulable
                 ulong n = left > slice ? slice : left;
                 Scheduler.RunFor(n);
                 left -= n;
+
+                // See SchedulerGeneration's own doc comment: this used to live inside an
+                // ISchedulable.Step() override that nothing ever called, because Ps2System
+                // itself was never Scheduler.Register()'d (only its individual components
+                // were) — SchedulerGeneration was permanently stuck at 0 as a result, which
+                // meant Sif.cs's real-RPC queue (TryDequeueRealRpc's "peekGen < currentGen"
+                // check) could NEVER successfully drain anything: every submission and every
+                // drain attempt saw the same gen=0, so "strictly older" was never true even
+                // once. The one real bind/call that ever appeared to work (Shaolin Monks'
+                // opening CDVD sector read) went through MidwayBootAssist's own separate,
+                // hardcoded direct-TryHandle bypass, not this queue at all — confirmed live
+                // (2026-07-28) via a diagnostic trace showing every queue submission and
+                // refusal stuck at gen=0 for the entire run. Fixed by advancing generation and
+                // draining once per real slice here, where it's actually reached.
+                SchedulerGeneration++;
+                Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
             }
         }
         else
         {
             Scheduler.RunFor(cyclesToRun);
+            SchedulerGeneration++;
+            Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
         }
     }
 
@@ -648,41 +666,18 @@ public sealed class Ps2System : ISchedulable
         return Memory.Read32(pkt + 12);
     }
 
-    /// <summary>Increments once per Ps2System.ISchedulable.Step() call (NOT tied to
-    /// MasterCycles, which only advances once per whole Scheduler.RunFor slice and so can't
-    /// distinguish "this tick" from "an earlier tick"). Used to tag real SIF RPC queue
-    /// entries (Sif.cs's _realRpcQueue) so they're never drained within the same tick they
-    /// were submitted in, while still being drainable on any later tick.</summary>
+    /// <summary>Increments once per real-RunFor-slice (see RunFor's own call sites — NOT tied
+    /// to MasterCycles, which only advances once per whole Scheduler.RunFor slice and so can't
+    /// distinguish "this tick" from "an earlier tick"). Used to tag real SIF RPC queue entries
+    /// (Sif.cs's _realRpcQueue) so they're never drained within the same tick they were
+    /// submitted in, while still being drainable on any later tick.
+    ///
+    /// This used to live inside an `ISchedulable.Step()` override, on the mistaken assumption
+    /// that Ps2System itself was registered with its own Scheduler the way EE/Iop/Sif/etc. are
+    /// (Ps2System.cs's constructor: Scheduler.Register(EE), .Register(Iop), ...). It never was
+    /// — only its individual components are — so that Step() override was dead code nothing
+    /// ever called, and it also would have double-stepped every one of those components had it
+    /// somehow been registered (it re-called EE.Step/Iop.Step/etc. itself). Removed; the
+    /// increment+drain now happens directly in RunFor, which is really called every slice.</summary>
     public ulong SchedulerGeneration { get; private set; }
-
-    int ISchedulable.Step(ulong maxCycles)
-    {
-        SchedulerGeneration++;
-        if (UseJit && EeJit.Enabled)
-            EeJit.Execute(maxCycles);
-        else
-            EE.Step(maxCycles);
-        Timers.Step(maxCycles);
-        Dmac.Step(maxCycles);
-        Vif.Step(maxCycles);
-        Gif.Step(maxCycles);
-        Gs.Step(maxCycles);
-        Pcrtc.Step(maxCycles);
-        Intc.Step(maxCycles);
-        Iop.Step(maxCycles);
-        // Real (retail sifrpc.c) bind/call packets queued by this tick's (or an earlier
-        // tick's) EE-side SifSetDma syscall get answered here, on the IOP's own turn — never
-        // synchronously inside the syscall handler itself. See Sif.cs's _realRpcQueue doc
-        // comment for why this ordering matters (EE and IOP are separate chips on real
-        // hardware, joined only by a narrow SIF bus; answering instantly within the same EE
-        // instruction that issued the request can't model that at all).
-        Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
-        Cdvd.Step(maxCycles);
-        Sif.Step(maxCycles);
-        Spu2.Step(maxCycles);
-        Ipu.Step(maxCycles);
-        return 0;
-    }
-
-    void ISchedulable.Reset() => Reset();
 }

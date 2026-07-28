@@ -132,7 +132,12 @@ public sealed class Sif : ISchedulable
     /// field's own doc comment for why this must not be drained synchronously from within
     /// the EE's own SifSetDma syscall handler, and why "later" means "any generation after
     /// this one", not strictly "only the very next one".</summary>
-    public void SubmitRealRpc(uint eePacketAddr, ulong generation) => _realRpcQueue.Enqueue((eePacketAddr, generation));
+    public void SubmitRealRpc(uint eePacketAddr, ulong generation)
+    {
+        _realRpcQueue.Enqueue((eePacketAddr, generation));
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPCQUEUE") == "1")
+            Console.Error.WriteLine($"[RPCQUEUE] submit addr=0x{eePacketAddr:X8} gen={generation} depth={_realRpcQueue.Count}");
+    }
 
     /// <summary>Dequeues the oldest real RPC packet, but only if it's from a strictly
     /// earlier generation than <paramref name="currentGeneration"/> — refuses to hand back
@@ -144,9 +149,13 @@ public sealed class Sif : ISchedulable
         if (_realRpcQueue.Count == 0 || _realRpcQueue.Peek().generation >= currentGeneration)
         {
             eePacketAddr = 0;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPCQUEUE") == "1" && _realRpcQueue.Count > 0)
+                Console.Error.WriteLine($"[RPCQUEUE] refused: peekGen={_realRpcQueue.Peek().generation} currentGen={currentGeneration} depth={_realRpcQueue.Count}");
             return false;
         }
         eePacketAddr = _realRpcQueue.Dequeue().addr;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPCQUEUE") == "1")
+            Console.Error.WriteLine($"[RPCQUEUE] drained addr=0x{eePacketAddr:X8} currentGen={currentGeneration} depthAfter={_realRpcQueue.Count}");
         return true;
     }
 

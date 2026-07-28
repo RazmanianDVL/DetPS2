@@ -4291,6 +4291,77 @@ like either a genuinely wild/garbage pointer being dereferenced, or an address-t
 somewhere upstream, not a real hardware register sweep. Not investigated further this session — the
 next concrete lead for continuing the Shaolin Monks push.
 
+### 7.19 The `0x1360xxxx` sweep was a red herring; `px` was misleading; the real bug was `Ps2System` never being registered with its own `Scheduler`
+
+Follow-up session. Traced §7.18's "new frontier" (`0x1360xxxx` sweep) first: it turned out to be a
+bounded, one-time 4096-word (exactly 16KB) sweep, not a hang — the trace log's `cyc=` stamp simply
+went stale during it (a known artifact, see §7.4/§7.16). Not the real blocker.
+
+**`px` (`Gs.PixelsWritten`) turned out to be an unreliable progress signal once `MidwayBootAssist`'s
+logo-hold overlay is active.** `Gs.SetHostOverlay` unconditionally adds a full framebuffer's worth of
+pixels to `PixelsWritten` every host-present tick, purely to keep a "no video" UI hint from showing —
+nothing to do with real rendering. A `pad-inject` run showed `px` climbing steadily and mechanically for
+58M+ cycles while `gifPath3`/`dmac` (the metrics `MidwayBootAssist` itself trusts to detect *real*
+rendering) stayed frozen the whole time. Added `gifPath1`/`gifPath3`/`dmac`/`sifBytes` columns to
+`pad-inject`'s own output (`Program.cs`) so this doesn't happen again.
+
+**Confirmed the game was not idling at an interactive menu.** Injected Start/Cross/Down presses at
+several points via `pad-inject --press=`; zero effect on `gifPath3`/`dmac`/`syscalls` trajectory at
+every injection point. `--trace-threads` confirmed only one thread (`id=1`) ever existed. The EE was
+genuinely parked at a `WaitSema` syscall trampoline (`0x0047FEA8`), cycling through semaphores
+1, 4, 5, 6, 7… — each one resolved *only* by `MidwayBootAssist.MaybeUnblockStarvedSema`'s blind
+2,000,000-cycle watchdog, never by a real completion. Ruled out `RealSifRpc.cs` as the cause:
+`HandleBind`/`HandleCall` always signal the packet's own `cdPtr+8` semaphore, for any service ID,
+recognized or not — so an unhandled IOP service couldn't be the reason these specific semaphores
+never resolved.
+
+**The real root cause, found via a purpose-built diagnostic trace (`DETPS2_TRACE_RPCQUEUE`, added to
+`Sif.cs`'s `SubmitRealRpc`/`TryDequeueRealRpc`): `Ps2System.SchedulerGeneration` was permanently stuck
+at 0.** §7.16's own generation-tagging fix (`929582b`) added `SchedulerGeneration++` and a
+`DrainRealRpcQueue` call inside an `ISchedulable.Step()` override on `Ps2System` itself, on the
+assumption that `Ps2System` was ticked by its own `Scheduler` the same way `EE`/`Iop`/`Sif`/etc. are.
+It never was — `Ps2System.cs`'s constructor only ever calls `Scheduler.Register(EE)`,
+`.Register(Iop)`, `.Register(Sif)`, and so on for its individual components; nothing ever called
+`Scheduler.Register(this)`. That made the entire `ISchedulable.Step()` override — and everything
+inside it, including the real-RPC-queue drain — **dead code that had never run once since it was
+written**, confirmed live: a diagnostic trace showed every queue submission and every drain attempt
+using `currentGeneration=0`, so `TryDequeueRealRpc`'s "strictly older generation" check
+(`peekGen < currentGen`) was never true, not even once. The one real bind/call that ever appeared to
+work (Shaolin Monks' opening CDVD sector read) went through a completely separate path —
+`MidwayBootAssist.MaybeCompleteRealSifCdRead` fabricates its *own* fake bind/call packet structures at
+hardcoded scratch addresses and calls `RealSifRpc.TryHandle` directly, bypassing the queue entirely —
+which is why it looked like the general mechanism worked at all.
+
+**Fixed**: removed the dead `ISchedulable` conformance and `Step()` override from `Ps2System` (which,
+had it somehow been registered, would have double-stepped every component anyway, since it
+redundantly re-called `EE.Step`/`Iop.Step`/etc. itself). Moved the generation-increment and
+`DrainRealRpcQueue` call directly into `Ps2System.RunFor`'s own slice loop (both the 50,000-cycle
+commercial-mode slicing path and the plain non-commercial path), which is genuinely invoked every
+real tick.
+
+**Verified, dramatic result.** Live re-trace: the same `WaitSema` chain that previously needed the
+2M-cycle watchdog for every single semaphore now resolves **all of them via real completions — zero
+watchdog rescues in the entire run** — racing through 77 semaphores (`0x1`–`0x4D`) in the time the old
+code took to rescue seven. `syscalls` at the old 20M-cycle checkpoint jumped from 116 → 35,948;
+`sifBytes` from 640 → 13,044. PC, previously frozen solid at the `WaitSema` trampoline for 58M+ cycles,
+now roams across dozens of real addresses throughout a 90M-cycle run, settling into what looks like a
+genuine, different, small idle loop only after real forward progress. 9-title cross-check at 20M
+cycles: all 8 other titles byte-identical to the pre-fix baseline — zero regression; Shaolin Monks
+alone shows the improvement.
+
+**New blocker, precisely identified via live disassembly (not yet fixed):** the game eventually settles
+into a tight polling loop at `0x004145D0` — `jal 0x00414590` (increments a heartbeat counter at
+`0x534180` every iteration, unconditionally) then `ld v0, 0(s0); beq v0, zero, 0x004145D0` (loops back
+while the flag at `0x5341D8` reads zero). Once that flag becomes nonzero, the code at `0x0047FCA0` runs
+— syscall `0x24`, `ExitDeleteThread` — meaning this is a real, legitimate "wait for shutdown/completion
+flag, then self-terminate this thread" pattern, not a bug in itself. The flag at `0x5341D8` never
+becomes nonzero across a 90M-cycle run because nothing in the current simulation would ever set it — no
+second thread exists, and no interrupt handler is registered (confirmed via `--trace-threads` and
+`DETPS2_TRACE_HANDLERS`). Pad input (Start/Cross, five separate injection points across the run) has no
+effect on this loop either. Next concrete lead: find what real hardware event is supposed to set
+`0x5341D8` — likely a VSync/PCRTC-interrupt-driven counter reaching a target, given the loop's own
+per-iteration counter-increment pattern, but not yet confirmed live.
+
 ---
 
 ## 8. Save states & determinism contracts
