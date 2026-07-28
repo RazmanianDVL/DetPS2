@@ -3776,11 +3776,109 @@ that, via Ghidra's decompiler, turned out to *not* be about the setter at all. F
 timing/dispatch behavior), but has no HLE that synthesizes an actual, correctly-formatted response
 payload for whatever specific SIF service this SDK's init sequence is calling. This is the real,
 final blocker — not a missing interrupt, not a missing callback registration, but a missing *payload*.
-**Not yet fixed**: doing so correctly requires knowing the exact response format this SDK's IOP-side
-module expects, which is not derivable from the EE-side binary alone. This is exactly the kind of gap
-PCSX2's real debugger (or its IOP-side module disassembly) would resolve directly — the next concrete
-step once GUI/computer-use access to PCSX2 is available: trace what real IOP firmware writes into the
-equivalent buffer for the equivalent request, and replicate that shape in DetPS2's SIF HLE.
+**Refined further in §7.13 below** — this section's original "reads leftover static-init pointer
+bytes as if they were real data" framing was half right (that IS what happens) but stopped one level
+too shallow: that pointer's *target* buffer is where the real gap is, and §7.13 traces it to an exact
+address and exact expected byte content, live, on both sides.
+
+### 7.13 The exact missing bytes, found via a real PCSX2 remote debugger built for this project
+
+PCSX2's own debugger (registers, breakpoints, memory watchpoints) has no network/scripting API —
+confirmed by checking three independent sources (PCSX2's official docs, a community forum thread
+requesting a GDB stub that never shipped, and the installed binary's own `-help` output, which lists
+only `-debugger` for the GUI). PINE (§7.11) is memory-only. So, with the user's explicit go-ahead to
+modify the PCSX2 installation directly ("it's open source... if you need more accurate logging... do
+it"), **extended PINE itself** with new opcodes that expose PCSX2's own internal `R5900DebugInterface`/
+`CBreakPoints` — the exact same machinery its Qt debugger UI is built on — over the network. Not a new
+debugging implementation, just a wire-protocol exposure of an existing, mature one.
+
+**Build setup** (repeatable in ~3 minutes once dependencies are cached):
+- `git clone --depth 1 https://github.com/PCSX2/pcsx2.git` (built on `E:\dev\pcsx2-src` — the C:
+  drive was too full for a full source+deps+build tree).
+- Prebuilt Windows deps: `https://github.com/PCSX2/pcsx2-windows-dependencies/releases` (a
+  continuously-updated `latest-windows-dependencies` tag, `.7z`, extract to a `deps/` folder
+  alongside `PCSX2_qt.sln` — the archive itself contains a top-level `deps/` folder, so it needs
+  flattening one level after extraction).
+- Build via `MSBuild.exe PCSX2_qt.sln /t:pcsx2-qt "/p:Configuration=Release AVX2" /p:Platform=x64
+  /m` (found via `vswhere`). **Gotcha**: `Start-Process -ArgumentList` does not auto-quote array
+  elements containing spaces — `/p:Configuration=Release AVX2` silently splits into two argv
+  entries unless the space is embedded inside the string itself
+  (`'/p:Configuration="Release AVX2"'`). Output: `bin\pcsx2-qtx64-avx2.exe`. Reuses the same
+  `Documents\PCSX2` user-data directory as the normal install (BIOS path, `EnablePINE=true`
+  already carry over — no reconfiguration needed).
+
+**Protocol extension** (`pcsx2/PINE.cpp`, opcodes `0x20`-`0x2B`, all reusing existing PCSX2 internals,
+none reimplemented):
+- `MsgGetPC`/`MsgGetGPR`/`MsgGetCP0` — `r5900Debug.getPC()`/`getRegister(EECAT_GPR/CP0, n)`. Only
+  succeed while the CPU is paused (matches how the GUI debugger itself only allows inspection then),
+  which sidesteps any need for cross-thread synchronization with the running CPU thread.
+- `MsgAddBreakpointEE`/`MsgRemoveBreakpointEE` — `CBreakPoints::AddBreakPoint`/`RemoveBreakPoint`.
+- `MsgAddMemCheckWrite`/`MsgRemoveMemCheckWrite` — `CBreakPoints::AddMemCheck(..., MEMCHECK_WRITE,
+  MEMCHECK_BREAK)` — a real write watchpoint, not something DetPS2 has an equivalent of at all.
+- `MsgIsPaused`/`MsgPauseCpu`/`MsgGetBreakpointTriggered` — thin wrappers.
+- `MsgResumeCpu` — **not** a thin wrapper. A plain `resumeCpu()` (`VMManager::SetPaused(false)`)
+  left the just-hit breakpoint's internal state armed, so the CPU immediately re-paused on the exact
+  same instruction instead of continuing — confirmed live (PC never advanced past a watchpoint hit
+  until fixed). Found the real fix by reading `DebuggerWindow::onVMPaused`'s own resume path
+  (`pcsx2-qt/Debugger/DebuggerWindow.cpp`) and mirroring it exactly: `Host::RunOnCPUThread` running
+  `CBreakPoints::ClearTemporaryBreakPoints()` + `SetBreakpointTriggered(false, ...)` +
+  `SetSkipFirst(BREAKPOINT_EE, r5900Debug.getPC())` (and the IOP equivalent) before calling
+  `resumeCpu()`. This is exactly the class of bug you'd only find by reading the real GUI code that
+  already solves the same problem, rather than guessing at the API surface.
+
+**Live trace, full chain, both emulators, byte-for-byte** (Burnout 3, table index 0, base
+`0x004E4140` — see §7.11):
+1. Set an execution breakpoint at the DMAC-5/SIF0 handler (`0x0010E688`). Hit immediately (PC, all
+   GPRs read correctly) — confirms the handler dispatch itself matches DetPS2's own already-confirmed
+   firing.
+2. Set a write-watchpoint on `0x4E4140` directly. First two hits are both routine, expected
+   zero-writes: the generic crt0 BSS-clear loop (`sq zero,0(v0)`, one quadword sweep through all of
+   BSS) and a second explicit small-range clear inside the SDK's own SIF-init routine
+   (`FUN_0010e120`, 32 words `0x4E4140`-`0x4E41BC`) — both just initializing the flag to its proper
+   0 state, not the bug.
+3. **Third hit is the real one**: `PC=0x0010E0BC` (`sw v1,0(v0)`), `v0=v1_addr=0x4E4140`,
+   **`v1=1`** — the real value. `ra=0x0010E7A8`, landing squarely inside the DMAC handler
+   (`0x0010E688`-`0x0010E7CF`) at the exact point Ghidra's decompile showed an indirect call through
+   a registered function pointer (`(*pcVar2)(auStack_a0, ...)`).
+4. Dumped the call's actual arguments live: `a0=0x81F20` (a local stack buffer, the handler's own
+   copy of received data) held real content at the exact offsets the setter reads (`+0x10=0`=index,
+   `+0x14=1`=value — precisely `table[0]=1`), and `a1` pointed at a registration struct
+   (`0x4E3F80`+, matching `FUN_0010e608`'s earlier setup) containing the real function pointer
+   `0x0010E0A8` (the generic `table[a0->index]=a0->value` setter, ground-truth disassembled directly)
+   at a fixed offset.
+5. **Dumped that same registration struct from DetPS2 at the equivalent point
+   (`--dump=4E3F80:60`) — byte-for-byte identical to real hardware**, function pointers included.
+   So the registration/table-building code (`FUN_0010e608`→`FUN_0010e4d0`) is not the bug; DetPS2
+   executes it correctly.
+6. **`--pcbreak=10E0A8` against DetPS2: zero hits.** DetPS2 never reaches the setter at all, despite
+   firing the handler and having correct registration state. `--trace-chrono` right at the handler's
+   first firing shows exactly why: `lw a3,16280(v1)` loads a *pointer* stored at `0x4E3F98`
+   (`0x204E3EC0`, a static constant written once at SDK init — confirmed identical on both emulators
+   via `--find-writer`), then `lbu v0,0(a3)` dereferences it — reading the length-prefix byte from
+   wherever that pointer *targets* (`0x204E3EC0`, mirroring to physical `0x4E3EC0`), not from
+   `0x4E3F98` itself. `beq a1,zero` **is taken** — DetPS2's byte there is `0`.
+7. **The actual missing data, read live from both sides**: `--dump=4E3EC0:30` under DetPS2 shows
+   **all zeros**. The same address read live from real PCSX2 (still paused mid-investigation) shows
+   real content: `+0x08=0x80000001`, `+0x10=0x00000000` (index), `+0x14=0x00000001` (value),
+   `+0x18=0x80000001`, `+0x20=0x8000000A`, matching exactly what the local copy at step 4 held.
+
+**This is the real, final, fully-traced root cause**: `0x4E3EC0` (physical RDRAM; the game's own code
+only ever stores a pointer *to* it, never writes it directly) is real SIF/IOP response data on real
+hardware and is never written at all under DetPS2 — not "processes garbage instead of a response" as
+§7.12 first framed it, but "the specific 44-ish bytes a real IOP response would contain are simply
+absent." The `0x80000001`/`0x8000000A`-shaped values match the same virtual-register-ID convention
+found in `SonyKernelHle.cs`'s `SifSetReg`/`SifGetReg` fix (§7.12) — plausibly a generic
+"registration acknowledged" response from real BIOS-level SIF plumbing, not something specific to
+this one IOP module, though that's not yet confirmed.
+
+**Not yet fixed.** The exact bytes are now known for this one specific Burnout 3 call site, but
+hardcoding them would be a single-game hack, not a general fix — matching this project's own
+standing bar (§4's whole thesis). The real fix needs the *generation logic* real BIOS/SIF plumbing
+uses to produce this response (most plausibly discoverable from `ps2sdk` source, the same way the
+Virtual HDD work in §9 cross-checked real struct layouts rather than guessing), so DetPS2 can
+synthesize the correct response for *any* registration of this shape, not just this one captured
+instance. The PCSX2 remote-debugger extension built this session is reusable for that next step, and
+for any future "what does real hardware actually do here" question on any title.
 
 ---
 
