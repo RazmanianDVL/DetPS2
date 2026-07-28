@@ -579,10 +579,18 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
         ? $"scheduled: {string.Join(", ", events.Select(e => $"{e.name}@{e.pressAt}-{e.releaseAt}"))}"
         : "scheduled: (no --press= events given — plain observation run)");
     Console.WriteLine();
-    Console.WriteLine($"{"cyc",12}  {"PC",-10} {"px",10} {"prims",7} {"syscalls",8} {"exit",5}  note");
+    // gifPath3/dmac/sifBytes alongside px: px is unreliable once MidwayBootAssist's logo-hold
+    // overlay is active (Gs.SetHostOverlay unconditionally adds a full framebuffer's worth of
+    // pixels to PixelsWritten every host-present tick just to keep the "no video" UI hint from
+    // showing, per its own doc comment — nothing to do with real game rendering). gifPath3
+    // (Gif.Path3Transfers) is what MidwayBootAssist itself uses to detect genuine organic
+    // rendering has started (KeepLogoVisible drops the overlay once Path3Transfers > 4) — a
+    // trustworthy signal px is not, once the logo-hold path is active.
+    Console.WriteLine($"{"cyc",12}  {"PC",-10} {"px",10} {"prims",7} {"syscalls",8} {"gifPath3",8} {"dmac",6} {"sifBytes",8} {"exit",5}  note");
 
     long prevPx = -1, prevPrims = -1;
     ulong prevSyscalls = ulong.MaxValue;
+    ulong prevGifPath3 = ulong.MaxValue, prevDmac = ulong.MaxValue, prevSifBytes = ulong.MaxValue;
     ulong done = 0, nextSample = 0, nextHostPresent = 1_000_000;
     int eventIdx = 0;
     var pending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
@@ -604,10 +612,13 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
     {
         long px = piSys.Gs.PixelsWritten, prims = piSys.Gs.PrimitivesDrawn;
         ulong syscalls = piSys.Hle.SyscallCount;
-        bool changed = px != prevPx || prims != prevPrims || syscalls != prevSyscalls;
+        ulong gifPath3 = piSys.Gif.Path3Transfers, dmac = piSys.Dmac.TransfersCompleted, sifBytes = piSys.Sif.BytesTransferred;
+        bool changed = px != prevPx || prims != prevPrims || syscalls != prevSyscalls
+            || gifPath3 != prevGifPath3 || dmac != prevDmac || sifBytes != prevSifBytes;
         string mark = changed && prevSyscalls != ulong.MaxValue ? "  <-- CHANGED since last sample" : "";
-        Console.WriteLine($"{done,12}  0x{piSys.EE.PC:X8} {px,10} {prims,7} {syscalls,8} {piSys.Hle.ExitRequested,5}  {note}{mark}");
+        Console.WriteLine($"{done,12}  0x{piSys.EE.PC:X8} {px,10} {prims,7} {syscalls,8} {gifPath3,8} {dmac,6} {sifBytes,8} {piSys.Hle.ExitRequested,5}  {note}{mark}");
         prevPx = px; prevPrims = prims; prevSyscalls = syscalls;
+        prevGifPath3 = gifPath3; prevDmac = dmac; prevSifBytes = sifBytes;
     }
 
     Sample("(initial)");
