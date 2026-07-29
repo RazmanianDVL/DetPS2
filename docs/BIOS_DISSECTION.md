@@ -391,9 +391,34 @@ wrongly-assumed `fno=0x06` (never a real MCSERV case number) correctly does *not
 suite green; 9-title cross-check byte-identical (no tracked title exercises memory card I/O within
 the tested cycle window yet, but this is now correct for whichever title/path does).
 
-**Not yet done**: individually verify the remaining 15 real MCSERV case numbers, and check MCMAN
-itself (62KB — the actual card-controller backend MCSERV's handlers call into) for real logic worth
-porting beyond the RPC-facing layer.
+**Not yet done**: individually verify the remaining 15 real MCSERV case numbers (see §6.8 for why
+MCMAN itself is not a near-term port target for these).
+
+---
+
+## 6.8 MCMAN — real card-format backend, scoped out for now (2026-07-29)
+
+Extracted and fully Ghidra-decompiled (`tools/bios-decomp/MCMAN_ALL.txt`, 151 functions, no dump-cap
+truncation). Confirmed this is genuine low-level PS1/PS2 dual-format memory-card filesystem code, not
+a thin RPC shell: per-port state structs on a `0x180`-byte stride, `0x2000`-byte sector I/O
+(`FUN_00002e10` reads a real sector count via `0x2000 / <bytes-per-page>` and loops a real low-level
+sector-read primitive `FUN_000059a0`), a versioned superblock write (literal string `"1.1.0.0"`), and
+a large body of what is very likely ECC/wear-leveling/directory-table logic given the function count
+and size distribution (several 1-2KB functions consistent with FAT-style directory/cluster
+management).
+
+**Scoped out, not abandoned.** This is a legitimate, self-contained subsystem (real card image
+persistence) but porting it wholesale is disproportionate to any currently known blocking symptom —
+`HandleMcServ`'s existing zero-fill-read / echo-size-write stub already returns plausible success
+values, which is sufficient for any boot path that only checks "did the call succeed," and no
+tracked title in the 9-title cross-check exercises deep card I/O within the tested cycle window. A
+real port here is a dedicated future feature (actual save-data persistence to a host file), not a
+playability blocker for the currently tracked titles — revisit if a specific title's stall is proven
+to be inside real MCMAN logic, not just the RPC dispatch layer already fixed in §6.7.
+
+XMCMAN/XMCSERV (extended/multi-card variants, larger: 80KB/5.8KB) were found in the ROMDIR listing
+but not extracted — same reasoning applies, lower priority still since XMC is PS2-specific expansion
+hardware most titles don't touch.
 
 ---
 
