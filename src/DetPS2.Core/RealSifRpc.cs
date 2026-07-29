@@ -137,13 +137,14 @@ public sealed class RealSifRpc
     private const uint IopHeapLimit = ScratchBase;
     private uint _iopHeapNext = IopHeapBase;
 
-    // CD_SCMD function numbers (ee/rpc/cdvd/src/scmd.c + BIOS CDVDFSV)
+    // CD_SCMD function numbers — ground-truthed against the real decompiled CDVDFSV.IRX SCMD
+    // dispatcher (Ghidra FUN_000041b8, tools/bios-decomp/CDVDFSV_ALL.txt); see HandleCdScmd for
+    // the rest of the 25 real case numbers and their per-case ground truth.
     private const uint ScmdReadClock = 0x01;
     private const uint ScmdWriteClock = 0x02;
     private const uint ScmdGetDiskType = 0x03;
     private const uint ScmdGetError = 0x04;
     private const uint ScmdTrayReq = 0x05;
-    private const uint ScmdApplySCmd = 0x07;
     private const uint ScmdStatus = 0x0C;
     private const uint ScmdBreak = 0x16;
 
@@ -562,6 +563,19 @@ public sealed class RealSifRpc
             return;
         }
 
+        // CD_SCMD (sid=0x80000593) — real BIOS CDVDFSV.IRX SCMD dispatcher (Ghidra FUN_000041b8,
+        // tools/bios-decomp/CDVDFSV_ALL.txt). Most of these 25 real function numbers reply with
+        // a packed multi-word struct (result + real hardware output data), not a single int —
+        // see HandleCdScmd's own doc comment for the exact per-case ground-truth.
+        if (sid == SidCdScmd)
+        {
+            HandleCdScmd(mem, cdvd, rpcNumber, argBuf, recvBuf);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] HandleCall sid=CD_SCMD fno=0x{rpcNumber:X} recvBuf=0x{recvBuf:X8} eePC=0x{SystemMemory.CurrentPcForWatch:X8}");
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr);
+            return;
+        }
+
         // FILEIO (sid=0x80000001) — BIOS FILEIO.IRX / sceOpen family.
         if (sid == SidFileIo)
         {
@@ -892,26 +906,6 @@ public sealed class RealSifRpc
                     _ => 1
                 };
 
-            case SidCdScmd:
-                return fno switch
-                {
-                    ScmdReadClock => WriteCdClock(mem, recvBuf),
-                    ScmdWriteClock => 1,
-                    ScmdGetDiskType => (int)cdvd.DiscType,
-                    ScmdGetError => 0, // SCECdErNO
-                    ScmdTrayReq => cdvd.TrayOpen ? 1 : 0,
-                    ScmdApplySCmd => 1,
-                    ScmdStatus => cdvd.ReadPending ? 0x80 : (int)cdvd.MechaconStatus,
-                    ScmdBreak => BreakCdvd(cdvd), // 0x16 — also used as layer-break probe in some builds; break wins
-                    // sceCdSync (often via SCMD): 0 = complete, 1 = busy
-                    0x08 => cdvd.SyncStatus,
-                    0x09 => cdvd.SyncStatus,
-                    0x0E => cdvd.DiscPresent ? 1 : 0,
-                    0x15 => (int)cdvd.TocLeadOutSector,
-                    0x17 => (int)cdvd.LayerBreakLba,
-                    _ => 1
-                };
-
             case SidCdNcmd:
                 if (fno is NcmdRead or NcmdDvdRead or NcmdCddaRead)
                 {
@@ -922,7 +916,14 @@ public sealed class RealSifRpc
                     // Synchronous fill inside RPC so WaitSema on CALL sees data ready.
                     // Also arm async state so late sceCdSync / status polls see ready.
                     uint ok = cdvd.ReadSectorsTo(mem, lbn, sectors, bufAddr);
-                    return ok > 0 ? 1 : 0;
+                    // Real BIOS NCMD read handlers (FUN_000004d8/FUN_000015ac/FUN_00000d8c,
+                    // ground-truthed via Ghidra decompile of CDVDFSV.IRX, tools/bios-decomp/
+                    // CDVDFSV_ALL.txt) return the accumulated **byte count actually read**
+                    // (their own `local_60`/`local_5c`/`local_4c` accumulator), not a boolean
+                    // 0/1 — real ps2sdk callers that check the transfer size against what they
+                    // requested (a common real pattern, not hypothetical) would previously see
+                    // "1 byte" transferred no matter how many sectors were actually read.
+                    return (int)(ok * (uint)Cdvd.SectorSize);
                 }
                 return fno switch
                 {
@@ -994,7 +995,9 @@ public sealed class RealSifRpc
         }
     }
 
-    /// <summary>sceCdReadClock: fill SCECdCLOCK (8 bytes) with a stable synthetic RTC.</summary>
+    /// <summary>sceCdReadClock: fill SCECdCLOCK (8 bytes) with a stable synthetic RTC, at the
+    /// real reply offset (recvBuf+4 — see HandleCdScmd's doc comment for why +0 is reserved
+    /// for the result word).</summary>
     private static int WriteCdClock(SystemMemory mem, uint recvBuf)
     {
         if (recvBuf == 0) return 1;
@@ -1010,15 +1013,27 @@ public sealed class RealSifRpc
         return 1;
     }
 
-    /// <summary>sceCdGetToc: write a minimal single-track TOC into recvbuf.</summary>
+    /// <summary>
+    /// NCMD GetToc (fno=4), ground-truthed against the real decompiled handler
+    /// (FUN_0000340c, tools/bios-decomp/CDVDFSV_ALL.txt): the real reply is only **2 words** —
+    /// result and an is-DVD flag (real code: `*param_3 = uVar1; param_3[1] = uVar4;`, where
+    /// uVar4 comes from checking the real mechacon disc-type register). The actual 0x810-byte
+    /// TOC payload is DMA'd to a *separate* IOP-side buffer on real hardware, not packed into
+    /// this RPC reply — callers that read TOC fields out of the RPC reply buffer itself were
+    /// reading track-count/lead-out/disc-type/layer-break words this file previously wrote at
+    /// +0../+12 with no result word at all, a structure the real BIOS never produces. Kept those
+    /// same fields, shifted to start after the real result+isDvd pair, as a best-effort
+    /// TOC-shaped payload for callers that do read further into the buffer regardless.
+    /// </summary>
     private static int WriteCdToc(SystemMemory mem, uint recvBuf, Cdvd cdvd)
     {
         if (recvBuf == 0) return 1;
-        // Minimal 1024-byte TOC region: track count + lead-out style fields.
-        mem.Write32(recvBuf + 0, cdvd.TocTracks);
-        mem.Write32(recvBuf + 4, cdvd.TocLeadOutSector);
-        mem.Write32(recvBuf + 8, cdvd.DiscType);
-        mem.Write32(recvBuf + 12, cdvd.LayerBreakLba);
+        uint isDvd = cdvd.DiscType is 0x14 or 0xFE ? 1u : 0u; // SCECdPS2DVD / SCECdDVDV-ish
+        mem.Write32(recvBuf + 4, isDvd);
+        mem.Write32(recvBuf + 8, cdvd.TocTracks);
+        mem.Write32(recvBuf + 12, cdvd.TocLeadOutSector);
+        mem.Write32(recvBuf + 16, cdvd.DiscType);
+        mem.Write32(recvBuf + 20, cdvd.LayerBreakLba);
         return 1;
     }
 
@@ -1026,6 +1041,166 @@ public sealed class RealSifRpc
     {
         cdvd.CancelAsync();
         return 1;
+    }
+
+    // Real BIOS CD_SCMD function numbers, ground-truthed against the actual decompiled
+    // CDVDFSV.IRX SCMD dispatcher (Ghidra FUN_000041b8, tools/bios-decomp/CDVDFSV_ALL.txt) —
+    // not guessed from ps2sdk headers alone. Case 7 in particular was previously mislabeled
+    // "ApplySCmd" in this file; the real dispatcher has no such case at 7, it's WRITE_ILinkID.
+    private const uint ScmdReadIlinkId = 0x06;
+    private const uint ScmdWriteIlinkId = 0x07;
+    private const uint ScmdReadNvm = 0x08;
+    private const uint ScmdWriteNvm = 0x09;
+    private const uint ScmdDecSet1 = 0x0A;
+    private const uint ScmdDecSet2 = 0x0B;
+    private const uint ScmdSetHdMode = 0x0D;
+    private const uint ScmdOpenConfig = 0x0E;
+    private const uint ScmdCloseConfig = 0x0F;
+    private const uint ScmdReadConfig = 0x10;
+    private const uint ScmdWriteConfig = 0x11;
+    private const uint ScmdReadConsoleId = 0x12;
+    private const uint ScmdWriteConsoleId = 0x13;
+    private const uint ScmdGetMecaconVersion = 0x14;
+    private const uint ScmdCtrlAudioDigitalOut = 0x15;
+    private const uint ScmdReadSubQ = 0x17;
+    private const uint ScmdForbidDvdP = 0x18;
+    private const uint ScmdAutoAdjustCtrl = 0x19;
+
+    /// <summary>
+    /// Real BIOS CD_SCMD dispatcher (sid=0x80000593), ported from the actual decompiled
+    /// CDVDFSV.IRX (Ghidra FUN_000041b8 — every case below traced to its real handler function
+    /// and, where it has one, its real debug-print format string; see
+    /// tools/bios-decomp/CDVDFSV_ALL.txt). Real reply convention confirmed directly from the
+    /// decompile: word[0] (recvBuf+0) is always the function's own return value; any further
+    /// payload the specific command produces starts at recvBuf+4 (most cases write into
+    /// <c>param_3+1</c>, i.e. one word past the result — this file's earlier version wrote
+    /// payload bytes starting at recvBuf+0 with no result word at all, which is wrong for a
+    /// caller that checks the result before touching the payload).
+    ///
+    /// Hardware state DetPS2 doesn't model for real (mechacon RTC/NVM/iLink ID/console ID) gets
+    /// stable, structurally-correct synthetic values — the real fix here is getting the *shape*
+    /// (word count, result-then-payload ordering) right, not fabricating real console secrets.
+    /// </summary>
+    private void HandleCdScmd(SystemMemory mem, Cdvd cdvd, uint fno, uint argBuf, uint recvBuf)
+    {
+        int result;
+        switch (fno)
+        {
+            case ScmdReadClock: // case 1, FUN_00003888
+                result = WriteCdClock(mem, recvBuf + 4);
+                break;
+            case ScmdWriteClock: // case 2, FUN_000038d0 — echoes the 2-word request back
+                result = 1;
+                if (recvBuf != 0 && argBuf != 0)
+                {
+                    mem.Write32(recvBuf + 4, mem.Read32(argBuf));
+                    mem.Write32(recvBuf + 8, mem.Read32(argBuf + 4));
+                }
+                break;
+            case ScmdGetDiskType: // case 3 — raw getter, no debug string in the real dispatch;
+                result = (int)cdvd.DiscType;
+                break;
+            case ScmdGetError: // case 4 — raw getter ("get error code" print elsewhere)
+                result = 0; // SCECdErNO
+                break;
+            case ScmdTrayReq: // case 5, FUN_00003e88 — result + tray status word
+                result = cdvd.TrayOpen ? 1 : 0;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, cdvd.TrayOpen ? 1u : 0u);
+                break;
+            case ScmdReadIlinkId: // case 6, FUN_000035b0 "READ ILinkID call" — 2-word ID payload
+                result = 1;
+                if (recvBuf != 0) { mem.Write32(recvBuf + 4, 0); mem.Write32(recvBuf + 8, 0); }
+                break;
+            case ScmdWriteIlinkId: // case 7, FUN_000035fc "WRITE ILinkID call"
+                result = 1;
+                break;
+            case ScmdReadNvm: // case 8, FUN_00003944 "READ NVM call" — echoes request words back
+                result = 1;
+                if (recvBuf != 0 && argBuf != 0)
+                {
+                    mem.Write32(recvBuf + 4, mem.Read32(argBuf));
+                    mem.Write32(recvBuf + 8, mem.Read32(argBuf + 4));
+                }
+                break;
+            case ScmdWriteNvm: // case 9, FUN_000039b0 "WRITE NVM call"
+                result = 1;
+                if (recvBuf != 0 && argBuf != 0)
+                {
+                    mem.Write32(recvBuf + 4, mem.Read32(argBuf));
+                    mem.Write32(recvBuf + 8, mem.Read32(argBuf + 4));
+                }
+                break;
+            case ScmdDecSet1: // case 0xa, FUN_00003d10 "DEC SET call" — result only
+                result = 0;
+                break;
+            case ScmdDecSet2: // case 0xb, FUN_00003d70 — a different real function, same debug
+                // string; 4-word output (local_20..local_14 in the decompile).
+                result = 0;
+                if (recvBuf != 0)
+                {
+                    mem.Write32(recvBuf + 4, 0);
+                    mem.Write32(recvBuf + 8, 0);
+                    mem.Write32(recvBuf + 12, 0);
+                }
+                break;
+            case ScmdStatus: // case 0xc — raw getter, no debug string
+                result = cdvd.ReadPending ? 0x80 : (int)cdvd.MechaconStatus;
+                break;
+            case ScmdSetHdMode: // case 0xd, FUN_00003a1c "SET HD mode call" — result only
+                result = 1;
+                break;
+            case ScmdOpenConfig: // case 0xe, FUN_00003a88 "OpenConfig call" — result + block info
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            case ScmdCloseConfig: // case 0xf, FUN_00003b20 "CloseConfig call"
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            case ScmdReadConfig: // case 0x10, FUN_00003b94 "ReadConfig call" — 2-word payload
+                result = 1;
+                if (recvBuf != 0) { mem.Write32(recvBuf + 4, 0); mem.Write32(recvBuf + 8, 0); }
+                break;
+            case ScmdWriteConfig: // case 0x11, FUN_00003c0c "WriteConfig call"
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            case ScmdReadConsoleId: // case 0x12, FUN_00003654 "READ Console call" — 2-word ID
+                result = 1;
+                if (recvBuf != 0) { mem.Write32(recvBuf + 4, 0); mem.Write32(recvBuf + 8, 0); }
+                break;
+            case ScmdWriteConsoleId: // case 0x13, FUN_000036a0 "WRITE ConsoleID call"
+                result = 1;
+                break;
+            case ScmdGetMecaconVersion: // case 0x14, FUN_000036f8 — 2-word version payload
+                result = 1;
+                if (recvBuf != 0) { mem.Write32(recvBuf + 4, 0x00020101); mem.Write32(recvBuf + 8, 0); }
+                break;
+            case ScmdCtrlAudioDigitalOut: // case 0x15, FUN_000037d8
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            case ScmdBreak: // case 0x16, FUN_00000280 == real sceCdAbort (debug-string confirmed)
+                result = BreakCdvd(cdvd);
+                break;
+            case ScmdReadSubQ: // case 0x17, FUN_00003744 — 2-word subchannel Q payload
+                result = 1;
+                if (recvBuf != 0) { mem.Write32(recvBuf + 4, 0); mem.Write32(recvBuf + 8, 0); }
+                break;
+            case ScmdForbidDvdP: // case 0x18, FUN_00003790 "ForbidDVDP call"
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            case ScmdAutoAdjustCtrl: // case 0x19, FUN_00003830 "Auto Ajust Ctrl call"
+                result = 1;
+                if (recvBuf != 0) mem.Write32(recvBuf + 4, 0);
+                break;
+            default:
+                result = 1;
+                break;
+        }
+        if (recvBuf != 0)
+            mem.Write32(recvBuf, unchecked((uint)result));
     }
 
     private static int StartCdStream(Cdvd cdvd, uint argBuf, SystemMemory mem)

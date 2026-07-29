@@ -660,6 +660,8 @@ public static class SmokeTests
             KernelHle_WaitVblank_ClearsOnPcrtc();
             BiosHarness_StubRuns();
             BiosHle_SifcmdRdataAndFileIoSid();
+            RealSifRpc_CdScmdRealReplyStructure();
+            RealSifRpc_CdNcmdReadReturnsRealByteCount();
             BiosHle_IopVblankEventFlag();
             BiosBootHost_IopBtConfContracts();
             BiosHle_FileIoGetstatAndCdvdSectors();
@@ -2214,6 +2216,104 @@ public static class SmokeTests
             throw new Exception("FILEIO sid constant");
 
         Console.WriteLine("[Smoke] BiosHle_SifcmdRdataAndFileIoSid OK");
+    }
+
+    /// <summary>Real BIOS CD_SCMD reply structure (HandleCdScmd, ground-truthed against the
+    /// decompiled CDVDFSV.IRX SCMD dispatcher): word[0] is always the result, any payload starts
+    /// at word[1] — the pre-fix version wrote payload bytes starting at word[0] with no result
+    /// word for several commands (WriteClock, ReadClock). Covers the WriteClock echo path (a
+    /// case that was previously mapped to the wrong real function entirely, "ScmdApplySCmd").</summary>
+    public static void RealSifRpc_CdScmdRealReplyStructure()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+
+        const uint cd = 0x0000E400;
+        const uint bindPkt = 0x0000E500;
+        int sema = k.CreateSema(0, 1);
+        mem.Write32(cd + 8, (uint)sema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1);
+        mem.Write32(bindPkt + 28, cd);
+        mem.Write32(bindPkt + 32, RealSifRpc.SidCdScmd);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+            throw new Exception("SCMD bind failed");
+        uint argBuf = mem.Read32(cd + 20);
+
+        // fno=2 (WriteClock): real handler echoes the 2-word request back starting at word[1],
+        // with word[0] as the result.
+        mem.Write32(argBuf + 0, 0x11111111);
+        mem.Write32(argBuf + 4, 0x22222222);
+        const uint recvBuf = 0x0000E600;
+        const uint callPkt = 0x0000E700;
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(callPkt + 28, cd);
+        mem.Write32(callPkt + 32, 2); // ScmdWriteClock
+        mem.Write32(callPkt + 36, 8); // send_size
+        mem.Write32(callPkt + 40, recvBuf);
+        mem.Write32(callPkt + 44, 12);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("SCMD WriteClock call failed");
+        if (mem.Read32(recvBuf + 0) != 1) throw new Exception($"WriteClock result word: 0x{mem.Read32(recvBuf):X8}");
+        if (mem.Read32(recvBuf + 4) != 0x11111111 || mem.Read32(recvBuf + 8) != 0x22222222)
+            throw new Exception("WriteClock did not echo request into word[1..2]");
+
+        Console.WriteLine("[Smoke] RealSifRpc_CdScmdRealReplyStructure OK");
+    }
+
+    /// <summary>NCMD read (fno=1/2/3) must return the real accumulated byte count, ground-truthed
+    /// against the decompiled CDVDFSV.IRX NCMD read handlers (FUN_000004d8 etc.) — previously
+    /// this returned a bare boolean 0/1 regardless of how many sectors were actually read.</summary>
+    public static void RealSifRpc_CdNcmdReadReturnsRealByteCount()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+        // No mount needed -- unmounted Cdvd already generates deterministic synthetic sectors
+        // (see Cdvd_ReadSector_Deterministic), which is all this test needs to verify the real
+        // byte-count return contract.
+
+        const uint cd = 0x0000E800;
+        const uint bindPkt = 0x0000E900;
+        int sema = k.CreateSema(0, 1);
+        mem.Write32(cd + 8, (uint)sema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1);
+        mem.Write32(bindPkt + 28, cd);
+        mem.Write32(bindPkt + 32, RealSifRpc.SidCdNcmd);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+            throw new Exception("NCMD bind failed");
+        uint argBuf = mem.Read32(cd + 20);
+
+        const uint destBuf = 0x00100000;
+        const uint sectors = 3;
+        mem.Write32(argBuf + 0, 0);       // lbn
+        mem.Write32(argBuf + 4, sectors); // sectors
+        mem.Write32(argBuf + 8, destBuf); // dest
+
+        const uint recvBuf = 0x0000EA00;
+        const uint callPkt = 0x0000EB00;
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(callPkt + 28, cd);
+        mem.Write32(callPkt + 32, 1); // NcmdRead
+        mem.Write32(callPkt + 36, 12);
+        mem.Write32(callPkt + 40, recvBuf);
+        mem.Write32(callPkt + 44, 4);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("NCMD read call failed");
+        uint got = mem.Read32(recvBuf);
+        uint expected = sectors * (uint)Cdvd.SectorSize;
+        if (got != expected)
+            throw new Exception($"NCMD read result 0x{got:X} != expected byte count 0x{expected:X}");
+
+        Console.WriteLine("[Smoke] RealSifRpc_CdNcmdReadReturnsRealByteCount OK");
     }
 
     /// <summary>BIOS VBLANK.IRX HLE: event flag set on EE VBlank pulse.</summary>
