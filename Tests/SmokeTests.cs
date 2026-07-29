@@ -707,6 +707,7 @@ public static class SmokeTests
             // Phase 22
             Irx_LoadMinimal_IntoIopRam();
             Irx_RealRelocation_ProducesCorrectAddresses();
+            IrxLoader_LinkImports_PatchesRealStubFormat();
             Romdir_ParseAndExtract_HandlesInterEntryPadding();
             IopModules_DefaultsIncludeMcmanLibsd();
             IopModules_FileDescriptorTableRealBound();
@@ -3093,6 +3094,80 @@ public static class SmokeTests
             throw new Exception($"recombined hi/lo 0x{recombined:X8} != expected 0x{expectedAddr:X8}");
 
         Console.WriteLine($"[Smoke] Irx_RealRelocation_ProducesCorrectAddresses OK (jal=0x{reconstructedTarget:X8} hilo=0x{recombined:X8})");
+    }
+
+    /// <summary>Real cross-module import/export linking (IrxLoader.ScanExports/LinkImports),
+    /// ground-truthed 2026-07-29 against the real BIOS LOADCORE module's own decompiled
+    /// relocation/linking routine (tools/bios-decomp/LOADCORE_ALL.txt) -- not guessed. Verified
+    /// live against real extracted BIOS kernel modules first (SYSMEM/THREADMAN/etc. all produced
+    /// real, correctly-named library exports via `load-irx --scan-exports`); this is the
+    /// committable synthetic regression check, since the real files can't be committed. Builds
+    /// an export table and an importer's unresolved stub directly in memory (bypassing full ELF
+    /// construction, since both functions operate on already-loaded memory, not raw ELF bytes)
+    /// and confirms: an in-range ordinal patches the stub to a real `J target` instruction, and
+    /// an out-of-range ordinal patches it to `jr ra` instead of leaving it unresolved.</summary>
+    public static void IrxLoader_LinkImports_PatchesRealStubFormat()
+    {
+        var mem = new SystemMemory();
+        const uint libBase = SystemMemory.IOP_RAM_BASE + 0x010000;
+        const uint fn0 = SystemMemory.IOP_RAM_BASE + 0x010100;
+        const uint fn1 = SystemMemory.IOP_RAM_BASE + 0x010200;
+
+        // Real export table layout: magic, next(0), version(u16 hi=major), flags(u16), name[8], exports[]...
+        mem.Write32(libBase + 0x00, IrxLoader.ExportTableMagic);
+        mem.Write32(libBase + 0x04, 0);
+        mem.Write8(libBase + 0x08, 0); mem.Write8(libBase + 0x09, 1); // version: minor=0, major=1
+        mem.Write8(libBase + 0x0A, 0); mem.Write8(libBase + 0x0B, 0);
+        byte[] libName = System.Text.Encoding.ASCII.GetBytes("testlib\0");
+        for (int i = 0; i < 8; i++) mem.Write8(libBase + 0x0C + (uint)i, libName[i]);
+        mem.Write32(libBase + 0x14, fn0); // ordinal 0
+        mem.Write32(libBase + 0x18, fn1); // ordinal 1
+        mem.Write32(libBase + 0x1C, 0);   // terminator
+
+        var exports = IrxLoader.ScanExports(mem, libBase, libBase + 0x100);
+        if (exports.Count != 1) throw new Exception($"expected 1 export table, got {exports.Count}");
+        if (exports[0].Name != "testlib") throw new Exception($"export name: {exports[0].Name}");
+        if (exports[0].VersionMajor != 1) throw new Exception($"export version major: {exports[0].VersionMajor}");
+        if (exports[0].Exports.Length != 2) throw new Exception($"export count: {exports[0].Exports.Length}");
+        if (exports[0].Exports[0] != fn0 || exports[0].Exports[1] != fn1)
+            throw new Exception("export function pointers mismatch");
+
+        // Real unresolved import stub: magic, next(0), version, name[8], then 2-word pairs --
+        // word[0]=placeholder, word[1]=`addiu zero,zero,ORDINAL` (opcode 9).
+        const uint importerBase = SystemMemory.IOP_RAM_BASE + 0x020000;
+        mem.Write32(importerBase + 0x00, IrxLoader.ImportStubMagic);
+        mem.Write32(importerBase + 0x04, 0);
+        mem.Write8(importerBase + 0x08, 0); mem.Write8(importerBase + 0x09, 1); // matching v1.x
+        mem.Write8(importerBase + 0x0A, 0); mem.Write8(importerBase + 0x0B, 0);
+        for (int i = 0; i < 8; i++) mem.Write8(importerBase + 0x0C + (uint)i, libName[i]);
+        const uint stub0 = importerBase + 0x14;
+        mem.Write32(stub0 + 0, 0x03E00008);          // placeholder (jr ra, same as unresolved default)
+        mem.Write32(stub0 + 4, (9u << 26) | 0);       // addiu zero,zero,0 -> ordinal 0 (in range)
+        const uint stub1 = importerBase + 0x1C;
+        mem.Write32(stub1 + 0, 0x03E00008);
+        mem.Write32(stub1 + 4, (9u << 26) | 99);      // ordinal 99 -> out of range
+        mem.Write32(importerBase + 0x24, 0);          // terminator (word[1] no longer opcode 9)
+
+        var registry = new Dictionary<string, IrxLoader.ExportTable> { ["testlib"] = exports[0] };
+        var (resolved, unresolved) = IrxLoader.LinkImports(mem, importerBase, importerBase + 0x100, registry);
+        if (resolved != 1) throw new Exception($"expected 1 resolved stub, got {resolved}");
+        if (unresolved != 1) throw new Exception($"expected 1 unresolved stub, got {unresolved}");
+
+        uint patched0 = mem.Read32(stub0);
+        uint expectedJ = ((fn0 >> 2) & 0x03FFFFFFu) | 0x08000000u;
+        if (patched0 != expectedJ)
+            throw new Exception($"in-range stub: got 0x{patched0:X8} expected J 0x{expectedJ:X8} (fn0=0x{fn0:X8})");
+        // Reconstructed real MIPS J-type target (top 4 bits from the executing PC) must land
+        // exactly on the real exported function address.
+        uint reconstructed = (stub0 & 0xF0000000u) | ((patched0 & 0x03FFFFFFu) << 2);
+        if (reconstructed != fn0)
+            throw new Exception($"J target reconstruction: 0x{reconstructed:X8} != fn0 0x{fn0:X8}");
+
+        uint patched1 = mem.Read32(stub1);
+        if (patched1 != 0x03E00008)
+            throw new Exception($"out-of-range stub should patch to jr ra, got 0x{patched1:X8}");
+
+        Console.WriteLine("[Smoke] IrxLoader_LinkImports_PatchesRealStubFormat OK");
     }
 
     /// <summary>ROMDIR extraction (IRX Phase 2), verified against a synthetic BIOS-shaped blob

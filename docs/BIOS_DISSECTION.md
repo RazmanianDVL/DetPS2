@@ -292,6 +292,62 @@ uncertain payoff. The stack-overflow check specifically is a good candidate for 
 isolated addition (diagnostic-only, shouldn't affect normal execution) but needs real verification
 against actual game stack-usage patterns before landing, not a rushed port.
 
+## 6.5 LOADCORE — real cross-module import/export linking, fully ported (2026-07-29)
+
+**This closes out IRX Phase 2 for real** (the earlier session-45 task tracker entry marked it
+"completed" via a scope reduction — extract+relocate and let the real LOADCORE module link itself —
+before literal LOADCORE execution was judged out of scope; this section supersedes that with an
+actual, verified port of the real algorithm instead).
+
+Ghidra-decompiled LOADCORE.IRX ("Module Manager") in full. No debug strings to lean on this time —
+identified the real relocation processor (`FUN_0000165c`) by its case-4 logic (`(*puVar7 & 0x3ffffff)*4
++ base) >> 2` — an exact byte-for-byte match for this project's own already-verified R_MIPS_26
+handling from IRX Phase 1 — which is itself a strong independent confirmation that Phase 1's
+relocation work was correct. Its case '\x02' (`*puVar7 = *puVar7 + iVar11`, a plain full-address add)
+identified a relocation type (R_MIPS_32) this project's loader had *not* previously handled — added.
+
+Found the real cross-module linker by searching for `0x41E00000`, the exact import-stub-table magic
+already known from ground-truthing real disc IRX files earlier this session
+(`MKSM_IOP_RPC_PROTOCOLS.md`'s "unlinked stubs are `jr ra` + `addiu zero,zero,ORDINAL`" note).
+`FUN_00001064` is the real resolver. Exact algorithm, transliterated directly:
+
+- **Export table** (a module registers one per library it provides — e.g. THREADMAN registers
+  separate tables for `thbase`/`thevent`/`thsemap`/`thmsgbx`/`thfpool`/`thvpool`/`thrdman`):
+  `+0x00` magic `0x41C00000`, `+0x04` next (runtime-only), `+0x08` version (u16, high byte = major),
+  `+0x0C` name (8 bytes), `+0x14` NUL-terminated array of real function pointers.
+- **Import stub** (one unresolved call site): 2-word pair, `[0]` placeholder, `[1]`
+  `addiu zero,zero,ORDINAL` (opcode 9 marks it unresolved; the ordinal indexes the target
+  library's export array).
+- **Resolution**: for each stub whose word[1] is still an ADDIU, if the ordinal is in range, patch
+  word[0] to a real `J exports[ordinal]` instruction; otherwise patch to `jr ra` (safe no-op for
+  an export the library doesn't actually provide at this version).
+
+**Ported into `IrxLoader.cs`** (`ScanExports`/`LinkImports`) and wired into `IopModuleHost.LoadIrx`
+so every module load automatically registers its exports and resolves its own imports against
+everything loaded so far — real boot order matters exactly as it does on real hardware.
+
+**Verified against real extracted BIOS modules first** (`load-irx --scan-exports`), not just
+synthetic data: SYSMEM → `sysmem` v1.1 (16 funcs), LOADCORE → `loadcore` v1.1 (25 funcs), INTRMANP/I →
+`intrman` v1.2 (32 funcs), VBLANK → `vblank` v1.1 (10 funcs), IOMAN → `ioman` v1.2 (25 funcs), MODLOAD
+→ `modload` v1.1 (16 funcs), SIFMAN → `sifman` v1.1 (36 funcs), SIFCMD → `sifcmd` v1.1 (32 funcs), and
+**THREADMAN → all 7 real libraries at once** (`thbase`/`thevent`/`thsemap`/`thmsgbx`/`thfpool`/
+`thvpool`/`thrdman`) — every name and function-pointer address is real, correctly-relocated data read
+straight out of the real BIOS.
+
+**Found and fixed a second, independent real bug along the way**: THREADMAN's real loaded size
+(0x6C94, confirmed live) is nearly 2x the fixed 0x4000 (16KB) per-module spacing
+`IopModuleHost.LoadIrx` used for its next-module allocation address — any module loaded right after
+a module bigger than 16KB would have silently overwritten its tail (which is exactly where
+THREADMAN's own export tables live). Added a real `Size` field to `IrxLoader.LoadResult` (the
+highest section end, not a guess) and made the next-module base advance past the real size,
+16KB-aligned, instead of a fixed stride.
+
+New synthetic smoke test (`IrxLoader_LinkImports_PatchesRealStubFormat`) builds the real table
+formats directly in memory and verifies both the in-range J-instruction patch and the out-of-range
+jr-ra fallback, including reconstructing the real MIPS J-type target (top 4 bits from the executing
+PC) to confirm it lands exactly on the intended function. Full smoke suite green; 9-title
+cross-check byte-identical to baseline.
+
 ---
 
 ## 7. What DetPS2 must implement (BIOS order, not game PCs)
@@ -320,6 +376,7 @@ Optional later: execute relocated BIOS IRX on IOP R3000 (large). Until then, HLE
 | CDVDFSV SCMD/NCMD | `RealSifRpc.HandleCdScmd` + NCMD read/GetToc | Full real command-set port (§6.1), 2026-07-29 |
 | SIFMAN | *(not a port target)* | Ground-truthed (§6.3) — real job is IOP DMAC/SBUS register programming; DetPS2's `Sif.cs` already implements the functional result via a different, working mechanism. |
 | THREADMAN (full scheduler) | `KernelState` (different implementation) | Ground-truthed real scope (§6.4) — 80 real functions incl. priority ready-queues, Mbx/Vpl/Fpl, real stack-overflow detection; DetPS2's existing sema-count/waiter-queue implementation is a different, working contract, not a literal port. |
+| **LOADCORE cross-module linking** | `IrxLoader.ScanExports`/`LinkImports`, wired into `IopModuleHost.LoadIrx` | **Full real port** (§6.5), 2026-07-29 — real export-table/import-stub format, real J-instruction stub patching, verified against real extracted BIOS modules (SYSMEM/THREADMAN/SIFMAN/SIFCMD/etc. all produce correct real library names+function pointers). Also fixed a real module-spacing overlap bug found along the way. |
 | LOADFILE / SYSMEM / FILEIO | `RealSifRpc` + disc IRX load / getstat/dir | RPC sid handlers (functionally equivalent, not literal transliteration — see §6) |
 | PADMAN / MCSERV | `HandlePad` / `HandleMcServ` | Open/read/getInfo |
 | EE INTC + full GPR | `Intc` / `KernelState.SaveFullContext` | Prior session |

@@ -1076,7 +1076,7 @@ if (args.Length > 0 && args[0].Equals("elf-sections", StringComparison.OrdinalIg
 // Standalone from any BIOS/disc boot so a single extracted module can be verified in isolation.
 if (args.Length > 0 && args[0].Equals("load-irx", StringComparison.OrdinalIgnoreCase))
 {
-    if (args.Length < 2) { Console.WriteLine("usage: detps2 load-irx <filePath> [--dump=ADDR:LEN]"); Environment.Exit(1); }
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 load-irx <filePath> [--dump=ADDR:LEN] [--scan-exports] [--link=<otherFile>...]"); Environment.Exit(1); }
     byte[] elf = File.ReadAllBytes(args[1]);
     var mem = new SystemMemory();
     var result = IrxLoader.Load(elf, mem);
@@ -1090,6 +1090,15 @@ if (args.Length > 0 && args[0].Equals("load-irx", StringComparison.OrdinalIgnore
         uint dlen = parts.Length > 1 ? Convert.ToUInt32(parts[1], 16) : 0x40u;
         for (uint o = 0; o < dlen; o += 4)
             Console.WriteLine($"  0x{dstart + o:X8}: 0x{mem.Read32(dstart + o):X8}  {EeDisassembler.Disassemble(dstart + o, mem.Read32(dstart + o))}");
+    }
+    if (result.Success && args.Any(a => a == "--scan-exports"))
+    {
+        uint scanEnd = result.LoadBase + Math.Max(result.Size, 0x4000u);
+        Console.WriteLine($"scan range: 0x{result.LoadBase:X8}..0x{scanEnd:X8} (real size=0x{result.Size:X})");
+        var exports = IrxLoader.ScanExports(mem, result.LoadBase, scanEnd);
+        Console.WriteLine($"exports found: {exports.Count}");
+        foreach (var e in exports)
+            Console.WriteLine($"  lib={e.Name} v{e.VersionMajor}.{e.VersionMinor} funcs={e.Exports.Length} [{string.Join(",", e.Exports.Take(5).Select(x => $"0x{x:X8}"))}{(e.Exports.Length > 5 ? ",..." : "")}]");
     }
     Environment.Exit(result.Success ? 0 : 1);
 }

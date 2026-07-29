@@ -192,7 +192,21 @@ public sealed class IopModuleHost
 
     public bool TryGetIrx(int id, out LoadedIrx irx) => _irxById.TryGetValue(id, out irx!);
 
-    /// <summary>Load IRX ELF bytes into IOP RAM and register module name.</summary>
+    // Real cross-module import/export linking registry (IrxLoader.ScanExports/LinkImports,
+    // ground-truthed against the real BIOS LOADCORE module — see IrxLoader.cs's own doc comment
+    // on the export/import table format). Keyed by library name; a module registered later with
+    // the same name replaces the earlier entry, matching real LOADCORE's own "last one wins for
+    // a given name" linked-list-prepend behavior (DAT_00001c70 in the real decompile).
+    private readonly Dictionary<string, IrxLoader.ExportTable> _exportRegistry = new(StringComparer.Ordinal);
+    public IReadOnlyDictionary<string, IrxLoader.ExportTable> ExportRegistry => _exportRegistry;
+    public ulong ImportsResolved { get; private set; }
+    public ulong ImportsUnresolved { get; private set; }
+
+    /// <summary>Load IRX ELF bytes into IOP RAM, register module name, and perform real
+    /// cross-module linking: register any libraries this module exports, then resolve this
+    /// module's own unresolved imports against every library registered so far (real boot order
+    /// matters exactly as on real hardware — a module can only call into libraries loaded before
+    /// it).</summary>
     public IrxLoader.LoadResult LoadIrx(byte[] elf, SystemMemory mem, string? nameOverride = null)
     {
         uint baseLocal = _nextIopBase;
@@ -212,8 +226,28 @@ public sealed class IopModuleHost
             LoadBase = result.LoadBase,
             Segments = result.Segments
         };
-        // Advance base for next load (16KB align)
-        _nextIopBase = baseLocal + 0x4000;
+
+        // Real cross-module linking: scan this module's own real loaded extent (result.Size,
+        // not a fixed guess) for both directions (it may both export libraries and import from
+        // earlier ones). Real BIOS modules vary a lot in size — e.g. THREADMAN's real loaded
+        // size is 0x6C94 (~27KB), confirmed live via `load-irx --scan-exports` against the real
+        // extracted module, well past a fixed 16KB window.
+        uint moduleSize = Math.Max(result.Size, 0x1000u); // sane floor for the legacy no-Size path
+        uint scanStart = result.LoadBase;
+        uint scanEnd = result.LoadBase + moduleSize;
+        foreach (var lib in IrxLoader.ScanExports(mem, scanStart, scanEnd))
+            _exportRegistry[lib.Name] = lib;
+        var (resolved, unresolved) = IrxLoader.LinkImports(mem, scanStart, scanEnd, _exportRegistry);
+        ImportsResolved += (ulong)resolved;
+        ImportsUnresolved += (ulong)unresolved;
+
+        // Advance base for next load, rounded up to a 16KB boundary past this module's real
+        // extent — previously a fixed +0x4000 regardless of real size, which silently let a
+        // module bigger than 16KB (confirmed real: THREADMAN) have its own tail overwritten by
+        // whatever loaded right after it.
+        uint afterModule = baseLocal + moduleSize;
+        _nextIopBase = (afterModule + 0x3FFFu) & ~0x3FFFu;
+        if (_nextIopBase <= baseLocal) _nextIopBase = baseLocal + 0x4000; // overflow guard
         if (_nextIopBase > 0x00180000) _nextIopBase = IrxLoader.DefaultLoadBase;
         IrxLoads++;
         return new IrxLoader.LoadResult

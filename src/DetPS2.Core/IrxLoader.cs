@@ -44,6 +44,10 @@ public static class IrxLoader
         public string ModuleName { get; init; } = "";
         public ushort VersionMajor { get; init; }
         public ushort VersionMinor { get; init; }
+        /// <summary>Real loaded module size in bytes (highest section end, module-relative) —
+        /// the real extent to scan for export/import tables over, not a fixed guess. 0 for the
+        /// legacy PT_LOAD-only path (no section-level size tracking).</summary>
+        public uint Size { get; init; }
     }
 
     // Confirmed live (2026-07-28) against a real disc IRX (IOP/CDVDSTM.IRX): the real value is
@@ -172,6 +176,7 @@ public static class IrxLoader
             ModuleName = string.IsNullOrEmpty(name) ? "IRX" : name,
             VersionMajor = verMajor,
             VersionMinor = verMinor,
+            Size = highestEnd,
         };
     }
 
@@ -234,6 +239,15 @@ public static class IrxLoader
                     memory.Write32(instrAddr, newInstr);
                     break;
                 }
+                case 2: // R_MIPS_32 — full-address add to a raw 32-bit data word. Not observed in
+                    // the original disc-file ground-truthing pass (CDVDSTM/PADMAN), but confirmed
+                    // real and necessary via a second, independent ground-truth source: the real
+                    // BIOS LOADCORE module's own relocation processor (FUN_0000165c, tools/
+                    // bios-decomp/LOADCORE_ALL.txt), case '\x02': `*puVar7 = *puVar7 + iVar11`,
+                    // a plain full-base add — exactly this. Needed for e.g. export-table function-
+                    // pointer arrays, which are raw data words, not instruction encodings.
+                    memory.Write32(instrAddr, instr + fullBase);
+                    break;
                 case 5: // R_MIPS_HI16 — buffer until the matching LO16 arrives
                     pendingHi16.Add(instrAddr);
                     break;
@@ -267,10 +281,10 @@ public static class IrxLoader
                     break;
                 }
                 default:
-                    // R_MIPS_32 and others exist in the ABI but weren't observed in any real
-                    // sample this loader was ground-truthed against; leave unpatched rather than
-                    // guess, so a title that needs one fails loudly (wrong code) instead of
-                    // silently (a plausible-looking but wrong patch).
+                    // Other ABI relocation types exist but weren't observed in any real sample
+                    // this loader was ground-truthed against; leave unpatched rather than guess,
+                    // so a title that needs one fails loudly (wrong code) instead of silently (a
+                    // plausible-looking but wrong patch).
                     break;
             }
         }
@@ -508,6 +522,136 @@ public static class IrxLoader
         WriteShdr(4, shNameOffsets[4], 3 /*STRTAB*/, 0, 0, (uint)shstrtabOff, (uint)shstrtab.Length);
 
         return elf;
+    }
+
+    // ---- Real cross-module import/export linking ----
+    //
+    // Ground-truthed 2026-07-29 from the real BIOS LOADCORE module's own decompiled linking
+    // routines (tools/bios-decomp/LOADCORE_ALL.txt) -- this is what actually resolves an IRX
+    // module's calls into another module's exported functions on real hardware. Not guessed:
+    // every constant and field offset below was read directly out of LOADCORE.IRX's own code.
+    //
+    // Export table (a module that provides a library embeds one of these per exported library,
+    // e.g. THREADMAN embeds separate tables for "thbase"/"thevent"/"thsema" etc.):
+    //   +0x00 magic 0x41C00000
+    //   +0x04 next (runtime-only linked-list pointer -- always 0 in a freshly loaded module)
+    //   +0x08 version (u16; real code reads it as `ushort >> 8`, i.e. the upper byte is major)
+    //   +0x0A flags/id (u16, LOADCORE's own bookkeeping -- irrelevant to a static export table)
+    //   +0x0C name (8 bytes, NUL-padded ASCII library id, e.g. "thbase\0\0")
+    //   +0x14 exports[] -- NUL-terminated array of real (already-relocated) function pointers
+    //
+    // Import stub (an unresolved call into another module's library, one 2-word pair per call
+    // site, confirmed live against real disc IRX files in an earlier pass this session):
+    //   [0] placeholder (patched in place once resolved)
+    //   [1] `addiu zero,zero,ORDINAL` (opcode 9; low 16 bits = the ordinal index into the
+    //       target library's exports[] array) -- this is what marks the stub as unresolved
+    //
+    // Resolution (LOADCORE's real FUN_00001064, transliterated exactly): for each stub whose
+    // word[1] is still an ADDIU (opcode 9), if the ordinal is within the target library's real
+    // export count, patch word[0] to a real `J exports[ordinal]` instruction
+    // (`(target >> 2) & 0x3FFFFFF | 0x08000000`); otherwise patch it to `jr ra` (0x03E00008) --
+    // a safe no-op for an export the target library doesn't actually provide at this version.
+
+    public const uint ExportTableMagic = 0x41C00000;
+    public const uint ImportStubMagic = 0x41E00000;
+    private const uint OpcodeAddiu = 9;
+    private const uint InstrJrRa = 0x03E00008;
+    private const int MaxExportsPerTable = 512; // sanity bound, real tables are a few dozen entries
+
+    public sealed class ExportTable
+    {
+        public string Name { get; init; } = "";
+        public byte VersionMajor { get; init; }
+        public byte VersionMinor { get; init; }
+        public uint[] Exports { get; init; } = Array.Empty<uint>();
+    }
+
+    /// <summary>Scans a loaded (and already-relocated) module's memory range for real
+    /// 0x41C00000-tagged export tables and returns everything it finds. Call after `Load`
+    /// succeeds, over `[result.LoadBase, result.LoadBase + moduleSize)`.</summary>
+    public static List<ExportTable> ScanExports(SystemMemory memory, uint rangeStart, uint rangeEnd)
+    {
+        var found = new List<ExportTable>();
+        for (uint addr = rangeStart; addr + 0x14 <= rangeEnd; addr += 4)
+        {
+            if (memory.Read32(addr) != ExportTableMagic) continue;
+            ushort ver = (ushort)(memory.Read8(addr + 8) | (memory.Read8(addr + 9) << 8));
+            byte[] nameBytes = new byte[8];
+            for (int i = 0; i < 8; i++) nameBytes[i] = memory.Read8(addr + 0xC + (uint)i);
+            int nameLen = Array.IndexOf(nameBytes, (byte)0);
+            if (nameLen < 0) nameLen = 8;
+            if (nameLen == 0) continue; // not a real table -- reject empty/garbage name
+            string name = Encoding.ASCII.GetString(nameBytes, 0, nameLen);
+
+            var exports = new List<uint>();
+            uint p = addr + 0x14;
+            while (p + 4 <= rangeEnd && exports.Count < MaxExportsPerTable)
+            {
+                uint fn = memory.Read32(p);
+                if (fn == 0) break;
+                exports.Add(fn);
+                p += 4;
+            }
+            found.Add(new ExportTable
+            {
+                Name = name,
+                VersionMajor = (byte)(ver >> 8),
+                VersionMinor = (byte)(ver & 0xFF),
+                Exports = exports.ToArray(),
+            });
+        }
+        return found;
+    }
+
+    /// <summary>Scans a loaded module's memory range for real 0x41E00000-tagged import-stub
+    /// tables and resolves every still-unresolved stub against <paramref name="registry"/>
+    /// (keyed by library name; version-major mismatches are treated as unavailable, matching
+    /// LOADCORE's own real version-compatibility check). Returns (resolved, unresolved) counts.
+    /// Call after `ScanExports` has registered every already-loaded module's exports (real boot
+    /// order matters here exactly as it does on real hardware: a module can only resolve calls
+    /// into libraries that have already been loaded and registered).</summary>
+    public static (int resolved, int unresolved) LinkImports(SystemMemory memory, uint rangeStart, uint rangeEnd,
+        IReadOnlyDictionary<string, ExportTable> registry)
+    {
+        int resolved = 0, unresolved = 0;
+        for (uint addr = rangeStart; addr + 0x14 <= rangeEnd; addr += 4)
+        {
+            if (memory.Read32(addr) != ImportStubMagic) continue;
+            ushort ver = (ushort)(memory.Read8(addr + 8) | (memory.Read8(addr + 9) << 8));
+            byte verMajor = (byte)(ver >> 8);
+            byte[] nameBytes = new byte[8];
+            for (int i = 0; i < 8; i++) nameBytes[i] = memory.Read8(addr + 0xC + (uint)i);
+            int nameLen = Array.IndexOf(nameBytes, (byte)0);
+            if (nameLen < 0) nameLen = 8;
+            if (nameLen == 0) continue;
+            string name = Encoding.ASCII.GetString(nameBytes, 0, nameLen);
+
+            registry.TryGetValue(name, out var lib);
+            bool versionOk = lib != null && lib.VersionMajor == verMajor;
+
+            uint p = addr + 0x14;
+            while (p + 8 <= rangeEnd)
+            {
+                uint word0Addr = p;
+                uint word1 = memory.Read32(p + 4);
+                if ((word1 >> 26) != OpcodeAddiu) break; // not (or no longer) an unresolved stub
+                uint ordinal = word1 & 0xFFFF;
+                if (versionOk && ordinal < (uint)lib!.Exports.Length)
+                {
+                    uint target = lib.Exports[(int)ordinal];
+                    uint jInstr = ((target >> 2) & 0x03FFFFFFu) | 0x08000000u;
+                    memory.Write32(word0Addr, jInstr);
+                    resolved++;
+                }
+                else
+                {
+                    memory.Write32(word0Addr, InstrJrRa);
+                    unresolved++;
+                }
+                p += 8;
+            }
+        }
+        return (resolved, unresolved);
     }
 
     private static LoadResult Fail(string m) => new() { Success = false, Message = m };
