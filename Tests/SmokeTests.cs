@@ -666,6 +666,7 @@ public static class SmokeTests
             BiosBootHost_IopBtConfContracts();
             BiosHle_FileIoGetstatAndCdvdSectors();
             BiosHle_IopSystemIntrAndTime();
+            IopExcepMan_PriorityOrderedRegistration();
 
             // Phase 15
             Ee_NorSlt_Ops();
@@ -2426,6 +2427,39 @@ public static class SmokeTests
         if (sys.Memory.Read32(0x00778800) != 1)
             throw new Exception("EE SIF ready slot 0 not planted");
         Console.WriteLine($"[Smoke] BiosHle_IopSystemIntrAndTime OK (clk={sys.IopSystem.SystemClock})");
+    }
+
+    /// <summary>Real BIOS EXCEPMAN.IRX handler registration (Ghidra-decompiled
+    /// tools/bios-decomp/EXCEPMAN_ALL.txt, FUN_00000134/FUN_00000264): priority-ordered chain per
+    /// exception code, real result codes (-50 invalid excCode, -51 not found), out-of-range
+    /// excCode rejected.</summary>
+    public static void IopExcepMan_PriorityOrderedRegistration()
+    {
+        var sys = new Ps2System();
+        var em = sys.IopExcepMan;
+
+        if (em.RegisterExceptionHandler(8, 0x1000) != IopExcepManHost.ResultOk)
+            throw new Exception("register excCode 8");
+        if (em.HandlerCount(8) != 1) throw new Exception("handler count after 1 register");
+
+        // Lower priority value = dispatched first; a higher-priority (numerically lower)
+        // handler registered second must still end up ahead of the default-priority one.
+        if (em.RegisterPriorityExceptionHandler(8, 1, 0x2000) != IopExcepManHost.ResultOk)
+            throw new Exception("register higher-priority handler");
+        if (em.HandlerCount(8) != 2) throw new Exception("handler count after 2 registers");
+
+        if (em.RegisterExceptionHandler(0x10, 0x3000) != IopExcepManHost.ResultInvalidExCode)
+            throw new Exception("excCode 0x10 should be rejected (real bound is < 0x10)");
+        if (em.ReleaseExceptionHandler(8, 0x9999) != IopExcepManHost.ResultNotFound)
+            throw new Exception("releasing an unregistered handler should report not-found");
+
+        ulong rebuildsBefore = em.RebuildCount;
+        if (em.ReleaseExceptionHandler(8, 0x1000) != IopExcepManHost.ResultOk)
+            throw new Exception("release registered handler");
+        if (em.HandlerCount(8) != 1) throw new Exception("handler count after release");
+        if (em.RebuildCount <= rebuildsBefore) throw new Exception("dispatch chain should rebuild on every registry change");
+
+        Console.WriteLine("[Smoke] IopExcepMan_PriorityOrderedRegistration OK");
     }
 
     public static void KernelHle_WaitVblank_ClearsOnPcrtc()

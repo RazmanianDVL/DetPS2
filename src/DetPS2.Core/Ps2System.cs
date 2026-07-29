@@ -65,6 +65,13 @@ public sealed class Ps2System
     /// </summary>
     public IopSystemHost IopSystem { get; } = new();
 
+    /// <summary>
+    /// BIOS EXCEPMAN.IRX HLE — real per-exception-code, priority-ordered handler registration
+    /// (distinct from IopSystem's INTRMAN interrupt registry — see IopExcepManHost's own doc
+    /// comment for the real architectural distinction).
+    /// </summary>
+    public IopExcepManHost IopExcepMan { get; } = new();
+
     public Scheduler Scheduler { get; }
 
     /// <summary>
@@ -678,6 +685,7 @@ public sealed class Ps2System
         BiosBoot.Reset();
         IopVblank.Reset();
         IopSystem.Reset();
+        IopExcepMan.Reset();
     }
 
     /// <summary>Phase 21: boot harness JSON including telemetry blockers.</summary>
