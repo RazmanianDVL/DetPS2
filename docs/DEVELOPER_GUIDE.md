@@ -4921,6 +4921,60 @@ would confirm whether it's even being reached versus the trace's sampled PC just
 SDRDRV between other threads' work. `--trace-threads` across the 55M-cyc mark would also show
 whether the post-gate flow actually moves to a *different* thread than the one polling SDRDRV.
 
+**Immediate follow-up, same session: found the answer to §7.25's own "next step" — `FUN_0026fd80`
+has never actually executed.** Ghidra-traced the real call chain one layer further to identify what
+`MaybeCompleteResourceLoadGate`'s forced `0x00678458+0x48=1` was really supposed to represent, and
+found real double-indirection the existing HLE gate doesn't account for:
+- `FUN_0026fbf0(0x678458)` (the poll `FUN_0026fd80` spins on) calls `FUN_0043e058(*param_1)` — i.e.
+  it dereferences `0x678458` *first*; the literal address `0x678458` is a pointer slot, not the
+  handle itself.
+- `FUN_0043e058(handle)` only enters its real polling logic `if (*(handle+4) == 2)`, and when it does,
+  calls `FUN_00450298(*(handle+0x3c))` — another pointer dereference, not a direct field read.
+- `FUN_00450298(subhandle)` finally reads `*(subhandle+0x48)` — confirmed this is the actual raw
+  status field. Its real caller logic: default `iVar1=4` (done), demoted to `iVar1=1` (in-progress) if
+  the read value is `>= 0`, further demoted to `iVar1=2` (error) if it's exactly `4` or `6`. **The
+  real "done" sentinel is a *negative* value at that innermost field — not the `1` the existing HLE
+  gate writes.** Writing `1` (which is `>= 0`) makes this resolve to `iVar1=1` ("still loading"),
+  which is very likely why the gate's forced completion doesn't actually unblock forward progress
+  through this exact path even when it fires.
+
+**However, checking whether any of this chain is even real at runtime first (rather than fixing the
+sentinel value speculatively) found something more fundamental**: `--find-writer=00678458:4` over a
+fresh 200M-cycle run shows `cyc=0, pc=0x00000000` — this project's established "never tracked/written"
+sentinel (§7.19 first identified this convention). `FUN_0026fd80` unconditionally zeroes this exact
+address as its own first action (`FUN_0020f750(0x678458,0,0x208); DAT_00678458 = 0;`, both real
+stores that would register in the writer log if executed) — so this address showing "never written"
+means **`FUN_0026fd80` itself has never actually run for real in the traced boot**, at least not
+through this call path. This makes the entire `FUN_0043e058`/`FUN_00450298`/sentinel-value analysis
+above statically correct but **not applicable to what's currently happening at runtime** — the
+`0x00463bb8` PC sampled at the end of a 200M/400M run is not downstream of this level-load path at
+all under the current boot flow; it's concurrent SDRDRV audio work on a different code path entirely.
+
+**Corrected conclusion for whoever continues this**: don't apply a sentinel-value fix to
+`MaybeCompleteResourceLoadGate` based on the analysis above — it would be patching a completion for a
+structure real code has not yet initialized, which is very unlikely to have any effect and risks
+looking like a fix while changing nothing. The real open question is upstream: what does the boot
+path actually reach `FUN_0032ea08`/`FUN_0026fd80` from, and why isn't the current HLE-assisted boot
+getting there — is it a different level-select/menu-driven trigger the current gates don't fire,
+or is `0x678458` simply the wrong static address for this build (data section layout differs from
+what was assumed) and the real per-instance handle lives elsewhere? A `--pcbreak=0032ea08` run (this
+function's own entry, not its callee) would answer directly whether the level-load dispatcher itself
+is ever reached at all — that's the next concrete check, one level higher than everything traced in
+this section.
+
+**Ran that check.** `--pcbreak=0032ea08` (the level-load dispatcher's own entry, not a callee) over a
+full 200M-cycle run: **zero hits.** `FUN_0032ea08` — and by extension everything traced in this
+section (`FUN_0026fd80`, `FUN_0026fbf0`, `FUN_0043e058`, `FUN_00450298`, the `0x678458` handle chain,
+FUN_00463948's SDRDRV pump) — is **not currently reachable at all** from the traced boot path. This
+whole thread (§7.24's original find plus this session's follow-up) is a real, verified, but currently
+**dormant** code path — accurate for whatever boot state would reach it, but not the cause of the
+current `px` plateau. That plateau's real cause is upstream of level-load entirely: still somewhere
+in boot/menu/logo territory. **Do not resume from `FUN_0026fd80` next time** — the next session should
+restart from a fresh, undirected trace of where the current boot's PC actually spends its time between
+the ADX-gate firing (cyc≈18M) and the plateau (`px` frozen from at least cyc=100M onward this run),
+e.g. a `PcProfiler`-style hot-address histogram rather than assuming any address from this section's
+analysis is on the live path.
+
 ---
 
 ## 8. Save states & determinism contracts
