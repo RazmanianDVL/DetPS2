@@ -245,6 +245,55 @@ and their real dispatchers.
 
 ---
 
+## 6.2 IOMAN — real file-descriptor table (2026-07-29)
+
+Ghidra-decompiled in full (`tools/bios-decomp/IOMAN_ALL.txt`, 39 real functions). Confirmed: real
+`sceOpen`/`sceClose`/`sceRead`/`sceWrite`/`sceLseek`/`sceIoctl`/`sceRemove`/`sceMkdir`/`sceRmdir`/
+`sceDopen`/`sceDclose`/`sceDread`/`sceGetstat`/`sceChstat`/`sceFormat` all dispatch through one
+16-slot file-descriptor table (`FUN_00000b98` allocates, `FUN_00000c3c` validates — bound confirmed
+independently from both sides) shared between file and directory opens (`sceDopen` calls the exact
+same allocator as `sceOpen`), returning real errno `-24` (EMFILE, the module's own debug string is
+literally "out of file descriptors") on exhaustion. DetPS2's own fd allocator had no such bound.
+Ported into `IopModuleHost.FileOpen`/`DirOpen` (`SifRpc.cs`) — real 16-slot shared-pool bound, real
+exhaustion errno, verified with a new smoke test and zero cross-title regression.
+
+**Not yet ported**: the real device-path parser (`FUN_00000d28` — colon-delimited device name with
+optional trailing-digit unit-number extraction, e.g. `mc0:` → device `mc` unit `0`) and the real
+`AddDrv`/`DelDrv` device-registry (`FUN_00000e8c`/`FUN_00000f44`). DetPS2 currently only special-cases
+`cdrom0:`/`cdrom:` path prefixes rather than a general device registry, because it doesn't yet have
+multiple distinct real backing-store implementations (host0:/mc0:/pfs0: all funnel through the same
+code paths today) for a general dispatcher to route between — porting the full registry doesn't have
+a behavioral payoff until that changes, so it's deliberately deferred rather than half-done.
+
+## 6.3 SIFMAN — ground-truthed, not a literal-port candidate (2026-07-29)
+
+Ghidra-decompiled in full (`tools/bios-decomp/SIFMAN_ALL.txt`, 27 real functions). Confirmed this
+module's real job is **direct physical DMAC/SBUS register programming** — every function pokes real
+IOP hardware register addresses (`0xBF8010xx`/`0xBF8015xx`/`0xBD0000xx`, the real SIF0/SIF1/SIF2 DMA
+channel + SBUS control registers), not a software-level transport abstraction. DetPS2's existing
+`Sif.cs` already implements the *functional result* SIFMAN exists to provide (reliable EE↔IOP byte
+transport) via its own working, extensively-verified mechanism — a literal port of SIFMAN's raw
+register pokes would require first building real IOP-side DMAC hardware register emulation from
+scratch (mirroring what `Dmac.cs` already does for the EE side), a much bigger prerequisite with no
+clear payoff over the working abstraction that already exists. Documented as ground-truthed and
+deliberately not ported, rather than silently skipped.
+
+## 6.4 THREADMAN — real scope larger than currently ported (2026-07-29)
+
+Ghidra-decompiled in full (`tools/bios-decomp/THREADMAN_ALL.txt`, 80 real functions — the largest
+BIOS module). Confirmed this is the complete real-time kernel: priority-based ready queues (not just
+sema counting), message boxes (Mbx), variable/fixed memory pools (Vpl/Fpl), and — notably — **real
+per-thread stack-overflow detection** (`FUN_00001cfc`/"CheckThreadStack()": compares current SP
+against `thread+0x3c`'s stack-limit field with a 168-byte margin, panics if exceeded). DetPS2's
+existing `KernelState` (round-robin + real sema count/waiter-queue semantics, already verified
+working extensively this session) is a different, working implementation of the same contract, not a
+literal port of this module — replacing it wholesale would be a large architectural risk for
+uncertain payoff. The stack-overflow check specifically is a good candidate for a future, carefully
+isolated addition (diagnostic-only, shouldn't affect normal execution) but needs real verification
+against actual game stack-usage patterns before landing, not a rushed port.
+
+---
+
 ## 7. What DetPS2 must implement (BIOS order, not game PCs)
 
 1. **Present IOPBTCONF stack** as registered (names + RPC sids) before ELF entry — `BiosBootHost`.  
@@ -267,8 +316,10 @@ Optional later: execute relocated BIOS IRX on IOP R3000 (large). Until then, HLE
 | THREADMAN semas | `KernelState` + `SonyKernelHle` 0x40–0x48 | Count/wake/Poll/Delete/i* |
 | VBLANK IOP | `IopVblankHost` via `BiosHle.OnVblank` | Lists + event flag |
 | INTRMAN/TIMEMAN | `IopSystemHost` | Register IRQ / time — **contract only, not decompiled yet** |
-| **IOMAN** | `IopSystemHost` (device table only) | **Contract only** — real 39-function module extracted+decompiled (`tools/bios-decomp/IOMAN_ALL.txt`) 2026-07-29, real vtable-based device-driver dispatch (`sceOpen`/`sceClose`/`sceRead`/etc., `FUN_000000e8` et al.) not yet ported. **Next concrete target.** |
+| IOMAN fd table | `IopModuleHost.FileOpen`/`DirOpen` | Real 16-slot shared pool + real EMFILE errno ported (§6.2), 2026-07-29. Device registry/path-parser (`FUN_00000d28`/AddDrv/DelDrv) deliberately deferred, no payoff yet. |
 | CDVDFSV SCMD/NCMD | `RealSifRpc.HandleCdScmd` + NCMD read/GetToc | Full real command-set port (§6.1), 2026-07-29 |
+| SIFMAN | *(not a port target)* | Ground-truthed (§6.3) — real job is IOP DMAC/SBUS register programming; DetPS2's `Sif.cs` already implements the functional result via a different, working mechanism. |
+| THREADMAN (full scheduler) | `KernelState` (different implementation) | Ground-truthed real scope (§6.4) — 80 real functions incl. priority ready-queues, Mbx/Vpl/Fpl, real stack-overflow detection; DetPS2's existing sema-count/waiter-queue implementation is a different, working contract, not a literal port. |
 | LOADFILE / SYSMEM / FILEIO | `RealSifRpc` + disc IRX load / getstat/dir | RPC sid handlers (functionally equivalent, not literal transliteration — see §6) |
 | PADMAN / MCSERV | `HandlePad` / `HandleMcServ` | Open/read/getInfo |
 | EE INTC + full GPR | `Intc` / `KernelState.SaveFullContext` | Prior session |
