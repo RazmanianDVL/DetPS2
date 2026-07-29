@@ -709,6 +709,7 @@ public static class SmokeTests
             Irx_RealRelocation_ProducesCorrectAddresses();
             Romdir_ParseAndExtract_HandlesInterEntryPadding();
             IopModules_DefaultsIncludeMcmanLibsd();
+            IopModules_FileDescriptorTableRealBound();
             MemCard_FormatWriteRead();
 
             // Phase 23
@@ -3175,6 +3176,34 @@ public static class SmokeTests
         if (!sys.IopModules.IsModuleLoaded("LIBSD")) throw new Exception("LIBSD");
         if (!sys.IopModules.IsModuleLoaded("MCSERV")) throw new Exception("MCSERV");
         Console.WriteLine($"[Smoke] IopModules_DefaultsIncludeMcmanLibsd OK (n={sys.IopModules.ModuleCount})");
+    }
+
+    /// <summary>Real BIOS IOMAN.IRX file-descriptor table bound (Ghidra-decompiled
+    /// FUN_00000b98/FUN_00000c3c, tools/bios-decomp/IOMAN_ALL.txt): a fixed 16-slot table,
+    /// real errno -24 (EMFILE) on exhaustion, file and directory opens sharing the same pool.
+    /// Previously DetPS2's fd allocator had no bound at all.</summary>
+    public static void IopModules_FileDescriptorTableRealBound()
+    {
+        var sys = new Ps2System();
+        var iop = sys.IopModules;
+
+        var fds = new List<int>();
+        for (int i = 0; i < 16; i++)
+        {
+            int fd = iop.FileOpen($"host:probe{i}.txt", 0x200 /* O_CREAT */);
+            if (fd < 0) throw new Exception($"unexpected open failure at slot {i}: {fd}");
+            fds.Add(fd);
+        }
+        int overflow = iop.FileOpen("host:onemore.txt", 0x200);
+        if (overflow != -24)
+            throw new Exception($"17th open should fail with real errno -24 (EMFILE), got {overflow}");
+
+        // Closing one slot frees real capacity for the next open.
+        if (iop.FileClose(fds[0]) != 0) throw new Exception("close");
+        int reopened = iop.FileOpen("host:reopen.txt", 0x200);
+        if (reopened < 0) throw new Exception($"open after close should succeed, got {reopened}");
+
+        Console.WriteLine("[Smoke] IopModules_FileDescriptorTableRealBound OK");
     }
 
     public static void MemCard_FormatWriteRead()

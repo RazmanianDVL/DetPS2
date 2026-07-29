@@ -91,6 +91,18 @@ public sealed class IopModuleHost
     public const uint FioSIwusr = 0x0080;
     public const uint FioSIxusr = 0x0040;
 
+    // Real BIOS IOMAN.IRX file-descriptor table, ground-truthed via Ghidra decompile
+    // (tools/bios-decomp/IOMAN_ALL.txt) rather than assumed: FUN_00000b98 (fd allocator) scans a
+    // fixed 16-slot table (bound confirmed independently by FUN_00000c3c's `0xf < fd` validity
+    // check) and, when every slot is in use, returns real errno 24 (EMFILE, "out of file
+    // descriptors" -- the real BIOS's own debug string) rather than failing silently or growing
+    // unbounded. DetPS2's own fd numbering previously had no such limit at all (_nextFd just
+    // incremented forever) -- a title that deliberately exhausts descriptors to test its own
+    // error handling (a real, if uncommon, defensive pattern) would never see the failure path
+    // real hardware guarantees.
+    private const int IoManMaxDescriptors = 16;
+    private const int IoManErrnoOutOfDescriptors = -24;
+
     private sealed class OpenHostFile
     {
         public string Path = "";
@@ -354,10 +366,13 @@ public sealed class IopModuleHost
 
     // ---- Public FILEIO ops used by RealSifRpc sid=0x80000001 ----
 
-    /// <summary>fio open by path string; returns fd or -1.</summary>
+    /// <summary>fio open by path string; returns fd, or a real negative errno on failure
+    /// (-24/EMFILE when the real 16-descriptor table is full — see IoManMaxDescriptors's doc
+    /// comment).</summary>
     public int FileOpen(string path, int mode = 0)
     {
         if (string.IsNullOrEmpty(path)) return -1;
+        if (_hostFiles.Count >= IoManMaxDescriptors) return IoManErrnoOutOfDescriptors;
         int fd = _nextFd++;
         _openFiles[fd] = path;
         var hf = new OpenHostFile { Path = path, Position = 0 };
@@ -475,6 +490,9 @@ public sealed class IopModuleHost
 
     public int DirOpen(string path)
     {
+        // Real IOMAN.IRX's sceDopen (FUN_000004c0) allocates from the exact same 16-slot fd
+        // table as sceOpen (both call the same FUN_00000b98) -- not a separate pool.
+        if (_hostFiles.Count + _openDirs.Count >= IoManMaxDescriptors) return IoManErrnoOutOfDescriptors;
         string norm = NormalizeDiscPath(path ?? "");
         if (norm.Length == 0) norm = "";
         var list = new List<Iso9660.FileEntry>();
