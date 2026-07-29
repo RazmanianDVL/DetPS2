@@ -4773,6 +4773,69 @@ request could be queued through the older "DetPS2 RPC ABI" in `SifRpc.cs` (separ
 further — already tried to 400M cycles and confirmed a genuine plateau, not a "just needs more time"
 situation.
 
+**Follow-up, same session: fully traced `FUN_00414568`'s real dispatch path — and found the worker
+thread's own dispatch call is a dead end.** `FUN_004147f8` (the polling worker thread) calls
+`FUN_00427678()` → `FUN_00427518(6)`, which reads a callback table at EE vaddr `0x0075E7A0` (stride
+`0x48`=72 bytes, up to 5 sub-slots). **Live-dumped this entire table region (`0x0075E7A0`-`0x0075E8B4`)
+at 150M cycles: every word is zero.** Nothing is ever registered there — this specific dispatch call
+the worker thread makes every loop iteration is unconditionally a no-op, confirmed by direct memory
+inspection, not just static analysis.
+
+`FUN_00414568` is registered elsewhere entirely: `FUN_00427410(6, 0x414568, 0)` (called from the CRI
+ADX init function, `FUN_00414d40`) writes into a *different* table at EE vaddr `0x0075E9E0` (stride 8
+— just one function pointer + one arg per group, no sub-slots). Found this table's real reader via a
+Ghidra XREF search (`FindTableReaders.java`, retargeted from its original one-off use): only one
+function, `FUN_00427468(group)`, reads it — and its only caller is `FUN_0043f370()` → `FUN_00427468(6)`,
+which is itself only called from three functions in the `0x43xxxx` resource/streaming-manager region
+(`FUN_0043ce78`, `FUN_0043ef98`, `FUN_0043fdd8`), each gated by its own conditions (a countdown-tick
+counter that only fires every Nth call; an "only pump the queue if nothing is currently loading"
+check; etc.) — i.e. this looks like a per-frame or per-streaming-tick "pump the CRI ADX event queue if
+idle" call, not something reachable from the boot sequence's current code path at all.
+
+**This reframes the blocker again**: it's not that a specific SIF RPC response or kernel primitive is
+wrong — it's that boot hasn't yet reached the point where the game's main loop or streaming-tick code
+(whatever calls into `FUN_0043ce78`/`FUN_0043ef98`/`FUN_0043fdd8`) starts running at all, or those
+functions' own internal gating conditions (`DAT_0055e1e8` countdown, "nothing loading" check) are never
+satisfied yet.
+
+**Follow-up, same session: traced this all the way to a stuck resource-load poll loop — CRI ADX was a
+downstream symptom, not the root cause.** Confirmed live that `DAT_0055e1e8` (`FUN_0043ce78`'s own
+countdown gate) has **never been written even once** (`--find-writer=55E1E8` shows `cyc=0, pc=0x0` —
+DetPS2's "never tracked" sentinel) across a 150M-cycle run — meaning `FUN_0043ce78` itself has never
+run at all, confirmed independently of the earlier static-analysis inference. A `--pcbreak` check on
+one of its callers (`0x002700F0`) also shows zero hits in the same window.
+
+Decompiled that caller (`FUN_0026fd80`, real EE vaddr `0x2700f0`'s containing function): it's a real
+**resource/level load-and-wait routine**. It builds a load request, calls `FUN_0026f918` to kick it
+off, then spins:
+```c
+do {
+    FUN_00272b28();               // pump/tick call
+    lVar4 = FUN_0026fbf0(0x678458);  // poll: 0=still loading, else done/error
+    lVar6 = (DAT_00678644 != 1) ? lVar4 : 3;
+} while (lVar6 == 0);
+DAT_00678650 = 0;
+...
+FUN_0043ce78();   // the CRI ADX tick call from earlier -- only reached AFTER this loop exits
+```
+`FUN_0026fbf0` polls `FUN_0043e058(*param_1)`, which checks a raw status field at `handle+0x48`
+(through `FUN_00450298`, itself just a field read behind a lock call) — this bottoms out in what
+looks like a real async I/O completion status, most likely CD/file read completion given the whole
+call chain's shape (a `t_ExecData`-shaped struct being built, a "load timeout after N frames" check
+comparing against 10/300 in the caller). **Not yet identified**: what code is actually supposed to
+write that status field on completion, and whether the underlying I/O request ever gets serviced by
+DetPS2's CD/file-read HLE at all.
+
+**Corrected takeaway for future work**: the CRI ADX audio thread investigation (worker thread
+`FUN_004147f8`, `SidCriAdx` fno 2/3, etc.) was chasing a real but *downstream* symptom — that
+subsystem simply hasn't started yet because it's gated behind this resource-load completion. Next
+step for whoever picks this up: don't go back to CRI ADX. Instead, trace `FUN_0026f918` (the load
+kickoff, real vaddr `0x26f918`) to find exactly what I/O primitive it issues (worth checking whether
+it's a real SIF RPC this session's `unknown sid=`/`DETPS2_TRACE_RPC` tooling would show, a raw CD
+sector read via `Cdvd.cs`, or something else), then check whether DetPS2 ever completes it. The
+`--find-writer`/`--pcbreak` techniques used throughout this session (live-verify a hypothesis against
+actual memory/PC state, don't just trust static analysis) are the right tools to keep using here.
+
 ---
 
 ## 8. Save states & determinism contracts
