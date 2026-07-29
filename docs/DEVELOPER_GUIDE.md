@@ -4853,6 +4853,74 @@ of this session's work even though the root I/O primitive itself wasn't identifi
 `--find-writer`/`--pcbreak` techniques used throughout this session (live-verify a hypothesis against
 actual memory/PC state, don't just trust static analysis) are the right tools to keep using here.
 
+### 7.25 A title-scoped HLE gate (`MaybeCompleteAdxInitGate` / `MaybeCompleteResourceLoadGate`) was added since §7.24 — re-verified live, then a wrong new hypothesis chased and corrected (2026-07-29)
+
+Follow-up session, picking up task "find Shaolin Monks' missing async completion." Between §7.24 and
+this session, `MidwayBootAssist.cs` gained two HLE gates not documented in this log yet:
+`MaybeCompleteAdxInitGate` (plants the six `FUN_00414ed0`-shaped ready flags at `0x5341D8`+ and
+drains the `0x534124` refcount once real SIF/RPC activity looks established — the exact "title-
+specific HLE shortcut" §7.21 flagged as the pragmatic alternative to real IOP execution) and
+`MaybeCompleteResourceLoadGate` (forces `0x00678458+0x48` — the status field `FUN_0026fbf0`/
+`FUN_0043e058` polls, per §7.24's own trace — to `1` once CDVD streaming looks WAD-scale-complete).
+**Both are synthetic completions, not real fixes**: they get the boot past the two wait loops this
+log traced, but they do not deliver whatever the real IOP-side completion would actually deliver.
+Confirmed both fire correctly on a fresh 200M-cycle run (`DETPS2_TRACE_BIOS=1`): `MaybeCompleteAdxInitGate`
+at cyc=18,000,000, `MaybeCompleteResourceLoadGate` at cyc=55,000,000 (`fixed=1 cdvd=198840`).
+
+**Re-verified `find-writer` on `0x006784A0` (the forced status field) to make sure the gate's own
+write was the only one** — confirmed: `last written at cyc=54999984 pc=0x004181B0 value=1`. The `pc`
+value here is `EE.PC` at the moment `MaybeCompleteResourceLoadGate`'s `mem.Write32` call runs, **not**
+a real store instruction — `SystemMemory`'s last-writer tracking stamps whatever the interpreter's
+current PC happens to be regardless of whether the call came from real CPU execution or host C# code
+poking memory directly, so a plausible-looking `pc=0x004181B0` here does **not** mean real game code
+wrote this field. Worth fixing that instrumentation gap if this tracking is relied on again — right
+now a synthetic write and a real one are indistinguishable in the log.
+
+**New wrong turn, then corrected**: with both gates confirmed firing, `blocker-trace --cycles=200000000
+--host-present` lands at `PC=0x0048073C` (`px=32,399,360`); extending to 400M cycles moves `PC` to
+`0x00463BB8` while `px` stays **exactly** flat (`32,399,360` at both checkpoints) and `RealSifRpc.Calls`
+more than doubles (1718→4148) — real forward CPU progress with zero rendering progress, the same
+"stuck poll loop" signature as §7.24. Ghidra-decompiled the containing function
+(`FUN_00463948`, `shaolin_boot.elf`'s own Ghidra project, not the BIOS) and its callees
+(`FUN_00382b00`, `FUN_004836c0`, `FUN_004834e0`, `FUN_00462fd8`) and initially misread this as a
+**new** undiscovered CD-read pump: a two-state (issue/poll) loop building a 4-word command block,
+calling `sceSifSetDma`+`sceSifDmaStat` (confirmed real, named symbols — direct SIF0 DMAC register
+pokes at `0x1000c0xx`/`0x1000f2xx`, the hardware layer underneath SifCmd, not the RPC layer itself),
+then `FUN_00382b00(1, 0x80f0/0x80d0, ...)` — dispatch codes `0x8130/0x8140/0x8160/0x8170/0x81a0-
+0x81d0/0x9000-range` that looked at first like a proprietary CD command table.
+
+**Traced `FUN_004836c0`/`FUN_004834e0` down to the real primitive and found they call
+`FUN_00482c20(0xffffffff8000000a, ...)` / `FUN_00482c20(0xffffffff80000009, ...)`** — the literal
+real SIFCMD `CID_RPC_CALL`/`CID_RPC_BIND` constants (`0x8000000A`/`0x80000009`) this project already
+ground-truthed (§3). So `FUN_00382b00`'s dispatch codes are real RPC `fno` values, not a proprietary
+CD table. **Traced the actual bind** (`FindBindRpcSids.java`, backward-scanning callers of
+`FUN_004834e0` for the literal `lui a1,0x8000 / ori a1,a1,NNN` sid pattern): the client struct at EE
+vaddr `0x757340` (`FUN_003829c0`, real vaddr `0x3829e8`) binds **sid `0x80000701`**.
+
+**That sid is not new — it's already `RealSifRpc.SidSdReg`**, Midway/Surreal's raw SPU2-register
+driver (SDRDRV.IRX), ground-truthed and implemented in an earlier session (see the field's own doc
+comment). Its real dispatch masks `fno & 0xFFF0` across a 24-voice, `0x10`-byte-stride register
+block — and `0x8130/0x8140/.../0x81d0` divided by `0x10` land exactly in voice-index range,
+confirming this. **Correction: `FUN_00463948` is a real, legitimate SPU2 voice-register/sample-DMA
+streaming pump (audio), not a stalled CD-read primitive.** `SidSdReg` already replies 0-for-success
+for every fno, so this pump is not blocked by DetPS2 — it runs correctly, which is exactly why `PC`
+advances freely through it over the 200M→400M window while contributing nothing to `px` (audio
+writes don't touch the GS). Not a bug; a red herring correctly ruled out this time with a concrete
+sid rather than left open.
+
+**Where this leaves task 45**: the title-scoped HLE gates already get boot past both wait loops this
+log traced (§7.19-7.24) and reach real, legitimate post-load code (confirmed: real SDRDRV audio
+streaming, not stalled). `px` still plateaus flat past that point — the boot is spending its CPU time
+in genuine background work (audio setup) rather than being stuck on an unserviced completion, but
+nothing yet drives it to the next visible screen. **Next step for whoever picks this up**: don't
+re-chase `FUN_00463948`/SDRDRV — it's cleared. Find what code the resource-load-and-wait caller
+(`FUN_0026fd80`, §7.24) falls through to after its loop exits (now forced open by the HLE gate) and
+whether *that* code's own next wait/completion is real or synthetic-gated; `--pcbreak=` on
+`FUN_0026fd80`'s return address (`ra` at the call site, real vaddr shown in §7.24's own decompile)
+would confirm whether it's even being reached versus the trace's sampled PC just landing in
+SDRDRV between other threads' work. `--trace-threads` across the 55M-cyc mark would also show
+whether the post-gate flow actually moves to a *different* thread than the one polling SDRDRV.
+
 ---
 
 ## 8. Save states & determinism contracts
