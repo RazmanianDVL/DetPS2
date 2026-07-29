@@ -4828,11 +4828,28 @@ DetPS2's CD/file-read HLE at all.
 
 **Corrected takeaway for future work**: the CRI ADX audio thread investigation (worker thread
 `FUN_004147f8`, `SidCriAdx` fno 2/3, etc.) was chasing a real but *downstream* symptom — that
-subsystem simply hasn't started yet because it's gated behind this resource-load completion. Next
-step for whoever picks this up: don't go back to CRI ADX. Instead, trace `FUN_0026f918` (the load
-kickoff, real vaddr `0x26f918`) to find exactly what I/O primitive it issues (worth checking whether
-it's a real SIF RPC this session's `unknown sid=`/`DETPS2_TRACE_RPC` tooling would show, a raw CD
-sector read via `Cdvd.cs`, or something else), then check whether DetPS2 ever completes it. The
+subsystem simply hasn't started yet because it's gated behind this resource-load completion.
+
+**Pushed one more layer into `FUN_0026f918`'s own load-kickoff logic**: it calls `FUN_0043b670`
+(real vaddr `0x43b670`), which allocates a resource-manager slot from a fixed 8-entry pool (each
+`0x2AC` bytes, scanned via a stride-matching loop) and initializes it through a long chain of further
+helpers (`FUN_0043ab88`, `FUN_0043b460`, `FUN_0043bb28`, `FUN_0043e268`, `FUN_0043e428`, etc. — all
+still in the same `0x43xxxx` resource-manager region) — this is a generic asset/resource allocator,
+not yet the specific I/O primitive. `FUN_0026f918` also separately calls `FUN_0043e120` and
+`FUN_0043d4f8`, both of which delegate into a *different* address region (`0x45xxxx` —
+`FUN_0045c5b8`, `FUN_004505f8`) not otherwise touched by anything traced so far this session — this
+is the most promising unexplored lead for finding the actual I/O primitive, since it's structurally
+distinct from the generic resource-pool code.
+
+Next step for whoever picks this up: don't go back to CRI ADX — start from `FUN_0045c5b8`/`FUN_004505f8`
+(the `0x45xxxx`-region calls) rather than continuing further into the `0x43xxxx` resource-pool
+internals, since those look like generic bookkeeping rather than the actual read/load primitive.
+Worth checking whether it's a real SIF RPC this session's `unknown sid=`/`DETPS2_TRACE_RPC` tooling
+would show, a raw CD sector read via `Cdvd.cs`, or something else, then checking whether DetPS2 ever
+completes it. This is realistically a multi-session reverse-engineering effort — the causal chain
+from the original vague "reference-counted gate" down to this specific load-and-wait routine is now
+fully traced and verified live (not just statically inferred), which is the valuable, durable output
+of this session's work even though the root I/O primitive itself wasn't identified. The
 `--find-writer`/`--pcbreak` techniques used throughout this session (live-verify a hypothesis against
 actual memory/PC state, don't just trust static analysis) are the right tools to keep using here.
 
