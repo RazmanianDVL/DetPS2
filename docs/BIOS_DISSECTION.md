@@ -204,6 +204,44 @@ IOP VBLANK still matters for CDVDFSV / FILEIO / drivers that `WaitEventFlag` on 
 - Registers RPC **sid=0x80000006** (`FUN_000018c8(..., 0x80000006, 0x4c4, …)`)  
 - Strings: `loadmodule:`, `loadelf:`, `Load File service.(99/11/05)`  
 - Handlers return `{ result, modres }` style buffers (matches existing `HandleLoadFile`)
+- Full real implementation is ~30 functions (`tools/bios-decomp/LOADFILE_ALL.txt`) including real
+  ELF/IRX loading (`FUN_00000a48`/`FUN_00000cf4`/`FUN_000010dc`); DetPS2's `HandleLoadFile` +
+  `IrxLoader.cs` achieve the same functional result (real relocation, real module registration)
+  through an independently-verified path rather than a literal transliteration of this module —
+  not yet reconciled line-for-line, lower priority since the existing path already works.
+
+---
+
+## 6.1 CDVDFSV — real SCMD/NCMD command semantics (2026-07-29 follow-up)
+
+Ghidra-decompiled in full (`tools/bios-decomp/CDVDFSV_ALL.txt`, 2876 lines). Two real command
+dispatchers, registered exactly where expected:
+
+| sid | Dispatcher | Real cases found |
+|-----|-----------|-------------------|
+| `0x80000593` (SCMD) | `FUN_000041b8` | 25 (`0x1`-`0x19`) |
+| `0x80000595` (NCMD) | `FUN_00003f3c` | 14 (`0x1`-`0xe`) |
+| `0x80000592` | raw addr `0x204` | not yet decompiled as its own dispatcher |
+| `0x80000597` | raw addr `0x2f0` | not yet decompiled |
+| `0x8000059a` | `FUN_000032d8` | not yet decompiled |
+
+Every real reply is **result word first, payload starting at word[1]** — confirmed directly from
+the decompile (e.g. `*param_3 = uVar1; param_3[1] = *param_1;` for WRITE RTC). The pre-existing
+`RealSifRpc.cs` handling wrote payload bytes starting at word[0] with no result word at all for
+several commands, and had case 7 mislabeled `ScmdApplySCmd` — the real case 7 is WRITE_ILinkID
+(confirmed via its real debug string `"WRITE ILinkID call"`). NCMD read (`fno` 1/2/3) real handlers
+return the accumulated **byte count actually transferred**, not a boolean — DetPS2 previously
+returned `1`/`0` regardless of sector count.
+
+Ported into a new `HandleCdScmd` (`RealSifRpc.cs`) covering all 25 real SCMD cases with the correct
+word-count/ordering shape; hardware DetPS2 doesn't model for real (mechacon RTC/NVM/iLink ID/console
+ID) gets structurally-correct synthetic values rather than fabricated real console secrets. 2 new
+smoke tests. Verified: full smoke suite green, 9-title cross-check byte-identical (these specific
+commands aren't yet on Shaolin Monks' critical path within the tested cycle window, but are now
+correct for whichever title/path does exercise them — general fix, not Shaolin-specific).
+
+**Not yet decompiled**: the other two SCMD-family services (`0x80000592`/`0x80000597`/`0x8000059a`)
+and their real dispatchers.
 
 ---
 
@@ -228,8 +266,10 @@ Optional later: execute relocated BIOS IRX on IOP R3000 (large). Until then, HLE
 | SIFCMD INIT + EE ready slots | `SonyKernelHle.AcknowledgeEeSifCmdReady` + boot plant | `0x778800` queue-ready |
 | THREADMAN semas | `KernelState` + `SonyKernelHle` 0x40–0x48 | Count/wake/Poll/Delete/i* |
 | VBLANK IOP | `IopVblankHost` via `BiosHle.OnVblank` | Lists + event flag |
-| INTRMAN/TIMEMAN/IOMAN | `IopSystemHost` | Register IRQ / time / devices |
-| LOADFILE / SYSMEM / FILEIO / CDVD | `RealSifRpc` + disc IRX load / getstat/dir | RPC sid handlers |
+| INTRMAN/TIMEMAN | `IopSystemHost` | Register IRQ / time — **contract only, not decompiled yet** |
+| **IOMAN** | `IopSystemHost` (device table only) | **Contract only** — real 39-function module extracted+decompiled (`tools/bios-decomp/IOMAN_ALL.txt`) 2026-07-29, real vtable-based device-driver dispatch (`sceOpen`/`sceClose`/`sceRead`/etc., `FUN_000000e8` et al.) not yet ported. **Next concrete target.** |
+| CDVDFSV SCMD/NCMD | `RealSifRpc.HandleCdScmd` + NCMD read/GetToc | Full real command-set port (§6.1), 2026-07-29 |
+| LOADFILE / SYSMEM / FILEIO | `RealSifRpc` + disc IRX load / getstat/dir | RPC sid handlers (functionally equivalent, not literal transliteration — see §6) |
 | PADMAN / MCSERV | `HandlePad` / `HandleMcServ` | Open/read/getInfo |
 | EE INTC + full GPR | `Intc` / `KernelState.SaveFullContext` | Prior session |
 
