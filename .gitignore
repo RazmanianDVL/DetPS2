@@ -30,6 +30,17 @@ detps2_frame.ppm
 detps2_*.ppm
 crash.log
 
+# Ghidra-decompiled BIOS dumps (real Sony firmware, decompiled to pseudo-C/disasm text --
+# copyrighted content even though it's text, not a binary; local diagnostics only, see
+# docs/BIOS_DISSECTION.md's own "Do not commit BIOS blobs" note)
+tools/bios-decomp/
+tools/bios-extract/
+
+# Scratch blocker-trace/investigation output logs (should live outside the repo, but in case
+# they land here, never commit them)
+mk-*.txt
+d[0-9]*.txt
+
 # OS
 Thumbs.db
 .DS_Store
