@@ -5,6 +5,18 @@ namespace DetPS2.Core;
 /// <summary>
 /// Interrupt Controller (Phase 8).
 /// STAT / MASK registers with MMIO; notifies EE to sync COP0 Cause.
+///
+/// <para><b>Stat vs CPU latch (real hardware semantics):</b>
+/// On real PS2, <c>INTC_STAT</c> is sticky until software write-1-clear. Taking a COP0
+/// exception does <b>not</b> clear STAT — games legitimately busy-poll <c>0x1000F000</c>
+/// for VBlank (bit 2) with interrupts still enabled. Our synthesized ISR is a bare
+/// <c>eret</c>, so if we left <c>GetPendingInterrupts() == Stat &amp; Mask</c> forever,
+/// the EE would re-enter the exception on every instruction (storm). If we instead
+/// auto-ack STAT in that fallback, pollers never see the bit (Shaolin Monks CRT0
+/// spin at <c>0x00480330</c>, 2026-07-29). Solution: keep STAT sticky for MMIO;
+/// deliver COP0 from a separate edge latch that is armed on 0→1 Raise and cleared
+/// when the CPU "accepts" the interrupt (handler dispatch or no-handler fallback).
+/// </para>
 /// </summary>
 public sealed class Intc : ISchedulable
 {
@@ -34,6 +46,26 @@ public sealed class Intc : ISchedulable
     public uint Stat { get; private set; }
     public uint Mask { get; private set; }
 
+    /// <summary>
+    /// Bits still pending delivery to COP0. Armed on Raise when STAT 0→1 (or re-Raise after
+    /// software cleared STAT); cleared by <see cref="ClearCpuLatch"/> / full Acknowledge.
+    /// </summary>
+    public uint CpuLatched { get; private set; }
+
+    /// <summary>
+    /// MasterCycles-based earliest time each STAT bit may be write-1-cleared. Gives busy-pollers
+    /// (read INTC_STAT in a tight loop with IE still on) a window to observe VBlankStart before
+    /// an ISR or sibling thread acks it. Real frames are ~0.5–1ms; a few thousand EE cycles is
+    /// enough for a 5-instruction poll to win the race (Shaolin Monks 0x4803D0, 2026-07-29).
+    /// </summary>
+    private readonly ulong[] _statHoldUntil = new ulong[16];
+    // Must outlast both the forced-preempt quantum (0x10000) and a full PCRTC VBlank period
+    // (~500k) so a busy-poller that loses the CPU for a few slices still observes
+    // VBlankStart. Shaolin Monks CRT0 at 0x4803D0 polls INTC_STAT bit2; with 200k hold the
+    // game's own write-1-clear after the hold window stole the bit before the poller ran
+    // (live STAT=0x2008 = VBlankEnd|Sif, no bit2 — 2026-07-29).
+    private const ulong StatHoldCycles = 2_000_000;
+
     private Action? _onChanged;
 
     public Intc() => Reset();
@@ -44,6 +76,8 @@ public sealed class Intc : ISchedulable
     {
         Stat = 0;
         Mask = 0;
+        CpuLatched = 0;
+        Array.Clear(_statHoldUntil);
     }
 
     public static ulong CurrentCycleForTrace;
@@ -54,28 +88,71 @@ public sealed class Intc : ISchedulable
         if (TraceRaise)
             Console.Error.WriteLine($"[INTC] Raise {source} cyc={CurrentCycleForTrace} alreadyRaised={(Stat & (1u << (int)source)) != 0} mask={Mask:X8}");
         uint bit = 1u << (int)source;
-        if ((Stat & bit) == 0)
+        bool edge = (Stat & bit) == 0;
+        Stat |= bit;
+        // Edge into sticky STAT also arms COP0 delivery. Re-Raise while already sticky does
+        // not re-arm (matches "already pending"); software write-1-clear then next Raise
+        // produces a fresh edge.
+        if (edge)
         {
-            Stat |= bit;
-            _onChanged?.Invoke();
+            CpuLatched |= bit;
+            int idx = (int)source;
+            if ((uint)idx < (uint)_statHoldUntil.Length)
+                _statHoldUntil[idx] = CurrentCycleForTrace + StatHoldCycles;
         }
-        else
-        {
-            Stat |= bit;
-            _onChanged?.Invoke();
-        }
+        _onChanged?.Invoke();
     }
 
     public void Acknowledge(InterruptSource source)
     {
-        Stat &= ~(1u << (int)source);
+        int idx = (int)source;
+        if ((uint)idx < (uint)_statHoldUntil.Length
+            && CurrentCycleForTrace < _statHoldUntil[idx])
+            return; // hold sticky for busy-pollers
+        uint bit = 1u << idx;
+        Stat &= ~bit;
+        CpuLatched &= ~bit;
         _onChanged?.Invoke();
     }
 
-    /// <summary>Write-1-to-clear style for STAT.</summary>
+    /// <summary>
+    /// CPU has accepted this interrupt (handler ran or default ISR). Clear COP0 latch only —
+    /// leave sticky STAT for software busy-poll / write-1-clear. Required so bare-eret HLE
+    /// does not storm while VBlank pollers still see bit 2.
+    /// </summary>
+    public void ClearCpuLatch(InterruptSource source)
+    {
+        uint bit = 1u << (int)source;
+        if ((CpuLatched & bit) == 0) return;
+        CpuLatched &= ~bit;
+        _onChanged?.Invoke();
+    }
+
+    /// <summary>Clear all CPU latches for currently pending (latched &amp; masked) sources.</summary>
+    public void ClearCpuLatchPending()
+    {
+        uint clear = CpuLatched & Mask;
+        if (clear == 0) return;
+        CpuLatched &= ~clear;
+        _onChanged?.Invoke();
+    }
+
+    /// <summary>Write-1-to-clear style for STAT (and matching COP0 latch bits).</summary>
     public void WriteStatClear(uint value)
     {
-        Stat &= ~value;
+        uint allowed = value;
+        // Respect per-source hold so a VBlank ISR / sibling clear cannot erase Start
+        // before the thread that is busy-polling INTC_STAT observes it.
+        for (int i = 0; i < 16; i++)
+        {
+            uint bit = 1u << i;
+            if ((allowed & bit) == 0) continue;
+            if (CurrentCycleForTrace < _statHoldUntil[i])
+                allowed &= ~bit;
+        }
+        if (allowed == 0) return;
+        Stat &= ~allowed;
+        CpuLatched &= ~allowed;
         _onChanged?.Invoke();
     }
 
@@ -83,7 +160,7 @@ public sealed class Intc : ISchedulable
         (Stat & (1u << (int)source)) != 0;
 
     public bool IsPending(InterruptSource source) =>
-        (Stat & (1u << (int)source)) != 0 &&
+        (CpuLatched & (1u << (int)source)) != 0 &&
         (Mask & (1u << (int)source)) != 0;
 
     public void SetMask(uint mask)
@@ -97,10 +174,17 @@ public sealed class Intc : ISchedulable
     {
         Stat = stat;
         Mask = mask;
+        // After restore, treat sticky STAT as already-delivered so we don't storm on load;
+        // next Raise edge re-arms. Callers that need immediate re-fire can Raise again.
+        CpuLatched = 0;
         _onChanged?.Invoke();
     }
 
-    public uint GetPendingInterrupts() => Stat & Mask;
+    /// <summary>
+    /// Sources that should assert COP0 right now (latched edge &amp; masked).
+    /// Sticky STAT alone does not re-assert after the CPU has accepted the edge.
+    /// </summary>
+    public uint GetPendingInterrupts() => CpuLatched & Mask;
 
     public bool AnyPending => GetPendingInterrupts() != 0;
 

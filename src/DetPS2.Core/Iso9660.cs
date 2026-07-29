@@ -131,16 +131,26 @@ public static class Iso9660
         }
     }
 
-    public static byte[]? ReadFile(Volume vol, string name)
+    /// <summary>Normalize a retail/CRI path to ISO9660 lookup form (upper, no device prefix).</summary>
+    public static string NormalizePath(string name)
     {
-        IDiscImage? disc = vol.Disc;
-        if (disc == null && vol.Image != null)
-            disc = new MemoryDiscImage(vol.Image);
-        if (disc == null) return null;
-
+        name = name.Trim();
         name = name.ToUpperInvariant();
-        if (name.StartsWith("CDROM0:\\")) name = name["CDROM0:\\".Length..];
+        if (name.StartsWith("CDROM0:\\", StringComparison.Ordinal)) name = name["CDROM0:\\".Length..];
+        if (name.StartsWith("CDROM:\\", StringComparison.Ordinal)) name = name["CDROM:\\".Length..];
+        if (name.StartsWith("CDV:", StringComparison.Ordinal)) name = name["CDV:".Length..];
+        if (name.StartsWith("MFS:", StringComparison.Ordinal)) name = name["MFS:".Length..];
+        // CRI paths often start with '\'; strip leading separators.
+        name = name.TrimStart('\\', '/');
         name = name.Replace('\\', '/');
+        return name;
+    }
+
+    /// <summary>Locate a file entry by name/path without loading contents (multi-GB WADs stay on disc).</summary>
+    public static FileEntry? FindFile(Volume vol, string name)
+    {
+        name = NormalizePath(name);
+        if (string.IsNullOrEmpty(name)) return null;
 
         foreach (var f in vol.Files)
         {
@@ -148,18 +158,45 @@ public static class Iso9660
             if (f.Name == name || f.Path == name || f.Path.EndsWith("/" + name, StringComparison.Ordinal) ||
                 f.Name.StartsWith(name + ".", StringComparison.Ordinal) ||
                 Path.GetFileName(f.Path) == name)
-            {
-                long off = (long)f.ExtentLba * SectorSize;
-                // Cap single file load at 512MB (ELF/modules); multi-GB files not loaded whole
-                int len = (int)Math.Min(f.Size, (uint)Math.Min(512 * 1024 * 1024, Math.Max(0, disc.Length - off)));
-                if (len <= 0) return Array.Empty<byte>();
-                byte[] data = new byte[len];
-                int got = disc.ReadAt(off, data);
-                if (got < len) Array.Resize(ref data, got);
-                return data;
-            }
+                return f;
         }
         return null;
+    }
+
+    /// <summary>Read a byte range from a file entry (sector-aligned disc path).</summary>
+    public static int ReadFileRange(Volume vol, FileEntry file, long fileOffset, Span<byte> dest)
+    {
+        IDiscImage? disc = vol.Disc;
+        if (disc == null && vol.Image != null)
+            disc = new MemoryDiscImage(vol.Image);
+        if (disc == null || dest.Length == 0) return 0;
+        if (fileOffset < 0 || fileOffset >= file.Size) return 0;
+
+        int want = (int)Math.Min(dest.Length, file.Size - fileOffset);
+        long discOff = (long)file.ExtentLba * SectorSize + fileOffset;
+        if (discOff >= disc.Length) return 0;
+        want = (int)Math.Min(want, disc.Length - discOff);
+        return disc.ReadAt(discOff, dest[..want]);
+    }
+
+    public static byte[]? ReadFile(Volume vol, string name)
+    {
+        IDiscImage? disc = vol.Disc;
+        if (disc == null && vol.Image != null)
+            disc = new MemoryDiscImage(vol.Image);
+        if (disc == null) return null;
+
+        var f = FindFile(vol, name);
+        if (f == null) return null;
+
+        long off = (long)f.ExtentLba * SectorSize;
+        // Cap single file load at 512MB (ELF/modules); multi-GB files not loaded whole
+        int len = (int)Math.Min(f.Size, (uint)Math.Min(512 * 1024 * 1024, Math.Max(0, disc.Length - off)));
+        if (len <= 0) return Array.Empty<byte>();
+        byte[] data = new byte[len];
+        int got = disc.ReadAt(off, data);
+        if (got < len) Array.Resize(ref data, got);
+        return data;
     }
 
     /// <summary>Build ISO with optional subdirectory (e.g. path MODULES/X.IRX).</summary>
@@ -487,6 +524,10 @@ public sealed class DiscBoot
         // MidwayBootAssist is now itself an IGameQuirkModule (serial SLUS_210.87) — this is
         // the only OnDiscMounted call site, so it's correctly serial-gated rather than firing
         // for every commercial title regardless of which disc is mounted.
+        // BIOS service map must be live before any title code runs (shared by all discs).
+        if (!system.BiosBoot.Started)
+            system.BiosBoot.StartCommercialIop(system);
+
         string? serial = MediaVerify.ExtractSerial(cnfText, bootName);
         system.ActiveQuirk = GameQuirkRegistry.Resolve(serial);
         system.ActiveQuirk?.OnDiscMounted(system);

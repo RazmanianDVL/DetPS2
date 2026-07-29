@@ -113,7 +113,19 @@ public sealed class BiosHle
         ExitCode = code;
     }
 
-    public void OnVblank() => _kernel.OnVblank();
+    public void OnVblank()
+    {
+        _kernel.OnVblank();
+        // sceSetVSyncFlag pointers (Sony syscall 0x73)
+        _sony?.OnVblankTick();
+        // BIOS VBLANK.IRX: IOP start/end callback lists + thevent flag (docs/BIOS_DISSECTION.md §5).
+        // Dispatch on every EE PCRTC edge so CDVDFSV/FILEIO WaitEventFlag waiters advance.
+        _system.IopVblank?.OnEeVblank(_kernel);
+        // TIMEMAN clock advances with display timing.
+        _system.IopSystem?.Tick(1);
+        // PADMAN: refresh open-port DMA buffers (padGetState is EE-side, not RPC).
+        _sony?.RealRpc.TickPadDma(_system.Memory, _system.Pad);
+    }
 
     public bool HandleSyscall(EmotionEngine ee)
     {

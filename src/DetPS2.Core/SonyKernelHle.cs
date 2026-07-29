@@ -30,6 +30,11 @@ public sealed class SonyKernelHle
     private readonly Dictionary<uint, uint> _customSyscalls = new();
     private uint _gsImr = 0xFF00;
     private bool _stubsInstalled;
+    /// <summary>sceSetVSyncFlag(u32* odd, u32* even) — EE pointers written each VBlank.
+    /// Was a flat no-op; MK and others poll these words for frame pacing (syscall 0x73).</summary>
+    private uint _vsyncFlagOdd;
+    private uint _vsyncFlagEven;
+    private uint _vsyncCount;
     private const uint StubBase = 0x00081000;
     // Top of usable RDRAM for heap purposes — leaves room below the top-of-RAM stack
     // region real hardware reserves. Shared by SetupHeap (0x3D) and EndOfHeap (0x3E)
@@ -62,6 +67,26 @@ public sealed class SonyKernelHle
         {
             if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, _system.IopModules, addr))
                 _system.Intc.Raise(Intc.InterruptSource.Sif);
+        }
+    }
+
+    /// <summary>Called from VBlank path — fulfills sceSetVSyncFlag pointers.</summary>
+    public void OnVblankTick()
+    {
+        _vsyncCount++;
+        // Alternate odd/even field counter writes (real GS/PCRTC is more nuanced; this
+        // unblocks software that waits for *any* change of the pointed words).
+        uint odd = _vsyncCount | 1u;
+        uint even = _vsyncCount & ~1u;
+        if (_vsyncFlagOdd != 0 && _vsyncFlagOdd < SystemMemory.RDRAM_SIZE - 4)
+            _system.Memory.Write32(_vsyncFlagOdd, odd);
+        if (_vsyncFlagEven != 0 && _vsyncFlagEven < SystemMemory.RDRAM_SIZE - 4)
+            _system.Memory.Write32(_vsyncFlagEven, even);
+        // Also poke common Midway/global VSync poll words if SetVSyncFlag was never called
+        // but software still samples a fixed address (observed thrash at high 0x73 counts).
+        if (_vsyncFlagOdd == 0 && _vsyncFlagEven == 0)
+        {
+            // no plant — only write registered pointers
         }
     }
 
@@ -373,8 +398,87 @@ public sealed class SonyKernelHle
                 result = _kernel.WakeupThread((int)a0);
                 break;
             case 0x35: // CancelWakeupThread
-            case 0x37: // SuspendThread
+                result = 0;
+                break;
+            case 0x37: // SuspendThread(tid) — was a no-op stub; ADX thrash path
+                {
+                    int sid = (int)a0;
+                    if (sid == 0) sid = _kernel.CurrentThreadId;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SUSPEND") == "1")
+                        Console.Error.WriteLine(
+                            $"[SUSPEND] from=tid{_kernel.CurrentThreadId} target={sid} ra=0x{ee.GetGpr(31).Lo:X8} " +
+                            $"pc=0x{ee.PC:X8} cyc={_system.MasterCycles}");
+                    var target = _kernel.GetThread(sid);
+                    // DORMANT pump worker only (entry 0x4147F8). One-shot waiters at
+                    // 0x4145A8/0x414600/0x414708 intentionally ExitThread after flags are set;
+                    // re-Starting them on every Suspend caused Start→see-flag→Exit thrash
+                    // (live: Suspend target=3 from ra=0x414A9C forever).
+                    if (target != null && target.Alive && !target.Started
+                        && target.Entry == 0x004147F8u)
+                    {
+                        _kernel.StartAndMaybeSwitch(ee, sid, switchNow: false, arg: 0, fromSyscall: false);
+                        target = _kernel.GetThread(sid);
+                    }
+                    // Suspending a still-DORMANT/missing thread: success, no full-EE freeze.
+                    if (target == null || !target.Alive || !target.Started)
+                    {
+                        result = 0;
+                        _kernel.SwitchToNext(ee);
+                        break;
+                    }
+                    // Already suspended: success without re-nesting.
+                    if ((target.SuspendCount > 0 || target.SoftSuspended) && sid != _kernel.CurrentThreadId)
+                    {
+                        result = 0;
+                        _kernel.SwitchToNext(ee);
+                        break;
+                    }
+                    result = _kernel.SuspendThread(sid);
+                    // Self-suspend must yield or the caller spins forever.
+                    if (sid == _kernel.CurrentThreadId)
+                    {
+                        if (!_kernel.SwitchToNext(ee))
+                        {
+                            // Deadlock break: main Suspend(self) with every peer Sleep/Suspend'd
+                            // freezes the whole EE (RequestSemaStall). Before parking, wake pure
+                            // SleepThread peers so the ADX pump (0x4147F8) can Resume main.
+                            foreach (var peer in _kernel.AllThreads)
+                            {
+                                if (peer.Id == sid || !peer.Alive || !peer.Started) continue;
+                                if (peer.WaitSemaId != 0) continue; // real WaitSema has its own producer
+                                if (peer.SuspendCount > 0)
+                                {
+                                    while (peer.SuspendCount > 0)
+                                        _kernel.ResumeThread(peer.Id);
+                                }
+                                else if (peer.Sleeping)
+                                    _kernel.WakeupThread(peer.Id);
+                            }
+                            if (!_kernel.SwitchToNext(ee))
+                            {
+                                ee.RequestSemaStall();
+                                _kernel.WaitSemaVblank();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Suspending a peer: try to yield so the suspendee is off-CPU.
+                        // Do NOT WaitSemaVblank if nobody else is runnable — that freezes the
+                        // entire EE (including workers) until the next PCRTC edge, which with
+                        // SoftSuspended peers made post-WAD boot crawl (~7k syscalls / 150M)
+                        // while PC sat on the Suspend stub.
+                        _kernel.SwitchToNext(ee);
+                    }
+                }
+                break;
+            case 0x38: // iSuspendThread
+                result = _kernel.SuspendThread((int)a0 == 0 ? _kernel.CurrentThreadId : (int)a0);
+                break;
             case 0x39: // ResumeThread
+            case 0x3A: // iResumeThread
+                result = _kernel.ResumeThread((int)a0 == 0 ? _kernel.CurrentThreadId : (int)a0);
+                break;
             case 0x3B: // JoinThread
                 result = 0;
                 break;
@@ -458,19 +562,15 @@ public sealed class SonyKernelHle
                     else result = wr < 0 ? 0 : wr;
                 }
                 break;
-            case 0x45: // PollSema — non-blocking (never sleep)
-                {
-                    int pr = _kernel.WaitSemaBlocking((int)a0);
-                    if (_kernel.LastWaitSemaBlocked)
-                    {
-                        var ct = _kernel.GetThread(_kernel.CurrentThreadId);
-                        if (ct != null) { ct.Sleeping = false; ct.WaitSemaId = 0; }
-                        result = -1;
-                    }
-                    else result = pr < 0 ? -1 : pr;
-                }
+            case 0x43: // iSignalSema — interrupt-safe SignalSema (Sony EE #67)
+                result = _kernel.ISignalSema((int)a0);
+                break;
+            case 0x45: // PollSema — non-blocking (never sleep); BIOS THREADMAN PollSema
+            case 0x46: // iPollSema — same rules, interrupt context
+                result = _kernel.PollSema((int)a0);
                 break;
             case 0x47: // ReferSemaStatus
+            case 0x48: // iReferSemaStatus
                 result = 0;
                 break;
 
@@ -608,7 +708,11 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x72: // SetPgifHandler
-            case 0x73: // SetVSyncFlag
+            case 0x73: // SetVSyncFlag(u32* oddField, u32* evenField) — ps2sdk sceSetVSyncFlag
+                // Stores EE RAM pointers; kernel writes field counters on each VBlank.
+                // Flat no-op left MK calling this ~500k times / 200M with no progress.
+                _vsyncFlagOdd = a0;
+                _vsyncFlagEven = a1;
                 result = 0;
                 break;
             case 0x74: // SetSyscall(num, addr)
@@ -771,7 +875,13 @@ public sealed class SonyKernelHle
             if ((attr & 1) != 0)
                 _system.Sif.Sif0IopToEe(src, dest, size);
             else
+            {
                 _system.Sif.Sif1EeToIop(src, dest, size);
+                // CRI DTX (and any future IOP consumer of EE→IOP bulk DMA) needs an IOP-side
+                // completion signal after the payload lands. RealSifRpc tracks CRI DTX channels
+                // created via sid=0x90000200 fno=2 and advances their EE work-buffer counter.
+                _realRpc.NotifyDtxEeToIopDma(_system.Memory, dest, size);
+            }
         }
 
         for (uint i = 0; i < count; i++)
@@ -822,20 +932,45 @@ public sealed class SonyKernelHle
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
             Console.Error.WriteLine($"[SIFCMD] cid=0x{cid:X8} dest=0x{dest:X8} opt=0x{opt:X8} psize={psize} dsize={dsize} eePacket=0x{eePacket:X8}");
 
-        // System commands (Sony)
+        // System commands (Sony SIFCMD.IRX — BIOS FUN_000006c0 registers these).
         switch (cid)
         {
-            case 0x80000000: // CHANGE_SADDR
-            case 0x80000001: // SET_SREG
+            case 0x80000000: // CHANGE_SADDR / SIF_CMD_CHANGE_SADDR
+                if ((cid & 0x1F) < _sifRegs.Length)
+                    _sifRegs[cid & 0x1F] = dest;
+                break;
+            case 0x80000001: // SET_SREG — packet often carries index/value after header
+                {
+                    // Layout seen in DEVELOPER_GUIDE: +0x10 index, +0x14 value
+                    uint idx = size >= 0x18 ? _system.Memory.Read32(eePacket + 0x10) : opt;
+                    uint val = size >= 0x18 ? _system.Memory.Read32(eePacket + 0x14) : dest;
+                    uint reg = idx & 0x1F;
+                    if (reg < _sifRegs.Length) _sifRegs[reg] = val;
+                    if (reg < _sifVirtualRegs.Length) _sifVirtualRegs[reg] = val;
+                    // SMFLAG writes from IOP side — mirror into Sif SMFLAG when reg==0-style boot bits
+                    if ((val & (Sif.SifStatSifInit | Sif.SifStatCmdInit | Sif.SifStatBootEnd)) != 0)
+                        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | val);
+                }
+                break;
             case 0x80000002: // INIT_CMD
+                _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30)
+                    | Sif.SifStatSifInit | Sif.SifStatCmdInit);
+                if (2 < _sifRegs.Length) _sifRegs[2] = 1;
+                break;
             case 0x80000003: // RESET_CMD
-                // Acknowledge by setting IOP "boot end / cmd init" style flags
-                if (cid < _sifRegs.Length)
-                    _sifRegs[cid & 0x1F] = opt | 1;
+                if (3 < _sifRegs.Length) _sifRegs[3] = 1;
+                break;
+            case 0x80000008: // RPC_END arriving EE→IOP (unusual) — treat as free/ack
                 break;
             default:
                 break;
         }
+
+        // EE SIF library effect of a successful IOP ack (normally _SifCmdIntHandler after
+        // SIF0 DMA). sceSifInitRpc polls a ready-slot table — without this write the EE
+        // spins forever even when SMFLAG already has CMDINIT|BOOTEND (BIOS HLE path).
+        // Confirmed: MK Shaolin Monks table base 0x00778800 (getter 0x00482740).
+        AcknowledgeEeSifCmdReady(cid);
 
         // Midway / custom: if dest looks like EE buffer, write a success result dword
         if (dest >= 0x100000 && (dest & 0x1FFFFFFFu) < SystemMemory.RDRAM_SIZE)
@@ -870,6 +1005,38 @@ public sealed class SonyKernelHle
         _ = cid;
     }
 
+    /// <summary>
+    /// Mark EE-side SIFCMD/RPC "queue registered / cmd ready" slots after an EE→IOP
+    /// command is accepted. Real hardware: IOP replies over SIF0 → EE DMAC IRQ →
+    /// <c>_SifCmdIntHandler</c> fills the handler table. HLE has no IOP R3000, so we
+    /// apply the same EE memory side effects here (docs/BIOS_DISSECTION.md §3).
+    /// </summary>
+    private void AcknowledgeEeSifCmdReady(uint cid)
+    {
+        // Primary: MK / common Midway EE sifrpc BSS ready-array base
+        const uint MkSifReadyBase = 0x00778800;
+        for (uint i = 0; i < 8; i++)
+            _system.Memory.Write32(MkSifReadyBase + i * 4, 1);
+
+        // Also ensure SMFLAG reflects full SIFCMD bring-up for any GetReg polls
+        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30)
+            | Sif.SifStatSifInit | Sif.SifStatCmdInit | Sif.SifStatBootEnd);
+
+        // INIT family: wake a waiter that may be parked on the init handshake sema.
+        // Prefer signaling only if someone is blocked — mirrors RPC_END iSignalSema.
+        if (cid is 0x80000000 or 0x80000001 or 0x80000002 or 0x80000003)
+        {
+            foreach (var t in _kernel.AllThreads)
+            {
+                if (t.Alive && t.Sleeping && t.WaitSemaId > 0)
+                {
+                    _kernel.ISignalSema(t.WaitSemaId);
+                    break; // one wake per ack, like SignalSema
+                }
+            }
+        }
+    }
+
     private long SetupThread(uint gp, uint stack, uint stackSize, uint args)
     {
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SETUPTHREAD") == "1")
@@ -900,10 +1067,27 @@ public sealed class SonyKernelHle
     {
         var t = _kernel.GetThread(id);
         if (t == null) return -1;
-        uint status = !t.Started ? 0x10u
-            : id == _kernel.CurrentThreadId ? 0x01u
-            : t.Sleeping ? 0x04u
-            : 0x02u;
+        // THS_RUN=1 READY=2 WAIT=4 SUSPEND=8 DORMANT=0x10 — combinable bits.
+        // Missing SUSPEND bit made callers that SuspendThread + poll status spin forever
+        // (MK ADX: 123k× Suspend / 150M while status never showed 0x08).
+        //
+        // Never-started → DORMANT(0x10). Exited-after-run → DORMANT unless SoftSuspended
+        // (logical park from SuspendThread on an exited peer — see KernelState.SoftSuspended).
+        uint status;
+        if (!t.Started)
+        {
+            status = t.SoftSuspended ? 0x08u : 0x10u;
+        }
+        else
+        {
+            status = 0;
+            if (id == _kernel.CurrentThreadId) status |= 0x01u;
+            else if (!t.Sleeping && t.SuspendCount == 0) status |= 0x02u;
+            // WAIT only while actually parked (Sleeping/WaitVblank).
+            if (t.Sleeping || t.WaitVblank) status |= 0x04u;
+            if (t.SuspendCount > 0 || t.SoftSuspended) status |= 0x08u;
+            if (status == 0) status = 0x02u;
+        }
         if (statusAddr != 0)
         {
             _system.Memory.Write32(statusAddr + 0, status);

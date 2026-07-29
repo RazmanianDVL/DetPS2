@@ -27,9 +27,15 @@ public sealed class Cdvd : ISchedulable
     private IDiscImage? _disc;
     private readonly byte[] _sectorBuffer = new byte[SectorSize];
     private Intc? _intc;
+    private SystemMemory? _memForAsync;
     private uint _pendingLba;
     private ulong _readCyclesLeft;
     private uint _pendingCount = 1;
+    /// <summary>EE/IOP dest for async multi-sector fill (0 = buffer-only, no DMA out).</summary>
+    private uint _pendingDest;
+    /// <summary>Completion event-flag id (THREADMAN) optional wake for sceCdSync waiters.</summary>
+    private int _completionEfId;
+    private KernelState? _kernelForComplete;
 
     public uint TocTracks { get; private set; } = 1;
     public uint TocLeadOutSector { get; private set; } = 100_000;
@@ -52,6 +58,10 @@ public sealed class Cdvd : ISchedulable
         _pendingLba = 0;
         _readCyclesLeft = 0;
         _pendingCount = 1;
+        _pendingDest = 0;
+        _memForAsync = null;
+        _completionEfId = 0;
+        _kernelForComplete = null;
         StreamCursor = 0;
         StreamBytes = 0;
         LayerBreakLba = 0;
@@ -239,10 +249,60 @@ public sealed class Cdvd : ISchedulable
         if (!DiscPresent || TrayOpen) return 0;
         _pendingLba = lba;
         _pendingCount = Math.Max(1u, count);
+        _pendingDest = 0;
+        _memForAsync = null;
         _readCyclesLeft = SectorLatencyCycles * _pendingCount;
         ReadPending = true;
         MechaconStatus = 0x80; // busy
         return 1;
+    }
+
+    /// <summary>
+    /// Async multi-sector read that DMA-fills <paramref name="destAddr"/> on completion
+    /// (BIOS CDVDFSV NCMD path). Optional event-flag bit for WaitEventFlag-style sceCdSync.
+    /// </summary>
+    public uint BeginAsyncReadTo(SystemMemory mem, uint lba, uint count, uint destAddr,
+        KernelState? kernel = null, int completionEfId = 0)
+    {
+        if (!DiscPresent || TrayOpen) return 0;
+        _pendingLba = lba;
+        _pendingCount = Math.Max(1u, Math.Min(count, 512u));
+        _pendingDest = destAddr;
+        _memForAsync = mem;
+        _kernelForComplete = kernel;
+        _completionEfId = completionEfId;
+        // Short but non-zero latency so RPC_END can land before busy clears when polled same-slice.
+        _readCyclesLeft = Math.Max(200u, SectorLatencyCycles) * Math.Min(_pendingCount, 8u);
+        ReadPending = true;
+        MechaconStatus = 0x80; // SCECdStatShellOpen / busy-ish
+        return 1;
+    }
+
+    /// <summary>Synchronous multi-sector fill used when NCMD must complete inside RPC_END.</summary>
+    public uint ReadSectorsTo(SystemMemory mem, uint lba, uint count, uint destAddr)
+    {
+        count = Math.Min(count, 512u);
+        uint ok = 0;
+        for (uint i = 0; i < count; i++)
+        {
+            if (!ReadSector(lba + i)) break;
+            if (destAddr != 0) CopySectorToMemory(mem, destAddr + i * (uint)SectorSize);
+            ok++;
+        }
+        return ok;
+    }
+
+    /// <summary>sceCdSync-style: 0=complete/ready, 1=busy.</summary>
+    public int SyncStatus => ReadPending ? 1 : 0;
+
+    /// <summary>Cancel in-flight async read (sceCdBreak).</summary>
+    public void CancelAsync()
+    {
+        ReadPending = false;
+        _readCyclesLeft = 0;
+        _pendingDest = 0;
+        _memForAsync = null;
+        MechaconStatus = 0x40;
     }
 
     /// <summary>Start sequential stream from LBA for `count` sectors (Step delivers).</summary>
@@ -292,6 +352,14 @@ public sealed class Cdvd : ISchedulable
         return true;
     }
 
+    /// <summary>Count host-side ISO reads (CRI HLE etc.) toward <see cref="SectorsRead"/> telemetry.</summary>
+    public void NoteHostReadSectors(int sectors)
+    {
+        if (sectors <= 0) return;
+        SectorsRead += (ulong)sectors;
+        StreamBytes += (ulong)sectors * SectorSize;
+    }
+
     public ReadOnlySpan<byte> GetSectorBuffer() => _sectorBuffer;
 
     public void CopySectorToMemory(SystemMemory memory, uint destAddr)
@@ -319,9 +387,18 @@ public sealed class Cdvd : ISchedulable
         ulong used = _readCyclesLeft;
         _readCyclesLeft = 0;
         ReadPending = false;
-        // Complete all pending sectors (last buffer holds final LBA)
+        // Complete all pending sectors; DMA out when dest was set by BeginAsyncReadTo.
         for (uint i = 0; i < _pendingCount; i++)
-            ReadSector(_pendingLba + i);
+        {
+            if (!ReadSector(_pendingLba + i)) break;
+            if (_pendingDest != 0 && _memForAsync != null)
+                CopySectorToMemory(_memForAsync, _pendingDest + i * (uint)SectorSize);
+        }
+        MechaconStatus = 0x40; // ready
+        if (_completionEfId != 0 && _kernelForComplete != null)
+            _kernelForComplete.SetEventFlag(_completionEfId, 1u);
+        _pendingDest = 0;
+        _memForAsync = null;
         return (int)used;
     }
 }

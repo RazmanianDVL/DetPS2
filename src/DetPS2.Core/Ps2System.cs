@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
@@ -46,16 +47,48 @@ public sealed class Ps2System
     public Ipu Ipu { get; }
     public EeJit EeJit { get; }
     public SnapshotEngine Snapshots { get; }
+    /// <summary>
+    /// Shared BIOS/IOP service host — C# reimplementation of ROMDIR module contracts.
+    /// Installed once at LoadBios; creates the destinations every commercial title waits on.
+    /// See <see cref="BiosBootHost"/> for why this is not per-title PC patching.
+    /// </summary>
+    public BiosBootHost BiosBoot { get; } = new();
+
+    /// <summary>
+    /// BIOS <c>VBLANK.IRX</c> HLE — IOP vblank callback lists and event-flag wakes
+    /// (separate from EE INTC cause 2). Driven from PCRTC via <see cref="BiosHle.OnVblank"/>.
+    /// </summary>
+    public IopVblankHost IopVblank { get; } = new();
+
+    /// <summary>
+    /// BIOS INTRMAN / TIMEMAN / IOMAN service contracts (register IRQ, system time, devices).
+    /// </summary>
+    public IopSystemHost IopSystem { get; } = new();
 
     public Scheduler Scheduler { get; }
+
+    /// <summary>
+    /// When true (default), commercial Midway path tries real CRT0 after BIOS services start.
+    /// The destinations CRT0 waits on are provided by <see cref="BiosBoot"/>, not by poking
+    /// individual EE threads. Disable with DETPS2_FAKE_CRT0=1 for the old jump-to-main baseline.
+    /// </summary>
+    public static bool PreferRealCrt0 =
+        Environment.GetEnvironmentVariable("DETPS2_FAKE_CRT0") != "1";
 
     public ulong MasterCycles => Scheduler.MasterCycles;
     public bool UseJit { get; set; }
     /// <summary>Last EE PC in game/code space — used to recover from low-memory thrash.</summary>
     public ulong LastGoodEePc { get; set; }
     private bool _commercialSifInitKicked;
-    private bool _commercialWorkerKicked;
-    private ulong? _commercialWorkerSeenNotStartedAtCycle;
+    /// <summary>
+    /// Per-thread first-seen cycle for commercial threads that are Alive but not Started.
+    /// One-shot <c>_commercialWorkerKicked</c> left ADX (entry 0x4147F8) and later workers
+    /// permanently dormant after only the SIF-RPC thread was kicked.
+    /// </summary>
+    private readonly Dictionary<int, ulong> _commercialWorkerSeenAt = new();
+    /// <summary>Thread ids we already StartThread'd once — never re-kick after ExitThread
+    /// leaves Started=false (DORMANT), or we thrash re-entering worker entry points.</summary>
+    private readonly HashSet<int> _commercialWorkerKickedIds = new();
     /// <summary>Diagnostic-only escape hatch to test whether the real boot now proceeds
     /// without the Midway forced-jump assists, now that several real EE/SIF-RPC bugs have
     /// been fixed. Opt-in via blocker-trace/etc --no-assist or DETPS2_DISABLE_MIDWAY_ASSIST=1.</summary>
@@ -245,6 +278,11 @@ public sealed class Ps2System
         // Kernel-friendly COP0: IE + EIE, user can run; leave BEV clear for RAM vectors later
         EE.COP0_Status = (1u << 16) | 1u; // EIE | IE
         KernelBootstrap.InstallCommercialRuntime(this);
+
+        // Structural substrate: parse ROMDIR and install IOP service destinations *before*
+        // any game ELF runs. This is the shared BIOS map — not a per-thread assist.
+        BiosBoot.BindBios(path, biosData);
+        BiosBoot.StartCommercialIop(this);
     }
 
     public void InstallStubBios(ulong jumpTarget = 0x00100000)
@@ -305,7 +343,10 @@ public sealed class Ps2System
         if (Hle.SonyKernelMode)
         {
             ulong left = cyclesToRun;
-            const ulong slice = 50_000;
+            // Default 50k; tighten while EE is inside CRI cvFs / our HLE stubs so MidwayBootAssist
+            // can finish ISO open/read without missing the PC window across a long slice.
+            const ulong sliceDefault = 50_000;
+            const ulong sliceCri = 2_000;
             while (left > 0)
             {
                 ulong pcPhys = EE.PC & 0x1FFFFFFFUL;
@@ -323,39 +364,24 @@ public sealed class Ps2System
                     !_commercialSifInitKicked && MasterCycles > 100_000)
                     KickMidwayMainPath();
 
-                // GameQuirks SDK: step whichever module (if any) matched the mounted disc's
-                // serial. --no-assist specifically disables MidwayBootAssist (kept for the
-                // existing blocker-trace diagnostic meaning "no Midway hacks") without
-                // disabling quirk modules for other titles in general.
-                if (ActiveQuirk != null && !(ActiveQuirk is MidwayBootAssist && DisableMidwayAssist))
-                    ActiveQuirk.Step(this);
+                // GameQuirks SDK: always step the matched module. MidwayBootAssist.Step itself
+                // keeps CRI cvFs + ADX gate HLE running even when DisableMidwayAssist is set
+                // (those are middleware contracts, not PC-range pokes); only force-jumps/logo
+                // assists are suppressed inside Step when --no-assist is on.
+                ActiveQuirk?.Step(this);
 
-                // KickCommercialWorker wire-up (2026-07-27): case 0x20 (CreateThread)'s own
-                // comment documents that Midway's SIF-RPC dispatch worker is deliberately never
-                // auto-started at creation time ("needs globals filled first") and expects either
-                // a real StartThread call or "a late commercial assist" to start it — but
-                // KickCommercialWorker (below) was written to be that assist and never actually
-                // wired up anywhere, leaving the worker thread permanently Alive-but-not-Started.
-                // Traced (2026-07-27): with this session's other SIF fixes landed, the game's own
-                // code never reaches its own StartThread call for this thread (thread dump at any
-                // point past creation shows started=false indefinitely) — the main thread is busy
-                // elsewhere and nothing else ever starts it. Fire once, a short grace period after
-                // first observing a created-but-not-started worker thread (id>=2), to let whatever
-                // globals the comment refers to get filled in first rather than racing thread
-                // creation itself.
-                if (!DisableMidwayAssist && !_commercialWorkerKicked && ActiveQuirk is MidwayBootAssist)
-                {
-                    var worker = Hle.Kernel.AllThreads.FirstOrDefault(t => t.Id >= 2 && t.Alive && !t.Started);
-                    if (worker != null)
-                    {
-                        _commercialWorkerSeenNotStartedAtCycle ??= MasterCycles;
-                        if (MasterCycles - _commercialWorkerSeenNotStartedAtCycle.Value > 200_000)
-                        {
-                            KickCommercialWorker();
-                            _commercialWorkerKicked = true;
-                        }
-                    }
-                }
+                bool criHot = pcPhys is (>= 0x0041D0C0UL and <= 0x0041D1E4UL)
+                    or (>= 0x00417F80UL and <= 0x00418020UL)
+                    or (>= 0x01FD4000UL and < 0x01FD4080UL);
+                ulong slice = criHot ? sliceCri : sliceDefault;
+
+                // Kick commercial workers that CreateThread left DORMANT (StartThread never
+                // reached). One-shot kick of only thread 2 left ADX (entry 0x4147F8) and every
+                // later worker permanently unstarted — traced 2026-07-29 at 120M cycles:
+                // threads 3–6 Alive/!Started while main spun SetVSyncFlag at 0x463960.
+                // Re-arm per thread so each new CreateThread gets its own grace then Start.
+                if (!DisableMidwayAssist && ActiveQuirk is MidwayBootAssist)
+                    KickAllDormantCommercialWorkers();
 
                 ulong n = left > slice ? slice : left;
                 Scheduler.RunFor(n);
@@ -415,59 +441,39 @@ public sealed class Ps2System
         Dmac.WriteRegister(0x1000E000, 1);
         Dmac.WriteRegister(0x1000F520, 0x1201);
 
-        // TRIED (2026-07-26) and REVERTED: redirecting into real CRT0 (0x0011C200, right before
-        // the real SetupThread syscall) instead of faking its effect and jumping straight to
-        // main(). Real CRT0 does run for real then — SetupThread/SetupHeap syscalls, the
-        // 0x00486228 init chain (confirmed: creates 2 library mutexes via CreateSema — this
-        // fixed the semaphore-ID-zero bug documented in DEVELOPER_GUIDE.md §7.4), and even
-        // creates a real worker thread (entry 0x00480A18) for the first time all session. But
-        // that worker thread immediately blocks on a semaphore (id 3) that nothing in the whole
-        // run ever signals — its entry point sits in the SIF-RPC library region, strongly
-        // suggesting it's the real SIF worker thread, permanently blocked on something only
-        // genuine IOP-side interaction would ever satisfy. Net effect measured: px capped at
-        // 573440 (was 860160+), gifPath3/dmac stuck at 0 (was 1/4 and climbing) — a real,
-        // reproducible regression versus the fake-CRT0 jump below, not an improvement, even
-        // though it's more architecturally correct. Reverted. The finding is real and valuable
-        // (concrete confirmation that real IOP-side SIF RPC service handling is the actual next
-        // wall — not a maybe) but the code change itself made the boot worse right now.
-        //
-        // RE-TESTED (2026-07-26) with the VBlank/INTC synthesized-vector ack fix in place
-        // (commit bfc8463): got further (syscalls 43->139, PC reached the real SIF-library
-        // polling loop at 0x00480330 instead of deadlocking on semaphore 3) but then stalled
-        // at that poll instead — traced to the ack fix itself: TryDispatchRegisteredIntcHandler
-        // already acks every pending INTC source except VBlankStart on any unhandled dispatch
-        // (deliberately, so busy-poll code can see it stay sticky), and the synthesized vector's
-        // unconditional ack ran immediately afterward on the same fallback path, undoing that
-        // exclusion and clearing VBlankStart out from under the poll on effectively every
-        // interrupt from any other unmasked source. Reverted the vector-level ack (see
-        // KernelBootstrap.cs); with it removed, this experiment reproduces the exact same
-        // px=573440 semaphore-3 deadlock as the original 2026-07-26 attempt — confirming the
-        // semaphore-3 wall is independent of the INTC ack question. Re-disabling this redirect;
-        // falling back to the fake-CRT0 jump below, which remains the better baseline until the
-        // semaphore-3 (real IOP-side SIF worker) wall is separately addressed.
-        // RE-TESTED (2026-07-26) with the PCPYUD fix (the "material" corruption's real root
-        // cause) in place: no longer regresses -- px/gifPath3/dmac now match the fake-CRT0-jump
-        // baseline (860160/1/4) instead of the old 573440/0/0 -- but syscalls balloon to ~200,000
-        // by 40M cycles, almost all Deci2Call (0x7C). Traced precisely, not guessed: 0x4020C9C8
-        // (the reported hot PC) is a completely ordinary table-driven CRC-32 routine, not garbage
-        // execution. It's called once per outgoing Deci2Send debug packet by a Deci2Poll retry
-        // loop that never sees success, because Deci2Open (which would register the handler id ->
-        // buffer mapping) never runs -- same root cause as everything else in this file, real
-        // CRT0 being skipped. Fixed Deci2Call's HLE (SonyKernelHle.cs) to actually implement its
-        // real sub-function dispatch (Open/Send/Poll/kPuts) instead of a flat stub, using struct
-        // layouts confirmed against Play!'s CPS2OS::sc_Deci2Call -- this alone roughly halved the
-        // retry count. What's left is self-resolving, not a real block: syscalls=93,824 already by
-        // 5M cycles and only 96,347 by 40M, i.e. the retry loop exhausts itself in the first few
-        // million cycles and then stops, same as it would on real hardware polling for a debug
-        // host that was never attached. Not the reason rendering stays capped -- that's still
-        // whatever comes after this resolves. Leaving this path disabled by default regardless;
-        // the fake-CRT0-jump baseline below remains the better one for actual pixel output.
-        // Run CRT0 SetupThread/Heap if we haven't (needed for SP)
+        // Pre-register disc IRX + ensure BIOS service map is live *before* any CRT0/main.
+        // Destinations (LOADFILE, CDVD, SIF stack names, etc.) come from BiosBootHost + disc
+        // preload — not from Midway PC-range assists.
+        if (!BiosBoot.Started)
+            BiosBoot.StartCommercialIop(this);
+        PreloadIopModulesFromDisc();
+        IopModules.BindDisc(Cdvd.MountedPath);
+
+        // Prefer real CRT0 when BIOS services are installed. Historical failures (worker stuck
+        // on an unsignaled SIF sema) were from missing IOP *destinations*; with BiosBootHost
+        // those destinations exist as HLE contracts. Fake jump-to-main remains via DETPS2_FAKE_CRT0=1.
+        bool useRealCrt0 = PreferRealCrt0 && BiosBoot.Started
+                           && Memory.Read32(0x0011C200) != 0; // CRT0 still present in ELF image
+        if (useRealCrt0)
+        {
+            // Enter just before SetupThread in real CRT0 (same address prior experiments used).
+            EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+            EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = 0 });
+            EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x0011C2A8 });
+            EE.PC = 0x0011C200;
+            LastGoodEePc = 0x0011C200;
+            EE.COP0_Status |= (1u << 16) | 1u;
+            MidwayAssist.OnMainKick(this); // ISO bind / worklist plant still useful under CRT0
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine($"[BIOS] KickMidwayMainPath → real CRT0 @ 0x0011C200 (bios services up)");
+            return;
+        }
+
+        // Fallback: synthetic main() entry (old baseline).
         if (pc < 0x0011C250)
         {
-            // Minimal: SetupThread-equivalent SP
             EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
-            EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = 0 }); // gp
+            EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = 0 });
         }
 
         uint argBase = 0x005C9C00;
@@ -481,10 +487,6 @@ public sealed class Ps2System
         LastGoodEePc = 0x00212F70;
         EE.COP0_Status |= (1u << 16) | 1u; // EIE | IE
 
-        // Pre-register IOP modules from the mounted disc so sceSifLoadModule
-        // checks succeed (MK loads PADMAN/SIO2MAN/CRI_ADXI/etc. before logo).
-        PreloadIopModulesFromDisc();
-        IopModules.BindDisc(Cdvd.MountedPath);
         MidwayAssist.OnMainKick(this);
     }
 
@@ -540,27 +542,64 @@ public sealed class Ps2System
     /// Start Midway worker with the real message ring base if SIF init created one,
     /// else a scratch ring.
     /// </summary>
-    private void KickCommercialWorker()
+    /// <summary>
+    /// Start every Alive-but-not-Started commercial thread after a short grace, with an
+    /// entry-appropriate StartThread arg. SIF-RPC dispatch (~0x480A18) gets the packet ring;
+    /// CRI ADX worker (0x4147F8) and other workers get arg 0.
+    /// </summary>
+    private void KickAllDormantCommercialWorkers()
     {
-        uint ring = Memory.Read32(0x77A080);
-        if (ring < 0x100000 || (ring & 0x1FFFFFFFu) >= SystemMemory.RDRAM_SIZE)
-            ring = 0x01F80000;
-        // Prefer thread id 2 (first CreateThread after main)
-        int tid = 2;
-        var t = Hle.Kernel.GetThread(tid);
-        if (t == null || !t.Alive)
+        const ulong grace = 200_000UL;
+        bool startedAny = false;
+        foreach (var t in Hle.Kernel.AllThreads)
         {
-            for (int id = 2; id <= Hle.Kernel.ThreadCount + 2; id++)
+            if (t.Id < 2 || !t.Alive || t.Started || _commercialWorkerKickedIds.Contains(t.Id))
             {
-                t = Hle.Kernel.GetThread(id);
-                if (t != null && t.Alive) { tid = id; break; }
+                _commercialWorkerSeenAt.Remove(t.Id);
+                continue;
             }
+            if (!_commercialWorkerSeenAt.TryGetValue(t.Id, out var seenAt))
+            {
+                _commercialWorkerSeenAt[t.Id] = MasterCycles;
+                continue;
+            }
+            if (MasterCycles - seenAt < grace) continue;
+
+            uint entry = t.Entry;
+            ulong arg = 0;
+            // SIF-RPC library worker: needs the packet-ring base as $a0
+            if (entry is >= 0x00480000u and < 0x00487000u)
+            {
+                uint ring = Memory.Read32(0x77A080);
+                if (ring < 0x100000 || (ring & 0x1FFFFFFFu) >= SystemMemory.RDRAM_SIZE)
+                    ring = 0x01F80000;
+                arg = ring;
+            }
+            // CRI ADX workers (0x414xxx): the game's own StartThread (syscall 0x22 ×5)
+            // already starts these. Re-kicking after ExitThread left them DORMANT with
+            // ADX flags already planted → instant re-exit + main SuspendThread thrash
+            // (650k× GetThreadId/Refer/ChangePrio per 150M). Never auto-start ADX range.
+            else if (entry is >= 0x00414000u and < 0x00416000u)
+            {
+                _commercialWorkerKickedIds.Add(t.Id); // don't keep retrying
+                _commercialWorkerSeenAt.Remove(t.Id);
+                continue;
+            }
+
+            Hle.Kernel.StartAndMaybeSwitch(EE, t.Id, switchNow: false, arg: arg, fromSyscall: false);
+            _commercialWorkerKickedIds.Add(t.Id);
+            _commercialWorkerSeenAt.Remove(t.Id);
+            startedAny = true;
+            // Always log once — this is the multi-worker fix path
+            Console.Error.WriteLine(
+                $"[RPC] KickCommercialWorker tid={t.Id} entry=0x{entry:X8} arg=0x{arg:X} cyc={MasterCycles}");
         }
-        if (t == null || !t.Alive) return;
-        Hle.Kernel.StartAndMaybeSwitch(EE, tid, switchNow: false, arg: ring, fromSyscall: false);
-        // Cooperative: yield once so worker can run a quantum
-        Hle.Kernel.YieldToWorker(EE);
+        if (startedAny)
+            Hle.Kernel.YieldToWorker(EE);
     }
+
+    /// <summary>Legacy single-thread entry — routes to multi-worker kick.</summary>
+    private void KickCommercialWorker() => KickAllDormantCommercialWorkers();
 
     /// <summary>Phase 32: EE JIT microbench path (bit-identical to Step when Det).</summary>
     public int RunEeJit(ulong cycles)
@@ -630,12 +669,15 @@ public sealed class Ps2System
         UseJit = false;
         LastGoodEePc = 0;
         _commercialSifInitKicked = false;
-        _commercialWorkerKicked = false;
-        _commercialWorkerSeenNotStartedAtCycle = null;
+        _commercialWorkerSeenAt.Clear();
+        _commercialWorkerKickedIds.Clear();
         // The fallback MidwayAssist instance (used when no quirk is active) is never
         // stepped/touched, so it never accumulates real state and needs no reset here.
         ActiveQuirk?.Reset();
         ActiveQuirk = null;
+        BiosBoot.Reset();
+        IopVblank.Reset();
+        IopSystem.Reset();
     }
 
     /// <summary>Phase 21: boot harness JSON including telemetry blockers.</summary>

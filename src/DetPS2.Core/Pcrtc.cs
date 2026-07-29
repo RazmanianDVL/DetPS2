@@ -59,7 +59,8 @@ public sealed class Pcrtc : ISchedulable
     public void EndVblank()
     {
         _inVblank = false;
-        _intc?.Acknowledge(Intc.InterruptSource.VBlankStart);
+        // Do NOT clear VBlankStart here — busy-pollers (e.g. MKSM 0x4803D0) need sticky STAT
+        // bit2 until software write-1-clear. Only raise End edge.
         _intc?.Raise(Intc.InterruptSource.VBlankEnd);
     }
 
@@ -69,7 +70,7 @@ public sealed class Pcrtc : ISchedulable
         _cyclesAccum += maxCycles;
         // Half-period: raise VBlankStart and leave it set so software can poll INTC.STAT bit2.
         // Only end/raise VBlankEnd after another half-period (or if software already ACKed).
-        ulong half = _vblankPeriod / 2;
+        ulong half = Math.Max(1UL, _vblankPeriod / 2);
         if (!_inVblank && _cyclesAccum >= half)
         {
             PresentFrame(); // raises VBlankStart, sets _inVblank
@@ -79,8 +80,17 @@ public sealed class Pcrtc : ISchedulable
             _cyclesAccum -= _vblankPeriod;
             // Do NOT auto-ack VBlankStart — games poll/ACK via INTC_STAT write-1-clear.
             // Only raise VBlankEnd edge; leave Start sticky until software clears it.
+            // Always re-Raise Start (edge re-arms hold) so busy-pollers at 0x4803D0 see bit2
+            // even if software cleared mid-frame — MKSM spent 250M+ cycles missing it.
             _inVblank = false;
+            _intc?.Raise(Intc.InterruptSource.VBlankStart);
             _intc?.Raise(Intc.InterruptSource.VBlankEnd);
+        }
+        // Mid-period insurance: if Start is somehow clear while we still claim in-vblank,
+        // re-assert so a tight poll cannot miss the entire frame window.
+        else if (_inVblank && _intc != null && !_intc.IsRaised(Intc.InterruptSource.VBlankStart))
+        {
+            _intc.Raise(Intc.InterruptSource.VBlankStart);
         }
         return (int)Math.Min(maxCycles, (ulong)int.MaxValue);
     }

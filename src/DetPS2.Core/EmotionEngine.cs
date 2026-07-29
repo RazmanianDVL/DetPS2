@@ -93,6 +93,10 @@ public sealed class EmotionEngine : ISchedulable
     public ulong LO { get; set; }
     public ulong HI { get; set; }
 
+    /// <summary>Optional mid-slice hook (e.g. CRI HLE stubs). Invoked every 64 EE instructions
+    /// when set; keep the handler cheap — it is on the hot path.</summary>
+    public Action<EmotionEngine>? MidInstructionHook { get; set; }
+
     /// <summary>Diagnostic-only: logs v0/v1/ra to stderr every time PC hits this address.
     /// Opt-in via blocker-trace --pcbreak=ADDR; null (default) costs one branch per Step().</summary>
     public static uint? PcBreakGpr;
@@ -503,10 +507,22 @@ public sealed class EmotionEngine : ISchedulable
             ulong cyc = _cycleSource?.Invoke() ?? 0;
             if (KernelState.TraceThreads) KernelState.CurrentCycle = cyc;
             if (TransferLog.Enabled) TransferLog.CurrentCycle = cyc;
-            if (Intc.TraceRaise) Intc.CurrentCycleForTrace = cyc;
+            Intc.CurrentCycleForTrace = cyc; // always — STAT hold windows depend on it
 
             if ((executed & 0x3F) == 0)
                 SyncInterruptsFromIntc();
+
+            // CRI HLE etc.: poll every instruction only while PC is in known hot ranges
+            // (cvFs / ADXF open / synthetic stubs). Full every-instr dispatch was too slow;
+            // open windows are short so we still need finer than 64-cycle sampling.
+            if (MidInstructionHook != null)
+            {
+                uint ppc = (uint)(PC & 0x1FFFFFFF);
+                if ((ppc >= 0x0041D000 && ppc <= 0x0041D800)
+                    || (ppc >= 0x00417B00 && ppc <= 0x00418200)
+                    || (ppc >= 0x01FD4000 && ppc < 0x01FD4100))
+                    MidInstructionHook.Invoke(this);
+            }
 
             // VBlank HLE wait (Phase 14): stall EE while kernel waits for VBlank
             if (_hle != null && _hle.Kernel.WaitingVblank)
@@ -917,53 +933,58 @@ public sealed class EmotionEngine : ISchedulable
                     or (int)Intc.InterruptSource.Timer2 or (int)Intc.InterruptSource.Timer3)
                 _intc.Acknowledge((Intc.InterruptSource)src);
 
+            // Consume COP0 edge latch for every dispatched source. STAT can stay sticky (pollers
+            // / software write-1-clear); without clearing the latch, eret immediately re-enters
+            // the same handler forever and leaves EXL effectively stuck (Shaolin Monks DI spin
+            // at 0x485FE4 with Status EXL=1 for 80M+ cycles after preemption fix, 2026-07-29).
+            if (!viaDmacFallback
+                && src is not ((int)Intc.InterruptSource.Timer0 or (int)Intc.InterruptSource.Timer1
+                    or (int)Intc.InterruptSource.Timer2 or (int)Intc.InterruptSource.Timer3))
+                _intc.ClearCpuLatch((Intc.InterruptSource)src);
+
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
                 Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedGprAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
-            EnterException(GetExceptionVector(general: true), causeExcCode: 0);
-            // Snapshot the full GPR file before handing off to the registered handler — real
-            // hardware's BIOS-level dispatcher would do this too (see the field's own doc
-            // comment). Must happen before the a0/ra overwrites below so it captures the true
-            // interrupted-context values, not the ones we're about to synthesize for the handler.
+            // Snapshot interrupted GPRs BEFORE EnterException/a0 clobber. Also publish to the
+            // thread's SaveFullContext so a handler that WaitSema/SwitchToNext mid-ISR cannot
+            // partial-restore this thread with ISR garbage (v1=0x44 instead of 0x1000F000 on
+            // MKSM INTC poll, 2026-07-29).
             var savedGpr = new ulong[32];
             for (int i = 0; i < 32; i++)
                 savedGpr[i] = GetGpr(i).Lo;
             _savedGprAcrossIntcDispatch.Push(savedGpr);
+            _hle?.Kernel.CaptureInterruptedContext(this, savedGpr);
+            EnterException(GetExceptionVector(general: true), causeExcCode: 0);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
             SetGpr(31, new Gpr128 { Lo = KernelBootstrap.Kseg0Interrupt }); // ra = vector's eret
             return true;
         }
 
-        // No game/kernel-registered handler owns any currently pending source. Real BIOS
-        // always acknowledges INTC internally (e.g. a default OS-tick handler) even before
-        // user code installs its own handler; our synthesized vector is a bare eret with no
-        // such bookkeeping, so leaving these unacked would re-raise the same interrupt on
-        // the very next instruction fetch forever, pinning PC in place. Ack them exactly
-        // like a minimal no-op default ISR would.
+        // No game/kernel-registered handler owns any currently pending source.
         //
-        // Previously excluded VBlankStart specifically, on the theory that Pcrtc.Step()
-        // deliberately leaves that bit sticky so code can busy-poll INTC_STAT directly with
-        // COP0 interrupts masked off, and auto-acking here would steal the event out from
-        // under that poll. Traced (2026-07-27): that scenario cannot actually occur at this
-        // exact point. `pending` (Intc.GetPendingInterrupts() = Stat & Mask) is already
-        // filtered by INTC's own per-source Mask register, so VBlankStart only appears here
-        // when its INTC-level mask is enabled — a game doing "masked polling" would leave
-        // that bit disabled, so its VBlankStart would never show up in `pending` at all.
-        // Separately, this whole method is only reached when the OUTER `_takeExceptions &&
-        // InterruptPending` check was true, which requires COP0-level IE/IM to be unmasked -
-        // directly contradicting "COP0 interrupts masked off". Both conditions the exclusion
-        // was protecting against are the opposite of how we got here, making it dead
-        // protection that never actually helps its own stated scenario, while confirmed (via
-        // DETPS2_TRACE_IRQLOOP) to cause a real, severe re-interrupt storm: VBlankStart
-        // staying permanently unacknowledged (since Pcrtc.Step() only sets it, never clears
-        // it, expecting a real handler's INTC_STAT write) re-raises via this exact fallback
-        // roughly every ~64-676 cycles for the rest of a run once no handler ever gets
-        // installed in time, starving the interrupted code of anything but a handful of
-        // instructions between re-entries, forever.
+        // Real INTC_STAT is sticky until software write-1-clear — taking a COP0 exception
+        // does not clear STAT. Our synthesized vector is bare eret, so if we leave the
+        // COP0 latch armed, we re-enter every instruction (storm). Auto-acking STAT fixed
+        // the storm but stole sticky VBlank from busy-pollers (Shaolin Monks CRT0 at
+        // 0x00480330: clear bit2, EI, spin on INTC_STAT — never sees the bit again).
+        //
+        // Structural fix (Intc.CpuLatched): clear only the COP0 edge latch here so bare-eret
+        // does not storm; leave STAT sticky for MMIO poll / real write-1-clear. Next Pcrtc
+        // Raise after software clears STAT re-arms the edge. VBlankStart/End keep STAT;
+        // other sources still full-Acknowledge (they are not typically busy-polled sticky
+        // the same way, and leaving them sticky without a handler was also a storm source).
         if (pending != 0)
+        {
             for (int src = 0; src < 15; src++)
-                if ((pending & (1u << src)) != 0)
-                    _intc.Acknowledge((Intc.InterruptSource)src);
+            {
+                if ((pending & (1u << src)) == 0) continue;
+                var source = (Intc.InterruptSource)src;
+                if (source is Intc.InterruptSource.VBlankStart or Intc.InterruptSource.VBlankEnd)
+                    _intc.ClearCpuLatch(source);
+                else
+                    _intc.Acknowledge(source);
+            }
+        }
         return false;
     }
 
@@ -1388,6 +1409,15 @@ public sealed class EmotionEngine : ISchedulable
             uint rt = (bneOpcode >> 16) & 0x1F;
             ulong a = GetGpr(rs).Lo;
             ulong b = GetGpr(rt).Lo;
+            // strcpy/strlen null checks commonly do `sll v0, byte, 24; bne v0, zero, loop`.
+            // The character lives only in bits 31–24 so |v0-0| looks "enormous" and the
+            // old heuristic snapped v0→0 after the first non-null byte — truncating every
+            // unaligned strcpy to a single character (live: GAMEDATA.WAD became "G", so
+            // ADXF open failed and MKSM never loaded the WAD past the logo). Never snap a
+            // value that is a pure high-byte mask.
+            static bool LooksLikeShiftedByte(ulong x) => x != 0 && (x & 0x00FFFFFFUL) == 0;
+            if (LooksLikeShiftedByte(a) || LooksLikeShiftedByte(b))
+                return;
             // Distance in 64-bit space
             ulong dist = a > b ? a - b : b - a;
             // Software delay loops (e.g. Midway spin counting to -1) burn tens of millions
@@ -2398,6 +2428,9 @@ public sealed class EmotionEngine : ISchedulable
                 Console.Error.WriteLine($"[ERET-POP] cyc={CurrentCycle()} poppedRa=0x{savedGpr[31]:X8} poppedV0=0x{savedGpr[2]:X8} stackDepthAfterPop={_savedGprAcrossIntcDispatch.Count} newPc=0x{PC:X8}");
             for (int i = 1; i < 32; i++) // skip $zero
                 SetGpr(i, new Gpr128 { Lo = savedGpr[i] });
+            // User GPRs are live in the EE again; drop the thread's interrupt snapshot so a
+            // later SwitchToNext cannot resurrect this (now stale) full save.
+            _hle?.Kernel.ClearFullSaveIfCurrent();
         }
     }
 

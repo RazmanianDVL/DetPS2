@@ -659,6 +659,11 @@ public static class SmokeTests
             KernelHle_ThreadsSemasEventFlags();
             KernelHle_WaitVblank_ClearsOnPcrtc();
             BiosHarness_StubRuns();
+            BiosHle_SifcmdRdataAndFileIoSid();
+            BiosHle_IopVblankEventFlag();
+            BiosBootHost_IopBtConfContracts();
+            BiosHle_FileIoGetstatAndCdvdSectors();
+            BiosHle_IopSystemIntrAndTime();
 
             // Phase 15
             Ee_NorSlt_Ops();
@@ -2121,8 +2126,24 @@ public static class SmokeTests
         // WaitSema returns -2 (not -1) when it blocks — a distinct sentinel telling the
         // caller to switch threads, per KernelHle.WaitSema's contract.
         if (k.WaitSema(sid) != -2) throw new Exception("empty sema should block (-2)");
-        if (k.SignalSema(sid) < 1) throw new Exception("signal");
+        // BIOS THREADMAN SignalSema: with a waiter queued, wake one and do NOT bump count
+        // (return value is remaining count, often 0). Only count++ when nobody is waiting.
+        if (k.SignalSema(sid) < 0) throw new Exception("signal should wake waiter");
+        // No waiter left, max=2, count=0 → count becomes 1
+        if (k.SignalSema(sid) != 1) throw new Exception("signal with no waiter should count++ to 1");
+        // PollSema consumes without sleeping
+        if (k.PollSema(sid) != 0) throw new Exception("poll should take the remaining count");
+        if (k.PollSema(sid) >= 0) throw new Exception("empty poll must fail");
+        if (k.ISignalSema(sid) != 1) throw new Exception("iSignalSema should count++");
         if (k.DeleteSema(sid) != 0) throw new Exception("delete sema");
+
+        // DeleteSema must wake waiters (not leave them Sleeping forever)
+        int sid2 = k.CreateSema(0, 1);
+        k.WaitSema(sid2); // parks current thread
+        if (k.DeleteSema(sid2) != 0) throw new Exception("delete with waiter");
+        var cur = k.GetThread(k.CurrentThreadId);
+        if (cur != null && cur.Sleeping && cur.WaitSemaId == sid2)
+            throw new Exception("DeleteSema left waiter blocked");
 
         int ef = k.CreateEventFlag(0x10);
         k.SetEventFlag(ef, 0x01);
@@ -2138,6 +2159,171 @@ public static class SmokeTests
         if ((int)sys.EE.GetGpr(2).Lo < 1) throw new Exception("HLE CreateSema");
 
         Console.WriteLine($"[Smoke] KernelHle_ThreadsSemasEventFlags OK (threads={k.ThreadCount})");
+    }
+
+    /// <summary>BIOS SIFCMD RDATA + FILEIO sid surface (docs/BIOS_DISSECTION.md §3).</summary>
+    public static void BiosHle_SifcmdRdataAndFileIoSid()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+
+        // Seed IOP RAM and EE dest for RDATA copy
+        const uint iopPhys = 0x1000;
+        const uint eeDest = 0x00100000;
+        mem.IopWrite8(iopPhys, 0xAB);
+        mem.IopWrite8(iopPhys + 1, 0xCD);
+
+        int sema = k.CreateSema(0, 1);
+        const uint pkt = 0x0000E000;
+        const uint cd = 0x0000E100;
+        mem.Write32(cd + 8, (uint)sema); // hdr.sema_id
+        mem.Write32(pkt + 8, RealSifRpc.CidRpcRdata);
+        mem.Write32(pkt + 16, 1); // PACKET_F_ALLOC
+        mem.Write32(pkt + 0x1c, cd);
+        mem.Write32(pkt + 0x20, iopPhys); // src (IOP physical)
+        mem.Write32(pkt + 0x24, eeDest);  // dest (EE)
+        mem.Write32(pkt + 0x28, 2);       // size
+
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, pkt))
+            throw new Exception("RDATA TryHandle returned false");
+        if (rpc.RdataOps == 0) throw new Exception("RdataOps not counted");
+        if (mem.Read8(eeDest) != 0xAB || mem.Read8(eeDest + 1) != 0xCD)
+            throw new Exception($"RDATA copy failed: {mem.Read8(eeDest):X2}{mem.Read8(eeDest + 1):X2}");
+        if (mem.Read32(pkt + 8) != RealSifRpc.CidRpcEnd)
+            throw new Exception("RDATA must stamp RPC_END on packet");
+        // Waiter-less SignalSema should have left count=1
+        if (k.PollSema(sema) < 0) throw new Exception("RDATA must SignalSema client");
+
+        // FILEIO known sid must not count as unknown on bind
+        const uint bindPkt = 0x0000E200;
+        const uint fioCd = 0x0000E300;
+        int fioSema = k.CreateSema(0, 1);
+        mem.Write32(fioCd + 8, (uint)fioSema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1);
+        mem.Write32(bindPkt + 28, fioCd);
+        mem.Write32(bindPkt + 32, RealSifRpc.SidFileIo);
+        ulong unkBefore = rpc.UnknownBindSids;
+        rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt);
+        if (rpc.UnknownBindSids != unkBefore)
+            throw new Exception("FILEIO sid must be a known bind target");
+        if (RealSifRpc.SidFileIo != 0x80000001)
+            throw new Exception("FILEIO sid constant");
+
+        Console.WriteLine("[Smoke] BiosHle_SifcmdRdataAndFileIoSid OK");
+    }
+
+    /// <summary>BIOS VBLANK.IRX HLE: event flag set on EE VBlank pulse.</summary>
+    public static void BiosHle_IopVblankEventFlag()
+    {
+        var sys = new Ps2System();
+        int ef = sys.IopVblank.EnsureEventFlag(sys.Hle.Kernel);
+        if (ef < 1) throw new Exception("ef create");
+        if (sys.IopVblank.Register(0, 10, 0x800, 0, sys.Hle.Kernel) != 0)
+            throw new Exception("register start handler");
+        if (sys.IopVblank.HandlerCount != 1) throw new Exception("handler count");
+
+        sys.Hle.OnVblank();
+        uint bits = sys.Hle.Kernel.PollEventFlag(ef);
+        if ((bits & IopVblankHost.EvfBitStart) == 0 || (bits & IopVblankHost.EvfBitEnd) == 0)
+            throw new Exception($"vblank ef bits 0x{bits:X}");
+        if (sys.IopVblank.StartDispatches == 0 || sys.IopVblank.EndDispatches == 0)
+            throw new Exception("dispatch counters");
+        if (sys.IopVblank.Unregister(0, 0x800) != 0) throw new Exception("unregister");
+
+        Console.WriteLine("[Smoke] BiosHle_IopVblankEventFlag OK");
+    }
+
+    /// <summary>BiosBootHost installs IOPBTCONF contract names + SIFCMD constants.</summary>
+    public static void BiosBootHost_IopBtConfContracts()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        if (!sys.BiosBoot.Started) throw new Exception("not started");
+        foreach (var name in new[] { "SYSMEM", "THREADMAN", "VBLANK", "SIFCMD", "LOADFILE", "FILEIO", "CDVDMAN" })
+        {
+            if (!sys.IopModules.IsModuleLoaded(name))
+                throw new Exception($"missing contract module {name}");
+        }
+        if (BiosBootHost.SifCmdRpcEnd != 0x80000008) throw new Exception("RPC_END cid");
+        if (BiosBootHost.SifCmdRpcRdata != 0x8000000C) throw new Exception("RDATA cid");
+        if (sys.IopVblank.EventFlagId == 0) throw new Exception("IOP VBLANK ef not created at boot");
+        string map = sys.BiosBoot.FormatServiceMap();
+        if (!map.Contains("SIFCMD") || !map.Contains("FILEIO"))
+            throw new Exception("service map incomplete");
+        Console.WriteLine($"[Smoke] BiosBootHost_IopBtConfContracts OK (svcs={sys.BiosBoot.ServicesInstalled})");
+    }
+
+    public static void BiosHle_FileIoGetstatAndCdvdSectors()
+    {
+        var sys = new Ps2System();
+        byte[] iso = Iso9660.Build("DETPS2", "BOOT2 = cdrom0:\\BOOT.ELF;1\nVER = 1.00\n",
+            new Dictionary<string, byte[]>
+            {
+                ["BOOT.ELF"] = new byte[] { 0x7F, (byte)'E', (byte)'L', (byte)'F' },
+                ["TEST.BIN"] = new byte[] { 0x11, 0x22, 0x33, 0x44 }
+            });
+        string tmp = Path.Combine(Path.GetTempPath(), "detps2-bios-hle-test.iso");
+        File.WriteAllBytes(tmp, iso);
+        try
+        {
+            sys.IopModules.BindDisc(tmp);
+            sys.Cdvd.MountIso(tmp);
+
+            int fd = sys.IopModules.FileOpen("cdrom0:\\TEST.BIN");
+            if (fd < 0) throw new Exception("FileOpen TEST.BIN");
+            uint buf = 0x00110000;
+            int n = sys.IopModules.FileRead(sys.Memory, fd, buf, 4);
+            if (n != 4 || sys.Memory.Read8(buf) != 0x11)
+                throw new Exception($"FileRead n={n} b0={sys.Memory.Read8(buf):X2}");
+            sys.IopModules.FileClose(fd);
+
+            uint stat = 0x00110100;
+            if (sys.IopModules.FileGetStat(sys.Memory, "cdrom0:TEST.BIN", stat) != 0)
+                throw new Exception("getstat");
+            uint mode = sys.Memory.Read32(stat);
+            if ((mode & IopModuleHost.FioSIfReg) == 0) throw new Exception($"mode 0x{mode:X}");
+            if (sys.Memory.Read32(stat + 8) != 4) throw new Exception("size");
+
+            int dfd = sys.IopModules.DirOpen("");
+            if (dfd < 0) throw new Exception("dopen");
+            uint dirent = 0x00110200;
+            if (sys.IopModules.DirRead(sys.Memory, dfd, dirent) < 0)
+                throw new Exception("dread");
+            sys.IopModules.DirClose(dfd);
+
+            uint dest = 0x00110300;
+            if (sys.Cdvd.ReadSectorsTo(sys.Memory, 16, 1, dest) == 0)
+                throw new Exception("ReadSectorsTo");
+            if (sys.Cdvd.SyncStatus != 0) throw new Exception("sync busy");
+            sys.Cdvd.CancelAsync();
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { /* ignore */ }
+        }
+        Console.WriteLine("[Smoke] BiosHle_FileIoGetstatAndCdvdSectors OK");
+    }
+
+    public static void BiosHle_IopSystemIntrAndTime()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        if (!sys.IopSystem.HasDevice("cdrom0")) throw new Exception("cdrom0 device");
+        if (sys.IopSystem.RegisterIntrHandler(2, 0, 0x800, 0) != 0)
+            throw new Exception("register intr");
+        if (sys.IopSystem.EnableIntr(2) != 0) throw new Exception("enable intr");
+        ulong t0 = sys.IopSystem.SystemClock;
+        sys.Hle.OnVblank();
+        if (sys.IopSystem.SystemClock <= t0) throw new Exception("timeman tick");
+        if (sys.IopSystem.SetAlarm(100, 0x900, 0) != 0) throw new Exception("alarm");
+        // EE SIF ready slots planted at boot (sceSifInitRpc poll target)
+        if (sys.Memory.Read32(0x00778800) != 1)
+            throw new Exception("EE SIF ready slot 0 not planted");
+        Console.WriteLine($"[Smoke] BiosHle_IopSystemIntrAndTime OK (clk={sys.IopSystem.SystemClock})");
     }
 
     public static void KernelHle_WaitVblank_ClearsOnPcrtc()

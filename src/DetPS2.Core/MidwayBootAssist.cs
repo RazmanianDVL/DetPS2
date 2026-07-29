@@ -115,11 +115,46 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     // machine, one step per Step() tick (every ~25,000 cycles), since Sif.SubmitRpc's packets
     // are only actually processed by Sif.Step() on a later scheduler tick, not synchronously.
     private int _realSifStage;
+    private bool _adxGateCompleted;
+    private bool _resourceLoadForced;
+    private int _resourceForceScans;
+    private bool _vblankPollNudgeArmed;
+    private ulong _lastPostResourceResumeCycle;
     private const uint RealSifClientData = 0x01FD0000; // SifRpcClientData_t, 40B
     private const uint RealSifBindPkt = 0x01FD0040;     // SifRpcBindPkt_t, 36B
     private const uint RealSifCallPkt = 0x01FD0080;     // SifRpcCallPkt_t, 56B
     private const uint RealSifRecvBuf = 0x01FD00C0;     // int result slot
     private const uint RealSifSectorBuf = 0x01FD1000;   // 2KB+ CD sector destination
+    // -------------------------------------------------------------------------
+    // CRI cvFs ISO-backed HLE (unblocks ADXF open of GAMEDATA.WAD etc.).
+    // Retail registers "MFS"/"CDV" via 0x418670, but that path never runs on our
+    // fast-boot spine, so the device table at 0x76BFE0 stays empty and cvFsOpen
+    // returns null (ADXF status=4). We plant CDV + service open/read/seek from ISO.
+    // -------------------------------------------------------------------------
+    private const uint CriDevTable = 0x0076BFE0;       // 32 × {void* dev, char name[12]}
+    private const uint CriCwd = 0x0076C1E0;
+    private const uint CriHandleTable = 0x0076BEA0;    // 40 × 8B {dev, fileobj}
+    private const uint CriOpsBase = 0x01FD3000;        // synthetic device ops table
+    private const uint CriFilePool = 0x01FD3100;       // synthetic file objects (32 × 0x40)
+    private const uint CriStubOpen = 0x01FD4000;
+    private const uint CriStubClose = 0x01FD4010;
+    private const uint CriStubSeek = 0x01FD4020;
+    private const uint CriStubTell = 0x01FD4030;
+    private const uint CriStubRead = 0x01FD4040;
+    private const uint CriStubStatus = 0x01FD4050;
+    private const uint CriStubNop = 0x01FD4060;
+    private const uint CriStubFsize = 0x01FD4070; // device+8: path → size in bytes
+    private const uint CvFsOpenFn = 0x0041D0C0;
+    private const int CriMaxFiles = 32;
+    private const int CriFileStride = 0x40;
+    // fileobj layout: +0 ops, +4 lba, +8 size, +0xC pos, +0x10 inUse, +0x14 path[44]
+    private bool _criFsPlanted;
+    private bool _criHookInstalled;
+    private Ps2System? _criHookSys;
+    /// <summary>Last EE buffer used by a CRI/ADXF read — used to pump multi-chunk WAD loads.</summary>
+    private uint _lastAdxfBuf;
+    private uint _lastAdxfFileObj;
+    private int _adxfPumpCount;
     private bool _titleIsMidwayKick;
     private int _hostPresentsSinceLogoFrame;
     /// <summary>
@@ -156,6 +191,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _initLocksResumePending = false;
         _initLocksSavedPc = 0;
         _initLocksSavedGpr = null;
+        _resourceLoadForced = false;
+        _resourceForceScans = 0;
+        _vblankPollNudgeArmed = false;
+        _lastPostResourceResumeCycle = 0;
+        _adxGateCompleted = false;
         _logoPrepared = false;
         _logoActive = false;
         _midwayDone = false;
@@ -170,9 +210,18 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _spinHits = 0;
         _postLogoKick = false;
         _preloadStarted = false;
+        if (_criHookSys != null)
+            _criHookSys.EE.MidInstructionHook = null;
+        _criFsPlanted = false;
+        _criHookInstalled = false;
+        _criHookSys = null;
+        _lastAdxfBuf = 0;
+        _lastAdxfFileObj = 0;
+        _adxfPumpCount = 0;
         _titleIsMidwayKick = false;
         _realSifStage = 0;
         _semaWaitStart.Clear();
+        _sleepWaitStart.Clear();
         _hostPresentsSinceLogoFrame = 0;
         Assists = WorkCompletions = FramesPresented = 0;
         Status = "idle";
@@ -198,6 +247,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         BindIso(sys.Cdvd.MountedPath);
+        // Install CRI mid-slice hook as early as possible (not only after 500k plant).
+        _criHookSys = sys;
+        sys.EE.MidInstructionHook = OnCriMidInstruction;
+        _criHookInstalled = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+            Console.Error.WriteLine($"[CRIFS] OnDiscMounted hook installed vol={_vol != null} files={_vol?.Files.Count ?? 0}");
         sys.IopModules.BindDisc(sys.Cdvd.MountedPath);
         // Detect optional title entry kick (signature only — not a hard dependency for all games)
         _titleIsMidwayKick = sys.Memory.Read32(0x00212F70) == 0x27BDFEE0;
@@ -300,15 +355,767 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         Assists++;
     }
 
-    /// <summary>Periodic assist from commercial RunFor slices (EE-side only — no FMV pacing).</summary>
+    /// <summary>
+    /// Plant CRI cvFs device table entries for "CDV" (and "MFS" → real static ops) plus a
+    /// synthetic CDV ops table whose methods are spin-stubs serviced by
+    /// <see cref="ServiceCriFsStubs"/>. Also sets the CRI cwd so device-less paths like
+    /// "\GAMEDATA.WAD" resolve through CDV.
+    /// </summary>
+    private void PlantCriFsDevices(Ps2System sys)
+    {
+        var mem = sys.Memory;
+
+        // One-time: write stubs + ops + clear file pool
+        if (!_criFsPlanted)
+        {
+            // Spin stub: beq zero,zero,self ; nop  — Step() rewrites PC after doing the work.
+            static void WriteSpinStub(SystemMemory m, uint addr)
+            {
+                m.Write32(addr, 0x1000FFFFu); // beq zero, zero, -1 (self)
+                m.Write32(addr + 4, 0);       // nop
+                m.Write32(addr + 8, 0x03E00008u); // jr ra (landing after HLE advances PC)
+                m.Write32(addr + 12, 0);
+            }
+
+            WriteSpinStub(mem, CriStubOpen);
+            WriteSpinStub(mem, CriStubClose);
+            WriteSpinStub(mem, CriStubSeek);
+            WriteSpinStub(mem, CriStubTell);
+            WriteSpinStub(mem, CriStubRead);
+            WriteSpinStub(mem, CriStubStatus);
+            WriteSpinStub(mem, CriStubNop);
+            WriteSpinStub(mem, CriStubFsize);
+
+            // Device ops layout (matches cvFs wrappers in 0x41D410..0x41D690):
+            // +0x00 destroy, +0x08 getsize(path), +0x10 open, +0x14 close,
+            // +0x18 seek, +0x1C tell, +0x20 read, +0x2C status
+            for (uint o = 0; o < 0x80; o += 4)
+                mem.Write32(CriOpsBase + o, CriStubNop);
+            mem.Write32(CriOpsBase + 0x00, CriStubNop);
+            mem.Write32(CriOpsBase + 0x08, CriStubFsize);
+            mem.Write32(CriOpsBase + 0x10, CriStubOpen);
+            mem.Write32(CriOpsBase + 0x14, CriStubClose);
+            mem.Write32(CriOpsBase + 0x18, CriStubSeek);
+            mem.Write32(CriOpsBase + 0x1C, CriStubTell);
+            mem.Write32(CriOpsBase + 0x20, CriStubRead);
+            mem.Write32(CriOpsBase + 0x2C, CriStubStatus);
+
+            for (int i = 0; i < CriMaxFiles; i++)
+            {
+                uint fo = CriFilePool + (uint)(i * CriFileStride);
+                for (uint o = 0; o < CriFileStride; o += 4)
+                    mem.Write32(fo + o, 0);
+            }
+
+            _criFsPlanted = true;
+            Status = "cri-fs-planted";
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+                Console.Error.WriteLine($"[CRIFS] planted CDV/MFS devices cyc={sys.MasterCycles}");
+        }
+
+        // Mid-slice EE hook so cvFsOpen/stub PCs are not missed across 50k-cycle commercial slices.
+        if (!_criHookInstalled)
+        {
+            _criHookSys = sys;
+            sys.EE.MidInstructionHook = OnCriMidInstruction;
+            _criHookInstalled = true;
+        }
+        else
+            _criHookSys = sys;
+
+        // Re-assert table + cwd every call — game BSS clear / failed AddDev can wipe them.
+        // Slot 0: CDV → synthetic ops (disc files)
+        mem.Write32(CriDevTable + 0, CriOpsBase);
+        WriteAsciiZ(mem, CriDevTable + 4, "CDV", 12);
+        // Slot 1: MFS → real static device at 0x5439A0
+        mem.Write32(CriDevTable + 16, 0x005439A0u);
+        WriteAsciiZ(mem, CriDevTable + 20, "MFS", 12);
+        // cwd = "CDV" so "\GAMEDATA.WAD" (no device prefix) binds to CDV
+        WriteAsciiZ(mem, CriCwd, "CDV", 32);
+        // Keep ops table pointers intact (in case something stomped scratch)
+        mem.Write32(CriOpsBase + 0x08, CriStubFsize);
+        mem.Write32(CriOpsBase + 0x10, CriStubOpen);
+        mem.Write32(CriOpsBase + 0x14, CriStubClose);
+        mem.Write32(CriOpsBase + 0x18, CriStubSeek);
+        mem.Write32(CriOpsBase + 0x1C, CriStubTell);
+        mem.Write32(CriOpsBase + 0x20, CriStubRead);
+        mem.Write32(CriOpsBase + 0x2C, CriStubStatus);
+    }
+
+    private void OnCriMidInstruction(EmotionEngine ee)
+    {
+        var sys = _criHookSys;
+        if (sys == null) return;
+        uint pc = (uint)(ee.PC & 0x1FFFFFFF);
+        // Cheap reject before any heavier work.
+        bool hot = (pc >= CvFsOpenFn && pc <= 0x0041D1E4)
+            || (pc >= 0x00417F80 && pc <= 0x00418020)
+            || (pc >= CriStubOpen && pc < CriStubFsize + 16)
+            || pc == 0x0041D4F0 || pc == 0x0041D488 || pc == 0x0041D558
+            || pc == 0x0041D410 || pc == 0x0041D628 || pc == 0x0041D690;
+        if (!hot) return;
+
+        // verbose mid-hook logging omitted (too noisy); see wrapper/open/getsize traces
+
+        MaybeHleCvFsOpen(sys);
+        MaybeHleCvFsGetSize(sys);
+        MaybeHleCvFsMethodWrappers(sys);
+        ServiceCriFsStubs(sys);
+    }
+
+    /// <summary>HLE cvFsGetFileSize (0x41D690): a0=path → byte size from ISO.</summary>
+    private void MaybeHleCvFsGetSize(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        if (pc != 0x0041D690 && pc != CriStubFsize && (pc < CriStubFsize || pc >= CriStubFsize + 16))
+            return;
+
+        uint pathPtr = (uint)sys.EE.GetGpr(4).Lo;
+        // Inside stub, a0 is path; at wrapper entry too
+        string path = pathPtr >= 0x1000 ? ReadCString(sys.Memory, pathPtr) : "";
+        long size = 0;
+        if (!string.IsNullOrEmpty(path) && _vol != null)
+        {
+            var e = Iso9660.FindFile(_vol, path);
+            if (e != null) size = e.Size;
+        }
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)size) });
+        if (pc == 0x0041D690)
+            sys.EE.PC = sys.EE.GetGpr(31).Lo;
+        else
+            sys.EE.PC = CriStubFsize + 8; // jr ra
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+            Console.Error.WriteLine($"[CRIFS] getsize path='{path}' size={size} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>HLE cvFs seek/tell/read/close wrappers when the handle is ours (skip stub jalr).</summary>
+    private void MaybeHleCvFsMethodWrappers(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint a2 = (uint)sys.EE.GetGpr(6).Lo;
+
+        // Resolve handle → fileobj if a0 is a cvFs handle pointing at our ops
+        uint fileObj = 0;
+        if (a0 >= CriHandleTable && a0 < CriHandleTable + 40 * 8 && (a0 - CriHandleTable) % 8 == 0)
+        {
+            if (sys.Memory.Read32(a0) == CriOpsBase)
+                fileObj = sys.Memory.Read32(a0 + 4);
+        }
+        else if (IsCriFileObj(a0))
+            fileObj = a0;
+
+        if (fileObj == 0 || !IsCriFileObj(fileObj)) return;
+
+        long result = 0;
+        bool handled = false;
+
+        if (pc == 0x0041D4F0) // seek
+        {
+            uint size = sys.Memory.Read32(fileObj + 0x08);
+            uint cur = sys.Memory.Read32(fileObj + 0x0C);
+            long sectorOff = (int)a1;
+            long pos = a2 switch
+            {
+                1 => cur + sectorOff * 2048L,
+                2 => size + sectorOff * 2048L,
+                _ => sectorOff * 2048L
+            };
+            if (pos < 0) pos = 0;
+            if (pos > size) pos = size;
+            sys.Memory.Write32(fileObj + 0x0C, (uint)pos);
+            result = 0;
+            handled = true;
+        }
+        else if (pc == 0x0041D488) // tell → sectors
+        {
+            uint pos = sys.Memory.Read32(fileObj + 0x0C);
+            result = pos / 2048u;
+            handled = true;
+        }
+        else if (pc == 0x0041D558) // read
+        {
+            // Wrapper passes fileobj in a0 (delay). Caller 0x417E4C: a1 = sector count
+            // (from sra …, 11), a2 = dest buffer. Convert sectors → bytes for ISO read.
+            uint buf = a2;
+            uint nSectors = a1;
+            if (a1 >= 0x100000 && a2 < 0x100000)
+            {
+                buf = a1;
+                nSectors = a2;
+            }
+            // Cap insane sizes; treat values that already look like byte counts (>1MB or
+            // not sector-aligned small) as bytes — but ADXF's path is always sector units.
+            uint nbytes = nSectors < 0x00100000u ? nSectors * 2048u : nSectors;
+            long bytesRead = CriRead(sys, fileObj, buf, nbytes);
+            // ADXF stores v0 at +0x20 then does `sll +0x20, 11` for memcpy size and
+            // `addu +0x58, +0x20` where +0x58 is compared to total sector count (+0x14).
+            // So both the request and the return value are in **sectors**.
+            result = bytesRead > 0 ? (bytesRead + 2047) / 2048 : 0;
+            if (result > 0)
+            {
+                _lastAdxfBuf = buf;
+                _lastAdxfFileObj = fileObj;
+                MaybeCompleteAdxfAfterRead(sys, a0 >= CriHandleTable && a0 < CriHandleTable + 40 * 8 ? a0 : 0, fileObj, (uint)result);
+            }
+            handled = true;
+        }
+        else if (pc == 0x0041D410) // close
+        {
+            sys.Memory.Write32(fileObj + 0x10, 0);
+            // free handle slot if a0 was handle
+            if (a0 >= CriHandleTable && a0 < CriHandleTable + 40 * 8)
+            {
+                sys.Memory.Write32(a0, 0);
+                sys.Memory.Write32(a0 + 4, 0);
+            }
+            result = 0;
+            handled = true;
+        }
+        else if (pc == 0x0041D628) // status
+        {
+            // ADXF fill (0x417AF0): when +2==1 (read pending), it waits until
+            // status() == ADXF+1. Open/fill sets +1=2 for "reading"; status 3 is
+            // treated as end/error (0x417C28 path). Sync HLE: report 2 = data ready.
+            uint pos = sys.Memory.Read32(fileObj + 0x0C);
+            uint size = sys.Memory.Read32(fileObj + 0x08);
+            result = pos >= size && size > 0 ? 3 : 2;
+            handled = true;
+        }
+
+        if (!handled) return;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)result) });
+        sys.EE.PC = sys.EE.GetGpr(31).Lo;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1"
+            && pc != 0x0041D628) // skip status spam
+            Console.Error.WriteLine($"[CRIFS] wrapper pc=0x{pc:X8} fo=0x{fileObj:X8} a1=0x{a1:X} a2=0x{a2:X} res={result} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// After a successful sync sector read, find the ADXF object that owns this cvFs handle
+    /// and clear its busy flag (+2) while advancing sector cursors. Without this, fill can
+    /// leave +2=1 and never re-enter completion if the tick path doesn't run again.
+    /// </summary>
+    private void MaybeCompleteAdxfAfterRead(Ps2System sys, uint handleHint, uint fileObj, uint sectors)
+    {
+        if (sectors == 0 || sectors > 0x10000) return;
+
+        void TryFix(uint adxf)
+        {
+            if (adxf < 0x100000 || adxf >= SystemMemory.RDRAM_SIZE - 0x60) return;
+            uint h = sys.Memory.Read32(adxf + 8);
+            // Match by handle, or by our fileobj living at handle+4
+            bool match = (handleHint != 0 && h == handleHint)
+                || (h >= CriHandleTable && h < CriHandleTable + 40 * 8
+                    && sys.Memory.Read32(h + 4) == fileObj)
+                || (h == CriOpsBase); // unlikely
+            // Also match if +8 is our handle table slot that points at this fileObj
+            if (!match && h != 0 && h < SystemMemory.RDRAM_SIZE - 8
+                && sys.Memory.Read32(h) == CriOpsBase && sys.Memory.Read32(h + 4) == fileObj)
+                match = true;
+            if (!match && sys.Memory.Read32(adxf + 8) != 0x0076BEA0
+                && sys.Memory.Read32(adxf + 8) != handleHint)
+            {
+                // Last resort: any ADXF with busy set and our buffer pattern
+                if (sys.Memory.Read8(adxf + 2) == 0) return;
+                if (sys.Memory.Read32(adxf + 8) == 0) return;
+                // only accept if handle+4 == fileObj
+                uint hh = sys.Memory.Read32(adxf + 8);
+                if (hh < 0x100000 || sys.Memory.Read32(hh + 4) != fileObj) return;
+            }
+            else if (!match) return;
+
+            sys.Memory.Write32(adxf + 0x20, sectors);
+            sys.Memory.Write8(adxf + 2, 0); // clear busy so next fill can issue again
+            uint cur = sys.Memory.Read32(adxf + 0x58);
+            sys.Memory.Write32(adxf + 0x58, cur + sectors);
+            uint bcur = sys.Memory.Read32(adxf + 0x34);
+            sys.Memory.Write32(adxf + 0x34, bcur + sectors * 2048u);
+            sys.Memory.Write8(adxf + 0x45, 0);
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+                Console.Error.WriteLine($"[CRIFS] adxf-complete adxf=0x{adxf:X8} sectors={sectors} cur={cur} cyc={sys.MasterCycles}");
+        }
+
+        // Prefer the live ADXF seen at open (0x53CE10) and the static pool.
+        TryFix(0x0053CE10);
+        for (uint i = 0; i < 40; i++)
+            TryFix(0x0054C510 + i * 0x60);
+
+        // Also scan a short range of heap-looking ADXF candidates if handle is known
+        if (handleHint != 0)
+        {
+            // Walk a few MB of RDRAM looking for handle pointer (capped)
+            // Skip — too expensive. The open path uses 0x53CE10 for this title.
+        }
+    }
+
+    private long CriRead(Ps2System sys, uint fileObj, uint buf, uint nbytes)
+    {
+        if (_vol == null || buf < 0x1000 || nbytes == 0 || nbytes > 16 * 1024 * 1024) return 0;
+        uint lba = sys.Memory.Read32(fileObj + 0x04);
+        uint size = sys.Memory.Read32(fileObj + 0x08);
+        uint pos = sys.Memory.Read32(fileObj + 0x0C);
+        int want = (int)Math.Min(nbytes, size > pos ? size - pos : 0);
+        if (want <= 0) return 0;
+        var fake = new Iso9660.FileEntry { ExtentLba = lba, Size = size, Name = "", Path = "" };
+        byte[] tmp = new byte[want];
+        int got = Iso9660.ReadFileRange(_vol, fake, pos, tmp);
+        if (got <= 0) return 0;
+        for (int i = 0; i < got; i++)
+            sys.Memory.Write8(buf + (uint)i, tmp[i]);
+        sys.Cdvd.NoteHostReadSectors((got + 2047) / 2048);
+        sys.Memory.Write32(fileObj + 0x0C, pos + (uint)got);
+        return got;
+    }
+
+    /// <summary>
+    /// When ADXF busy (+2) is set, complete one window into the last EE buffer and clear
+    /// busy so fill can continue. Does not invent a full-WAD-in-RDRAM lie (that crashed
+    /// into bad code at 0x6Axxxx after claiming 198k sectors were delivered).
+    /// Also pumps the first-chunk stall (busy cleared but almost nothing read yet) a few times.
+    /// </summary>
+    private void MaybePumpAdxfBulk(Ps2System sys)
+    {
+        if (_vol == null || _lastAdxfFileObj == 0 || _lastAdxfBuf == 0) return;
+        if (!IsCriFileObj(_lastAdxfFileObj)) return;
+        if (_adxfPumpCount > 20000) return;
+
+        uint adxf = 0x0053CE10;
+        byte busy = sys.Memory.Read8(adxf + 2);
+        uint size = sys.Memory.Read32(_lastAdxfFileObj + 0x08);
+        uint pos = sys.Memory.Read32(_lastAdxfFileObj + 0x0C);
+        if (size == 0) return;
+        if (pos >= size)
+        {
+            // WAD fully streamed — mark ADXF done once (do not SignalSema every Step).
+            sys.Memory.Write8(adxf + 2, 0);
+            sys.Memory.Write8(adxf + 1, 3);
+            uint tot = (size + 2047) / 2048;
+            sys.Memory.Write32(adxf + 0x58, tot);
+            if (tot != 0) sys.Memory.Write32(adxf + 0x14, tot);
+            return;
+        }
+
+        // Always stream remaining file data (fill often clears busy then WaitSema before
+        // re-issuing). 29-sector windows → ~6900 pumps for a 198839-sector GAMEDATA.WAD.
+        _ = busy;
+
+        uint buf = _lastAdxfBuf;
+        if (buf < 0x100000 || buf >= SystemMemory.RDRAM_SIZE - 0x40000) return;
+
+        uint req = sys.Memory.Read32(adxf + 0x20);
+        if (req == 0 || req > 512) req = 29;
+        uint nbytes = Math.Min(req * 2048u, size - pos);
+        if (nbytes < 2048) return;
+
+        // Multiple windows per Step so a 198k-sector WAD finishes in tens of M cycles,
+        // not hundreds (Step fires ~every 50k EE cycles).
+        for (int n = 0; n < 32; n++)
+        {
+            pos = sys.Memory.Read32(_lastAdxfFileObj + 0x0C);
+            if (pos >= size) break;
+            nbytes = Math.Min(req * 2048u, size - pos);
+            if (nbytes < 2048) break;
+            long got = CriRead(sys, _lastAdxfFileObj, buf, nbytes);
+            if (got <= 0) break;
+            uint sectors = (uint)((got + 2047) / 2048);
+            MaybeCompleteAdxfAfterRead(sys, 0x0076BEA0, _lastAdxfFileObj, sectors);
+            sys.Memory.Write8(adxf + 2, 0);
+            _adxfPumpCount++;
+        }
+    }
+
+    /// <summary>
+    /// If EE is stuck forever at the synthesized interrupt vector (0x80000200 bare eret),
+    /// or executing our HLE scratch (0x01FD0000–0x01FEFFFF: synthetic SIF packets / CRI stubs),
+    /// force return to a safe game PC so commercial boot does not pin the whole budget there.
+    /// </summary>
+    private void MaybeEscapeStuckIntVector(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        if (sys.MasterCycles < 5_000_000) return;
+
+        // HLE scratch / synthetic packet region — never valid game code
+        if (pc is >= 0x01FD0000 and < 0x01FF0000)
+        {
+            ulong safe = sys.LastGoodEePc;
+            uint safePhys = (uint)(safe & 0x1FFFFFFF);
+            if (safePhys is < 0x00100000 or >= 0x01FD0000 or (>= 0x01FD0000 and < 0x01FF0000))
+                safe = 0x00212F70; // Midway main prologue (signature-checked at kick)
+            if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0)
+                safe = 0x0011C200; // CRT0 SetupThread region
+            sys.EE.COP0_Status &= ~(1u << 1);
+            sys.EE.PC = safe;
+            sys.Intc.ClearCpuLatchPending();
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine($"[BIOS] escape HLE scratch pc=0x{pc:X8} -> 0x{safe:X8} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // Phys interrupt vector = 0x200 (KSEG0 0x80000200)
+        if (pc is not (0x200 or 0x180 or 0x000)) return;
+        if ((sys.MasterCycles % 50_000) != 0) return; // cheap throttle
+
+        uint epc = (uint)sys.EE.COP0_EPC;
+        if (epc < 0x100000 || epc >= 0x01FD0000) return;
+        // Clear EXL and jump back
+        sys.EE.COP0_Status &= ~(1u << 1); // clear EXL
+        sys.EE.PC = epc;
+        // Drop sticky COP0 latches that might re-enter immediately
+        sys.Intc.ClearCpuLatchPending();
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine($"[BIOS] escape stuck int vector -> EPC=0x{epc:X8} cyc={sys.MasterCycles}");
+    }
+
+    private static void WriteAsciiZ(SystemMemory mem, uint addr, string s, int maxLen)
+    {
+        int n = Math.Min(s.Length, maxLen - 1);
+        for (int i = 0; i < n; i++)
+            mem.Write8(addr + (uint)i, (byte)s[i]);
+        for (int i = n; i < maxLen; i++)
+            mem.Write8(addr + (uint)i, 0);
+    }
+
+    private static string ReadCString(SystemMemory mem, uint addr, int maxLen = 256)
+    {
+        var sb = new StringBuilder(Math.Min(maxLen, 64));
+        for (int i = 0; i < maxLen; i++)
+        {
+            byte b = mem.Read8(addr + (uint)i);
+            if (b == 0) break;
+            sb.Append((char)b);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// When EE is inside cvFsOpen (entry or mid-body — commercial slices are 50k cycles so the
+    /// exact entry PC is often skipped), finish the open from ISO and return a synthetic handle.
+    /// </summary>
+    private void MaybeHleCvFsOpen(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Whole function body through jr ra (0x41D0C0..0x41D1E4)
+        if (pc is < CvFsOpenFn or > 0x0041D1E4) return;
+        if (_vol == null) BindIso(sys.Cdvd.MountedPath);
+        if (_vol == null) return;
+
+        PlantCriFsDevices(sys);
+
+        // Prefer live a0 (valid at entry). Mid-body a0 may be clobbered — recover path from
+        // ADXF caller's s0+0x50 when ra points back at 0x417FE0, or from stack path buffer.
+        uint pathPtr = (uint)sys.EE.GetGpr(4).Lo; // a0
+        string path = "";
+        if (pathPtr >= 0x1000 && pathPtr < SystemMemory.RDRAM_SIZE)
+            path = ReadCString(sys.Memory, pathPtr);
+
+        // ADXF open: jal 0x41D0C0 from 0x417FD8, ra=0x417FE0, path at s0+0x50
+        if ((string.IsNullOrEmpty(path) || path.Length < 3) &&
+            (uint)sys.EE.GetGpr(31).Lo == 0x00417FE0)
+        {
+            uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+            if (s0 >= 0x1000 && s0 < SystemMemory.RDRAM_SIZE - 0x60)
+            {
+                uint p = sys.Memory.Read32(s0 + 0x50);
+                if (p >= 0x1000 && p < SystemMemory.RDRAM_SIZE)
+                    path = ReadCString(sys.Memory, p);
+            }
+        }
+
+        // Mid-function: path copy lives at original a0 (s1) or sp+0 path buffers
+        if (string.IsNullOrEmpty(path) || path.Length < 3)
+        {
+            uint s1 = (uint)sys.EE.GetGpr(17).Lo; // s1 = original a0 path at entry
+            if (s1 >= 0x1000 && s1 < SystemMemory.RDRAM_SIZE)
+                path = ReadCString(sys.Memory, s1);
+        }
+
+        if (string.IsNullOrEmpty(path))
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            ReturnFromCvFsOpen(sys);
+            return;
+        }
+
+        uint handle = CriOpenPath(sys, path);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = handle });
+        ReturnFromCvFsOpen(sys);
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+            Console.Error.WriteLine($"[CRIFS] cvFsOpen path='{path}' handle=0x{handle:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+    }
+
+    private static void ReturnFromCvFsOpen(Ps2System sys)
+    {
+        // Prefer $ra when still at entry; mid-body $ra is still the real caller (saved on stack
+        // only after prologue, and prologue does sd ra,648(sp) — restore if sp looks valid).
+        uint ra = (uint)sys.EE.GetGpr(31).Lo;
+        uint sp = (uint)sys.EE.GetGpr(29).Lo;
+        if (ra < 0x100000 || ra >= SystemMemory.RDRAM_SIZE)
+        {
+            // Prologue: addiu sp,-656; sd ra,648(sp)
+            if (sp >= 0x1000 && sp < SystemMemory.RDRAM_SIZE - 0x290)
+                ra = sys.Memory.Read32(sp + 648);
+        }
+        if (ra >= 0x100000 && ra < SystemMemory.RDRAM_SIZE)
+            sys.EE.PC = ra;
+        else
+            sys.EE.PC = 0x00417FE0; // known ADXF open return
+    }
+
+    private uint CriOpenPath(Ps2System sys, string path)
+    {
+        if (_vol == null) return 0;
+        var entry = Iso9660.FindFile(_vol, path);
+        if (entry == null)
+        {
+            // Also try stripping a leading device: prefix the game might pass through
+            int colon = path.IndexOf(':');
+            if (colon >= 0 && colon + 1 < path.Length)
+                entry = Iso9660.FindFile(_vol, path[(colon + 1)..]);
+        }
+        if (entry == null) return 0;
+
+        // Allocate synthetic file object
+        uint fileObj = 0;
+        for (int i = 0; i < CriMaxFiles; i++)
+        {
+            uint fo = CriFilePool + (uint)(i * CriFileStride);
+            if (sys.Memory.Read32(fo + 0x10) == 0)
+            {
+                fileObj = fo;
+                break;
+            }
+        }
+        if (fileObj == 0) return 0;
+
+        sys.Memory.Write32(fileObj + 0x00, CriOpsBase);
+        sys.Memory.Write32(fileObj + 0x04, entry.ExtentLba);
+        sys.Memory.Write32(fileObj + 0x08, entry.Size);
+        sys.Memory.Write32(fileObj + 0x0C, 0); // pos
+        sys.Memory.Write32(fileObj + 0x10, 1); // in use
+        WriteAsciiZ(sys.Memory, fileObj + 0x14, Iso9660.NormalizePath(path), 44);
+
+        // Allocate cvFs handle slot at 0x76BEA0 (40 × 8B): free when +0 == 0
+        uint handle = 0;
+        for (int i = 0; i < 40; i++)
+        {
+            uint h = CriHandleTable + (uint)(i * 8);
+            if (sys.Memory.Read32(h) == 0)
+            {
+                handle = h;
+                break;
+            }
+        }
+        if (handle == 0)
+        {
+            // Fall back to file-object-as-handle (some call sites use ops at +0 directly)
+            return fileObj;
+        }
+
+        sys.Memory.Write32(handle + 0, CriOpsBase);
+        sys.Memory.Write32(handle + 4, fileObj);
+        return handle;
+    }
+
+    /// <summary>Service synthetic CDV method stubs (spin loops at CriStub*).</summary>
+    private void ServiceCriFsStubs(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Stubs are 16 bytes; accept any PC in the stub block.
+        if (pc is < CriStubOpen or >= CriStubFsize + 16) return;
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint a2 = (uint)sys.EE.GetGpr(6).Lo;
+        long result = 0;
+
+        // Map PC to which stub
+        uint stubBase = pc & ~0xFu;
+        if (stubBase == CriStubFsize)
+        {
+            string path = a0 >= 0x1000 ? ReadCString(sys.Memory, a0) : "";
+            if (!string.IsNullOrEmpty(path) && _vol != null)
+            {
+                var e = Iso9660.FindFile(_vol, path);
+                if (e != null) result = e.Size;
+            }
+        }
+        else if (stubBase == CriStubOpen)
+        {
+            // a0 = path (device open signature)
+            string path = a0 >= 0x1000 ? ReadCString(sys.Memory, a0) : "";
+            uint fileObj = 0;
+            if (!string.IsNullOrEmpty(path) && _vol != null)
+            {
+                // Open returns file object (not full handle) — matching device->open
+                var entry = Iso9660.FindFile(_vol, path);
+                if (entry != null)
+                {
+                    for (int i = 0; i < CriMaxFiles; i++)
+                    {
+                        uint fo = CriFilePool + (uint)(i * CriFileStride);
+                        if (sys.Memory.Read32(fo + 0x10) == 0)
+                        {
+                            fileObj = fo;
+                            sys.Memory.Write32(fo + 0x00, CriOpsBase);
+                            sys.Memory.Write32(fo + 0x04, entry.ExtentLba);
+                            sys.Memory.Write32(fo + 0x08, entry.Size);
+                            sys.Memory.Write32(fo + 0x0C, 0);
+                            sys.Memory.Write32(fo + 0x10, 1);
+                            WriteAsciiZ(sys.Memory, fo + 0x14, Iso9660.NormalizePath(path), 44);
+                            break;
+                        }
+                    }
+                }
+            }
+            result = fileObj;
+        }
+        else if (stubBase == CriStubClose)
+        {
+            // a0 = file object
+            if (IsCriFileObj(a0))
+                sys.Memory.Write32(a0 + 0x10, 0);
+            result = 0;
+        }
+        else if (stubBase == CriStubSeek)
+        {
+            // a0 = fileobj (wrapper unwraps handle+4). ADXF/CRI CDV uses sector units
+            // (2048B): seek(fp, sectorOff, whence) with whence in a2 (0=set,1=cur,2=end).
+            // Internal position stays in bytes.
+            if (IsCriFileObj(a0))
+            {
+                uint size = sys.Memory.Read32(a0 + 0x08);
+                uint cur = sys.Memory.Read32(a0 + 0x0C);
+                long sectorOff = (int)a1;
+                long pos;
+                if (a2 <= 2)
+                {
+                    pos = a2 switch
+                    {
+                        1 => cur + sectorOff * 2048L,
+                        2 => size + sectorOff * 2048L,
+                        _ => sectorOff * 2048L
+                    };
+                }
+                else
+                {
+                    // Fallback: treat a1 as byte offset
+                    pos = a1;
+                }
+                if (pos < 0) pos = 0;
+                if (pos > size) pos = size;
+                sys.Memory.Write32(a0 + 0x0C, (uint)pos);
+                result = 0; // success
+            }
+            else result = -1;
+        }
+        else if (stubBase == CriStubTell)
+        {
+            // a0 = fileobj — ADXF does tell after SEEK_END then `sll result, 11` to get
+            // bytes, so tell must return **sector** position (pos/2048), not bytes.
+            if (IsCriFileObj(a0))
+            {
+                uint pos = sys.Memory.Read32(a0 + 0x0C);
+                uint size = sys.Memory.Read32(a0 + 0x08);
+                uint posSect = pos / 2048u;
+                uint sizeSect = (size + 2047u) / 2048u;
+                // If a2 looks like a writable pointer, store size (sectors) there.
+                if (a2 >= 0x100000 && (a2 & 0x1FFFFFFFu) < SystemMemory.RDRAM_SIZE - 4)
+                    sys.Memory.Write32(a2, sizeSect);
+                if (a1 >= 0x100000 && (a1 & 0x1FFFFFFFu) < SystemMemory.RDRAM_SIZE - 4 && a1 != a2)
+                    sys.Memory.Write32(a1, posSect);
+                result = posSect;
+            }
+        }
+        else if (stubBase == CriStubRead)
+        {
+            // Device method: a0=fileobj, a1/a2 = (buf,size) or (size,buf)
+            uint fileObj = a0;
+            if (!IsCriFileObj(a0) && a0 >= CriHandleTable && a0 < CriHandleTable + 40 * 8)
+                fileObj = sys.Memory.Read32(a0 + 4);
+            uint buf = a2, nbytes = a1;
+            if (a1 >= 0x100000 && a2 < 0x100000) { buf = a1; nbytes = a2; }
+            if (IsCriFileObj(fileObj))
+                result = CriRead(sys, fileObj, buf, nbytes);
+        }
+        else if (stubBase == CriStubStatus)
+        {
+            // Match wrapper: 2 = reading/data ready, 3 = EOF
+            if (IsCriFileObj(a0))
+            {
+                uint pos = sys.Memory.Read32(a0 + 0x0C);
+                uint size = sys.Memory.Read32(a0 + 0x08);
+                result = pos >= size && size > 0 ? 3 : 2;
+            }
+            else result = 2;
+        }
+        else if (stubBase == CriStubNop)
+        {
+            result = 0;
+        }
+        else return;
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)(long)result) });
+        // Advance past spin to jr ra at stub+8
+        sys.EE.PC = stubBase + 8;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
+            Console.Error.WriteLine($"[CRIFS] stub=0x{stubBase:X8} a0=0x{a0:X} a1=0x{a1:X} a2=0x{a2:X} res={result} cyc={sys.MasterCycles}");
+    }
+
+    private static bool IsCriFileObj(uint addr) =>
+        addr >= CriFilePool && addr < CriFilePool + (uint)(CriMaxFiles * CriFileStride)
+        && ((addr - CriFilePool) % CriFileStride) == 0;
+
+    /// <summary>
+    /// Periodic commercial-slice work. Split into:
+    /// <list type="bullet">
+    /// <item><b>Structural middleware HLE</b> (always): CRI cvFs ISO open/read, ADXPS2
+    /// completion gate — required for GAMEDATA.WAD / resource loads. Not a PC poke.</item>
+    /// <item><b>PC-range assists</b> (only when <see cref="Ps2System.DisableMidwayAssist"/> is
+    /// false): force SIF init jump, unstick waits, logo FMV overlay.</item>
+    /// </list>
+    /// With <c>DETPS2_DISABLE_MIDWAY_ASSIST=1</c> / <c>--no-assist</c>, structural HLE still
+    /// runs so pure-BIOS boot can progress past the ADX/resource gate.
+    /// </summary>
     public void Step(Ps2System sys)
     {
         if (!sys.Hle.SonyKernelMode) return;
         ulong c = sys.MasterCycles;
+
+        // --- Structural (always on for this title) ---
+        BindIso(sys.Cdvd.MountedPath);
+        if (c > 200_000)
+        {
+            PlantCriFsDevices(sys);
+            MaybeHleCvFsOpen(sys);
+            MaybeHleCvFsGetSize(sys);
+            MaybeHleCvFsMethodWrappers(sys);
+            ServiceCriFsStubs(sys);
+            MaybePumpAdxfBulk(sys);
+        }
+        // ADX refcount gate: after real SIF/DTX activity, plant ready flags (FUN_00414ed0).
+        MaybeCompleteAdxInitGate(sys);
+        // After bulk disc stream, force resource-manager load slots out of "still loading".
+        MaybeCompleteResourceLoadGate(sys);
+        // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
+        MaybeEscapeStuckIntVector(sys);
+
+        // --- PC-range Midway assists (opt-out via --no-assist) ---
+        if (Ps2System.DisableMidwayAssist)
+            return;
+
         if (c - _lastAssistCycle < 25_000) return;
         _lastAssistCycle = c;
 
-        BindIso(sys.Cdvd.MountedPath);
         if (!_worklistPlanted && c > 100_000)
             PlantSifWorklist(sys);
 
@@ -327,6 +1134,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         MaybeResumeAfterForcedInitLocks(sys);
         MaybeUnblockStarvedSema(sys);
         MaybeUnblockStarvedSleep(sys);
+        MaybeResumeAllAfterResource(sys);
         MaybeCompleteRealSifCdRead(sys);
         // Start logo when EE is ready, but advance frames only on host present
         // (see OnHostPresent). Advancing on EE cycles burns the whole SFD in 1–2
@@ -383,6 +1191,31 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Assists++;
             return;
         }
+
+        // INTC_STAT VBlankStart poll (MKSM 0x4803D0): lw [0x1000F000]; andi 4; bne exit.
+        // Live 300M: PC stuck at 0x4803DC with cdvd/RPC frozen — VBlank bit never observed.
+        // Force Raise + jump past poll so boot continues (STAT already sticky elsewhere).
+        if (pc is >= 0x004803D0 and <= 0x004803E8)
+        {
+            sys.Intc.Raise(Intc.InterruptSource.VBlankStart);
+            // Prefer real exit path: set bit is enough if next lw sees it. Also nudge PC past
+            // the beq timeout arm so one assist sample completes the wait.
+            if (!_vblankPollNudgeArmed)
+            {
+                _vblankPollNudgeArmed = true;
+                Assists++;
+            }
+            else
+            {
+                // Second hit: hard-exit to post-poll (jal 0x485FB8)
+                sys.EE.PC = 0x004803EC;
+                _vblankPollNudgeArmed = false;
+                Assists++;
+            }
+            return;
+        }
+        else
+            _vblankPollNudgeArmed = false;
 
         // Wait loop in sif-init: jal; beqz v0, back @ 0x482FF8. Traced (2026-07-27) to
         // sceSifInitRpc's (real vaddr 0x482E98) own internal RPC-queue-ready check: it polls
@@ -770,7 +1603,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// </summary>
     private void MaybeUnblockStarvedSema(Ps2System sys)
     {
-        const ulong graceCycles = 2_000_000;
+        // Prefer real RPC completions. Force-signal only after a long genuine stall.
+        // After WAD/resource gate, poke more often so SIF worker (sema 3) keeps draining.
+        ulong graceCycles = _resourceLoadForced ? 250_000UL : 1_500_000UL;
         var kernel = sys.Hle?.Kernel;
         if (kernel == null) return;
 
@@ -788,10 +1623,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
             if (sys.MasterCycles - w.sinceCycle < graceCycles) continue;
 
+            // Drain real RPC first — often the producer for this WaitSema.
+            sys.Hle?.Sony?.DrainRealRpcQueue(sys.SchedulerGeneration + 1);
+            if (!t.Sleeping) { _semaWaitStart.Remove(t.Id); continue; }
+
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine($"[RPC] force-unblocking starved sema={t.WaitSemaId} thread={t.Id} cyc={sys.MasterCycles}");
             kernel.SignalSema(t.WaitSemaId);
-            _semaWaitStart.Remove(t.Id); // fresh grace period if it re-blocks on the same sema
+            // Cooldown: do not re-rescue this thread for another full grace window
+            _semaWaitStart[t.Id] = (t.WaitSemaId, sys.MasterCycles);
             Assists++;
         }
     }
@@ -808,15 +1648,60 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// therefore sleeps forever even though the worker is genuinely alive and running. Force-wakes
     /// any such starved thread after the same grace period as the sema case.
     /// </summary>
+    /// <summary>
+    /// After WAD/resource gate, ADX mutual-exclusion often Suspends the live pump and leaves
+    /// SoftSuspended peers while main sits at the Suspend stub with RPC frozen. Periodically
+    /// drain SoftSuspended + SuspendCount and Signal WaitSema waiters so SIF/pump run again.
+    /// </summary>
+    private void MaybeResumeAllAfterResource(Ps2System sys)
+    {
+        if (!_resourceLoadForced) return;
+        if (sys.MasterCycles - _lastPostResourceResumeCycle < 500_000UL) return;
+        _lastPostResourceResumeCycle = sys.MasterCycles;
+        var kernel = sys.Hle?.Kernel;
+        if (kernel == null) return;
+
+        sys.Hle?.Sony?.DrainRealRpcQueue(sys.SchedulerGeneration + 1);
+
+        foreach (var t in kernel.AllThreads)
+        {
+            if (!t.Alive) continue;
+            if (t.SoftSuspended)
+                kernel.ResumeThread(t.Id);
+            while (t.SuspendCount > 0)
+                kernel.ResumeThread(t.Id);
+            if (t.Sleeping && t.WaitSemaId != 0)
+            {
+                try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+            }
+            else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank && t.Id >= 2)
+                kernel.WakeupThread(t.Id);
+        }
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        if (pc is >= 0x0047FDD0 and <= 0x0047FDE0)
+            kernel.YieldToWorker(sys.EE);
+        Assists++;
+    }
+
     private void MaybeUnblockStarvedSleep(Ps2System sys)
     {
-        const ulong graceCycles = 2_000_000;
+        // SuspendThread parks are often "wait for peer Resume" with no peer under HLE —
+        // rescue sooner than plain SleepThread so boot CD/ADX can proceed.
+        const ulong graceSleep = 2_000_000UL;
+        const ulong graceSuspend = 400_000UL;
         var kernel = sys.Hle?.Kernel;
         if (kernel == null) return;
 
         foreach (var t in kernel.AllThreads)
         {
-            if (!t.Alive || !t.Sleeping || t.WaitSemaId != 0 || t.WaitVblank)
+            // Pure SleepThread OR SuspendThread park (SuspendCount>0), no sema/vblank
+            bool suspended = t.SuspendCount > 0;
+            if (!t.Alive || t.WaitSemaId != 0 || t.WaitVblank)
+            {
+                _sleepWaitStart.Remove(t.Id);
+                continue;
+            }
+            if (!t.Sleeping && !suspended)
             {
                 _sleepWaitStart.Remove(t.Id);
                 continue;
@@ -826,11 +1711,20 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 _sleepWaitStart[t.Id] = sys.MasterCycles;
                 continue;
             }
-            if (sys.MasterCycles - since < graceCycles) continue;
+            ulong grace = suspended ? graceSuspend : graceSleep;
+            if (sys.MasterCycles - since < grace) continue;
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                Console.Error.WriteLine($"[RPC] force-waking starved sleep thread={t.Id} cyc={sys.MasterCycles}");
-            kernel.WakeupThread(t.Id);
+                Console.Error.WriteLine(
+                    $"[RPC] force-waking starved sleep/suspend thread={t.Id} susp={t.SuspendCount} cyc={sys.MasterCycles}");
+            if (t.SuspendCount > 0)
+            {
+                // Drain suspend nest so Resume-equivalent unpark works
+                while (t.SuspendCount > 0)
+                    kernel.ResumeThread(t.Id);
+            }
+            else
+                kernel.WakeupThread(t.Id);
             _sleepWaitStart.Remove(t.Id); // fresh grace period if it re-sleeps
             Assists++;
         }
@@ -917,6 +1811,272 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (trace)
             Console.Error.WriteLine($"[RPC] MaybeCompleteRealSifCdRead: call(NcmdRead lbn=0) -> result={result} calls={realRpc.Calls} cdvdSectors={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
         _realSifStage = -1; // done — one-shot proof that the real dispatch chain works end to end
+    }
+
+    /// <summary>
+    /// HLE the Midway/Surreal ADXPS2 "last async complete" gate when real IOP IRX execution
+    /// is not yet available to deliver the EE callback that would call FUN_00414f20.
+    ///
+    /// Live-traced (2026-07-29, DEVELOPER_GUIDE §7.19–7.22): CRI ADX init (FUN_00414d40)
+    /// increments refcount at 0x534124 0→1, spawns waiters on readiness flags 0x5341D8…228,
+    /// then never receives the completion that would run FUN_00414f20 (only static caller
+    /// FUN_0026f288 is itself only reachable via an IOP-driven path never entered under HLE).
+    /// FUN_00414ed0 (called only when that refcount hits 0) is an unconditional six-flag store.
+    /// After RealSifRpc has finished the bind/DTX surface the game already exercised, plant the
+    /// same six flags and clear the refcount — same observable as a real last-out completion.
+    /// Title-scoped (MidwayBootAssist); not a generic BIOS contract.
+    /// </summary>
+    private void MaybeCompleteAdxInitGate(Ps2System sys)
+    {
+        if (_adxGateCompleted) return;
+        // Do NOT plant before ADX workers (0x4145A8/0x4147F8) have been StartThread'd and
+        // had a chance to park on zero flags. Planting at 5M then kicking at 7.35M made
+        // every worker see flag!=0, ExitThread immediately, and left main thrashing
+        // SuspendThread/GetThreadId/ReferThreadStatus (~144k each / 150M).
+        if (sys.MasterCycles < 12_000_000) return;
+        var realRpc = sys.Hle?.Sony?.RealRpc;
+        if (realRpc == null) return;
+        // Need real CRI ADX / SIF activity before claiming ready (binds include CD/FILEIO/ADX).
+        if (realRpc.Binds < 4 || realRpc.Calls < 10) return;
+
+        // Plant only once ADX workers have had time to park on zero flags, OR late emergency.
+        // Prefer: bulk disc stream underway (WAD) so resource path isn't starved of EE time.
+        bool heavyIo = sys.Cdvd.SectorsRead > 10_000 || _adxfPumpCount > 50;
+        if (!heavyIo && sys.MasterCycles < 35_000_000) return;
+        if (sys.MasterCycles < 18_000_000) return;
+
+        uint rc = sys.Memory.Read32(0x00534124);
+        uint flag = sys.Memory.Read32(0x005341D8);
+        if (flag != 0) { _adxGateCompleted = true; return; } // already open
+        // If refcount never acquired, still open waiters after long run with heavy RPC —
+        // resource load can leave threads parked on zero flags with rc still 0.
+        if (rc == 0 && sys.MasterCycles < 40_000_000) return;
+        if (rc == 0 && realRpc.Calls < 50) return;
+
+        // Mirror FUN_00414ed0 ready flags — BUT skip DAT_00534218 (0x5341D8 + 4*0x10).
+        // Live-traced (2026-07-29): pump worker entry 0x4147F8 is
+        //   ld v1,0(0x534218); bne v1,zero,epilogue
+        // so planting 1 there forces every ADX worker to fall through to jr ra with
+        // $ra=0 → ExitThread (observed: all four tids exit at 0x47FCA4 ra=0 the same
+        // cycle the gate fires). Waiters only need 0x5341D8 / 0x5341E8 / … / 0x534208.
+        for (uint i = 0; i < 6; i++)
+        {
+            uint addr = 0x005341D8 + i * 0x10;
+            if (addr == 0x00534218) continue; // pump-stop — leave 0
+            sys.Memory.Write32(addr, 1);
+            sys.Memory.Write32(addr + 4, 0);
+        }
+        sys.Memory.Write32(0x00534124, 0); // refcount drained
+        // Force pump-stop flag clear in case prior session state / game code set it.
+        sys.Memory.Write32(0x00534218, 0);
+        sys.Memory.Write32(0x0053421C, 0);
+        // Also mark sibling heartbeat region the wait loop samples (0x534180 area).
+        if (sys.Memory.Read32(0x00534180) == 0)
+            sys.Memory.Write32(0x00534180, 1);
+
+        // Mirror FUN_00427410(6, 0x414568, 0): register group-6 ADX callback so the pump
+        // worker's FUN_00427678 → FUN_00427518(6) / FUN_00427468(6) is not a pure no-op.
+        // Live dumps showed 0x75E9E0 and 0x75E7A0 all-zero for entire boots (DEVELOPER_GUIDE).
+        // Single-slot table: base 0x75E9E0, stride 8, group 6 → 0x75EA10.
+        const uint AdxGroup6Fn = 0x00414568;
+        const uint AdxGroupTable = 0x0075E9E0;
+        const uint AdxGroup6Slot = AdxGroupTable + 6 * 8;
+        if (sys.Memory.Read32(AdxGroup6Slot) == 0)
+        {
+            sys.Memory.Write32(AdxGroup6Slot, AdxGroup6Fn);
+            sys.Memory.Write32(AdxGroup6Slot + 4, 0);
+        }
+        // Multi-slot table (stride 0x48): plant one live entry for group 6 first sub-slot.
+        // Layout unknown beyond "non-zero func pointer"; store fn at +0 and arg at +4.
+        const uint AdxMultiBase = 0x0075E7A0;
+        // Group index * 0x48 * 5? DEVELOPER_GUIDE: table for group 6 scanned with stride 0x48.
+        // FUN_00427518(6) — plant at base + small offset if still empty.
+        if (sys.Memory.Read32(AdxMultiBase) == 0)
+        {
+            sys.Memory.Write32(AdxMultiBase, AdxGroup6Fn);
+            sys.Memory.Write32(AdxMultiBase + 4, 0);
+            sys.Memory.Write32(AdxMultiBase + 8, 1); // active / count-ish
+        }
+
+        // Wake anyone parked via SuspendThread waiting on these flags.
+        var kernel = sys.Hle?.Kernel;
+        if (kernel != null)
+        {
+            foreach (var t in kernel.AllThreads)
+            {
+                if (!t.Alive || t.SuspendCount <= 0) continue;
+                while (t.SuspendCount > 0)
+                    kernel.ResumeThread(t.Id);
+            }
+        }
+        _adxGateCompleted = true;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] MaybeCompleteAdxInitGate: 6 ready flags, rc 0x534124 {rc}->0 " +
+                $"binds={realRpc.Binds} calls={realRpc.Calls} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Unblock FUN_0026fd80-style resource load-and-wait once bulk disc I/O has finished.
+    /// Live-traced (DEVELOPER_GUIDE §ADX/resource): poll is
+    /// <c>FUN_0026fbf0(0x678458) → status at handle+0x48</c> (0 = still loading). After
+    /// GAMEDATA.WAD-scale CDVD activity, force active resource slots to "done" so main can
+    /// leave the load spin and reach the CRI ADX tick / menu path.
+    /// </summary>
+    private void MaybeCompleteResourceLoadGate(Ps2System sys)
+    {
+        if (_resourceLoadForced) return;
+        // Wait until WAD-scale stream is done AND boot has had time for pad/SIF surface.
+        // Firing at 35M with only status poke still left main at Suspend stub with RPC
+        // frozen at 172 calls for the rest of a 400M run.
+        if (sys.MasterCycles < 55_000_000) return;
+        bool wadDone = (sys.Cdvd.SectorsRead >= 180_000 && _adxfPumpCount >= 5000)
+            || sys.MasterCycles > 100_000_000;
+        if (!wadDone) return;
+
+        var mem = sys.Memory;
+        int fixedSlots = 0;
+
+        // Known static handle used by FUN_0026fd80 poll (DEVELOPER_GUIDE)
+        fixedSlots += ForceResourceHandleDone(mem, 0x00678458);
+        // Unconditional status poke — handle may have zero header under HLE but still be polled.
+        if (mem.Read32(0x00678458 + 0x48) == 0)
+        {
+            mem.Write32(0x00678458 + 0x48, 1);
+            fixedSlots++;
+        }
+
+        // FUN_0026fd80: lVar6 = (DAT_00678644 != 1) ? poll : 3; while (lVar6 == 0);
+        // Prefer poll completion via +0x48 status (above) rather than forcing DAT_00678644=1,
+        // which previously aborted load-wait before the SIF bind surface finished expanding
+        // (binds stuck at 12 / calls at 172 for hundreds of M cycles after the gate).
+        // Prefer +0x48 status alone. Force DAT_00678644 only very late.
+        if (sys.MasterCycles > 120_000_000)
+            mem.Write32(0x00678644, 1);
+        mem.Write32(0x00678650, 0);
+
+        // Streaming-tick countdown that never gets written under HLE (DEVELOPER_GUIDE §ADX).
+        if (mem.Read32(0x0055E1E8) == 0)
+            mem.Write32(0x0055E1E8, 1);
+
+        // Resource-manager pool: 8 entries × 0x2AC (FUN_0043b670), scan a few candidate bases
+        // used by Midway resource manager near 0x678xxx / 0x55Exxx.
+        uint[] poolBases = { 0x00678000, 0x00670000, 0x0055E000, 0x00560000 };
+        foreach (uint baseP in poolBases)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                uint slot = baseP + (uint)(i * 0x2AC);
+                if (slot + 0x50 >= SystemMemory.RDRAM_SIZE) continue;
+                // Active slot: non-zero pointer/id at +0 and status 0 at +0x48
+                uint id = mem.Read32(slot);
+                uint st = mem.Read32(slot + 0x48);
+                if (id != 0 && st == 0)
+                    fixedSlots += ForceResourceHandleDone(mem, slot);
+            }
+        }
+
+        // Also sweep a tight window around 0x678458 for any 0x48-offset status zeros with
+        // non-zero object headers (cheap, bounded).
+        for (uint p = 0x00678000; p < 0x0067A000; p += 4)
+        {
+            uint st = mem.Read32(p);
+            // Only write when looking at likely status fields: prior word non-zero, this zero,
+            // and p ends with pattern matching +0x48 stride-ish — use direct handle force only.
+            _ = st;
+        }
+
+        // Countdown gate DAT_0055e1e8 that never gets written under HLE — plant a non-zero
+        // so FUN_0043ce78's "every Nth tick" path can fire once main reaches it.
+        if (mem.Read32(0x0055E1E8) == 0)
+            mem.Write32(0x0055E1E8, 1);
+
+        _resourceForceScans++;
+        if (fixedSlots > 0 || sys.MasterCycles > 50_000_000)
+        {
+            _resourceLoadForced = true;
+            // Wake only threads that are actually blocked — do NOT SignalSema(1..64) blindly
+            // (that re-created a 2M× WaitSema/Wakeup thrash after the early-gate regression).
+            var kernel = sys.Hle?.Kernel;
+            if (kernel != null)
+            {
+                foreach (var t in kernel.AllThreads)
+                {
+                    if (!t.Alive) continue;
+                    if (t.Sleeping && t.WaitSemaId != 0)
+                    {
+                        try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    if (t.SuspendCount > 0)
+                    {
+                        while (t.SuspendCount > 0)
+                            kernel.ResumeThread(t.Id);
+                    }
+                }
+            }
+            // Re-arm only the ADX pump worker (0x4147F8) after bulk load — not one-shot
+            // flag waiters (0x4145A8 etc.) which correctly ExitThread once flags are set.
+            if (kernel != null)
+            {
+                foreach (var t in kernel.AllThreads)
+                {
+                    if (t.Id < 2 || !t.Alive || t.Started) continue;
+                    if (t.Entry != 0x004147F8u) continue;
+                    kernel.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false);
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                        Console.Error.WriteLine(
+                            $"[BIOS] re-Start ADX pump tid={t.Id} entry=0x{t.Entry:X8} cyc={sys.MasterCycles}");
+                }
+                kernel.YieldToWorker(sys.EE);
+            }
+            // Drop host logo overlay once bulk resources are in — game GS (Path3) should
+            // own the framebuffer past this point (was pinning px≈77M on logo blit).
+            if (_midwayDone || _logoActive)
+            {
+                _logoActive = false;
+                _midwayDone = true;
+                sys.Gs.ClearHostOverlay();
+                Status = "post-wad-gs";
+            }
+
+            // Soft-suspend exited ADX waiters permanently so lock/unlock stops re-Suspend thrash.
+            if (kernel != null)
+            {
+                foreach (var t in kernel.AllThreads)
+                {
+                    if (t.Alive && t.EverStarted && !t.Started
+                        && t.Entry is >= 0x00414000u and < 0x00416000u)
+                        t.SoftSuspended = true;
+                }
+            }
+
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] MaybeCompleteResourceLoadGate: fixed={fixedSlots} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} adxfPumps={_adxfPumpCount} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>Write resource handle status field +0x48 to "done" (non-zero). Returns 1 if changed.</summary>
+    private static int ForceResourceHandleDone(SystemMemory mem, uint handle)
+    {
+        if (handle < 0x100000 || handle + 0x50 >= SystemMemory.RDRAM_SIZE) return 0;
+        uint st = mem.Read32(handle + 0x48);
+        if (st != 0) return 0;
+        // Only if handle looks allocated (any non-zero in first 0x20)
+        bool live = false;
+        for (uint o = 0; o < 0x20; o += 4)
+            if (mem.Read32(handle + o) != 0) { live = true; break; }
+        if (!live) return 0;
+        mem.Write32(handle + 0x48, 1); // done
+        // Common sibling fields: error=0, progress=full
+        if (mem.Read32(handle + 0x4C) == 0)
+            mem.Write32(handle + 0x4C, 0);
+        return 1;
     }
 
     private void MaybeStartLogo(Ps2System sys)

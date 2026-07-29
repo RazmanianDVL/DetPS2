@@ -17,6 +17,19 @@ public sealed class KernelState
         public bool Sleeping;
         public bool WaitVblank;
         public bool Started;
+        /// <summary>True after the first successful StartThread. Distinguishes never-started
+        /// DORMANT (Refer must report 0x10 so games can StartThread) from exited-after-run.</summary>
+        public bool EverStarted;
+        /// <summary>Logical suspend for exited (DORMANT) threads. MK ADX lock at 0x414A58 does
+        /// Suspend on peers; unlock at 0x4149F0 Resumes if status==SUSPEND. Reporting permanent
+        /// SUSPEND for all EverStarted DORMANT caused 2.6M× Resume thrash; never-SUSPEND caused
+        /// Suspend thrash. SoftSuspended is set by SuspendThread on exited peers and cleared by
+        /// ResumeThread — mutual exclusion without resurrecting ExitThread'd workers.</summary>
+        public bool SoftSuspended;
+        /// <summary>EE SuspendThread nest count. Non-zero ⇒ not runnable until ResumeThread
+        /// drains it (independent of SleepThread / WaitSema). Was a no-op stub — ADX workers
+        /// burned 160k+ SuspendThread calls/80M cycles with no yield.</summary>
+        public int SuspendCount;
         public int WaitSemaId;
         /// <summary>0 = not waiting on an event flag. See WaitEventFlag/SetEventFlag in
         /// SonyKernelHle.cs and KernelState.EventFlagSatisfied/ConsumeEventFlag/ParkOnEventFlag.</summary>
@@ -287,9 +300,11 @@ public sealed class KernelState
         t.Sleeping = false;
         t.WaitVblank = false;
         t.Started = true;
+        t.EverStarted = true;
         t.StartArg = arg;
         t.FreshStart = true;
         t.SavedPc = t.Entry;
+        t.SuspendCount = 0;
         if (t.SavedSp == 0)
             t.SavedSp = t.Stack != 0 ? t.Stack : 0x01F00000u - (uint)(id * 0x10000);
         LogThreadEvent("Start", id, t.SavedPc, t.SavedSp, $"arg=0x{arg:X}");
@@ -300,6 +315,48 @@ public sealed class KernelState
     {
         var t = FindThread(_currentTid);
         if (t != null) t.Sleeping = true;
+        return 0;
+    }
+
+    /// <summary>BIOS THREADMAN SuspendThread — nestable; thread not runnable while count &gt; 0.</summary>
+    public int SuspendThread(int id)
+    {
+        var t = FindThread(id == 0 ? _currentTid : id);
+        if (t == null || !t.Alive) return -1;
+        // Exited (DORMANT) peer: record logical suspend for Refer/Resume mutual-exclusion
+        // without resurrecting the thread (see SoftSuspended doc).
+        if (!t.Started && t.EverStarted)
+        {
+            t.SoftSuspended = true;
+            return 0;
+        }
+        if (!t.Started) return 0; // never-started: no-op success
+        t.SuspendCount++;
+        // Suspend implies not runnable (same as sleeping for the ready-queue scan).
+        t.Sleeping = true;
+        return 0;
+    }
+
+    /// <summary>BIOS THREADMAN ResumeThread — decrements suspend nest; ready when count hits 0
+    /// and not blocked on a sema/vblank.</summary>
+    public int ResumeThread(int id)
+    {
+        var t = FindThread(id == 0 ? _currentTid : id);
+        if (t == null || !t.Alive) return -1;
+        // Exited peers (EverStarted && !Started): keep SoftSuspended sticky. Unlock path
+        // 0x4149F0 Resumes if status==SUSPEND; if we clear SoftSuspended, the lock path
+        // immediately Suspends again → 390k× Suspend/Refer thrash after WaitSemaVblank
+        // freeze was removed. Permanent park is correct for ExitThread'd ADX waiters.
+        if (t.SoftSuspended)
+        {
+            if (!(t.EverStarted && !t.Started))
+                t.SoftSuspended = false;
+            return 0;
+        }
+        if (t.SuspendCount > 0)
+            t.SuspendCount--;
+        if (t.SuspendCount == 0 && t.WaitSemaId == 0 && !t.WaitVblank)
+            t.Sleeping = false;
         return 0;
     }
 
@@ -327,10 +384,52 @@ public sealed class KernelState
 
     public int WakeupThread(int id)
     {
-        var t = FindThread(id);
-        if (t == null) return -1;
-        t.Sleeping = false;
-        t.WaitVblank = false;
+        // Retail code (esp. Midway SIF-RPC dispatch workers) often calls WakeupThread(0)
+        // because the primordial EE thread never went through CreateThread/GetThreadId, so
+        // the id stored for "wake main when done" is 0. Real kernels treat invalid ids as
+        // errors; under HLE a permanent no-op deadlocks every SleepThread waiter that
+        // expected that wake (Shaolin Monks threads 4–6, 2026-07-27). Map id 0 to: wake
+        // every pure SleepThread waiter (WaitSemaId==0, not VBlank), preferring thread 1.
+        if (id == 0)
+        {
+            int woken = 0;
+            foreach (var t in _threads)
+            {
+                // Don't clear SuspendThread park via WakeupThread(0)
+                if (!t.Alive || !t.Sleeping || t.WaitSemaId != 0 || t.WaitVblank || t.SuspendCount > 0) continue;
+                t.Sleeping = false;
+                t.WaitVblank = false;
+                woken++;
+            }
+            // Also clear a pure-sleep on the current thread if it SleepThread'd itself
+            // waiting for a worker that only ever WakeupThread(0)'s.
+            if (woken == 0)
+            {
+                var main = FindThread(1);
+                if (main != null && main.Alive && main.Sleeping && main.WaitSemaId == 0 && main.SuspendCount == 0)
+                {
+                    main.Sleeping = false;
+                    main.WaitVblank = false;
+                    woken = 1;
+                }
+            }
+            return woken > 0 ? 0 : -1;
+        }
+
+        var th = FindThread(id);
+        if (th == null) return -1;
+        // Real THREADMAN: WakeupThread only affects SleepThread waiters. A WaitSema
+        // park is released by SignalSema. MK ADX helper at 0x414988 does
+        //   ReferStatus; if WAIT(4) or WAIT|SUSPEND(12) → WakeupThread
+        // against the SIF worker (WaitSemaId=3). Clearing Sleeping without
+        // clearing WaitSemaId left Refer status stuck at WAIT forever → 5.8M×
+        // Refer thrash. Route WaitSema waiters through SignalSema instead.
+        if (th.WaitSemaId != 0)
+            return SignalSema(th.WaitSemaId);
+        th.WaitVblank = false;
+        // WakeupThread does not cancel SuspendThread — only ResumeThread does.
+        if (th.SuspendCount == 0)
+            th.Sleeping = false;
         return 0;
     }
 
@@ -383,23 +482,38 @@ public sealed class KernelState
     public Thread? GetThread(int id) => FindThread(id);
     public IReadOnlyList<Thread> AllThreads => _threads;
 
-    /// <summary>Save minimal context from EE into the current thread slot.</summary>
+    /// <summary>Save context from EE into the current thread slot.</summary>
     /// <param name="fromSyscall">When true, resume at PC+4 (skip SYSCALL insn).</param>
+    /// <remarks>
+    /// Always snapshots the full GPR file. Partial (callee-saved-only) saves leaked the previous
+    /// thread's v0/v1/a0-a3 across SwitchToNext — e.g. WaitSema stub leaves v1=0x44, then the
+    /// resumed thread's INTC busy-poll does lw via v1 and reads address 0x44 forever
+    /// (Shaolin Monks 0x4803D0, 2026-07-29). Full save is cheap relative to that class of bug.
+    /// While EXL is set, prefer keeping CaptureInterruptedContext's user snapshot.
+    /// </remarks>
     public void SaveCurrentContext(EmotionEngine ee, bool fromSyscall = true)
     {
         var t = FindThread(_currentTid);
         if (t == null) return;
         // From SYSCALL: PC is the SYSCALL insn → resume after it.
         // From preemptive yield: PC is the next insn to run → keep as-is.
-        t.SavedPc = fromSyscall ? ee.PC + 4 : ee.PC;
-        // Invalidate any older full-preemption snapshot (see SaveFullContext's doc comment for
-        // the matching half of this fix): once this thread has taken a normal cooperative save,
-        // that snapshot's caller-saved registers (v0/v1/a0-a3/t0-t9) are stale relative to
-        // whatever this save just captured. A later MaybePreempt on THIS thread always calls
-        // SaveFullContext fresh before anyone restores it, but a later RestoreFullContext call
-        // could otherwise resurrect the old SavedGprFull array instead of the fields just written
-        // below -- clearing the flag forces it to fall back to these (always current) fields.
-        t.HasFullSave = false;
+        ulong resumePc = fromSyscall ? ee.PC + 4 : ee.PC;
+
+        // Inside ISR: do not overwrite the interrupted-user full snapshot with ISR GPRs.
+        if ((ee.COP0_Status & 0x2) != 0 && t.HasFullSave && t.SavedGprFull != null)
+        {
+            // Still record that this thread is blocked in the ISR (for bookkeeping only).
+            t.SavedSp = ee.GetGpr(29).Lo;
+            LogThreadEvent("SaveOutIsr", _currentTid, t.SavedPc, t.SavedSp, fromSyscall ? "fromSyscall" : "cooperative");
+            return;
+        }
+
+        t.SavedPc = resumePc;
+        t.SavedGprFull ??= new ulong[32];
+        for (int i = 0; i < 32; i++)
+            t.SavedGprFull[i] = ee.GetGpr(i).Lo;
+        // Resume PC may differ from current PC (syscall +4); keep that in SavedPc / slot 0 unused.
+        t.HasFullSave = true;
         t.SavedSp = ee.GetGpr(29).Lo;
         t.SavedGp = ee.GetGpr(28).Lo;
         t.SavedRa = ee.GetGpr(31).Lo;
@@ -423,7 +537,31 @@ public sealed class KernelState
         var t = FindThread(id);
         if (t == null || !t.Alive) return false;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RESTORE1") == "1" && id == 1)
-            Console.Error.WriteLine($"[RESTORE1] cyc={CurrentCycle} wasStarted={t.Started} wasSleeping={t.Sleeping} savedPc=0x{t.SavedPc:X8}");
+            Console.Error.WriteLine($"[RESTORE1] cyc={CurrentCycle} wasStarted={t.Started} wasSleeping={t.Sleeping} savedPc=0x{t.SavedPc:X8} hasFull={t.HasFullSave}");
+
+        // Force-preempted threads (MaybePreempt → SaveFullContext) may be resumed here via
+        // SwitchToNext after another thread's WaitSema/Sleep — NOT only via RestoreFullContext.
+        // Partial restore (callee-saved only) would resume at SavedPc mid-memset/memcpy with
+        // garbage a0/a2/t* and self-corrupt code (Shaolin Monks 0x474814, 2026-07-29).
+        if (t.HasFullSave && t.SavedGprFull != null && !t.FreshStart)
+        {
+            _currentTid = id;
+            ulong fpc = t.SavedPc != 0 ? t.SavedPc : t.Entry;
+            if (fpc == 0) return false;
+            if (fromSyscall)
+                ee.HleRedirectPc = fpc;
+            else
+                ee.PC = fpc;
+            for (int i = 1; i < 32; i++)
+                ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
+            // Snapshot consumed — next leave must SaveFullContext again if preempted.
+            t.HasFullSave = false;
+            t.Sleeping = false;
+            t.Started = true;
+            LogThreadEvent("SwitchToFull", id, fpc, t.SavedGprFull[29], fromSyscall ? "fromSyscall" : "cooperative");
+            return true;
+        }
+
         _currentTid = id;
         ulong pc = t.SavedPc != 0 ? t.SavedPc : t.Entry;
         if (pc == 0) return false;
@@ -483,7 +621,9 @@ public sealed class KernelState
             // by 100M cycles in one trace, masking the real underlying error as a fake loop
             // instead of surfacing it.
             var cur = FindThread(_currentTid);
-            if (cur != null && cur.Sleeping && cur.Started)
+            // Self-wake only for temporary SleepThread/WaitSema — never for SuspendThread
+            // nest (would undo Suspend the same cycle and recreate the ADX thrash loop).
+            if (cur != null && cur.Sleeping && cur.Started && cur.SuspendCount == 0)
             {
                 cur.Sleeping = false;
                 cur.WaitSemaId = 0;
@@ -517,6 +657,40 @@ public sealed class KernelState
 
     private uint _preemptQuantum = 0x10000; // ~65536 EE cycles per timeslice
     private ulong _cyclesSinceLastPreempt;
+
+    /// <summary>Drop HasFullSave on the current thread (after eret restored user GPRs into EE).</summary>
+    public void ClearFullSaveIfCurrent()
+    {
+        var t = FindThread(_currentTid);
+        if (t != null) t.HasFullSave = false;
+    }
+
+    /// <summary>
+    /// Publish the interrupted user GPR file (from INTC dispatch) onto the current thread so
+    /// cooperative SwitchToNext from inside the ISR can full-restore, not partial-restore.
+    /// </summary>
+    public void CaptureInterruptedContext(EmotionEngine ee, ulong[] gprs)
+    {
+        var t = FindThread(_currentTid);
+        if (t == null || gprs == null || gprs.Length < 32) return;
+        t.SavedGprFull ??= new ulong[32];
+        Array.Copy(gprs, t.SavedGprFull, 32);
+        t.HasFullSave = true;
+        t.SavedPc = ee.PC; // PC still points at interrupted instruction when this is called
+        t.SavedSp = gprs[29];
+        t.SavedGp = gprs[28];
+        t.SavedRa = gprs[31];
+        t.SavedS0 = gprs[16];
+        t.SavedS1 = gprs[17];
+        t.SavedS2 = gprs[18];
+        t.SavedS3 = gprs[19];
+        t.SavedS4 = gprs[20];
+        t.SavedS5 = gprs[21];
+        t.SavedS6 = gprs[22];
+        t.SavedS7 = gprs[23];
+        t.SavedS8 = gprs[30];
+        t.SavedFp = gprs[30];
+    }
 
     /// <summary>Save every GPR (not just the callee-saved subset) — see the
     /// SavedGprFull doc comment on why a forced preemption needs this.</summary>
@@ -575,7 +749,9 @@ public sealed class KernelState
         ee.PC = t.SavedPc;
         for (int i = 1; i < 32; i++) // skip $zero
             ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
-        t.Sleeping = false;
+        // Don't clear SuspendThread park on preempt-in
+        if (t.SuspendCount == 0)
+            t.Sleeping = false;
         t.Started = true;
         LogThreadEvent("PreemptIn", id, t.SavedPc, t.SavedGprFull[29]);
         return true;
@@ -627,7 +803,11 @@ public sealed class KernelState
             if (t.WaitVblank)
             {
                 t.WaitVblank = false;
-                t.Sleeping = false;
+                // Do not clear Sleeping if SuspendThread is still nested — that turned
+                // Suspend+WaitSemaVblank into "return every frame" and left main spinning
+                // at the Suspend stub (MK 0x47FDD8, ~600 Suspends/150M with no Resume).
+                if (t.SuspendCount == 0 && t.WaitSemaId == 0)
+                    t.Sleeping = false;
             }
         }
     }
@@ -639,26 +819,79 @@ public sealed class KernelState
         return id;
     }
 
-    public int DeleteSema(int id) => _semas.Remove(id) ? 0 : -1;
-
-    /// <summary>Non-mutating existence check — unlike WaitSemaBlocking, does not consume a count.</summary>
-    public bool SemaExists(int id) => _semas.ContainsKey(id);
-
-    public int SignalSema(int id)
+    /// <summary>
+    /// BIOS THREADMAN DeleteSema: remove the object and wake every waiter (they observe
+    /// failure on re-check). Leaving waiters Sleeping forever is a hang source once games
+    /// tear down RPC client semaphores.
+    /// </summary>
+    public int DeleteSema(int id)
     {
-        if (!_semas.TryGetValue(id, out var s)) return -1;
-        if (s.Count < s.MaxCount) s.Count++;
-        // Wake one thread waiting on this sema
+        if (!_semas.Remove(id)) return -1;
         foreach (var t in _threads)
         {
             if (t.Alive && t.Sleeping && t.WaitSemaId == id)
             {
                 t.Sleeping = false;
                 t.WaitSemaId = 0;
-                break;
             }
         }
-        return s.Count;
+        return 0;
+    }
+
+    /// <summary>Non-mutating existence check — unlike WaitSemaBlocking, does not consume a count.</summary>
+    public bool SemaExists(int id) => _semas.ContainsKey(id);
+
+    /// <summary>
+    /// BIOS THREADMAN SignalSema (Ghidra tools/bios-decomp/THREADMAN_ALL.txt):
+    /// if any waiter is queued → wake exactly one (do not also bump count);
+    /// else if count &lt; max → count++;
+    /// else error (full). EE RPC uses CreateSema(init=0,max=1) then WaitSema;
+    /// double-counting on wake made later WaitSema succeed without a real producer.
+    /// </summary>
+    public int SignalSema(int id)
+    {
+        if (!_semas.TryGetValue(id, out var s)) return -1;
+
+        // Prefer waking a waiter (BIOS: wait queue non-empty → ready one thread).
+        foreach (var t in _threads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitSemaId == id)
+            {
+                t.Sleeping = false;
+                t.WaitSemaId = 0;
+                // No count++: the wake *is* the unit of signal consumption.
+                return s.Count;
+            }
+        }
+
+        if (s.Count < s.MaxCount)
+        {
+            s.Count++;
+            return s.Count;
+        }
+        return -1; // KE_SEMA_OVF style — max already held, no waiter
+    }
+
+    /// <summary>
+    /// Interrupt-context SignalSema (THREADMAN iSignalSema). Same count/wake rules as
+    /// <see cref="SignalSema"/> — EE i-forms only differ in which context may call them.
+    /// </summary>
+    public int ISignalSema(int id) => SignalSema(id);
+
+    /// <summary>
+    /// BIOS THREADMAN PollSema: non-blocking WaitSema. Decrements count if available;
+    /// returns negative without sleeping when empty. Distinct from WaitSemaBlocking, which
+    /// parks the thread (and was incorrectly used for PollSema before).
+    /// </summary>
+    public int PollSema(int id)
+    {
+        if (!_semas.TryGetValue(id, out var s)) return -1;
+        if (s.Count > 0)
+        {
+            s.Count--;
+            return s.Count;
+        }
+        return -1; // KE_SEMA_ZERO — would block
     }
 
     public int WaitSema(int id)

@@ -1111,6 +1111,40 @@ if (args.Length > 0 && args[0].Equals("romdir-list", StringComparison.OrdinalIgn
     Environment.Exit(0);
 }
 
+// detps2 bios-map [biosPath] — print the C# BIOS/IOP service map (ROMDIR ∩ boot contracts).
+// This is the structural substrate shared by every commercial title — not a per-game hack list.
+if (args.Length > 0 && args[0].Equals("bios-map", StringComparison.OrdinalIgnoreCase))
+{
+    string? bpath = args.Length > 1 ? args[1] : null;
+    if (string.IsNullOrEmpty(bpath))
+    {
+        // Fall back to user-media.json biosPath if present
+        string media = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".grok", "user-media.json");
+        if (File.Exists(Environment.GetEnvironmentVariable("TEMP") + Path.DirectorySeparatorChar + "shaolin-only.json"))
+            media = Path.Combine(Environment.GetEnvironmentVariable("TEMP")!, "shaolin-only.json");
+        if (File.Exists(media))
+        {
+            try
+            {
+                var cfg = UserMediaConfig.Load(media);
+                bpath = cfg.BiosPath;
+            }
+            catch { /* ignore */ }
+        }
+    }
+    if (string.IsNullOrEmpty(bpath) || !File.Exists(bpath))
+    {
+        Console.WriteLine("usage: detps2 bios-map <biosPath>");
+        Environment.Exit(1);
+    }
+    var biosSys = new Ps2System();
+    biosSys.LoadBios(bpath);
+    Console.Write(biosSys.BiosBoot.FormatServiceMap());
+    Console.WriteLine($"  servicesInstalled={biosSys.BiosBoot.ServicesInstalled} iopModules={biosSys.IopModules.ModuleCount}");
+    Environment.Exit(0);
+}
+
 // detps2 romdir-extract <biosPath> <moduleName> <outPath> — extract a single named ROMDIR
 // module's raw ELF bytes from a BIOS ROM image (IRX Phase 2 tooling). Never commit BIOS
 // images or extracted module bytes to the repo — this is a diagnostic tool only.

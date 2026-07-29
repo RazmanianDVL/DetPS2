@@ -74,12 +74,22 @@ public sealed class IopModuleHost
     private readonly Dictionary<int, LoadedIrx> _irxById = new();
     private readonly Dictionary<int, string> _openFiles = new();
     private readonly Dictionary<int, OpenHostFile> _hostFiles = new();
+    private readonly Dictionary<int, OpenDir> _openDirs = new();
     private int _nextModuleId = 1;
     private int _nextFd = 3;
+    private int _nextDirFd = 1000;
     private uint _nextIopBase = IrxLoader.DefaultLoadBase;
     private MemoryCard _memcard = new();
     private Iso9660.Volume? _discVolume;
     private string? _discPath;
+
+    // fio / iox_stat mode bits (ps2sdk iox_stat.h)
+    public const uint FioSIfDir = 0x1000;
+    public const uint FioSIfReg = 0x2000;
+    public const uint FioSIfmt = 0xF000;
+    public const uint FioSIrusr = 0x0100;
+    public const uint FioSIwusr = 0x0080;
+    public const uint FioSIxusr = 0x0040;
 
     private sealed class OpenHostFile
     {
@@ -88,6 +98,13 @@ public sealed class IopModuleHost
         public int Position;
         public uint Lba;
         public uint Size;
+    }
+
+    private sealed class OpenDir
+    {
+        public string Path = "";
+        public List<Iso9660.FileEntry> Entries = new();
+        public int Index;
     }
 
     public ulong RpcHandled { get; private set; }
@@ -106,8 +123,10 @@ public sealed class IopModuleHost
         _irxById.Clear();
         _openFiles.Clear();
         _hostFiles.Clear();
+        _openDirs.Clear();
         _nextModuleId = 1;
         _nextFd = 3;
+        _nextDirFd = 1000;
         _nextIopBase = IrxLoader.DefaultLoadBase;
         RpcHandled = 0;
         IrxLoads = 0;
@@ -115,6 +134,9 @@ public sealed class IopModuleHost
         // keep disc volume + bound card
         _memcard.Format();
     }
+
+    /// <summary>Mounted ISO volume (null if none). Used by LOADFILE disc path loads.</summary>
+    public Iso9660.Volume? DiscVolume => _discVolume;
 
     /// <summary>Bind mounted ISO so FILEIO open/read return real disc bytes.</summary>
     public void BindDisc(string? isoPath)
@@ -322,10 +344,252 @@ public sealed class IopModuleHost
         int fd = (int)pkt.Result;
         if (_hostFiles.TryGetValue(fd, out var hf))
         {
-            hf.Position = (int)Math.Min(pkt.Size, hf.Size != 0 ? hf.Size : (uint)(hf.Data?.Length ?? 0));
+            // Size encodes offset; high path: absolute seek within file
+            int max = (int)(hf.Size != 0 ? hf.Size : (uint)(hf.Data?.Length ?? 0));
+            hf.Position = Math.Clamp((int)pkt.Size, 0, Math.Max(0, max));
             return (uint)hf.Position;
         }
         return pkt.Size;
+    }
+
+    // ---- Public FILEIO ops used by RealSifRpc sid=0x80000001 ----
+
+    /// <summary>fio open by path string; returns fd or -1.</summary>
+    public int FileOpen(string path, int mode = 0)
+    {
+        if (string.IsNullOrEmpty(path)) return -1;
+        int fd = _nextFd++;
+        _openFiles[fd] = path;
+        var hf = new OpenHostFile { Path = path, Position = 0 };
+        if (_discVolume != null)
+        {
+            string norm = NormalizeDiscPath(path);
+            var entry = FindDiscEntry(norm) ?? FindDiscEntryAny(norm);
+            if (entry != null && !entry.IsDirectory && entry.Size > 0)
+            {
+                if (entry.Size <= 16 * 1024 * 1024)
+                    hf.Data = Iso9660.ReadFile(_discVolume, entry.Path);
+                hf.Lba = entry.ExtentLba;
+                hf.Size = entry.Size;
+            }
+            else if (entry == null && (mode & 0x200) != 0)
+            {
+                // O_CREAT-ish: allow empty host file for write probes
+                hf.Data = Array.Empty<byte>();
+            }
+            else if (entry == null && !_discVolume.Files.Exists(f => !f.IsDirectory))
+            {
+                // no disc files — still return fd for boot probes
+            }
+            else if (entry == null)
+            {
+                // Missing path on real disc — fail open (commercial games check this)
+                _openFiles.Remove(fd);
+                return -1;
+            }
+        }
+        _hostFiles[fd] = hf;
+        _ = mode;
+        return fd;
+    }
+
+    public int FileClose(int fd)
+    {
+        _openFiles.Remove(fd);
+        _hostFiles.Remove(fd);
+        return 0;
+    }
+
+    public int FileRead(SystemMemory mem, int fd, uint buf, uint size)
+    {
+        var pkt = new SifRpcPacket
+        {
+            Cmd = SifRpcCmd.Read,
+            EeBuffer = buf,
+            Size = size,
+            Result = unchecked((uint)fd)
+        };
+        return unchecked((int)DoRead(pkt, mem));
+    }
+
+    public int FileWrite(SystemMemory mem, int fd, uint buf, uint size)
+    {
+        var pkt = new SifRpcPacket
+        {
+            Cmd = SifRpcCmd.Write,
+            EeBuffer = buf,
+            Size = size,
+            Result = unchecked((uint)fd)
+        };
+        return unchecked((int)DoWrite(pkt, mem));
+    }
+
+    public int FileSeek(int fd, int offset, int whence)
+    {
+        if (!_hostFiles.TryGetValue(fd, out var hf)) return -1;
+        int max = (int)(hf.Size != 0 ? hf.Size : (uint)(hf.Data?.Length ?? 0));
+        int pos = whence switch
+        {
+            1 => hf.Position + offset, // SEEK_CUR
+            2 => max + offset,         // SEEK_END
+            _ => offset               // SEEK_SET
+        };
+        hf.Position = Math.Clamp(pos, 0, Math.Max(0, max));
+        return hf.Position;
+    }
+
+    /// <summary>
+    /// fio getstat / chstat. Writes io_stat_t-shaped fields into <paramref name="statAddr"/>
+    /// when non-zero: +0 mode, +4 attr, +8 size (u32), +0x28 hisize.
+    /// </summary>
+    public int FileGetStat(SystemMemory mem, string path, uint statAddr)
+    {
+        if (string.IsNullOrEmpty(path)) return -1;
+        string norm = NormalizeDiscPath(path);
+        var entry = FindDiscEntryAny(norm);
+        uint mode = FioSIrusr | FioSIwusr | FioSIxusr;
+        uint size = 0;
+        if (entry != null)
+        {
+            mode |= entry.IsDirectory ? FioSIfDir : FioSIfReg;
+            size = entry.Size;
+        }
+        else if (_discVolume == null)
+        {
+            // No disc: claim regular empty file so probes succeed
+            mode |= FioSIfReg;
+        }
+        else
+            return -1; // missing on mounted disc
+
+        if (statAddr != 0)
+        {
+            mem.Write32(statAddr + 0, mode);
+            mem.Write32(statAddr + 4, 0); // attr
+            mem.Write32(statAddr + 8, size);
+            // ctime/atime/mtime 8 bytes each at +0xC,+0x14,+0x1C — leave zero
+            mem.Write32(statAddr + 0x28, 0); // hisize
+        }
+        return 0;
+    }
+
+    public int DirOpen(string path)
+    {
+        string norm = NormalizeDiscPath(path ?? "");
+        if (norm.Length == 0) norm = "";
+        var list = new List<Iso9660.FileEntry>();
+        if (_discVolume != null)
+        {
+            string prefix = norm.TrimEnd('/');
+            foreach (var f in _discVolume.Files)
+            {
+                string p = f.Path.Replace('\\', '/').ToUpperInvariant();
+                if (prefix.Length == 0)
+                {
+                    // Root: only top-level names (no slash, or first segment)
+                    int slash = p.IndexOf('/');
+                    if (slash < 0) list.Add(f);
+                    else
+                    {
+                        string top = p[..slash];
+                        if (!list.Exists(e => string.Equals(e.Name, top, StringComparison.OrdinalIgnoreCase)))
+                            list.Add(new Iso9660.FileEntry { Name = top, Path = top, IsDirectory = true });
+                    }
+                }
+                else if (p == prefix || p.StartsWith(prefix + "/", StringComparison.Ordinal))
+                {
+                    string rest = p == prefix ? f.Name : p[(prefix.Length + 1)..];
+                    int slash = rest.IndexOf('/');
+                    if (slash < 0)
+                        list.Add(f);
+                    else
+                    {
+                        string child = rest[..slash];
+                        if (!list.Exists(e => string.Equals(e.Name, child, StringComparison.OrdinalIgnoreCase)))
+                            list.Add(new Iso9660.FileEntry { Name = child, Path = prefix + "/" + child, IsDirectory = true });
+                    }
+                }
+            }
+        }
+        int dfd = _nextDirFd++;
+        _openDirs[dfd] = new OpenDir { Path = norm, Entries = list, Index = 0 };
+        return dfd;
+    }
+
+    public int DirClose(int dfd)
+    {
+        return _openDirs.Remove(dfd) ? 0 : -1;
+    }
+
+    /// <summary>fio dread: write io_dirent_t name + stat into <paramref name="direntAddr"/>.</summary>
+    public int DirRead(SystemMemory mem, int dfd, uint direntAddr)
+    {
+        if (!_openDirs.TryGetValue(dfd, out var dir)) return -1;
+        if (dir.Index >= dir.Entries.Count) return -1; // end
+        var e = dir.Entries[dir.Index++];
+        if (direntAddr != 0)
+        {
+            // io_dirent_t: io_stat_t stat; char name[256];
+            uint mode = FioSIrusr | FioSIwusr | FioSIxusr | (e.IsDirectory ? FioSIfDir : FioSIfReg);
+            mem.Write32(direntAddr + 0, mode);
+            mem.Write32(direntAddr + 4, 0);
+            mem.Write32(direntAddr + 8, e.Size);
+            uint nameAddr = direntAddr + 0x40; // common padding; also try +0x30
+            WriteCString(mem, nameAddr, e.Name, 255);
+            // Alternate layout used by some SDK builds: name at +0x20 after shorter stat
+            WriteCString(mem, direntAddr + 0x20, e.Name, 255);
+        }
+        return dir.Index; // positive remaining-ish / success
+    }
+
+    public int FileRemove(string path)
+    {
+        // Read-only ISO: pretend success for temp paths, fail for disc files
+        if (_discVolume != null && FindDiscEntryAny(NormalizeDiscPath(path)) != null)
+            return -1;
+        return 0;
+    }
+
+    /// <summary>Load IRX bytes from mounted disc by path (LOADFILE path loads).</summary>
+    public byte[]? ReadDiscFileBytes(string path, int maxBytes = 0x100000)
+    {
+        if (_discVolume == null || string.IsNullOrEmpty(path)) return null;
+        string norm = NormalizeDiscPath(path);
+        var entry = FindDiscEntryAny(norm);
+        if (entry == null || entry.IsDirectory || entry.Size == 0) return null;
+        try
+        {
+            byte[]? full = Iso9660.ReadFile(_discVolume, entry.Path);
+            if (full == null) return null;
+            if (full.Length <= maxBytes) return full;
+            var cut = new byte[maxBytes];
+            Buffer.BlockCopy(full, 0, cut, 0, maxBytes);
+            return cut;
+        }
+        catch { return null; }
+    }
+
+    private Iso9660.FileEntry? FindDiscEntryAny(string normPath)
+    {
+        var file = FindDiscEntry(normPath);
+        if (file != null) return file;
+        if (_discVolume == null) return null;
+        foreach (var f in _discVolume.Files)
+        {
+            string p = f.Path.Replace('\\', '/').ToUpperInvariant();
+            string n = f.Name.ToUpperInvariant();
+            if (p == normPath || n == normPath || p.EndsWith("/" + normPath, StringComparison.Ordinal))
+                return f;
+        }
+        return null;
+    }
+
+    private static void WriteCString(SystemMemory mem, uint addr, string s, int max)
+    {
+        int n = Math.Min(s.Length, max);
+        for (int i = 0; i < n; i++)
+            mem.Write8(addr + (uint)i, (byte)s[i]);
+        mem.Write8(addr + (uint)n, 0);
     }
 
     private Iso9660.FileEntry? FindDiscEntry(string normPath)
