@@ -662,6 +662,7 @@ public static class SmokeTests
             BiosHle_SifcmdRdataAndFileIoSid();
             RealSifRpc_CdScmdRealReplyStructure();
             RealSifRpc_CdNcmdReadReturnsRealByteCount();
+            RealSifRpc_McservRealFunctionNumbers();
             BiosHle_IopVblankEventFlag();
             BiosBootHost_IopBtConfContracts();
             BiosHle_FileIoGetstatAndCdvdSectors();
@@ -2317,6 +2318,66 @@ public static class SmokeTests
             throw new Exception($"NCMD read result 0x{got:X} != expected byte count 0x{expected:X}");
 
         Console.WriteLine("[Smoke] RealSifRpc_CdNcmdReadReturnsRealByteCount OK");
+    }
+
+    /// <summary>Real BIOS MCSERV.IRX function numbers (Ghidra-decompiled
+    /// tools/bios-decomp/MCSERV_ALL.txt): the real dispatcher switches on 0x70-0x80, not the
+    /// small 0x00-0x14 range this file previously assumed with no real-source citation -- the
+    /// same class of mistake as CDVDFSV's mislabeled case 7. Confirms the real fno 0x73 (mcRead)
+    /// and 0x74 (mcWrite) now actually transfer data instead of always hitting the generic
+    /// "unmapped -> 0" fallback every real call previously fell into.</summary>
+    public static void RealSifRpc_McservRealFunctionNumbers()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+
+        const uint cd = 0x0000EC00;
+        const uint bindPkt = 0x0000ED00;
+        int sema = k.CreateSema(0, 1);
+        mem.Write32(cd + 8, (uint)sema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1);
+        mem.Write32(bindPkt + 28, cd);
+        mem.Write32(bindPkt + 32, RealSifRpc.SidMcServ);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+            throw new Exception("MCSERV bind failed");
+        uint argBuf = mem.Read32(cd + 20);
+
+        // fno=0x74 (real mcWrite): argBuf+8 is the requested size; real handler echoes it back
+        // as the transferred byte count.
+        const uint recvBuf = 0x0000EE00;
+        const uint callPkt = 0x0000EF00;
+        mem.Write32(argBuf + 8, 256); // requested write size
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(callPkt + 28, cd);
+        mem.Write32(callPkt + 32, 0x74); // real mcWrite fno
+        mem.Write32(callPkt + 36, 12);
+        mem.Write32(callPkt + 40, recvBuf);
+        mem.Write32(callPkt + 44, 4);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("MCSERV write call failed");
+        if (mem.Read32(recvBuf) != 256)
+            throw new Exception($"real mcWrite (fno=0x74) should transfer 256 bytes, got {mem.Read32(recvBuf)}");
+
+        // The old, wrongly-assumed fno=0x06 (which this file previously believed was mcWrite)
+        // must NOT match the real mcWrite behavior -- it's not a real MCSERV case number at all,
+        // so it should fall through to this service's generic 0-for-unmapped default.
+        // Re-arm the packet for reuse: CompleteRpcEnd stamped +8 to CidRpcEnd and cleared the
+        // PACKET_F_ALLOC bit at +16 (matching real SIFCMD RPC_END semantics) after the call above.
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(recvBuf, 0xDEADBEEF); // sentinel so a no-op handler is distinguishable from a stale 256
+        mem.Write32(callPkt + 32, 0x06);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("MCSERV legacy-fno call failed");
+        if (mem.Read32(recvBuf) != 0)
+            throw new Exception("fno=0x06 is not a real MCSERV case number and should not transfer data");
+
+        Console.WriteLine("[Smoke] RealSifRpc_McservRealFunctionNumbers OK");
     }
 
     /// <summary>BIOS VBLANK.IRX HLE: event flag set on EE VBlank pulse.</summary>

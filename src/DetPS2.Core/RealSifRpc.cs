@@ -1421,14 +1421,50 @@ public sealed class RealSifRpc
     /// MCSERV RPC (sid=0x80000400). Enough of libmc for boot probes: init, getInfo,
     /// open/close/read/write/seek — return codes match "card present / formatted".
     /// </summary>
+    // Real BIOS MCSERV.IRX function numbers, ground-truthed 2026-07-29 against the decompiled
+    // module (Ghidra, tools/bios-decomp/MCSERV_ALL.txt) -- the real switch dispatches on
+    // 0x70-0x80 (17 cases), *not* the small 0x00-0x14 range this file previously assumed with no
+    // real-source citation (the same class of mistake CDVDFSV's mislabeled case 7 turned out to
+    // be, and by the same mechanism: this file's own dispatch previously never matched a real
+    // call at all, since no real MCSERV RPC ever sends fno in the 0x00-0x14 range).
+    //
+    // Only two cases were confirmed with enough structural certainty to remap precisely: 0x73
+    // (FUN_000003e4, a buffer/size read loop over a low-level read primitive) and 0x74
+    // (FUN_00000624, the same loop shape over a paired low-level write primitive) -- these are
+    // also the highest-value cases (real save-data load/save). The remaining 15 real case
+    // numbers are real (confirmed present in the real dispatcher) but not individually verified
+    // against their exact semantics without further decompile work; they fall through to this
+    // service's existing 0-for-success convention rather than guessing wrong-but-plausible
+    // per-case behavior.
+    private const uint McservRead = 0x73;
+    private const uint McservWrite = 0x74;
+
     private int HandleMcServ(SystemMemory mem, uint fno, uint argBuf, uint recvBuf)
     {
+        if (fno == McservRead)
+        {
+            // Real read: buffer/size layout not independently re-verified for the real wire
+            // format (only the IOP-internal already-unpacked struct was decompiled) -- kept the
+            // same argBuf layout this file already used for the (wrongly-numbered) old case 0x05,
+            // which matches standard ps2sdk libmc.c sceMcRead argument conventions.
+            uint buf = argBuf != 0 ? mem.Read32(argBuf + 4) : recvBuf;
+            int size = argBuf != 0 ? (int)mem.Read32(argBuf + 8) : 0;
+            size = Math.Clamp(size, 0, 0x10000);
+            for (int i = 0; i < size && buf != 0; i++)
+                mem.Write8(buf + (uint)i, 0);
+            return size;
+        }
+        if (fno == McservWrite)
+            return argBuf != 0 ? (int)mem.Read32(argBuf + 8) : 0;
+
         switch (fno)
         {
-            case 0x00: // mcInit
+            case 0x00: // Legacy/never-observed-real small-number path, kept for callers that
+                       // might still use it — mcInit-shaped: accept, no state to reset.
                 return 0;
-            case 0x01: // mcGetInfo — type/free/format into recv or arg
-                // type=2 (PS2), free clusters high, format=1
+            case 0x01: // mcGetInfo-shaped — type/free/format into recv or arg (kept from the
+                       // pre-ground-truth version; real case number for this not yet identified
+                       // among 0x70-0x80, most likely 0x78 given its combined multi-query shape).
                 if (recvBuf != 0)
                 {
                     mem.Write32(recvBuf + 0, 2);       // type PS2
@@ -1437,7 +1473,6 @@ public sealed class RealSifRpc
                 }
                 if (argBuf != 0 && argBuf != recvBuf)
                 {
-                    // Some clients pass out-ptrs in arg: +0 port, +4 slot, +8 *type, +C *free, +10 *format
                     uint typePtr = mem.Read32(argBuf + 8);
                     uint freePtr = mem.Read32(argBuf + 12);
                     uint fmtPtr = mem.Read32(argBuf + 16);
@@ -1446,37 +1481,19 @@ public sealed class RealSifRpc
                     if (fmtPtr != 0) mem.Write32(fmtPtr, 1);
                 }
                 return 0;
-            case 0x02: // mcOpen
+            case 0x02: // mcOpen-shaped
                 if (recvBuf != 0) mem.Write32(recvBuf, 1); // fd=1
                 return 1;
-            case 0x03: // mcClose
-                return 0;
-            case 0x04: // mcSeek
+            case 0x04: // mcSeek-shaped
                 return argBuf != 0 ? (int)mem.Read32(argBuf + 4) : 0;
-            case 0x05: // mcRead — zero-fill buffer
-                {
-                    uint buf = argBuf != 0 ? mem.Read32(argBuf + 4) : recvBuf;
-                    int size = argBuf != 0 ? (int)mem.Read32(argBuf + 8) : 0;
-                    size = Math.Clamp(size, 0, 0x10000);
-                    for (int i = 0; i < size && buf != 0; i++)
-                        mem.Write8(buf + (uint)i, 0);
-                    return size;
-                }
-            case 0x06: // mcWrite
-                return argBuf != 0 ? (int)mem.Read32(argBuf + 8) : 0;
-            case 0x07: // mcFlush
-            case 0x08: // mcMkDir
-            case 0x09: // mcChDir
-            case 0x0A: // mcFormat
-            case 0x0B: // mcUnformat
-            case 0x0C: // mcDelete
-            case 0x0E: // mcSetInfo
-            case 0x0F: // mcRename
-            case 0x14: // mcSync
-                return 0;
-            case 0x0D: // mcGetDir — write 0 entries
+            case 0x0D: // mcGetDir-shaped — write 0 entries
                 if (recvBuf != 0) mem.Write32(recvBuf, 0);
                 return 0;
+            // Confirmed real case numbers (0x70-0x80) not yet individually mapped to specific
+            // semantics — real, structurally distinct handlers exist for each (open/close/seek/
+            // flush/mkdir/chdir/format/delete/getdir/geticon/etc.) but weren't verified precisely
+            // enough this pass to assign without risking a wrong-but-plausible mapping. Falls to
+            // the shared default below, matching this service's existing 0-for-success stance.
             default:
                 return 0;
         }

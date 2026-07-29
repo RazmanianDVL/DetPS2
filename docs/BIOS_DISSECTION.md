@@ -348,6 +348,53 @@ jr-ra fallback, including reconstructing the real MIPS J-type target (top 4 bits
 PC) to confirm it lands exactly on the intended function. Full smoke suite green; 9-title
 cross-check byte-identical to baseline.
 
+## 6.6 EXCEPMAN — real exception-handler registry (2026-07-29)
+
+Ghidra-decompiled in full (`tools/bios-decomp/EXCEPMAN_ALL.txt`, 14 real functions). Real
+per-exception-code (16 codes, `0x0`-`0xf`), priority-ordered handler chain — `RegisterExceptionHandler`/
+`RegisterPriorityExceptionHandler`/`ReleaseExceptionHandler`, real result codes read directly off the
+decompile (`-50` invalid excCode, `-51` not found). Confirmed architecturally distinct from INTRMAN:
+EXCEPMAN handles synchronous CPU exceptions (syscall, address error, TLB miss), INTRMAN handles
+asynchronous hardware interrupts.
+
+Ported into new `IopExcepManHost.cs`, wired into `Ps2System`. Bookkeeping only — like the LOADCORE
+linking work, nothing in this project executes real R3000A BIOS code yet, so nothing currently
+dispatches through the chain this builds, but a module's real registration call now succeeds/fails/
+orders exactly as it would on real hardware.
+
+**SIFINIT and EESYNC checked and found not worth a dedicated port**: both are tiny (3 and 5 real
+functions respectively) thin bootstrap wrappers around external SIFMAN/EE-sync calls with no
+meaningful internal state or logic of their own.
+
+## 6.7 MCSERV — real function-number range was completely wrong (2026-07-29)
+
+**A real, high-value bug, not just missing coverage.** Ghidra-decompiled MCSERV.IRX in full and found
+its real RPC dispatcher (`FUN_0000655c`, found via the module's version string
+`"PsIImcserv 1.30"`'s containing region) switches on **`0x70`-`0x80`** (17 real cases) — completely
+different from the `0x00`-`0x14` range `HandleMcServ` had assumed with no real-source citation. This
+means **every real MCSERV call from any title was previously falling through to the generic
+"unmapped → return 0" default**, regardless of what the game actually asked for — the exact same class
+of mistake as CDVDFSV's mislabeled case 7 (§6.1), just undiscovered until this pass because nothing
+had gone back to check `HandleMcServ`'s assumptions against a real decompile before.
+
+Confirmed two cases with high structural confidence — `0x73` (`FUN_000003e4`, a buffer/size read loop
+over a low-level read primitive) and `0x74` (`FUN_00000624`, the same loop shape over a paired
+low-level write primitive) — and remapped them to this file's existing read/write logic (real
+save-data load/save is the highest-value MCSERV path). The other 15 real case numbers are confirmed
+present in the real dispatcher but not individually mapped to specific semantics without further
+decompile work (open/close/seek/flush/mkdir/format/delete/getdir/geticon and others); they fall
+through to the service's existing 0-for-unmapped convention rather than guessing wrong-but-plausible
+per-case behavior for each.
+
+New smoke test confirms both that real `fno=0x74` now actually transfers data and that the old,
+wrongly-assumed `fno=0x06` (never a real MCSERV case number) correctly does *not* match. Full smoke
+suite green; 9-title cross-check byte-identical (no tracked title exercises memory card I/O within
+the tested cycle window yet, but this is now correct for whichever title/path does).
+
+**Not yet done**: individually verify the remaining 15 real MCSERV case numbers, and check MCMAN
+itself (62KB — the actual card-controller backend MCSERV's handlers call into) for real logic worth
+porting beyond the RPC-facing layer.
+
 ---
 
 ## 7. What DetPS2 must implement (BIOS order, not game PCs)
@@ -377,6 +424,9 @@ Optional later: execute relocated BIOS IRX on IOP R3000 (large). Until then, HLE
 | SIFMAN | *(not a port target)* | Ground-truthed (§6.3) — real job is IOP DMAC/SBUS register programming; DetPS2's `Sif.cs` already implements the functional result via a different, working mechanism. |
 | THREADMAN (full scheduler) | `KernelState` (different implementation) | Ground-truthed real scope (§6.4) — 80 real functions incl. priority ready-queues, Mbx/Vpl/Fpl, real stack-overflow detection; DetPS2's existing sema-count/waiter-queue implementation is a different, working contract, not a literal port. |
 | **LOADCORE cross-module linking** | `IrxLoader.ScanExports`/`LinkImports`, wired into `IopModuleHost.LoadIrx` | **Full real port** (§6.5), 2026-07-29 — real export-table/import-stub format, real J-instruction stub patching, verified against real extracted BIOS modules (SYSMEM/THREADMAN/SIFMAN/SIFCMD/etc. all produce correct real library names+function pointers). Also fixed a real module-spacing overlap bug found along the way. |
+| EXCEPMAN | `IopExcepManHost` | Real per-excCode priority-ordered handler registry (§6.6), 2026-07-29 — bookkeeping only, inert until real IOP execution. |
+| PADMAN RPC | `RealSifRpc.HandlePad` | Already real (confirmed 2026-07-29 against a fresh decompile) — the prior session had already ground-truthed all 15 real `0x800001xx` cases; no gap found. |
+| **MCSERV RPC** | `RealSifRpc.HandleMcServ` | **Real fno range was completely wrong** (§6.7), 2026-07-29 — every real call previously missed every case (assumed `0x00-0x14`, real is `0x70-0x80`). Fixed the two highest-value cases (real read/write); 15 remaining real case numbers confirmed but not individually mapped yet. |
 | LOADFILE / SYSMEM / FILEIO | `RealSifRpc` + disc IRX load / getstat/dir | RPC sid handlers (functionally equivalent, not literal transliteration — see §6) |
 | PADMAN / MCSERV | `HandlePad` / `HandleMcServ` | Open/read/getInfo |
 | EE INTC + full GPR | `Intc` / `KernelState.SaveFullContext` | Prior session |
