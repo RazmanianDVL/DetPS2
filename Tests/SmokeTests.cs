@@ -805,6 +805,7 @@ public static class SmokeTests
             BiosHle_IopVblankEventFlag();
             BiosBootHost_IopBtConfContracts();
             BiosRomdirGate_PortDocsForRequiredModules();
+            BiosExtendedRomdir_SecrClearSpuLibSdUdnl();
             BiosHle_RebootStdioIgreetingIomanContracts();
             Eeconf_InitContracts();
             Ssbusc_BusWindowContracts();
@@ -2803,6 +2804,51 @@ public static class SmokeTests
         if (checkedN < 20)
             throw new Exception($"gate doc check only saw {checkedN} required modules");
         Console.WriteLine($"[Smoke] BiosRomdirGate_PortDocsForRequiredModules OK (checked={checkedN}, ports={portsDir})");
+    }
+
+    /// <summary>
+    /// Extended ROMDIR services (SECRMAN/CLEARSPU/LIBSD/UDNL/X*) + export tables + UDNL handoff.
+    /// Ground-truthed against SCPH70008 full ROMDIR (101 entries) and Ghidra IRX decomp.
+    /// </summary>
+    public static void BiosExtendedRomdir_SecrClearSpuLibSdUdnl()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        if (!sys.IopExtendedBios.Installed)
+            throw new Exception("IopExtendedBios not installed");
+        if (sys.IopExtendedBios.ClearSpuRuns < 1)
+            throw new Exception("CLEARSPU did not soft-reset at commercial IOP start");
+        foreach (var n in new[] { "SECRMAN", "CLEARSPU", "UDNL", "ADDDRV", "LIBSD", "XPADMAN", "XSIO2MAN", "XMTAPMAN" })
+        {
+            if (!sys.IopModules.IsModuleLoaded(n))
+                throw new Exception($"missing extended ROMDIR module {n}");
+        }
+        if (sys.IopModules.LookupExportLibrary("secrman") == null)
+            throw new Exception("secrman export table missing");
+        if (sys.IopModules.LookupExportLibrary("libsd") == null)
+            throw new Exception("libsd export table missing");
+        if (sys.IopModules.LookupExportLibrary("thmsgbx") == null)
+            throw new Exception("thmsgbx export table missing");
+        if (sys.IopModules.LookupExportLibrary("thvpool") == null)
+            throw new Exception("thvpool export table missing");
+        if (sys.IopModules.LookupExportLibrary("thfpool") == null)
+            throw new Exception("thfpool export table missing");
+
+        // UDNL handoff after simulated SifIopReset with IOPRP300 image arg.
+        sys.Sif.MarkIopRebootPending("rom0:UDNL cdrom0:\\IOPRP300.IMG;1", 0);
+        if (!sys.Sif.TryCompletePendingIopReboot())
+            throw new Exception("reboot did not complete");
+        BiosBootHost.ApplyPostIopRebootContracts(sys);
+        if (sys.IopExtendedBios.UdnlApplies < 1)
+            throw new Exception("UDNL handoff did not run");
+        if (sys.IopExtendedBios.LastUdnlVersion != "3000")
+            throw new Exception($"expected UDNL ver 3000 got \"{sys.IopExtendedBios.LastUdnlVersion}\"");
+        if (sys.IopExtendedBios.SecrDiskBootFilePassthrough() != 0)
+            throw new Exception("SECRMAN passthrough failed");
+        Console.WriteLine(
+            $"[Smoke] BiosExtendedRomdir_SecrClearSpuLibSdUdnl OK " +
+            $"(clearspu={sys.IopExtendedBios.ClearSpuRuns} udnl={sys.IopExtendedBios.UdnlApplies} " +
+            $"ver={sys.IopExtendedBios.LastUdnlVersion})");
     }
 
     public static void BiosHle_FileIoGetstatAndCdvdSectors()

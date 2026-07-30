@@ -68,6 +68,8 @@ public sealed class Ps2System
     public IopSsbuscHost IopSsbusc { get; } = new();
     public IopSysclibHeaplibHost IopSysclibHeaplib { get; } = new();
     public IopDmacManHost IopDmacMan { get; } = new();
+    /// <summary>SECRMAN / CLEARSPU / LIBSD / UDNL / X* + THREADMAN thmsgbx/vpl/fpl export HLE.</summary>
+    public IopExtendedBiosHost IopExtendedBios { get; } = new();
 
     /// <summary>
     /// BIOS EXCEPMAN.IRX HLE — real per-exception-code, priority-ordered handler registration
@@ -898,6 +900,7 @@ public sealed class Ps2System
         IopSsbusc.Reset();
         IopSysclibHeaplib.Reset();
         IopDmacMan.Reset();
+        IopExtendedBios.Reset();
         IopExcepMan.Reset();
         // Re-bind after IopSystem.Reset so FILEIO ENODEV/AddDrv still route to the live host.
         IopModules.BindIopSystem(IopSystem);

@@ -58,9 +58,15 @@
 
 | Module | Notes | Gate |
 |--------|-------|------|
-| XLOADFILE / XFILEIO / NCDVDMAN | Aliases / X paths share primary HLE | **PARTIAL** |
+| XLOADFILE / XFILEIO / NCDVDMAN / XPADMAN / XSIO2MAN / … | Aliases / X paths share primary HLE (`IopExtendedBiosHost`) | **OK** (alias) |
 | MCMAN / MCSERV | MCSERV.md full RPC; MCMAN FAT scoped | MCSERV **OK**, MCMAN **PARTIAL** |
-| LIBSD | Sound; not boot-critical | **PARTIAL** (name only) |
+| LIBSD | Export table + name (`IopExtendedBiosHost`) | **PARTIAL** (stubs; not full audio) |
+| SECRMAN | Secr*BootFile passthrough; no MagicGate crypto | **PARTIAL** |
+| CLEARSPU | Spu2 soft-reset on boot + UDNL handoff | **OK** |
+| UDNL | IOPRP version + module re-register (not full image unpack) | **PARTIAL** |
+| ADDDRV / RMRESET / XMTAPMAN | Name + related hosts | **PARTIAL** |
+
+Full 101-entry map: **ROMDIR_FULL_AUDIT.md**.
 
 ## Gate acceptance criteria
 
