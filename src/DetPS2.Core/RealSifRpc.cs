@@ -2571,37 +2571,43 @@ public sealed class RealSifRpc
 
         uint dest = 0, size = 0, offset = 0;
         // Layout B (live): dest in w0, handle in w1, optional size/offset in w2/w3.
+        // Live B3 fno=5 after Global open: w=[0, handle, dest, pathResidue] where w3 is
+        // ASCII "txd\0" (0x00647874) — never treat printable path residue as size/offset.
         if (IsEeRamPointer(w0) && (w0 & 0x1FFFFFFFu) < 0x01E00000u)
         {
             dest = w0 & 0x1FFFFFFFu;
-            if (w2 is > 0 and <= 0x02000000u && !IsEeRamPointer(w2))
+            if (w2 is > 0 and <= 0x02000000u && !IsEeRamPointer(w2) && !LooksLikeAsciiResidue(w2))
                 size = w2;
-            else if (w3 is > 0 and <= 0x02000000u && !IsEeRamPointer(w3))
+            else if (w3 is > 0 and <= 0x02000000u && !IsEeRamPointer(w3) && !LooksLikeAsciiResidue(w3))
                 size = w3;
-            if (w2 < 0x01000000u && w2 != size && !IsEeRamPointer(w2) && w2 > 0x100u)
+            if (w2 < 0x01000000u && w2 != size && !IsEeRamPointer(w2) && w2 > 0x100u
+                && !LooksLikeAsciiResidue(w2))
                 offset = w2;
             if (w3 < 0x01000000u && w3 != size && !IsEeRamPointer(w3) && w3 > 0x100u
-                && offset == 0)
+                && offset == 0 && !LooksLikeAsciiResidue(w3))
                 offset = w3;
         }
         else if (w0 == 0 && IsEeRamPointer(w2) && (w2 & 0x1FFFFFFFu) < 0x01E00000u)
         {
             dest = w2 & 0x1FFFFFFFu;
-            if (w3 is > 0 and <= 0x02000000u) size = w3;
+            if (w3 is > 0 and <= 0x02000000u && !LooksLikeAsciiResidue(w3))
+                size = w3;
         }
         else if (w0 < 0x01000000u && w1 is > 0 and <= 0x02000000u
-                 && IsEeRamPointer(w2) && (w2 & 0x1FFFFFFFu) < 0x01E00000u)
+                 && IsEeRamPointer(w2) && (w2 & 0x1FFFFFFFu) < 0x01E00000u
+                 && !LooksLikeAsciiResidue(w1))
         {
             offset = w0;
             size = w1;
             dest = w2 & 0x1FFFFFFFu;
         }
         else if (IsEeRamPointer(w0) && w1 is > 0x100 and <= 0x02000000u
-                 && !IsEeRamPointer(w1))
+                 && !IsEeRamPointer(w1) && !LooksLikeAsciiResidue(w1))
         {
             dest = w0 & 0x1FFFFFFFu;
             size = w1;
-            if (w2 < 0x01000000u && !IsEeRamPointer(w2)) offset = w2;
+            if (w2 < 0x01000000u && !IsEeRamPointer(w2) && !LooksLikeAsciiResidue(w2))
+                offset = w2;
         }
 
         if (dest == 0 || dest >= 0x01E00000u)
@@ -2629,6 +2635,26 @@ public sealed class RealSifRpc
             return 0;
         }
 
+        // After full Global.txd DMA, EE may fno=5 a new dest for FRONTEND without re-open.
+        // SHARED: if cursor exhausted on last path and dest is a fresh EE buffer, arm FRONTEND.
+        if (_gtfsFrontendFd >= 0 && _gtfsFrontendSize > 0
+            && _gtfsReadOffset >= maxSz && maxSz > 0
+            && dest != _gtfsLastDmaDest
+            && dest != (_gtfsLastDmaDest + _gtfsReadOffset)
+            && fd != _gtfsFrontendFd)
+        {
+            fd = _gtfsFrontendFd;
+            maxSz = _gtfsFrontendSize;
+            _gtfsLastPathFd = _gtfsFrontendFd;
+            _gtfsLastPathSize = _gtfsFrontendSize;
+            _gtfsReadOffset = 0;
+            offset = 0;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] fno=5 arm FRONTEND stream after full prior TXD dest=0x{dest:X8} " +
+                    $"feSize={_gtfsFrontendSize}");
+        }
+
         if (offset == 0 && _gtfsReadOffset > 0 && _gtfsReadOffset < maxSz
             && (_gtfsLastDmaDest == 0 || dest == _gtfsLastDmaDest
                 || dest == _gtfsLastDmaDest + _gtfsReadOffset))
@@ -2638,6 +2664,7 @@ public sealed class RealSifRpc
 
         uint remaining = maxSz > offset ? maxSz - offset : 0;
         if (remaining == 0) return 0;
+        // size==0 → remaining (full rest of TXD / FRONTEND multi-chunk).
         uint want = size != 0 ? Math.Min(size, remaining) : remaining;
         want = Math.Min(want, remaining);
         want = Math.Min(want, (uint)SystemMemory.RDRAM_SIZE - dest);
@@ -2649,6 +2676,12 @@ public sealed class RealSifRpc
             _gtfsLastDmaDest = dest;
             _gtfsReadOffset = offset + total;
             _gtfsTotalDmaBytes += total;
+            // After completing a non-FRONTEND file, keep FRONTEND fd ready for next stream.
+            if (_gtfsReadOffset >= maxSz && _gtfsFrontendFd >= 0
+                && fd != _gtfsFrontendFd && maxSz == _gtfsLastPathSize)
+            {
+                // Cursor exhausted — next open/DMA can bind FRONTEND without stale Global cursor.
+            }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
                     $"[GTFS] fno=5 DMA fd={fd} -> 0x{dest:X8} off=0x{offset:X} n={total} " +
@@ -2656,6 +2689,23 @@ public sealed class RealSifRpc
                     $"w=[{w0:X8} {w1:X8} {w2:X8} {w3:X8}]");
         }
         return total;
+    }
+
+    /// <summary>
+    /// True when a word looks like leftover C-string path bytes (e.g. live fno=5 w3=
+    /// <c>0x00647874</c> = "txd\\0") rather than a size/offset.
+    /// </summary>
+    private static bool LooksLikeAsciiResidue(uint w)
+    {
+        int printable = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            byte b = (byte)((w >> (8 * i)) & 0xFF);
+            if (b == 0) continue;
+            if (b is >= 0x20 and <= 0x7E) printable++;
+            else return false;
+        }
+        return printable >= 3;
     }
 
     /// <summary>
