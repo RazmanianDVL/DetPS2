@@ -182,6 +182,12 @@ public sealed class EmotionEngine : ISchedulable
     /// GPR file (same approach as KernelHle's SaveFullContext/RestoreFullContext for thread
     /// preemption, which already gets this right) instead of just $ra.</summary>
     private readonly Stack<ulong[]> _savedGprAcrossIntcDispatch = new();
+    /// <summary>True while a TryDispatchRegisteredIntcHandler frame is outstanding (between
+    /// push and the matching EXL-path eret pop). Games may clear Status.EXL mid-handler via
+    /// ERL critical sections; treat the frame as "still inside ISR" for GPR/thread save so
+    /// cooperative SwitchToNext / preemption cannot overwrite CaptureInterruptedContext's
+    /// user snapshot with ISR scratch (SotC INTC poll v1, MKSM 0x44, 2026-07-30).</summary>
+    public bool HasOutstandingIntcDispatch => _savedGprAcrossIntcDispatch.Count > 0;
     private bool _branchWasLikely;
 
     // COP1 FPU (Phase 25) — 32 single regs, Det policy

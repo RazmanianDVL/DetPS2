@@ -570,9 +570,41 @@ public sealed class Ps2System
         EE.PC = resume;
         LastGoodEePc = resume;
         _nopSledHits = 0;
+        // Nop-sled rescue can re-home mid-function into an INTC_STAT busy-poll
+        // (`lw v0,0(v1)` / `andi v0,4` / `beq` spin) whose `lui/ori v1,0x1000F000` setup
+        // was skipped — live SotC after a LoadModule-error hang: rescue re-home left
+        // v1=sema residue so the poll never saw sticky STAT bit2 even when set.
+        TryRepairIntcStatPollBase();
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[BIOS] rescue nop-sled 0x{pcPhys:X8} -> 0x{(uint)(resume & 0x1FFFFFFF):X8} cyc={MasterCycles}");
+    }
+
+    /// <summary>
+    /// If EE.PC is at <c>lw rt, 0(rs)</c> followed by <c>andi rt, rt, 4</c> (VBlankStart bit)
+    /// and the base register is not already <c>INTC_STAT</c> (<c>0x1000F000</c>), load it.
+    /// Shared assist for mid-function nop-sled re-homes; does not invent poll success.
+    /// </summary>
+    private void TryRepairIntcStatPollBase()
+    {
+        uint pc = (uint)(EE.PC & 0x1FFFFFFFu);
+        if (pc < 0x00100000u || pc + 8u >= (uint)SystemMemory.RDRAM_SIZE) return;
+        uint opLw = Memory.Read32(pc);
+        // lw rt, off(rs): primary 0x23, signed imm == 0
+        if ((opLw >> 26) != 0x23 || (short)(opLw & 0xFFFF) != 0) return;
+        uint rs = (opLw >> 21) & 0x1F;
+        uint rt = (opLw >> 16) & 0x1F;
+        if (rs == 0 || rt == 0) return;
+        uint opAndi = Memory.Read32(pc + 4);
+        // andi rt, rt, 4 — primary 0x0C, same rt, imm=4 (VBlankStart)
+        if ((opAndi >> 26) != 0x0C) return;
+        if (((opAndi >> 21) & 0x1F) != rt || ((opAndi >> 16) & 0x1F) != rt) return;
+        if ((opAndi & 0xFFFF) != 4) return;
+        if ((EE.GetGpr((int)rs).Lo & 0xFFFFFFFFu) == Intc.AddrStat) return;
+        EE.SetGpr((int)rs, new EmotionEngine.Gpr128 { Lo = Intc.AddrStat });
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] repair INTC_STAT poll base r{rs}=0x{Intc.AddrStat:X8} at pc=0x{pc:X8} cyc={MasterCycles}");
     }
 
     /// <summary>
