@@ -3849,22 +3849,38 @@ public sealed class RealSifRpc
     private void WarmMslAssetOpens(IopModuleHost iopModules, Cdvd cdvd)
     {
         EnsureMkdaPakMounted(iopModules, cdvd);
-        // Touch the ISO root PAK via FILEIO so path aliases are hot.
+        // Touch the ISO root PAK + MSL sound bank so post-DADA opens are hot.
+        // Dec ELF references "/sounds/MSLASSET.MS2"; ISO root has MSLASSET.MS2.
         string[] warm =
         {
             @"cdrom0:\MKDA.PAK",
             @"cdrom0:\MKDA.PAK;1",
+            @"cdrom0:\MSLASSET.MS2",
+            @"cdrom0:\MSLASSET.MS2;1",
+            @"cdrom0:\MSLASSET.MS4",
         };
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string p in warm)
         {
+            string key = p.Replace(";1", "", StringComparison.OrdinalIgnoreCase);
+            if (!seen.Add(key)) continue;
             int fd = iopModules.FileOpen(p, 1);
-            if (fd >= 0)
-            {
-                if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
-                    cdvd.NoteHostReadSectors(8);
-                try { iopModules.FileClose(fd); } catch { /* ignore */ }
-                break;
-            }
+            if (fd < 0) continue;
+            if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+                cdvd.NoteHostReadSectors(Math.Min(8, (int)((sz + 2047) / 2048)));
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+        }
+        // Also warm the common first art member (Dec gameart.ssf / DA gameart via artps2).
+        foreach (string member in new[] { "gameart.ssf", @"\ps2dvd\art\gameart.ssf", @"\ps2dvd\artps2\gameart.ssf" })
+        {
+            int mfd = TryOpenFromMkdaPak(iopModules, member, out uint msz);
+            if (mfd < 0) continue;
+            if (msz > 0)
+                cdvd.NoteHostReadSectors(Math.Min(32, (int)((msz + 2047) / 2048)));
+            try { iopModules.FileClose(mfd); } catch { /* ignore */ }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[MSL-MFL] warm member \"{member}\" size={msz}");
+            break;
         }
     }
 
@@ -4093,18 +4109,31 @@ public sealed class RealSifRpc
                 // Always warm MKDA TOC so subsequent member .ssf opens (same or later CallRpc)
                 // hit virtual streams even when this open is the archive root itself.
                 EnsureMkdaPakMounted(iopModules, cdvd);
-                int fd = iopModules.FileOpen(path, mode);
+                // Prefer PAK virtual members first for art paths (.ssf / ps2dvd / /art/) so we do
+                // not accidentally open a same-named ISO root stub or miss host-style members.
+                uint memberSz = 0;
+                int fd = -1;
+                if (LooksLikeMkdaMemberPath(path))
+                    fd = TryOpenFromMkdaPak(iopModules, path, out memberSz);
+                if (fd < 0)
+                    fd = iopModules.FileOpen(path, mode);
                 if (fd < 0)
                 {
                     // Retry without device prefix and with cdrom0:
                     string leaf = path;
                     int colon = leaf.IndexOf(':');
                     if (colon >= 0) leaf = leaf[(colon + 1)..].TrimStart('\\', '/');
-                    fd = iopModules.FileOpen("cdrom0:\\" + leaf, mode);
+                    // /sounds/MSLASSET.MS2 (Dec ELF) lives at ISO root as MSLASSET.MS2
+                    if (leaf.StartsWith("sounds\\", StringComparison.OrdinalIgnoreCase)
+                        || leaf.StartsWith("sounds/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string soundLeaf = leaf[(leaf.IndexOfAny(new[] { '\\', '/' }) + 1)..];
+                        fd = iopModules.FileOpen("cdrom0:\\" + soundLeaf, mode);
+                    }
+                    if (fd < 0) fd = iopModules.FileOpen("cdrom0:\\" + leaf, mode);
                     if (fd < 0) fd = iopModules.FileOpen(leaf, mode);
                 }
                 // Midway MKDA.PAK virtual members (art \ps2dvd\art\*.ssf etc.).
-                uint memberSz = 0;
                 if (fd < 0)
                     fd = TryOpenFromMkdaPak(iopModules, path, out memberSz);
                 if (fd < 0)
@@ -4121,25 +4150,35 @@ public sealed class RealSifRpc
                     cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 64));
                 // Live open send word0 is an EE file-object pointer (Dec: 0xCDD420). Real
                 // MWFILEFR fills object fields the post-open queue at 0x3D87xx inspects.
-                // Stamp size at +8/+12 when those cells are still zero (ground-truthed: without
-                // this the queue never drains after MKDA.PAK open). Leave +0 intact.
+                // Stamp size at +8/+12 (force +8; +12 only when 0 or looks like leftover mode/ptr
+                // junk below 0x10000). Also publish size at send+8 when that cell is 0 so clients
+                // that re-read the DMA send buffer (not only recv/object) see a length.
+                // Ground-truthed: without size the queue never drains after MKDA.PAK open.
                 if (argBuf != 0 && sendSize >= 4 && fsz > 0)
                 {
                     uint obj = mem.Read32(argBuf);
-                    if (obj >= 0x00100000 && obj + 16 <= SystemMemory.RDRAM_SIZE)
+                    if (obj >= 0x00100000 && obj + 20 <= SystemMemory.RDRAM_SIZE)
                     {
-                        if (mem.Read32(obj + 8) == 0)
-                            mem.Write32(obj + 8, fsz);
-                        if (mem.Read32(obj + 12) == 0)
+                        // Always publish size at +8 (queue @0x3D8B70 lw +8).
+                        mem.Write32(obj + 8, fsz);
+                        uint o12 = mem.Read32(obj + 12);
+                        if (o12 == 0 || o12 < 0x10000)
                             mem.Write32(obj + 12, fsz);
+                        // +0x10 position/cursor stays 0; +0x14 sometimes used as aux size.
+                        if (mem.Read32(obj + 0x14) == 0)
+                            mem.Write32(obj + 0x14, fsz);
                     }
+                    // send+8 is 0 on Dec open pack; leave +0 object ptr and +12 path intact.
+                    if (sendSize >= 12 && mem.Read32(argBuf + 8) == 0)
+                        mem.Write32(argBuf + 8, fsz);
                 }
                 // Multi-word recv: +0 handle (HandleCall), +4 size when present.
                 if (recvBuf != 0 && recvSize >= 8 && fsz > 0)
                     mem.Write32(recvBuf + 4, fsz);
                 if (trace)
                     Console.Error.WriteLine(
-                        $"[MWFILE] open OK path=\"{path}\" handle={handle} fd={fd} size={fsz}");
+                        $"[MWFILE] open OK path=\"{path}\" handle={handle} fd={fd} size={fsz}" +
+                        (memberSz > 0 ? " (pak-member)" : ""));
                 return handle;
             }
 
@@ -4283,7 +4322,8 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Midway Deception/DA path aliases: retail EE opens <c>/game/mkda.pak</c> (host-style)
-    /// while the ISO root file is <c>MKDA.PAK</c>. Also normalize bare <c>mkda.pak</c>.
+    /// while the ISO root file is <c>MKDA.PAK</c>. Also normalize bare <c>mkda.pak</c>,
+    /// <c>/sounds/MSLASSET.MS2</c> → ISO root, and keep art member paths intact for TOC.
     /// </summary>
     private static string AliasMidwayPakPath(string path)
     {
@@ -4302,6 +4342,17 @@ public sealed class RealSifRpc
             || leaf.Equals("game\\mkda.pak", StringComparison.OrdinalIgnoreCase)
             || leaf.Equals("game/mkda.pak", StringComparison.OrdinalIgnoreCase))
             return @"cdrom0:\MKDA.PAK";
+        // Dec ELF: "/sounds/MSLASSET.MS2" — ISO root file is MSLASSET.MS2 (no sounds/).
+        if (leaf.Equals("SOUNDS\\MSLASSET.MS2", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("MSLASSET.MS2", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("MSLASSET.MS4", StringComparison.OrdinalIgnoreCase)
+            || leaf.EndsWith("\\MSLASSET.MS2", StringComparison.OrdinalIgnoreCase)
+            || leaf.EndsWith("\\MSLASSET.MS4", StringComparison.OrdinalIgnoreCase))
+        {
+            string ms = leaf.EndsWith("MS4", StringComparison.OrdinalIgnoreCase)
+                ? "MSLASSET.MS4" : "MSLASSET.MS2";
+            return @"cdrom0:\" + ms;
+        }
         // Art member paths often arrive as host0:\ps2dvd\art\foo.ssf or \ps2dvd\art\...
         return path;
     }
@@ -5261,6 +5312,27 @@ public sealed class RealSifRpc
         return k;
     }
 
+    /// <summary>
+    /// True when path looks like a Midway MKDA.PAK art member (gameart.ssf / ps2dvd art).
+    /// Used to prefer virtual PAK open before ISO FileOpen for member-shaped paths.
+    /// </summary>
+    private static bool LooksLikeMkdaMemberPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        string p = path.Replace('\\', '/');
+        if (p.Contains("ps2dvd/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("/art/", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("/artps2/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.EndsWith(".ssf", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("gameart", StringComparison.OrdinalIgnoreCase)) return true;
+        // Host-style leaf without device (artps2 members).
+        string leaf = p;
+        int slash = leaf.LastIndexOf('/');
+        if (slash >= 0) leaf = leaf[(slash + 1)..];
+        if (leaf.EndsWith(".ssf", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
     /// <summary>Open a path from the mounted MKDA.PAK TOC as a virtual disc stream.</summary>
     private int TryOpenFromMkdaPak(IopModuleHost iopModules, string path, out uint size)
     {
@@ -5273,11 +5345,16 @@ public sealed class RealSifRpc
         bool found = false;
         var alts = new List<string> { key };
         if (key.StartsWith("game/")) alts.Add(key["game/".Length..]);
+        // Dec asset tables use bare "gameart.ssf"; host paths use ps2dvd/art or /art/.
         alts.Add("ps2dvd/art/" + key);
         alts.Add("ps2dvd/artps2/" + key);
+        if (key.StartsWith("art/")) alts.Add("ps2dvd/" + key);
+        if (key.StartsWith("artps2/")) alts.Add("ps2dvd/" + key);
         if (key.StartsWith("ps2dvd/art/")) alts.Add(key["ps2dvd/art/".Length..]);
         if (key.StartsWith("ps2dvd/artps2/")) alts.Add(key["ps2dvd/artps2/".Length..]);
         if (key.StartsWith("ps2dvd/")) alts.Add(key["ps2dvd/".Length..]);
+        if (key.StartsWith("art/")) alts.Add(key["art/".Length..]);
+        if (key.StartsWith("artps2/")) alts.Add(key["artps2/".Length..]);
         int slash = key.LastIndexOf('/');
         if (slash >= 0) alts.Add(key[(slash + 1)..]);
 
