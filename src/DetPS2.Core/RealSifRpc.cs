@@ -1229,6 +1229,20 @@ public sealed class RealSifRpc
                     int bg2 = TryOpenBo2RealBg2(iopModules, cdvd, path);
                     if (bg2 >= 0) openRes = bg2;
                 }
+                // Pack-resident assets (KAIN.IMP / .ETP / ASSETS/*) live inside CODE/PRECODE
+                // goefile bigfiles — not as ISO 8.3 leaves. Resolve via goefile path index.
+                // Sector credit comes from the generic openedSz path below.
+                if (openRes < 0)
+                {
+                    int packFd = TryOpenBo2PackResident(iopModules, cdvd, path, out uint packSz);
+                    if (packFd >= 0)
+                    {
+                        openRes = packFd;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine(
+                                $"[FILEIO] open PACK path=\"{path}\" fd={packFd} size={packSz}");
+                    }
+                }
                 // Soft stub ONLY for non-payload probes. Never empty-stub .BG2 / MAINMENU /
                 // PRECODE / CODE / .IMP / .ETP — empty goefile/package bytes stall parsers and
                 // block "Starting code big file" / title menu (live: KAIN.IMP stub vs ENOENT).
@@ -4579,6 +4593,18 @@ public sealed class RealSifRpc
             int bg2 = TryOpenBo2RealBg2(iopModules, cdvd, norm);
             if (bg2 >= 0) hostFd = bg2;
         }
+        // Pack-resident ASSETS / .IMP / .ETP inside CODE/PRECODE goefile bigfiles.
+        if (hostFd < 0)
+        {
+            int packFd = TryOpenBo2PackResident(iopModules, cdvd, norm, out uint packSz);
+            if (packFd >= 0)
+            {
+                hostFd = packFd;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[IOPFILE] open PACK path=\"{norm}\" fd={packFd} size={packSz}");
+            }
+        }
         if (hostFd < 0 && LooksLikeBo2SoftProbeStub(norm))
         {
             // Soft stub only for non-payload probes — never empty .BG2/MAINMENU/IMP/ETP.
@@ -5276,6 +5302,220 @@ public sealed class RealSifRpc
         long abs = (long)_mkdaPakDiscByteOffset + ent.Offset;
         if (abs > uint.MaxValue) return -1;
         return iopModules.FileOpenVirtualStream("mkda:" + key, (uint)abs, ent.Size);
+    }
+
+    // -------------------------------------------------------------------------
+    // Blood Omen 2 pack-resident assets (CODE.BG2 / PRECODE.BG2 / MAINMENU.BG2).
+    //
+    // Retail disc (usebigfile=1): entity .IMP/.ETP under ASSETS/ are NOT ISO leaves —
+    // they are baked into Crystal Dynamics "goefile" bigfiles. Live FILEIO of
+    // cdrom0:\GOGAMES\BO2\ASSETS\ETYPES\KAIN\KAIN.IMP → honest ENOENT without this HLE.
+    // Ground-truthed 2026-07-30: PRECODE/CODE/MAINMENU start with "goefile\0" + nested
+    // "symlist\0" and embed path strings like "assets/etypes/kain/kain.imp". When a
+    // request path matches a goefile-resident string, serve the parent bigfile payload
+    // (real disc bytes) so the factory path gets a non-empty goefile stream.
+    // -------------------------------------------------------------------------
+    private bool _bo2PackIndexBuilt;
+    /// <summary>Normalized relative path → parent pack disc path.</summary>
+    private readonly Dictionary<string, string> _bo2PackPathToParent =
+        new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Parent pack disc path → raw goefile bytes (≤16 MiB packs only).</summary>
+    private readonly Dictionary<string, byte[]> _bo2PackBytes =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Open a pack-resident BO2 asset (.IMP/.ETP/ASSETS/…) from PRECODE/CODE/MAINMENU
+    /// goefile bigfiles when the path is not an ISO leaf.
+    /// </summary>
+    private int TryOpenBo2PackResident(IopModuleHost iopModules, Cdvd cdvd, string path,
+        out uint size)
+    {
+        size = 0;
+        if (string.IsNullOrEmpty(path) || !LooksLikeBo2PackResidentPath(path))
+            return -1;
+        EnsureBo2PackIndex(iopModules, cdvd);
+        if (_bo2PackPathToParent.Count == 0) return -1;
+
+        string key = NormalizeBo2PackMemberKey(path);
+        if (string.IsNullOrEmpty(key)) return -1;
+
+        if (!_bo2PackPathToParent.TryGetValue(key, out string? parent)
+            || string.IsNullOrEmpty(parent))
+        {
+            // Basename fallback (KAIN.IMP → assets/etypes/kain/kain.imp).
+            int slash = key.LastIndexOf('/');
+            string baseName = slash >= 0 ? key[(slash + 1)..] : key;
+            if (baseName.Length >= 3)
+            {
+                foreach (var kv in _bo2PackPathToParent)
+                {
+                    if (kv.Key.EndsWith("/" + baseName, StringComparison.OrdinalIgnoreCase)
+                        || kv.Key.Equals(baseName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        parent = kv.Value;
+                        key = kv.Key;
+                        break;
+                    }
+                }
+            }
+        }
+        if (string.IsNullOrEmpty(parent)) return -1;
+
+        // Serve parent goefile bytes as a memory image (complete "goefile" payload).
+        if (_bo2PackBytes.TryGetValue(parent, out byte[]? bytes) && bytes is { Length: > 0 })
+        {
+            size = (uint)bytes.Length;
+            return iopModules.FileOpenMemoryStub("bo2pack:" + key, bytes);
+        }
+
+        int fd = iopModules.FileOpen(parent, 1);
+        if (fd < 0)
+            fd = TryOpenBo2RealBg2(iopModules, cdvd, parent, countSectors: false);
+        if (fd >= 0 && iopModules.TryGetOpenFileSize(fd, out uint fsz))
+            size = fsz;
+        return fd;
+    }
+
+    private static bool LooksLikeBo2PackResidentPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        string p = path.Replace('/', '\\');
+        if (p.Contains("PRECODE.BG2", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("CODE.BG2", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("MAINMENU.BG2", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("PS2.RKV", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("GAME.ERG", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("ENGLISH.DIR", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return p.Contains("ASSETS", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("ETYPES", StringComparison.OrdinalIgnoreCase)
+            || p.Contains(".IMP", StringComparison.OrdinalIgnoreCase)
+            || p.Contains(".ETP", StringComparison.OrdinalIgnoreCase)
+            || p.Contains(".REA", StringComparison.OrdinalIgnoreCase)
+            || p.Contains(".FNT", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("fonts/", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("fonts\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeBo2PackMemberKey(string path)
+    {
+        string key = path.Replace('\\', '/').Trim().ToLowerInvariant();
+        int semi = key.IndexOf(';');
+        if (semi > 0) key = key[..semi];
+        int colon = key.IndexOf(':');
+        if (colon >= 0) key = key[(colon + 1)..].TrimStart('/');
+        if (key.StartsWith("gogames/bo2/")) key = key["gogames/bo2/".Length..];
+        if (key.StartsWith("gogames/")) key = key["gogames/".Length..];
+        return key.TrimStart('/');
+    }
+
+    /// <summary>
+    /// Scan PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2 for embedded path strings and index
+    /// them to the parent pack. Packs are small (≤2 MiB) so full host read is fine.
+    /// </summary>
+    private void EnsureBo2PackIndex(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_bo2PackIndexBuilt) return;
+        _bo2PackIndexBuilt = true;
+        _ = cdvd;
+
+        string[] packs =
+        {
+            @"cdrom0:\GOGAMES\BO2\PRECODE.BG2",
+            @"cdrom0:\GOGAMES\BO2\CODE.BG2",
+            @"cdrom0:\GOGAMES\BO2\RESOURCES\LEVELS\UI\MAINMENU.BG2",
+            @"cdrom0:\GOGAMES\BO2\RESOUR~1\LEVELS\UI\MAINMENU.BG2",
+        };
+        var seenPack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string packPath in packs)
+        {
+            int fd = iopModules.FileOpen(packPath, 1);
+            if (fd < 0) continue;
+            if (!iopModules.TryGetOpenFileSize(fd, out uint fsz) || fsz is 0 or > 16u * 1024 * 1024)
+            {
+                iopModules.FileClose(fd);
+                continue;
+            }
+            if (!iopModules.TryReadOpenFileBytes(fd, 0, (int)fsz, out byte[]? data)
+                || data == null || data.Length < 32)
+            {
+                iopModules.FileClose(fd);
+                continue;
+            }
+            iopModules.FileClose(fd);
+
+            if (data.Length < 16
+                || data[0] != (byte)'g' || data[1] != (byte)'o' || data[2] != (byte)'e'
+                || data[3] != (byte)'f' || data[4] != (byte)'i' || data[5] != (byte)'l'
+                || data[6] != (byte)'e')
+                continue;
+
+            string packKey = packPath;
+            if (packPath.Contains("MAINMENU", StringComparison.OrdinalIgnoreCase))
+                packKey = @"cdrom0:\GOGAMES\BO2\RESOURCES\LEVELS\UI\MAINMENU.BG2";
+            if (!seenPack.Add(packKey))
+                continue;
+            _bo2PackBytes[packKey] = data;
+
+            int added = IndexBo2GoeFilePaths(data, packKey);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] pack index {packKey} size={data.Length} paths+={added} total={_bo2PackPathToParent.Count}");
+        }
+    }
+
+    /// <summary>Walk C-string runs in a goefile and register path-like members.</summary>
+    private int IndexBo2GoeFilePaths(byte[] data, string packKey)
+    {
+        int added = 0;
+        int i = 0;
+        while (i < data.Length)
+        {
+            byte b = data[i];
+            if (b is < (byte)'A' or > (byte)'z')
+            {
+                i++;
+                continue;
+            }
+            int start = i;
+            while (i < data.Length)
+            {
+                byte c = data[i];
+                if (c is >= 32 and <= 126 && c != (byte)'"' && c != (byte)'\'')
+                    i++;
+                else
+                    break;
+            }
+            int len = i - start;
+            if (len is >= 8 and <= 180 && i < data.Length && data[i] == 0)
+            {
+                string s = System.Text.Encoding.ASCII.GetString(data, start, len);
+                if (IsBo2GoeMemberPath(s))
+                {
+                    string key = NormalizeBo2PackMemberKey(s);
+                    if (key.Length > 0 && !_bo2PackPathToParent.ContainsKey(key))
+                    {
+                        _bo2PackPathToParent[key] = packKey;
+                        added++;
+                    }
+                }
+            }
+            if (i < data.Length && data[i] == 0) i++;
+        }
+        return added;
+    }
+
+    private static bool IsBo2GoeMemberPath(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length < 8) return false;
+        bool hasSep = s.Contains('/') || s.Contains('\\');
+        string lower = s.ToLowerInvariant();
+        if (!(hasSep || lower.StartsWith("assets") || lower.StartsWith("fonts")
+              || lower.StartsWith("resources")))
+            return false;
+        return lower.Contains(".imp") || lower.Contains(".etp") || lower.Contains(".rea")
+            || lower.Contains(".fnt") || lower.Contains(".chn") || lower.Contains(".txt")
+            || lower.Contains(".bg2") || lower.Contains("assets/") || lower.Contains("fonts/");
     }
 
     /// <summary>
