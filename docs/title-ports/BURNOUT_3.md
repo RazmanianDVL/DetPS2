@@ -93,3 +93,14 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | Wall | post-TXD MMIO probe 0x21A5xx / PC 0x1F308C |
 | Assist | e90eaef post-TXD MMIO leave |
 | Residual | #20 presentation px>0; tip residual-STG flaky after SM RR |
+
+## Wave-8 (2026-07-30 presentation thrash)
+
+| Field | Value |
+|-------|-------|
+| Wall disasm | GIF flush `0x21A4F0` bulk lq/sq MMIO src; submit `0x1F3080` / final `0x1F308C` |
+| Assist | Collapse absurd gp ring; leave epilogue `0x21A5D8` / `0x218774`; `b3Hot` tight slices; force≥22M; delay entry/leaf stubs n≥24 |
+| Deliver 100M | STG+TXD+FRONTEND cdvd=2425 gifP3=656 **px=0** PC=0x1F308C |
+| Tip 100M | residual n=2–3 cdvd=**425** (residual-STG still flaky vs deliver) |
+| MENU / px | **No / 0** |
+| Next | tip residual→STG restore → FRONTEND DMA → sane GIF flush → px>0 |

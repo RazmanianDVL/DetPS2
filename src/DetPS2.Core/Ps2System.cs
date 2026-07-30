@@ -454,7 +454,12 @@ public sealed class Ps2System
                     or (>= 0x0013DED0UL and <= 0x0013DEF8UL)
                     or (>= 0x0013E1C0UL and <= 0x0013E1F4UL)  // global free-search circular
                     or (>= 0x80000180UL and <= 0x80000200UL);
-                ulong slice = (criHot || gowHot) ? sliceCri : sliceDefault;
+                // Burnout 3 post-TXD GIF flush thrash.
+                bool b3Hot = ActiveQuirk is Burnout3Assist && pcPhys is
+                    (>= 0x0021A4F0UL and <= 0x0021A5E8UL)
+                    or (>= 0x001F3080UL and <= 0x001F3500UL)
+                    or (>= 0x00218700UL and <= 0x00218790UL);
+                ulong slice = (criHot || gowHot || b3Hot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never
                 // reached). One-shot kick of only thread 2 left ADX (entry 0x4147F8) and every

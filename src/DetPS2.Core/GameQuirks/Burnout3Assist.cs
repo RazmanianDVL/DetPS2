@@ -454,8 +454,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // only on main high-stack (menu4 stable FC10); rewrite whole LGDEV .text savedRa.
         if (_lgDevFullyDone)
         {
-            PlantLgDevEntryStub(sys);
-            PlantLgDevCallRpcLeafStub(sys);
+            // Wave-8: delay permanent stubs until residual n≥24 (early stub → no STG).
+            if (_lgDevEscapes >= 24)
+            {
+                PlantLgDevEntryStub(sys);
+                PlantLgDevCallRpcLeafStub(sys);
+            }
             sys.Memory.Write32(LgDevPostFlag, 0);
 
             // 0x443DA8 = delay slot of leaf jr ra (ld ra; jr ra; addiu sp,48). Dead $ra
@@ -604,8 +608,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
             if (sp is < 0x01FFF000 or >= 0x02000000)
                 return;
             bool pristine = sp is >= 0x01FFFC00 and <= 0x01FFFC20;
-            bool forceNow = (pristine && sys.MasterCycles >= 18_000_000)
-                            || sys.MasterCycles >= 22_500_000;
+            // Wave-8: delay force to ≥22M so residual can settle (tip early@18M → n=2–3 no STG).
+            bool forceNow = (pristine && sys.MasterCycles >= 22_000_000)
+                            || sys.MasterCycles >= 23_500_000;
             if (!forceNow)
                 return;
             // Permanent structural break of fno=18 path.
@@ -637,7 +642,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.COP0_Status &= ~(1u << 1);
             _lgDevEscapes++;
             _lgDevFullyDone = true;
-            PlantLgDevEntryStub(sys);
+            // Wave-8: do not plant entry/leaf stubs here — residual CallRpc must re-enter
+            // for menu4-like n≈48→STG. Sticky j 0x443C44 already blocks fno=18 re-init.
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
                     $"[B3] force CallRpc→lgDev epilogue pc=0x{pc:X8} sp=0x{sp:X8} s1=0x{s1:X8} " +
@@ -720,7 +726,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         sys.EE.COP0_Status &= ~(1u << 1);
         _lgDevEscapes++;
         _lgDevFullyDone = true;
-        PlantLgDevEntryStub(sys);
+        // Wave-8: delay entry stub for residual→STG cadence.
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[B3] force lgDeviceInit complete ({why}) pc=0x{fromPc:X8} " +
@@ -806,8 +812,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
             }
         }
 
-        // Sticky re-plant entry stub after LGDEV so boot cannot re-enter wheel init.
-        if (_lgDevFullyDone)
+        // Sticky re-plant only after residual window (n≥24).
+        if (_lgDevFullyDone && _lgDevEscapes >= 24)
             PlantLgDevEntryStub(sys);
 
         // Boot wait-flag plant: break while (*(gp-23028)==0) SleepThread at 0x2B34D8.
@@ -883,28 +889,60 @@ public sealed class Burnout3Assist : IGameQuirkModule
     /// </summary>
     private void MaybeEscapePostTxdHang(Ps2System sys)
     {
-        if (_postTxdEscapes >= 256) return;
-        if (sys.MasterCycles - _lastPostTxdEscapeCyc < 40_000) return;
+        if (_postTxdEscapes >= 1024) return;
+        if (sys.MasterCycles - _lastPostTxdEscapeCyc < 4_000) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
 
-        // Live deliver: post full-TXD UnknownMmioRead flood @ 0x21A5xx / park 0x1F308C (px=0).
-        bool mmioProbe = (pc is >= 0x0021A540 and <= 0x0021A580
-                          || pc is >= 0x00218740 and <= 0x00218770
-                          || pc is >= 0x001F3080 and <= 0x001F30A0)
+        // Wave-8: GIF path-flush 0x21A4F0 bulk lq/sq with MMIO src (UnknownMmioRead) /
+        // submit 0x1F308C. Collapse absurd gp ring; leave flush epilogue (not 0x1F2520).
+        // Do not permanent-stub flush entry — sane flushes needed for Soft-GS px>0.
+        bool inGifFlush = pc is >= 0x0021A4F0 and <= 0x0021A5E4;
+        bool inGifSubmit = pc is >= 0x001F3080 and <= 0x001F3500;
+        bool inFlushCaller = pc is >= 0x00218700 and <= 0x00218790;
+        bool mmioProbe = (inGifFlush || inGifSubmit || inFlushCaller)
                          && sys.Cdvd.SectorsRead >= 2000;
         if (mmioProbe)
         {
+            uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
+            if (gp is < 0x00400000 or >= 0x01000000) gp = 0x004E8670;
+            uint startCell = gp - 27936u, endCell = gp - 23960u, dstCell = gp - 24240u;
+            uint startPhys = sys.Memory.Read32(startCell) & 0x1FFFFFFFu;
+            uint endPhys = sys.Memory.Read32(endCell) & 0x1FFFFFFFu;
+            bool absurd = startPhys >= 0x10000000u || endPhys >= 0x10000000u
+                || endPhys < startPhys
+                || (endPhys > startPhys && endPhys - startPhys > 0x00080000u)
+                || startPhys < 0x00100000u
+                || startPhys >= (uint)SystemMemory.RDRAM_SIZE;
+            if (!absurd && inGifFlush)
+            {
+                uint t7 = (uint)(sys.EE.GetGpr(15).Lo & 0xFFFFFFFFUL);
+                if ((t7 & 0x1FFFFFFFu) >= 0x10000000u) absurd = true;
+            }
+            if (!absurd && inGifSubmit)
+            {
+                uint a1 = (uint)(sys.EE.GetGpr(5).Lo & 0xFFFFFFFFUL);
+                if (a1 > 0x4000u) absurd = true;
+            }
+            if (!absurd) return; // sane GIF path — let Soft-GS draw
+
             _lastPostTxdEscapeCyc = sys.MasterCycles;
             _postTxdEscapes++;
-            uint resume = 0x001F2520; // past flip-wait
+            uint safe = startPhys is >= 0x00100000 and < 0x01E00000u
+                ? sys.Memory.Read32(startCell) : 0x00700000u;
+            sys.Memory.Write32(startCell, safe);
+            sys.Memory.Write32(endCell, safe);
+            sys.Memory.Write32(dstCell, safe);
+
+            uint resume = inGifFlush ? 0x0021A5D8u : 0x00218774u;
             if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
-                && ra is not (>= 0x0021A500 and <= 0x0021A600)
-                && ra is not (>= 0x001F3080 and <= 0x001F30C0)
+                && ra is not (>= 0x0021A4F0 and <= 0x0021A5E8)
+                && ra is not (>= 0x001F3080 and <= 0x001F3500)
                 && ra is not (>= 0x001F24E0 and <= 0x001F2520))
                 resume = ra;
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.PC = resume;
             sys.EE.COP0_Status &= ~0x6u;
             ArmFlipConsumer(sys);
@@ -927,9 +965,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_postTxdEscapes <= 16 || _postTxdEscapes % 16 == 0))
                 Console.Error.WriteLine(
-                    $"[B3] post-TXD MMIO probe leave pc=0x{pc:X8} ra=0x{ra:X8} -> 0x{resume:X8} " +
+                    $"[B3] post-TXD GIF-flush leave pc=0x{pc:X8} ra=0x{ra:X8} -> 0x{resume:X8} " +
                     $"n={_postTxdEscapes} cdvd={sys.Cdvd.SectorsRead} gifP3={sys.Gif.Path3Transfers} " +
-                    $"cyc={sys.MasterCycles}");
+                    $"px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
             return;
         }
 
