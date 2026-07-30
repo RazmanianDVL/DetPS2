@@ -1338,6 +1338,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-8: minimal stream cookie *0x5BB860=1 (FUN_0043ccf8 arg / slot-style active).
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeInitStreamCookie(sys);
+        // Wave-9: re-arm stream CAS *0x55E248 so FUN_0043FAE8 can re-enter after first pass
+        // (live 120M: cas248 stuck at 1 while gifP3 plateaus 11; skip200 already 0).
+        if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeRearmStreamCas(sys);
+        // Wave-9: post-spine sticky park in syscall-68 / worker 0x47FD..0x480B and ADX
+        // re-init 0x4143A0 — starve second chrome + pad accept.
+        if (c >= 75_000_000 && sys.Gif.Path3Transfers >= 11)
+            MaybeEscapePostSpineWorkerThrash(sys);
         // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
         // Wave-8: gifP3>=11 (not 12).
         if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 11)
@@ -2732,7 +2740,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Live: index-6 tick at 0x54E600 climbs under pad; dump for accept-to-submenu proof.
         // Wave-6: also dump once multiLive (frame-cb path) even if gifP3 still climbing.
         // Scan 0x54E5E0..0x54E640 and cookie 0x5BB860 for small ints that move with D-pad
-        // (selection index typically 0..N where N≤16).
+        // (selection index typically 0..N where N≤16). Wave-9: also scan 0x54E680..0x54E780
+        // and 0x54F000..0x54F100 for alternate Midway menu object slots.
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (sys.Gif.Path3Transfers >= 11 || multiLive)
             && (_menuPadPulses == 16 || _menuPadPulses == 64 || _menuPadPulses == 128
@@ -2771,6 +2780,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 if (v <= 16)
                     small.Append($" +{off:X2}={v}");
             }
+            // Wider small-int scan for selection (D-pad tracking).
+            var wide = new System.Text.StringBuilder();
+            foreach (uint baseAddr in new uint[] { 0x0054E680, 0x0054F000, 0x0054E800 })
+            {
+                for (uint off = 0; off < 0x100; off += 4)
+                {
+                    uint v = sys.Memory.Read32(baseAddr + off);
+                    if (v <= 8)
+                        wide.Append($" {baseAddr + off:X6}={v}");
+                }
+            }
             Console.Error.WriteLine(
                 $"[BIOS] menu-sel *54E5E0={t0:X8}/{t1:X8}/{t2:X8}/{t3:X8} " +
                 $"*54E600={t4:X8} *54E610={t5:X8}/{t6:X8}/{t7:X8}/{t8:X8} " +
@@ -2778,9 +2798,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"ck={ck0:X8}/{ck1:X8}/{ck2:X8}/{ck3:X8}/{ck4:X8}/{ck5:X8} " +
                 $"gateEc={gateEc:X} skip200={skip200:X} cas248={cas248:X} " +
                 $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
-                $"n={_menuPadPulses} cyc={sys.MasterCycles}");
+                $"dmac={sys.Dmac.TransfersCompleted} n={_menuPadPulses} cyc={sys.MasterCycles}");
             if (small.Length > 0)
                 Console.Error.WriteLine($"[BIOS] menu-sel-small{small} cyc={sys.MasterCycles}");
+            if (wide.Length > 0 && wide.Length < 400)
+                Console.Error.WriteLine($"[BIOS] menu-sel-wide{wide} cyc={sys.MasterCycles}");
         }
 
         // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
@@ -3167,7 +3189,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// (FUN_0043ce78 countdown). Live menu-sel dumps kept cookie <c>0x5BB860</c> zero and
     /// PC samples parked on epilogue <c>0x43FB9C</c> — work body never ran.
     /// Secondary check <c>FUN_0043F2C0(base+0x58)</c> is a compare-and-set on
-    /// <c>*0x55E248</c> (returns 1 when previously not 1) — leave that for the game.
+    /// <c>*0x55E248</c> (returns 1 when previously not 1) — re-armed by
+    /// <see cref="MaybeRearmStreamCas"/> after first pass sticks.
+    /// Stream-tick skip flag <c>*0x55E200</c> (<c>*(FUN_0043CB18()+16)</c>) must stay 0 —
+    /// <c>FUN_0043F920</c> early-outs FAE8 when it equals 1.
     /// </para>
     /// Do NOT plant <c>*0x75C0D0</c>. Prefer SHARED if a generic stream-manager ready
     /// contract emerges; for now TITLE_LOCAL (wrong offset was a title-assist bug).
@@ -3182,6 +3207,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
         if (!multiLive && !frameCbLive && sys.Cdvd.SectorsRead < 180_000)
             return;
+
+        // Keep stream-tick skip flag clear (FUN_0043F968 returns *(base+16)).
+        if (sys.Memory.Read32(0x0055E200) == 1)
+            sys.Memory.Write32(0x0055E200, 0);
 
         uint gate = sys.Memory.Read32(0x0055E1EC);
         if (gate == 1)
@@ -3205,6 +3234,133 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"[BIOS] hold stream work gate *0x55E1EC=1 (was 0x{gate:X8}) " +
                 $"n={_streamWorkGateHolds} multi={(multiLive ? 1 : 0)} fcb={(frameCbLive ? 1 : 0)} " +
                 $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    private int _streamCasRearms;
+    private ulong _lastStreamCasRearmCyc;
+
+    /// <summary>
+    /// Wave-9: re-arm stream compare-and-set cell <c>*0x55E248</c> (stream manager base+0x58).
+    /// <para>
+    /// Disasm <c>FUN_0043FAE8</c> → <c>FUN_0043F2C0(base+0x58)</c> → <c>0x4277E8</c>:
+    /// <c>old=*a0; *a0=1; return (old^1)!=0</c>. When old is already 1 the leaf returns 0
+    /// and FAE8 takes the epilogue — live 120M menu-sel showed <c>cas248=1</c> stuck after
+    /// the first stream burst that lifted gifP3 5→11, with no further Path3 growth.
+    /// Clear to 0 on a rate-limited cadence so the work body can run again (second chrome).
+    /// Also clears skip flag <c>*0x55E200</c> if set. Do NOT plant <c>*0x75C0D0</c>.
+    /// </para>
+    /// </summary>
+    private void MaybeRearmStreamCas(Ps2System sys)
+    {
+        if (_streamCasRearms >= 32) return;
+        if (sys.MasterCycles - _lastStreamCasRearmCyc < 1_500_000) return;
+
+        bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
+        bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
+        if (!multiLive && !frameCbLive) return;
+        // Gate must already be open — do not thrash CAS before first FAE8 entry.
+        if (sys.Memory.Read32(0x0055E1EC) != 1) return;
+
+        if (sys.Memory.Read32(0x0055E200) == 1)
+            sys.Memory.Write32(0x0055E200, 0);
+
+        uint cas = sys.Memory.Read32(0x0055E248);
+        if (cas == 0)
+        {
+            // Still re-open once gifP3 is plateaued so a later plant of cas=1 gets cleared.
+            if (sys.Gif.Path3Transfers < 11 || sys.Gif.Path3Transfers >= 14)
+                return;
+            // gifP3 11..13 and cas already 0: nothing to do this tick.
+            return;
+        }
+
+        sys.Memory.Write32(0x0055E248, 0);
+        // Sibling CAS at base+0x5C (FUN_0043F9A8) can also stick.
+        if (sys.Memory.Read32(0x0055E24C) == 1)
+            sys.Memory.Write32(0x0055E24C, 0);
+
+        _streamCasRearms++;
+        _lastStreamCasRearmCyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_streamCasRearms <= 8 || _streamCasRearms % 4 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] re-arm stream CAS *0x55E248=0 (was 0x{cas:X8}) n={_streamCasRearms} " +
+                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    private int _postSpineWorkerEscapes;
+    private ulong _lastPostSpineWorkerEscCyc;
+    private int _postSpineWorkerVisits;
+    private ulong _lastPostSpineWorkerVisitCyc;
+
+    /// <summary>
+    /// Wave-9: escape post-spine sticky parks that starve second chrome / pad accept.
+    /// <para>
+    /// Live 120M pad-inject after gifP3=11:
+    /// <list type="bullet">
+    /// <item><c>0x426E28</c> lock thrash (handled by lock-wrapper break)</item>
+    /// <item><c>0x4143A0</c> ADX re-init body hammering syscall stubs for ~10M cyc</item>
+    /// <item><c>0x47FEA0</c> (syscall 68) / <c>0x480Axx</c> commercial worker loop</item>
+    /// </list>
+    /// Trampoline escape only fires when <c>$ra</c> is dead — legitimate jal→syscall with
+    /// live ra never exits. Sticky re-visits force resume to ADX pump / group-6 / stream tick
+    /// and re-arm stream CAS so FAE8 can contribute Path3 again.
+    /// </para>
+    /// </summary>
+    private void MaybeEscapePostSpineWorkerThrash(Ps2System sys)
+    {
+        if (_postSpineWorkerEscapes >= 96) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inBand = pc is (>= 0x0047FD00 and <= 0x00480C00)
+            or (>= 0x00414380 and <= 0x00414400)
+            or (>= 0x004143A0 and <= 0x00414410);
+        if (!inBand) return;
+
+        if (sys.MasterCycles - _lastPostSpineWorkerVisitCyc < 300_000)
+            _postSpineWorkerVisits++;
+        else
+            _postSpineWorkerVisits = 1;
+        _lastPostSpineWorkerVisitCyc = sys.MasterCycles;
+        if (_postSpineWorkerVisits < 3) return;
+        if (sys.MasterCycles - _lastPostSpineWorkerEscCyc < 80_000) return;
+
+        // Prefer menu/stream targets over pure ADX pump so second chrome can draw.
+        // Live wave-9: ADX pump alone re-ran stream CAS (dmac 16→730) but gifP3 stuck 11;
+        // group-6 multi + stream tick are the pad/UI callback path.
+        uint resume = 0;
+        if (sys.Memory.IsLikelyEeCode(0x00427518UL))
+            resume = 0x00427518; // group-6 multi dispatch (pad/menu tick)
+        else if (sys.Memory.Read32(0x0043F920) == 0x27BDFFF0u)
+            resume = 0x0043F920; // stream tick leaf
+        else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8; // ADX pump
+        else if (sys.Memory.IsLikelyEeCode(0x00414590UL))
+            resume = 0x00414590;
+        if (resume == 0) return;
+
+        // Re-open stream work for second chrome while we leave the thrash band.
+        if (sys.Memory.Read32(0x0055E1EC) != 1)
+            sys.Memory.Write32(0x0055E1EC, 1);
+        if (sys.Memory.Read32(0x0055E200) == 1)
+            sys.Memory.Write32(0x0055E200, 0);
+        if (sys.Memory.Read32(0x0055E248) != 0)
+            sys.Memory.Write32(0x0055E248, 0);
+
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        ReHomeSpIfInHleScratch(sys);
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        _lastPostSpineWorkerEscCyc = sys.MasterCycles;
+        _postSpineWorkerEscapes++;
+        _postSpineWorkerVisits = 0;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_postSpineWorkerEscapes <= 12 || _postSpineWorkerEscapes % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] escape post-spine worker thrash 0x{pc:X8} -> 0x{resume:X8} " +
+                $"n={_postSpineWorkerEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
     }
 
     private int _streamCookieInits;
@@ -3350,8 +3506,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         uint resume = 0x00426ED4;
         if (stickyBand || stickyRef)
         {
-            // Prefer ADX pump over unlock epilogue so we leave the lock band (live 0x426E28 park).
-            if (sys.Memory.IsLikelyEeCode(0x004147F8UL)) resume = 0x004147F8;
+            // Prefer group-6 multi / stream tick over ADX pump once spine is live so
+            // pad/menu callbacks run (wave-9: ADX-only escape lifted dmac not gifP3).
+            if (sys.Gif.Path3Transfers >= 11 && sys.Memory.IsLikelyEeCode(0x00427518UL))
+                resume = 0x00427518;
+            else if (sys.Gif.Path3Transfers >= 11 && sys.Memory.Read32(0x0043F920) == 0x27BDFFF0u)
+                resume = 0x0043F920;
+            else if (sys.Memory.IsLikelyEeCode(0x004147F8UL)) resume = 0x004147F8;
             else if (sys.Memory.IsLikelyEeCode(0x00427518UL)) resume = 0x00427518;
             try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
         }

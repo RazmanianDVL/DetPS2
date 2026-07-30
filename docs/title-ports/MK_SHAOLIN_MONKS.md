@@ -14,7 +14,57 @@
 
 ---
 
-## Result this session (wave-8)
+## Result this session (wave-9)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — stream CAS re-arm + post-spine worker escape; **selection index + gifP3≥12 still unproven** |
+| WAD stream | **Yes** — `cdvd=198840` |
+| gifP3 | **11** (plateau; CAS re-arm did **not** lift Path3 to 12–14) |
+| dmac | **730** @120M (was **16** wave-8 — stream body re-enters) |
+| Frame cb | **`*0x75BDD8=0x43F920` held** + arg `0x5BB860` |
+| Group-6 multi | **`*0x75E950=0x43F920` held** cookie `0x5BB860` |
+| Stream cookie | **`*0x5BB860=1` planted** (live may become `0x5BB8`) |
+| Stream work gate | **`*0x55E1EC=1` held**; skip `*0x55E200=0` held |
+| Stream CAS | **`*0x55E248` re-armed 0** (was stuck 1 after first FAE8 pass) |
+| Pad | Dense START/CROSS/DOWN/UP; ghost PADMAN; Play! PAD consulted (generic) |
+| Final PC | **`0x43FB60`** (stream work body) — was `0x480Axx` worker thrash |
+| Accept | Stream leaf live; **selection index + second UI chrome not proven** |
+| Constraints | `DETPS2_SEMA_STALL_YIELD` OFF; **no `*0x75C0D0` plant** |
+| Smokes | **ALL PASSED** |
+| diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 binds=16 calls=241 (baseline hold) |
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
+- Play! PAD: `Iop_PadMan.cpp` (0x80000100) — ghost DMA + ForceRefreshPad already ported SHARED
+- PINE: **N** (not used this wave; disasm of FAE8/F920 sufficient for CAS wall)
+
+### Change class
+
+- **TITLE** `MidwayBootAssist.cs`: `MaybeRearmStreamCas`, `MaybeEscapePostSpineWorkerThrash`, skip-flag hold, prefer group-6/stream over ADX for post-spine lock escape
+- **SHARED**: none this wave
+
+### pad-inject @ 120M (host-present, wave-9)
+
+```
+  58200000  logo-spine kick → ADX pump gifP3=5
+  60000000  group-6 + frame-cb + cookie=1 + stream gateEc=1 skip200=0
+  73200000  re-arm stream CAS *0x55E248=0 (was 1); gifP3 climbs 6→8→11
+  75000000  CROSS; gifP3=11; memset + VU pastEp escape
+  77000000  post-spine worker thrash 0x47FEA8 → pump/group-6
+  85550000  menu-sel tick *54E600 climbs; cas248 oscillates 0/1 under re-arm
+ 120000000  final PC=0x43FB60 gifP3=11 dmac=730 syscalls~1.08M cdvd=198840
+```
+
+### Residual wall (wave-9)
+
+1. **gifP3 plateau 11** — stream FAE8 re-entry lifts **dmac** (16→730) not Path3; second chrome needs UI/PATH3 path, not only stream DMA.
+2. **Selection index location still unknown** — D-pad moves `*54E610/*54E618` flags only; wider BSS scan not yet a stable 0..N cell.
+3. **Hard accept-to-submenu unproven** — no new UI string set after CROSS.
+4. Prefer PCSX2+PINE dump of menu object / selection cell under real pad if next wave stalls.
+
+## Result prior session (wave-8)
 
 | Goal | Status |
 |------|--------|
