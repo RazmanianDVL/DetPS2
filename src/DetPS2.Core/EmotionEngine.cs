@@ -1089,7 +1089,15 @@ public sealed class EmotionEngine : ISchedulable
             // hardware's actual behavior for a periodic timer tick and breaks the storm.
             if (src is (int)Intc.InterruptSource.Timer0 or (int)Intc.InterruptSource.Timer1
                     or (int)Intc.InterruptSource.Timer2 or (int)Intc.InterruptSource.Timer3)
+            {
                 _intc.Acknowledge((Intc.InterruptSource)src);
+                // Defense in depth (Vexx 2026-07-30): if Acknowledge is ever a no-op (legacy
+                // StatHold on non-VBlank, or future hold changes), still drop the COP0 latch so
+                // eret cannot re-enter the same Timer ISR every instruction. Matches the
+                // viaDmacFallback ClearCpuLatch fallback above.
+                if (_intc.IsPending((Intc.InterruptSource)src))
+                    _intc.ClearCpuLatch((Intc.InterruptSource)src);
+            }
 
             // Consume COP0 edge latch for every dispatched source. STAT can stay sticky (pollers
             // / software write-1-clear); without clearing the latch, eret immediately re-enters

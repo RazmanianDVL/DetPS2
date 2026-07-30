@@ -53,10 +53,11 @@ public sealed class Intc : ISchedulable
     public uint CpuLatched { get; private set; }
 
     /// <summary>
-    /// MasterCycles-based earliest time each STAT bit may be write-1-cleared. Gives busy-pollers
-    /// (read INTC_STAT in a tight loop with IE still on) a window to observe VBlankStart before
-    /// an ISR or sibling thread acks it. Real frames are ~0.5–1ms; a few thousand EE cycles is
-    /// enough for a 5-instruction poll to win the race (Shaolin Monks 0x4803D0, 2026-07-29).
+    /// MasterCycles-based earliest time <b>VBlank</b> STAT bits may be write-1-cleared / HLE-acked.
+    /// Gives busy-pollers (read INTC_STAT in a tight loop with IE still on) a window to observe
+    /// VBlankStart before an ISR or sibling thread acks it. Hold applies <b>only</b> to
+    /// VBlankStart/End — never Timer/SIF (Vexx Timer0 storm when hold blocked Acknowledge while
+    /// CpuLatched stayed armed, 2026-07-30).
     /// </summary>
     private readonly ulong[] _statHoldUntil = new ulong[16];
     // Must outlast both the forced-preempt quantum (0x10000) and a full PCRTC VBlank period
@@ -100,7 +101,12 @@ public sealed class Intc : ISchedulable
         // subsequent Pcrtc Raise saw alreadyRaised=true, CpuLatched never came back, and
         // the frame-counter wait at 0x0021FF00 spun forever on a counter that never moved.
         CpuLatched |= bit;
-        if (edge)
+        // Hold only for VBlank sticky-poll assist (Shaolin Monks CRT0 INTC_STAT spin).
+        // Applying the 2M-cycle hold to Timer/SIF/etc. makes HLE Acknowledge a no-op while
+        // TryDispatchRegisteredIntcHandler still relies on Acknowledge to clear CpuLatched for
+        // timers (ClearCpuLatch is deliberately skipped on that path) → permanent Timer0 storm
+        // (Vexx SLUS_203.83: 334k src=9 dispatches in 8M cyc, LOADFILE/RPC starved, 2026-07-30).
+        if (edge && (source is InterruptSource.VBlankStart or InterruptSource.VBlankEnd))
         {
             int idx = (int)source;
             if ((uint)idx < (uint)_statHoldUntil.Length)
@@ -126,9 +132,12 @@ public sealed class Intc : ISchedulable
     public void Acknowledge(InterruptSource source)
     {
         int idx = (int)source;
-        if ((uint)idx < (uint)_statHoldUntil.Length
+        // Hold applies only to VBlank sources (see Raise); other sources must ack immediately
+        // so HLE timer/SIF dispatch cannot storm on a stuck CpuLatched bit.
+        if (source is InterruptSource.VBlankStart or InterruptSource.VBlankEnd
+            && (uint)idx < (uint)_statHoldUntil.Length
             && CurrentCycleForTrace < _statHoldUntil[idx])
-            return; // hold sticky for busy-pollers
+            return; // hold sticky for VBlank busy-pollers
         uint bit = 1u << idx;
         Stat &= ~bit;
         CpuLatched &= ~bit;
@@ -161,12 +170,14 @@ public sealed class Intc : ISchedulable
     public void WriteStatClear(uint value)
     {
         uint allowed = value;
-        // Respect per-source hold so a VBlank ISR / sibling clear cannot erase Start
-        // before the thread that is busy-polling INTC_STAT observes it.
+        // Respect VBlank hold so a sibling ISR clear cannot erase Start before the thread
+        // that is busy-polling INTC_STAT observes it. Timer/SIF/etc. clear immediately.
         for (int i = 0; i < 16; i++)
         {
             uint bit = 1u << i;
             if ((allowed & bit) == 0) continue;
+            if (i is not ((int)InterruptSource.VBlankStart or (int)InterruptSource.VBlankEnd))
+                continue;
             if (CurrentCycleForTrace < _statHoldUntil[i])
                 allowed &= ~bit;
         }

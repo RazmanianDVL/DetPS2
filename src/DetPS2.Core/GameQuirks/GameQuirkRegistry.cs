@@ -28,6 +28,8 @@ public static class GameQuirkRegistry
         Register("SLUS_200.24", () => new BloodOmen2SnAssist());
         Register("SCUS_973.99", () => new GodOfWarAssist());
         Register("SLUS_210.50", () => new Burnout3Assist());
+        Register("SLUS_203.83", () => new VexxAssist());
+        Register("SLUS_206.84", () => new WhiplashAssist());
         // Register("SLUS_XXXXX", () => new MyNewTitleQuirks());
     }
 

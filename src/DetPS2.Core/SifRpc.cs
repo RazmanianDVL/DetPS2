@@ -210,6 +210,7 @@ public sealed class IopModuleHost
         _openFiles.Clear();
         _hostFiles.Clear();
         _openDirs.Clear();
+        _hostWriteOverlay.Clear();
         _nextModuleId = 1;
         _nextStartOrder = 1;
         _nextFd = 3;
@@ -909,6 +910,17 @@ public sealed class IopModuleHost
         var hf = new OpenHostFile { Path = path, Position = 0 };
         bool nonDisc = IsNonDiscDevicePath(path);
 
+        // Retail leftovers often keep host0:~/bin/… / host:… paths from SN ProView builds
+        // (Whiplash SLUS_206.84, others). When a mounted ISO has a matching basename/path,
+        // serve real disc bytes instead of an empty host stub so boot can proceed without
+        // a title-only path rewrite. Prefer exact disc open for cdrom* as before.
+        if (_discVolume != null && nonDisc && TryMapHostPathToDisc(path, out var hostMapped))
+        {
+            nonDisc = false;
+            path = hostMapped;
+            hf.Path = path;
+        }
+
         // ROMDRV: rom0:/rom: file content from bound BIOS ROMDIR (or synthetic empty stubs).
         if (TryResolveRom0Path(path, out string? romName))
         {
@@ -969,6 +981,15 @@ public sealed class IopModuleHost
             hf.Data ??= Array.Empty<byte>();
         }
 
+        // Prefer prior FILEIO write overlay (BO2 GAME.ERG RDWR config) over stock ISO bytes.
+        if (_hostWriteOverlay.TryGetValue(NormalizeOverlayKey(path), out byte[]? overlay)
+            && overlay is { Length: > 0 })
+        {
+            hf.Data = (byte[])overlay.Clone();
+            hf.Size = (uint)overlay.Length;
+            hf.Position = 0;
+        }
+
         _openFiles[fd] = path;
         _hostFiles[fd] = hf;
         _ = mode;
@@ -1027,6 +1048,13 @@ public sealed class IopModuleHost
         return 0;
     }
 
+    /// <summary>
+    /// Host-side overlay for files written via FILEIO (e.g. BO2 GAME.ERG config lines).
+    /// Survives close/re-open of the same path so RDWR config updates are visible on re-read.
+    /// </summary>
+    private readonly Dictionary<string, byte[]> _hostWriteOverlay =
+        new(StringComparer.OrdinalIgnoreCase);
+
     public int FileWrite(SystemMemory mem, int fd, uint buf, uint size)
     {
         if (!_hostFiles.TryGetValue(fd, out var hf))
@@ -1040,11 +1068,51 @@ public sealed class IopModuleHost
             // Fallback: swallow as successful write (no sink bound).
             return n;
         }
-        // Read-only ISO + empty host stubs: report the requested size as written so write
-        // probes don't spin; no durable store beyond the open lifetime.
-        // (Blood Omen 2 opens GAME.ERG RDWR and writes short config lines; success keeps boot moving.)
-        _ = mem; _ = buf;
-        return (int)Math.Min(size, 0x100000u);
+        // Persist writes into the open-file host buffer + path overlay.
+        // Blood Omen 2 / SN FILEIO opens GAME.ERG RDWR and writes short config lines
+        // (usebigfile / path keys); a pure success-size stub left re-reads seeing stock
+        // ISO bytes and blocked the PRECODE/CODE bigfile path after GOE bind.
+        int nWrite = (int)Math.Min(size, 0x100000u);
+        if (nWrite <= 0 || mem == null || buf == 0)
+            return Math.Max(0, nWrite);
+
+        int need = hf.Position + nWrite;
+        if (need > 4 * 1024 * 1024)
+            nWrite = Math.Max(0, 4 * 1024 * 1024 - hf.Position);
+        if (nWrite <= 0)
+            return 0;
+
+        if (hf.Data == null)
+            hf.Data = new byte[Math.Max(need, 256)];
+        else if (hf.Data.Length < need)
+        {
+            int grow = Math.Max(need, hf.Data.Length * 2);
+            if (grow > 4 * 1024 * 1024) grow = 4 * 1024 * 1024;
+            Array.Resize(ref hf.Data, grow);
+        }
+        for (int i = 0; i < nWrite; i++)
+            hf.Data[hf.Position + i] = mem.Read8(buf + (uint)i);
+        hf.Position += nWrite;
+        if (hf.Position > (int)hf.Size)
+            hf.Size = (uint)hf.Position;
+
+        // Snapshot overlay for close/re-open of the same path (normalize device prefix).
+        if (!string.IsNullOrEmpty(hf.Path) && hf.Data != null && hf.Size > 0)
+        {
+            int copyLen = (int)Math.Min(hf.Size, (uint)hf.Data.Length);
+            var snap = new byte[copyLen];
+            Buffer.BlockCopy(hf.Data, 0, snap, 0, copyLen);
+            _hostWriteOverlay[NormalizeOverlayKey(hf.Path)] = snap;
+        }
+        return nWrite;
+    }
+
+    private static string NormalizeOverlayKey(string path)
+    {
+        string p = path.Replace('/', '\\').Trim();
+        int semi = p.IndexOf(';');
+        if (semi > 0) p = p[..semi];
+        return p;
     }
 
     private static bool IsStdioPath(string path)
@@ -1389,10 +1457,43 @@ public sealed class IopModuleHost
             path = path["cdrom0:".Length..];
         if (path.StartsWith("cdrom:", StringComparison.OrdinalIgnoreCase))
             path = path["cdrom:".Length..];
+        // Strip host0:~/… / host:… so FindDiscEntryAny can basename-match disc IRX/IMG.
+        if (path.StartsWith("host0:", StringComparison.OrdinalIgnoreCase))
+            path = path["host0:".Length..];
+        else if (path.StartsWith("host:", StringComparison.OrdinalIgnoreCase))
+            path = path["host:".Length..];
+        // Drop home-prefix leftovers from SN ProView paths (host0:~/bin/FOO.IRX).
+        if (path.StartsWith("~/", StringComparison.Ordinal) || path.StartsWith("~\\", StringComparison.Ordinal))
+            path = path[2..];
         path = path.TrimStart('\\', '/');
         int semi = path.IndexOf(';');
         if (semi >= 0) path = path[..semi];
         return path.Replace('\\', '/').ToUpperInvariant();
+    }
+
+    /// <summary>
+    /// Map SN ProView-style <c>host0:~/bin/FOO</c> / <c>host:…</c> paths onto a mounted ISO
+    /// entry when one exists. Returns a <c>cdrom0:</c>-shaped path for the normal disc open
+    /// path. No-op when the disc has no matching file (caller keeps empty host stub).
+    /// </summary>
+    private bool TryMapHostPathToDisc(string path, out string mapped)
+    {
+        mapped = path;
+        if (_discVolume == null || string.IsNullOrEmpty(path)) return false;
+        if (!IsNonDiscDevicePath(path)) return false;
+        // Only remap host* — never mc/rom/hdd (those are real non-disc devices).
+        int colon = path.IndexOf(':');
+        if (colon <= 0) return false;
+        string dev = path[..colon].ToLowerInvariant();
+        while (dev.Length > 0 && char.IsDigit(dev[^1]))
+            dev = dev[..^1];
+        if (dev != "host") return false;
+
+        string norm = NormalizeDiscPath(path);
+        var entry = FindDiscEntry(norm) ?? FindDiscEntryAny(norm);
+        if (entry == null || entry.IsDirectory) return false;
+        mapped = "cdrom0:" + entry.Path.Replace('/', '\\');
+        return true;
     }
 
     /// <summary>
