@@ -30,6 +30,10 @@ public static class GameQuirkRegistry
         Register("SLUS_210.50", () => new Burnout3Assist());
         Register("SLUS_203.83", () => new VexxAssist());
         Register("SLUS_206.84", () => new WhiplashAssist());
+        // MK Midway family (DA/Deception/Armageddon): version-policy only — no SM plants.
+        Register("SLUS_204.23", () => new MidwayFamilyAssist("SLUS_204.23", "Mortal Kombat: Deadly Alliance (USA)"));
+        Register("SLUS_208.81", () => new MidwayFamilyAssist("SLUS_208.81", "Mortal Kombat: Deception (USA)"));
+        Register("SLUS_215.50", () => new MidwayFamilyAssist("SLUS_215.50", "Mortal Kombat: Armageddon (USA)"));
         // Register("SLUS_XXXXX", () => new MyNewTitleQuirks());
     }
 

@@ -158,6 +158,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
+        if (sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantIopRpVersion(sys);
     }
 

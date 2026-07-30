@@ -187,6 +187,19 @@ public sealed class RealSifRpc
     public ulong LoadFileOps { get; private set; }
 
     /// <summary>
+    /// When true, PADMAN GetModVer returns major=4 (0x0400) for MK:DA / XPADMAN gates.
+    /// Default false → major=3 (0x0300) which Shaolin Monks (SLUS_210.87) needs for a live
+    /// post-reboot spine (see PadRpcCmdGetModVer). Set from a title quirk if required.
+    /// </summary>
+    public bool PadModVerMajor4 { get; set; }
+
+    /// <summary>
+    /// When true, LOADFILE GetVersion returns the IOPRP/DNAS ASCII tag after reboot
+    /// (DA/BO2/B3 gates). Default false keeps classic 0x00020000 for Shaolin Monks spine.
+    /// </summary>
+    public bool PreferIopRpGetVersion { get; set; }
+
+    /// <summary>
     /// Last IOPRP/DNAS image version tag derived from <c>SifIopReset</c> arg
     /// (e.g. <c>"2430"</c> for <c>IOPRP243.IMG</c>). Empty until a RESET_CMD with an
     /// image name completes. Used by <c>LF_F_GET_VERSION</c> so SN ProDG / Midway
@@ -1134,8 +1147,8 @@ public sealed class RealSifRpc
                 // "2800"/…). Returning the bare LOADFILE 2.0 token 0x00020000 overwrites a
                 // previously correct LOADFILE GetVersion cell and makes sceOpen return
                 // 0xFFFEFFFC forever (live Deci2: "Failed overlay load: <cdrom0:\GAMER.OVL;1>").
-                // Prefer the same post-reboot ASCII tag LOADFILE uses.
-                if (!string.IsNullOrEmpty(_lastIopRpVersionAscii))
+                // Same PreferIopRpGetVersion gate as LOADFILE: SM needs classic 0x00020000.
+                if (PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii))
                     return PackAsciiVersion(_lastIopRpVersionAscii);
                 return 0x00020000;
             case FioClose:
@@ -1713,14 +1726,17 @@ public sealed class RealSifRpc
                 // against the expected IOPRP digit string ("2430"/"2340"/"2800") or "....".
                 // Real UDNL would surface the image version; without that handoff HLE used
                 // to return a bare LOADFILE 0x00020000 placeholder and the gate returned
-                // 0xFFFEFFFC forever (cdvdSectors stuck at 0). Prefer the post-reboot tag.
-                result = !string.IsNullOrEmpty(_lastIopRpVersionAscii)
+                // 0xFFFEFFFC forever (cdvdSectors stuck at 0) on those titles.
+                // Shaolin Monks (SLUS_210.87) A/B (2026-07-30): always-IOPRP-ASCII path
+                // changes post-reboot RPC cadence vs pre-merge spine. Prefer classic
+                // 0x00020000 unless <see cref="PreferIopRpGetVersion"/> is set (DA/BO2/B3).
+                result = PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii)
                     ? PackAsciiVersion(_lastIopRpVersionAscii)
-                    : 0x00020000; // pre-reboot / no image: keep classic LOADFILE 2.0 token
+                    : 0x00020000;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
                         $"[LOADFILE] GET_VERSION result=0x{unchecked((uint)result):X8} " +
-                        $"ioprp=\"{_lastIopRpVersionAscii}\"");
+                        $"ioprp=\"{_lastIopRpVersionAscii}\" preferIopRp={PreferIopRpGetVersion}");
                 break;
 
             default:
@@ -4742,11 +4758,15 @@ public sealed class RealSifRpc
                 break;
             case PadRpcCmdGetModVer:
                 // NEW/disc PADMAN (sid 0x80000100, cmd 0x12): major in high byte.
-                // Midway MK:DA / shared SN libpad gate (EE 0x115548) requires major==4
-                // (sra ver,8; beq 4) after LoadModule(PADMAN); 0x0300 failed that check
-                // and main returned 0 → Exit(0) at ~5.6M cycles. rom0-era 3.x is too old
-                // for disc MODULES/PADMAN.IRX clients; 0x0400 matches XPADMAN-class replies.
-                result = 0x0400;
+                // Title split (2026-07-30 A/B on SLUS_210.87 Shaolin Monks):
+                //   - major=4 (0x0400): MK:DA / some SN libpad gates (sra ver,8; beq 4).
+                //   - major=3 (0x0300): Shaolin Monks retail — 0x0400 drives open-bus thrash
+                //     at ~16.8M (PC 0x08002000 → main with SP=0x250 → syscall trampoline
+                //     walk 0x47FExx, gifP3 stuck at logo spine). Pre-merge menu6 spine used
+                //     0x0300 and reached gifP3=12 / pad band.
+                // Default 0x0300 (SM + broad retail). Set <see cref="PadModVerMajor4"/> for
+                // titles that hard-require XPADMAN major 4 (MK:DA).
+                result = PadModVerMajor4 ? 0x0400 : 0x0300;
                 WritePadResultAt(mem, argBuf, recvBuf, result, 0x0C);
                 break;
             case PadRpcCmdGetBtnMaskNew:

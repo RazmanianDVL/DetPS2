@@ -65,6 +65,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // ELF load happens after OnDiscMounted and rewrites .text — only plant RDRAM
         // stubs that live outside the PT_LOAD window here. Code patches must re-apply
         // in Step() once the boot ELF is resident (see ApplyPostElfPatches).
+        if (sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantSnExtensionStubs(sys);
         ForceSnScanSuccess(sys);
         PlantIopRpVersion(sys);
