@@ -89,6 +89,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _free2Escapes;
     private int _worldKickPulses;
     private int _padInjectPulses;
+    private int _objDispatchEscapes;
+    private int _listCmpEscapes;
     private ulong _lastWorldKickCyc;
     private bool _heapDefaultsPlanted;
 
@@ -151,6 +153,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _free2Escapes = 0;
         _worldKickPulses = 0;
         _padInjectPulses = 0;
+        _objDispatchEscapes = 0;
+        _listCmpEscapes = 0;
         _lastWorldKickCyc = 0;
         _heapDefaultsPlanted = false;
     }
@@ -274,38 +278,18 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= HeapFree2PcLo and <= HeapFree2PcHi)
             TryEscapeSecondaryFreelist(sys, pc, c);
 
-        // Permanent freelist leaf stubs after many escapes so boot cannot re-thrash
-        // 0x2396xx / 0x23A9xx forever with px=0 (live menu14 residual).
-        // Earlier plant once CDVD is live or escapes accumulate — menu17 still thrashing.
-        if (c >= 40_000_000 && sys.Gs.PixelsWritten == 0
-            && (_free2Escapes >= 4 || _heapNullEscapes >= 4 || sys.Cdvd.SectorsRead > 0))
+        // Wave-2: do NOT permanent-stub freelist / list-filter leaves after CDVD.
+        // menu14-style early jr-ra stubs returned v0=0 forever, left a1=0x401Axxxx
+        // corrupt object graphs, and dumped EE into exception-vector thrash (0x80000180
+        // + 0x2847xx list-cmp + 0x233AEx dispatch) — regressing vs soft-escape final3
+        // (PC=0x26C0E0, syscalls~436k, sifBytes~43k). Soft escapes below remain.
+        //
+        // Keep ONLY structural body-breaks that empty-exit known infinite walks:
+        // flag-set follow (0x15F560), parent-list entry after repeated escapes, cache-wb.
+        if (c >= 40_000_000 && sys.Gs.PixelsWritten == 0)
         {
-            if (sys.Memory.Read32(HeapFree2PcLo) != 0x03E00008u)
-            {
-                sys.Memory.Write32(HeapFree2PcLo, 0x03E00008u); // jr ra
-                sys.Memory.Write32(HeapFree2PcLo + 4, 0x0000102Du); // v0=0
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant freelist2 stub @ 0x{HeapFree2PcLo:X8} cyc={c}");
-            }
-            if (sys.Memory.Read32(HeapNullPcLo) != 0x03E00008u)
-            {
-                sys.Memory.Write32(HeapNullPcLo, 0x03E00008u);
-                sys.Memory.Write32(HeapNullPcLo + 4, 0x0000102Du);
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant freelist-null stub @ 0x{HeapNullPcLo:X8} cyc={c}");
-            }
-            // Also stub list-filter walk head when empty/corrupt forever (live 0x15F2C8).
-            if (sys.Cdvd.SectorsRead > 0 && sys.Memory.Read32(0x0015F2C0) != 0x03E00008u
-                && _listWalkEscapes >= 6)
-            {
-                sys.Memory.Write32(0x0015F2C0, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x0015F2C4, 0x0000102Du); // v0=0
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant list-walk stub @ 0x15F2C0 cyc={c}");
-            }
-            // Flag-set sibling at 0x15F538 (live menu19 residual 0x15F560).
-            // Entry stub alone is not enough mid-body thrash (50k-cycle slices) — also
-            // plant an unconditional branch out of the follow-next body.
+            // Flag-set sibling at 0x15F538 (wave-1 residual 0x15F560).
+            // Body break only — soft escape plants this too; permanent so re-entry dies in 1 insn.
             if (_flagSetEscapes >= 1)
             {
                 if (sys.Memory.Read32(0x0015F538) != 0x03E00008u)
@@ -315,7 +299,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                         Console.Error.WriteLine($"[GOW] plant flag-set list stub @ 0x15F538 cyc={c}");
                 }
-                // beq zero,zero,0x15F590  (unconditional) at follow body so re-entry dies in 1 insn
+                // beq zero,zero,0x15F590  (unconditional) at follow body
                 uint followPatch = 0x10000000u | (((0x0015F590u - 0x0015F560u - 4u) >> 2) & 0xFFFFu);
                 if (sys.Memory.Read32(0x0015F560) != followPatch)
                 {
@@ -325,22 +309,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                         Console.Error.WriteLine($"[GOW] plant flag-set body break @ 0x15F560 cyc={c}");
                 }
             }
-            // Parent object-list walker entry (0x15F440) — empty after flag-set residual.
-            if (_parentListEscapes >= 2 && sys.Memory.Read32(0x0015F440) != 0x03E00008u)
+            // Parent object-list walker entry — only after soft escapes proved corrupt.
+            if (_parentListEscapes >= 4 && sys.Memory.Read32(0x0015F440) != 0x03E00008u)
             {
                 sys.Memory.Write32(0x0015F440, 0x03E00008u); // jr ra
                 sys.Memory.Write32(0x0015F444, 0x0000102Du); // v0=0
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                     Console.Error.WriteLine($"[GOW] plant parent-list stub @ 0x15F440 cyc={c}");
-            }
-            // Tag-list walk permanent empty exit.
-            if (sys.Cdvd.SectorsRead > 0 && sys.Memory.Read32(0x00170BB0) != 0x03E00008u
-                && _worldKickPulses >= 8)
-            {
-                sys.Memory.Write32(0x00170BB0, 0x03E00008u);
-                sys.Memory.Write32(0x00170BB4, 0x0000102Du);
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant tag-list stub @ 0x170BB0 cyc={c}");
             }
         }
 
@@ -363,22 +338,91 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= 0x0015F440 and <= 0x0015F514)
             TryEscapeParentObjectList(sys, pc, c);
 
-        // Software delay + flag poll at 0x17A328..0x17A35C (live PC 0x17A334):
-        //   do { v0 = 20000; while (--v0); } while (*0x29C7D0 == 1);
-        // Flag stuck at 1 → forever. Clear AND snap past the outer beq restart.
-        if (c >= 40_000_000 && pc is >= 0x0017A320 and <= 0x0017A360)
+        // Software delay + flag poll — two sibling sites share *0x29C7D0:
+        //   0x17A328..0x17A35C (live PC 0x17A334)
+        //   0x183880..0x1838C8 (wave-2 profiler #1: countdown 20000 while flag==1)
+        // Flag stuck at 1 → forever. Clear AND snap to jr-ra / post-loop.
+        if (c >= 38_000_000
+            && (pc is >= 0x0017A320 and <= 0x0017A360
+                || pc is >= 0x00183880 and <= 0x001838C8))
         {
             uint fl = sys.Memory.Read32(0x0029C7D0);
-            if (fl == 1)
+            if (fl == 1 || fl != 0)
                 sys.Memory.Write32(0x0029C7D0, 0);
-            // Snap countdown to 0 and jump to post-loop (0x17A350 loads next state).
-            // Outer loop at 0x17A358 only restarts when flag==1 — with flag 0 we fall through.
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
-            if (pc < 0x0017A350)
+            sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0 }); // v1 != 1 so outer exits
+            if (pc is >= 0x00183880 and <= 0x001838C8)
+            {
+                // 0x1838C8 is jr ra — only take it when $ra is real code.
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                    && ra is not (>= 0x00183880 and <= 0x001838D0))
+                    sys.EE.PC = 0x001838C8; // jr ra
+                else
+                    sys.EE.PC = PickSafeResume(sys, 0x0026C0EC);
+                sys.EE.COP0_Status &= ~0x6u;
+            }
+            else if (pc < 0x0017A350)
+            {
                 sys.EE.PC = 0x0017A350;
+            }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (c % 10_000_000) < 50_000)
-                Console.Error.WriteLine($"[GOW] exit spin @0x17A3xx flag was {fl} cyc={c}");
+                Console.Error.WriteLine($"[GOW] exit spin @0x{pc:X8} flag was {fl} cyc={c}");
+        }
+
+        // Permanent list-filter stub only (NOT freelist — freelist stubs caused exception
+        // storms). Soft escapes miss 50k-cycle slices so 0x15F2C8 re-thrash burns millions.
+        // Also patch mid-body (0x15F2C8) → branch to empty epilogue so in-flight thrash dies.
+        if (c >= 40_000_000 && sys.Gs.PixelsWritten == 0
+            && _listWalkEscapes >= 8 && sys.Cdvd.SectorsRead > 0)
+        {
+            if (sys.Memory.Read32(0x0015F2C0) != 0x03E00008u)
+            {
+                sys.Memory.Write32(0x0015F2C0, 0x03E00008u); // jr ra
+                sys.Memory.Write32(0x0015F2C4, 0x0000102Du); // v0=0
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine($"[GOW] plant list-walk stub @ 0x15F2C0 cyc={c}");
+            }
+            // beq zero,zero,0x15F414 at follow body
+            uint bodyPatch = 0x10000000u | (((0x0015F414u - 0x0015F2C8u - 4u) >> 2) & 0xFFFFu);
+            if (sys.Memory.Read32(0x0015F2C8) != bodyPatch)
+            {
+                sys.Memory.Write32(0x0015F2C8, bodyPatch);
+                sys.Memory.Write32(0x0015F2CC, 0x00000000u);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine($"[GOW] plant list-walk body break @ 0x15F2C8 cyc={c}");
+            }
+        }
+
+        // Object-block init at 0x15F6F0..0x15F9xx (live w2 PC 0x15F7C4 / residual 0x15F928):
+        // fill loops then jal 0x13DC78 (real 8KiB alloc — never stub). When s0 is null/OOB
+        // (poison freelist), writing open-bus forever. HARD return via $ra / PickSafeResume
+        // — never snap to mid-body 0x15F71C (self-kick thrash).
+        if (c >= 40_000_000 && pc is >= 0x0015F6F0 and <= 0x0015FA80)
+        {
+            uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+            if (IsBadCursor(s0) || (s0 & 0x1FFFFFFFu) >= (uint)SystemMemory.RDRAM_SIZE - 0x800)
+            {
+                // Always leave the entire 0x15Fxxx object/list band — $ra often points at
+                // the next insn inside the same poison function (live: 0x15F908).
+                uint resume = PickSafeResume(sys, 0x00185FAC);
+                const uint synth = 0x01FD7E00;
+                for (uint o = 0; o < 0x40; o += 4)
+                    sys.Memory.Write32(synth + o, 0);
+                sys.Memory.Write32(synth, synth);
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = synth }); // s0
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                {
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 0UL
+                });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (c % 5_000_000) < 50_000)
+                    Console.Error.WriteLine(
+                        $"[GOW] escape OOB object-init pc=0x{pc:X8} s0=0x{s0:X8} -> 0x{resume:X8} cyc={c}");
+            }
         }
 
         // Cache writeback loop at 0x2944F8..0x29457C (live final 0x29457C): a2+=64 until
@@ -412,6 +456,51 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
+        // Pathological heap align loop inside real alloc (0x13DC78 band — NEVER empty-exit
+        // the whole allocator). Live w2: divu/mfhi at 0x13DEE8 with s0=0x310380 (address
+        // mistaken for alignment) → remainder never 0 → forever. Return null block via $ra.
+        if (c >= 38_000_000 && pc is >= 0x0013DED0 and <= 0x0013DEF8)
+        {
+            uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+            uint a3 = (uint)sys.EE.GetGpr(7).Lo;
+            // Alignment must be small power-of-two. Address-sized or non-PoT → poison.
+            bool badAlign = s0 == 0 || s0 > 0x1000u || (s0 & (s0 - 1u)) != 0;
+            bool spunOut = a3 > 0x8000u || a3 > 0xFFFF0000u; // wrapped / huge trip count
+            if (badAlign || spunOut)
+            {
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint resume = ra;
+                if (!sys.Memory.IsLikelyEeCode(resume) || resume is < 0x00100000 or >= 0x00280000
+                    || resume is (>= 0x0013DC00 and <= 0x0013E200)
+                    || resume is (>= 0x0015F2C0 and <= 0x0015FB00))
+                    resume = PickSafeResume(sys, 0x0027CC08);
+                // Return a small in-RDRAM block instead of NULL — callers often store without
+                // null-check and then OOB-fault (live object-init s0=0).
+                const uint block = 0x01FD7C00;
+                for (uint o = 0; o < 0x100; o += 4)
+                    sys.Memory.Write32(block + o, 0);
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block }); // v0
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (c % 5_000_000) < 50_000)
+                    Console.Error.WriteLine(
+                        $"[GOW] escape heap-align loop pc=0x{pc:X8} s0=0x{s0:X8} a3=0x{a3:X8} " +
+                        $"-> 0x{resume:X8} block=0x{block:X8} cyc={c}");
+            }
+        }
+
+        // Wave-2 live residual: object virtual dispatch at 0x233AEx with a1=0x401Axxxx
+        // or s0 OOB → jalr garbage → exception vector thrash. Soft escape from 38M —
+        // w3c gated-after-CDVD left EE in silent non-syscall spin (syscalls~20k, main
+        // dormant); w3b with early escape unstuck WaitSema(3) and lifted calls 44→70.
+        if (c >= 38_000_000 && pc is >= 0x00233AD0 and <= 0x00233B34)
+            TryEscapeObjectDispatch(sys, pc, c);
+
+        // Sibling list-compare walk at 0x2847xx (profiler hot after stubs).
+        if (c >= 38_000_000 && pc is >= 0x00284780 and <= 0x002848B0)
+            TryEscapeListCompareWalk(sys, pc, c);
+
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
         // re-escape empty/corrupt list walks, wake peers, and inject pad so world/UI path
         // can reach a GS frame.
@@ -421,6 +510,151 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Pre-CDVD freelist thrash at 0x23A9xx / 0x13DCxx: keep escaping so first CDVD lands.
         if (c >= 35_000_000 && sys.Cdvd.SectorsRead == 0 && pc is >= 0x0023A900 and <= 0x0023AA30)
             TryEscapeNullHeapWalk(sys, pc, c);
+    }
+
+    /// <summary>
+    /// True when a pointer is unusable as an EE list/object cursor (null, unaligned, or
+    /// physical address outside RDRAM). Accepts uncached aliases (bit 30 / KSEG) via mask.
+    /// </summary>
+    private static bool IsBadCursor(uint ptr)
+    {
+        if (ptr == 0) return true;
+        uint phys = ptr & 0x1FFFFFFFu;
+        if ((phys & 3u) != 0) return true;
+        if (phys < 0x00100000u) return true;
+        if (phys >= (uint)SystemMemory.RDRAM_SIZE) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Object method dispatch (disasm 0x233AD0..0x233B40): loads flags from <c>a1</c>,
+    /// then <c>jalr</c> through vtable on <c>s0</c>. Live w2: a1=0x401A67F8 with bad
+    /// payload → Ade / bad jalr → 0x80000180 thrash; KSEG rescue re-homed to mid-body.
+    /// Snap to restore epilogue (lq s0 / ld ra / jr ra at 0x233B38).
+    /// </summary>
+    private void TryEscapeObjectDispatch(Ps2System sys, uint pc, ulong c)
+    {
+        // Already in epilogue — leave alone.
+        if (pc is >= 0x00233B38 and <= 0x00233B44)
+            return;
+
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+        bool bad = IsBadCursor(a1) || IsBadCursor(s0);
+        if (!bad)
+        {
+            // In-range but next/vtable likely poison after empty heap — force after re-hits.
+            if (_objDispatchEscapes == 0 && (_worldKickPulses % 8) != 0)
+                return;
+            // Probe vtable slot: *( *(s0+0x20) + 0x44 ) used as jalr target.
+            uint physS0 = s0 & 0x1FFFFFFFu;
+            uint obj = sys.Memory.Read32(physS0 + 0x20);
+            if (!IsBadCursor(obj))
+            {
+                uint fn = sys.Memory.Read32((obj & 0x1FFFFFFFu) + 0x44);
+                if (sys.Memory.IsLikelyEeCode(fn) && _objDispatchEscapes < 2)
+                    return; // healthy dispatch once
+            }
+            bad = true;
+        }
+
+        if (!bad) return;
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a1
+        // Prefer live $ra when it is real code outside this leaf; else epilogue.
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0x00233B38;
+        if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+            && ra is not (>= 0x00233AD0 and <= 0x00233B44))
+            resume = ra;
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _objDispatchEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _objDispatchEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[GOW] escape object dispatch pc=0x{pc:X8} a1=0x{a1:X8} s0=0x{s0:X8} " +
+                $"-> 0x{resume:X8} n={_objDispatchEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Sorted list compare / merge walk at 0x2847xx (live profiler #2 after exception
+    /// vector). Advances <c>a1</c>/<c>t0</c> via <c>lw *,4(*)</c> until equal. When either
+    /// cursor is null/OOB the loop never hits the done branch at 0x2848AC.
+    /// </summary>
+    private void TryEscapeListCompareWalk(Ps2System sys, uint pc, ulong c)
+    {
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint t0 = (uint)sys.EE.GetGpr(8).Lo;
+        bool bad = IsBadCursor(a1) || (t0 != 0 && IsBadCursor(t0));
+        // Even with "valid" phys (0x401Axxxx → 0x001Axxxx), empty/corrupt rings re-enter.
+        if (!bad && pc is >= 0x002847D0 and <= 0x00284820
+            && (_listCmpEscapes > 0 || (_worldKickPulses % 4) == 0))
+            bad = true;
+        if (!bad) return;
+
+        // Force done: t0 = a1 so beq t0,a1,0x2848AC would take; snap there or $ra.
+        sys.EE.SetGpr(8, new EmotionEngine.Gpr128 { Lo = a1 == 0 ? 0 : a1 }); // t0
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0x002848AC;
+        if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+            && ra is not (>= 0x00284780 and <= 0x00284900))
+            resume = ra;
+        else if (!sys.Memory.IsLikelyEeCode(0x002848ACUL))
+            resume = 0x00185FAC; // last resort post-FreezeCache
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _listCmpEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _listCmpEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[GOW] escape list-cmp walk pc=0x{pc:X8} a1=0x{a1:X8} t0=0x{t0:X8} " +
+                $"-> 0x{resume:X8} n={_listCmpEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Pick a safe resume PC after exception/KSEG thrash. Never re-enter known death
+    /// mid-bodies (0x233AEx dispatch, 0x2847xx list-cmp, exception vector, CRT0).
+    /// </summary>
+    private static uint PickSafeResume(Ps2System sys, uint preferred)
+    {
+        static bool IsDeathBand(uint p) =>
+            p is (>= 0x80000000 and <= 0x80020000)
+            or (< 0x00100000)
+            or (>= 0x00233AD0 and <= 0x00233B34)
+            or (>= 0x00284780 and <= 0x002848A8)
+            or (>= 0x002A0000 and <= 0x002B0000)
+            or (>= 0x0021FF00 and <= 0x00220600)
+            or (>= 0x0015F2C0 and <= 0x0015FB00)  // list / object-init thrash
+            or (>= 0x0013DED0 and <= 0x0013DEF8)  // heap-align spin
+            or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
+            or (>= 0x00183880 and <= 0x001838D0)
+            or (>= 0x00300000 and <= 0x00400000)  // post-ELF data / heap (live w3d 0x396xxx)
+            || p == 0x00100008u;
+
+        uint cand = preferred;
+        if (!IsDeathBand(cand) && sys.Memory.IsLikelyEeCode(cand))
+            return cand;
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        if (!IsDeathBand(ra) && sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000)
+            return ra;
+
+        uint lg = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
+        if (!IsDeathBand(lg) && sys.Memory.IsLikelyEeCode(lg) && lg is >= 0x00100000 and < 0x00280000)
+            return lg;
+
+        // Prefer stream poll entry (0x26C0E0) after CDVD — post-FreezeCache re-entry without
+        // full s1/s2 frame re-faults. Worker dispatch 0x27CC08 is a solid alternate.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Memory.IsLikelyEeCode(0x0026C0E0UL))
+            return 0x0026C0E0;
+        if (sys.Memory.IsLikelyEeCode(0x0027CC08UL))
+            return 0x0027CC08;
+        if (sys.Memory.IsLikelyEeCode(0x00185FACUL))
+            return 0x00185FAC;
+        return 0x00185FAC;
     }
 
     /// <summary>
@@ -493,6 +727,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeFlagSetListWalk(sys, pc, c);
         if (pc is >= 0x0015F440 and <= 0x0015F514)
             TryEscapeParentObjectList(sys, pc, c);
+        if (pc is >= 0x00233AD0 and <= 0x00233B34)
+            TryEscapeObjectDispatch(sys, pc, c);
+        if (pc is >= 0x00284780 and <= 0x002848B0)
+            TryEscapeListCompareWalk(sys, pc, c);
 
         // Live final PC band 0x170BBx — list tag walk (sb flags @ node+0x18). With empty/
         // corrupt a1 (often zeroed then movn'd) the loop at 0x170BB0..BF8 never hits the
@@ -640,17 +878,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
 
         // Exception-vector rescue: bad freelist/list snaps can land on 0x80000180.
-        // Re-home to last good EE PC or a safe post-heap continue when EXL sticky.
+        // Never re-home to 0x233AEx / 0x2847xx mid-body (wave-2 death loop).
         if (pc is >= 0x80000180 and <= 0x80000200 || pc < 0x00100000)
         {
-            uint resume = 0;
-            if (sys.LastGoodEePc is >= 0x00100000 and < 0x00300000)
-                resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-            if (resume == 0)
-                resume = 0x00185FAC; // post-FreezeCache continue
+            uint resume = PickSafeResume(sys, (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL));
+            sys.Memory.Write32(0x002A1338, 0); // stream ready
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a1
             sys.EE.COP0_Status &= ~0x6u;
             sys.EE.PC = resume;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _worldKickPulses <= 16)
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_worldKickPulses <= 16 || _worldKickPulses % 32 == 0))
                 Console.Error.WriteLine(
                     $"[GOW] rescue exception vector -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
@@ -676,14 +914,18 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 }
                 if (t.Sleeping && t.WaitSemaId != 0)
                 {
-                    // After CDVD, residual WaitSema(3) SIF-cmd poll (live final8 0x293C64)
-                    // parks forever with px=0. Pulse low ids sparingly so RPC can complete
-                    // without the global SEMA_STALL_YIELD hammer.
-                    bool lowSif = t.WaitSemaId > 0 && t.WaitSemaId <= 8
+                    // Wave-3: SHARED QueueMaySignalSema + CompleteRpcEnd + AcknowledgeEeSifCmdReady
+                    // own real BIND/CALL and SIFCMD acks. Residual only:
+                    //   • WaitSema(3) SIF-cmd poll (worker 0x27CCxx) when no more SIF traffic
+                    //   • high ids ≥32 (game-private, no HLE producer — B3 class)
+                    // Never blanket-pulse 1..16 (races RPC_END). SEMA_STALL_YIELD OFF.
+                    bool sifCmdPoll = t.WaitSemaId == 3
                         && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
                         && (_worldKickPulses % 4) == 0;
-                    bool high = t.WaitSemaId >= 32;
-                    if (high || lowSif)
+                    bool high = t.WaitSemaId >= 32
+                        && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+                        && (_worldKickPulses % 2) == 0;
+                    if (high || sifCmdPoll)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
                     }
@@ -696,19 +938,25 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
-        // BIOS / KSEG0 thrash (live 0x800098xx) after freelist stubs — re-home.
-        if (pc is >= 0x80000000 and <= 0x80020000 || pc < 0x00100000)
+        // BIOS / KSEG0 thrash (live 0x800098xx), uncached alias (0x40xxxxxx), or data PC
+        // (0x396xxx) — re-home safely. Never re-enter 0x233AEx / 0x2847xx mid-body.
+        uint pcPhys = pc & 0x1FFFFFFFu;
+        if (pc is >= 0x80000000 and <= 0x80020000 || pc < 0x00100000
+            || pcPhys >= (uint)SystemMemory.RDRAM_SIZE
+            || pc is >= 0x00300000 and < 0x00400000
+            || (pc & 0xE0000000u) == 0x40000000u // uncached EE phys (live w3e 0x40289328)
+            || !sys.Memory.IsLikelyEeCode(pcPhys) && pcPhys is >= 0x00300000)
         {
-            uint resume = 0;
-            if (sys.LastGoodEePc is >= 0x00100000 and < 0x00280000)
-                resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-            if (resume == 0) resume = 0x00185FAC;
+            uint resume = PickSafeResume(sys, (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL));
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.COP0_Status &= ~0x6u;
             sys.EE.PC = resume;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
-                    $"[GOW] rescue KSEG thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+                    $"[GOW] rescue KSEG/data thrash pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
         // Live final band 0x182A08 after stubs — force stream-ready + pad so world can draw.
@@ -777,10 +1025,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"[GOW] re-home residual pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
-        // Dormant main after list escapes (live agent4: started=False). Main only —
+        // Dormant main after list escapes (live w2: started=False). Main only —
         // peer re-start historically left garbage WaitSemaIds (menu17).
+        // Gate on CDVD alone — flag-set may never fire once list stub is planted.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
-            && _flagSetEscapes >= 1 && (_worldKickPulses % 16) == 0)
+            && (_worldKickPulses % 8) == 0)
         {
             var kk = sys.Hle?.Kernel;
             if (kk != null)
@@ -802,26 +1051,96 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
-        // Live menu16: thrash at 0x21FFxx / 0x2200xx nop-sled (BIOS rescuer re-homes nearby).
-        // Force a known post-heap continue once CDVD is live and px still 0.
-        if (pc is (>= 0x0021FF00 and <= 0x00220600) && sys.Cdvd.SectorsRead > 0
-            && sys.Gs.PixelsWritten == 0 && (_worldKickPulses % 4) == 0)
+        // $ra==0 after stack poison (live w2 residual at 0x17A7A0 jr ra): force safe resume
+        // so delay-slot thrash cannot fall into zero-page forever.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && (_worldKickPulses % 4) == 0)
         {
-            uint resume = 0x00185FAC; // post-FreezeCache
-            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00200000
-                && ra is not (>= 0x0021FF00 and <= 0x00220600))
-                resume = ra;
-            else if (sys.LastGoodEePc is >= 0x00100000 and < 0x00200000)
-                resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            uint ra0 = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (ra0 == 0 || !sys.Memory.IsLikelyEeCode(ra0))
+            {
+                // Only act if current PC is an epilogue / jr band that needs $ra.
+                bool needsRa = pc is (>= 0x0017A790 and <= 0x0017A7A4)
+                    or (>= 0x001838C8 and <= 0x001838CC)
+                    || sys.Memory.Read32(pc) == 0x03E00008u;
+                if (needsRa)
+                {
+                    uint resume = PickSafeResume(sys, 0x0026C0EC);
+                    sys.Memory.Write32(0x002A1338, 0);
+                    sys.Memory.Write32(0x0029C7D0, 0);
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume }); // repair $ra
+                    sys.EE.PC = resume;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_worldKickPulses % 16) == 0)
+                        Console.Error.WriteLine(
+                            $"[GOW] repair null $ra pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+                }
+            }
+        }
+
+        // Live menu16/w2: thrash at 0x21FFxx / 0x2200xx nop-sled (final PC 0x2200F0).
+        // Always re-home via PickSafeResume — never leave EE in this band.
+        if (pc is (>= 0x0021FF00 and <= 0x00220600) && sys.Cdvd.SectorsRead > 0
+            && sys.Gs.PixelsWritten == 0)
+        {
+            uint resume = PickSafeResume(sys, 0x0026C0EC);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL });
             sys.EE.PC = resume;
             sys.EE.COP0_Status &= ~0x6u;
             sys.Memory.Write32(0x002A1338, 0);
+            sys.Memory.Write32(0x0029C7D0, 0);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
                     $"[GOW] escape 0x21FFxx thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+        }
+
+        // Wave-3: after CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (live w3
+        // PC=0x293C48, multi-M 0x44/0x42, RPC plateau 44, sifBytes~10k). SHARED
+        // QueueMaySignalSema + AcknowledgeEeSifCmdReady already complete real RPCs;
+        // empty SIF-cmd poll still re-WaitSema forever. Prefer stream-ready POLL entry
+        // 0x26C0E0 (historical peak) — mid-body 0x26C0EC without a frame nop-sleds
+        // (live w3b: 0x26C288 → BIOS rescue). Also catch residual 0x2993xx / 0x289Axx.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && _worldKickPulses >= 8 && (_worldKickPulses % 4) == 0
+            && (pc is >= 0x00293C00 and <= 0x00293C80
+                || pc is >= 0x00299300 and <= 0x00299400
+                || pc is >= 0x00289A00 and <= 0x00289B00
+                || pc is >= 0x0026BF80 and <= 0x0026C300 && pc is not (>= 0x0026C0E0 and <= 0x0026C130)))
+        {
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.Memory.Write32(0x0029C7D0, 0);
+            // Plant stream-work object so poll→body can jal work path.
+            const uint synthObj = 0x01FD7F00;
+            sys.Memory.Write32(0x002A1378, 0);
+            sys.Memory.Write32(0x002A1358, synthObj);
+            sys.Memory.Write32(synthObj, synthObj + 16);
+            sys.Memory.Write32(synthObj + 16, 1);
+            sys.Memory.Write32(0x002A137C, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x0026C0E0; // poll entry — force-ready block advances to 0x26C0EC
+            sys.EE.COP0_Status &= ~0x6u;
+            // Wake worker WaitSema(3) / high waiters so peers can run alongside main.
+            if (k != null)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping) continue;
+                    if (t.WaitSemaId == 3 || t.WaitSemaId >= 32)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    else if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        k.WakeupThread(t.Id);
+                }
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_worldKickPulses % 16) == 0)
+                Console.Error.WriteLine(
+                    $"[GOW] leave sifrpc/stream residual pc=0x{pc:X8} -> 0x26C0E0 " +
+                    $"n={_worldKickPulses} cyc={c}");
         }
 
         if (_padInjectPulses < 8192)

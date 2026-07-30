@@ -664,6 +664,7 @@ public sealed class RealSifRpc
             && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx && sid != SidSdReg
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
+            && sid != SidMsl
             && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
@@ -1056,6 +1057,22 @@ public sealed class RealSifRpc
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
                     $"[RPC] HandleCall sid=MWFILE(0x{sid:X8}) fno=0x{rpcNumber:X} result={mr} " +
+                    $"recvBuf=0x{recvBuf:X8} send={sendSize} arg=0x{argBuf:X8}");
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return;
+        }
+
+        // Midway MSL.IRX (DA: bind 0x00012345 after MSL.IRX load; init fno=0xDADA).
+        // Soft-success so EE leaves bind/init; full stream/bank protocol still incomplete.
+        // Mount MKDA.PAK TOC on first touch so later FILEIO artps2 member opens resolve.
+        if (sid == SidMsl)
+        {
+            int ms = HandleMsl(mem, iopModules, cdvd, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
+            if (recvBuf != 0 && recvSize >= 4 && mem.Read32(recvBuf) == 0)
+                mem.Write32(recvBuf, unchecked((uint)ms));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] HandleCall sid=MSL(0x{sid:X8}) fno=0x{rpcNumber:X} result={ms} " +
                     $"recvBuf=0x{recvBuf:X8} send={sendSize} arg=0x{argBuf:X8}");
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
@@ -2368,6 +2385,9 @@ public sealed class RealSifRpc
             case SidMwFileAux:
                 return HandleMwFile(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
 
+            case SidMsl:
+                return HandleMsl(mem, iopModules, cdvd, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
+
             default:
                 if (IsBurnout3GtfsSid(sid))
                     return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
@@ -2911,6 +2931,13 @@ public sealed class RealSifRpc
     public const uint Sid989Snd = 0x00123456;
     /// <summary>989snd secondary / stream RPC.</summary>
     public const uint Sid989Snd2 = 0x00123457;
+    /// <summary>
+    /// Midway MSL.IRX (Modular Sound Library) — DA live bind after LIBSD/SDRDRV/MSL load
+    /// (sid=<c>0x00012345</c>, init fno=<c>0xDADA</c>). Distinct from 989snd 0x00123456.
+    /// Disc: MODULES/MSL.IRX "MSL IOP driver version 1.7.4". Shared DA (and family titles
+    /// that ship MSL rather than 989snd).
+    /// </summary>
+    public const uint SidMsl = 0x00012345;
 
     // Crystal Dynamics / SN "GOE_FSRV" IOPFILE.IRX services (Blood Omen 2 + Whiplash).
     // Disc module registers low SIDs — BO2 live bind order 0x30, 0x20, 0x21, 0x29
@@ -2989,6 +3016,42 @@ public sealed class RealSifRpc
     /// <summary>Live MWFILE handles: synthetic id → FILEIO fd.</summary>
     private readonly Dictionary<int, int> _mwFileHandles = new();
     private int _mwFileNextHandle = 1;
+
+    // MSL init fno observed on Deadly Alliance after MSL.IRX load (live 2026-07-30).
+    private const uint MslFnoInit = 0xDADA;
+
+    /// <summary>
+    /// Midway MSL.IRX HLE (sid <see cref="SidMsl"/>). Soft-success for bind/init so DA
+    /// leaves the LIBSD→SDRDRV→MSL chain. Eagerly mounts MKDA.PAK (127 artps2 members) so
+    /// subsequent FILEIO opens of <c>\ps2dvd\artps2\*.ssf</c> resolve without waiting for
+    /// the EE archive stream path. Full bank/stream RPC still returns 0 (success).
+    /// </summary>
+    private int HandleMsl(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+    {
+        // First MSL touch → ensure shared art archive TOC is ready (DA artps2 / Dec art).
+        // EnsureMkdaPakMounted is idempotent (_mkdaPakMounted gate).
+        EnsureMkdaPakMounted(iopModules, cdvd);
+
+        if (fno == MslFnoInit)
+        {
+            // Init: zero result = OK (matches other Midway services). Optionally paint a
+            // short version-shaped payload when recv is larger than one word.
+            if (recvBuf != 0)
+            {
+                uint lim = recvSize != 0 ? recvSize : 4u;
+                if (lim >= 4) mem.Write32(recvBuf, 0);
+                // "1.7.4" style nibble packing for clients that strcmp a short token.
+                if (lim >= 8) mem.Write32(recvBuf + 4, 0x00010704u);
+            }
+            return 0;
+        }
+
+        // Remaining MSL fnos (bank load / play / stream): soft-OK until per-fno ground truth.
+        if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+            mem.Write32(recvBuf, 0);
+        return 0;
+    }
     private bool _mwFileInited;
 
     /// <summary>
@@ -3754,7 +3817,10 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Touch real PRECODE.BG2 + CODE.BG2 on disc (Blood Omen 2 usebigfile path) so path
-    /// resolution and cdvd telemetry prove the goefile payloads are reachable before title.
+    /// resolution proves goefile payloads are reachable before title.
+    /// Does <b>not</b> credit <see cref="Cdvd.SectorsRead"/> — host warm ≠ game load.
+    /// Inflating cdvd via warm (≈+1130 sectors) tripped title assists (WaitSema leave /
+    /// menu-kick at cdvd≥1600) before GOE bind sid=0x29 and ENGLISH.DIR / PRECODE Open.
     /// </summary>
     private void WarmBo2CodeBg2(IopModuleHost iopModules, Cdvd cdvd)
     {
@@ -3762,12 +3828,14 @@ public sealed class RealSifRpc
         _bo2CodeBg2Warmed = true;
         foreach (string name in new[] { "PRECODE.BG2", "CODE.BG2", @"RESOURCES\LEVELS\UI\MAINMENU.BG2" })
         {
-            int fd = TryOpenBo2RealBg2(iopModules, cdvd, @"cdrom0:\GOGAMES\BO2\" + name);
+            // countSectors: false — probe open only; game Open will credit real sectors.
+            int fd = TryOpenBo2RealBg2(iopModules, cdvd, @"cdrom0:\GOGAMES\BO2\" + name,
+                countSectors: false);
             if (fd >= 0)
             {
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                     && iopModules.TryGetOpenFileSize(fd, out uint sz))
-                    Console.Error.WriteLine($"[BO2] warm {name} size={sz}");
+                    Console.Error.WriteLine($"[BO2] warm {name} size={sz} (no sector credit)");
                 iopModules.FileClose(fd);
             }
         }
@@ -4297,7 +4365,12 @@ public sealed class RealSifRpc
     /// Open real PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2 (and other level .BG2) from the ISO,
     /// including ISO 9660 Level-1 short-name aliases (RESOURCES→RESOUR~1, etc.).
     /// </summary>
-    private int TryOpenBo2RealBg2(IopModuleHost iopModules, Cdvd cdvd, string path)
+    /// <param name="countSectors">
+    /// When false (host warm probe only), skip <see cref="Cdvd.NoteHostReadSectors"/> so
+    /// telemetry and title assists reflect game-initiated I/O only.
+    /// </param>
+    private int TryOpenBo2RealBg2(IopModuleHost iopModules, Cdvd cdvd, string path,
+        bool countSectors = true)
     {
         if (string.IsNullOrEmpty(path)) return -1;
         string p = path.Replace('/', '\\');
@@ -4349,7 +4422,10 @@ public sealed class RealSifRpc
         {
             int fd = iopModules.FileOpen(c, 1);
             if (fd < 0) continue;
-            if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+            // Only credit sectors for game-initiated opens (default). Host warm probes must
+            // not inflate cdvdSectors or title assists fire before GOE sid=0x29 / asset Open.
+            if (countSectors
+                && iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
             {
                 int sectors = fsz <= 16u * 1024 * 1024
                     ? (int)((fsz + 2047) / 2048)
@@ -4357,7 +4433,8 @@ public sealed class RealSifRpc
                 cdvd.NoteHostReadSectors(sectors);
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                Console.Error.WriteLine($"[BO2] real BG2 open path=\"{c}\" fd={fd}");
+                Console.Error.WriteLine(
+                    $"[BO2] real BG2 open path=\"{c}\" fd={fd} countSectors={countSectors}");
             return fd;
         }
         return -1;

@@ -32,11 +32,27 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint HeapWalkExit = 0x003BA990;
     private const uint HeapWalkRet0 = 0x003BA900; // v0=0; restore; jr ra
 
+    // DA (SLUS_204.23) wait-for-ready: while (*s0 != 4) { spin; Delay(50); poll MSL }.
+    // Live: after MSL fno=0xDADA, boot opens gameart.ssf (MKDA.PAK artps2 member) and
+    // parks here. When archive stream/host was never mounted, s0 stays 0 and the wait
+    // is unbounded (primary DA wall @0x2F5580). Shared shape with Dec asset waits.
+    private const uint WaitReadyPcLo = 0x002F5564;
+    private const uint WaitReadyPcHi = 0x002F55AC;
+    private const uint WaitReadyEpilogue = 0x002F55B0; // restore s0/ra; jr ra
+    // MSL EE response ring (DA live @0x587E60): +0 capacity, +4 count. count==0 ⇒ poll
+    // short-circuits and async file completions never land.
+    private const uint MslRingDa = 0x00587E60;
+    // Scratch status word used when wait is entered with s0==null (no job object).
+    private const uint WaitReadyScratch = 0x0007FF00;
+
     private uint _walkLastV1;
     private int _walkSameV1Hits;
     private int _walkBandHits;
     private int _cycleBreaks;
     private int _walkForcedExits;
+    private int _waitReadyHits;
+    private int _waitReadyEscapes;
+    private int _mslRingSeeds;
 
     public MidwayFamilyAssist(string serial, string displayName)
     {
@@ -54,6 +70,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _walkBandHits = 0;
         _cycleBreaks = 0;
         _walkForcedExits = 0;
+        _waitReadyHits = 0;
+        _waitReadyEscapes = 0;
+        _mslRingSeeds = 0;
     }
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
@@ -65,6 +84,11 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // Re-assert after IOP reboot / RealRpc internal resets that clear open pad state
         // but leave flags; cheap idempotent set in case a future path recreates RealRpc.
         ApplyVersionPolicy(sys);
+        TrySeedMslRing(sys);
+        // Wait-ready force (*s0=4 / null-s0 plant) false-completes gameart.ssf and the
+        // title Exit(0)s. Leave the honest hang at 0x2F55xx until MSL stream host + SEC
+        // open actually deliver status==4. (TryEscapeWaitReady kept for future opt-in.)
+        // TryEscapeWaitReady(sys);
         TryBreakHeapTreeCycle(sys);
     }
 
@@ -74,6 +98,83 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (rpc == null) return;
         rpc.PadModVerMajor4 = true;
         rpc.PreferIopRpGetVersion = true;
+    }
+
+    /// <summary>
+    /// If the DA MSL response ring looks initialized (capacity 0x28) but count is still 0
+    /// after MSL bind/init, seed count=1 so EE poll helpers do not hard-skip. Does not
+    /// invent full async payloads — only unblocks the empty-ring short-circuit.
+    /// Safe: only when cap==0x28, count==0, and ring base is a valid RDRAM pointer.
+    /// </summary>
+    private void TrySeedMslRing(Ps2System sys)
+    {
+        if (_mslRingSeeds != 0) return;
+        uint cap = sys.Memory.Read32(MslRingDa);
+        uint count = sys.Memory.Read32(MslRingDa + 4);
+        if (cap != 0x28 || count != 0) return;
+        // Only seed once PAD/MSL boot has progressed (ring buffer base non-null).
+        uint basePtr = sys.Memory.Read32(MslRingDa + 8);
+        if (basePtr < 0x00100000 || basePtr >= 0x02000000) return;
+        sys.Memory.Write32(MslRingDa + 4, 1);
+        _mslRingSeeds = 1;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine($"[MKFAM] MSL ring seed count=1 base=0x{basePtr:X8} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Escape DA wait-for-ready at 0x2F5564..0x2F55AC when status is sticky non-4.
+    /// Live: gameart.ssf SEC load never reaches status==4 without a mounted archive stream
+    /// (MSL host). Prefer writing *s0=4 when s0 is a valid RDRAM status object.
+    /// When s0 is null (job never created — 0x5320E4 stays 0), plant a scratch status=4,
+    /// point s0 at it, and also publish it at the DA status slot 0x5320E4 so the natural
+    /// loop exit is taken (do <b>not</b> jump the epilogue — that trips Exit(0)).
+    ///
+    /// NOT called from <see cref="Step"/> — force-ready false-completes SEC and Exit(0)s.
+    /// Kept for future opt-in once stream host is ground-truthed.
+    /// </summary>
+    private void TryEscapeWaitReady(Ps2System sys)
+    {
+        uint pc = (uint)sys.EE.PC;
+        if (pc < WaitReadyPcLo || pc > WaitReadyPcHi)
+        {
+            _waitReadyHits = 0;
+            return;
+        }
+
+        _waitReadyHits++;
+        if (_waitReadyHits < 64) return;
+
+        uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        ulong cyc = sys.MasterCycles;
+
+        if (s0 >= 0x00100000 && s0 < 0x02000000)
+        {
+            uint st = sys.Memory.Read32(s0);
+            if (st != 4)
+            {
+                sys.Memory.Write32(s0, 4);
+                _waitReadyEscapes++;
+                _waitReadyHits = 0;
+                if (trace && _waitReadyEscapes <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] wait-ready force *0x{s0:X8}=4 pc=0x{pc:X8} n={_waitReadyEscapes} cyc={cyc}");
+            }
+            return;
+        }
+
+        // s0 null/garbage: publish scratch status and retarget s0; let the *s0==4 check pass.
+        if (_waitReadyHits < 96) return;
+        sys.Memory.Write32(WaitReadyScratch, 4);
+        // DA global slot loaded at 0x19BFE8 (lw s0, 0x5320E4).
+        sys.Memory.Write32(0x005320E4, WaitReadyScratch);
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = WaitReadyScratch });
+        _waitReadyEscapes++;
+        _waitReadyHits = 0;
+        if (trace && _waitReadyEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] wait-ready null-s0 plant scratch=0x{WaitReadyScratch:X8}=4 " +
+                $"slot=0x5320E4 n={_waitReadyEscapes} cyc={cyc}");
     }
 
     /// <summary>

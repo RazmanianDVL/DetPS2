@@ -60,6 +60,13 @@ public sealed class SonyKernelHle
     private readonly (uint device, uint bufferAddr)?[] _deci2Handlers = new (uint, uint)?[8];
     public RealSifRpc RealRpc => _realRpc;
 
+    /// <summary>Count of pending real BIND/CALL/RDATA packets (generation-gated drain).</summary>
+    public int RealRpcQueueCount => _system.Sif.RealRpcQueueCount;
+
+    /// <summary>True when a queued real RPC packet's client sema matches <paramref name="semaId"/>.</summary>
+    public bool RealRpcQueueMaySignalSema(int semaId) =>
+        _system.Sif.QueueMaySignalSema(_system.Memory, semaId);
+
     private readonly Dictionary<int, uint> _dmacHandlers = new();
 
     /// <summary>Drains real (retail sifrpc.c) bind/call packets queued by HleSifCmdFromEe
@@ -881,14 +888,16 @@ public sealed class SonyKernelHle
                     {
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                             Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} gp=0x{ee.GetGpr(28).Lo:X8}");
-                        // When a real SIF RPC is already queued, stall the EE rather than
-                        // SwitchToNext's self-wake (which undoes WaitSemaBlocking and fabricates
-                        // success — Shaolin Monks bind-retry storm, 2026-07-28).
-                        // EmotionEngine also yields out of the stall if drain wakes a *different*
-                        // waiter (God of War wrong-sema deadlock, 2026-07-30). Do NOT prefer
-                        // TryYield here when queue>0: that diverted MK's ADX/WAD path (cdvdSectors
-                        // collapsed 198k→1 in the same session).
-                        if (_system.Sif.RealRpcQueueCount > 0)
+                        // Stall only when a *queued* real BIND/CALL/RDATA will SignalSema(this
+                        // id) via CompleteRpcEnd. Queue depth alone is not enough: GoW/B3
+                        // WaitSema(3) on the SIF-cmd poll mutex saw unrelated CDVD/PAD packets
+                        // in the queue, RequestSemaStall'd, and froze the whole EE forever
+                        // (wrong-sema deadlock — SEMA_STALL_YIELD is OFF for MK WAD). Matching
+                        // client sema ⇒ real RPC_END path (SHARED). No match ⇒ yield/fabricate
+                        // like a non-RPC wait (SIF-cmd poll / mutex re-lock).
+                        // Do NOT TryYield when our packet is queued: that diverted MK's ADX/WAD
+                        // path (cdvdSectors collapsed 198k→1).
+                        if (_system.Sif.QueueMaySignalSema(_system.Memory, (int)a0))
                         {
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
@@ -896,12 +905,12 @@ public sealed class SonyKernelHle
                         }
                         else if (!_kernel.TryYieldToOtherRunnable(ee))
                         {
-                            // Nobody else runnable and no real SIF RPC pending: park on VBlank
+                            // Nobody else runnable and no matching SIF RPC pending: park on VBlank
                             // instead of busy-spin. Next PCRTC VBlank wakes us so the frame loop
                             // can progress. Preserved as-is for waits unrelated to SIF RPC.
                             // Use TryYield (no self-wake) then fabricate only if still alone.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no runnable thread)");
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no matching RPC / no runnable thread)");
                             _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
@@ -1511,17 +1520,20 @@ public sealed class SonyKernelHle
         Sif.PlantEeSifReadySlots(_system.Memory);
         _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
 
-        // INIT family: wake a waiter that may be parked on the init handshake sema.
-        // Prefer signaling only if someone is blocked — mirrors RPC_END iSignalSema.
+        // Wake one SIF-cmd / init waiter. Real IOP SIFCMD posts reverse DMA then the EE
+        // handler SignalSema's the cmd-queue mutex (often id 3 — GoW/B3 sifrpc poll at
+        // WaitSema trampoline). INIT family always woke; also wake on any successful
+        // non-RESET cmd so WaitSema(3) is not stuck forever under empty fabricate thrash
+        // (wave-3 SHARED — prefer real SIF completion over LOCAL SignalSema pulse).
         // RESET_CMD does not wake here (reboot completion does via GetReg path).
-        if (cid is 0x80000000 or 0x80000001 or 0x80000002)
+        if (cid != 0x80000003)
         {
             foreach (var t in _kernel.AllThreads)
             {
-                if (t.Alive && t.Sleeping && t.WaitSemaId > 0)
+                if (t.Alive && t.Sleeping && t.WaitSemaId > 0 && t.WaitSemaId <= 16)
                 {
                     _kernel.ISignalSema(t.WaitSemaId);
-                    break; // one wake per ack, like SignalSema
+                    break; // one wake per ack, like SignalSema / RPC_END
                 }
             }
         }
