@@ -60,6 +60,9 @@ public sealed class SystemMemory
                 or 16 or 17 or 18 or 19;
         }
         // Common R5900 primary opcodes (SPECIAL/J/branches/ALU/COP/loads/stores/MMI).
+        // Include 62/63 (LQ/SQ and LD/SD family used heavily in EE prologs: sd s0,0(sp)).
+        // Without 63, dual-word IsLikelyEeCode rejects real Midway callbacks that start
+        // with addiu sp / sd sN (group-6 multi registration targets, 2026-07-30).
         return primary is 0 or 2 or 3 or 4 or 5 or 6 or 7
             or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15
             or 16 or 17 or 18
@@ -67,7 +70,8 @@ public sealed class SystemMemory
             or 28 or 31
             or 32 or 33 or 34 or 35 or 36 or 37 or 38 or 39
             or 40 or 41 or 42 or 43 or 44 or 45 or 46 or 47
-            or 49 or 51 or 53 or 57 or 59 or 61;
+            or 49 or 51 or 53 or 57 or 59 or 61
+            or 62 or 63;
     }
 
     private readonly byte[] _rdram = new byte[RDRAM_SIZE];

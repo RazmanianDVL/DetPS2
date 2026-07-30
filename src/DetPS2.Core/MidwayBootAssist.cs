@@ -749,7 +749,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// </summary>
     private void MaybeKickMainForLogoSpine(Ps2System sys)
     {
-        if (_logoSpineKicks >= 8) return;
+        // Allow enough kicks to restore historical gifP3≥11 spine, but stop once Path3 is
+        // moving (further main re-entry storms IOPRP gen≥2 and clears pad open areas).
+        if (_logoSpineKicks >= 6) return;
         if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_000_000) return;
         if (sys.Gif.Path3Transfers >= 11) return;
         if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
@@ -1283,8 +1285,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeBreakMenuCallbackCountdown(sys);
         // Post-spine pump thrash (empty group-6): re-home toward Midway main so menu
         // state machine can observe pad edges written into ghost PADMAN DMA areas.
-        if (c >= 90_000_000 && sys.Gif.Path3Transfers >= 12)
+        // Cap: after gifP3≥12 main re-entry storms IOPRP gen≥2; prefer multi-slot fill.
+        if (c >= 90_000_000 && sys.Gif.Path3Transfers >= 12 && sys.Gif.Path3Transfers < 16)
             MaybeKickMainFromPumpThrash(sys);
+        // Mirror FUN_0043ccf8 group-6 multi-slot registration (stream tick @ 0x43F920).
+        // Live wall: *0x75E950 empty → pump is pure no-op while menu tick 0x54E600 climbs.
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeFillGroup6MultiSlot(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
         if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
@@ -2468,8 +2475,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         // Faster cadence once logo spine is restored (historical gifP3≥11).
         // Even faster once in interactive pad-poll / ADX title bands (gifP3≥12).
-        ulong interval = sys.Gif.Path3Transfers >= 12 ? 25_000UL
-            : sys.Gif.Path3Transfers >= 11 ? 50_000UL
+        // Wave-3 denser pad: 12k cycle cadence once interactive (gifP3≥12) so edge-triggered
+        // menu code sees more press/release pairs; ghost PADMAN DMA refreshed each pulse.
+        ulong interval = sys.Gif.Path3Transfers >= 12 ? 12_000UL
+            : sys.Gif.Path3Transfers >= 11 ? 40_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2712,13 +2721,99 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
 
+    private bool _group6MultiFilled;
+    private int _group6MultiFills;
+
+    /// <summary>
+    /// Mirror resource-manager <c>FUN_0043ccf8</c> group-6 multi-slot registration.
+    /// <para>
+    /// Layout (FUN_00427108 / FUN_00427518): base <c>0x75E7A0</c>, stride <c>0x48</c>/group,
+    /// sub-slot stride 12: <c>+0 fn, +4 arg, +8 cookie</c>. Group 6 → <c>0x75E950</c>.
+    /// Sole game registration path: <c>FUN_0043ccf8</c> → <c>FUN_0043f168(0x43F920, 0, 0x5BB860)</c>
+    /// (stream tick). Live 100M dumps leave the slot all-zero while menu tick <c>0x54E600</c>
+    /// still climbs (dispatch epilogue runs with empty callbacks).
+    /// </para>
+    /// Do NOT plant <c>0x414568</c> here (lock-wait → self-deadlock with multi-table).
+    /// Do NOT plant <c>*0x75C0D0</c>. Prefer this over post-spine main re-home (IOPRP storms).
+    /// </summary>
+    private void MaybeFillGroup6MultiSlot(Ps2System sys)
+    {
+        if (_group6MultiFills >= 8) return;
+        // Rate-limit re-plants (table can be scrubbed by partial inits / IOPRP gen≥2).
+        if (_group6MultiFilled && sys.MasterCycles - _lastGroup6FillCyc < 2_000_000)
+            return;
+
+        const uint Group6Base = 0x0075E950; // 0x75E7A0 + 6*0x48
+        const uint StreamTickFn = 0x0043F920; // FUN registered by FUN_0043ccf8
+        const uint StreamCookie = 0x005BB860;
+        // Sibling group-2 stream cb from the same init (FUN_0043cd14 → 0x43F8C0).
+        const uint Group2Base = 0x0075E830; // 0x75E7A0 + 2*0x48
+        const uint StreamTickFnG2 = 0x0043F8C0;
+
+        uint g6fn = sys.Memory.Read32(Group6Base);
+        // Already filled by real game path or prior plant — leave it alone.
+        if (g6fn != 0 && g6fn != StreamTickFn)
+        {
+            _group6MultiFilled = true;
+            return;
+        }
+        if (g6fn == StreamTickFn && sys.Memory.Read32(Group6Base + 8) == StreamCookie)
+        {
+            _group6MultiFilled = true;
+            return;
+        }
+
+        // Validate target prolog. Do NOT use IsLikelyEeCode here — EE `sd` (primary 0x3F)
+        // in the delay/next word is rejected by WordLooksLikeInsn, so real callbacks at
+        // 0x43F920 / 0x43F8C0 (addiu sp; sd s0) fail the dual-word check.
+        if (sys.Memory.Read32(StreamTickFn) != 0x27BDFFF0u) // addiu sp,sp,-16
+            return;
+
+        // Plant group-6 multi-slot[0] = stream tick (exactly what FUN_00427108 stores).
+        sys.Memory.Write32(Group6Base + 0, StreamTickFn);
+        sys.Memory.Write32(Group6Base + 4, 0);
+        sys.Memory.Write32(Group6Base + 8, StreamCookie);
+
+        // Optional group-2 fill when empty (same resource-init batch). Safe no-op if code missing.
+        if (sys.Memory.Read32(Group2Base) == 0
+            && sys.Memory.Read32(StreamTickFnG2) == 0x27BDFFF0u)
+        {
+            sys.Memory.Write32(Group2Base + 0, StreamTickFnG2);
+            sys.Memory.Write32(Group2Base + 4, 0);
+            sys.Memory.Write32(Group2Base + 8, 0x005BB830);
+        }
+
+        // Keep single-slot group-6 (0x75EA10) as ADX lock-wait — already planted by
+        // MaybeCompleteAdxInitGate; do not touch multi-table with 0x414568.
+        // Scrub self-deadlock plant if any residual build left it.
+        if (sys.Memory.Read32(0x0075E7A0) == 0x00414568u)
+        {
+            sys.Memory.Write32(0x0075E7A0, 0);
+            sys.Memory.Write32(0x0075E7A4, 0);
+            sys.Memory.Write32(0x0075E7A8, 0);
+        }
+
+        _group6MultiFilled = true;
+        _lastGroup6FillCyc = sys.MasterCycles;
+        _group6MultiFills++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _group6MultiFills <= 4)
+            Console.Error.WriteLine(
+                $"[BIOS] fill group-6 multi *0x75E950=0x{StreamTickFn:X8} cookie=0x{StreamCookie:X8} " +
+                $"(mirror FUN_0043ccf8) n={_group6MultiFills} gifP3={sys.Gif.Path3Transfers} " +
+                $"cyc={sys.MasterCycles}");
+    }
+
+    private ulong _lastGroup6FillCyc;
+
     /// <summary>
     /// Live (2026-07-30): after gifP3=12 the EE oscillates <c>0x4148EC</c>↔<c>0x4275xx</c>
     /// (ADX pump group-6 dispatch) with multi-slot table at <c>0x75E950</c> empty and frame
     /// callback <c>*0x75BDD8</c> null. Menu tick at <c>0x54E600</c> advances millions but no
     /// UI accept path runs — pump is a pure no-op dispatcher. Re-home to Midway main
     /// (<c>0x212F70</c>) so title/menu can observe pad edges in ghost PADMAN DMA.
-    /// Do NOT plant <c>*0x75C0D0</c>.
+    /// Do NOT plant <c>*0x75C0D0</c>. Prefer <see cref="MaybeFillGroup6MultiSlot"/> first.
     /// </summary>
     private void MaybeKickMainFromPumpThrash(Ps2System sys)
     {
@@ -2863,18 +2958,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
         }
 
-        // Known live boot targets once bulk WAD is in. Prefer main ONLY while its prolog
-        // is still intact — inverted memset can wipe 0x212F70 (live mainOp=0 by 64.8M).
+        // Known live boot targets once bulk WAD is in. Prefer main ONLY while logo spine
+        // is still cold (gifP3&lt;12) and prolog intact. After spine restore, re-entering main
+        // storms IOPRP gen≥2 (live: gen 2→6 @ 100M) and wipes pad open areas — prefer ADX
+        // pump / pad-poll so dense pad + group-6 multi can drive accept.
         if (resume == 0 || forceKnown)
         {
-            if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
-                resume = 0x00212F70; // Midway main (intact)
+            bool spineRestored = sys.Gif.Path3Transfers >= 12;
+            if (!spineRestored && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+                resume = 0x00212F70; // Midway main (intact, pre-spine only)
             else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
                 resume = 0x004147F8; // ADX pump
+            else if (sys.Memory.IsLikelyEeCode(0x00427518UL))
+                resume = 0x00427518; // group-6 multi dispatch (pad/menu tick)
             else if (sys.Memory.IsLikelyEeCode(0x004145A8UL))
                 resume = 0x004145A8; // ADX ready waiter
             else if (sys.Memory.IsLikelyEeCode(0x00414590UL))
                 resume = 0x00414590; // historical gifP3=11 waiter spine
+            else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+                resume = 0x00212F70; // last resort
         }
 
         if (resume != 0 && resume != pc)
