@@ -309,7 +309,7 @@ public sealed class BiosBootHost
                      "LOADFILE", "FILEIO", "MODLOAD", "SIO2MAN", "PADMAN", "MCMAN", "MCSERV",
                      "LIBSD", "SDRDRV", "IOPFILE", "IOPMEM", "IOPSND", "CDVDMAN", "CDVDFSV",
                      // Common retail IOPRP image tags (also re-registered from RESET_CMD arg).
-                     "IOPRP214", "IOPRP234", "IOPRP243", "IOPRP280", "IOPRP300"
+                     "IOPRP214", "IOPRP234", "IOPRP243", "IOPRP250", "IOPRP280", "IOPRP300"
                  })
             sys.IopModules.RegisterModule(n);
 
