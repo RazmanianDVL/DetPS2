@@ -36,9 +36,11 @@ public static class GameQuirkRegistry
         // Armageddon USA standard (SLUS_215.50) + Premium Edition (SLUS_215.43) — same SN gates.
         Register("SLUS_215.50", () => new MidwayFamilyAssist("SLUS_215.50", "Mortal Kombat: Armageddon (USA)"));
         Register("SLUS_215.43", () => new MidwayFamilyAssist("SLUS_215.43", "Mortal Kombat: Armageddon (USA) (Premium Edition)"));
-        // Team ICO / first-party IOPRP300 GetVersion policy (no memory plants).
+        // IOPRP ASCII GetVersion policy (no memory plants) — PreferIopRpGetVersion only.
         Register("SCUS_974.72", () => new TeamIcoAssist("SCUS_974.72", "Shadow of the Colossus (USA)"));
         Register("SCUS_971.13", () => new TeamIcoAssist("SCUS_971.13", "Ico (USA)"));
+        // Haven: Call of the King — IOPRP250 → "2500"; classic 0x00020000 → Exit before MOD_LOAD.
+        Register("SLUS_205.17", () => new TeamIcoAssist("SLUS_205.17", "Haven: Call of the King (USA)"));
         // Register("SLUS_XXXXX", () => new MyNewTitleQuirks());
     }
 

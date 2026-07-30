@@ -3,7 +3,9 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Team ICO first-party titles — IOPRP300 LOADFILE GetVersion policy only.
+/// IOPRP ASCII LOADFILE GetVersion policy (no memory plants).
+/// Used by Team ICO first-party titles and other retail discs that memcmp GetVersion
+/// against the post-UDNL 4-char IOPRP tag (e.g. <c>"3000"</c>, <c>"2500"</c>).
 ///
 /// <para>
 /// <b>Shadow of the Colossus (SCUS_974.72)</b> reboots IOP with
@@ -16,10 +18,16 @@ namespace DetPS2.Core;
 /// </para>
 ///
 /// <para>
+/// <b>Haven: Call of the King (SLUS_205.17)</b> reboots with
+/// <c>rom0:UDNL cdrom0:\SYS250\IOPRP250.IMG;1</c> (shared tag <c>"2500"</c>). Without
+/// <see cref="RealSifRpc.PreferIopRpGetVersion"/>, GetVersion stays classic
+/// <c>0x00020000</c> and the title <c>Exit(0)</c> before any post-reboot MOD_LOAD / FILEIO.
+/// </para>
+///
+/// <para>
 /// Enabling <see cref="RealSifRpc.PreferIopRpGetVersion"/> reuses the shared
-/// OnIopReboot ASCII tag path (already extracts <c>"3000"</c>) — no title-local memory
-/// plant. Same class as <see cref="GodOfWarAssist"/> / <see cref="VexxAssist"/> version
-/// policy; no Midway plants.
+/// OnIopReboot ASCII tag path — no title-local memory plant. Same class as
+/// <see cref="GodOfWarAssist"/> / <see cref="VexxAssist"/> version policy; no Midway plants.
 /// </para>
 /// </summary>
 public sealed class TeamIcoAssist : IGameQuirkModule

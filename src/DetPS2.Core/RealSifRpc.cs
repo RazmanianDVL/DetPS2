@@ -1270,9 +1270,14 @@ public sealed class RealSifRpc
                     Console.Error.WriteLine(
                         $"[FILEIO] open path=\"{path}\" mode=0x{mode:X} result={openRes} size={openedSz} argBuf=0x{argBuf:X8} send={sendSize} fio2200={_fio2200Armed}");
                 // FILEIO-2200: Play returns 1 from Invoke and posts GENERICREPLY to resultPtr0
-                // + signals command.semaphoreId. Hybrid: still return open fd for classic clients.
-                if (_fio2200Armed && openSema != 0)
+                // + signals command.semaphoreId. When armed, always use that ABI — returning the
+                // raw fd (esp. fd=0) as CallRpc result is read as "RPC fail" by 2200 clients, so
+                // SotC never issues READ after STARTUP.XFF open (live fleet: open×2, no read).
+                // Recover sema from COMMANDHEADER if decode left it 0 (hybrid classic path).
+                if (_fio2200Armed)
                 {
+                    if (openSema == 0 && argBuf != 0 && sendSize >= 4)
+                        openSema = mem.Read32(argBuf);
                     WriteFio2200GenericReply(mem, kernel, openSema, FioOpen, unchecked((uint)openRes));
                     return 1;
                 }
@@ -3907,8 +3912,20 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
+    /// DA MFL CallRpc client (live open/info/close at 0x22C9F0/0x22CC00/0x22CAB0).
+    /// EE uses <c>lui a0,0x55; addiu a0,a0,-3584</c> → <c>0x54F200</c>, which is a
+    /// separate SifRpcClientData from the MSL sound bind at <c>0x546E80</c>. Without a
+    /// soft-bind here CallRpc resolves sid=0 (unknownServiceCalls++) and archive host+4
+    /// stays null — the primary gameart wait wall at 0x2F55xx.
+    /// </summary>
+    private const uint MflClientDa = 0x0054F200;
+    /// <summary>MSL sound client bound after MSL.IRX (DA live).</summary>
+    private const uint MslClientDa = 0x00546E80;
+
+    /// <summary>
     /// DA: gp-24716 (0x40ACE4 with gp=0x410D70) is the MFL RPC ready word. EE open/read
-    /// clients return null when it is 0. Seed a positive sentinel once MSL rings exist.
+    /// clients return null when it is 0. Seed a positive sentinel once MSL rings exist,
+    /// and soft-bind the MFL CallRpc client so fno 21/22/24 hit HandleMsl.
     /// </summary>
     private void TrySeedMflReadyFlag(SystemMemory mem)
     {
@@ -3917,11 +3934,65 @@ public sealed class RealSifRpc
         if (respCap != 0x28) return;
         const uint mflReady = 0x0040ACE4; // gp(0x410D70) - 24716
         uint cur = mem.Read32(mflReady);
-        if (cur != 0) return;
-        mem.Write32(mflReady, 1);
+        if (cur == 0)
+        {
+            mem.Write32(mflReady, 1);
+            MflInited = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine("[MSL-MFL] seed ready flag @0x40ACE4=1");
+        }
+
+        // Soft-bind MFL file client → same SID as MSL sound (init at 0x22B7B0 binds
+        // 0x00012345 only; file CallRpc still uses a distinct client pointer).
+        TrySoftBindMflClient(mem);
+    }
+
+    /// <summary>
+    /// Register <see cref="MflClientDa"/> in the HLE bind map and stamp sid at +36 so
+    /// sceSifCallRpc packets from mflrpc carry a real Midway MSL/MFL service id.
+    /// Idempotent; prefers cloning argBuf from the live MSL client when present.
+    /// </summary>
+    private void TrySoftBindMflClient(SystemMemory mem)
+    {
+        if (_cdToSid.ContainsKey(MflClientDa))
+        {
+            // Keep sid stamped even if EE zeroed client memory after our first seed.
+            if (mem.Read32(MflClientDa + 36) == 0)
+                mem.Write32(MflClientDa + 36, SidMsl);
+            return;
+        }
+
+        // Prefer MSL sid when its client is live; fall back to MFL-only sid constant.
+        uint sid = SidMsl;
+        uint argBuf = 0;
+        if (_cdToSid.TryGetValue(MslClientDa, out uint mslSid) && mslSid != 0)
+        {
+            sid = mslSid;
+            if (_cdToArgBuf.TryGetValue(MslClientDa, out uint ab))
+                argBuf = ab;
+        }
+        if (argBuf == 0)
+            argBuf = AssignSlot();
+
+        _cdToSid[MflClientDa] = sid;
+        _cdToArgBuf[MflClientDa] = argBuf;
+
+        // Mirror minimal SifRpcClientData_t fields the EE/HLE round-trip needs.
+        // +8 sema: leave if EE already created one; else plant a non-zero token.
+        if (mem.Read32(MflClientDa + 8) == 0)
+        {
+            uint mslSema = mem.Read32(MslClientDa + 8);
+            mem.Write32(MflClientDa + 8, mslSema != 0 ? mslSema : 1u);
+        }
+        mem.Write32(MflClientDa + 20, argBuf);
+        if (mem.Read32(MflClientDa + 24) == 0)
+            mem.Write32(MflClientDa + 24, AssignSlot());
+        mem.Write32(MflClientDa + 36, sid);
+
         MflInited = true;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-            Console.Error.WriteLine("[MSL-MFL] seed ready flag @0x40ACE4=1");
+            Console.Error.WriteLine(
+                $"[MSL-MFL] soft-bind client=0x{MflClientDa:X8} sid=0x{sid:X8} arg=0x{argBuf:X8}");
     }
 
     private void TryCompleteMslRequestRing(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
@@ -3964,21 +4035,28 @@ public sealed class RealSifRpc
             if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
                 cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 64));
 
-            // Keep request slot path intact. Build a tiny response object the EE poll
-            // (0x2F5A80) understands: +0 status=0 (need process), +12 = request ptr,
-            // +16 result handle. Response *ring* entries are stride-4 pointers (DA init).
+            // Response object layout ground-truthed from DA poll @0x2F5A80:
+            //   +0  status (1 = open done → info/close path @0x2F5C64 when +16 handle ≠ 0)
+            //   +4  secondary status
+            //   +8  flags (bit1 ⇒ complete to status=4 after info @0x2F5D74)
+            //   +12 request slot ptr
+            //   +16 MFL handle (non-zero required — zero takes empty-complete path)
+            //   +20 size hint
+            // Do NOT write request+16: path string lives at request+8 and spans into +16
+            // ("cdrom0:\MKDA.PAK"). Stamping handle there corruptsthe path for retries.
+            // Mark request +0 = 1 only as re-pump skip (poll open path already finished).
             const uint respObj = 0x0007FE00; // low scratch; outside ELF image
-            mem.Write32(respObj + 0, 0);                     // need process
+            mem.Write32(respObj + 0, 1);                     // open-done
             mem.Write32(respObj + 4, 0);
-            mem.Write32(respObj + 8, 0);
+            mem.Write32(respObj + 8, 2);                     // bit1 → status=4 after info
             mem.Write32(respObj + 12, slot);                 // request
-            mem.Write32(respObj + 16, unchecked((uint)h));  // pre-filled handle
+            mem.Write32(respObj + 16, unchecked((uint)h));  // handle for info/close
             mem.Write32(respObj + 20, fsz);
+            mem.Write32(respObj + 24, fsz);
             mem.Write32(respObj + 28, 0);
 
-            // Mark request itself as open-done so re-pumps skip; poll uses response obj.
+            // Re-pump skip only — leave path bytes at +8.. intact.
             mem.Write32(slot, 1);
-            mem.Write32(slot + 16, unchecked((uint)h));
 
             uint rCap = mem.Read32(respHdr);
             uint rCount = mem.Read32(respHdr + 4);
@@ -4003,6 +4081,9 @@ public sealed class RealSifRpc
                         mem.Write32(respHdr + 4, 1);
                 }
             }
+
+            // Also ensure MFL client is bound so poll's CallRpc info/close succeed.
+            TrySoftBindMflClient(mem);
 
             if (trace)
                 Console.Error.WriteLine(
@@ -4639,10 +4720,17 @@ public sealed class RealSifRpc
         }
 
         // Real PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2 (and other level goefiles) on disc.
+        // Game-initiated Open (vs host warm) always countSectors:true so telemetry / assists
+        // see real bigfile load (CODE ~447 sectors, MAINMENU ~738).
+        bool gameBg2 = false;
         if (hostFd < 0)
         {
-            int bg2 = TryOpenBo2RealBg2(iopModules, cdvd, norm);
-            if (bg2 >= 0) hostFd = bg2;
+            int bg2 = TryOpenBo2RealBg2(iopModules, cdvd, norm, countSectors: true);
+            if (bg2 >= 0)
+            {
+                hostFd = bg2;
+                gameBg2 = LooksLikeBo2GameBg2Path(norm) || LooksLikeBo2GameBg2Path(path);
+            }
         }
         // Pack-resident ASSETS / .IMP / .ETP inside CODE/PRECODE goefile bigfiles.
         if (hostFd < 0)
@@ -4678,7 +4766,8 @@ public sealed class RealSifRpc
         iopModules.TryGetOpenFileSize(hostFd, out fsz);
         // Count open preload for small files; large RKV is streamed so only note a token sector
         // here — real growth comes from Start/read.
-        if (LooksLikeDiscPath(norm) && fsz > 0)
+        // Game BG2 already credited inside TryOpenBo2RealBg2(countSectors:true).
+        if (!gameBg2 && LooksLikeDiscPath(norm) && fsz > 0)
         {
             int sectors = fsz <= 16u * 1024 * 1024
                 ? (int)((fsz + 2047) / 2048)
@@ -4698,11 +4787,28 @@ public sealed class RealSifRpc
         _iopFileFds[hostFd] = norm;
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+        {
+            string tag = gameBg2 ? "GAME BG2" : "path";
             Console.Error.WriteLine(
-                $"[IOPFILE] open path=\"{norm}\" fd={hostFd} size={fsz} iStream={iStream}");
+                $"[IOPFILE] open {tag}=\"{norm}\" fd={hostFd} size={fsz} iStream={iStream}");
+        }
 
         WriteGoeReply(mem, recvBuf, recvSize, status: 1, filesize: fsz, scefd: hostFd, iStream: iStream);
         return 1;
+    }
+
+    /// <summary>True for BO2 code/menu goefile Open paths (game load, not soft probes).</summary>
+    private static bool LooksLikeBo2GameBg2Path(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        string p = path.Replace('/', '\\');
+        return p.Contains("MAINMENU", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("PRECODE", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("CODE.BG2", StringComparison.OrdinalIgnoreCase)
+            || (p.Contains(".BG2", StringComparison.OrdinalIgnoreCase)
+                && (p.Contains("CODE", StringComparison.OrdinalIgnoreCase)
+                    || p.Contains("LEVELS", StringComparison.OrdinalIgnoreCase)
+                    || p.Contains("GOGAMES", StringComparison.OrdinalIgnoreCase)));
     }
 
     private static string NormalizeGoeDiscPath(string path)
@@ -4731,7 +4837,13 @@ public sealed class RealSifRpc
                 || norm.Contains("GAME.ERG", StringComparison.OrdinalIgnoreCase)
                 || norm.Contains(".BG2", StringComparison.OrdinalIgnoreCase)
                 || norm.Contains("PRECODE", StringComparison.OrdinalIgnoreCase)
-                || norm.Contains("CODE.BG2", StringComparison.OrdinalIgnoreCase))
+                || norm.Contains("CODE.BG2", StringComparison.OrdinalIgnoreCase)
+                || norm.Contains("MAINMENU", StringComparison.OrdinalIgnoreCase)
+                || rest.Equals("CODE", StringComparison.OrdinalIgnoreCase)
+                || rest.Equals("PRECODE", StringComparison.OrdinalIgnoreCase)
+                || rest.StartsWith("resources\\", StringComparison.OrdinalIgnoreCase)
+                || rest.StartsWith("assets\\", StringComparison.OrdinalIgnoreCase)
+                || rest.StartsWith("levels\\", StringComparison.OrdinalIgnoreCase))
             {
                 // gogames\bo2\ps2.rkv → cdrom0:\GOGAMES\BO2\PS2.RKV
                 if (rest.StartsWith("gogames\\bo2\\", StringComparison.OrdinalIgnoreCase))
@@ -4743,6 +4855,14 @@ public sealed class RealSifRpc
                 if (rest.Equals("PS2.RKV", StringComparison.OrdinalIgnoreCase)
                     || rest.Equals("ps2.rkv", StringComparison.OrdinalIgnoreCase))
                     norm = @"cdrom0:\WHIPLASH\PS2.RKV";
+                // Bare CODE / PRECODE / MAINMENU tokens from StartBigFile / usebigfile.
+                else if (rest.Equals("CODE", StringComparison.OrdinalIgnoreCase))
+                    norm = @"cdrom0:\GOGAMES\BO2\CODE.BG2";
+                else if (rest.Equals("PRECODE", StringComparison.OrdinalIgnoreCase))
+                    norm = @"cdrom0:\GOGAMES\BO2\PRECODE.BG2";
+                else if (rest.Equals("MAINMENU", StringComparison.OrdinalIgnoreCase)
+                    || rest.Equals("MAINMENU.BG2", StringComparison.OrdinalIgnoreCase))
+                    norm = @"cdrom0:\GOGAMES\BO2\RESOURCES\LEVELS\UI\MAINMENU.BG2";
                 else
                     norm = "cdrom0:\\GOGAMES\\BO2\\" + rest;
             }
@@ -5788,17 +5908,29 @@ public sealed class RealSifRpc
     private static string ScanSendBufferForPath(SystemMemory mem, uint argBuf, uint sendSize)
     {
         uint max = Math.Min(sendSize, 0x800u);
-        for (uint off = 0; off + 8 < max; off++)
+        for (uint off = 0; off + 4 < max; off++)
         {
             byte b0 = mem.Read8(argBuf + off);
+            // BO2 goefile / bigfile Open often uses relative "CODE" / "PRECODE" / "MAINMENU" /
+            // "resources\\levels\\ui\\mainmenu.bg2" / "assets/…" without a device prefix.
             if (b0 is not ((byte)'c' or (byte)'C' or (byte)'r' or (byte)'R' or (byte)'h' or (byte)'H'
-                or (byte)'g' or (byte)'G' or (byte)'p' or (byte)'P'))
+                or (byte)'g' or (byte)'G' or (byte)'p' or (byte)'P' or (byte)'m' or (byte)'M'
+                or (byte)'a' or (byte)'A' or (byte)'f' or (byte)'F' or (byte)'l' or (byte)'L'))
                 continue;
             string s = ReadCString(mem, argBuf + off, 256);
+            if (string.IsNullOrEmpty(s) || s.Length < 3) continue;
             if (LooksLikeFsPath(s) || s.Contains("GOGAMES", StringComparison.OrdinalIgnoreCase)
                 || s.Contains("PS2.RKV", StringComparison.OrdinalIgnoreCase)
                 || s.Contains(".rkv", StringComparison.OrdinalIgnoreCase)
-                || s.Contains(".ERG", StringComparison.OrdinalIgnoreCase))
+                || s.Contains(".ERG", StringComparison.OrdinalIgnoreCase)
+                || s.Contains(".BG2", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("MAINMENU", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("PRECODE", StringComparison.OrdinalIgnoreCase)
+                || s.Equals("CODE", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("assets/", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("assets\\", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("resources/", StringComparison.OrdinalIgnoreCase)
+                || s.Contains("resources\\", StringComparison.OrdinalIgnoreCase))
                 return s;
         }
         return "";
