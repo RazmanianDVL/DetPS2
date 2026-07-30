@@ -227,9 +227,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
             && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
 
-        // Post full-TXD presentation: leave kernel MMIO thrash (0x10FBB0) so workers can
-        // issue FRONTEND.TXD fno=3/5. Does not touch residual force timing / STG bind.
-        if (_lgDevFullyDone && sys.Cdvd.SectorsRead >= 2000 && sys.MasterCycles >= 55_000_000)
+        // Post full-TXD presentation: leave GIF flush MMIO thrash so Soft-GS can draw
+        // FRONTEND/logo chrome. Does not touch residual force timing / STG bind.
+        // TXD completes ~43M on deliver; do not wait until 55M to start escapes.
+        if (_lgDevFullyDone && sys.Cdvd.SectorsRead >= 2000 && sys.MasterCycles >= 40_000_000)
             MaybeEscapePostTxdHang(sys);
 
         if (sys.MasterCycles < 16_000_000) return;
@@ -454,12 +455,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // only on main high-stack (menu4 stable FC10); rewrite whole LGDEV .text savedRa.
         if (_lgDevFullyDone)
         {
-            // Wave-8: delay permanent stubs until residual n≥24 (early stub → no STG).
-            if (_lgDevEscapes >= 24)
-            {
-                PlantLgDevEntryStub(sys);
-                PlantLgDevCallRpcLeafStub(sys);
-            }
+            // Deliver residual→STG plants entry+leaf stubs at force (n=1) and still binds STG.
+            // Wave-8 delayed stubs to n≥24 + force@22M and tip residual died n=2–3 (cdvd=425).
+            // Restore deliver: keep stubs sticky once FullyDone so fno≠12 cannot re-thrash.
+            PlantLgDevEntryStub(sys);
+            PlantLgDevCallRpcLeafStub(sys);
             sys.Memory.Write32(LgDevPostFlag, 0);
 
             // 0x443DA8 = delay slot of leaf jr ra (ld ra; jr ra; addiu sp,48). Dead $ra
@@ -487,6 +487,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
             if (IsLgDevCallRpcThrash(sys, pc, ra) && _lgDevEscapes < 256)
             {
+                // After STG/game FILEIO, stop faking LGDEV residual CallRpc — live tip
+                // re-entered n→32 @92–99M and monopolized EE after full FRONTEND DMA.
+                if (sys.Cdvd.SectorsRead >= 600)
+                    return;
                 uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
                 // menu4 residual: main high-stack (FC10). Also allow mid-high frames that
                 // share the CallRpc leaf shape; skip pure worker 0x01EDxxxx parks.
@@ -608,9 +612,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
             if (sp is < 0x01FFF000 or >= 0x02000000)
                 return;
             bool pristine = sp is >= 0x01FFFC00 and <= 0x01FFFC20;
-            // Wave-8: delay force to ≥22M so residual can settle (tip early@18M → n=2–3 no STG).
-            bool forceNow = (pristine && sys.MasterCycles >= 22_000_000)
-                            || sys.MasterCycles >= 23_500_000;
+            // Deliver residual→STG: force at first pristine thrash ≥18M (live ~19.65M @ FC00).
+            // Wave-8 delayed to ≥22M and tip residual died n=2–3 with UnknownOpcode thrash.
+            bool forceNow = (pristine && sys.MasterCycles >= 18_000_000)
+                            || sys.MasterCycles >= 22_500_000;
             if (!forceNow)
                 return;
             // Permanent structural break of fno=18 path.
@@ -642,8 +647,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.COP0_Status &= ~(1u << 1);
             _lgDevEscapes++;
             _lgDevFullyDone = true;
-            // Wave-8: do not plant entry/leaf stubs here — residual CallRpc must re-enter
-            // for menu4-like n≈48→STG. Sticky j 0x443C44 already blocks fno=18 re-init.
+            // Deliver plants stubs at force; residual still completes 1–2 in-flight CallRpcs
+            // then STG binds. Do not delay stubs (wave-8 n≥24 broke tip residual→STG).
+            PlantLgDevEntryStub(sys);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
                     $"[B3] force CallRpc→lgDev epilogue pc=0x{pc:X8} sp=0x{sp:X8} s1=0x{s1:X8} " +
@@ -726,7 +732,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         sys.EE.COP0_Status &= ~(1u << 1);
         _lgDevEscapes++;
         _lgDevFullyDone = true;
-        // Wave-8: delay entry stub for residual→STG cadence.
+        PlantLgDevEntryStub(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[B3] force lgDeviceInit complete ({why}) pc=0x{fromPc:X8} " +
@@ -794,26 +800,42 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x002371E0;
         }
 
-        // Main often WaitSema's a high id (e.g. 606 / 0x25E) after LGDEV with no producer
-        // under HLE (live: tid=1 WaitSemaId=606 while VBlank thrash holds the EE). Pulse
-        // high waiters AND pure-Sleep main so Criterion can open game FILEIO (cdvd≫425).
-        if (_lgDevFullyDone && k != null && (_menuKickPulses % 2) == 0)
+        // High WaitSema pulse only while IRX-only after residual settle (≥30M).
+        // Live tip: main WaitSemaId=70 (gp-23068) at 0x2AF864 after post-LGDEV spin —
+        // SignalSema alone can race; also soft-complete WaitSema when ra is in 0x2AF8xx.
+        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && sys.Cdvd.SectorsRead < 600)
         {
-            foreach (var t in k.AllThreads)
+            uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+            uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (pcW is >= 0x0010BE60 and <= 0x0010BE70
+                && raW is >= 0x002AF800 and <= 0x002AF910)
             {
-                if (!t.Alive || !t.Sleeping) continue;
-                if (t.WaitSemaId >= 32)
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = raW;
+                sys.EE.COP0_Status &= ~(1u << 1);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_menuKickPulses % 16) == 0)
+                    Console.Error.WriteLine(
+                        $"[B3] soft-complete post-LGDEV WaitSema ra=0x{raW:X8} " +
+                        $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+            }
+            if (k != null && (_menuKickPulses % 2) == 0)
+            {
+                foreach (var t in k.AllThreads)
                 {
-                    try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    if (!t.Alive || !t.Sleeping) continue;
+                    if (t.WaitSemaId >= 32)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        k.WakeupThread(t.Id);
                 }
-                // Also wake pure SleepThread peers that gate asset load.
-                if (t.WaitSemaId == 0 && !t.WaitVblank)
-                    k.WakeupThread(t.Id);
             }
         }
 
-        // Sticky re-plant only after residual window (n≥24).
-        if (_lgDevFullyDone && _lgDevEscapes >= 24)
+        // Sticky re-plant entry stub after LGDEV so boot cannot re-enter wheel init.
+        if (_lgDevFullyDone)
             PlantLgDevEntryStub(sys);
 
         // Boot wait-flag plant: break while (*(gp-23028)==0) SleepThread at 0x2B34D8.
@@ -929,18 +951,35 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
             _lastPostTxdEscapeCyc = sys.MasterCycles;
             _postTxdEscapes++;
-            uint safe = startPhys is >= 0x00100000 and < 0x01E00000u
-                ? sys.Memory.Read32(startCell) : 0x00700000u;
+            // Empty the ring (start==end==dst) so re-entry does a zero-size flush and
+            // returns cleanly; sane later fills can still produce Soft-GS px>0.
+            uint safeRaw = sys.Memory.Read32(startCell);
+            uint safePhys = safeRaw & 0x1FFFFFFFu;
+            uint safe = safePhys is >= 0x00100000 and < 0x01E00000u ? safeRaw : 0x00700000u;
             sys.Memory.Write32(startCell, safe);
-            sys.Memory.Write32(endCell, safe);
+            sys.Memory.Write32(endCell, safe); // empty range → s0≈0 after (end-start+8)>>4
             sys.Memory.Write32(dstCell, safe);
 
-            uint resume = inGifFlush ? 0x0021A5D8u : 0x00218774u;
+            // Prefer flush epilogue (ld ra / jr) so callers see a clean return; only use
+            // raw $ra when it is outside the flush/submit thrash band.
+            uint resume = inGifFlush ? 0x0021A5D8u
+                : inGifSubmit ? 0x00218774u
+                : 0x00218774u;
             if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
                 && ra is not (>= 0x0021A4F0 and <= 0x0021A5E8)
                 && ra is not (>= 0x001F3080 and <= 0x001F3500)
-                && ra is not (>= 0x001F24E0 and <= 0x001F2520))
+                && ra is not (>= 0x001F24E0 and <= 0x001F2520)
+                && ra is not (>= 0x00218700 and <= 0x00218790))
                 resume = ra;
+            // Sticky thrash at submit final (0x1F308C): after many leaves, bypass submit
+            // entry to caller so FRONTEND draw path can continue past empty rings.
+            if (inGifSubmit && _postTxdEscapes >= 32
+                && sys.Memory.Read32(0x001F3080) != 0x03E00008u)
+            {
+                // One-shot soft-return only when still absurd — do not permanent-stub
+                // forever; rewrite s0 count in-frame instead.
+                sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // a1 size = 0
+            }
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.PC = resume;
@@ -1206,7 +1245,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         // Permanent bypass of path-sync wait once we've left a few times (re-entry thrash).
         // j 0x1F2520 = 0x08000000 | (0x001F2520 >> 2) = 0x0807C948
+        // After FRONTEND/Global DMA (cdvd≫2000), delay bypass so real flip can present
+        // Soft-GS frames — early bypass left gifP3 climbing with px=0.
         if (_vblankExits >= 2 && !_flipWaitStubPlanted
+            && (sys.Cdvd.SectorsRead < 2000 || sys.MasterCycles >= 90_000_000)
             && sys.Memory.Read32(0x001F24E0) != 0x0807C948u)
         {
             sys.Memory.Write32(0x001F24E0, 0x0807C948u); // j 0x001F2520
@@ -1514,8 +1556,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         bool inWait2 = pc is >= 0x002B3510 and <= 0x002B3540;
         bool inWait3 = pc is >= 0x002B35A0 and <= 0x002B35C0;
         bool inSleep = pc is >= 0x0010C0A0 and <= 0x0010C0AC;
-        bool periodic = (_menuKickPulses % 2) == 0 && sys.Cdvd.SectorsRead < 8000;
-        if (!inWait1 && !inWait2 && !inWait3 && !inSleep && !periodic) return;
+        // 0x2AF80C..0x2AF90C: post-LGDEV poll *(gp-23104) before STG bind.
+        bool inPostLgDevSpin = pc is >= 0x002AF800 and <= 0x002AF910;
+        // Periodic plant only while IRX-only — stop once game FILEIO opens (cdvd≫425).
+        bool periodic = (_menuKickPulses % 4) == 0 && sys.Cdvd.SectorsRead is >= 400 and < 600;
+        if (!inWait1 && !inWait2 && !inWait3 && !inSleep && !inPostLgDevSpin && !periodic) return;
 
         _lastBootWaitPlantCyc = sys.MasterCycles;
         _bootWaitFlagPlants++;
@@ -1543,15 +1588,22 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Wait-3: *(s0+0x13A4) — object-local ready flag after jal 0x2AEFC0 (a3=21).
-        // Only plant when s0 looks like a real EE object (not stack garbage / low page).
+        // Only plant when s0 looks like a real EE object in .data/bss (not high heap/stack).
+        // Live tip residual: s0=0x01E7DDF0 heap cursor — writing +0x13A4 corrupted STG path.
         uint s0 = (uint)(sys.EE.GetGpr(16).Lo & 0x1FFFFFFFUL);
-        if (s0 is >= 0x00400000 and < 0x02000000 && (s0 & 3) == 0)
+        if (s0 is >= 0x00400000 and < 0x01000000 && (s0 & 3) == 0)
         {
             sys.Memory.Write32(s0 + 0x13A4, 1);
             // Sibling cells used nearby (0x13A0 / 0x1380) — keep non-zero for follow-on.
             if (sys.Memory.Read32(s0 + 0x13A0) == 0)
                 sys.Memory.Write32(s0 + 0x13A0, 1);
         }
+
+        // Post-LGDEV spin at 0x2AF80C: while (*(gp-23104)==0 && s0<600) SleepThread.
+        // Producer never fills under HLE residual — plant so Criterion can bind STG.
+        uint flag23104 = unchecked((uint)((int)gp - 23104));
+        if (flag23104 is >= 0x00400000 and < 0x01000000)
+            sys.Memory.Write32(flag23104, 1);
 
         // Snap PC out of the active wait body.
         if (inWait1)
