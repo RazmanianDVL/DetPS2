@@ -10,7 +10,7 @@
 | **Media config** | `user-media-god-of-war.json` |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | CDVD 142; RPC binds=45 calls=207; sifBytes↑; free-search circular thrash escaped; still `px=0` |
+| **Status** | CDVD 142; RPC 16/443; dmac=463 sif=95k; tick-wait + free-search escaped; still `px=0` |
 | **Last updated** | 2026-07-30 |
 
 ---
@@ -24,29 +24,30 @@
 | 989snd sentinel HLE | **Yes** |
 | FreezeCache escape | **Yes** |
 | BST + HERO_HEAP_SIZE | **Yes** |
-| Heap freelist / list walk | **Partial** — capped escapes |
-| Global free-search `0x13E1C8` | **Escaped** — plant null-terminated head @ `*0x29BEB0` |
+| Heap freelist / list walk | **Partial** — soft escapes |
+| Soft-tick wait `0x17A1D0` | **Escaped** — advance `*0x29C7D4`; jr ra without zeroing tick |
+| Global free-search `0x13E1C8` | **Escaped** — plant null-terminated head @ `*0x29BEB0` (in-RDRAM arena) |
 | Tag-list `0x170BBx` | **Escaped** → empty epilogue `0x170BFC` |
 | **CDVD** | **Yes** — `cdvdSectors=142` (IRX-only; no game FILEIO) |
 | GS / px | **No** (`px=0`, `gifPath3=0`) |
-| Main menu | **No** (not MK MAINMENU gate) |
+| Interactive title surface | **No** (not MK MAINMENU gate) |
 
-### Evidence @ 100M (host-present) — free-head plant
+### Evidence @ 100M (host-present) — tick-wait + free-head
 
 ```
-PC=0x00284694  px=0 gifPath3=0 dmac=87 sifBytes=46768 syscalls=29509
+PC=0x00293C68  px=0 gifPath3=0 dmac=463 sifBytes=95684 syscalls=24796
 cdvdSectors=142
-RealSifRpc: binds=30 calls=153
-threads: all started, not sleeping
-[GOW] plant global free-head node=0x01FEC200 size=0x00000000 @0x0029BEB0
+RealSifRpc: binds=16 calls=443
+[GOW] plant global free-head node=0x01FF3600 size=0x00000000 @0x0029BEB0
+PcProfiler: 0x17A32C flag-countdown residual; freelist/list-cmp secondary
 ```
 
 ### Evidence @ 150M (host-present)
 
 ```
-PC=0x00284650  px=0 gifPath3=0 dmac=90 sifBytes=68656 syscalls=35827
+PC=0x00293C68  px=0 gifPath3=0 dmac=463 sifBytes=95684 syscalls=25337
 cdvdSectors=142
-RealSifRpc: binds=45 calls=207
+RealSifRpc: binds=16 calls=443  (metrics frozen after ~60M — WaitSema residual)
 ```
 
 ### Assists
@@ -54,24 +55,28 @@ RealSifRpc: binds=45 calls=207
 - IOPRP `"3000"` + FreezeCache unlock
 - BST HERO/SLOT/UPGRADE_HEAP_SIZE + freelist bump-arena soft escapes
 - List/flag/parent/link-search soft escapes; cache-wb leaf stub
-- **Global free-search plant** — `*0x29BEB0` null-terminated node (size=0, field=~0) so `0x13E1C8` cannot circular-walk forever
-- World kick after CDVD: list re-escape, peer wake, dense pad
+- **Soft-tick wait** — `*0x29C7D4` advance + `0x17A1D0` escape (jr ra @ `0x17A294`, no tick zero)
+- **Global free-search plant** — `*0x29BEB0` null-terminated node; arena hard-clamped under 32 MiB RDRAM
+- World kick after CDVD: list re-escape, peer wake, dense pad, tick advance
 - Policy: no SEMA_STALL_YIELD, PollSema-id, no global DMAC force-finish
 - Prefer shared HLE; title thrash only in `GodOfWarAssist`
 
-## MENU REACHED?
+## First real GS / interactive?
 
-**No.** Gate is **first real GS** (`px>0` non-black) then pad-interactive — **not** MK-style MAINMENU.
+**First real GS: No** (`px=0`, `gifPath3=0`)  
+**Interactive: No**
 
-> Past DualInfo, 989snd, FreezeCache, BST, freelist, **CDVD 142**, free-search plant, tag empty-exit.  
-> RPC calls **207** @150M. Still **px=0** / **gifPath3=0** — no GS frame. cdvd stuck IRX-only.
+Gate is **first real GS** (`px>0` non-black) then pad-interactive — **not** MK-style MAINMENU.
+
+> Past DualInfo, 989snd, FreezeCache, BST, freelist, **CDVD 142**, free-search plant, **tick-wait escape**.  
+> RPC calls **443** / dmac **463** / sif **95k** @100M (was 153/87/46k). Still **px=0** — no GS frame. cdvd IRX-only.
 
 ### Next
 
-1. FILEIO / NCMD asset load past `cdvd=142` (game data, not more IRX).  
-2. Break residual list-cmp thrash (`0x2847xx`) + float band residual (`0x284650`).  
-3. First GS (`px>0` / `gifPath3>0`, non-black Soft-GS).  
-4. Pad-inject once presentable title/in-engine surface exists.
+1. Leave WaitSema residual (`0x293C68`) + re-start dormant main after thrash.  
+2. FILEIO / NCMD asset load past `cdvd=142` (game data, not more IRX).  
+3. Drain residual flag-countdown (`0x17A32C`) / freelist (`0x23A978`) / list-cmp (`0x2847xx`).  
+4. First GS (`px>0` / `gifPath3>0`, non-black Soft-GS) then pad-inject.
 
 ### Reproduce
 
