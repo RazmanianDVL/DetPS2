@@ -338,6 +338,7 @@ public sealed class RealSifRpc
         Binds = Calls = RdataOps = FileIoOps = SysmemOps = UnknownServiceCalls = UnknownBindSids = 0;
         _unknownSidsSeen.Clear();
         _padAreas.Clear();
+        _padAreasGhost.Clear();
         _padFrame = 0;
         _lastIopRpVersionAscii = "";
     }
@@ -348,6 +349,13 @@ public sealed class RealSifRpc
     /// rom0-style OPEN return 0 ("already open") across REBOOT gen≥2 (MK IOPRP300 reload).
     /// Client bind maps are kept — EE still rebinds, and wiping them mid-flight loses argBufs.
     /// </summary>
+    /// <remarks>
+    /// Live MK (SLUS_210.87) and other IOPRP-reload titles often keep EE-side pad buffer
+    /// pointers and never re-OPEN after gen≥2 — padGetState then polls a frozen buffer and
+    /// menu accept never sees CROSS/START. Snapshot open areas into
+    /// <see cref="_padAreasGhost"/> so <see cref="TickPadDma"/> can keep refreshing those
+    /// DMA surfaces until a real OPEN arrives (active map is still cleared so re-OPEN works).
+    /// </remarks>
     /// <param name="rebootArg">
     /// Optional RESET_CMD arg string (e.g. <c>rom0:UDNL cdrom0:\MODULE\IOPRP243.IMG;1</c>).
     /// When present, updates the LOADFILE GetVersion ASCII tag so SN/Midway clients that
@@ -356,6 +364,13 @@ public sealed class RealSifRpc
     /// </param>
     public void OnIopReboot(string? rebootArg = null)
     {
+        // Snapshot for ghost DMA refresh; clear active map so re-OPEN can succeed.
+        if (_padAreas.Count > 0)
+        {
+            _padAreasGhost.Clear();
+            foreach (var kv in _padAreas)
+                _padAreasGhost[kv.Key] = kv.Value;
+        }
         _padAreas.Clear();
         if (!string.IsNullOrEmpty(rebootArg))
         {
@@ -366,8 +381,8 @@ public sealed class RealSifRpc
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1"
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[RPC] OnIopReboot: cleared pad open areas; ioprpVer=\"{_lastIopRpVersionAscii}\" " +
-                $"arg=\"{rebootArg}\"");
+                $"[RPC] OnIopReboot: cleared pad open areas; ghost={_padAreasGhost.Count} " +
+                $"ioprpVer=\"{_lastIopRpVersionAscii}\" arg=\"{rebootArg}\"");
     }
 
     /// <summary>
@@ -4127,6 +4142,12 @@ public sealed class RealSifRpc
 
     // (port<<8|slot) -> open DMA area + layout style
     private readonly Dictionary<uint, PadOpenEntry> _padAreas = new();
+    /// <summary>
+    /// Last-known open pad areas retained across IOP reboot. Active map is cleared so
+    /// re-OPEN can succeed; ghost map keeps EE-polled DMA surfaces live until re-OPEN
+    /// (MK IOPRP300 gen≥2 never re-OPEN'd while EE still polls the old padArea).
+    /// </summary>
+    private readonly Dictionary<uint, PadOpenEntry> _padAreasGhost = new();
     private uint _padFrame;
 
     private int HandlePad(SystemMemory mem, PadInput pad, uint fno, uint argBuf, uint recvBuf, bool oldStyle)
@@ -4180,7 +4201,10 @@ public sealed class RealSifRpc
                     else
                     {
                         bool style = cmd == PadRpcCmdOpenOld || useOld;
-                        _padAreas[key] = new PadOpenEntry { PadArea = padArea, OldStyle = style };
+                        var entry = new PadOpenEntry { PadArea = padArea, OldStyle = style };
+                        _padAreas[key] = entry;
+                        // Real OPEN supersedes any ghost for this port/slot.
+                        _padAreasGhost.Remove(key);
                         InitPadArea(mem, pad, padArea, style);
                         result = 1;
                         // padOpenResult: result @+0x0C, padBuf @+0x14 (libpad.c)
@@ -4194,6 +4218,11 @@ public sealed class RealSifRpc
                             mem.Write32(recvBuf + 0x0C, 1);
                             mem.Write32(recvBuf + 0x14, padArea);
                         }
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                            || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine(
+                                $"[RPC] PADMAN OPEN port={port} slot={slot} area=0x{padArea:X8} " +
+                                $"old={style} opens={_padAreas.Count}");
                     }
                 }
                 else result = 0;
@@ -4406,9 +4435,9 @@ public sealed class RealSifRpc
             mem.Write8(dataBase + o, 0x00); // pressure / reserved
     }
 
-    private void RefreshAllPadAreas(SystemMemory mem, PadInput pad)
+    private void RefreshPadMap(SystemMemory mem, PadInput pad, Dictionary<uint, PadOpenEntry> map)
     {
-        foreach (var kv in _padAreas)
+        foreach (var kv in map)
         {
             uint padArea = kv.Value.PadArea;
             if (padArea == 0 || padArea >= SystemMemory.RDRAM_SIZE - 0x80) continue;
@@ -4426,18 +4455,34 @@ public sealed class RealSifRpc
         }
     }
 
+    private void RefreshAllPadAreas(SystemMemory mem, PadInput pad)
+    {
+        RefreshPadMap(mem, pad, _padAreas);
+        // After IOP reboot with no re-OPEN yet, keep ghost surfaces live so EE padRead
+        // still sees STABLE + current buttons (MK gen≥2 IOPRP300 path).
+        if (_padAreas.Count == 0 && _padAreasGhost.Count > 0)
+            RefreshPadMap(mem, pad, _padAreasGhost);
+    }
+
     /// <summary>
     /// IOP PADMAN continuous update — padGetState/padRead are EE-side DMA buffer polls,
     /// not RPC. Call once per VBlank so STABLE + button data stay live.
+    /// Also refreshes ghost areas retained across IOP reboot until re-OPEN.
     /// </summary>
     public void TickPadDma(SystemMemory mem, PadInput pad)
     {
-        if (_padAreas.Count == 0) return;
+        if (_padAreas.Count == 0 && _padAreasGhost.Count == 0) return;
         RefreshAllPadAreas(mem, pad);
     }
 
-    /// <summary>Test/diagnostics: number of currently open pad DMA areas.</summary>
+    /// <summary>Test/diagnostics: number of currently open pad DMA areas (active only).</summary>
     public int OpenPadCount => _padAreas.Count;
+
+    /// <summary>Ghost pad areas retained across IOP reboot (diagnostics).</summary>
+    public int GhostPadCount => _padAreasGhost.Count;
+
+    /// <summary>Force-refresh pad DMA now (menu pad inject / host present). Safe no-op when empty.</summary>
+    public void ForceRefreshPad(SystemMemory mem, PadInput pad) => TickPadDma(mem, pad);
 
 
 

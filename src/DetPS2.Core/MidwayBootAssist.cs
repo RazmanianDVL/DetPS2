@@ -1135,14 +1135,31 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeInjectMenuPad(sys);
-        // Post-spine memset loop at 0x385278 (a1..a2 clear) with absurd end parks the
-        // EE after gifP3=12 — force epilogue so title/menu can run (pad then moves PC).
-        if (c >= 65_000_000 && sys.Gif.Path3Transfers >= 11)
+        // Post-WAD / post-spine memset at 0x385278 (a1..a2 clear). Inverted a2<a1 walks
+        // the whole VA space via bne and WIPES EE code (live: main 0x212F70→0 by 64.8M,
+        // nop-sled rescue at 0x215FF8). Break as soon as bulk WAD is in — do not wait for
+        // gifP3≥11 (wipe races the spine restore).
+        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeBreakMenuMemset(sys);
         // After logo spine, kill countdown thrash at 0x427594 (pad-poll callback list)
         // when s2 is absurd so CROSS/DOWN can reach accept paths past the list.
         if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
             MaybeBreakMenuCallbackCountdown(sys);
+        // Post-spine pump thrash (empty group-6): re-home toward Midway main so menu
+        // state machine can observe pad edges written into ghost PADMAN DMA areas.
+        if (c >= 90_000_000 && sys.Gif.Path3Transfers >= 12)
+            MaybeKickMainFromPumpThrash(sys);
+        // Title-band hash/mix loops with corrupt cursors walk into ELF code
+        // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
+        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
+        {
+            MaybeBreakTitleHashCodeWalk(sys);
+            MaybeBreakTitleHashCodeWalk2(sys);
+        }
+        // VU blit at 0x385674 sqc2 vi5,0(a0) with corrupt a0 overwrites EE code
+        // (live find-writer: pc=0x385674 cyc≈81.9M zeros main).
+        if (c >= 65_000_000 && sys.Gif.Path3Transfers >= 11)
+            MaybeGuardVuBlitCodeDest(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
 
@@ -2198,48 +2215,62 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong _lastMemsetBreakCyc;
     private int _memsetBreaks;
 
+    private bool _memsetFnStubbed;
+
     /// <summary>
-    /// Post-spine clear loop at <c>0x385278</c>: <c>sw zero,0(a1); a1+=4; bne a1,a2</c>.
-    /// Live pad-inject parks here with a2-a1 enormous after gifP3 hits 12 — pad cannot
-    /// be observed until the loop ends. Force <c>jr ra</c> when remaining words &gt; 256K.
-    /// After first break, permanently nop the back-edge so re-entry cannot re-stall.
+    /// Clear loop at <c>0x385278</c>: <c>sw zero,0(a1); a1+=4; bne a1,a2</c>.
+    /// When <c>a2 &lt; a1</c> or remain is huge the loop <b>zeros EE code</b> (live:
+    /// main <c>0x212F70</c> wiped; progressive a1 walked 0x670→0x1081e0 across breaks).
+    /// After bulk WAD: permanently stub the clear function to <c>jr ra</c> so re-entry
+    /// cannot keep advancing a1 through the ELF image. No break-count cap.
     /// </summary>
     private void MaybeBreakMenuMemset(Ps2System sys)
     {
-        // Permanent: once spine is up, kill the back-edge so absurd clears fall through
-        // after at most one store. Live pad-inject re-entered 0x3854xx for ~20M cycles.
-        // 0x38528C was: bne v0, zero, 0x385278 — nop it.
-        if (sys.Gif.Path3Transfers >= 11 && sys.Memory.Read32(0x0038528C) != 0u)
+        // Permanent stub once WAD is bulk-loaded: replace clear body with jr ra / nop.
+        // Live: back-edge-only nop was not enough — caller re-entered with advancing a1
+        // and 128 break cap then allowed free wipe of 0x100000.. code.
+        if (sys.Cdvd.SectorsRead >= 100_000 && !_memsetFnStubbed)
         {
-            sys.Memory.Write32(0x0038528C, 0u); // nop back-edge
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && _memsetBreaks == 0)
+            // 0x385278 is the store; epilogue jr ra at 0x385294. Stub entry of the
+            // tight loop so any path into the clear becomes an immediate return.
+            // Keep delay-slot friendly: jr ra; nop at 0x385278.
+            sys.Memory.Write32(0x00385278, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x0038527C, 0x00000000u); // nop
+            // Also nop historical back-edge if present.
+            if (sys.Memory.Read32(0x0038528C) != 0u)
+                sys.Memory.Write32(0x0038528C, 0u);
+            _memsetFnStubbed = true;
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[BIOS] plant memset back-edge nop @ 0x38528C gifP3={sys.Gif.Path3Transfers} " +
-                    $"cyc={sys.MasterCycles}");
+                    $"[BIOS] stub menu memset 0x385278 -> jr ra (code-wipe guard) " +
+                    $"gifP3={sys.Gif.Path3Transfers} cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
         }
 
+        // ONLY the tight clear loop (0x385278..0x385290). Live disasm: 0x3854C0.. is COP2
+        // VU math (jr ra @ 0x3854C0/0x385534) — treating that band as memset false-positives
+        // snapped a1/a2 mid-VU and thrashed title for tens of M cycles.
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-        if (pc is < 0x00385260 or > 0x00385290) return;
-        if (sys.MasterCycles - _lastMemsetBreakCyc < 100_000) return;
-        if (_memsetBreaks >= 64) return;
+        if (pc is < 0x00385270 or > 0x00385290) return;
+        if (sys.MasterCycles - _lastMemsetBreakCyc < 10_000) return;
 
         uint a1 = (uint)(sys.EE.GetGpr(5).Lo & 0x1FFFFFFFUL); // cursor
         uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0x1FFFFFFFUL); // end
         ulong remain = a2 >= a1 ? (ulong)(a2 - a1) : ulong.MaxValue;
-        // Also snap when inverted (a2 < a1 → wrap remain) or clearly past RDRAM.
-        bool absurd = remain >= 0x100000 || a2 < a1 || a2 >= 0x02000000 || a1 >= 0x02000000;
-        if (!absurd) return;
+        bool absurd = remain >= 0x40000 || a2 < a1 || a2 >= 0x02000000 || a1 >= 0x02000000
+            || (a1 < 0x00780000 && remain >= 0x1000);
+        // Permanent stub already makes the loop a jr ra — still clamp a1 if we land here
+        // before the stub fetch (branch delay / cached path).
+        if (!absurd && !_memsetFnStubbed) return;
 
-        // Snap to epilogue jr ra (0x385294).
-        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a2 }); // a1 = end
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a2 == 0 ? a1 : a2 });
         sys.EE.PC = 0x00385294;
         sys.LastGoodEePc = 0x00385294;
         _lastMemsetBreakCyc = sys.MasterCycles;
         _memsetBreaks++;
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_memsetBreaks <= 8 || _memsetBreaks % 8 == 0))
+            && (_memsetBreaks <= 8 || _memsetBreaks % 16 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] break menu memset a1=0x{a1:X8} a2=0x{a2:X8} remain=0x{remain:X} " +
                 $"-> 0x385294 n={_memsetBreaks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
@@ -2252,7 +2283,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Live pad-poll band <c>0x427570..0x427594</c>: countdown <c>s2</c> with
     /// <c>bgezl s2, loop; jalr callback</c>. With HLE-corrupt list length s2 is huge
     /// (or never reaches -1) so CROSS accept never falls through to the epilogue that
-    /// bumps the menu tick at <c>0x55E5E8+s4</c>. Clamp s2 so the list finishes.
+    /// bumps the menu tick at <c>0x54E5E8+s4</c> (MIPS <c>lui 0x55; addiu -6680</c>).
+    /// Clamp s2 so the list finishes. Live: index-6 tick at 0x54E600 advances millions
+    /// when s2 is the natural constant 5 — only absurd s2 needs this snap.
     /// </summary>
     private void MaybeBreakMenuCallbackCountdown(Ps2System sys)
     {
@@ -2262,7 +2295,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_cbCountdownBreaks >= 64) return;
 
         long s2 = unchecked((int)(uint)sys.EE.GetGpr(18).Lo);
-        // Real callback lists are tiny. Negative means already done (bgezl falls through).
+        // Real callback lists are tiny (entry hardcodes s2=5). Negative means already done.
         if (s2 < 0 || s2 < 64) return;
 
         // Snap to one last iteration then fall through (s2 = 0 → next bgezl may still
@@ -2375,6 +2408,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
 
+        // Push buttons into PADMAN DMA immediately (not only on next PCRTC VBlank).
+        // After IOPRP300 gen≥2 reboot RealSifRpc keeps ghost areas — ForceRefreshPad
+        // writes STABLE + active-low buttons into the EE pad buffer the game polls.
+        try
+        {
+            var rpc = sys.Hle?.Sony?.RealRpc;
+            rpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _menuPadPulses <= 4
+                && sys.Gif.Path3Transfers >= 11)
+                Console.Error.WriteLine(
+                    $"[BIOS] menu pad pulse n={_menuPadPulses} btn=0x{buttons:X4} " +
+                    $"open={rpc?.OpenPadCount ?? -1} ghost={rpc?.GhostPadCount ?? -1} " +
+                    $"pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+        }
+        catch { /* ignore */ }
+
         // Keep workers alive so pad edge is observed on a running thread.
         if (sys.Gif.Path3Transfers >= 11 && (_menuPadPulses % 2) == 0)
         {
@@ -2399,6 +2449,192 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
             _menuSpineKicks++;
         }
+
+        // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
+        // (*0x75E950 all zero — live dump), yield once toward Midway main so title/menu
+        // state machine can observe the pad edge we just wrote.
+        if (sys.Gif.Path3Transfers >= 12 && _menuPadPulses >= 8 && (_menuPadPulses % 16) == 0)
+            MaybeKickMainFromPumpThrash(sys);
+    }
+
+    private int _mainFromPumpKicks;
+    private ulong _lastMainKickCyc;
+    private ulong _lastTitleHashBreakCyc;
+    private int _titleHashBreaks;
+    private ulong _lastVuBlitGuardCyc;
+    private int _vuBlitGuards;
+
+    private ulong _lastTitleHash2Cyc;
+    private int _titleHash2Breaks;
+
+    /// <summary>
+    /// Second mix loop at <c>0x47EF68..0x47EFB4</c>: <c>sh v0,0(t0); sh a1,2(t0); t0+=4</c>.
+    /// Live find-writer: t0 lands on main at cyc≈119.5M (<c>sh a1,2(t0)</c> @ 0x47EFA8).
+    /// </summary>
+    private void MaybeBreakTitleHashCodeWalk2(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x0047EF60 or > 0x0047EFB8) return;
+        if (sys.MasterCycles - _lastTitleHash2Cyc < 20_000) return;
+        if (_titleHash2Breaks >= 64) return;
+
+        uint t0 = (uint)(sys.EE.GetGpr(8).Lo & 0x1FFFFFFFUL);
+        if (t0 is < 0x00100000 or >= 0x00780000) return;
+
+        // Exit loop: clear a2 (bne a2,zero) and jump past.
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2 = 0
+        sys.EE.PC = 0x0047EFB8;
+        sys.LastGoodEePc = 0x0047EFB8;
+        _lastTitleHash2Cyc = sys.MasterCycles;
+        _titleHash2Breaks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_titleHash2Breaks <= 12 || _titleHash2Breaks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] break title hash2 code-walk t0=0x{t0:X8} -> 0x47EFB8 " +
+                $"n={_titleHash2Breaks} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// VU copy at <c>0x385660..0x385688</c>: 4× <c>lqc2 / mix / sqc2 vi5,0(a0); a0+=16</c>.
+    /// Live find-writer: <c>a0</c> can point into the ELF image so <c>sqc2</c> @ <c>0x385674</c>
+    /// zeros Midway main. Redirect <c>a0</c> to a scratch page or force <c>jr ra</c> when dest
+    /// is code. Scratch is high RDRAM unused by typical Midway heaps.
+    /// </summary>
+    private void MaybeGuardVuBlitCodeDest(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x00385650 or > 0x00385688) return;
+        if (sys.MasterCycles - _lastVuBlitGuardCyc < 10_000) return;
+        if (_vuBlitGuards >= 128) return;
+
+        uint a0 = (uint)(sys.EE.GetGpr(4).Lo & 0x1FFFFFFFUL);
+        // Dest in ELF code/rodata image → code wipe.
+        if (a0 is < 0x00100000 or >= 0x00780000) return;
+        // Allow writes into known high BSS-ish if we ever need; for now any code-image dest is bad.
+        const uint scratch = 0x01F00000;
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = scratch }); // a0 -> scratch
+        // Also force countdown done so we don't keep blitting 4 quads into scratch needlessly
+        // when the real dest was nonsense — exit via jr ra at 0x385688.
+        sys.EE.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 }); // a3 = 0
+        sys.EE.PC = 0x00385688;
+        sys.LastGoodEePc = 0x00385688;
+        _lastVuBlitGuardCyc = sys.MasterCycles;
+        _vuBlitGuards++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_vuBlitGuards <= 12 || _vuBlitGuards % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] guard VU blit code-dest a0 was 0x{a0:X8} -> scratch/exit " +
+                $"n={_vuBlitGuards} cyc={sys.MasterCycles}");
+    }
+
+
+    /// <summary>
+    /// Title path <c>0x47EAF0..0x47EB30</c>: mix/hash loop
+    /// <c>a3=s1+0x14; for i in 0..*(s1+0x10): *a3 = mix(*a3); a3+=4</c>.
+    /// Live find-writer: when <c>s1</c> is garbage, <c>a3</c> lands on EE code and
+    /// <c>sw v0,0(a3)</c> @ <c>0x47EB28</c> zeros Midway main (<c>0x212F70</c> at
+    /// cyc≈89182640). Abort the loop when a3/s1 points into the ELF image or count is absurd.
+    /// </summary>
+    private void MaybeBreakTitleHashCodeWalk(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x0047EAE0 or > 0x0047EB30) return;
+        if (sys.MasterCycles - _lastTitleHashBreakCyc < 20_000) return;
+        if (_titleHashBreaks >= 64) return;
+
+        uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
+        uint a3 = (uint)(sys.EE.GetGpr(7).Lo & 0x1FFFFFFFUL);
+        uint s2 = (uint)sys.EE.GetGpr(18).Lo; // remaining/limit count
+        // Only intervene when the store pointer is in / will enter the ELF image.
+        bool a3InCode = a3 is >= 0x00100000 and < 0x00780000;
+        bool s1InCode = s1 is >= 0x00100000 and < 0x00780000;
+        // Huge count with a3 already near code base (or null object about to walk).
+        bool countThreatensCode = s2 > 0x10000 && a3 is >= 0x00080000 and < 0x00780000;
+        if (!a3InCode && !s1InCode && !countThreatensCode) return;
+
+        // Force loop exit: t1=s2 so slt a2,t1,s2 is false; jump past bne to 0x47EB34.
+        sys.EE.SetGpr(9, new EmotionEngine.Gpr128 { Lo = s2 }); // t1 = s2
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = 0 }); // s2 = 0
+        sys.EE.PC = 0x0047EB34; // beq s3 / epilogue path
+        sys.LastGoodEePc = 0x0047EB34;
+        _lastTitleHashBreakCyc = sys.MasterCycles;
+        _titleHashBreaks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_titleHashBreaks <= 12 || _titleHashBreaks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] break title hash code-walk s1=0x{s1:X8} a3=0x{a3:X8} s2=0x{s2:X} " +
+                $"-> 0x47EB34 n={_titleHashBreaks} cyc={sys.MasterCycles}");
+    }
+
+
+    /// <summary>
+    /// Live (2026-07-30): after gifP3=12 the EE oscillates <c>0x4148EC</c>↔<c>0x4275xx</c>
+    /// (ADX pump group-6 dispatch) with multi-slot table at <c>0x75E950</c> empty and frame
+    /// callback <c>*0x75BDD8</c> null. Menu tick at <c>0x54E600</c> advances millions but no
+    /// UI accept path runs — pump is a pure no-op dispatcher. Re-home to Midway main
+    /// (<c>0x212F70</c>) so title/menu can observe pad edges in ghost PADMAN DMA.
+    /// Do NOT plant <c>*0x75C0D0</c>.
+    /// </summary>
+    private void MaybeKickMainFromPumpThrash(Ps2System sys)
+    {
+        if (_mainFromPumpKicks >= 48) return;
+        if (sys.MasterCycles - _lastMainKickCyc < 500_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inPump = pc is (>= 0x004147F8 and <= 0x00414A80)
+            or (>= 0x00427518 and <= 0x004276A0)
+            or (>= 0x0047FD60 and <= 0x0047FE00)
+            // Live pad-inject samples also park on the bgezl itself and epilogue.
+            or (>= 0x00427590 and <= 0x004275E0)
+            or (>= 0x004148C0 and <= 0x00414910);
+        if (!inPump) return;
+
+        // Only when group-6 multi-slot table is still empty (live: all zero at 100M).
+        if (sys.Memory.Read32(0x0075E950) != 0) return;
+        // Bail if inverted-memset already wiped main — re-homing into zeros is worse.
+        if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return;
+
+        // Wake every non-pump worker first so main-shaped peers can run.
+        var kernel = sys.Hle?.Kernel;
+        if (kernel != null)
+        {
+            foreach (var t in kernel.AllThreads)
+            {
+                if (!t.Alive) continue;
+                // Leave pure ADX pump entry alone if it's the only thing making ticks.
+                if (t.Entry == 0x004147F8u) continue;
+                if (t.SoftSuspended) t.SoftSuspended = false;
+                while (t.SuspendCount > 0) kernel.ResumeThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                    kernel.WakeupThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId > 0 && t.WaitSemaId < 64)
+                {
+                    try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                }
+            }
+        }
+
+        // Re-home current context to Midway main. Pump thread will be rescheduled later
+        // via Create/Start or residual; empty group-6 means we lose nothing by leaving.
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (sp < 0x01000000 || sp >= (uint)SystemMemory.RDRAM_SIZE)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        // Ensure a1/a0 look non-wild for main (daddu s0,a1 / daddu s1,a0 at entry).
+        sys.EE.PC = 0x00212F70;
+        sys.LastGoodEePc = 0x00212F70;
+        _lastMainKickCyc = sys.MasterCycles;
+        _mainFromPumpKicks++;
+        Assists++;
+        // Keep pad DMA live across the kick.
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_mainFromPumpKicks <= 12 || _mainFromPumpKicks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] re-home pump thrash 0x{pc:X8} -> Midway main 0x212F70 " +
+                $"n={_mainFromPumpKicks} open={sys.Hle?.Sony?.RealRpc?.OpenPadCount} " +
+                $"ghost={sys.Hle?.Sony?.RealRpc?.GhostPadCount} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -2482,11 +2718,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
         }
 
-        // Known live boot targets once bulk WAD is in (prefer main over pump after thrash).
+        // Known live boot targets once bulk WAD is in. Prefer main ONLY while its prolog
+        // is still intact — inverted memset can wipe 0x212F70 (live mainOp=0 by 64.8M).
         if (resume == 0 || forceKnown)
         {
             if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
-                resume = 0x00212F70; // Midway main
+                resume = 0x00212F70; // Midway main (intact)
             else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
                 resume = 0x004147F8; // ADX pump
             else if (sys.Memory.IsLikelyEeCode(0x004145A8UL))
@@ -2701,7 +2938,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 3 or 4 => (uint)PadInput.Button.Cross,
                 _ => 0u
             };
-            try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+            try
+            {
+                sys.Pad.SetButtons(buttons);
+                sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+            }
+            catch { /* ignore */ }
         }
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
