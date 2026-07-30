@@ -91,9 +91,11 @@ These remain for later deepening but do **not** leave commercial boot without a 
 
 | Field | Value |
 |-------|--------|
-| Status | **CLOSED** |
+| Status | **CLOSED** (commercial required-26) |
+| **G0 BIOS core** | **BIOS_CORE_COMPLETE** — `BIOS_COMPLETION_VERDICT.md` |
 | Closed date | 2026-07-30 |
-| Closed by | orchestrator (waves 1–4 integrated; full smoke green) |
-| Smoke evidence | `BiosBootHost_IopBtConfContracts` required=26; `BiosRomdirGate_PortDocsForRequiredModules`; `=== ALL SMOKE TESTS PASSED ===` |
+| Closed by | orchestrator + multi-agent G0 phase campaign (plan #29) |
+| Smoke evidence | Required + extended BIOS smokes; `=== ALL SMOKE TESTS PASSED ===` |
+| Tracking | GitHub **#29** (closed completed) |
 
-**Commercial multi-title troubleshooting may begin** (orchestrator may now spawn per-game agents). Per-game work must still prefer generic BIOS fixes when a bug is shared.
+**Commercial multi-title work may resume** with the rule: prefer shared BIOS/HLE over GameQuirks when the bug is generic.
