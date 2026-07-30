@@ -49,6 +49,8 @@ public sealed class IopExtendedBiosHost
     private ulong _iopRpImagesApplied;
     private int _lastIopRpModulesRegistered;
     private int _lastIopRpElfsLoaded;
+    /// <summary>When true, next ApplyIopRpImageCore skips LoadIrx (UDNL commercial handoff).</summary>
+    private bool _iopRpNameOnlyApply;
     private string _lastUdnlArg = "";
     private string _lastUdnlVersion = "";
     private string _lastIopRpSource = "";
@@ -172,6 +174,22 @@ public sealed class IopExtendedBiosHost
         foreach (string n in UdnlImageModuleNames)
             sys.IopModules.RegisterModule(n, systemResident: true);
 
+        // Diagnostic: skip image apply entirely (name list above still registers).
+        // Live SM A/B: full ApplyIopRpImage (even name-only) correlated with Exit@13M —
+        // leave this opt-out while diagnosing; default remains apply-on.
+        if (string.Equals(Environment.GetEnvironmentVariable("DETPS2_UDNL_SKIP_IMAGE"), "1",
+                StringComparison.Ordinal))
+        {
+            ApplyClearSpu(sys);
+            sys.IopModules.RegisterModule("SECRMAN", systemResident: true);
+            _udnlApplies++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] UDNL handoff SKIP image applies={_udnlApplies} ver=\"{_lastUdnlVersion}\" " +
+                    $"arg=\"{_lastUdnlArg}\"");
+            return;
+        }
+
         // Version-specific IOPRP token (e.g. IOPRP300) already handled by BiosBootHost;
         // re-assert here so a direct call still works.
         if (!string.IsNullOrEmpty(_lastUdnlVersion) && _lastUdnlVersion.Length >= 3)
@@ -184,11 +202,15 @@ public sealed class IopExtendedBiosHost
         }
 
         // Prefer real IOPRP/DNAS container when path is resolvable via FILEIO/ISO.
+        // Name-only: HLE already provides FILEIO/PADMAN/CDVD/… — do not LoadIrx retail
+        // IRX bodies that upgrade name registrations (mission: ignore literal IRX exec).
         byte[]? image = TryResolveUdnlImageBytes(sys, _lastUdnlArg);
         if (image != null && image.Length >= 32)
         {
             string src = ExtractUdnlImagePath(_lastUdnlArg) ?? "udnl-image";
-            ApplyIopRpImage(sys, image, src);
+            _iopRpNameOnlyApply = true;
+            try { ApplyIopRpImage(sys, image, src); }
+            finally { _iopRpNameOnlyApply = false; }
         }
 
         // CLEARSPU is commonly re-run after UDNL image apply.
@@ -207,9 +229,11 @@ public sealed class IopExtendedBiosHost
     }
 
     /// <summary>
-    /// Parse a retail IOPRP/DNAS ROMDIR-in-IMG container and register / LoadIrx modules.
+    /// Parse a retail IOPRP/DNAS ROMDIR-in-IMG container and register module names.
     /// Common layout: <c>RESET</c> entry at offset 0, cumulative naive payloads, optional
     /// <c>IOPBTCONF</c> text listing load order (else all non-meta ROMDIR names).
+    /// Direct callers (smokes) LoadIrx extractable ELFs. UDNL commercial handoff uses
+    /// name-only via <see cref="_iopRpNameOnlyApply"/> (or <c>DETPS2_IOPRP_NAME_ONLY=1</c>).
     /// </summary>
     /// <returns>Number of module names registered from the image.</returns>
     public int ApplyIopRpImage(Ps2System sys, byte[] image, string? sourceName = null)
@@ -259,6 +283,12 @@ public sealed class IopExtendedBiosHost
         int registered = 0;
         int elfs = 0;
         var names = new List<string>();
+        // Direct ApplyIopRpImage (smokes): LoadIrx extractable ELFs.
+        // UDNL commercial handoff sets _iopRpNameOnlyApply (HLE services already present).
+        // DETPS2_IOPRP_NAME_ONLY=1 forces name-only for all callers.
+        bool loadElfs = !_iopRpNameOnlyApply
+            && !string.Equals(Environment.GetEnvironmentVariable("DETPS2_IOPRP_NAME_ONLY"), "1",
+                StringComparison.Ordinal);
         foreach (string modName in loadList)
         {
             if (string.IsNullOrWhiteSpace(modName)) continue;
@@ -267,6 +297,8 @@ public sealed class IopExtendedBiosHost
             modules.RegisterModule(key, systemResident: true);
             registered++;
             names.Add(key);
+
+            if (!loadElfs) continue;
 
             // Load ELF into IOP RAM when extractable from the image.
             byte[]? elf = ExtractEntryElf(image, entries, key);
@@ -314,7 +346,8 @@ public sealed class IopExtendedBiosHost
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[BIOS] IOPRP apply src=\"{sourceName}\" entries={entries.Count} " +
-                $"btconf={btconf.Count} reg={registered} elfs={elfs}");
+                $"btconf={btconf.Count} reg={registered} elfs={elfs}" +
+                (loadElfs ? "" : " (name-only)"));
 
         return registered;
     }

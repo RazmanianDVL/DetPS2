@@ -748,10 +748,17 @@ public sealed class KernelState
     }
 
     /// <summary>
+    /// When true, <see cref="FindNextRunnable"/> uses circular RR (ignores Priority).
+    /// Midway SM (SLUS_210.87) needs this: G0 priority band + preempt reordered ADX pump
+    /// vs main → Exit@12.4M / no WAD. Default false preserves THREADMAN priority smokes.
+    /// Env <c>DETPS2_RR_SCHED=1</c> forces RR; <c>DETPS2_PRIO_SCHED=1</c> forces priority.
+    /// </summary>
+    public bool PreferRoundRobinSched { get; set; }
+
+    /// <summary>
     /// Find next runnable thread id, or <paramref name="afterId"/> if none.
-    /// Priority-aware (THREADMAN readyq / μITRON): lower <see cref="Thread.Priority"/> runs first.
-    /// Among equal priority, circular order after <paramref name="afterId"/> keeps determinism
-    /// (round-robin within a priority band).
+    /// Default: priority-aware (THREADMAN readyq / μITRON: lower Priority runs first).
+    /// Circular RR when <see cref="PreferRoundRobinSched"/> or <c>DETPS2_RR_SCHED=1</c>.
     /// </summary>
     public int FindNextRunnable(int afterId)
     {
@@ -759,37 +766,64 @@ public sealed class KernelState
         for (int i = 0; i < _threads.Count; i++)
             if (_threads[i].Id == afterId) { idx = i; break; }
 
-        // Best priority among OTHER runnable threads (exclude afterId for selection).
-        int bestPrio = int.MaxValue;
-        bool found = false;
-        for (int i = 0; i < _threads.Count; i++)
+        bool forcePrio = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_PRIO_SCHED"), "1",
+            StringComparison.Ordinal);
+        bool forceRr = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_RR_SCHED"), "1",
+            StringComparison.Ordinal);
+        bool prioSched = forcePrio || (!forceRr && !PreferRoundRobinSched);
+
+        if (prioSched)
         {
-            var t = _threads[i];
-            if (t.Id == afterId) continue;
-            if (!IsRunnable(t)) continue;
-            if (t.Priority < bestPrio)
+            // Best priority among OTHER runnable threads (exclude afterId for selection).
+            int bestPrio = int.MaxValue;
+            bool found = false;
+            for (int i = 0; i < _threads.Count; i++)
             {
-                bestPrio = t.Priority;
-                found = true;
+                var t = _threads[i];
+                if (t.Id == afterId) continue;
+                if (!IsRunnable(t)) continue;
+                if (t.Priority < bestPrio)
+                {
+                    bestPrio = t.Priority;
+                    found = true;
+                }
             }
-        }
-        if (!found)
-        {
-            // Nobody else — allow main fallback when afterId is not main and main is idle-runnable
-            var main = FindThread(1);
-            if (main != null && main.Id != afterId && main.Alive && !main.Sleeping && main.SuspendCount == 0)
-                return 1;
+            if (!found)
+            {
+                var mainP = FindThread(1);
+                if (mainP != null && mainP.Id != afterId && mainP.Alive && !mainP.Sleeping
+                    && mainP.SuspendCount == 0)
+                    return 1;
+                return afterId;
+            }
+
+            for (int i = 1; i < _threads.Count; i++)
+            {
+                var t = _threads[(idx + i) % _threads.Count];
+                if (t.Id == afterId) continue;
+                if (IsRunnable(t) && t.Priority == bestPrio)
+                    return t.Id;
+            }
             return afterId;
         }
 
-        // Circular scan from afterId: first runnable at bestPrio (deterministic RR in band).
+        // Default commercial RR (pre-G0): ignore Priority field; circular after afterId.
+        // i < Count (not <=): must NOT wrap onto afterId itself (see historical thrash note).
         for (int i = 1; i < _threads.Count; i++)
         {
             var t = _threads[(idx + i) % _threads.Count];
             if (t.Id == afterId) continue;
-            if (IsRunnable(t) && t.Priority == bestPrio)
+            // Match pre-G0: Alive+Started+!Sleeping+!WaitVblank. Also respect Suspend nest.
+            if (t.Alive && t.Started && !t.Sleeping && !t.WaitVblank && t.SuspendCount == 0)
                 return t.Id;
         }
+        // Also allow main thread (id 1) even if Started flag never set
+        var main = FindThread(1);
+        if (main != null && main.Id != afterId && main.Alive && !main.Sleeping
+            && main.SuspendCount == 0)
+            return 1;
         return afterId;
     }
 
@@ -1123,6 +1157,14 @@ public sealed class KernelState
     /// </summary>
     public void MaybePreempt(EmotionEngine ee)
     {
+        // Force preemption stays ON by default (busy-loops like Midway ADX lock-wait at
+        // 0x4145xx never call WaitSema — without timeslice SM freezes sifBytes~2k).
+        // Pair with RR FindNextRunnable (DETPS2_PRIO_SCHED off) — priority+preempt combo
+        // caused Exit@12.4M on SLUS_210.87. DETPS2_NO_PREEMPT=1 disables for A/B.
+        if (string.Equals(Environment.GetEnvironmentVariable("DETPS2_NO_PREEMPT"), "1",
+                StringComparison.Ordinal))
+            return;
+
         _cyclesSinceLastPreempt++;
         if (_cyclesSinceLastPreempt < _preemptQuantum) return;
         _cyclesSinceLastPreempt = 0;

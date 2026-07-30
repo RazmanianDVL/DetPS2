@@ -259,6 +259,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_CRIFS") == "1")
             Console.Error.WriteLine($"[CRIFS] OnDiscMounted hook installed vol={_vol != null} files={_vol?.Files.Count ?? 0}");
         sys.IopModules.BindDisc(sys.Cdvd.MountedPath);
+        // G0 THREADMAN priority band + preempt reordered ADX pump vs main on this title
+        // (Exit@12.4M, cdvdSectors 198k→1). Prefer circular RR while keeping force-preempt
+        // for lock-wait busy loops. Shared flag — not a PC plant. See KernelState.PreferRoundRobinSched.
+        if (sys.Hle?.Kernel != null)
+            sys.Hle.Kernel.PreferRoundRobinSched = true;
         // Detect optional title entry kick (signature only — not a hard dependency for all games)
         _titleIsMidwayKick = sys.Memory.Read32(0x00212F70) == 0x27BDFEE0;
         BeginPreloadFrames();
@@ -1325,6 +1330,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // bulk WAD + group-6 multi plant so the frame path has real work to dispatch.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeRearmFrameCb(sys);
+        // Stream work gate *0x55E1EC must stay 1 so FUN_0043FAE8 does not early-out.
+        // Hold after multi+frame-cb plant (resource gate plants once; scrub re-opens).
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeHoldStreamWorkGate(sys);
         // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
         if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
             MaybeBreakLockWrapperThrash(sys);
@@ -2230,6 +2239,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Streaming-tick countdown that never gets written under HLE (DEVELOPER_GUIDE §ADX).
         if (mem.Read32(0x0055E1E8) == 0)
             mem.Write32(0x0055E1E8, 1);
+        // Stream work gate for FUN_0043FAE8: lw s1, *0x55E1EC; bne s1,1,skip.
+        // Live disasm (2026-07-30): plant at 0x55E1E8 alone left *0x55E1EC=0 so stream tick
+        // entered 0x43FAE8 then immediately took the epilogue (PC samples 0x43FB9C). Without
+        // this, cookie work / UI accept never runs even with group-6+frame-cb planted.
+        if (mem.Read32(0x0055E1EC) == 0)
+            mem.Write32(0x0055E1EC, 1);
 
         // Resource-manager pool: 8 entries × 0x2AC (FUN_0043b670), scan a few candidate bases
         // used by Midway resource manager near 0x678xxx / 0x55Exxx.
@@ -2262,6 +2277,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // so FUN_0043ce78's "every Nth tick" path can fire once main reaches it.
         if (mem.Read32(0x0055E1E8) == 0)
             mem.Write32(0x0055E1E8, 1);
+        if (mem.Read32(0x0055E1EC) == 0)
+            mem.Write32(0x0055E1EC, 1);
 
         _resourceForceScans++;
         if (fixedSlots > 0 || sys.MasterCycles > 50_000_000)
@@ -2726,6 +2743,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             uint ck3 = sys.Memory.Read32(0x005BB86C);
             uint ck4 = sys.Memory.Read32(0x005BB870);
             uint ck5 = sys.Memory.Read32(0x005BB874);
+            // Stream work gate + skip flag (FUN_0043F968 / FUN_0043FAE8).
+            uint gateEc = sys.Memory.Read32(0x0055E1EC);
+            uint skip200 = sys.Memory.Read32(0x0055E200); // *(FUN_0043CB18()+16)
+            uint cas248 = sys.Memory.Read32(0x0055E248); // FUN_0043F2C0 compare-and-set cell
             // Small-int candidates in menu cluster (selection index 0..15).
             var small = new System.Text.StringBuilder();
             for (uint off = 0; off < 0x80; off += 4)
@@ -2739,6 +2760,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"*54E600={t4:X8} *54E610={t5:X8}/{t6:X8}/{t7:X8}/{t8:X8} " +
                 $"*54E620={t9:X8}/{ta:X8}/{tb:X8} fcb=0x{fcb:X8} g6=0x{g6:X8} " +
                 $"ck={ck0:X8}/{ck1:X8}/{ck2:X8}/{ck3:X8}/{ck4:X8}/{ck5:X8} " +
+                $"gateEc={gateEc:X} skip200={skip200:X} cas248={cas248:X} " +
                 $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
                 $"n={_menuPadPulses} cyc={sys.MasterCycles}");
             if (small.Length > 0)
@@ -3105,6 +3127,56 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong _lastFrameCbRearmCyc;
     private int _lockWrapperBreaks;
     private ulong _lastLockWrapperBreakCyc;
+    private int _streamWorkGateHolds;
+    private ulong _lastStreamWorkGateCyc;
+
+    /// <summary>
+    /// Hold stream-work gate <c>*0x55E1EC = 1</c> once group-6 multi / frame-cb are live.
+    /// <para>
+    /// Disasm of <c>FUN_0043FAE8</c> (stream tick work leaf):
+    /// <c>lw s1, *0x55E1EC; bne s1,1,epilogue</c>. Prior plant only wrote <c>0x55E1E8</c>
+    /// (FUN_0043ce78 countdown). Live menu-sel dumps kept cookie <c>0x5BB860</c> zero and
+    /// PC samples parked on epilogue <c>0x43FB9C</c> — work body never ran.
+    /// Secondary check <c>FUN_0043F2C0(base+0x58)</c> is a compare-and-set on
+    /// <c>*0x55E248</c> (returns 1 when previously not 1) — leave that for the game.
+    /// </para>
+    /// Do NOT plant <c>*0x75C0D0</c>. Prefer SHARED if a generic stream-manager ready
+    /// contract emerges; for now TITLE_LOCAL (wrong offset was a title-assist bug).
+    /// </summary>
+    private void MaybeHoldStreamWorkGate(Ps2System sys)
+    {
+        if (_streamWorkGateHolds >= 24) return;
+        if (sys.MasterCycles - _lastStreamWorkGateCyc < 1_000_000) return;
+
+        // Prefer after multi+frame-cb plant so we do not open work on an empty pump.
+        bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
+        bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
+        if (!multiLive && !frameCbLive && sys.Cdvd.SectorsRead < 180_000)
+            return;
+
+        uint gate = sys.Memory.Read32(0x0055E1EC);
+        if (gate == 1)
+        {
+            // Also keep sibling countdown non-zero if scrubbed.
+            if (sys.Memory.Read32(0x0055E1E8) == 0)
+                sys.Memory.Write32(0x0055E1E8, 1);
+            return;
+        }
+
+        sys.Memory.Write32(0x0055E1EC, 1);
+        if (sys.Memory.Read32(0x0055E1E8) == 0)
+            sys.Memory.Write32(0x0055E1E8, 1);
+
+        _streamWorkGateHolds++;
+        _lastStreamWorkGateCyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _streamWorkGateHolds <= 6)
+            Console.Error.WriteLine(
+                $"[BIOS] hold stream work gate *0x55E1EC=1 (was 0x{gate:X8}) " +
+                $"n={_streamWorkGateHolds} multi={(multiLive ? 1 : 0)} fcb={(frameCbLive ? 1 : 0)} " +
+                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
 
     /// <summary>
     /// Re-arm frame callback <c>*0x75BDD8</c> after ADX init zeros it.

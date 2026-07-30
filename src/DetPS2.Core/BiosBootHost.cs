@@ -312,7 +312,11 @@ public sealed class BiosBootHost
         // Functional UDNL handoff: version tag + CLEARSPU + common IOPRP module names.
         // RealRpc.OnIopReboot still runs from SonyKernelHle.OnIopRebootCompleted (after this).
         // Titles still plant EE RAM version cells when they bypass LOADFILE GetVersion.
-        sys.IopExtendedBios.ApplyUdnlHandoff(sys, sys.Sif.LastIopRebootArg);
+        // DETPS2_UDNL_SKIP_HANDOFF=1: leave pre-G0 reboot surface (name re-reg only) — A/B for
+        // commercial titles that Exit early when full UDNL image path runs.
+        if (!string.Equals(Environment.GetEnvironmentVariable("DETPS2_UDNL_SKIP_HANDOFF"), "1",
+                StringComparison.Ordinal))
+            sys.IopExtendedBios.ApplyUdnlHandoff(sys, sys.Sif.LastIopRebootArg);
         host._iopRebootHandoffs++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1" ||
             Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
