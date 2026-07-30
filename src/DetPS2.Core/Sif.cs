@@ -368,13 +368,18 @@ public sealed class Sif : ISchedulable
         if (semaId < 0 || _realRpcQueue.Count == 0) return false;
         foreach (var (addr, _) in _realRpcQueue)
         {
-            if (addr == 0 || addr >= SystemMemory.RDRAM_SIZE - 0x30) continue;
-            uint cid = mem.Read32(addr + 8);
+            // EE sifrpc often posts packets via the uncached phys window (0x20000000|pa).
+            // Bounds must use physical — raw 0x20xxxxxx fails RDRAM_SIZE and skips every
+            // entry (BO2 WAVE 4: 0 STALL / all FABRICATE → half-updated CallRpc thrash).
+            uint phys = addr & 0x1FFFFFFFu;
+            if (phys == 0 || phys >= (uint)SystemMemory.RDRAM_SIZE - 0x30u) continue;
+            uint cid = mem.Read32(phys + 8);
             // BIND/CALL: client at +28; RDATA: client at +0x1c (see RealSifRpc).
             uint cdPtr = cid == RealSifRpc.CidRpcRdata
-                ? mem.Read32(addr + 0x1c)
-                : mem.Read32(addr + 28);
-            if (cdPtr == 0 || cdPtr >= SystemMemory.RDRAM_SIZE - 0x10) continue;
+                ? mem.Read32(phys + 0x1c)
+                : mem.Read32(phys + 28);
+            cdPtr &= 0x1FFFFFFFu;
+            if (cdPtr == 0 || cdPtr >= (uint)SystemMemory.RDRAM_SIZE - 0x10u) continue;
             int pktSema = unchecked((int)mem.Read32(cdPtr + 8)); // hdr.sema_id
             if (pktSema == semaId)
                 return true;

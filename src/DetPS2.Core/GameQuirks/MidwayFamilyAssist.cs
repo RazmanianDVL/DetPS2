@@ -10,7 +10,7 @@ namespace DetPS2.Core;
 /// <list type="bullet">
 /// <item>MK: Deadly Alliance (SLUS_204.23) — PADMAN GetModVer major 4 + IOPRP ASCII GetVersion</item>
 /// <item>MK: Deception (SLUS_208.81) — IOPRP ASCII GetVersion (and XPADMAN-class pad gate)</item>
-/// <item>MK: Armageddon (SLUS_215.50) when present — same SN-family gates</item>
+/// <item>MK: Armageddon (SLUS_215.50 standard / SLUS_215.43 Premium Edition) — same SN-family gates</item>
 /// </list>
 ///
 /// Does <b>not</b> run <see cref="MidwayBootAssist"/> SM plants (no CRI, no logo spine,
@@ -22,15 +22,18 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private readonly string _serial;
     private readonly string _displayName;
 
-    // Midway custom heap: block lookup walk at 0x3BA948..0x3BA988 (Deception SLUS_208.81;
-    // same allocator family on DA). Walks tree via node+0x24 / +0x28. After incomplete
-    // MWo3 overlay free (GAMER.OVL stub → no GAMEFD.ovl body), free@0x3BA270 can leave a
-    // right-child cycle (live: C64500→C422E0→C4CD70→C64500) so the walk never exits.
+    // Midway custom heap: block lookup walk via node+0x24 / +0x28. After incomplete
+    // MWo3 overlay free (GAMER.OVL stub → no GAMEFD.ovl body), free can leave a
+    // right-child cycle so the walk never exits.
     // Prefer breaking the cycle in RDRAM (repair) over planting a permanent code stub.
-    private const uint HeapWalkPcLo = 0x003BA948;
-    private const uint HeapWalkPcHi = 0x003BA98C;
-    private const uint HeapWalkExit = 0x003BA990;
-    private const uint HeapWalkRet0 = 0x003BA900; // v0=0; restore; jr ra
+    // PC bands differ by title build; +0x24/+0x28 layout is SHARED across DA/Dec/Arm.
+    // Dec SLUS_208.81 / DA family: 0x3BA948..0x3BA98C, ret0 @ 0x3BA900
+    // Arm Premium SLUS_215.43 (live 2026-07-30): 0x42940C..0x42944C, ret0 @ 0x429450
+    private static readonly (uint Lo, uint Hi, uint Ret0)[] HeapWalkBands =
+    {
+        (0x003BA948, 0x003BA98C, 0x003BA900), // DA / Deception
+        (0x0042940C, 0x0042944C, 0x00429450), // Armageddon PE (SLUS_215.43)
+    };
 
     // DA (SLUS_204.23) wait-for-ready: while (*s0 != 4) { spin; Delay(50); poll MSL }.
     // Live: after MSL fno=0xDADA, boot opens gameart.ssf (MKDA.PAK artps2 member) and
@@ -180,12 +183,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// <summary>
     /// Detect Midway heap range-tree walk stuck on a +0x28 cycle (post-OVL free corruption)
     /// and repair by nulling one right-child link, or force a null lookup return.
-    /// Shared across DA/Deception/Armageddon — same allocator PCs on the Midway EE heap.
+    /// Shared across DA/Deception/Armageddon — same +0x24/+0x28 tree layout; PC bands vary.
     /// </summary>
     private void TryBreakHeapTreeCycle(Ps2System sys)
     {
         uint pc = (uint)sys.EE.PC;
-        if (pc < HeapWalkPcLo || pc > HeapWalkPcHi)
+        uint ret0 = 0;
+        bool inBand = false;
+        foreach (var (lo, hi, bandRet0) in HeapWalkBands)
+        {
+            if (pc < lo || pc > hi) continue;
+            inBand = true;
+            ret0 = bandRet0;
+            break;
+        }
+        if (!inBand)
         {
             _walkBandHits = 0;
             _walkSameV1Hits = 0;
@@ -229,19 +241,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             }
         }
 
-        // Fallback: force null return from lookup (epilogue at 0x3BA900 sets v0=0).
+        // Fallback: force null return from lookup (band ret0 epilogue / exit sets v0=0).
         // Used when the cycle walk cannot be resolved (garbage pointers).
         if (_walkBandHits >= 128 || _cycleBreaks >= 4)
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
             sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 }); // s0
-            sys.EE.PC = HeapWalkRet0;
+            sys.EE.PC = ret0;
             _walkForcedExits++;
             _walkBandHits = 0;
             _walkSameV1Hits = 0;
             if (trace && _walkForcedExits <= 16)
                 Console.Error.WriteLine(
-                    $"[MKFAM] heap-walk force-ret0 pc=0x{pc:X8} v1=0x{v1:X8} n={_walkForcedExits} cyc={cyc}");
+                    $"[MKFAM] heap-walk force-ret0 pc=0x{pc:X8} v1=0x{v1:X8} ret0=0x{ret0:X8} " +
+                    $"n={_walkForcedExits} cyc={cyc}");
         }
     }
 

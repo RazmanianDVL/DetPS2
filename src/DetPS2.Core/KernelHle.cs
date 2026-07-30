@@ -547,7 +547,8 @@ public sealed class KernelState
     /// thread's v0/v1/a0-a3 across SwitchToNext — e.g. WaitSema stub leaves v1=0x44, then the
     /// resumed thread's INTC busy-poll does lw via v1 and reads address 0x44 forever
     /// (Shaolin Monks 0x4803D0, 2026-07-29). Full save is cheap relative to that class of bug.
-    /// While EXL is set, prefer keeping CaptureInterruptedContext's user snapshot.
+    /// While EXL is set <b>or</b> an HLE INTC dispatch frame is outstanding (software may clear
+    /// EXL mid-handler), prefer keeping CaptureInterruptedContext's user snapshot.
     /// </remarks>
     public void SaveCurrentContext(EmotionEngine ee, bool fromSyscall = true)
     {
@@ -558,7 +559,10 @@ public sealed class KernelState
         ulong resumePc = fromSyscall ? ee.PC + 4 : ee.PC;
 
         // Inside ISR: do not overwrite the interrupted-user full snapshot with ISR GPRs.
-        if ((ee.COP0_Status & 0x2) != 0 && t.HasFullSave && t.SavedGprFull != null)
+        // EXL alone is not enough — registered handlers (GoW/SotC) clear EXL via ERL critical
+        // sections while _savedGprAcrossIntcDispatch still holds the user frame.
+        bool inHleIsr = (ee.COP0_Status & 0x2) != 0 || ee.HasOutstandingIntcDispatch;
+        if (inHleIsr && t.HasFullSave && t.SavedGprFull != null)
         {
             // Still record that this thread is blocked in the ISR (for bookkeeping only).
             t.SavedSp = ee.GetGpr(29).Lo;
@@ -845,6 +849,13 @@ public sealed class KernelState
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT") == "1")
             Console.Error.WriteLine($"[PREEMPT] tick threads={_threads.Count} cur={_currentTid} pc=0x{ee.PC:X8}");
         if (_threads.Count < 2) return; // common case: nothing else to switch to
+
+        // Never force-preempt across an HLE INTC episode. SaveFullContext would overwrite
+        // CaptureInterruptedContext's user GPR file with ISR scratch (v1=sema-id etc.), so
+        // eret/SwitchToNext resumes a busy-poll with a garbage base register. Real hardware
+        // keeps the user frame on the kernel stack for the whole exception episode.
+        if ((ee.COP0_Status & 0x2) != 0 || ee.HasOutstandingIntcDispatch)
+            return;
 
         int next = FindNextRunnable(_currentTid);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT") == "1")

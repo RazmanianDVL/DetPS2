@@ -33,7 +33,12 @@ public static class GameQuirkRegistry
         // MK Midway family (DA/Deception/Armageddon): version-policy only — no SM plants.
         Register("SLUS_204.23", () => new MidwayFamilyAssist("SLUS_204.23", "Mortal Kombat: Deadly Alliance (USA)"));
         Register("SLUS_208.81", () => new MidwayFamilyAssist("SLUS_208.81", "Mortal Kombat: Deception (USA)"));
+        // Armageddon USA standard (SLUS_215.50) + Premium Edition (SLUS_215.43) — same SN gates.
         Register("SLUS_215.50", () => new MidwayFamilyAssist("SLUS_215.50", "Mortal Kombat: Armageddon (USA)"));
+        Register("SLUS_215.43", () => new MidwayFamilyAssist("SLUS_215.43", "Mortal Kombat: Armageddon (USA) (Premium Edition)"));
+        // Team ICO / first-party IOPRP300 GetVersion policy (no memory plants).
+        Register("SCUS_974.72", () => new TeamIcoAssist("SCUS_974.72", "Shadow of the Colossus (USA)"));
+        Register("SCUS_971.13", () => new TeamIcoAssist("SCUS_971.13", "Ico (USA)"));
         // Register("SLUS_XXXXX", () => new MyNewTitleQuirks());
     }
 

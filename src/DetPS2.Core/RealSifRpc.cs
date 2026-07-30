@@ -664,7 +664,7 @@ public sealed class RealSifRpc
             && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx && sid != SidSdReg
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
-            && sid != SidMsl
+            && sid != SidMsl && sid != SidMslMfl
             && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
@@ -1062,12 +1062,12 @@ public sealed class RealSifRpc
             return;
         }
 
-        // Midway MSL.IRX (DA: bind 0x00012345 after MSL.IRX load; init fno=0xDADA).
-        // Soft-success so EE leaves bind/init; full stream/bank protocol still incomplete.
-        // Mount MKDA.PAK TOC on first touch so later FILEIO artps2 member opens resolve.
-        if (sid == SidMsl)
+        // Midway MSL.IRX (0x00012345 sound) + MFL file link (0x00012347 open/read).
+        // Soft DADA alone is not enough: DA queues cdrom0:\MKDA.PAK opens on the EE
+        // request ring and completes them via MFL CallRpc. Bridge file fnos to FILEIO.
+        if (IsMslFamilySid(sid))
         {
-            int ms = HandleMsl(mem, iopModules, cdvd, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
+            int ms = HandleMsl(mem, iopModules, cdvd, sid, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
             if (recvBuf != 0 && recvSize >= 4 && mem.Read32(recvBuf) == 0)
                 mem.Write32(recvBuf, unchecked((uint)ms));
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -2386,13 +2386,16 @@ public sealed class RealSifRpc
                 return HandleMwFile(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
 
             case SidMsl:
-                return HandleMsl(mem, iopModules, cdvd, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
+            case SidMslMfl:
+                return HandleMsl(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
 
             default:
                 if (IsBurnout3GtfsSid(sid))
                     return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
                 if (IsMwFileSid(sid))
                     return HandleMwFile(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
+                if (IsMslFamilySid(sid))
+                    return HandleMsl(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
                 // Prefer 0 (common IOP "OK") over 1. Callers that treat non-zero as success
                 // still pass with our specialized handlers above; 989snd treats 1 as fail.
                 UnknownServiceCalls++;
@@ -2988,6 +2991,15 @@ public sealed class RealSifRpc
     /// that ship MSL rather than 989snd).
     /// </summary>
     public const uint SidMsl = 0x00012345;
+    /// <summary>
+    /// Midway MFL (MSL File Link) IOP↔EE file RPC — DA EE binds sid=<c>0x00012347</c>
+    /// from <c>mflrpc.c</c> after MSL sound sid 0x12345. Carries open/read/close for
+    /// <c>cdrom0:\MKDA.PAK</c> and member streams. Soft 0xDADA alone leaves this unbound
+    /// and gameart.ssf wait never reaches status==4.
+    /// </summary>
+    public const uint SidMslMfl = 0x00012347;
+
+    private static bool IsMslFamilySid(uint sid) => sid == SidMsl || sid == SidMslMfl;
 
     // Crystal Dynamics / SN "GOE_FSRV" IOPFILE.IRX services (Blood Omen 2 + Whiplash).
     // Disc module registers low SIDs — BO2 live bind order 0x30, 0x20, 0x21, 0x29
@@ -3067,40 +3079,375 @@ public sealed class RealSifRpc
     private readonly Dictionary<int, int> _mwFileHandles = new();
     private int _mwFileNextHandle = 1;
 
-    // MSL init fno observed on Deadly Alliance after MSL.IRX load (live 2026-07-30).
+    // MSL sound init fno observed on Deadly Alliance after MSL.IRX load (live 2026-07-30).
     private const uint MslFnoInit = 0xDADA;
+    // MFL (mflrpc.c) CallRpc fnos ground-truthed from DA EE client @ 0x22Cxxx:
+    //   fno=1  init after bind 0x12347
+    //   fno=24 open  (path@send, mode trailing)
+    //   fno=21 stat / wait-ready poll
+    //   fno=22 close / release
+    //   fno=7  read  (common Midway; also accept when send has fd+buf+len)
+    private const uint MflFnoInit = 1;
+    private const uint MflFnoRead = 7;
+    private const uint MflFnoStat = 21;
+    private const uint MflFnoClose = 22;
+    private const uint MflFnoOpen = 24;
+
+    /// <summary>Live MFL handles: synthetic id → FILEIO fd.</summary>
+    private readonly Dictionary<int, int> _mflHandles = new();
+    private int _mflNextHandle = 1;
+    /// <summary>True after MFL init fno or ready-flag seed / successful open.</summary>
+    public bool MflInited { get; private set; }
 
     /// <summary>
-    /// Midway MSL.IRX HLE (sid <see cref="SidMsl"/>). Soft-success for bind/init so DA
-    /// leaves the LIBSD→SDRDRV→MSL chain. Eagerly mounts MKDA.PAK (127 artps2 members) so
-    /// subsequent FILEIO opens of <c>\ps2dvd\artps2\*.ssf</c> resolve without waiting for
-    /// the EE archive stream path. Full bank/stream RPC still returns 0 (success).
+    /// Midway MSL.IRX + MFL file-link HLE (sids <see cref="SidMsl"/> / <see cref="SidMslMfl"/>).
+    /// Soft-success for sound init (0xDADA). Real open/read/close on MFL so DA can mount
+    /// MKDA.PAK and stream <c>gameart.ssf</c> without planting wait-ready status=4 (Exit).
     /// </summary>
     private int HandleMsl(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
-        uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+        uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
-        // First MSL touch → ensure shared art archive TOC is ready (DA artps2 / Dec art).
-        // EnsureMkdaPakMounted is idempotent (_mkdaPakMounted gate).
+        // First MSL/MFL touch → ensure shared art archive TOC is ready (DA artps2 / Dec art).
         EnsureMkdaPakMounted(iopModules, cdvd);
+
+        // MFL file link (0x12347) — real open/read. Also accept file fnos on primary sid
+        // (some family builds multiplex).
+        if (sid == SidMslMfl || fno is MflFnoInit or MflFnoOpen or MflFnoRead or MflFnoStat or MflFnoClose)
+        {
+            int fr = HandleMfl(mem, iopModules, cdvd, fno, argBuf, sendSize, recvBuf, recvSize);
+            return fr;
+        }
 
         if (fno == MslFnoInit)
         {
-            // Init: zero result = OK (matches other Midway services). Optionally paint a
-            // short version-shaped payload when recv is larger than one word.
+            // Sound SysInit: zero result = OK. Paint version token for clients that read it.
             if (recvBuf != 0)
             {
                 uint lim = recvSize != 0 ? recvSize : 4u;
                 if (lim >= 4) mem.Write32(recvBuf, 0);
-                // "1.7.4" style nibble packing for clients that strcmp a short token.
                 if (lim >= 8) mem.Write32(recvBuf + 4, 0x00010704u);
             }
+            // After sound init, EE may already have queued MKDA.PAK on the request ring —
+            // proactively open so subsequent MFL open/stat see a warm FILEIO path.
+            WarmMslAssetOpens(iopModules, cdvd);
             return 0;
         }
 
-        // Remaining MSL fnos (bank load / play / stream): soft-OK until per-fno ground truth.
+        // Remaining sound fnos (bank load / play / stream): soft-OK until per-fno ground truth.
         if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
             mem.Write32(recvBuf, 0);
         return 0;
+    }
+
+    /// <summary>
+    /// MFL open/read/close/stat. EE client (mflrpc.c) CallRpc shapes observed on DA:
+    /// open fno=24 send has path string; read fno=7 send has handle/len; close fno=22.
+    /// </summary>
+    private int HandleMfl(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+    {
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+
+        switch (fno)
+        {
+            case MflFnoInit:
+            case 0: // bind probe / soft init
+                MflInited = true;
+                if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                    mem.Write32(recvBuf, 0);
+                WarmMslAssetOpens(iopModules, cdvd);
+                return 0;
+
+            case MflFnoOpen:
+            case 5: // allow MWFILE-style open fno as alias
+            {
+                string path = argBuf != 0 && sendSize > 0
+                    ? ScanSendBufferForPath(mem, argBuf, sendSize)
+                    : "";
+                if (string.IsNullOrEmpty(path) && argBuf != 0 && sendSize >= 4)
+                {
+                    // Inline C string at +0 or +4 (mode then path).
+                    path = ReadCString(mem, argBuf, 256);
+                    if (!LooksLikeFsPath(path) && path.IndexOf('.') < 0)
+                        path = sendSize >= 8 ? ReadCString(mem, argBuf + 4, 256) : "";
+                }
+                if (string.IsNullOrEmpty(path))
+                {
+                    if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                        mem.Write32(recvBuf, unchecked((uint)(-2)));
+                    return -2;
+                }
+                path = AliasMidwayPakPath(path);
+                int fd = iopModules.FileOpen(path, 1);
+                if (fd < 0)
+                {
+                    EnsureMkdaPakMounted(iopModules, cdvd);
+                    fd = TryOpenFromMkdaPak(iopModules, path, out _);
+                }
+                if (fd < 0)
+                {
+                    if (trace)
+                        Console.Error.WriteLine($"[MSL-MFL] open FAIL path=\"{path}\"");
+                    if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                        mem.Write32(recvBuf, unchecked((uint)(-2)));
+                    return -2;
+                }
+                int h = _mflNextHandle++;
+                _mflHandles[h] = fd;
+                MflInited = true;
+                if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+                    cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 256));
+                if (trace)
+                    Console.Error.WriteLine($"[MSL-MFL] open path=\"{path}\" h={h} fd={fd} size={fsz}");
+                if (recvBuf != 0)
+                {
+                    if (recvSize == 0 || recvSize >= 4) mem.Write32(recvBuf, unchecked((uint)h));
+                    if (recvSize >= 8) mem.Write32(recvBuf + 4, fsz);
+                }
+                return h;
+            }
+
+            case MflFnoRead:
+            case 3: // common read alias
+            {
+                // Layout guess: +0 handle, +4 dst ptr, +8 length (or length at +4).
+                int h = argBuf != 0 && sendSize >= 4 ? (int)mem.Read32(argBuf) : 0;
+                uint dst = 0;
+                int len = 0;
+                if (argBuf != 0 && sendSize >= 12)
+                {
+                    dst = mem.Read32(argBuf + 4);
+                    len = (int)mem.Read32(argBuf + 8);
+                }
+                else if (argBuf != 0 && sendSize >= 8)
+                {
+                    len = (int)mem.Read32(argBuf + 4);
+                }
+                if (!_mflHandles.TryGetValue(h, out int fd) || len <= 0)
+                {
+                    if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                        mem.Write32(recvBuf, 0);
+                    return 0;
+                }
+                // Prefer host read into EE buffer when dst is RDRAM; else report size only.
+                int got = 0;
+                if (dst >= 0x00100000 && dst < SystemMemory.RDRAM_SIZE && len > 0)
+                {
+                    int toRead = Math.Min(len, 4 * 1024 * 1024);
+                    // Offset 0 for first chunk; full sequential read is driven by EE seeks.
+                    if (iopModules.TryReadOpenFileBytes(fd, 0, toRead, out byte[]? buf) && buf != null)
+                    {
+                        got = buf.Length;
+                        for (int i = 0; i < got; i++)
+                            mem.Write8(dst + (uint)i, buf[i]);
+                        cdvd.NoteHostReadSectors((got + 2047) / 2048);
+                    }
+                }
+                if (trace)
+                    Console.Error.WriteLine($"[MSL-MFL] read h={h} dst=0x{dst:X8} len={len} got={got}");
+                if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                    mem.Write32(recvBuf, unchecked((uint)got));
+                return got;
+            }
+
+            case MflFnoStat: // 21 / 0x15 — DA "get file info" (0x22CC00), not a bare poll
+            {
+                // EE CallRpc fno=21 send=4 (handle) recv=40; then *(recv+4) & 8
+                // (andi v0,v0,8 @ 0x22CC98). poll@0x2F5C6C abandons if that is 0.
+                // +4 is FLAGS with bit3=ready; size lives at +16 (DA WAVE 3).
+                int h = argBuf != 0 && sendSize >= 4 ? (int)mem.Read32(argBuf) : 0;
+                uint fsz = 0;
+                if (_mflHandles.TryGetValue(h, out int fdInfo))
+                    iopModules.TryGetOpenFileSize(fdInfo, out fsz);
+                if (fsz == 0 && h > 0)
+                    fsz = 1;
+                const uint InfoReadyFlag = 0x8;
+                if (recvBuf != 0)
+                {
+                    uint lim = recvSize != 0 ? recvSize : 4u;
+                    for (uint o = 0; o + 4 <= lim && o < 40; o += 4)
+                        mem.Write32(recvBuf + o, 0);
+                    if (lim >= 4) mem.Write32(recvBuf, unchecked((uint)h));
+                    if (lim >= 8) mem.Write32(recvBuf + 4, InfoReadyFlag | (h > 0 ? 1u : 0u));
+                    if (lim >= 12) mem.Write32(recvBuf + 8, 0);
+                    if (lim >= 16) mem.Write32(recvBuf + 12, 1);
+                    if (lim >= 20) mem.Write32(recvBuf + 16, fsz);
+                    if (lim >= 24) mem.Write32(recvBuf + 20, fsz);
+                }
+                return h > 0 ? unchecked((int)InfoReadyFlag) : 0;
+            }
+
+            case MflFnoClose:
+            {
+                int h = argBuf != 0 && sendSize >= 4 ? (int)mem.Read32(argBuf) : 0;
+                if (_mflHandles.TryGetValue(h, out int fd))
+                {
+                    try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                    _mflHandles.Remove(h);
+                }
+                if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                    mem.Write32(recvBuf, 0);
+                return 0;
+            }
+
+            default:
+                if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
+                    mem.Write32(recvBuf, 0);
+                return 0;
+        }
+    }
+
+    /// <summary>
+    /// Eager FILEIO open of MKDA.PAK (and token sector note) so MFL open/stat after DADA
+    /// does not race an unmounted archive. Idempotent.
+    /// </summary>
+    private void WarmMslAssetOpens(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        EnsureMkdaPakMounted(iopModules, cdvd);
+        // Touch the ISO root PAK via FILEIO so path aliases are hot.
+        string[] warm =
+        {
+            @"cdrom0:\MKDA.PAK",
+            @"cdrom0:\MKDA.PAK;1",
+        };
+        foreach (string p in warm)
+        {
+            int fd = iopModules.FileOpen(p, 1);
+            if (fd >= 0)
+            {
+                if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+                    cdvd.NoteHostReadSectors(8);
+                try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pump MFL completions for EE-side request rings that queued a path open without a
+    /// CallRpc (DA 0x2F53A0). Completes <c>cdrom0:\MKDA.PAK</c> / artps2 member paths via
+    /// FILEIO so archive host+4 is non-null and gameart wait can reach status==4 honestly.
+    /// Safe no-op when rings are empty or not the standard MSL layout.
+    /// </summary>
+    public void PumpMslFileRequests(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (mem == null || iopModules == null) return;
+        EnsureMkdaPakMounted(iopModules, cdvd);
+
+        // Publish MFL-ready so EE mflrpc open (0x22C9F0) does not hard-skip when the
+        // MFL bind/CreateSema path was skipped (DA 0x22B640 residual). GP=0x410D70 on DA.
+        // Only seed when the MSL response ring looks live (cap==0x28) so we don't poke cold boots.
+        TrySeedMflReadyFlag(mem);
+
+        // DA live request ring header @ 0x587DA0: cap, free, base, stride, flags.
+        // Response ring @ 0x587E60: cap, count, base, stride.
+        // Layout shared by MSL EE client after 0x2F5960 init — also used by Dec family.
+        TryCompleteMslRequestRing(mem, iopModules, cdvd, reqHdr: 0x00587DA0u, respHdr: 0x00587E60u);
+    }
+
+    /// <summary>
+    /// DA: gp-24716 (0x40ACE4 with gp=0x410D70) is the MFL RPC ready word. EE open/read
+    /// clients return null when it is 0. Seed a positive sentinel once MSL rings exist.
+    /// </summary>
+    private void TrySeedMflReadyFlag(SystemMemory mem)
+    {
+        // Discover GP-relative cell via the known absolute for DA when rings are up.
+        uint respCap = mem.Read32(0x00587E60);
+        if (respCap != 0x28) return;
+        const uint mflReady = 0x0040ACE4; // gp(0x410D70) - 24716
+        uint cur = mem.Read32(mflReady);
+        if (cur != 0) return;
+        mem.Write32(mflReady, 1);
+        MflInited = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine("[MSL-MFL] seed ready flag @0x40ACE4=1");
+    }
+
+    private void TryCompleteMslRequestRing(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint reqHdr, uint respHdr)
+    {
+        uint cap = mem.Read32(reqHdr);
+        uint free = mem.Read32(reqHdr + 4);
+        uint basePtr = mem.Read32(reqHdr + 8);
+        uint stride = mem.Read32(reqHdr + 12);
+        if (cap is 0 or > 64 || stride < 32 || stride > 256) return;
+        if (basePtr < 0x00100000 || basePtr >= SystemMemory.RDRAM_SIZE) return;
+        // free < cap ⇒ at least one slot claimed.
+        if (free >= cap) return;
+
+        int used = (int)(cap - free);
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+        for (int i = 0; i < used && i < 8; i++)
+        {
+            uint slot = basePtr + (uint)(i * (int)stride);
+            if (slot + stride > SystemMemory.RDRAM_SIZE) break;
+            // Path at +8 (0x2F53A0 copies path to slot+8, mode to +68).
+            string path = ReadCString(mem, slot + 8, 64);
+            if (string.IsNullOrEmpty(path) || path.IndexOf('.') < 0) continue;
+            // Already completed? status word at +0 non-zero and looks like a handle/flag.
+            uint st = mem.Read32(slot);
+            if (st == 4 || st == 1) continue;
+
+            path = AliasMidwayPakPath(path);
+            int fd = iopModules.FileOpen(path, 1);
+            if (fd < 0)
+            {
+                EnsureMkdaPakMounted(iopModules, cdvd);
+                fd = TryOpenFromMkdaPak(iopModules, path, out _);
+            }
+            if (fd < 0) continue;
+
+            int h = _mflNextHandle++;
+            _mflHandles[h] = fd;
+            MflInited = true;
+            if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+                cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 64));
+
+            // Keep request slot path intact. Build a tiny response object the EE poll
+            // (0x2F5A80) understands: +0 status=0 (need process), +12 = request ptr,
+            // +16 result handle. Response *ring* entries are stride-4 pointers (DA init).
+            const uint respObj = 0x0007FE00; // low scratch; outside ELF image
+            mem.Write32(respObj + 0, 0);                     // need process
+            mem.Write32(respObj + 4, 0);
+            mem.Write32(respObj + 8, 0);
+            mem.Write32(respObj + 12, slot);                 // request
+            mem.Write32(respObj + 16, unchecked((uint)h));  // pre-filled handle
+            mem.Write32(respObj + 20, fsz);
+            mem.Write32(respObj + 28, 0);
+
+            // Mark request itself as open-done so re-pumps skip; poll uses response obj.
+            mem.Write32(slot, 1);
+            mem.Write32(slot + 16, unchecked((uint)h));
+
+            uint rCap = mem.Read32(respHdr);
+            uint rCount = mem.Read32(respHdr + 4);
+            uint rBase = mem.Read32(respHdr + 8);
+            uint rStride = mem.Read32(respHdr + 12);
+            if (rCap is > 0 and <= 64 && rBase >= 0x00100000 && rBase < SystemMemory.RDRAM_SIZE
+                && rStride is >= 4 and <= 64 && rCount < rCap)
+            {
+                // Prefer slot 0 if our earlier count=1 seed left a stale pointer.
+                uint idx = rCount == 0 ? 0 : rCount;
+                if (idx >= rCap) idx = 0;
+                uint rSlot = rBase + idx * Math.Max(rStride, 4u);
+                if (rSlot + 4 <= SystemMemory.RDRAM_SIZE)
+                {
+                    mem.Write32(rSlot, respObj); // ring[i] = &response_object
+                    if (rCount == 0)
+                        mem.Write32(respHdr + 4, 1);
+                    else if (rCount < rCap)
+                        mem.Write32(respHdr + 4, rCount); // keep; we overwrote slot 0 if seeded
+                    // Ensure at least one pending response is visible.
+                    if (mem.Read32(respHdr + 4) == 0)
+                        mem.Write32(respHdr + 4, 1);
+                }
+            }
+
+            if (trace)
+                Console.Error.WriteLine(
+                    $"[MSL-MFL] ring-complete path=\"{path}\" h={h} fd={fd} size={fsz} " +
+                    $"slot=0x{slot:X8} respObj=0x{respObj:X8}");
+        }
     }
     private bool _mwFileInited;
 
