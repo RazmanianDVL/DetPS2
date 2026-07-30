@@ -44,6 +44,7 @@ param(
     [switch]$FailOnRegression,
     [switch]$SkipBuild,
     [switch]$NoHostPresent,
+    [switch]$NativeMetrics,
     [string]$BuildOut = "out/scoreboard-build",
     [string]$TraceDir = "out/traces"
 )
@@ -90,6 +91,7 @@ $sbArgs = @{
 }
 if ($SkipBuild) { $sbArgs.SkipBuild = $true }
 if ($NoHostPresent) { $sbArgs.NoHostPresent = $true }
+if ($NativeMetrics) { $sbArgs.NativeMetrics = $true }
 
 & $scoreboard @sbArgs
 $sbExit = $LASTEXITCODE
