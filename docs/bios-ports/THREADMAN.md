@@ -43,22 +43,26 @@ Combinable: WAIT\|SUSPEND = 0x0C.
 
 | API | Location | Status vs decomp |
 |-----|----------|------------------|
-| CreateSema | `KernelState.CreateSema` / `CreateSemaFromStruct` | Count/max OK; **InitCount not stored**; no magic/generation ids |
-| DeleteSema | `KernelState.DeleteSema` | Wakes all waiters ✓; does **not** set negative WaitSema return; **clears Sleeping even under SuspendCount** |
-| SignalSema | `KernelState.SignalSema` | One waiter OR count++ OR OVF ✓; return is live count (not 0); **wake ignores SuspendCount** |
+| CreateSema | `KernelState.CreateSema` / `CreateSemaFromStruct` | Count/max/InitCount ✓; no magic/generation ids (EE flat ints) |
+| DeleteSema | `KernelState.DeleteSema` | Wakes all waiters ✓; waiter return `KeWaitDelete` (`0xfffffe57`) ✓; Suspend nest preserved ✓ |
+| SignalSema | `KernelState.SignalSema` | One waiter OR count++ OR OVF ✓; Suspend nest preserved ✓ |
 | iSignalSema | `ISignalSema` → SignalSema | Same rules ✓ |
 | WaitSema / WaitSemaBlocking | `KernelState` + `SonyKernelHle` 0x44 | Count-- / park ✓; stall path when SIF RPC queued ✓ |
 | PollSema | `PollSema` | Non-blocking consume ✓ |
-| ReferSemaStatus | `SonyKernelHle` 0x47/0x48 | **Stub — always returns 0, writes nothing** |
+| ReferSemaStatus | `SonyKernelHle` 0x47/0x48 | Fills ee_sema_t (count/max/init/waiters) ✓ |
 | SuspendThread / ResumeThread | `KernelState` + 0x37–0x3A | Nestable SuspendCount ✓; SoftSuspended sticky for exited peers ✓ (intentional) |
-| ReferThreadStatus | `SonyKernelHle` 0x30/0x31 | RUN/READY/WAIT/SUSPEND/DORMANT bits ✓ |
-| WakeupThread | `KernelState.WakeupThread` | Sleep waiters ✓; WaitSema routed through **SignalSema** (not fake-clear Sleeping alone) ✓ intentional vs thrash |
-| SleepThread | `SleepThread` | Always parks; **no wakeup-count** |
-| CancelWakeupThread | 0x35 | **Stub** |
-| WaitSema auto-create | Sony 0x44 | Calls `CreateSema(0,1)` which allocates a **new** id, then waits on the **old** id — broken |
-| SaveState | `WriteState`/`ReadState` | Missing EverStarted, SoftSuspended, SuspendCount, InitCount, WakeupCount |
-| Priority ready queues | — | Not ported (documented §6.4) |
-| Mbx / Vpl / Fpl | — | Not ported |
+| ReferThreadStatus | `SonyKernelHle` 0x30/0x31 | RUN/READY/WAIT/SUSPEND/DORMANT + priority + wakeupCount ✓ |
+| WakeupThread | `KernelState.WakeupThread` | Sleep waiters ✓; WaitSema routed through **SignalSema** ✓ intentional |
+| SleepThread | `SleepThread` | Wakeup-count consume without park ✓ |
+| CancelWakeupThread | 0x35 | Return+clear wakeup count ✓ |
+| WaitSema auto-create | Sony 0x44 | `EnsureSema(id)` materializes requested id ✓ |
+| SaveState | `WriteState`/`ReadState` | Threads/semas/flags/Mbx/Vpl/Fpl + priority/delay/wait returns ✓ |
+| Priority ready selection | `FindNextRunnable` / `ChangeThreadPriority` (0x29) | Lower priority value runs first; RR within band ✓ |
+| Message boxes | `KernelState` Create/Delete/Send/Receive/Poll/ReferMbx | Contract HLE ✓ (host API; no EE syscall) |
+| Variable pools | `KernelState` Create/Delete/Allocate/Free/ReferVpl | Host freelist + synthetic cookies ✓ |
+| Fixed pools | `KernelState` Create/Delete/Allocate/Free/ReferFpl | Fixed block freelist ✓ |
+| DelayThread | `KernelState.DelayThread` + `TickDelays` / `OnVblank` | Alarm-style park ✓ (host API; no EE syscall) |
+| ReleaseWaitThread | 0x2D + `KernelState.ReleaseWaitThread` | `KeReleaseWait` (`0xfffffe5e`) ✓ |
 | CheckThreadStack | — | Not ported (diagnostic candidate only) |
 
 ---
@@ -91,34 +95,51 @@ Combinable: WAIT\|SUSPEND = 0x0C.
 | WakeupThread(WaitSema waiter) → SignalSema | Real IOP only bumps wakeup-count; EE games that Refer WAIT then Wakeup need a real WaitSema release (not half-clear Sleeping). SignalSema is the correct release path |
 | WakeupThread(0) wakes pure Sleep waiters | Primordial EE main is often addressed as id 0; real kernel would error |
 | WaitSema fabricates VBlank park when nothing runnable and no RPC | Avoids whole-EE deadlock under incomplete producers |
-| Round-robin instead of priority ready queues | §6.4 — large rewrite, low payoff while count/wake is correct |
-| SignalSema/PollSema success return live count (not always 0) | Callers use `< 0` for errors; smokes assert count |
+| Priority selection without full multi-band readyq lists | `FindNextRunnable` picks min priority then RR within band — contract equivalent for EE cooperative + preemption |
+| SignalSema/PollSema success return live count (not always 0) | Callers use `< 0` for errors; smokes assert count; Sony path returns id for SN ProDG |
+| Mbx/Vpl/Fpl/DelayThread as host `KernelState` API | **No EE syscalls** in ps2sdk `kernel.h` for these (IOP thmsgbx/thvpool/thfpool exports only). Documented public API for IOP HLE / tests |
+| Vpl/Fpl synthetic pointer cookies (`0x0E000000+`) | Contract freelist without mapping real RDRAM; Free matches cookies only |
+| DelayThread advanced by `TickDelays` / ~16667 µs per `OnVblank` | No real TIMEMAN hard-timer coupling yet; sufficient for contract + smokes |
 
 ---
 
-## 5. Remaining gaps for full ROMDIR THREADMAN completeness
+## 5. Remaining gaps (post Phase-1 completion)
 
-Ordered by contract value (not game PCs):
+Ordered by residual value:
 
-1. **Priority ready queues** (`readyq`, ChangeThreadPriority, RotateThreadReadyQueue real semantics) — currently round-robin / SwitchToNext.
-2. **Message boxes** (thmsgbx: CreateMbx / SendMbx / ReceiveMbx / PollMbx / ReferMbx) — full decomp present; zero HLE.
-3. **Fixed / variable pools** (thfpool / thvpool: CreateFpl/Vpl, Allocate, Free) — decomp present; zero HLE.
+1. ~~**Priority ready selection**~~ — **done** (min-priority + RR band; full multi-list readyq optional polish).
+2. ~~**Message boxes**~~ — **done** (Create/Delete/Send/Receive/Poll/Refer).
+3. ~~**Fixed / variable pools**~~ — **done** (Create/Delete/Allocate/Free/Refer + park-on-empty).
 4. **Event-flag wait-queue priority / multi-waiter fairness** — basic Set/Wait/Poll exists; not full thevent object model.
-5. **DeleteSema / ReleaseWaitThread waiter return codes** (`0xfffffe57` deleted, `0xfffffe5e` released) — EE rarely checks; still incomplete ABI.
+5. ~~**DeleteSema / ReleaseWaitThread waiter return codes**~~ — **done** (`KeWaitDelete` / `KeReleaseWait` + `$v0` patch on restore).
 6. **Sema/thread generation-bit IDs** (IOP `id = ptr<<5 | gen<<1 | 1`) — EE uses flat ints; OK for EE syscall path, incomplete if real IOP THREADMAN IRX ever executes.
 7. **CheckThreadStack** diagnostic (`FUN_00001cfc`, 168-byte margin) — optional, must not false-panic.
-8. **DelayThread** alarm path (`FUN_00002444`) — not modeled.
+8. ~~**DelayThread** alarm path~~ — **done** (`DelayThread` + `TickDelays` / `OnVblank`).
 9. **i-form context checks** (iSignal/iWakeup only from interrupt) — currently same as non-i.
 10. **Full literal IOP THREADMAN** when/if R3000 BIOS IRX execution lands — then this HLE becomes a shim or is retired.
+11. **RotateThreadReadyQueue(priority)** full band-only rotate — currently yields via `SwitchToNext` (priority-aware).
+12. **Vpl/Fpl real IOP heap backing** — synthetic cookies until SYSMEM/heap coupling needed.
 
 ---
 
-## 6. Acceptance for this slice
+## 6. Acceptance for Phase 1 (THREADMAN completion slice)
 
 - Sema count vs single-waiter wake matches decomp (no double-count).
-- PollSema never sleeps; DeleteSema wakes all waiters; iSignalSema shares SignalSema rules.
+- PollSema never sleeps; DeleteSema wakes all waiters with `0xfffffe57`; iSignalSema shares SignalSema rules.
 - Suspend nest + SoftSuspended sticky preserved; Signal/Delete wakes do not clear Suspend.
-- ReferThreadStatus bits RUN/READY/WAIT/SUSPEND/DORMANT correct; ReferSemaStatus filled.
+- ReferThreadStatus bits RUN/READY/WAIT/SUSPEND/DORMANT + priority/wakeupCount correct; ReferSemaStatus filled.
 - WakeupThread does not fake-clear WaitSema without SignalSema.
-- Smokes green; no commercial title hacks.
-- Remaining ROMDIR THREADMAN work listed in §5.
+- Mbx/Vpl/Fpl host APIs + smokes green.
+- Priority-aware SwitchToNext; DelayThread tick path; ReleaseWaitThread `0xfffffe5e`.
+- Smokes: `KernelHle_ThreadmanMbxVplFpl`, `KernelHle_ThreadmanPriorityAndDelay`, `KernelHle_ThreadmanReleaseWaitAndDeleteSemaCodes` (+ prior Sleep/Sema smokes).
+- No commercial title hacks / GameQuirks.
+- Remaining residual listed in §5 (items 4, 6, 7, 9–12).
+
+## 7. EE syscall wiring note
+
+| Feature | EE syscall (ps2sdk) | DetPS2 |
+|---------|---------------------|--------|
+| Threads / Semas / EventFlags | 0x20–0x58 family | `SonyKernelHle` ✓ |
+| ChangeThreadPriority | 0x29 / 0x2A | ✓ stores priority |
+| ReleaseWaitThread | 0x2D / 0x2E | ✓ `KeReleaseWait` |
+| CreateMbx / Vpl / Fpl / DelayThread | **none on EE** | `KernelState` public API only |

@@ -151,6 +151,11 @@ public sealed class Cdvd : ISchedulable
         w.Write(StreamBytes);
         w.Write(SectorLatencyCycles);
         w.Write(MechaconStatus);
+        w.Write(LastError);
+        w.Write(DriveState);
+        w.Write(StreamActive);
+        w.Write(StreamBanks);
+        w.Write(StreamBankSectors);
         w.Write(_pendingLba);
         w.Write(_readCyclesLeft);
         w.Write(_pendingCount);
@@ -175,6 +180,11 @@ public sealed class Cdvd : ISchedulable
         StreamBytes = r.ReadUInt64();
         SectorLatencyCycles = r.ReadUInt32();
         MechaconStatus = r.ReadUInt32();
+        LastError = r.ReadInt32();
+        DriveState = r.ReadInt32();
+        StreamActive = r.ReadBoolean();
+        StreamBanks = r.ReadUInt32();
+        StreamBankSectors = r.ReadUInt32();
         _pendingLba = r.ReadUInt32();
         _readCyclesLeft = r.ReadUInt64();
         _pendingCount = r.ReadUInt32();
@@ -213,6 +223,7 @@ public sealed class Cdvd : ISchedulable
             TrayOpen = false;
             TocLeadOutSector = (uint)Math.Max(1, _disc.Length / SectorSize);
             DetectDualLayer();
+            SetMountedReady();
             return true;
         }
         catch
@@ -228,8 +239,10 @@ public sealed class Cdvd : ISchedulable
         _disc = new MemoryDiscImage(image.ToArray());
         DiscId = discId;
         DiscPresent = true;
+        TrayOpen = false;
         TocLeadOutSector = (uint)Math.Max(1, _disc.Length / SectorSize);
         DetectDualLayer();
+        SetMountedReady();
     }
 
     public void MountDisc(IDiscImage disc, string? discId = null)
@@ -246,6 +259,19 @@ public sealed class Cdvd : ISchedulable
         TrayOpen = false;
         TocLeadOutSector = (uint)Math.Max(1, _disc.Length / SectorSize);
         DetectDualLayer();
+        SetMountedReady();
+    }
+
+    /// <summary>
+    /// After a successful mount: clear tray-open / read errors and put the mechacon stand-in
+    /// into SCECdComplete-ready spin (matches retail CDVDMAN post-insert settle).
+    /// </summary>
+    private void SetMountedReady()
+    {
+        CancelAsyncInternal(keepError: false);
+        LastError = ErNO;
+        DriveState = StatSpin;
+        MechaconStatus = 0x40;
     }
 
     private void DetectDualLayer()
