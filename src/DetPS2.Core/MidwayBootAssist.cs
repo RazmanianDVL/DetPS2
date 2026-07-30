@@ -1292,6 +1292,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Live wall: *0x75E950 empty → pump is pure no-op while menu tick 0x54E600 climbs.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeFillGroup6MultiSlot(sys);
+        // ADX init FUN_00414d40 @ cyc≈2.76M does `sw zero,0(0x75BDD8)` and never re-arms.
+        // Pump path (0x414688/0x4148D8) jal 0x4156E0 → jalr *0x75BDD8; null = skip frame work.
+        // Do NOT re-arm at 3M (empty group-6 thrash starved spine: gifP3 stuck 6). Wait for
+        // bulk WAD + group-6 multi plant so the frame path has real work to dispatch.
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeRearmFrameCb(sys);
+        // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
+        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
+            MaybeBreakLockWrapperThrash(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
         if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
@@ -2475,10 +2484,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         // Faster cadence once logo spine is restored (historical gifP3≥11).
         // Even faster once in interactive pad-poll / ADX title bands (gifP3≥12).
-        // Wave-3 denser pad: 12k cycle cadence once interactive (gifP3≥12) so edge-triggered
+        // Wave-4 denser pad: 8k cycle cadence once interactive (gifP3≥12) so edge-triggered
         // menu code sees more press/release pairs; ghost PADMAN DMA refreshed each pulse.
-        ulong interval = sys.Gif.Path3Transfers >= 12 ? 12_000UL
-            : sys.Gif.Path3Transfers >= 11 ? 40_000UL
+        ulong interval = sys.Gif.Path3Transfers >= 12 ? 8_000UL
+            : sys.Gif.Path3Transfers >= 11 ? 30_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2492,7 +2501,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             or (>= 0x00384000 and <= 0x00386000)
             or (>= 0x00427000 and <= 0x00428000)
             or (>= 0x00414000 and <= 0x00415000)
-            or (>= 0x00414800 and <= 0x00414A00); // live ADX title 0x4148EC
+            or (>= 0x00414800 and <= 0x00414A00) // live ADX title 0x4148EC
+            or (>= 0x00426E00 and <= 0x00427000) // lock wrapper thrash band
+            or (>= 0x00202000 and <= 0x00203000); // wave-2 title settle 0x20243x
 
         int phase = (int)((sys.MasterCycles / 1_000_000) % 6);
         // After spine: longer START hold then CROSS accept (menu confirm pattern).
@@ -2505,34 +2516,34 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             // Circle/Triangle for alternate confirm bindings Midway titles use.
             if (inMenuBand || sys.Gif.Path3Transfers >= 12)
             {
-                // Accept-heavy cadence: more CROSS edges + Start confirm after D-pad.
-                // Live interactive band oscillates 0x4148EC↔0x4275xx — need release edges
-                // between presses so edge-triggered menu code sees press/release.
-                phase = _menuPadPulses % 16;
+                // Accept-heavy cadence: denser CROSS + D-pad so selection index moves then
+                // accept. Live interactive band oscillates 0x4148EC↔0x4275xx / lock 0x426Fxx
+                // — need release edges between presses for edge-triggered menu code.
+                phase = _menuPadPulses % 20;
                 buttons = phase switch
                 {
                     0 => 0u, // release edge
                     1 => (uint)PadInput.Button.Down,
                     2 => 0u,
-                    3 or 4 => (uint)PadInput.Button.Cross,
-                    5 => 0u,
-                    6 => (uint)PadInput.Button.Up,
-                    7 => 0u,
-                    8 or 9 => (uint)PadInput.Button.Cross,
-                    10 => (uint)PadInput.Button.Start,
-                    11 => 0u,
-                    12 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
-                    13 => (uint)PadInput.Button.Circle, // alt confirm on some Midway UIs
-                    14 => 0u,
+                    3 or 4 or 5 => (uint)PadInput.Button.Cross,
+                    6 => 0u,
+                    7 => (uint)PadInput.Button.Up,
+                    8 => 0u,
+                    9 or 10 or 11 => (uint)PadInput.Button.Cross,
+                    12 => (uint)PadInput.Button.Start,
+                    13 => 0u,
+                    14 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                    15 => (uint)PadInput.Button.Circle, // alt confirm on some Midway UIs
+                    16 => 0u,
+                    17 => (uint)PadInput.Button.Right,
+                    18 => 0u,
                     _ => (uint)PadInput.Button.Cross
                 };
-                // Occasional Right/Left so horizontal menus also move.
-                if (_menuPadPulses % 17 == 0)
-                    buttons = (uint)PadInput.Button.Right;
-                if (_menuPadPulses % 19 == 0)
+                // Occasional Left so horizontal menus also move.
+                if (_menuPadPulses % 23 == 0)
                     buttons = (uint)PadInput.Button.Left;
-                // After many pulses still in pad-poll band: hold CROSS longer for accept.
-                if (_menuPadPulses >= 64 && inMenuBand && (_menuPadPulses % 4) < 2)
+                // After many pulses still in pad-poll / ADX title band: hold CROSS for accept.
+                if (_menuPadPulses >= 48 && inMenuBand && (_menuPadPulses % 3) < 2)
                     buttons = (uint)PadInput.Button.Cross;
             }
             else
@@ -2806,6 +2817,125 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     private ulong _lastGroup6FillCyc;
+
+    private int _frameCbRearms;
+    private ulong _lastFrameCbRearmCyc;
+    private int _lockWrapperBreaks;
+    private ulong _lastLockWrapperBreakCyc;
+
+    /// <summary>
+    /// Re-arm frame callback <c>*0x75BDD8</c> after ADX init zeros it.
+    /// <para>
+    /// Live find-writer: only write is <c>pc=0x414DC8 sw zero</c> inside
+    /// <c>FUN_00414d40</c> (ADXPS2 init) at cyc≈2.76M — slot never re-filled by game
+    /// under HLE. Pump path <c>0x414688</c>/<c>0x4148D8</c> does
+    /// <c>jal 0x4156E0 → lw v1,*0x75BDD8; beql skip; jalr v1</c> so a null slot
+    /// permanently skips per-frame work (selection chrome / accept).
+    /// </para>
+    /// Plant stream tick <c>0x43F920</c> (same fn FUN_0043ccf8 registers into group-6)
+    /// with cookie arg <c>0x5BB860</c>. Prefer the real leaf over the group-6 multi wrapper
+    /// (<c>0x427678</c>) — early wrapper plants with empty multi-table starved logo spine
+    /// (live: gifP3 stuck at 6). Sibling slot <c>*0x75BDD0</c> gets group-2 stream tick
+    /// <c>0x43F8C0</c> when empty. Do NOT plant <c>*0x75C0D0</c>.
+    /// Prefer SHARED if ADX init clears incorrectly (not applied — title-local plant).
+    /// </summary>
+    private void MaybeRearmFrameCb(Ps2System sys)
+    {
+        if (_frameCbRearms >= 12) return;
+        if (sys.MasterCycles - _lastFrameCbRearmCyc < 1_500_000) return;
+
+        const uint FrameCbSlot = 0x0075BDD8; // FUN_004156E0 loads / jalr
+        const uint FrameCbArg = 0x0075BDDC;
+        const uint FrameCbSlot0 = 0x0075BDD0; // FUN_004156B0 sibling
+        const uint FrameCbArg0 = 0x0075BDD4;
+        // Real stream tick (FUN_0043ccf8 target) — safe leaf, same as group-6 multi plant.
+        const uint StreamTickFn = 0x0043F920;
+        const uint StreamCookie = 0x005BB860;
+        const uint StreamTickFnG2 = 0x0043F8C0;
+        const uint StreamCookieG2 = 0x005BB830;
+
+        uint cur = sys.Memory.Read32(FrameCbSlot);
+        // Already armed with a live non-zero code pointer — leave alone (unless it is our
+        // known target and arg got wiped).
+        if (cur != 0 && cur != StreamTickFn && sys.Memory.IsLikelyEeCode(cur))
+            return;
+        if (cur == StreamTickFn && sys.Memory.Read32(FrameCbArg) == StreamCookie)
+            return;
+
+        // Validate stream-tick prolog (addiu sp,sp,-16). Prefer not using IsLikelyEeCode
+        // alone — dual-word check used to reject sd; prolog word is enough.
+        if (sys.Memory.Read32(StreamTickFn) != 0x27BDFFF0u)
+            return;
+        // Prefer arming once group-6 multi is also filled (or about to be) so frame path
+        // and multi-table agree. Soft-require: allow after bulk WAD even if multi empty.
+        bool multiReady = sys.Memory.Read32(0x0075E950) == StreamTickFn
+            || sys.Cdvd.SectorsRead >= 180_000;
+
+        if (!multiReady && sys.Gif.Path3Transfers < 11)
+            return;
+
+        sys.Memory.Write32(FrameCbSlot, StreamTickFn);
+        sys.Memory.Write32(FrameCbArg, StreamCookie);
+
+        // Sibling pre-frame slot when empty.
+        if (sys.Memory.Read32(FrameCbSlot0) == 0
+            && sys.Memory.Read32(StreamTickFnG2) == 0x27BDFFF0u)
+        {
+            sys.Memory.Write32(FrameCbSlot0, StreamTickFnG2);
+            sys.Memory.Write32(FrameCbArg0, StreamCookieG2);
+        }
+
+        _frameCbRearms++;
+        _lastFrameCbRearmCyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _frameCbRearms <= 6)
+            Console.Error.WriteLine(
+                $"[BIOS] re-arm frame cb *0x75BDD8=0x{StreamTickFn:X8} arg=0x{StreamCookie:X8} " +
+                $"(was 0x{cur:X8}) n={_frameCbRearms} gifP3={sys.Gif.Path3Transfers} " +
+                $"cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Escape lock-wrapper thrash at <c>0x426EF8..0x426F80</c> (wave-3 late PC).
+    /// Wrappers force a0=lock-id then jump to acquire (<c>0x426DF0</c>) / release
+    /// (<c>0x426E50</c>) which jalr <c>*0x75EA20/*0x75EA28</c>. With HLE-corrupt
+    /// refcount at <c>0x54E5E0</c> the EE tight-loops the unlock path. Clear the
+    /// stuck refcount and force <c>jr ra</c> epilogue so pad/accept can resume.
+    /// </summary>
+    private void MaybeBreakLockWrapperThrash(Ps2System sys)
+    {
+        if (_lockWrapperBreaks >= 48) return;
+        if (sys.MasterCycles - _lastLockWrapperBreakCyc < 50_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inWrap = pc is (>= 0x00426EE0 and <= 0x00426F90)
+            or (>= 0x00426DF0 and <= 0x00426ED8);
+        if (!inWrap) return;
+
+        // Sticky thrash: refcount huge or PC parked on unlock ld ra / j delay.
+        uint refc = sys.Memory.Read32(0x0054E5E0);
+        bool stickyRef = refc > 8;
+        bool onHotInsn = pc is (>= 0x00426F00 and <= 0x00426F10)
+            or (>= 0x00426EBC and <= 0x00426EC8);
+        if (!stickyRef && !onHotInsn) return;
+
+        // Clear stuck lock state (menu tick pair at 0x54E5E0 / 0x54E5E4).
+        if (stickyRef)
+            sys.Memory.Write32(0x0054E5E0, 0);
+        sys.Memory.Write32(0x0054E5E4, 0);
+
+        // Force epilogue of unlock path (jr ra @ 0x426ED4).
+        sys.EE.PC = 0x00426ED4;
+        sys.LastGoodEePc = 0x00426ED4;
+        _lastLockWrapperBreakCyc = sys.MasterCycles;
+        _lockWrapperBreaks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_lockWrapperBreaks <= 12 || _lockWrapperBreaks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] break lock-wrapper thrash pc=0x{pc:X8} refc={refc} -> 0x426ED4 " +
+                $"n={_lockWrapperBreaks} cyc={sys.MasterCycles}");
+    }
 
     /// <summary>
     /// Live (2026-07-30): after gifP3=12 the EE oscillates <c>0x4148EC</c>↔<c>0x4275xx</c>
