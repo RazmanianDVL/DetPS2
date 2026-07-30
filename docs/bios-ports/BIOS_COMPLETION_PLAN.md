@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | **ACTIVE — BIOS-ONLY CAMPAIGN** |
+| **Status** | **G0 COMPLETE** (2026-07-30) — see `BIOS_COMPLETION_VERDICT.md` |
 | **Authority** | SCPH70008 ROMDIR (101 entries) + IOPBTCONF + Ghidra IRX decomp + ps2sdk |
 | **BIOS image** | Operator `user-media*.json` → SCPH70008 4 MiB (never commit) |
 | **Rule** | **No per-title work, no GameQuirks, no title PCs, no commercial scoreboard pushes** until Phase Gate G0 is COMPLETE (all PARTIAL → OK/NONPORT for IOPBTCONF + extended service modules listed below). |
