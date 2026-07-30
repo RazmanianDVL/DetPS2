@@ -56,6 +56,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _titleSmEscapes = 0;
         _menuDrawKicks = 0;
         _cacheFlushSkips = 0;
+        _snPrintfStubbed = false;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -283,17 +284,26 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             _snQuietPatches++;
         }
 
-        // Post-MAINMENU: EE parks in WaitSema body at 0x488898. Live caller at 0x46FB80:
-        //   jal WaitSema; lw v1, (gp-32752); bne v1,v0,fail
-        // Complete by returning to 0x46FB88 with v0 == *(gp-32752) so the match path runs
-        // (NOT blind jump to 0x4520B0 which needs a live object in a0).
-        // Live menu14 thrashed leave→0x48B1D8 (RPC complete) forever with px=3 — always
-        // force the match caller, and after N leaves patch the jal WaitSema site.
+        // Soft-stub SN ProDG printf (entry 0x46FAF8 → CallRpc sid=0x534E03) after GOE/RKV
+        // is live. Debug prints park on WaitSema and flood SIFCMD ASCII; they are not the
+        // MAINMENU draw path. Permanent jr-ra so boot can open PRECODE/CODE.BG2 instead.
+        if (sys.Cdvd.SectorsRead >= 1000 && sys.Gs.PixelsWritten < 50_000)
+            SoftStubSnPrintf(sys);
+
+        // Post-GOE: EE parks in WaitSema body at 0x488898. Callers vary:
+        //   - SN printf (0x46FB80): jal WaitSema; lw v1,(gp-32752); bne v1,v0,fail
+        //   - RPC Bind/Call complete (0x48AF30 / 0x48B1D8 / 0x48BCxx): natural ra resume
+        // Live menu14–19 always forced 0x46FB88 — that hijacked EVERY RPC completion into
+        // SN printf with a wrong frame, thrashing exception vectors / data-as-code and
+        // preventing PRECODE/CODE/MAINMENU Open (find-string .BG2 still empty @30M).
+        // Only force the SN match path when $ra is actually in the SN printf body.
         if (sys.Cdvd.SectorsRead >= 1600 && sys.Gs.PixelsWritten < 50_000)
         {
             uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             if (pcW is >= 0x00488890 and <= 0x00488920 && (c - _lastTitleSmCyc) >= 100_000)
             {
+                uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint a0Sema = (uint)(sys.EE.GetGpr(4).Lo & 0xFFFFFFFFUL); // WaitSema arg
                 uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
                 uint expected = 0;
                 if (gp is >= 0x00400000 and < 0x01000000)
@@ -302,36 +312,60 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                     if (cell is >= 0x00400000 and < 0x01000000)
                         expected = sys.Memory.Read32(cell);
                 }
-                // Always the match-path delay slot after jal WaitSema (0x46FB84 delay / 0x46FB88).
-                // Do NOT follow $ra into 0x48B1D8 RPC-complete which re-WaitSemas forever.
-                uint resumeW = 0x0046FB88;
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = expected });
-                // Also plant expected into v1 so any delayed lw is already matched.
-                sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = expected });
-                sys.EE.PC = resumeW;
-                sys.EE.COP0_Status &= ~0x6u;
-                _menuDrawKicks++;
-                _lastTitleSmCyc = c;
-                ArmGifPath3(sys);
-                try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                catch { /* ignore */ }
-                // After several leaves still px low: nop the jal WaitSema at 0x46FB80 so
-                // re-entry cannot re-park (li v0, expected pattern via keep v0).
-                if (_menuDrawKicks >= 8 && sys.Memory.Read32(0x0046FB80) != 0x00000000u
-                    && sys.Gs.PixelsWritten < 10_000)
+
+                bool snCaller = raW is >= 0x0046FAF8 and <= 0x0046FC80;
+                // Policy: WaitSema returns semaphore id (a0). SN match needs v0==*(gp-32752).
+                uint v0Out = snCaller && expected != 0 ? expected : (a0Sema != 0 ? a0Sema : expected);
+                uint resumeW = 0;
+                if (snCaller)
                 {
-                    // 0x46FB80 was jal WaitSema — replace with nop; delay already lw v1.
-                    // Keep v0==expected so bne v1,v0 never fails.
-                    sys.Memory.Write32(0x0046FB80, 0x00000000u); // nop (was jal)
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                        Console.Error.WriteLine(
-                            $"[BO2] nop jal WaitSema @ 0x46FB80 expected=0x{expected:X8} cyc={c}");
+                    // SN: complete delay-slot match at 0x46FB88.
+                    resumeW = 0x0046FB88;
+                    sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = expected }); // v1 match
                 }
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
-                    Console.Error.WriteLine(
-                        $"[BO2] leave WaitSema park -> 0x{resumeW:X8} v0=0x{expected:X8} " +
-                        $"n={_menuDrawKicks} px={sys.Gs.PixelsWritten} cyc={c}");
+                else if (IsSafeCodeTarget(sys, raW) && raW is >= 0x0048AF00 and <= 0x0048C800)
+                {
+                    // RPC client complete — return to real caller (do NOT divert to SN).
+                    resumeW = raW;
+                }
+                else if (IsSafeCodeTarget(sys, raW) && raW != pcW)
+                {
+                    resumeW = raW;
+                }
+
+                if (resumeW == 0)
+                {
+                    // Unknown frame: leave PC alone after SignalSema; only soft-nudge v0.
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v0Out });
+                    _lastTitleSmCyc = c;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && _menuDrawKicks < 8)
+                        Console.Error.WriteLine(
+                            $"[BO2] WaitSema Signal only ra=0x{raW:X8} v0=0x{v0Out:X8} cyc={c}");
+                }
+                else
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v0Out });
+                    sys.EE.PC = resumeW;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    _menuDrawKicks++;
+                    _lastTitleSmCyc = c;
+                    ArmGifPath3(sys);
+                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+                    catch { /* ignore */ }
+
+                    // After SN leaves still thrash: soft-stub whole SN printf entry (preferred
+                    // over nop'ing only the WaitSema jal — keeps epilogue $ra frames intact).
+                    if (snCaller && _menuDrawKicks >= 2)
+                        SoftStubSnPrintf(sys);
+
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
+                        Console.Error.WriteLine(
+                            $"[BO2] leave WaitSema park ra=0x{raW:X8} -> 0x{resumeW:X8} " +
+                            $"v0=0x{v0Out:X8} sn={snCaller} n={_menuDrawKicks} " +
+                            $"px={sys.Gs.PixelsWritten} cyc={c}");
+                }
             }
         }
 
@@ -380,30 +414,75 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                     Console.Error.WriteLine(
                         $"[BO2] rescue post-MAINMENU data thrash 0x{pcBad:X8} -> 0x{resume:X8} cyc={c}");
             }
-            else if (pcBad is >= 0x0046FB88 and <= 0x0046FD00 && (c - _lastTitleSmCyc) >= 200_000)
+            else if (pcBad is >= 0x0046FC54 and <= 0x0046FC78 && (c - _lastTitleSmCyc) >= 100_000)
             {
-                // Post-WaitSema match body with no GS growth — credit PATH3 and inject pad.
-                // After several visits, step into mid-title (0x2CD7E0) so draw can run.
+                // SN-channel function epilogue (jr ra @ 0x46FC70 / delay 0x46FC74).
+                // Follow stack/live $ra into real caller instead of thrashing PATH3 here.
+                uint raEpi = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint spEpi = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                uint resumeEpi = IsSafeCodeTarget(sys, raEpi) ? raEpi : 0;
+                if (resumeEpi == 0 && spEpi is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0xA0)
+                {
+                    uint stackRa = sys.Memory.Read32(spEpi + 144) & 0x1FFFFFFFu;
+                    if (IsSafeCodeTarget(sys, stackRa))
+                        resumeEpi = stackRa;
+                }
+                if (resumeEpi == 0)
+                    resumeEpi = IsSafeCodeTarget(sys, 0x002D71E4) ? 0x002D71E4u : 0x0048A980u;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = resumeEpi;
+                sys.EE.COP0_Status &= ~0x6u;
                 ArmGifPath3(sys);
-                try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                catch { /* ignore */ }
                 _menuDrawKicks++;
                 _lastTitleSmCyc = c;
-                if (_menuDrawKicks >= 16 && sys.Gs.PixelsWritten < 100)
-                {
-                    uint resume = 0x002CD7E0;
-                    if (IsSafeCodeTarget(sys, resume))
-                    {
-                        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                        sys.EE.PC = resume;
-                        sys.EE.COP0_Status &= ~0x6u;
-                    }
-                }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && (_menuDrawKicks <= 20 || _menuDrawKicks % 16 == 0))
                     Console.Error.WriteLine(
-                        $"[BO2] post-match PATH3 arm pc=0x{pcBad:X8} n={_menuDrawKicks} " +
+                        $"[BO2] SN epilogue follow ra -> 0x{resumeEpi:X8} n={_menuDrawKicks} " +
                         $"px={sys.Gs.PixelsWritten} cyc={c}");
+            }
+            else if (pcBad is >= 0x0046FB88 and <= 0x0046FD00 && (c - _lastTitleSmCyc) >= 200_000)
+            {
+                // Residual in SN printf body — soft-stub entry and jump to epilogue with v0=0
+                // so caller $ra resumes natural boot (FILEIO/GOE Open of PRECODE/CODE).
+                SoftStubSnPrintf(sys);
+                ArmGifPath3(sys);
+                try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+                catch { /* ignore */ }
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = 0x0046FC54; // epilogue restore / jr ra
+                sys.EE.COP0_Status &= ~0x6u;
+                _menuDrawKicks++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_menuDrawKicks <= 20 || _menuDrawKicks % 16 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] SN body → epilogue pc was 0x{pcBad:X8} n={_menuDrawKicks} " +
+                        $"px={sys.Gs.PixelsWritten} cyc={c}");
+            }
+            // List-walk thrash at 0x2CD7E0 (lw v0,16392(s1)) with bad s1 after false resume.
+            else if (pcBad is >= 0x002CD7C0 and <= 0x002CD810 && (c - _lastTitleSmCyc) >= 150_000)
+            {
+                uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
+                bool badS1 = s1 < 0x00100000 || s1 >= (uint)SystemMemory.RDRAM_SIZE || (s1 & 3) != 0;
+                if (badS1 || sys.Gs.PixelsWritten < 100)
+                {
+                    // Skip to post-loop jal 0x4815C8 path with v0 safe, or safer mid-title.
+                    uint resume = 0x002CD800;
+                    if (!IsSafeCodeTarget(sys, resume) || _menuDrawKicks >= 8)
+                        resume = IsSafeCodeTarget(sys, 0x002D71E4) ? 0x002D71E4u : 0x0048A980u;
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                    sys.EE.PC = resume;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    ArmGifPath3(sys);
+                    _menuDrawKicks++;
+                    _lastTitleSmCyc = c;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
+                        Console.Error.WriteLine(
+                            $"[BO2] escape 0x2CD7xx list s1=0x{s1:X8} -> 0x{resume:X8} " +
+                            $"n={_menuDrawKicks} cyc={c}");
+                }
             }
         }
 
@@ -457,6 +536,87 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             MaybeSkipCacheFlush(sys, c);
         if (sys.Cdvd.SectorsRead >= 1000 && sys.Gs.PixelsWritten < 10_000)
             MaybeKickMenuDraw(sys, c);
+
+        // Live menu18: after SN leave, lands at 0x48A9B8 (j 0x48CF50 / sp+=64 early-out
+        // of post-flush init when *0x49C108 != 0). Force the jump target so EI / return
+        // completes and caller can resume toward MAINMENU draw.
+        if (sys.Cdvd.SectorsRead >= 1600 && sys.Gs.PixelsWritten < 50_000)
+        {
+            uint pcEi = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+            if (pcEi is >= 0x0048A9A8 and <= 0x0048A9C0 && (c - _lastTitleSmCyc) >= 100_000)
+            {
+                sys.EE.PC = 0x0048CF50; // mfc0 Status; ei; jr ra
+                sys.EE.COP0_Status &= ~0x6u;
+                // Ensure $ra is real so after 0x48CF50 returns we land somewhere useful.
+                uint raEi = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                if (!IsSafeCodeTarget(sys, raEi))
+                {
+                    uint plant = IsSafeCodeTarget(sys, 0x0048A980) ? 0x0048A980u : 0x004891A0u;
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = plant });
+                }
+                ArmGifPath3(sys);
+                _menuDrawKicks++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] force post-flush EI path 0x{pcEi:X8} -> 0x48CF50 " +
+                        $"n={_menuDrawKicks} px={sys.Gs.PixelsWritten} cyc={c}");
+            }
+            // After EI helper (0x48CF50..64) with low px: only follow a real $ra.
+            // Never blind-kick 0x4520B0 — that prologue needs a live object in a0
+            // (live menu19 thrash + UnknownOpcode at 0x5378xx data).
+            else if (pcEi is >= 0x0048CF50 and <= 0x0048CF64 && (c - _lastTitleSmCyc) >= 150_000)
+            {
+                uint ra2 = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                if (IsSafeCodeTarget(sys, ra2) && ra2 is not (>= 0x004520B0 and <= 0x004520D0))
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                    sys.EE.PC = ra2;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    ArmGifPath3(sys);
+                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+                    catch { /* ignore */ }
+                    _menuDrawKicks++;
+                    _lastTitleSmCyc = c;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
+                        Console.Error.WriteLine(
+                            $"[BO2] leave EI helper -> 0x{ra2:X8} n={_menuDrawKicks} " +
+                            $"px={sys.Gs.PixelsWritten} cyc={c}");
+                }
+                else
+                {
+                    // Let jr ra complete naturally; only arm PATH3 + pad.
+                    ArmGifPath3(sys);
+                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+                    catch { /* ignore */ }
+                    _lastTitleSmCyc = c;
+                }
+            }
+        }
+    }
+
+    private bool _snPrintfStubbed;
+
+    /// <summary>
+    /// SN ProDG printf channel entry at <c>0x46FAF8</c> (sp-=160, CallRpc sid=0x534E03).
+    /// Soft-stub to <c>jr ra; li v0,0</c> so debug prints cannot park WaitSema after GOE.
+    /// Not the MAINMENU draw path (disasm: a1=0x534E03).
+    /// </summary>
+    private void SoftStubSnPrintf(Ps2System sys)
+    {
+        if (_snPrintfStubbed) return;
+        // Only plant once the ELF is resident (probe first opcode of entry).
+        uint head = sys.Memory.Read32(0x0046FAF8);
+        if (head == 0) return;
+        // Already stubbed?
+        if (head == 0x03E00008u) { _snPrintfStubbed = true; return; }
+        sys.Memory.Write32(0x0046FAF8, 0x03E00008u); // jr ra
+        sys.Memory.Write32(0x0046FAFC, 0x00001021u); // addu v0, zero, zero  (v0=0 success)
+        _snPrintfStubbed = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine("[BO2] soft-stub SN printf @ 0x46FAF8 (jr ra; v0=0)");
     }
 
     private int _cacheFlushSkips;
@@ -533,16 +693,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             uint resume = IsSafeCodeTarget(sys, ra) && ra != pc ? ra : 0;
             if (resume == 0)
                 resume = PickSafeResume(sys, pc);
-            // Prefer next function after this epilogue (real prologue at 0x4520B0) when
-            // $ra is the RPC-complete park — keep walking forward through init.
+            // Prefer post-flush init / RPC worker when $ra is WaitSema/RPC-complete park.
+            // Never cold-enter 0x4520B0 (needs a0 object) or 0x2CD7E0 (needs s1 list).
             if (resume == 0 || resume is (>= 0x00488800 and <= 0x0048B200)
                 || !IsSafeCodeTarget(sys, resume))
-                resume = 0x004520B0;
-            // After many kicks still px low, try post-flush init and RPC worker instead of
-            // thrashing 0x4520B0 alone (menu14 thrash residual).
+                resume = 0x0048A980;
             if (_menuDrawKicks >= 24 && sys.Gs.PixelsWritten < 100)
             {
-                uint[] alts = { 0x0048A980, 0x004891A0, 0x002CD7E0, 0x002CD800 };
+                uint[] alts = { 0x0048A980, 0x004891A0, 0x0048AF30 };
                 int idx = (_menuDrawKicks / 8) % alts.Length;
                 if (IsSafeCodeTarget(sys, alts[idx]))
                     resume = alts[idx];
@@ -660,19 +818,33 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 if (sys.Memory.Read32(pc + i * 4) == 0) nops++;
             if (nops >= 3) return true;
         }
-        // Known mid-utility that was previously used as a false "menu draw" target.
-        if (pc is >= 0x00479E00 and <= 0x00479E28) return true;
+        // 0x479E04 is a real bit-pack utility (ori v0,v0,0xFFFF) — never a menu-draw
+        // entry, but natural calls must run to completion. Do NOT treat as data thrash
+        // (live agent-fix30: post-Bind sid=0x29 lands here legitimately; rescuing to
+        // 0x48AF30 cold-corrupted RPC frames).
         // Trust resident .text inside the boot ELF window.
         if (pc is >= 0x00120000 and < 0x004A0000)
             return false;
         return !sys.Memory.IsLikelyEeCode(pc) && pc is >= 0x00100000 and < 0x02000000;
     }
 
+    private static bool IsColdSafeResume(Ps2System sys, uint addr)
+    {
+        if (!IsSafeCodeTarget(sys, addr)) return false;
+        // Mid-RPC Bind/Call complete needs a live frame — only natural WaitSema $ra
+        // may re-enter (handled separately). Cold rescue into 0x48AFxx corrupts state.
+        if (addr is >= 0x0048AF00 and <= 0x0048C800) return false;
+        if (addr is >= 0x004891A0 and <= 0x00489200) return false; // RPC worker entry cold
+        // Low EE library / syscall stubs — live final thrash re-entered 0x16642C mid-frame.
+        if (addr is >= 0x00120000 and < 0x00200000) return false;
+        return true;
+    }
+
     private static uint PickSafeResume(Ps2System sys, uint pc)
     {
-        // 1) Live $ra when it is real .text outside data/utility.
+        // 1) Live $ra when cold-safe.
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-        if (IsSafeCodeTarget(sys, ra) && ra != pc)
+        if (IsColdSafeResume(sys, ra) && ra != pc)
             return ra;
 
         // 2) Stack scan for return addresses.
@@ -682,7 +854,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             for (uint off = 0; off <= 0xC0; off += 4)
             {
                 uint cand = sys.Memory.Read32(sp + off) & 0x1FFFFFFFu;
-                if (IsSafeCodeTarget(sys, cand) && cand != pc)
+                if (IsColdSafeResume(sys, cand) && cand != pc)
                     return cand;
             }
         }
@@ -691,20 +863,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (sys.LastGoodEePc is >= 0x00100000 and < 0x00500000)
         {
             uint lg = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-            if (IsSafeCodeTarget(sys, lg) && lg != pc)
+            if (IsColdSafeResume(sys, lg) && lg != pc)
                 return lg;
         }
 
-        // 4) Known live boot / post-MAINMENU sites (NOT 0x479E04 bit-pack utility).
-        // 0x48A980 = function after cache-flush leaf (real prologue); 0x4891A0 RPC worker;
-        // Prefer mid-title 0x2CD7E0 / 0x2D71E4 (live final) over RPC-complete which re-parks.
-        // 0x4520B0 = next fn after live final epilogue 0x4520AC (menu/init continue).
-        // NEVER 0x1C03xx (menu15 false rescue → data thrash at 0xA227xx).
-        foreach (uint cand in new uint[]
-                 { 0x002D71E4, 0x002CD7E0, 0x002CD800, 0x0048A980, 0x004891A0,
-                   0x004520B0, 0x0048AF30 })
+        // 4) Cold-resume only into self-contained prologues.
+        foreach (uint cand in new uint[] { 0x0048A980, 0x002D71E4 })
         {
-            if (IsSafeCodeTarget(sys, cand) && cand != pc)
+            if (IsColdSafeResume(sys, cand) && cand != pc)
                 return cand;
         }
         return 0;
@@ -714,11 +880,15 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     {
         // BO2 ELF .text ends ~0x4A477C (PT_LOAD memsz) — never resume into high goefile data.
         if (addr is < 0x00100000 or >= 0x004A0000) return false;
-        if (addr is >= 0x00479E00 and <= 0x00479E80) return false; // bit-pack utility
+        if (addr is >= 0x00479E00 and <= 0x00479E80) return false; // bit-pack (no cold entry)
         if (addr is >= 0x00488890 and <= 0x00488920) return false; // WaitSema body
         if (addr is >= 0x00489090 and <= 0x004890B8) return false; // memcpy epilogue (jr-ra park)
         if (addr is >= 0x0048A8D0 and <= 0x0048A974) return false; // cache-flush leaf
+        if (addr is >= 0x0046FAF8 and <= 0x0046FC80) return false; // SN printf channel
         if (addr == 0x00100008) return false; // never re-CRT0
+        // Object-dependent mid-functions — cold kicks thrash into data (live menu19).
+        if (addr is >= 0x002CD7C0 and <= 0x002CD810) return false; // list-walk needs s1
+        if (addr is >= 0x004520B0 and <= 0x00452100) return false; // needs a0 object
         // menu15 false rescue 0x1C03F0 → data thrash at 0xA227xx — reject low mid-blob.
         if (addr is >= 0x001C0000 and <= 0x001C1000) return false;
         // Low BIOS/HLE stubs (0x10xxxx) are real but re-entering mid-syscall thrashes.

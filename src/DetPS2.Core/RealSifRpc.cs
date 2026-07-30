@@ -186,6 +186,16 @@ public sealed class RealSifRpc
     /// <summary>Count of LOADFILE RPC calls handled (smoke / diagnostics).</summary>
     public ulong LoadFileOps { get; private set; }
 
+    /// <summary>
+    /// Last IOPRP/DNAS image version tag derived from <c>SifIopReset</c> arg
+    /// (e.g. <c>"2430"</c> for <c>IOPRP243.IMG</c>). Empty until a RESET_CMD with an
+    /// image name completes. Used by <c>LF_F_GET_VERSION</c> so SN ProDG / Midway
+    /// LOADFILE clients that strcmp the 4-byte reply against the expected IOPRP
+    /// digits (MK: Deadly Alliance, Deception, Blood Omen 2, Burnout 3) advance past
+    /// the post-reboot gate without per-title plants.
+    /// </summary>
+    private string _lastIopRpVersionAscii = "";
+
     // IOP heap window for SidSysmem HLE. Sits above IopModuleHost IRX placement
     // (IrxLoader.DefaultLoadBase … ~0x180000) and below bind-scratch (0x1F0000).
     // Real SYSMEM manages nearly all free IOP RAM via 256-byte page freelists; this is a
@@ -329,6 +339,7 @@ public sealed class RealSifRpc
         _unknownSidsSeen.Clear();
         _padAreas.Clear();
         _padFrame = 0;
+        _lastIopRpVersionAscii = "";
     }
 
     /// <summary>
@@ -337,12 +348,69 @@ public sealed class RealSifRpc
     /// rom0-style OPEN return 0 ("already open") across REBOOT gen≥2 (MK IOPRP300 reload).
     /// Client bind maps are kept — EE still rebinds, and wiping them mid-flight loses argBufs.
     /// </summary>
-    public void OnIopReboot()
+    /// <param name="rebootArg">
+    /// Optional RESET_CMD arg string (e.g. <c>rom0:UDNL cdrom0:\MODULE\IOPRP243.IMG;1</c>).
+    /// When present, updates the LOADFILE GetVersion ASCII tag so SN/Midway clients that
+    /// compare the 4-byte reply against the IOPRP digits (MK:DA "2430", BO2 "2340", B3 "2800")
+    /// see a real UDNL-style handoff instead of the bare LOADFILE 0x00020000 placeholder.
+    /// </param>
+    public void OnIopReboot(string? rebootArg = null)
     {
         _padAreas.Clear();
+        if (!string.IsNullOrEmpty(rebootArg))
+        {
+            string ver = ExtractIopRpVersionAscii(rebootArg);
+            if (ver.Length > 0)
+                _lastIopRpVersionAscii = ver;
+        }
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1"
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-            Console.Error.WriteLine("[RPC] OnIopReboot: cleared pad open areas (PADMAN surface)");
+            Console.Error.WriteLine(
+                $"[RPC] OnIopReboot: cleared pad open areas; ioprpVer=\"{_lastIopRpVersionAscii}\" " +
+                $"arg=\"{rebootArg}\"");
+    }
+
+    /// <summary>
+    /// Derive the 4-char IOPRP version tag SN/Midway LOADFILE clients compare after
+    /// <c>LF_F_GET_VERSION</c>. <c>IOPRP243.IMG</c> → <c>"2430"</c>, <c>IOPRP234</c> →
+    /// <c>"2340"</c>, <c>DNAS280.IMG</c> / <c>IOPRP280</c> → <c>"2800"</c>. Empty if no match.
+    /// </summary>
+    public static string ExtractIopRpVersionAscii(string rebootArg)
+    {
+        if (string.IsNullOrEmpty(rebootArg)) return "";
+        // Prefer IOPRPxxx; also accept DNASxxx (Burnout 3 DNAS280 path).
+        int idx = rebootArg.IndexOf("IOPRP", StringComparison.OrdinalIgnoreCase);
+        int digitStart;
+        if (idx >= 0)
+            digitStart = idx + 5;
+        else
+        {
+            idx = rebootArg.IndexOf("DNAS", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return "";
+            digitStart = idx + 4;
+        }
+        var digits = new System.Text.StringBuilder(4);
+        for (int i = digitStart; i < rebootArg.Length && digits.Length < 4; i++)
+        {
+            char c = rebootArg[i];
+            if (c is >= '0' and <= '9') digits.Append(c);
+            else break;
+        }
+        if (digits.Length == 0) return "";
+        // 3-digit image codes (243/234/280) become 4-char tags with trailing '0'.
+        while (digits.Length < 4) digits.Append('0');
+        return digits.ToString(0, 4);
+    }
+
+    /// <summary>Pack 4 ASCII chars little-endian into a LOADFILE GetVersion reply dword.</summary>
+    public static int PackAsciiVersion(string four)
+    {
+        if (string.IsNullOrEmpty(four) || four.Length < 4) return 0x00020000;
+        return unchecked((int)(
+            (uint)(byte)four[0] |
+            ((uint)(byte)four[1] << 8) |
+            ((uint)(byte)four[2] << 16) |
+            ((uint)(byte)four[3] << 24)));
     }
 
     private void ResetIopHeap()
@@ -558,7 +626,7 @@ public sealed class RealSifRpc
             && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx && sid != SidSdReg
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
-            && sid != SidIopFile20 && sid != SidIopFile21 && sid != SidIopFile29 && sid != SidIopFile30
+            && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
             && !IsBurnout3GtfsSid(sid))
@@ -881,10 +949,10 @@ public sealed class RealSifRpc
             return;
         }
 
-        // IOPFILE / GOE_FSRV (Blood Omen 2) — low SIDs 0x20/0x21/0x29/0x30.
+        // IOPFILE / GOE_FSRV (Blood Omen 2 + Whiplash) — low SIDs including 0x31/0x40.
         // HandleIopFile writes the multi-word GOE reply (status/filesize/scefd/iStream)
         // into recvBuf — do NOT clobber with a single int afterwards.
-        if (sid is SidIopFile20 or SidIopFile21 or SidIopFile29 or SidIopFile30)
+        if (IsIopFileSid(sid))
         {
             int ir = HandleIopFile(mem, iopModules, cdvd, sid, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -918,15 +986,15 @@ public sealed class RealSifRpc
             return;
         }
 
-        // Criterion GTFS / B3 aux after GTFSCDVD.IRX — soft-success with zeroed recv so
-        // stage/table open does not thrash; game FILEIO may follow once boot leaves flip.
+        // Criterion GTFS / B3 aux after GTFSCDVD.IRX — real Iso TOC / STAGEHED open so
+        // cdvd rises past IRX-only 425 and EE stream tables get non-zero sizes.
         if (IsBurnout3GtfsSid(sid))
         {
-            int gr = HandleGtfs(mem, sid, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
+            int gr = HandleGtfs(mem, cdvd, iopModules, sid, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
                     $"[RPC] HandleCall sid=GTFS(0x{sid:X8}) fno=0x{rpcNumber:X} result={gr} " +
-                    $"recvBuf=0x{recvBuf:X8} send={sendSize}");
+                    $"recvBuf=0x{recvBuf:X8} send={sendSize} arg=0x{argBuf:X8}");
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
         }
@@ -1550,9 +1618,20 @@ public sealed class RealSifRpc
                 break;
             }
             case LfGetVersion:
-                // Confirmed called live (not via public ps2sdk wrapper). Packed major.minor-ish
-                // placeholder — never negative (defensive clients refuse a negative "version").
-                result = 0x00020000;
+                // Confirmed called live (not via public ps2sdk wrapper).
+                // After SifIopReset(IOPRPxxx/DNASxxx), SN ProDG / Midway clients (MK:DA @
+                // 0x113778, BO2, B3) copy the 4-byte reply into a BSS cell and strcmp it
+                // against the expected IOPRP digit string ("2430"/"2340"/"2800") or "....".
+                // Real UDNL would surface the image version; without that handoff HLE used
+                // to return a bare LOADFILE 0x00020000 placeholder and the gate returned
+                // 0xFFFEFFFC forever (cdvdSectors stuck at 0). Prefer the post-reboot tag.
+                result = !string.IsNullOrEmpty(_lastIopRpVersionAscii)
+                    ? PackAsciiVersion(_lastIopRpVersionAscii)
+                    : 0x00020000; // pre-reboot / no image: keep classic LOADFILE 2.0 token
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[LOADFILE] GET_VERSION result=0x{unchecked((uint)result):X8} " +
+                        $"ioprp=\"{_lastIopRpVersionAscii}\"");
                 break;
 
             default:
@@ -2156,11 +2235,11 @@ public sealed class RealSifRpc
 
             case SidGtfsStg:
             case SidB3Aux:
-                return HandleGtfs(mem, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
+                return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
 
             default:
                 if (IsBurnout3GtfsSid(sid))
-                    return HandleGtfs(mem, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
+                    return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
                 // Prefer 0 (common IOP "OK") over 1. Callers that treat non-zero as success
                 // still pass with our specialized handlers above; 989snd treats 1 as fail.
                 UnknownServiceCalls++;
@@ -2169,25 +2248,330 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// Criterion GTFS / Burnout 3 stage RPC soft HLE. No real GTFSCDVD service under HLE —
-    /// return 0 success and clear a modest recv prefix so open/read-style fnos take empty paths
-    /// rather than assert. Live B3: fno=1 recv@0x4E2730, fno=3 recv@0x66E080 after IRX load.
+    /// Criterion GTFS / Burnout 3 stage RPC HLE (GTFSCDVD.IRX / sid <c>"STG\\0"</c>).
+    /// Live B3: fno=1 recv@0x4E2730 send=48, fno=3 recv@0x66E080 send=64, fno=5 send=16.
+    /// Soft-only replies left <c>cdvdSectors</c> stuck at IRX-only 425. Now opens real
+    /// <c>DATA/STAGEHED.BIN</c> (and optionally FRONTEND) via Iso FILEIO host so TOC-style
+    /// status carries real sizes and host sector counters advance past IRX.
     /// </summary>
-    private static int HandleGtfs(SystemMemory mem, uint sid, uint fno, uint argBuf, uint sendSize,
-        uint recvBuf, uint recvSize)
+    private static int _gtfsStageHedFd = -1;
+    private static uint _gtfsStageHedSize;
+    private static int _gtfsFrontendFd = -1;
+    private static uint _gtfsFrontendSize;
+    private static bool _gtfsTocOpened;
+
+    private static int HandleGtfs(SystemMemory mem, Cdvd cdvd, IopModuleHost iopModules,
+        uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
-        _ = sid; _ = fno; _ = argBuf; _ = sendSize;
+        _ = sid;
+        // Dump send buffer so we can reverse path/handle layouts under TRACE_RPC.
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1" && argBuf != 0 && sendSize > 0)
+        {
+            uint n = Math.Min(sendSize, 64u);
+            var sb = new System.Text.StringBuilder(128);
+            sb.Append($"[GTFS] fno=0x{fno:X} send={sendSize} arg=0x{argBuf:X8}:");
+            for (uint o = 0; o + 4 <= n; o += 4)
+                sb.Append($" {mem.Read32(argBuf + o):X8}");
+            // Inline path if send looks like a C string (device:/name).
+            string probe = ReadCString(mem, argBuf, 96);
+            if (LooksLikeFsPath(probe))
+                sb.Append($" path=\"{probe}\"");
+            // Or path at +4 / +8 (pointer or inline after header words).
+            if (sendSize >= 8)
+            {
+                uint p4 = mem.Read32(argBuf + 4);
+                if (IsEeRamPointer(p4))
+                {
+                    string p = ReadCString(mem, p4, 96);
+                    if (LooksLikeFsPath(p)) sb.Append($" path*4=\"{p}\"");
+                }
+                else
+                {
+                    string p = ReadCString(mem, argBuf + 4, 96);
+                    if (LooksLikeFsPath(p)) sb.Append($" path+4=\"{p}\"");
+                }
+            }
+            Console.Error.WriteLine(sb.ToString());
+        }
+
+        // Ensure stage header is open on the host (Criterion stage TOC) — STG sid only.
+        // SidB3Aux (0x00150276) is a residual post-LGDEV service (likely B3ROUTE family);
+        // do NOT DMA STAGEHED into its send dest (live dest 0x01E7AC80 collides with EE stacks).
+        bool isStg = sid == SidGtfsStg || sid == 0x53465447u;
+        if (isStg)
+            EnsureGtfsStageAssets(iopModules, cdvd);
+        else
+        {
+            // Soft-success only for aux: zeroed-OK reply, no disc DMA.
+            if (recvBuf != 0)
+            {
+                uint limit = recvSize > 0 ? Math.Min(recvSize, 0x40u) : 0x40u;
+                for (uint o = 0; o + 4 <= limit; o += 4)
+                    mem.Write32(recvBuf + o, 0);
+            }
+            return 0;
+        }
+
+        // Path open (fno=3 live: inline "Data\\Global.txd") + dest/size DMA heuristics.
+        uint openedSize = 0;
+        int openedFd = TryGtfsPathOpenOrRead(mem, iopModules, cdvd, fno, argBuf, sendSize,
+            recvBuf, recvSize, out openedSize);
+
+        // fno=5 live: {0, handle?, dest, …} — read previously opened Global.txd slice only.
+        // Cap size so we never blast multi-MB FRONTEND into a small EE buffer.
+        if (fno == 5 && argBuf != 0 && sendSize >= 12)
+        {
+            uint w0 = mem.Read32(argBuf + 0);
+            uint w1 = mem.Read32(argBuf + 4);
+            uint dest = mem.Read32(argBuf + 8) & 0x1FFFFFFFu;
+            // Reject stack/high scratch dests (0x01E00000+) — live stack band.
+            if (w0 == 0 && IsEeRamPointer(dest) && dest < 0x01E00000u)
+            {
+                int fd = _gtfsLastPathFd >= 0 ? _gtfsLastPathFd : openedFd;
+                uint maxSz = _gtfsLastPathSize != 0 ? _gtfsLastPathSize
+                    : (openedSize != 0 ? openedSize : 0x10000u);
+                uint want = Math.Min(maxSz, 0x40000u); // cap 256KiB per fno=5
+                if (fd >= 0 && dest + want <= (uint)SystemMemory.RDRAM_SIZE
+                    && iopModules.TryReadOpenFileBytes(fd, 0, (int)want, out byte[]? data)
+                    && data != null)
+                {
+                    for (int i = 0; i < data.Length; i++)
+                        mem.Write8(dest + (uint)i, data[i]);
+                    cdvd.NoteHostReadSectors((data.Length + 2047) / 2048);
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                        Console.Error.WriteLine(
+                            $"[GTFS] fno=5 DMA fd={fd} -> 0x{dest:X8} n={data.Length} h={w1}");
+                }
+            }
+        }
+
+        uint assetSize = openedSize != 0 ? openedSize
+            : (_gtfsLastPathSize != 0 ? _gtfsLastPathSize
+                : (_gtfsStageHedSize != 0 ? _gtfsStageHedSize
+                    : (_gtfsFrontendSize != 0 ? _gtfsFrontendSize : 0x10000u)));
+        uint handle = 1u + (fno & 0xF);
+        if (openedFd >= 0)
+            handle = (uint)(0x100 + openedFd);
+        else if (_gtfsLastPathFd >= 0)
+            handle = (uint)(0x100 + _gtfsLastPathFd);
+        else if (_gtfsStageHedFd >= 0)
+            handle = (uint)(0x100 + _gtfsStageHedFd);
+
         if (recvBuf != 0)
         {
-            uint limit = recvSize > 0 ? Math.Min(recvSize, 0x80u) : 0x40u;
+            uint limit = recvSize > 0 ? Math.Min(recvSize, 0x100u) : 0x40u;
             for (uint o = 0; o + 4 <= limit; o += 4)
                 mem.Write32(recvBuf + o, 0);
-            // Word0 = status OK; some open-style fnos read a handle at +4 — plant 1.
+            // Word0 = status OK; +4 = handle; +8 = size; +12 = count; +16 = sectors.
             mem.Write32(recvBuf, 0);
             if (limit >= 8)
-                mem.Write32(recvBuf + 4, 1);
+                mem.Write32(recvBuf + 4, handle);
+            if (limit >= 12)
+                mem.Write32(recvBuf + 8, assetSize);
+            if (limit >= 16)
+                mem.Write32(recvBuf + 12, 1);
+            if (limit >= 20)
+                mem.Write32(recvBuf + 16, (assetSize + 2047) / 2048);
+            // fno=1 init / fno=3 path-open — advertise real file size.
+            if ((fno == 1 || fno == 3) && limit >= 8)
+            {
+                mem.Write32(recvBuf, 0);
+                mem.Write32(recvBuf + 4, handle);
+                if (limit >= 12)
+                    mem.Write32(recvBuf + 8, assetSize);
+            }
         }
         return 0;
+    }
+
+    private static int _gtfsLastPathFd = -1;
+    private static uint _gtfsLastPathSize;
+
+    /// <summary>
+    /// Open <c>DATA/STAGEHED.BIN</c> + <c>DATA/FRONTEND.TXD</c> once via FILEIO host.
+    /// Counts real ISO sectors toward <see cref="Cdvd.SectorsRead"/> so telemetry leaves IRX-only 425.
+    /// </summary>
+    private static void EnsureGtfsStageAssets(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_gtfsTocOpened) return;
+        _gtfsTocOpened = true;
+
+        // STAGEHED — stage/header TOC used by Criterion front-end boot.
+        foreach (string p in new[]
+                 {
+                     @"cdrom0:\DATA\STAGEHED.BIN;1",
+                     @"cdrom0:\DATA\STAGEHED.BIN",
+                     "DATA/STAGEHED.BIN",
+                     "STAGEHED.BIN",
+                 })
+        {
+            int fd = iopModules.FileOpen(p);
+            if (fd < 0) continue;
+            _gtfsStageHedFd = fd;
+            if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+            {
+                _gtfsStageHedSize = sz;
+                cdvd.NoteHostReadSectors((int)Math.Min((sz + 2047) / 2048, 4096));
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] open STAGEHED path=\"{p}\" fd={fd} size={_gtfsStageHedSize}");
+            break;
+        }
+
+        // FRONTEND.TXD — main menu textures (large; count sectors, stream don't preload full).
+        foreach (string p in new[]
+                 {
+                     @"cdrom0:\DATA\FRONTEND.TXD;1",
+                     @"cdrom0:\DATA\FRONTEND.TXD",
+                     "DATA/FRONTEND.TXD",
+                     "FRONTEND.TXD",
+                 })
+        {
+            int fd = iopModules.FileOpen(p);
+            if (fd < 0) continue;
+            _gtfsFrontendFd = fd;
+            if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+            {
+                _gtfsFrontendSize = sz;
+                // Count a slice at open so cdvd advances without loading 8MB into RAM twice.
+                cdvd.NoteHostReadSectors((int)Math.Min((sz + 2047) / 2048, 512));
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] open FRONTEND path=\"{p}\" fd={fd} size={_gtfsFrontendSize}");
+            break;
+        }
+
+        // HEADUS.BIN — localized menu strings (ONLINE/CRASH/RACE …).
+        foreach (string p in new[]
+                 {
+                     @"cdrom0:\DATA\HEADUS.BIN;1",
+                     @"cdrom0:\DATA\HEADUS.BIN",
+                     "DATA/HEADUS.BIN",
+                 })
+        {
+            int fd = iopModules.FileOpen(p);
+            if (fd < 0) continue;
+            if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+                cdvd.NoteHostReadSectors((int)Math.Min((sz + 2047) / 2048, 64));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[GTFS] open HEADUS path=\"{p}\" fd={fd} size={sz}");
+            break;
+        }
+    }
+
+    /// <summary>
+    /// If send buffer encodes a disc path (+ optional EE dest), open/read through FILEIO host.
+    /// Live B3 fno=3: inline <c>Data\Global.txd</c> at arg+0 (no dest — status/size in recv).
+    /// Returns fd (≥0) and size via <paramref name="openedSize"/>.
+    /// </summary>
+    private static int TryGtfsPathOpenOrRead(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize, out uint openedSize)
+    {
+        openedSize = 0;
+        if (argBuf == 0 || sendSize < 4) return -1;
+
+        string path = "";
+        string p0 = ReadCString(mem, argBuf, 96);
+        if (LooksLikeFsPath(p0) && (p0.Contains('.') || p0.Contains(':') || p0.Contains('\\') || p0.Contains('/')))
+            path = p0;
+        if (path.Length == 0 && sendSize >= 8)
+        {
+            uint maybePtr = mem.Read32(argBuf + 4);
+            if (IsEeRamPointer(maybePtr))
+            {
+                string pp = ReadCString(mem, maybePtr, 96);
+                if (LooksLikeFsPath(pp)) path = pp;
+            }
+            else
+            {
+                string p4 = ReadCString(mem, argBuf + 4, 96);
+                if (LooksLikeFsPath(p4) && p4.Length >= 4) path = p4;
+            }
+        }
+        if (path.Length == 0) return -1;
+
+        // Dest + size heuristics: scan words for EE pointer + plausible size.
+        uint dest = 0, size = 0;
+        uint scan = Math.Min(sendSize, 48u);
+        for (uint o = 0; o + 8 <= scan; o += 4)
+        {
+            uint a = mem.Read32(argBuf + o);
+            uint b = mem.Read32(argBuf + o + 4);
+            // Skip if 'a' is part of an ASCII path (high bytes printable).
+            bool aLooksAscii = (a & 0xFF) is >= 0x20 and <= 0x7E
+                               && ((a >> 8) & 0xFF) is >= 0x20 and <= 0x7E;
+            if (aLooksAscii) continue;
+            if (IsEeRamPointer(a) && b is > 0 and <= 0x01000000)
+            {
+                dest = a & 0x1FFFFFFFu;
+                size = b;
+                break;
+            }
+            if (IsEeRamPointer(b) && a is > 0 and <= 0x01000000 && a < 0x00100000)
+            {
+                size = a;
+                dest = b & 0x1FFFFFFFu;
+                break;
+            }
+        }
+
+        // Resolve Criterion relative paths: "Data\Global.txd" → cdrom0:\DATA\GLOBAL.TXD
+        string resolved = path;
+        if (!path.StartsWith("cdrom", StringComparison.OrdinalIgnoreCase))
+        {
+            string norm = path.Replace('/', '\\').TrimStart('\\');
+            resolved = @"cdrom0:\" + norm;
+            if (!resolved.Contains(';'))
+                resolved += ";1";
+        }
+
+        int fd = iopModules.FileOpen(resolved);
+        if (fd < 0)
+            fd = iopModules.FileOpen(path);
+        if (fd < 0)
+        {
+            // Try upper-case DATA\ name (ISO 9660).
+            string up = resolved.ToUpperInvariant();
+            fd = iopModules.FileOpen(up);
+        }
+        if (fd < 0) return -1;
+
+        uint fsz = 0;
+        if (iopModules.TryGetOpenFileSize(fd, out fsz) && fsz > 0)
+        {
+            openedSize = fsz;
+            _gtfsLastPathFd = fd;
+            _gtfsLastPathSize = fsz;
+            cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 2048));
+        }
+
+        if (dest != 0 && size != 0 && dest < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            uint want = Math.Min(size, fsz != 0 ? fsz : size);
+            want = Math.Min(want, (uint)SystemMemory.RDRAM_SIZE - dest);
+            want = Math.Min(want, 4u * 1024 * 1024);
+            if (iopModules.TryReadOpenFileBytes(fd, 0, (int)want, out byte[]? data) && data != null)
+            {
+                for (int i = 0; i < data.Length; i++)
+                    mem.Write8(dest + (uint)i, data[i]);
+                if (recvBuf != 0 && recvSize >= 8)
+                {
+                    mem.Write32(recvBuf, 0);
+                    mem.Write32(recvBuf + 4, (uint)data.Length);
+                }
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[GTFS] read path=\"{path}\" -> 0x{dest:X8} n={data.Length} fno=0x{fno:X}");
+            }
+        }
+        else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[GTFS] open path=\"{path}\" fd={fd} size={fsz} fno=0x{fno:X}");
+        }
+        return fd;
     }
 
     /// <summary>dbcman.irx RPC (sid=0x80001300). Version must match libdbc 3.10.</summary>
@@ -2207,14 +2591,23 @@ public sealed class RealSifRpc
     /// <summary>989snd secondary / stream RPC.</summary>
     public const uint Sid989Snd2 = 0x00123457;
 
-    // Crystal Dynamics / SN "GOE_FSRV" IOPFILE.IRX services (Blood Omen 2).
-    // Disc module registers four low SIDs (live bind order 0x30, 0x20, 0x21, 0x29) —
-    // reverse-truthed from iopfile.irx data words at file+0xC70/0xE44 and retail bind log.
-    // EE client uses these for archive / bigfile streaming (PS2.RKV) after GAME.ERG config.
+    // Crystal Dynamics / SN "GOE_FSRV" IOPFILE.IRX services (Blood Omen 2 + Whiplash).
+    // Disc module registers low SIDs — BO2 live bind order 0x30, 0x20, 0x21, 0x29
+    // (iopfile.irx data words at file+0xC70/0xE44). Whiplash IOPFILE.IRX binds 0x31 + 0x40
+    // (2026-07-30 live unknownBindSids). EE client uses these for archive / bigfile
+    // streaming (PS2.RKV) after GAME.INI / GAME.ERG config.
     public const uint SidIopFile20 = 0x00000020;
     public const uint SidIopFile21 = 0x00000021;
     public const uint SidIopFile29 = 0x00000029;
     public const uint SidIopFile30 = 0x00000030;
+    /// <summary>Whiplash (SLUS_206.84) IOPFILE primary stream SID (live bind).</summary>
+    public const uint SidIopFile31 = 0x00000031;
+    /// <summary>Whiplash (SLUS_206.84) IOPFILE secondary / control SID (live bind).</summary>
+    public const uint SidIopFile40 = 0x00000040;
+
+    private static bool IsIopFileSid(uint sid) =>
+        sid is SidIopFile20 or SidIopFile21 or SidIopFile29 or SidIopFile30
+            or SidIopFile31 or SidIopFile40;
 
     /// <summary>
     /// libdbc extension SIDs (DS2O / dualshock siblings of dbcman 0x80001300).
@@ -2574,10 +2967,23 @@ public sealed class RealSifRpc
     private static string NormalizeGoeDiscPath(string path)
     {
         string norm = path.Replace('/', '\\').Trim();
-        // ArchiveFile="gogames\bo2\ps2.rkv" / basePath-relative names.
+        // ArchiveFile="gogames\bo2\ps2.rkv" / "whiplash\ps2.rkv" / basePath-relative names.
         if (!norm.Contains(':'))
         {
-            if (norm.StartsWith("gogames", StringComparison.OrdinalIgnoreCase)
+            string rest = norm.TrimStart('\\');
+            // Whiplash GAME.INI: ArchivePs2="whiplash/ps2.rkv", gamepath="whiplash"
+            if (rest.StartsWith("whiplash\\", StringComparison.OrdinalIgnoreCase)
+                || rest.StartsWith("whiplash/", StringComparison.OrdinalIgnoreCase)
+                || rest.Equals("whiplash", StringComparison.OrdinalIgnoreCase))
+            {
+                string leaf = rest.StartsWith("whiplash", StringComparison.OrdinalIgnoreCase)
+                    ? rest["whiplash".Length..].TrimStart('\\', '/')
+                    : rest;
+                norm = string.IsNullOrEmpty(leaf)
+                    ? @"cdrom0:\WHIPLASH"
+                    : @"cdrom0:\WHIPLASH\" + leaf.Replace('/', '\\');
+            }
+            else if (norm.StartsWith("gogames", StringComparison.OrdinalIgnoreCase)
                 || norm.StartsWith("\\gogames", StringComparison.OrdinalIgnoreCase)
                 || norm.Contains("PS2.RKV", StringComparison.OrdinalIgnoreCase)
                 || norm.Contains(".rkv", StringComparison.OrdinalIgnoreCase)
@@ -2586,13 +2992,18 @@ public sealed class RealSifRpc
                 || norm.Contains("PRECODE", StringComparison.OrdinalIgnoreCase)
                 || norm.Contains("CODE.BG2", StringComparison.OrdinalIgnoreCase))
             {
-                string rest = norm.TrimStart('\\');
                 // gogames\bo2\ps2.rkv → cdrom0:\GOGAMES\BO2\PS2.RKV
                 if (rest.StartsWith("gogames\\bo2\\", StringComparison.OrdinalIgnoreCase))
                     rest = rest["gogames\\bo2\\".Length..];
                 else if (rest.StartsWith("gogames\\", StringComparison.OrdinalIgnoreCase))
                     rest = rest["gogames\\".Length..];
-                norm = "cdrom0:\\GOGAMES\\BO2\\" + rest;
+                // Bare PS2.RKV on Whiplash lives at WHIPLASH/PS2.RKV — try that prefix first
+                // for non-gogames relative names (BO2 still has GOGAMES\BO2\PS2.RKV).
+                if (rest.Equals("PS2.RKV", StringComparison.OrdinalIgnoreCase)
+                    || rest.Equals("ps2.rkv", StringComparison.OrdinalIgnoreCase))
+                    norm = @"cdrom0:\WHIPLASH\PS2.RKV";
+                else
+                    norm = "cdrom0:\\GOGAMES\\BO2\\" + rest;
             }
             else
             {
@@ -2715,17 +3126,30 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// Mount GOGAMES/BO2/PS2.RKV once after GOE init, parse TOC, and make archive entries
-    /// openable via <see cref="TryOpenFromRkv"/> / virtual streams.
+    /// Mount PS2.RKV once after GOE init (Blood Omen 2: GOGAMES/BO2; Whiplash: WHIPLASH/),
+    /// parse TOC, and make archive entries openable via <see cref="TryOpenFromRkv"/>.
     /// </summary>
     private void EnsureGoeArchiveMounted(IopModuleHost iopModules, Cdvd cdvd)
     {
         if (_goeArchiveMounted) return;
         _goeArchiveMounted = true;
-        const string RkvPath = @"cdrom0:\GOGAMES\BO2\PS2.RKV";
-        int fd = iopModules.FileOpen(RkvPath, 1);
-        if (fd < 0)
-            fd = iopModules.FileOpen("cdrom0:/GOGAMES/BO2/PS2.RKV;1", 1);
+        // Prefer disc layout by title serial family. Whiplash GAME.INI:
+        //   ArchivePs2="whiplash/ps2.rkv" → WHIPLASH/PS2.RKV on ISO.
+        string[] candidates =
+        {
+            @"cdrom0:\WHIPLASH\PS2.RKV",
+            @"cdrom0:/WHIPLASH/PS2.RKV;1",
+            @"cdrom0:\GOGAMES\BO2\PS2.RKV",
+            @"cdrom0:/GOGAMES/BO2/PS2.RKV;1",
+            @"cdrom0:\PS2.RKV",
+        };
+        int fd = -1;
+        string rkvPath = candidates[0];
+        foreach (string c in candidates)
+        {
+            fd = iopModules.FileOpen(c, 1);
+            if (fd >= 0) { rkvPath = c; break; }
+        }
         if (fd < 0)
         {
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -2733,7 +3157,7 @@ public sealed class RealSifRpc
             return;
         }
         _goeArchiveFd = fd;
-        _iopFileFds[fd] = RkvPath;
+        _iopFileFds[fd] = rkvPath;
         if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
         {
             _goeArchiveSize = fsz;
@@ -2794,10 +3218,12 @@ public sealed class RealSifRpc
         uint tocSizeField = BitConverter.ToUInt32(toc, 4);
         if (ver != 1 || tocSizeField < 0x100) return;
         int limit = (int)Math.Min(tocSizeField, (uint)toc.Length);
-        // Skip folder headers (english/strstream) — first length-prefixed entry at 0x30.
-        int p = 0x30;
         uint tocFloor = tocSizeField;
         var offsets = new List<(string Name, uint Off, uint Sz)>();
+
+        // --- Format A (Blood Omen 2): u32 nlen, name[nlen] incl. implicit null trailer,
+        // 16 B at null: pad/size/off/pad. First file entries typically at 0x30. ---
+        int p = 0x30;
         while (p + 4 < limit)
         {
             uint nlen = BitConverter.ToUInt32(toc, p);
@@ -2827,6 +3253,51 @@ public sealed class RealSifRpc
             { off = w2; sz = w1; }
             offsets.Add((name, off, sz));
             p = block + 16;
+        }
+
+        // --- Format B (Whiplash SLUS_206.84): no null after name.
+        // Sliding scan: u32 nlen, char name[nlen], u32 type==1, u32 size, u32 offset, u32 pad.
+        // Folder headers interleave with shorter records; byte-scan is robust.
+        // Live 2026-07-30: ver=1 tocBytes=0x1C7F8, names "Code","firstscreen","frontend",… ---
+        if (offsets.Count == 0)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (p = 0x0C; p + 24 < limit; p += 4)
+            {
+                uint nlen = BitConverter.ToUInt32(toc, p);
+                if (nlen is < 1 or > 64) continue;
+                int ns = p + 4;
+                if (ns + (int)nlen + 16 > limit) continue;
+                bool bad = false;
+                for (int i = 0; i < (int)nlen; i++)
+                {
+                    byte b = toc[ns + i];
+                    // Names are [A-Za-z0-9_./-]
+                    if (!((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+                          || b is (byte)'_' or (byte)'.' or (byte)'/' or (byte)'-' or (byte)'\\'))
+                    { bad = true; break; }
+                }
+                if (bad) continue;
+                string name = System.Text.Encoding.ASCII.GetString(toc, ns, (int)nlen);
+                int block = ns + (int)nlen;
+                uint type = BitConverter.ToUInt32(toc, block);
+                if (type != 1) continue;
+                uint w1 = BitConverter.ToUInt32(toc, block + 4);
+                uint w2 = BitConverter.ToUInt32(toc, block + 8);
+                uint off = w2, sz = w1;
+                if (off < tocFloor || off >= _goeArchiveSize)
+                {
+                    if (w1 >= tocFloor && w1 < _goeArchiveSize)
+                    { off = w1; sz = w2; }
+                    else
+                        continue;
+                }
+                if (!seen.Add(name)) continue;
+                offsets.Add((name, off, sz));
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[IOPFILE] RKV format-B (Whiplash-style) candidates={offsets.Count}");
         }
 
         // Fill zero sizes from next offset delta (sorted by offset).
@@ -3759,7 +4230,12 @@ public sealed class RealSifRpc
                 WritePadResultAt(mem, argBuf, recvBuf, result, 0x0C);
                 break;
             case PadRpcCmdGetModVer:
-                result = 0x0300;
+                // NEW/disc PADMAN (sid 0x80000100, cmd 0x12): major in high byte.
+                // Midway MK:DA / shared SN libpad gate (EE 0x115548) requires major==4
+                // (sra ver,8; beq 4) after LoadModule(PADMAN); 0x0300 failed that check
+                // and main returned 0 → Exit(0) at ~5.6M cycles. rom0-era 3.x is too old
+                // for disc MODULES/PADMAN.IRX clients; 0x0400 matches XPADMAN-class replies.
+                result = 0x0400;
                 WritePadResultAt(mem, argBuf, recvBuf, result, 0x0C);
                 break;
             case PadRpcCmdGetBtnMaskNew:
@@ -3982,6 +4458,11 @@ public sealed class RealSifRpc
     private const uint McFnoReadPage = 0x7E;
     private const uint McFnoWritePage = 0x7F;
     private const uint McFnoUnformat = 0x80;
+    // XMCSERV (disc MODULES/MCSERV.IRX, Midway MK:DA et al.): init is fno 0xFE, not 0x70.
+    // Returning -5 here made libmc-style probes "fall back" but Midway hard-fails and Exit(0).
+    private const uint McFnoXInit = 0xFE;
+    // XMCSERV getInfo is fno 0x01 (classic MCSERV uses 0x78).
+    private const uint McFnoXGetInfo = 0x01;
 
     // libmc-common.h result / type codes used by EE-side endFunc + probes.
     private const int McResSucceed = 0;
@@ -4015,17 +4496,19 @@ public sealed class RealSifRpc
     /// MCSERV RPC dispatcher. Arg layouts from ps2sdk <c>mcDescParam_t</c> (fd ops) and
     /// <c>libmc_name_param_stru</c> (path ops). Backend is DetPS2 <see cref="MemoryCard"/> —
     /// not a byte-exact MCMAN FAT port (scoped out; see BIOS_DISSECTION §6.8).
-    /// Unmapped fnos return <see cref="McResDeniedPermit"/> so libmc's XMCSERV probe
-    /// (fno 0xFE / flush with bad fd) correctly falls back to MCSERV.
+    /// Unmapped classic fnos return <see cref="McResDeniedPermit"/>. XMCSERV init
+    /// (<c>0xFE</c>) and getInfo (<c>0x01</c>) are accepted so disc MCSERV.IRX clients
+    /// (MK: Deadly Alliance after LoadModule MCSERV) do not Exit on probe failure.
     /// </summary>
     private int HandleMcServ(SystemMemory mem, IopModuleHost iopModules, uint fno, uint argBuf, uint recvBuf)
     {
         MemoryCard card = iopModules.MemCard;
         _ = recvBuf;
 
-        return fno switch
+        int result = fno switch
         {
             McFnoInit => McservInit(mem, argBuf),
+            McFnoXInit => McservXInit(mem, argBuf, recvBuf),
             McFnoOpen => McservOpen(mem, card, argBuf),
             McFnoClose => McservClose(mem, card, argBuf),
             McFnoRead => McservRead(mem, argBuf),
@@ -4034,6 +4517,7 @@ public sealed class RealSifRpc
             McFnoGetDir => McservGetDir(mem, card, argBuf),
             McFnoFormat => McservFormat(mem, card, argBuf),
             McFnoGetInfo => McservGetInfo(mem, card, argBuf),
+            McFnoXGetInfo => McservGetInfo(mem, card, argBuf), // XMCSERV GET_INFO
             McFnoDelete => McservDelete(mem, card, argBuf),
             McFnoFlush => McservFlush(mem, card, argBuf),
             McFnoChDir => McservChDir(mem, argBuf),
@@ -4044,6 +4528,28 @@ public sealed class RealSifRpc
             McFnoUnformat => McservUnformat(mem, card, argBuf),
             _ => McResDeniedPermit,
         };
+        return result;
+    }
+
+    /// <summary>
+    /// XMCSERV INIT (fno 0xFE). Midway MK:DA (and libmc XMCSERV clients) expect a 12-byte
+    /// reply: result@+0, mcservVer@+4, mcmanVer@+8. DA's EE gate at 0x117E74 requires
+    /// mcservVer ≥ 522 and mcmanVer ≥ 526; bare result=0 left those words zero → -120 Exit.
+    /// </summary>
+    private static int McservXInit(SystemMemory mem, uint argBuf, uint recvBuf)
+    {
+        _ = argBuf;
+        // Version tokens above Midway's floors (522/526). Not exact IRX module versions —
+        // structural HLE so version gates pass without parsing disc MCSERV.IRX headers.
+        const uint McServVer = 0x020A; // 522
+        const uint McManVer = 0x020E;  // 526
+        if (recvBuf != 0)
+        {
+            mem.Write32(recvBuf + 0, 0);          // result
+            mem.Write32(recvBuf + 4, McServVer);
+            mem.Write32(recvBuf + 8, McManVer);
+        }
+        return McResSucceed;
     }
 
     // mcDescParam_t offsets (libmc-common.h, size 48).

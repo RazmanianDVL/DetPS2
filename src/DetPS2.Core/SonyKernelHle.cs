@@ -1546,7 +1546,9 @@ public sealed class SonyKernelHle
         BiosBootHost.ApplyPostIopRebootContracts(_system);
 
         // PADMAN open-port table dies with the IOP image; clear so post-reboot OPEN works.
-        RealRpc.OnIopReboot();
+        // Pass reboot arg so LOADFILE GetVersion can return the IOPRP ASCII tag
+        // (MK:DA "2430", shared SN ProDG gate — see RealSifRpc.ExtractIopRpVersionAscii).
+        RealRpc.OnIopReboot(_system.Sif.LastIopRebootArg);
 
         // Wake one WaitSema sleeper if any (EESYNC post → EE SifIopSync consumer).
         foreach (var t in _kernel.AllThreads)

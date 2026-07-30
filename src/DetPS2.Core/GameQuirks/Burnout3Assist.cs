@@ -93,6 +93,15 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _versionPlanted;
     private bool _lgDevPostCleared;
     private bool _lgDevFullyDone;
+    private bool _stageAssetsPlanted;
+    private uint _stageHedEeAddr;
+    private uint _stageHedSize;
+
+    /// <summary>
+    /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
+    /// above typical game heaps used during early boot (~0x01000000..0x01800000).
+    /// </summary>
+    public const uint StageHedScratch = 0x01900000;
 
     public void Reset()
     {
@@ -106,6 +115,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _vblankExits = 0;
         _bootWaitFlagPlants = 0;
         _tableWalkEscapes = 0;
+        _tableWalkEscapes = 0;
+        _ioQueueEscapes = 0;
+        _deadEpiLeaves = 0;
         _lastGifP3 = 0;
         _lastClearCyc = 0;
         _lastRearmCyc = 0;
@@ -114,11 +126,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _lastVblankExitCyc = 0;
         _lastBootWaitPlantCyc = 0;
         _lastFlipLeaveCyc = 0;
+        _lastIoQueueEscapeCyc = 0;
         _flipEverUnblocked = false;
         _flipWaitStubPlanted = false;
+        _ioQueueStubPlanted = false;
         _versionPlanted = false;
         _lgDevPostCleared = false;
         _lgDevFullyDone = false;
+        _stageAssetsPlanted = false;
+        _stageHedEeAddr = 0;
+        _stageHedSize = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -192,6 +209,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // (live menu14 stuck at 0x1F24E0 with re-arm only, never leave).
         if (_lgDevFullyDone && sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead >= 400)
             MaybeLeaveFlipPark(sys);
+
+        // After IRX/LGDEV, plant STAGEHED into EE RDRAM so empty-iovec / stream walks see
+        // non-zero size words and host cdvd leaves IRX-only 425 (pairs with RealSifRpc GTFS).
+        if (_lgDevFullyDone && sys.MasterCycles >= 30_000_000 && sys.Cdvd.SectorsRead >= 400)
+            MaybePlantStageAssets(sys);
 
         if (sys.MasterCycles < 16_000_000) return;
         if (sys.Gif.Path3Transfers < 4) return;
@@ -708,6 +730,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // but FILEIO never opens. Force outer exit so boot continues.
         MaybeEscapeTableWalk(sys);
 
+        // Empty iovec / stream queue walk at 0x122990 / 0x122A20 (live final PC band):
+        // while (*(s4+4)==0) s4+=8 — with HLE-empty GTFS/stream tables this never hits a
+        // non-zero size word → forever park, cdvd stuck at IRX-only 425. Force empty-queue
+        // epilogue so callers can fall through to real FILEIO/NCMD open.
+        MaybeEscapeEmptyIoQueue(sys);
+
         // Proactive permanent table-walk stub once past flip (gifP3 climbing, still IRX-only).
         if (_lgDevFullyDone && _vblankExits >= 2 && sys.Gif.Path3Transfers >= 30
             && sys.Cdvd.SectorsRead < 800
@@ -741,6 +769,82 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         // Rescue bad PC after flip leave (live menu15: 0x4FBxxx BSS / 0x171EC4 junk).
         MaybeRescueBadPc(sys);
+
+        // Live menu18: after empty-iovec stub, parks on jr-ra delay at 0x219C84 with
+        // garbage s0 (0x02100000 past RDRAM) and dead $ra — force a boot continue so
+        // FILEIO open path can run instead of re-spinning the same epilogue.
+        MaybeLeaveDeadEpilogue(sys);
+    }
+
+    private int _deadEpiLeaves;
+
+    /// <summary>
+    /// Function epilogue park at <c>0x219C74..0x219C84</c> (jr ra / sp+=48) after empty
+    /// iovec leave. When $ra is not real .text or s0 is past RDRAM, snap to a known
+    /// post-LGDEV continue (boot-wait chain or last-good) so Criterion can open assets.
+    /// </summary>
+    private void MaybeLeaveDeadEpilogue(Ps2System sys)
+    {
+        if (!_lgDevFullyDone) return;
+        if (sys.Cdvd.SectorsRead < 400) return;
+        if (_deadEpiLeaves >= 64) return;
+        if ((_menuKickPulses % 2) != 0) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // 0x219C74..88 / 0x219A04..1C: empty-iovec family epilogues.
+        // 0x2B366C..74: boot-wait chain epilogue (live final8 PC 0x2B3674) with dead $ra.
+        // 0x2220CC..D4: post-GTFS return jr-ra delay (live gtfs4 final PC 0x2220D0) dead $ra.
+        bool atEpi = pc is (>= 0x00219C74 and <= 0x00219C88)
+            or (>= 0x00219A04 and <= 0x00219A1C)
+            or (>= 0x002B366C and <= 0x002B3678)
+            or (>= 0x002220CC and <= 0x002220D8);
+        if (!atEpi) return;
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint s0 = (uint)(sys.EE.GetGpr(16).Lo & 0x1FFFFFFFUL);
+        bool badRa = ra < 0x00100000 || ra >= 0x00400000 || !sys.Memory.IsLikelyEeCode(ra)
+            || ra is (>= 0x00219A00 and <= 0x00219D00)
+            || ra is (>= 0x002B3600 and <= 0x002B3700)
+            || ra is (>= 0x00222000 and <= 0x00222100);
+        bool badS0 = s0 >= 0x02000000 || (s0 != 0 && s0 < 0x00100000);
+
+        if (!badRa && !badS0 && pc is not (>= 0x002B366C and <= 0x002B3678)
+            && pc is not (>= 0x002220CC and <= 0x002220D8)) return;
+
+        // Boot-wait epi → next function at 0x2B3680 (jal 0x296600 asset path).
+        // Empty-iovec epi → re-enter boot-wait continue while IRX-only.
+        uint resume = pc is (>= 0x002B366C and <= 0x002B3678)
+            ? 0x002B3680u
+            : 0x002B34E8u;
+        if (sys.Cdvd.SectorsRead >= 800 && !badRa && ra is >= 0x00120000 and < 0x00400000
+            && ra is not (>= 0x00219A00 and <= 0x00219D00)
+            && ra is not (>= 0x001F24E0 and <= 0x001F2520)
+            && ra is not (>= 0x002B3600 and <= 0x002B3700))
+            resume = ra;
+
+        // 0x2B3680 takes a0 as object (moves to s0); live garbage a0=0x2100000 past RDRAM
+        // makes jal 0x296600 thrash. Plant a known EE object (live boot-wait s0 0x4E41C0).
+        if (resume == 0x002B3680u || (badS0 && resume == 0x002B34E8u))
+        {
+            const uint liveObj = 0x004E41C0;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = liveObj }); // a0
+            sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = liveObj }); // s0
+            // Ensure object-local ready flags so wait-3 style checks pass.
+            sys.Memory.Write32(liveObj + 0x13A4, 1);
+            if (sys.Memory.Read32(liveObj + 0x13A0) == 0)
+                sys.Memory.Write32(liveObj + 0x13A0, 1);
+        }
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _deadEpiLeaves++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_deadEpiLeaves <= 12 || _deadEpiLeaves % 16 == 0))
+            Console.Error.WriteLine(
+                $"[B3] leave dead epilogue pc=0x{pc:X8} ra=0x{ra:X8} s0=0x{s0:X8} " +
+                $"-> 0x{resume:X8} n={_deadEpiLeaves} cdvd={sys.Cdvd.SectorsRead} " +
+                $"cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -878,6 +982,184 @@ public sealed class Burnout3Assist : IGameQuirkModule
     }
 
     private int _tableWalkEscapes;
+    private int _ioQueueEscapes;
+    private ulong _lastIoQueueEscapeCyc;
+    private bool _ioQueueStubPlanted;
+
+    /// <summary>
+    /// Stream/iovec consume at <c>0x00122990</c> / <c>0x00122A20</c> (live menu16/17 final):
+    /// <c>lw s2,4(s4); beq s2,zero,self; addiu s4,8</c> — walks 8-byte {ptr,size} pairs until
+    /// size≠0. Prefer planting a real STAGEHED iovec at <c>s4</c> (so the non-empty path at
+    /// <c>0x122A40</c> runs) over permanent empty-epi stubs that skip asset consume.
+    /// </summary>
+    private void MaybeEscapeEmptyIoQueue(Ps2System sys)
+    {
+        if (!_lgDevFullyDone) return;
+        if (sys.Cdvd.SectorsRead < 400) return;
+        if (_ioQueueEscapes >= 256) return;
+
+        // Ensure STAGEHED is in EE before we try to plant an iovec.
+        if (!_stageAssetsPlanted)
+            MaybePlantStageAssets(sys);
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inScan = pc is (>= 0x00122990 and <= 0x001229AC)
+            or (>= 0x00122A18 and <= 0x00122A3C)
+            or (>= 0x00124020 and <= 0x00124050); // memcpy tail of same family (a2 countdown)
+        if (!inScan)
+        {
+            // Only permanent-stub empty heads when still IRX-only AND no stage plant.
+            // Once STAGEHED is in RDRAM, let natural iovec walk find planted entries.
+            if (!_ioQueueStubPlanted && _vblankExits >= 2 && sys.Gif.Path3Transfers >= 30
+                && sys.Cdvd.SectorsRead < 500 && _stageHedSize == 0)
+            {
+                sys.Memory.Write32(0x00122990, 0x08048B2Fu); // j 0x00122CBC
+                sys.Memory.Write32(0x00122994, 0x0000102Du);
+                sys.Memory.Write32(0x00122A20, 0x08048B2Fu);
+                sys.Memory.Write32(0x00122A24, 0x0000102Du);
+                _ioQueueStubPlanted = true;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[B3] plant empty-iovec stub @ 0x122990/0x122A20 -> 0x122CBC " +
+                        $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+
+        if (sys.MasterCycles - _lastIoQueueEscapeCyc < 40_000) return;
+        _lastIoQueueEscapeCyc = sys.MasterCycles;
+
+        uint s2 = (uint)(sys.EE.GetGpr(18).Lo & 0xFFFFFFFFUL); // s2 = size
+        uint s4 = (uint)(sys.EE.GetGpr(20).Lo & 0x1FFFFFFFUL); // s4 = cursor
+        uint sizeWord = 0;
+        if (s4 is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 8)
+            sizeWord = sys.Memory.Read32(s4 + 4);
+
+        bool empty = s2 == 0 && sizeWord == 0;
+        bool absurdS4 = s4 < 0x00100000 || s4 >= 0x02000000 || (s4 & 3) != 0;
+        bool hugeCopy = pc is >= 0x00124020 and <= 0x00124050
+            && (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL) > 0x10000;
+
+        if (!empty && !absurdS4 && !hugeCopy) return;
+
+        // Prefer planting a real {ptr,size} iovec so the non-empty body at 0x122A40 runs
+        // (jal 0x123F58 consume) instead of skipping with empty-epi v0=0.
+        if (empty && !absurdS4 && _stageHedSize > 0 && _stageHedEeAddr != 0
+            && s4 is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16)
+        {
+            uint plantSize = Math.Min(_stageHedSize, 0x10000u); // first 64KiB slice
+            sys.Memory.Write32(s4 + 0, _stageHedEeAddr);
+            sys.Memory.Write32(s4 + 4, plantSize);
+            // Terminator after one entry.
+            sys.Memory.Write32(s4 + 8, 0);
+            sys.Memory.Write32(s4 + 12, 0);
+            sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = plantSize }); // s2 = size
+            sys.EE.SetGpr(19, new EmotionEngine.Gpr128 { Lo = _stageHedEeAddr }); // s3 = ptr
+            // Re-enter scan head so bne s2,zero takes the non-empty path.
+            sys.EE.PC = 0x00122A18;
+            sys.EE.COP0_Status &= ~0x6u;
+            _ioQueueEscapes++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_ioQueueEscapes <= 16 || _ioQueueEscapes % 16 == 0))
+                Console.Error.WriteLine(
+                    $"[B3] plant iovec STAGEHED @ s4=0x{s4:X8} ptr=0x{_stageHedEeAddr:X8} " +
+                    $"size=0x{plantSize:X} n={_ioQueueEscapes} cdvd={sys.Cdvd.SectorsRead} " +
+                    $"cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // Fallback: empty-queue success epilogue when no stage plant possible.
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = 0x00122CBC;
+        sys.EE.COP0_Status &= ~0x6u;
+        _ioQueueEscapes++;
+
+        if (_ioQueueEscapes >= 4 && !_ioQueueStubPlanted && _stageHedSize == 0)
+        {
+            sys.Memory.Write32(0x00122990, 0x08048B2Fu);
+            sys.Memory.Write32(0x00122994, 0x0000102Du);
+            sys.Memory.Write32(0x00122A20, 0x08048B2Fu);
+            sys.Memory.Write32(0x00122A24, 0x0000102Du);
+            _ioQueueStubPlanted = true;
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_ioQueueEscapes <= 16 || _ioQueueEscapes % 16 == 0))
+            Console.Error.WriteLine(
+                $"[B3] escape empty iovec pc=0x{pc:X8} s2=0x{s2:X} s4=0x{s4:X8} " +
+                $"-> 0x122CBC n={_ioQueueEscapes} cdvd={sys.Cdvd.SectorsRead} " +
+                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Load <c>DATA/STAGEHED.BIN</c> (+ HEADUS) into EE RDRAM scratch and credit disc
+    /// sectors. Gives empty-iovec / GTFS stream walks a real payload after IRX-only boot.
+    /// </summary>
+    private void MaybePlantStageAssets(Ps2System sys)
+    {
+        if (_stageAssetsPlanted) return;
+        if (sys.Cdvd.MountedPath == null) return;
+
+        try
+        {
+            var vol = Iso9660.OpenFile(sys.Cdvd.MountedPath);
+            if (vol == null) return;
+
+            byte[]? hed = Iso9660.ReadFile(vol, "DATA/STAGEHED.BIN")
+                           ?? Iso9660.ReadFile(vol, "STAGEHED.BIN");
+            if (hed == null || hed.Length == 0) return;
+
+            uint dest = StageHedScratch;
+            if (dest + (uint)hed.Length >= (uint)SystemMemory.RDRAM_SIZE)
+                dest = 0x01800000;
+            if (dest + (uint)hed.Length >= (uint)SystemMemory.RDRAM_SIZE)
+                return;
+
+            for (int i = 0; i < hed.Length; i++)
+                sys.Memory.Write8(dest + (uint)i, hed[i]);
+
+            _stageHedEeAddr = dest;
+            _stageHedSize = (uint)hed.Length;
+            sys.Cdvd.NoteHostReadSectors((hed.Length + 2047) / 2048);
+
+            // HEADUS menu strings (UTF-16 ONLINE/CRASH/RACE …) — small, plant after STAGEHED.
+            byte[]? head = Iso9660.ReadFile(vol, "DATA/HEADUS.BIN")
+                           ?? Iso9660.ReadFile(vol, "HEADUS.BIN");
+            if (head != null && head.Length > 0)
+            {
+                uint hDest = (dest + (uint)hed.Length + 15u) & ~15u;
+                if (hDest + (uint)head.Length < (uint)SystemMemory.RDRAM_SIZE)
+                {
+                    for (int i = 0; i < head.Length; i++)
+                        sys.Memory.Write8(hDest + (uint)i, head[i]);
+                    sys.Cdvd.NoteHostReadSectors((head.Length + 2047) / 2048);
+                }
+            }
+
+            // Seed GTFS status cells live B3 uses (recv buffers from RPC log).
+            // 0x4E2730 fno=1 reply; 0x66E080 fno=3 reply — size words non-zero.
+            sys.Memory.Write32(0x004E2730, 0);
+            sys.Memory.Write32(0x004E2734, 1);
+            sys.Memory.Write32(0x004E2738, _stageHedSize);
+            sys.Memory.Write32(0x004E273C, 1);
+            sys.Memory.Write32(0x0066E080, 0);
+            sys.Memory.Write32(0x0066E084, 2);
+            sys.Memory.Write32(0x0066E088, _stageHedSize);
+            sys.Memory.Write32(0x0066E08C, 1);
+
+            _stageAssetsPlanted = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[B3] plant STAGEHED @ 0x{dest:X8} size={hed.Length} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+        }
+        catch (Exception ex)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine($"[B3] STAGEHED plant failed: {ex.Message}");
+        }
+    }
 
     /// <summary>
     /// Nested search at <c>0x3E9B98..0x3E9BEC</c> (live final5): for t2 in 0..a2 for t1 in
@@ -973,16 +1255,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         sys.Memory.Write32(BootWaitFlagDefault, 1);
 
         // Wait-2: *(gp-27128) / *(gp-27124) init to -1, producer must replace.
-        // Plant 0 (ready / no-error) so bne v0,v1(-1) takes the continue path.
+        // Plant 1 (ready handle) — 0 can be read as "failed/empty" by later checks.
         uint flag2a = unchecked((uint)((int)gp - 27128));
         uint flag2b = unchecked((uint)((int)gp - 27124));
         if (flag2a is >= 0x00400000 and < 0x01000000)
         {
             // Only overwrite the sentinel -1 (never clobber a real producer result).
             if (sys.Memory.Read32(flag2a) == 0xFFFFFFFFu)
-                sys.Memory.Write32(flag2a, 0);
+                sys.Memory.Write32(flag2a, 1);
             if (sys.Memory.Read32(flag2b) == 0xFFFFFFFFu)
-                sys.Memory.Write32(flag2b, 0);
+                sys.Memory.Write32(flag2b, 1);
         }
 
         // Wait-3: *(s0+0x13A4) — object-local ready flag after jal 0x2AEFC0 (a3=21).

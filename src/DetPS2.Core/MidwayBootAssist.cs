@@ -1139,6 +1139,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // EE after gifP3=12 — force epilogue so title/menu can run (pad then moves PC).
         if (c >= 65_000_000 && sys.Gif.Path3Transfers >= 11)
             MaybeBreakMenuMemset(sys);
+        // After logo spine, kill countdown thrash at 0x427594 (pad-poll callback list)
+        // when s2 is absurd so CROSS/DOWN can reach accept paths past the list.
+        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
+            MaybeBreakMenuCallbackCountdown(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
 
@@ -2198,18 +2202,34 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Post-spine clear loop at <c>0x385278</c>: <c>sw zero,0(a1); a1+=4; bne a1,a2</c>.
     /// Live pad-inject parks here with a2-a1 enormous after gifP3 hits 12 — pad cannot
     /// be observed until the loop ends. Force <c>jr ra</c> when remaining words &gt; 256K.
+    /// After first break, permanently nop the back-edge so re-entry cannot re-stall.
     /// </summary>
     private void MaybeBreakMenuMemset(Ps2System sys)
     {
+        // Permanent: once spine is up, kill the back-edge so absurd clears fall through
+        // after at most one store. Live pad-inject re-entered 0x3854xx for ~20M cycles.
+        // 0x38528C was: bne v0, zero, 0x385278 — nop it.
+        if (sys.Gif.Path3Transfers >= 11 && sys.Memory.Read32(0x0038528C) != 0u)
+        {
+            sys.Memory.Write32(0x0038528C, 0u); // nop back-edge
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _memsetBreaks == 0)
+                Console.Error.WriteLine(
+                    $"[BIOS] plant memset back-edge nop @ 0x38528C gifP3={sys.Gif.Path3Transfers} " +
+                    $"cyc={sys.MasterCycles}");
+        }
+
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-        if (pc is < 0x00385278 or > 0x00385290) return;
-        if (sys.MasterCycles - _lastMemsetBreakCyc < 200_000) return;
-        if (_memsetBreaks >= 32) return;
+        if (pc is < 0x00385260 or > 0x00385290) return;
+        if (sys.MasterCycles - _lastMemsetBreakCyc < 100_000) return;
+        if (_memsetBreaks >= 64) return;
 
         uint a1 = (uint)(sys.EE.GetGpr(5).Lo & 0x1FFFFFFFUL); // cursor
         uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0x1FFFFFFFUL); // end
         ulong remain = a2 >= a1 ? (ulong)(a2 - a1) : ulong.MaxValue;
-        if (remain < 0x100000) return; // < 1MB remaining is plausible
+        // Also snap when inverted (a2 < a1 → wrap remain) or clearly past RDRAM.
+        bool absurd = remain >= 0x100000 || a2 < a1 || a2 >= 0x02000000 || a1 >= 0x02000000;
+        if (!absurd) return;
 
         // Snap to epilogue jr ra (0x385294).
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a2 }); // a1 = end
@@ -2223,6 +2243,41 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BIOS] break menu memset a1=0x{a1:X8} a2=0x{a2:X8} remain=0x{remain:X} " +
                 $"-> 0x385294 n={_memsetBreaks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    private ulong _lastCbCountdownCyc;
+    private int _cbCountdownBreaks;
+
+    /// <summary>
+    /// Live pad-poll band <c>0x427570..0x427594</c>: countdown <c>s2</c> with
+    /// <c>bgezl s2, loop; jalr callback</c>. With HLE-corrupt list length s2 is huge
+    /// (or never reaches -1) so CROSS accept never falls through to the epilogue that
+    /// bumps the menu tick at <c>0x55E5E8+s4</c>. Clamp s2 so the list finishes.
+    /// </summary>
+    private void MaybeBreakMenuCallbackCountdown(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x00427570 or > 0x00427598) return;
+        if (sys.MasterCycles - _lastCbCountdownCyc < 80_000) return;
+        if (_cbCountdownBreaks >= 64) return;
+
+        long s2 = unchecked((int)(uint)sys.EE.GetGpr(18).Lo);
+        // Real callback lists are tiny. Negative means already done (bgezl falls through).
+        if (s2 < 0 || s2 < 64) return;
+
+        // Snap to one last iteration then fall through (s2 = 0 → next bgezl may still
+        // take once with delay-slot load; s2 = -1 guarantees fall-through).
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFUL }); // s2 = -1
+        sys.EE.PC = 0x0042759C; // past bgezl into epilogue (lui a0)
+        sys.LastGoodEePc = 0x0042759C;
+        _lastCbCountdownCyc = sys.MasterCycles;
+        _cbCountdownBreaks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_cbCountdownBreaks <= 12 || _cbCountdownBreaks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] break menu callback countdown s2 was {s2} -> -1 / 0x42759C " +
+                $"n={_cbCountdownBreaks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -2266,18 +2321,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             // Circle/Triangle for alternate confirm bindings Midway titles use.
             if (inMenuBand || sys.Gif.Path3Transfers >= 12)
             {
-                phase = _menuPadPulses % 12;
+                // Accept-heavy cadence: more CROSS edges + Start confirm after D-pad.
+                // Live interactive band oscillates 0x4148EC↔0x4275xx — need release edges
+                // between presses so edge-triggered menu code sees press/release.
+                phase = _menuPadPulses % 16;
                 buttons = phase switch
                 {
                     0 => 0u, // release edge
                     1 => (uint)PadInput.Button.Down,
                     2 => 0u,
                     3 or 4 => (uint)PadInput.Button.Cross,
-                    5 => (uint)PadInput.Button.Up,
-                    6 => 0u,
-                    7 or 8 => (uint)PadInput.Button.Cross,
-                    9 => (uint)PadInput.Button.Start,
-                    10 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                    5 => 0u,
+                    6 => (uint)PadInput.Button.Up,
+                    7 => 0u,
+                    8 or 9 => (uint)PadInput.Button.Cross,
+                    10 => (uint)PadInput.Button.Start,
+                    11 => 0u,
+                    12 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                    13 => (uint)PadInput.Button.Circle, // alt confirm on some Midway UIs
+                    14 => 0u,
                     _ => (uint)PadInput.Button.Cross
                 };
                 // Occasional Right/Left so horizontal menus also move.
@@ -2285,6 +2347,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     buttons = (uint)PadInput.Button.Right;
                 if (_menuPadPulses % 19 == 0)
                     buttons = (uint)PadInput.Button.Left;
+                // After many pulses still in pad-poll band: hold CROSS longer for accept.
+                if (_menuPadPulses >= 64 && inMenuBand && (_menuPadPulses % 4) < 2)
+                    buttons = (uint)PadInput.Button.Cross;
             }
             else
             {
