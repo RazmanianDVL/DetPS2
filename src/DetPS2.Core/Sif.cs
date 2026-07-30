@@ -349,6 +349,39 @@ public sealed class Sif : ISchedulable
 
     public int RealRpcQueueCount => _realRpcQueue.Count;
 
+    /// <summary>
+    /// True when some queued real BIND/CALL/RDATA packet's client
+    /// <c>SifRpcClientData_t.hdr.sema_id</c> matches <paramref name="semaId"/>.
+    /// <para>
+    /// Used by WaitSema to decide whether to <c>RequestSemaStall</c> for real
+    /// <c>CompleteRpcEnd</c>/<c>iSignalSema</c> completion vs yield/fabricate.
+    /// Without this check, a WaitSema on the SIF-cmd poll mutex (e.g. GoW/B3
+    /// WaitSema(3) at the sifrpc trampoline) freezes the whole EE whenever any
+    /// unrelated BIND/CALL is in the queue — the stall only clears when *our*
+    /// sema is signaled, which those packets never do (wrong-sema deadlock,
+    /// 2026-07-30). SEMA_STALL_YIELD is not required when we only stall for a
+    /// matching client.
+    /// </para>
+    /// </summary>
+    public bool QueueMaySignalSema(SystemMemory mem, int semaId)
+    {
+        if (semaId < 0 || _realRpcQueue.Count == 0) return false;
+        foreach (var (addr, _) in _realRpcQueue)
+        {
+            if (addr == 0 || addr >= SystemMemory.RDRAM_SIZE - 0x30) continue;
+            uint cid = mem.Read32(addr + 8);
+            // BIND/CALL: client at +28; RDATA: client at +0x1c (see RealSifRpc).
+            uint cdPtr = cid == RealSifRpc.CidRpcRdata
+                ? mem.Read32(addr + 0x1c)
+                : mem.Read32(addr + 28);
+            if (cdPtr == 0 || cdPtr >= SystemMemory.RDRAM_SIZE - 0x10) continue;
+            int pktSema = unchecked((int)mem.Read32(cdPtr + 8)); // hdr.sema_id
+            if (pktSema == semaId)
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Queue an EE RPC packet address for IOP-side processing.</summary>
     public void SubmitRpc(uint packetEeAddr)
     {

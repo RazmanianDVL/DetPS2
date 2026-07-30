@@ -563,9 +563,11 @@ public sealed class EmotionEngine : ISchedulable
             // RPC to resolve this semaphore via SignalSema, instead of calling SwitchToNext (whose
             // own "wake ourselves" fallback would undo the Sleeping state before the real response
             // ever arrives) or fabricating a fake signal.
-            // Also: if drain woke a *different* waiter (or another thread was always runnable),
-            // clear the stall and SwitchToNext — otherwise one wrong-sema WaitSema freezes the EE
-            // forever after the RPC that was never going to signal it completes.
+            // Also: if drain woke a *different* waiter, the queue no longer targets our sema, or
+            // the queue emptied without waking us — clear the stall (wrong-sema recovery). We only
+            // entered this stall when QueueMaySignalSema matched; once that is false, staying here
+            // freezes the whole EE (GoW WaitSema(3) SIF-cmd poll, 2026-07-30). SEMA_STALL_YIELD is
+            // still opt-in for mid-wait peer yield while our matching packet remains queued (MK WAD).
             if (_pendingSemaStall)
             {
                 var stalledThread = _hle?.Kernel.GetThread(_hle.Kernel.CurrentThreadId);
@@ -574,6 +576,25 @@ public sealed class EmotionEngine : ISchedulable
                     _pendingSemaStall = false;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
                         Console.Error.WriteLine($"[STALLCLEAR-SEMA] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle?.Kernel.CurrentThreadId}");
+                }
+                else if (stalledThread.WaitSemaId > 0
+                         && _hle?.Sony != null
+                         && !_hle.Sony.RealRpcQueueMaySignalSema(stalledThread.WaitSemaId))
+                {
+                    // Queue drained or no longer targets us — SHARED recovery without
+                    // SEMA_STALL_YIELD. Prefer peer yield; else SignalSema (same as WaitSema
+                    // fabricate when no matching RPC). Real CompleteRpcEnd already ran for
+                    // whatever was in the queue.
+                    _pendingSemaStall = false;
+                    if (!_hle.Kernel.TryYieldToOtherRunnable(this))
+                    {
+                        try { _hle.Kernel.SignalSema(stalledThread.WaitSemaId); }
+                        catch { /* ignore */ }
+                    }
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                        Console.Error.WriteLine(
+                            $"[STALLCLEAR-SEMA-EMPTYQ] cyc={CurrentCycle()} pc=0x{PC:X8} " +
+                            $"tid={_hle.Kernel.CurrentThreadId} sema=0x{stalledThread.WaitSemaId:X}");
                 }
                 else if (Environment.GetEnvironmentVariable("DETPS2_SEMA_STALL_YIELD") == "1"
                          && _hle != null && _hle.Kernel.TryYieldToOtherRunnable(this))

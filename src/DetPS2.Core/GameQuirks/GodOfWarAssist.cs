@@ -491,13 +491,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
 
         // Wave-2 live residual: object virtual dispatch at 0x233AEx with a1=0x401Axxxx
-        // (uncached list cursor) or s0 OOB → jalr garbage → exception vector thrash.
-        // Force clean epilogue; do NOT re-enter mid-body via KSEG rescue.
+        // or s0 OOB → jalr garbage → exception vector thrash. Soft escape from 38M —
+        // w3c gated-after-CDVD left EE in silent non-syscall spin (syscalls~20k, main
+        // dormant); w3b with early escape unstuck WaitSema(3) and lifted calls 44→70.
         if (c >= 38_000_000 && pc is >= 0x00233AD0 and <= 0x00233B34)
             TryEscapeObjectDispatch(sys, pc, c);
 
-        // Sibling list-compare walk at 0x2847xx (profiler hot after stubs): walks a1/t0
-        // next-links until equal. Corrupt a1 never matches → forever + Ade on bad next.
+        // Sibling list-compare walk at 0x2847xx (profiler hot after stubs).
         if (c >= 38_000_000 && pc is >= 0x00284780 and <= 0x002848B0)
             TryEscapeListCompareWalk(sys, pc, c);
 
@@ -631,6 +631,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0013DED0 and <= 0x0013DEF8)  // heap-align spin
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
+            or (>= 0x00300000 and <= 0x00400000)  // post-ELF data / heap (live w3d 0x396xxx)
             || p == 0x00100008u;
 
         uint cand = preferred;
@@ -913,17 +914,18 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 }
                 if (t.Sleeping && t.WaitSemaId != 0)
                 {
-                    // After CDVD, residual WaitSema(3) SIF-cmd poll (live final8 0x293C64)
-                    // parks forever with px=0. Pulse low ids sparingly so RPC can complete
-                    // without the global SEMA_STALL_YIELD hammer.
-                    // Pulse SIF/RPC wait semas (1..16) every kick after CDVD — live residual
-                    // WaitSema(3) at 0x293C64 parks worker 0x27CCxx with px=0. Id-based only
-                    // (no SEMA_STALL_YIELD).
-                    bool lowSif = t.WaitSemaId > 0 && t.WaitSemaId <= 16
+                    // Wave-3: SHARED QueueMaySignalSema + CompleteRpcEnd + AcknowledgeEeSifCmdReady
+                    // own real BIND/CALL and SIFCMD acks. Residual only:
+                    //   • WaitSema(3) SIF-cmd poll (worker 0x27CCxx) when no more SIF traffic
+                    //   • high ids ≥32 (game-private, no HLE producer — B3 class)
+                    // Never blanket-pulse 1..16 (races RPC_END). SEMA_STALL_YIELD OFF.
+                    bool sifCmdPoll = t.WaitSemaId == 3
+                        && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+                        && (_worldKickPulses % 4) == 0;
+                    bool high = t.WaitSemaId >= 32
                         && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
                         && (_worldKickPulses % 2) == 0;
-                    bool high = t.WaitSemaId >= 32;
-                    if (high || lowSif)
+                    if (high || sifCmdPoll)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
                     }
@@ -936,11 +938,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
-        // BIOS / KSEG0 thrash (live 0x800098xx) or garbage PC (0x42xxxxxx) — re-home safely.
-        // Never re-enter 0x233AEx / 0x2847xx mid-body (wave-2 exception death loop).
+        // BIOS / KSEG0 thrash (live 0x800098xx), uncached alias (0x40xxxxxx), or data PC
+        // (0x396xxx) — re-home safely. Never re-enter 0x233AEx / 0x2847xx mid-body.
+        uint pcPhys = pc & 0x1FFFFFFFu;
         if (pc is >= 0x80000000 and <= 0x80020000 || pc < 0x00100000
-            || (pc & 0x1FFFFFFFu) >= (uint)SystemMemory.RDRAM_SIZE
-            || !sys.Memory.IsLikelyEeCode(pc) && pc is >= 0x00300000)
+            || pcPhys >= (uint)SystemMemory.RDRAM_SIZE
+            || pc is >= 0x00300000 and < 0x00400000
+            || (pc & 0xE0000000u) == 0x40000000u // uncached EE phys (live w3e 0x40289328)
+            || !sys.Memory.IsLikelyEeCode(pcPhys) && pcPhys is >= 0x00300000)
         {
             uint resume = PickSafeResume(sys, (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL));
             sys.Memory.Write32(0x002A1338, 0);
@@ -951,7 +956,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
-                    $"[GOW] rescue KSEG thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+                    $"[GOW] rescue KSEG/data thrash pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
         // Live final band 0x182A08 after stubs — force stream-ready + pad so world can draw.
@@ -1090,6 +1095,52 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
                     $"[GOW] escape 0x21FFxx thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+        }
+
+        // Wave-3: after CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (live w3
+        // PC=0x293C48, multi-M 0x44/0x42, RPC plateau 44, sifBytes~10k). SHARED
+        // QueueMaySignalSema + AcknowledgeEeSifCmdReady already complete real RPCs;
+        // empty SIF-cmd poll still re-WaitSema forever. Prefer stream-ready POLL entry
+        // 0x26C0E0 (historical peak) — mid-body 0x26C0EC without a frame nop-sleds
+        // (live w3b: 0x26C288 → BIOS rescue). Also catch residual 0x2993xx / 0x289Axx.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && _worldKickPulses >= 8 && (_worldKickPulses % 4) == 0
+            && (pc is >= 0x00293C00 and <= 0x00293C80
+                || pc is >= 0x00299300 and <= 0x00299400
+                || pc is >= 0x00289A00 and <= 0x00289B00
+                || pc is >= 0x0026BF80 and <= 0x0026C300 && pc is not (>= 0x0026C0E0 and <= 0x0026C130)))
+        {
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.Memory.Write32(0x0029C7D0, 0);
+            // Plant stream-work object so poll→body can jal work path.
+            const uint synthObj = 0x01FD7F00;
+            sys.Memory.Write32(0x002A1378, 0);
+            sys.Memory.Write32(0x002A1358, synthObj);
+            sys.Memory.Write32(synthObj, synthObj + 16);
+            sys.Memory.Write32(synthObj + 16, 1);
+            sys.Memory.Write32(0x002A137C, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x0026C0E0; // poll entry — force-ready block advances to 0x26C0EC
+            sys.EE.COP0_Status &= ~0x6u;
+            // Wake worker WaitSema(3) / high waiters so peers can run alongside main.
+            if (k != null)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping) continue;
+                    if (t.WaitSemaId == 3 || t.WaitSemaId >= 32)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    else if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        k.WakeupThread(t.Id);
+                }
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_worldKickPulses % 16) == 0)
+                Console.Error.WriteLine(
+                    $"[GOW] leave sifrpc/stream residual pc=0x{pc:X8} -> 0x26C0E0 " +
+                    $"n={_worldKickPulses} cyc={c}");
         }
 
         if (_padInjectPulses < 8192)
