@@ -2553,7 +2553,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         long s2 = unchecked((int)(uint)sys.EE.GetGpr(18).Lo);
         bool absurd = s2 >= 64;
-        bool sticky = _cbCountdownVisits >= 4;
+        bool sticky = _cbCountdownVisits >= 2;
         if (!absurd && !sticky) return;
         if (s2 < 0 && !sticky) return;
 
@@ -3325,7 +3325,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_lockWrapperBreaks >= 96) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         bool inWrap = pc is (>= 0x00426EE0 and <= 0x00426F90)
-            or (>= 0x00426DF0 and <= 0x00426ED8);
+            or (>= 0x00426DF0 and <= 0x00426ED8)
+            or (>= 0x00426E00 and <= 0x00426E40); // live park 0x426E28
         if (!inWrap) return;
 
         if (sys.MasterCycles - _lastLockWrapperVisitCyc < 250_000)
@@ -3339,7 +3340,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool stickyRef = refc > 8 || refc == 0xFFFFFFFFu;
         bool onHotInsn = pc is (>= 0x00426F00 and <= 0x00426F10)
             or (>= 0x00426EBC and <= 0x00426EC8);
-        bool stickyBand = _lockWrapperVisits >= 4;
+        bool stickyBand = _lockWrapperVisits >= 2;
         if (!stickyRef && !onHotInsn && !stickyBand) return;
 
         if (stickyRef || stickyBand)
@@ -3347,10 +3348,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         sys.Memory.Write32(0x0054E5E4, 0);
 
         uint resume = 0x00426ED4;
-        if (stickyBand)
+        if (stickyBand || stickyRef)
         {
-            if (sys.Memory.IsLikelyEeCode(0x00427518UL)) resume = 0x00427518;
-            else if (sys.Memory.IsLikelyEeCode(0x004147F8UL)) resume = 0x004147F8;
+            // Prefer ADX pump over unlock epilogue so we leave the lock band (live 0x426E28 park).
+            if (sys.Memory.IsLikelyEeCode(0x004147F8UL)) resume = 0x004147F8;
+            else if (sys.Memory.IsLikelyEeCode(0x00427518UL)) resume = 0x00427518;
             try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
         }
 
