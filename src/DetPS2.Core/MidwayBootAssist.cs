@@ -746,27 +746,47 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// list-walk→format-stall sequence that menu6 used to restore gifP3 5→12. Mirror that
     /// format-stall re-home to Midway main when logo spine is still frozen post-WAD.
     /// Does <b>not</b> set PreferIopRpGetVersion / PadModVerMajor4 (SM needs classic defaults).
+    /// <para>
+    /// Wave-6 (live 2026-07-30 HEAD): do <b>not</b> treat pad-poll / group-6 multi dispatch
+    /// (<c>0x427518..0x4276A0</c>) as thrash — kicking that band into Midway main storms
+    /// IOPRP gen≥2 and lands the EE in title-hash code-walk thrash (<c>0x47EBxx</c>) with
+    /// gifP3 stuck at 8 and eventual open-bus death. Only kick empty-ADX / syscall-table
+    /// residual when group-6 multi is still empty.
+    /// </para>
     /// </summary>
     private void MaybeKickMainForLogoSpine(Ps2System sys)
     {
         // Allow enough kicks to restore historical gifP3≥11 spine, but stop once Path3 is
         // moving (further main re-entry storms IOPRP gen≥2 and clears pad open areas).
-        if (_logoSpineKicks >= 6) return;
-        if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_000_000) return;
+        if (_logoSpineKicks >= 4) return;
+        if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_500_000) return;
         if (sys.Gif.Path3Transfers >= 11) return;
         if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
+        // Group-6 multi already filled: stay in pump/pad; main re-entry only harms pad ghosts.
+        if (sys.Memory.Read32(0x0075E950) == 0x0043F920u) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-        bool inPostWadThrash = pc is (>= 0x00414000 and <= 0x00416000)
-            or (>= 0x00427000 and <= 0x0042A000)
+        // Productive post-WAD bands — NEVER kick (live regression → title-hash / open-bus).
+        // pad-poll multi 0x4275xx, frame-cb dispatch 0x4156xx, stream tick 0x43F9xx.
+        if (pc is (>= 0x00427500 and <= 0x004276A0)
+            or (>= 0x00415600 and <= 0x00415780)
+            or (>= 0x0043F800 and <= 0x0043FC00)
+            or (>= 0x0043CB00 and <= 0x0043CD00)) return;
+        // True residual thrash only: empty ADX lock-wait / pump entry, syscall stub table.
+        // Exclude productive ADX title 0x4148xx..0x414Axx and frame path above.
+        bool inPostWadThrash = pc is (>= 0x00414480 and <= 0x00414550) // lock-wait
+            or (>= 0x00414980 and <= 0x00414A80) // ReferThreadStatus thrash
             or (>= 0x0047FD00 and <= 0x0047FF80)
             or (>= 0x00418000 and <= 0x00419000);
         if (!inPostWadThrash) return;
 
-        // Prefer natural stack return when present.
-        uint resume = 0x00212F70;
+        // After bulk WAD, prefer ADX pump / pad-poll over Midway main — main re-entry
+        // storms IOPRP gen≥2 and outer-list thrash (live: kick@59.9M → 0x474Cxx).
+        // Prefer natural stack return into main body only when still pre-WAD-cold.
+        uint resume = 0;
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-        if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        bool bulkWad = sys.Cdvd.SectorsRead >= 100_000;
+        if (!bulkWad && sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
         {
             for (uint off = 0; off <= 0x80; off += 4)
             {
@@ -778,6 +798,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 }
             }
         }
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8; // ADX pump
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x00427518UL))
+            resume = 0x00427518; // group-6 multi / pad-poll
+        if (resume == 0 && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+            resume = 0x00212F70; // last resort Midway main
+        if (resume == 0) return;
 
         sys.EE.COP0_Status &= ~0x6u;
         sys.EE.PC = resume;
@@ -1303,10 +1330,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeBreakLockWrapperThrash(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
-        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 12)
+        // Wave-6: run after bulk WAD without gifP3≥12 gate — HEAD residual parks here
+        // at gifP3=8 after bad logo-spine kick and never recovers if gated on spine.
+        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
         {
             MaybeBreakTitleHashCodeWalk(sys);
             MaybeBreakTitleHashCodeWalk2(sys);
+            MaybeEscapeTitleHashStickyThrash(sys);
+            MaybeEscapeOuterListThrash(sys);
         }
         // VU blit at 0x385674 sqc2 vi5,0(a0) with corrupt a0 overwrites EE code
         // (live find-writer: pc=0x385674 cyc≈81.9M zeros main).
@@ -2314,7 +2345,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// After bulk WAD I/O, if EE PC lands on a zero opcode (bad function pointer into BSS),
     /// snap to a stack return candidate or ADX waiter epilogue. Complements
     /// <c>Ps2System.MaybeRescueNopSled</c> which can miss when a 50k slice walks off zeros.
+    /// Wave-6: past-RDRAM open-bus sticky thrash (live <c>0x00F30Cxx</c>) must prefer
+    /// ADX pump / pad-poll over stack-scan garbage (live loop: rescue→0x170BFC→open-bus).
     /// </summary>
+    private int _openBusStickyHits;
+    private ulong _lastOpenBusCyc;
+
     private void MaybeRescuePostWadNopSled(Ps2System sys)
     {
         if (sys.Cdvd.SectorsRead < 100_000) return;
@@ -2327,27 +2363,53 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (!pastRdram && op != 0) return;
         if (!pastRdram && sys.Memory.Read32(pc + 4) != 0 && sys.Memory.Read32(pc + 8) != 0) return;
 
-        uint resume = 0;
-        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-        if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        if (pastRdram)
         {
-            for (uint off = 0; off <= 0x80; off += 4)
+            if (sys.MasterCycles - _lastOpenBusCyc < 200_000)
+                _openBusStickyHits++;
+            else
+                _openBusStickyHits = 1;
+            _lastOpenBusCyc = sys.MasterCycles;
+        }
+
+        uint resume = 0;
+        // Past-RDRAM sticky thrash: skip stack scan (returns garbage that re-enters open bus).
+        bool forceKnown = pastRdram && _openBusStickyHits >= 4;
+        if (!forceKnown)
+        {
+            uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+            if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
             {
-                uint cand = sys.Memory.Read32(sp + off);
-                if (!sys.Memory.IsLikelyEeCode(cand)) continue;
-                resume = cand & 0x1FFFFFFFu;
-                break;
+                for (uint off = 0; off <= 0x80; off += 4)
+                {
+                    uint cand = sys.Memory.Read32(sp + off) & 0x1FFFFFFFu;
+                    // Reject low BIOS/kernel stubs and anything past typical ELF image.
+                    if (cand is < 0x00110000 or >= 0x00800000) continue;
+                    if (!sys.Memory.IsLikelyEeCode(cand)) continue;
+                    // Reject title-hash / outer-list thrash bands as resume targets.
+                    if (cand is (>= 0x0047EAE0 and <= 0x0047EFC0)
+                        or (>= 0x00474C00 and <= 0x00476840)) continue;
+                    resume = cand;
+                    break;
+                }
             }
         }
-        // Prefer ADX pump / ready-waiter / main if stack scan failed (code-validated).
+        // Prefer ADX pump / pad-poll / ready-waiter / main (code-validated).
         if (resume == 0 && sys.Memory.IsLikelyEeCode(0x004147F8UL))
             resume = 0x004147F8;
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x00427518UL))
+            resume = 0x00427518;
         if (resume == 0 && sys.Memory.IsLikelyEeCode(0x004145A8UL))
             resume = 0x004145A8;
         if (resume == 0 && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
             resume = 0x00212F70;
         if (resume == 0 && sys.Memory.IsLikelyEeCode(sys.LastGoodEePc))
-            resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
+        {
+            uint lg = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
+            if (lg is not ((>= 0x0047EAE0 and <= 0x0047EFC0)
+                or (>= 0x00474C00 and <= 0x00476840)))
+                resume = lg;
+        }
         if (resume == 0) return;
 
         sys.EE.COP0_Status &= ~0x6u;
@@ -2357,10 +2419,16 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Ensure ADX ready flags so waiter at 0x4145A8 can exit.
         if (sys.Memory.Read32(0x005341D8) == 0)
             sys.Memory.Write32(0x005341D8, 1);
+        sys.Memory.Write32(0x00534164, 0);
+        if (pastRdram)
+            _openBusStickyHits = 0;
         Assists++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        // Rate-limit spam: sticky open-bus used to log every 50k cycles.
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (!pastRdram || _openBusStickyHits == 0))
             Console.Error.WriteLine(
-                $"[BIOS] post-WAD nop-sled rescue 0x{pc:X8} -> 0x{resume:X8} pastRdram={pastRdram} cyc={sys.MasterCycles}");
+                $"[BIOS] post-WAD nop-sled rescue 0x{pc:X8} -> 0x{resume:X8} pastRdram={pastRdram} " +
+                $"forceKnown={forceKnown} cyc={sys.MasterCycles}");
     }
 
     private ulong _lastMenuPadCyc;
@@ -2487,9 +2555,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-5 heavy pad: 5k cycle cadence once interactive (gifP3≥12) so edge-triggered
         // menu code sees more press/release pairs; ghost PADMAN DMA refreshed each pulse.
         // gifP3≥14 (frame-cb + group-6 live): even denser 3k for accept-to-submenu push.
+        // Wave-6: group-6 multi + frame-cb live also counts as interactive even if Path3
+        // is still climbing (HEAD residual often holds gifP3=5..8 in healthy pad bands).
+        bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
+        bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
+        bool interactive = sys.Gif.Path3Transfers >= 12 || (multiLive && frameCbLive);
         ulong interval = sys.Gif.Path3Transfers >= 14 ? 3_000UL
-            : sys.Gif.Path3Transfers >= 12 ? 5_000UL
-            : sys.Gif.Path3Transfers >= 11 ? 20_000UL
+            : interactive ? 5_000UL
+            : sys.Gif.Path3Transfers >= 11 || multiLive ? 12_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2511,12 +2584,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // After spine: longer START hold then CROSS accept (menu confirm pattern).
         // Include D-pad so selection index can move before CROSS accept.
         uint buttons;
-        if (sys.Gif.Path3Transfers >= 11)
+        if (sys.Gif.Path3Transfers >= 11 || multiLive)
         {
             // In menu-class PC bands: D-pad then CROSS so selection/accept advances.
-            // Accept-heavy once gifP3≥12 (interactive-class): more CROSS edges + occasional
-            // Circle/Triangle for alternate confirm bindings Midway titles use.
-            if (inMenuBand || sys.Gif.Path3Transfers >= 12)
+            // Accept-heavy once interactive (gifP3≥12 or multi+frame-cb): more CROSS edges.
+            if (inMenuBand || interactive)
             {
                 // Wave-5 accept-heavy: denser CROSS + D-pad so selection index moves then
                 // accept. Live: gifP3=14 with *0x75BDD8=*0x75E950=0x43F920; pad moves PC;
@@ -2599,7 +2671,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         catch { /* ignore */ }
 
         // Keep workers alive so pad edge is observed on a running thread.
-        if (sys.Gif.Path3Transfers >= 11 && (_menuPadPulses % 2) == 0)
+        if ((sys.Gif.Path3Transfers >= 11 || multiLive) && (_menuPadPulses % 2) == 0)
         {
             var kernel = sys.Hle?.Kernel;
             if (kernel != null)
@@ -2613,7 +2685,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
                         kernel.WakeupThread(t.Id);
                     // Menu accept often WaitSema's the pad/RPC path — pulse lightly.
-                    if ((inMenuBand || sys.Gif.Path3Transfers >= 12)
+                    if ((inMenuBand || interactive)
                         && t.Sleeping && t.WaitSemaId > 0 && t.WaitSemaId < 64)
                     {
                         try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
@@ -2623,10 +2695,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             _menuSpineKicks++;
         }
 
-        // Wave-5 selection chrome telemetry: menu tick cluster around 0x54E5E0..0x54E620.
+        // Wave-5/6 selection chrome telemetry: menu tick cluster + stream cookie object.
         // Live: index-6 tick at 0x54E600 climbs under pad; dump for accept-to-submenu proof.
+        // Wave-6: also dump once multiLive (frame-cb path) even if gifP3 still climbing.
+        // Scan 0x54E5E0..0x54E640 and cookie 0x5BB860 for small ints that move with D-pad
+        // (selection index typically 0..N where N≤16).
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && sys.Gif.Path3Transfers >= 12
+            && (sys.Gif.Path3Transfers >= 11 || multiLive)
             && (_menuPadPulses == 16 || _menuPadPulses == 64 || _menuPadPulses == 128
                 || _menuPadPulses == 256 || (_menuPadPulses > 0 && _menuPadPulses % 512 == 0)))
         {
@@ -2636,13 +2711,38 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             uint t3 = sys.Memory.Read32(0x0054E5EC);
             uint t4 = sys.Memory.Read32(0x0054E600);
             uint t5 = sys.Memory.Read32(0x0054E610);
+            uint t6 = sys.Memory.Read32(0x0054E614);
+            uint t7 = sys.Memory.Read32(0x0054E618);
+            uint t8 = sys.Memory.Read32(0x0054E61C);
+            uint t9 = sys.Memory.Read32(0x0054E620);
+            uint ta = sys.Memory.Read32(0x0054E624);
+            uint tb = sys.Memory.Read32(0x0054E628);
             uint fcb = sys.Memory.Read32(0x0075BDD8);
             uint g6 = sys.Memory.Read32(0x0075E950);
+            // Stream cookie object (FUN_0043ccf8 arg) — often holds UI/stream state.
+            uint ck0 = sys.Memory.Read32(0x005BB860);
+            uint ck1 = sys.Memory.Read32(0x005BB864);
+            uint ck2 = sys.Memory.Read32(0x005BB868);
+            uint ck3 = sys.Memory.Read32(0x005BB86C);
+            uint ck4 = sys.Memory.Read32(0x005BB870);
+            uint ck5 = sys.Memory.Read32(0x005BB874);
+            // Small-int candidates in menu cluster (selection index 0..15).
+            var small = new System.Text.StringBuilder();
+            for (uint off = 0; off < 0x80; off += 4)
+            {
+                uint v = sys.Memory.Read32(0x0054E5E0 + off);
+                if (v <= 16)
+                    small.Append($" +{off:X2}={v}");
+            }
             Console.Error.WriteLine(
                 $"[BIOS] menu-sel *54E5E0={t0:X8}/{t1:X8}/{t2:X8}/{t3:X8} " +
-                $"*54E600={t4:X8} *54E610={t5:X8} fcb=0x{fcb:X8} g6=0x{g6:X8} " +
+                $"*54E600={t4:X8} *54E610={t5:X8}/{t6:X8}/{t7:X8}/{t8:X8} " +
+                $"*54E620={t9:X8}/{ta:X8}/{tb:X8} fcb=0x{fcb:X8} g6=0x{g6:X8} " +
+                $"ck={ck0:X8}/{ck1:X8}/{ck2:X8}/{ck3:X8}/{ck4:X8}/{ck5:X8} " +
                 $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
                 $"n={_menuPadPulses} cyc={sys.MasterCycles}");
+            if (small.Length > 0)
+                Console.Error.WriteLine($"[BIOS] menu-sel-small{small} cyc={sys.MasterCycles}");
         }
 
         // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
@@ -2762,13 +2862,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Live find-writer: when <c>s1</c> is garbage, <c>a3</c> lands on EE code and
     /// <c>sw v0,0(a3)</c> @ <c>0x47EB28</c> zeros Midway main (<c>0x212F70</c> at
     /// cyc≈89182640). Abort the loop when a3/s1 points into the ELF image or count is absurd.
+    /// Wave-6: also trip on sticky re-visits (plausible high-BSS a3 that never exits).
     /// </summary>
     private void MaybeBreakTitleHashCodeWalk(Ps2System sys)
     {
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         if (pc is < 0x0047EAE0 or > 0x0047EB30) return;
         if (sys.MasterCycles - _lastTitleHashBreakCyc < 20_000) return;
-        if (_titleHashBreaks >= 64) return;
+        if (_titleHashBreaks >= 128) return;
 
         uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
         uint a3 = (uint)(sys.EE.GetGpr(7).Lo & 0x1FFFFFFFUL);
@@ -2778,7 +2879,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool s1InCode = s1 is >= 0x00100000 and < 0x00780000;
         // Huge count with a3 already near code base (or null object about to walk).
         bool countThreatensCode = s2 > 0x10000 && a3 is >= 0x00080000 and < 0x00780000;
-        if (!a3InCode && !s1InCode && !countThreatensCode) return;
+        // Sticky: band re-entered many times without leaving (live HEAD: parks at 0x47EB00).
+        bool sticky = _titleHashVisits >= 12;
+        if (!a3InCode && !s1InCode && !countThreatensCode && !sticky) return;
 
         // Force loop exit: t1=s2 so slt a2,t1,s2 is false; jump past bne to 0x47EB34.
         sys.EE.SetGpr(9, new EmotionEngine.Gpr128 { Lo = s2 }); // t1 = s2
@@ -2787,12 +2890,128 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         sys.LastGoodEePc = 0x0047EB34;
         _lastTitleHashBreakCyc = sys.MasterCycles;
         _titleHashBreaks++;
+        _titleHashVisits = 0;
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (_titleHashBreaks <= 12 || _titleHashBreaks % 8 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] break title hash code-walk s1=0x{s1:X8} a3=0x{a3:X8} s2=0x{s2:X} " +
-                $"-> 0x47EB34 n={_titleHashBreaks} cyc={sys.MasterCycles}");
+                $"sticky={sticky} -> 0x47EB34 n={_titleHashBreaks} cyc={sys.MasterCycles}");
+    }
+
+    private int _titleHashVisits;
+    private ulong _lastTitleHashVisitCyc;
+    private int _titleHashStickyEscapes;
+    private ulong _lastTitleHashStickyCyc;
+    private int _outerListThrashVisits;
+    private ulong _lastOuterListVisitCyc;
+    private int _outerListEscapes;
+    private ulong _lastOuterListEscCyc;
+
+    /// <summary>
+    /// Sticky thrash in the wider title-hash band <c>0x47EAE0..0x47EFC0</c> (mix loop +
+    /// second sh-walk). Live HEAD after bad logo-spine kick: PC parks here for tens of M
+    /// cycles then walks open-bus (<c>0x00F30Cxx</c>). Prefer ADX pump / pad-poll resume
+    /// so dense pad + group-6 multi can drive accept — do not re-enter Midway main
+    /// (IOPRP storm). Mirrors VU blit sticky thrash escape pattern.
+    /// </summary>
+    private void MaybeEscapeTitleHashStickyThrash(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x0047EAE0 or > 0x0047EFC0) return;
+        if (_titleHashStickyEscapes >= 48) return;
+
+        if (sys.MasterCycles - _lastTitleHashVisitCyc < 250_000)
+            _titleHashVisits++;
+        else
+            _titleHashVisits = 1;
+        _lastTitleHashVisitCyc = sys.MasterCycles;
+
+        if (_titleHashVisits < 16) return;
+        if (sys.MasterCycles - _lastTitleHashStickyCyc < 100_000) return;
+
+        // Prefer productive post-WAD targets over main (main → IOPRP gen≥2).
+        uint resume = 0;
+        if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8; // ADX pump
+        else if (sys.Memory.IsLikelyEeCode(0x00427518UL))
+            resume = 0x00427518; // group-6 multi dispatch / pad-poll
+        else if (sys.Memory.IsLikelyEeCode(0x004145A8UL))
+            resume = 0x004145A8; // ADX ready waiter
+        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && sys.Gif.Path3Transfers < 8)
+            resume = 0x00212F70; // main only if spine still cold
+        if (resume == 0) return;
+
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        ReHomeSpIfInHleScratch(sys);
+        // Keep ADX ready so pump can run after escape.
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        sys.Memory.Write32(0x00534164, 0);
+        sys.Memory.Write32(0x00534218, 0);
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        _titleHashStickyEscapes++;
+        _lastTitleHashStickyCyc = sys.MasterCycles;
+        _titleHashVisits = 0;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_titleHashStickyEscapes <= 12 || _titleHashStickyEscapes % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] escape title-hash sticky thrash 0x{pc:X8} -> 0x{resume:X8} " +
+                $"n={_titleHashStickyEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Outer list-apply band <c>0x474C00..0x474E00</c> (FUN_00474Cxx) thrash that never
+    /// reaches the inner absurd-count loop at <c>0x475608</c> covered by
+    /// <see cref="MaybeBreakRunawayListWalk"/>. Live HEAD samples park here for 10M+
+    /// cycles interleaved with title-hash. Sticky escape to ADX pump / pad-poll.
+    /// </summary>
+    private void MaybeEscapeOuterListThrash(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x00474C00 or > 0x00474E00) return;
+        if (_outerListEscapes >= 48) return;
+
+        if (sys.MasterCycles - _lastOuterListVisitCyc < 250_000)
+            _outerListThrashVisits++;
+        else
+            _outerListThrashVisits = 1;
+        _lastOuterListVisitCyc = sys.MasterCycles;
+
+        if (_outerListThrashVisits < 16) return;
+        if (sys.MasterCycles - _lastOuterListEscCyc < 100_000) return;
+
+        uint resume = 0;
+        if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8;
+        else if (sys.Memory.IsLikelyEeCode(0x00427518UL))
+            resume = 0x00427518;
+        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && sys.Gif.Path3Transfers < 8)
+            resume = 0x00212F70;
+        if (resume == 0) return;
+
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        ReHomeSpIfInHleScratch(sys);
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        sys.Memory.Write32(0x00534164, 0);
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        _outerListEscapes++;
+        _lastOuterListEscCyc = sys.MasterCycles;
+        _outerListThrashVisits = 0;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_outerListEscapes <= 12 || _outerListEscapes % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] escape outer list thrash 0x{pc:X8} -> 0x{resume:X8} " +
+                $"n={_outerListEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
     }
 
 
