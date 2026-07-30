@@ -141,8 +141,6 @@ public sealed class Burnout3Assist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
-        if (sys.Hle?.Sony?.RealRpc != null)
-            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantIopRpVersion(sys);
     }
 
@@ -202,8 +200,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         else if (_lgDevPostCleared && (sys.MasterCycles % 500_000) < 50_000)
             sys.Memory.Write32(LgDevPostFlag, 0); // sticky: game may re-set
 
-        // After first LGDEV force, periodically wake SleepThread parks + pad so boot can
-        // reach FILEIO assets. Start at 24M (after force ~22.5M) so CallRpc frames settle.
+        // After first LGDEV force, wake SleepThread/pad. Delay past force so CallRpc frames
+        // settle (menu-kick at force-cycle planted STAGEHED + boot-wait and broke residual).
         if (sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead > 0 && _lgDevFullyDone)
             MaybeKickPostGtfsMenu(sys);
 
@@ -212,10 +210,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (_lgDevFullyDone && sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead >= 400)
             MaybeLeaveFlipPark(sys);
 
-        // After IRX/LGDEV residual settles, plant STAGEHED into EE RDRAM so empty-iovec /
-        // stream walks see non-zero size words (pairs with RealSifRpc GTFS). Delay past the
-        // first residual window — planting at force-cycle (22M) disturbed CallRpc frames and
-        // left PC in deep LGDEV (0x44448C) with STG never bound.
+        // Plant STAGEHED only after residual LGDEV CallRpc has stabilized (menu4/final10:
+        // residual ~48× at sp@FC10 then STG). Planting at force-cycle (22M) disturbed
+        // frames and left PC in deep LGDEV (0x444904) with STG never bound.
         if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && _lgDevEscapes >= 8
             && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
@@ -438,18 +435,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // Sticky: after first clean exit, keep lgDeviceInit a no-op. Residual CallRpc on
         // the LGDEV client (leaf 0x443DB0): complete and stub the leaf so fno≠12 cannot
         // re-enter cid=0 thrash. Prefer epilogue 0x443D94 over re-entry into CallRpc.
-        // Wave-2/3: residual sometimes returns into deep LGDEV (0x443E30/0x443EC8/0x44448C)
-        // when savedRa is past the old rewrite window — expand rewrite to whole LGDEV .text
-        // and only complete main high-stack frames (worker sp@0x01EDxxxx is not CallRpc leaf).
+        // Wave-4: fix dead $ra at leaf delay-slot 0x443DA8 (parent post-jal). Residual
+        // only on main high-stack (menu4 stable FC10); rewrite whole LGDEV .text savedRa.
         if (_lgDevFullyDone)
         {
             PlantLgDevEntryStub(sys);
             PlantLgDevCallRpcLeafStub(sys);
             sys.Memory.Write32(LgDevPostFlag, 0);
 
-            // 0x443DA8 is the DELAY SLOT of leaf jr ra (disasm: ld ra; jr ra; addiu sp,48).
-            // Wave-2 "park" there means $ra loaded from leaf frame is dead — fix $ra to
-            // parent post-jal (0x4427FC) and re-issue jr. Do NOT hard-leave to boot-wait.
+            // 0x443DA8 = delay slot of leaf jr ra (ld ra; jr ra; addiu sp,48). Dead $ra
+            // → parent post-jal 0x4427FC and re-issue jr. Do NOT hard-leave mid-body.
             if (pc == 0x00443DA8u)
             {
                 bool badRa = ra < 0x00100000 || ra >= 0x00400000
@@ -459,7 +454,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 {
                     sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x004427FCu });
                     sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                    sys.EE.PC = 0x00443DA4; // jr ra (delay will re-run addiu sp)
+                    sys.EE.PC = 0x00443DA4; // jr ra
                     sys.EE.COP0_Status &= ~(1u << 1);
                     _lgDevEscapes++;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -471,14 +466,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 return;
             }
 
-            // Residual CallRpc thrash (menu4build shape): main high-stack only, rewrite
-            // any LGDEV .text savedRa to leaf epi 0x443D94.
             if (IsLgDevCallRpcThrash(sys, pc, ra) && _lgDevEscapes < 256)
             {
                 uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                // Main high-stack only — worker 0x01EDxxxx completes diverged residual vs menu4.
                 if (sp is >= 0x01FFF000 and < 0x02000000)
                 {
                     uint savedRa = sys.Memory.Read32(sp + 176) & 0x1FFFFFFFu;
+                    // Whole LGDEV .text + CallRpc body → leaf epi (deep 0x443E30+ was unbound).
                     if (savedRa is >= 0x00443800 and < 0x00445000
                         || savedRa is < 0x00100000 or >= 0x00800000
                         || savedRa is (>= 0x0010BE00 and <= 0x0010F400))
@@ -486,14 +481,6 @@ public sealed class Burnout3Assist : IGameQuirkModule
                         sys.Memory.Write32(sp + 176, 0x00443D94u);
                         sys.Memory.Write32(sp + 180, 0);
                         savedRa = 0x00443D94u;
-                    }
-                    // Also plant leaf frame $ra (sp will be leaf after CallRpc epi pops 192)
-                    // so ld ra,40(sp) at 0x443DA0 is parent post-jal not garbage.
-                    uint leafSp = sp + 192;
-                    if (leafSp is >= 0x01FFF000 and < 0x02000000)
-                    {
-                        sys.Memory.Write32(leafSp + 40, 0x004427FCu);
-                        sys.Memory.Write32(leafSp + 44, 0);
                     }
                     sys.Memory.Write32(0x01ECDF00, 0);
                     sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -507,8 +494,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
                             $"savedRa=0x{savedRa:X8} n={_lgDevEscapes} cyc={sys.MasterCycles}");
                 }
             }
-            // Deep LGDEV body (0x443E00+) after bad residual — snap to parent post-jal.
-            else if (pc is >= 0x00443E00 and < 0x00444800 && _lgDevEscapes >= 2)
+            // Deep LGDEV body after bad residual return — snap to parent post-jal.
+            else if (pc is >= 0x00443E00 and < 0x00445000 && _lgDevEscapes >= 2)
             {
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
                 sys.EE.PC = 0x004427FCu;
@@ -570,9 +557,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // (0x10F3A0). Live: dest-climbing cid=0 SIFCMD on recv 0x01ECDF40.
         // Force the *entire* lgDeviceInit success epilogue so boot leaves the wheel path.
         // Only when CallRpc's s1 (cd) is the LGDEV client at 0x01ECDF00 — never other RPCs.
-        // Delay first force to ~22.5M (menu4build 22.75M) so version/fno=12 frame is fully
-        // nested — forcing at exactly 22.0M left residual with climbing sp and park 0x443DA8.
-        if (IsLgDevCallRpcThrash(sys, pc, ra) && sys.MasterCycles >= 22_500_000 && _lgDevEscapes < 256)
+        // Gate ≥18M (not 22M): FILEIO GetVersion now returns ASCII "2800" so version+thrash
+        // arrives earlier; waiting to 22M left force on already-diverged sp@FC10 (menu4 was
+        // force-at-version with sp@FC00 → stable residual → STG).
+        if (IsLgDevCallRpcThrash(sys, pc, ra) && sys.MasterCycles >= 18_000_000 && _lgDevEscapes < 256)
         {
             uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
             // Permanent structural break of fno=18 path.
@@ -791,11 +779,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // epilogue so callers can fall through to real FILEIO/NCMD open.
         MaybeEscapeEmptyIoQueue(sys);
 
-        // Proactive table-walk stub only after STG window — early stub (gifP3=35) blocked
-        // the post-LGDEV path that menu4 used to reach STG bind.
+        // Proactive table-walk stub only after STG window — early stub blocked menu4 STG path.
         if (_lgDevFullyDone && _vblankExits >= 4 && sys.Gif.Path3Transfers >= 90
-            && sys.Cdvd.SectorsRead is >= 600 and < 1200
-            && sys.MasterCycles >= 50_000_000
+            && sys.Cdvd.SectorsRead is >= 600 and < 2000
+            && sys.MasterCycles >= 55_000_000
             && sys.Memory.Read32(0x003E9B40) != 0x03E00008u)
         {
             sys.Memory.Write32(0x003E9B40, 0x03E00008u); // jr ra
@@ -914,11 +901,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles - _lastFlipLeaveCyc < 80_000 && _vblankExits < 4) return;
         uint pc = (uint)(sys.EE.PC & 0xFFFFFFFFUL);
         uint phys = pc & 0x1FFFFFFFu;
-        // 0x480000..0x4E0000 is EE .data/.bss for SLUS_210.50 (live w3 final PC 0x48019C
-        // thrash with UnknownSpecial) — treat as bad PC after LGDEV leave.
         bool bad = pc is >= 0x80000180 and <= 0x80000200
             || phys < 0x00100000
-            || phys is >= 0x00480000 and < 0x02000000 // data/BSS (was 0x4E0000+)
+            || phys is >= 0x004E0000 and < 0x02000000 // high BSS/data (live 0x4FB168)
             || (phys is >= 0x00171E00 and <= 0x00171F00 && sys.Memory.Read32(phys) == 0x4C0899E8u);
         if (!bad) return;
 
@@ -929,16 +914,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (resume == 0 && sys.LastGoodEePc is >= 0x00100000 and < 0x00400000)
             resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
         // Known live post-LGDEV continues (not CRT0, not flip wait body).
-        // Prefer past wait-3 (0x2B35C0) once flags are plantable so STG bind can run.
-        if (resume == 0 || resume is (>= 0x001F24E0 and <= 0x001F2520) || resume == 0x00100008
-            || resume is (>= 0x00480000 and < 0x02000000))
-            resume = 0x002B35C0;
-        if (resume is >= 0x00400000) resume = 0x002B35C0;
-        // Ensure live object in s0/a0 for wait-3 continue.
-        const uint liveObj = 0x004E41C0u;
-        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = liveObj });
-        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = liveObj });
-        sys.Memory.Write32(liveObj + 0x13A4, 1);
+        if (resume == 0 || resume is (>= 0x001F24E0 and <= 0x001F2520) || resume == 0x00100008)
+            resume = 0x002B34E8; // past boot-wait-1 → continue Criterion boot
+        if (resume is >= 0x00400000) resume = 0x002B34E8;
 
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
         sys.EE.PC = resume;
@@ -1074,12 +1052,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
             or (>= 0x00124020 and <= 0x00124050); // memcpy tail of same family (a2 countdown)
         if (!inScan)
         {
-            // Do NOT permanent-stub empty iovec heads while still IRX-only — that skipped
-            // the Criterion stream walk that binds STG (menu4 reached STG without stubs).
-            // Only stub after assets have been attempted (cdvd past plant-only ~609).
+            // Do NOT permanent-stub empty iovec before STG bind (menu4 reached STG without).
             if (!_ioQueueStubPlanted && _vblankExits >= 4 && sys.Gif.Path3Transfers >= 90
                 && sys.Cdvd.SectorsRead is >= 600 and < 900 && _stageHedSize == 0
-                && sys.MasterCycles >= 50_000_000)
+                && sys.MasterCycles >= 55_000_000)
             {
                 sys.Memory.Write32(0x00122990, 0x08048B2Fu); // j 0x00122CBC
                 sys.Memory.Write32(0x00122994, 0x0000102Du);
@@ -1304,10 +1280,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         bool inWait1 = pc is >= 0x002B34C0 and <= 0x002B34E4;
-        // 0x2B34E8..0x2B3514: stores -1 into flag2 then jal producer — if we only plant
-        // flag2=1 without snapping, EE re-stores -1 and wait-2 never ends (w3 wall).
-        bool inWait2Setup = pc is >= 0x002B34E8 and <= 0x002B3514;
-        bool inWait2 = pc is >= 0x002B3510 and <= 0x002B3540 || inWait2Setup;
+        bool inWait2 = pc is >= 0x002B3510 and <= 0x002B3540;
         bool inWait3 = pc is >= 0x002B35A0 and <= 0x002B35C0;
         bool inSleep = pc is >= 0x0010C0A0 and <= 0x0010C0AC;
         bool periodic = (_menuKickPulses % 2) == 0 && sys.Cdvd.SectorsRead < 8000;
@@ -1326,30 +1299,25 @@ public sealed class Burnout3Assist : IGameQuirkModule
         sys.Memory.Write32(BootWaitFlagDefault, 1);
 
         // Wait-2: *(gp-27128) / *(gp-27124) init to -1, producer must replace.
-        // Always plant ready when in wait-2 setup/loop (code re-stores -1 at 0x2B34F0).
+        // Plant 1 (ready handle) — 0 can be read as "failed/empty" by later checks.
         uint flag2a = unchecked((uint)((int)gp - 27128));
         uint flag2b = unchecked((uint)((int)gp - 27124));
         if (flag2a is >= 0x00400000 and < 0x01000000)
         {
-            if (inWait2 || sys.Memory.Read32(flag2a) == 0xFFFFFFFFu)
+            // Only overwrite the sentinel -1 (never clobber a real producer result).
+            if (sys.Memory.Read32(flag2a) == 0xFFFFFFFFu)
                 sys.Memory.Write32(flag2a, 1);
-            if (inWait2 || sys.Memory.Read32(flag2b) == 0xFFFFFFFFu)
+            if (sys.Memory.Read32(flag2b) == 0xFFFFFFFFu)
                 sys.Memory.Write32(flag2b, 1);
         }
 
         // Wait-3: *(s0+0x13A4) — object-local ready flag after jal 0x2AEFC0 (a3=21).
         // Only plant when s0 looks like a real EE object (not stack garbage / low page).
         uint s0 = (uint)(sys.EE.GetGpr(16).Lo & 0x1FFFFFFFUL);
-        if (s0 is < 0x00400000 or >= 0x02000000 || (s0 & 3) != 0)
-        {
-            // Live boot object when s0 is garbage (hard-leave / early snap).
-            s0 = 0x004E41C0u;
-            sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = s0 });
-            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = s0 });
-        }
         if (s0 is >= 0x00400000 and < 0x02000000 && (s0 & 3) == 0)
         {
             sys.Memory.Write32(s0 + 0x13A4, 1);
+            // Sibling cells used nearby (0x13A0 / 0x1380) — keep non-zero for follow-on.
             if (sys.Memory.Read32(s0 + 0x13A0) == 0)
                 sys.Memory.Write32(s0 + 0x13A0, 1);
         }
@@ -1358,13 +1326,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (inWait1)
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-            // Skip 0x2B34E8..F8 which re-stores flag2=-1; land at wait-2 check with flags ready.
-            sys.EE.PC = 0x002B3518;
+            sys.EE.PC = 0x002B34E8;
             sys.EE.COP0_Status &= ~0x6u;
         }
-        else if (inWait2Setup || inWait2)
+        else if (inWait2)
         {
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 }); // != -1
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // != -1
             sys.EE.PC = 0x002B356C; // success continue after first result check
             sys.EE.COP0_Status &= ~0x6u;
         }

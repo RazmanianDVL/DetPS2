@@ -2539,7 +2539,13 @@ public sealed class RealSifRpc
             if (w2 < 0x01000000u && !IsEeRamPointer(w2)) offset = w2;
         }
 
-        if (dest == 0 || dest >= 0x01E00000u) return 0;
+        if (dest == 0 || dest >= 0x01E00000u)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] fno=5 skip bad dest w=[{w0:X8} {w1:X8} {w2:X8} {w3:X8}]");
+            return 0;
+        }
 
         int fd = _gtfsLastPathFd >= 0 ? _gtfsLastPathFd
             : (openedFd >= 0 ? openedFd
@@ -2548,7 +2554,15 @@ public sealed class RealSifRpc
             : (openedSize != 0 ? openedSize
                 : (_gtfsFrontendSize != 0 ? _gtfsFrontendSize
                     : (_gtfsStageHedSize != 0 ? _gtfsStageHedSize : 0x10000u)));
-        if (fd < 0 || maxSz == 0) return 0;
+        if (fd < 0 || maxSz == 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] fno=5 no file fd={fd} maxSz={maxSz} lastFd={_gtfsLastPathFd} " +
+                    $"fe={_gtfsFrontendFd} hed={_gtfsStageHedFd} " +
+                    $"w=[{w0:X8} {w1:X8} {w2:X8} {w3:X8}]");
+            return 0;
+        }
 
         if (offset == 0 && _gtfsReadOffset > 0 && _gtfsReadOffset < maxSz
             && (_gtfsLastDmaDest == 0 || dest == _gtfsLastDmaDest
@@ -2752,7 +2766,30 @@ public sealed class RealSifRpc
             string up = resolved.ToUpperInvariant();
             fd = iopModules.FileOpen(up);
         }
-        if (fd < 0) return -1;
+        if (fd < 0 && path.Contains('.'))
+        {
+            // Bare "Global.txd" / "Data\Global.txd" → DATA\GLOBAL.TXD variants.
+            string baseName = path.Replace('/', '\\');
+            int slash = baseName.LastIndexOf('\\');
+            string leaf = slash >= 0 ? baseName[(slash + 1)..] : baseName;
+            foreach (string cand in new[]
+                     {
+                         $@"cdrom0:\DATA\{leaf.ToUpperInvariant()};1",
+                         $@"cdrom0:\DATA\{leaf};1",
+                         $@"cdrom0:\{leaf.ToUpperInvariant()};1",
+                     })
+            {
+                fd = iopModules.FileOpen(cand);
+                if (fd >= 0) { resolved = cand; break; }
+            }
+        }
+        if (fd < 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] open FAIL path=\"{path}\" resolved=\"{resolved}\" fno=0x{fno:X}");
+            return -1;
+        }
 
         uint fsz = 0;
         if (iopModules.TryGetOpenFileSize(fd, out fsz) && fsz > 0)
