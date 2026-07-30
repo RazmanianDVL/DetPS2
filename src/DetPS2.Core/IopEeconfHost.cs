@@ -151,4 +151,26 @@ public sealed class IopEeconfHost
         _ps1BlockCleared &&
         (_speedCaps & SpeedCapPresent) != 0 &&
         (_mac[0] | _mac[1] | _mac[2] | _mac[3] | _mac[4] | _mac[5]) != 0;
+
+    /// <summary>
+    /// Write a test/diagnostic pattern into the PS1 config block (normally zero after init).
+    /// Used by smokes to prove the next <see cref="ApplyBiosInit"/> re-clears the block.
+    /// </summary>
+    public void DirtyPs1ConfigBlock(byte fill = 0x5A)
+    {
+        for (int i = 0; i < _ps1Config.Length; i++)
+            _ps1Config[i] = fill;
+        _ps1BlockCleared = false;
+    }
+
+    /// <summary>True when every PS1 config byte is zero.</summary>
+    public bool IsPs1ConfigAllZero
+    {
+        get
+        {
+            for (int i = 0; i < _ps1Config.Length; i++)
+                if (_ps1Config[i] != 0) return false;
+            return true;
+        }
+    }
 }

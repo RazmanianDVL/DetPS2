@@ -84,6 +84,8 @@ public sealed class IopDmacManHost
     private ulong _completeCount;
     private ulong _enableCount;
     private ulong _disableCount;
+    private ulong _releaseCount;
+    private ulong _dicrIrqCount;
     private bool _started;
 
     public bool Started => _started;
@@ -98,6 +100,10 @@ public sealed class IopDmacManHost
     public ulong CompleteCount => _completeCount;
     public ulong EnableCount => _enableCount;
     public ulong DisableCount => _disableCount;
+    /// <summary>How many times <see cref="ReleaseChannel"/> cleared a channel.</summary>
+    public ulong ReleaseCount => _releaseCount;
+    /// <summary>How many times a complete raised a DICR interrupt flag.</summary>
+    public ulong DicrIrqCount => _dicrIrqCount;
 
     public IopDmacManHost() => Reset();
 
@@ -118,6 +124,7 @@ public sealed class IopDmacManHost
         _reg57C = 0;
         _setSliceCount = _startCount = _completeCount = 0;
         _enableCount = _disableCount = 0;
+        _releaseCount = _dicrIrqCount = 0;
         _started = false;
         // Decode default priorities (nibble low 3 bits) without enable bits set.
         for (int i = 0; i < 7; i++)
@@ -294,6 +301,30 @@ public sealed class IopDmacManHost
         ulong words = count != 0 ? (ulong)size * count : size;
         _ = words;
         _completeCount++;
+        // DICR interrupt flags: if channel IE bit set, set IF bit (bookkeeping).
+        // PS1-class DICR: IE in bits 16+ch, IF in bits 24+ch (channels 0–6).
+        // DICR2 covers later channels in the same layout for ch 7–12 (HLE extension).
+        if (channel <= 6)
+        {
+            uint ie = 1u << (16 + channel);
+            if ((_dicr & ie) != 0)
+            {
+                _dicr |= 1u << (24 + channel);
+                _dicr |= 0x80000000u; // master IF
+                _dicrIrqCount++;
+            }
+        }
+        else if (channel < ChannelCount)
+        {
+            int bit = channel - 7;
+            uint ie = 1u << (16 + bit);
+            if ((_dicr2 & ie) != 0)
+            {
+                _dicr2 |= 1u << (24 + bit);
+                _dicr2 |= 0x80000000u;
+                _dicrIrqCount++;
+            }
+        }
     }
 
     /// <summary>sceSetDMAPriority(channel, val) — export 33. val is 0..7 priority field.</summary>
@@ -405,15 +436,102 @@ public sealed class IopDmacManHost
     public int GetChannelPriority(int channel) =>
         IsHwChannel(channel) ? _ch[channel].Priority : -1;
 
+    /// <summary>True while CHCR.TR is set (normally false after synchronous StartDMA complete).</summary>
+    public bool IsTransferActive(int channel) =>
+        IsHwChannel(channel) && (_ch[channel].Chcr & ChcrTr) != 0;
+
+    /// <summary>
+    /// Request a channel: enable DPCR bit + SetSliceDMA setup without starting.
+    /// Returns 1 if setup accepted, 0 otherwise. Pair with <see cref="StartDma"/> /
+    /// <see cref="ReleaseChannel"/>.
+    /// </summary>
+    public int RequestChannel(int channel, uint addr, uint size, uint count, int dir)
+    {
+        if (SetSliceDma(channel, addr, size, count, dir) == 0)
+            return 0;
+        EnableDmaChannel(channel);
+        return 1;
+    }
+
+    /// <summary>
+    /// Release a channel: clear TR, zero MADR/BCR/CHCR/TADR, disable DPCR enable bit.
+    /// Completes the channel lifecycle after Request/Start.
+    /// </summary>
+    public int ReleaseChannel(int channel)
+    {
+        if (!IsHwChannel(channel)) return 0;
+        var c = _ch[channel];
+        c.Chcr &= ~ChcrTr;
+        c.Madr = 0;
+        c.Bcr = 0;
+        c.Chcr = 0;
+        c.Tadr = 0;
+        c.Ext49A = 0;
+        DisableDmaChannel(channel);
+        _releaseCount++;
+        return 1;
+    }
+
+    /// <summary>
+    /// Enable DICR interrupt for a channel (IE bit). After StartDMA complete, IF bit latches.
+    /// ch 0–6 → DICR; ch 7–12 → DICR2.
+    /// </summary>
+    public void SetChannelInterruptEnable(int channel, bool enable)
+    {
+        if (channel >= 0 && channel <= 6)
+        {
+            uint ie = 1u << (16 + channel);
+            if (enable) _dicr |= ie;
+            else _dicr &= ~ie;
+        }
+        else if (channel >= 7 && channel < ChannelCount)
+        {
+            int bit = channel - 7;
+            uint ie = 1u << (16 + bit);
+            if (enable) _dicr2 |= ie;
+            else _dicr2 &= ~ie;
+        }
+    }
+
+    /// <summary>True when DICR/DICR2 IF bit is latched for the channel.</summary>
+    public bool IsChannelInterruptPending(int channel)
+    {
+        if (channel >= 0 && channel <= 6)
+            return (_dicr & (1u << (24 + channel))) != 0;
+        if (channel >= 7 && channel < ChannelCount)
+        {
+            int bit = channel - 7;
+            return (_dicr2 & (1u << (24 + bit))) != 0;
+        }
+        return false;
+    }
+
+    /// <summary>Clear DICR/DICR2 IF bit for a channel (and master IF when no others remain).</summary>
+    public void AcknowledgeChannelInterrupt(int channel)
+    {
+        if (channel >= 0 && channel <= 6)
+        {
+            _dicr &= ~(1u << (24 + channel));
+            if ((_dicr & 0x7F000000u) == 0)
+                _dicr &= ~0x80000000u;
+        }
+        else if (channel >= 7 && channel < ChannelCount)
+        {
+            int bit = channel - 7;
+            _dicr2 &= ~(1u << (24 + bit));
+            if ((_dicr2 & 0x3F000000u) == 0)
+                _dicr2 &= ~0x80000000u;
+        }
+    }
+
     /// <summary>
     /// Convenience used by HLE drivers: enable + set slice + start in one call.
     /// Returns 1 if setup accepted, 0 otherwise.
     /// </summary>
     public int RequestAndStart(int channel, uint addr, uint size, uint count, int dir)
     {
-        if (SetSliceDma(channel, addr, size, count, dir) == 0)
+        if (RequestChannel(channel, addr, size, count, dir) == 0)
             return 0;
-        EnableDmaChannel(channel);
         StartDma(channel);
         return 1;
     }

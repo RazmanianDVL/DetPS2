@@ -808,7 +808,7 @@ public static class SmokeTests
             BiosBootHost_IopBtConfContracts();
             BiosRomdirGate_PortDocsForRequiredModules();
             BiosExtendedRomdir_SecrClearSpuLibSdUdnl();
-            // BiosUdnl_IopRpImageApplyAndSecrMgPath — Phase 3 (AGENT-U); restore when method lands
+            BiosUdnl_IopRpImageApplyAndSecrMgPath();
             BiosHle_RebootStdioIgreetingIomanContracts();
             Eeconf_InitContracts();
             Ssbusc_BusWindowContracts();

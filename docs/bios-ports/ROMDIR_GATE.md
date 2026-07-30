@@ -21,16 +21,16 @@
 | 1 | SYSMEM | SYSMEM.md · RealSifRpc sid 0x80000003 | **OK** |
 | 2 | LOADCORE | IrxLoader ScanExports/LinkImports · BIOS_DISSECTION §6.5 | **OK** |
 | 3 | EXCEPMAN | IopExcepManHost · §6.6 | **OK** (bookkeeping until IOP exec) |
-| 4 | INTRMANP | VBLANK_INTRMAN.md · IopSystemHost | **PARTIAL** |
-| 5 | INTRMANI | VBLANK_INTRMAN.md · IopSystemHost | **PARTIAL** |
-| 6 | SSBUSC | SSBUSC_EECONF.md · IopSsbuscHost | **PARTIAL** |
-| 7 | DMACMAN | DMACMAN.md · IopDmacManHost | **PARTIAL** |
-| 8 | TIMEMANP | ROMDRV_TIMEMAN.md · IopSystemHost | **PARTIAL** |
-| 9 | TIMEMANI | ROMDRV_TIMEMAN.md · IopSystemHost | **PARTIAL** |
+| 4 | INTRMANP | VBLANK_INTRMAN.md · IopSystemHost | **OK** |
+| 5 | INTRMANI | VBLANK_INTRMAN.md · IopSystemHost | **OK** |
+| 6 | SSBUSC | SSBUSC_EECONF.md · IopSsbuscHost | **OK** |
+| 7 | DMACMAN | DMACMAN.md · IopDmacManHost | **OK** |
+| 8 | TIMEMANP | ROMDRV_TIMEMAN.md · IopSystemHost | **OK** |
+| 9 | TIMEMANI | ROMDRV_TIMEMAN.md · IopSystemHost | **OK** |
 | 10 | SYSCLIB | SYSCLIB_HEAPLIB.md · IopSysclibHeaplibHost | **OK** |
 | 11 | HEAPLIB | SYSCLIB_HEAPLIB.md · IopSysclibHeaplibHost | **OK** |
-| 12 | EECONF | SSBUSC_EECONF.md · IopEeconfHost | **PARTIAL** (optional REQ) |
-| 13 | THREADMAN | THREADMAN.md · KernelHle/SonyKernelHle | **PARTIAL** (no Mbx/Vpl/Fpl) |
+| 12 | EECONF | SSBUSC_EECONF.md · IopEeconfHost | **OK** (optional REQ) |
+| 13 | THREADMAN | THREADMAN.md · KernelHle/SonyKernelHle | **OK** (Mbx/Vpl/Fpl/priority/delay; residual §5.4/6/7/9–12) |
 | 14 | VBLANK | VBLANK_INTRMAN.md · IopVblankHost | **OK** |
 | 15 | IOMAN | FILEIO.md + REBOOT_STDIO_IOMAN.md · 16-slot + AddDrv | **OK** |
 | 16 | MODLOAD | MODLOAD.md · IopModuleHost lifecycle | **OK** |
@@ -41,7 +41,7 @@
 | 21 | SIFCMD | RealSifRpc BIND/CALL/RDATA/RPC_END | **OK** |
 | 22 | REBOOT | REBOOT_STDIO_IOMAN.md · SifIopReset + handoff | **OK** |
 | 23 | LOADFILE | LOADFILE.md · sid 0x80000006 | **OK** |
-| 24 | CDVDMAN | CDVD.md · Cdvd.cs | **PARTIAL** (mechacon stand-in) |
+| 24 | CDVDMAN | CDVD.md · Cdvd.cs | **OK** (mechacon stand-in; DiskReady/tray/error/NCMD) |
 | 25 | CDVDFSV | CDVD.md · SCMD/NCMD/siblings | **OK** |
 | 26 | SIFINIT | SIFINIT_EESYNC.md | **OK** |
 | 27 | FILEIO | FILEIO.md · sid 0x80000001 | **OK** |
@@ -59,8 +59,8 @@
 | Module | Notes | Gate |
 |--------|-------|------|
 | XLOADFILE / XFILEIO / NCDVDMAN / XPADMAN / XSIO2MAN / … | Aliases / X paths share primary HLE (`IopExtendedBiosHost`) | **OK** (alias) |
-| MCMAN / MCSERV | MCSERV.md full RPC; MCMAN FAT scoped | MCSERV **OK**, MCMAN **PARTIAL** |
-| LIBSD | Export table + name (`IopExtendedBiosHost`) | **PARTIAL** (stubs; not full audio) |
+| MCMAN / MCSERV | MCSERV.md full RPC + dual-format FAT (PS1/PS2) | MCSERV **OK**, MCMAN **OK** |
+| LIBSD | LIBSD.md · IopLibSdHost (sceSdInit/param/key-on) | **OK** (core; mixer residual in LIBSD.md) |
 | SECRMAN | Secr*BootFile passthrough; no MagicGate crypto | **PARTIAL** |
 | CLEARSPU | Spu2 soft-reset on boot + UDNL handoff | **OK** |
 | UDNL | IOPRP version + module re-register (not full image unpack) | **PARTIAL** |
@@ -81,11 +81,11 @@ Full 101-entry map: **ROMDIR_FULL_AUDIT.md**.
 These remain for later deepening but do **not** leave commercial boot without a destination:
 
 - Literal R3000 execution of BIOS IRX (optional architecture path)
-- THREADMAN Mbx/Vpl/Fpl + priority ready queues
-- Full MCMAN dual-format FAT
-- IOP DMAC/SSBUS MMIO shared with hosts
-- INTRMAN full Ghidra dump
-- LIBSD deep audio
+- THREADMAN event-flag wait-queue priority / generation-bit IDs / CheckThreadStack / i-form checks (Mbx/Vpl/Fpl/priority/delay **done** — see THREADMAN.md §5)
+- MCMAN ECC spare / wear-leveling (dual-format FAT present; ECC residual)
+- IOP DMAC/SSBUS MMIO shared with hosts (contract HLE is OK; MMIO is residual)
+- INTRMAN full Ghidra dump (export contracts ground-truthed from binary KE_* + ps2sdk)
+- LIBSD dual-core mixer / effect DSP (core contracts OK — see LIBSD.md)
 
 ## Gate decision
 

@@ -102,38 +102,41 @@ From ps2sdk recreation of SCE TIMEMAN (6 slots; TIMEMANP is first 3):
 | SetAlarm / CancelAlarm / fire on Tick | `IopSystemHost` | ✓ duplicate + NOTFOUND |
 | USec2SysClock / SysClock2USec | static on `IopSystemHost` | ✓ |
 | VBlank `Tick(1)` | `BiosHle.OnVblank` | Advances **SysClockPerVblank** (≈614400), not 1 |
+| SetTimerHandler / SetOverflowHandler | `IopSystemHost` | ✓ compare-match → timeup + INTRMAN RaiseIntr bookkeeping |
+| Get/ClearTimerTimeupFlags | `IopSystemHost` | ✓ |
 
 ### Intentional HLE divergences
 
 | Divergence | Why |
 |------------|-----|
 | No `0xBF8011xx` MMIO timer hardware | Project has no IOP timer MMIO model; counters advance on host Tick |
-| Alarm callbacks not R3000-executed | Same class as VBLANK callbacks — count + drop only |
-| SetTimerHandler / overflow IRQ path | Not wired to INTRMAN RaiseIntr yet |
+| Alarm / timer callbacks not R3000-executed | Same class as VBLANK callbacks — count + INTRMAN pending only |
 | thbase + timrman colocated | No IOP IRX execution; single host is the service surface |
 | No full Ghidra TIMEMAN dump | Contracts from ps2sdk recreation + kerr.h; re-verify when `TIMEMAN*_ALL.txt` lands |
 
 ---
 
-## 3. Landed in this agent pass
+## 3. Landed (waves + Phase 2 deepen)
 
 1. **`RomdirExtractor.ExtractModuleContent` / `TryFindEntry` / `HasModule`** — ELF or raw ROMDIR payload.
 2. **`IopModuleHost.BindRomBios` + rom0 open/read/getstat/dopen** through FILEIO.
 3. **`BiosBootHost.StartCommercialIop` binds ROM image** into FILEIO (and clears on no-image path).
 4. **Hard-timer table TIMEMANI/P** with real timid encoding and KE_* family.
 5. **SysClock units**, USec conversion, SetAlarm duplicate/cancel contracts, VBlank-scale Tick.
-6. **Smokes:** `Romdrv_Rom0ContentServingThroughFileIo`, `Timeman_HardTimerAndSysClockContracts`; extended `BiosHle_IopSystemIntrAndTime`.
+6. **Phase 2 (AGENT-I):** `SetTimerHandler` / `SetOverflowHandler`; Tick compare-match / overflow → timeup flags + INTRMAN pending raise on timer IRQ; strict timid encode check on lookup.
+7. **Smokes:** `Romdrv_Rom0ContentServingThroughFileIo`, `Timeman_HardTimerAndSysClockContracts` (deepened); extended `BiosHle_IopSystemIntrAndTime`.
+
+**Gate:** TIMEMANP / TIMEMANI → **OK** (contract HLE + smokes; residual = no MMIO / no Ghidra dump / no R3000 cb exec).
 
 ---
 
-## 4. Remaining gaps (orchestrator / later)
+## 4. Remaining gaps (non-blocking)
 
 | Gap | Notes |
 |-----|-------|
 | **TIMEMAN Ghidra dump** | Extract TIMEMANP/TIMEMANI bins + headless decomp; reconcile timid/order vs recreation |
 | **ROMDRV.IRX decomp** | Confirm path parse / unit digit / error codes line-for-line |
 | **IOP timer MMIO** | Real `BF801100` family so free-running hardware matches GetTimerCounter without Tick |
-| **SetTimerHandler → INTRMAN** | Compare IRQ dispatch into registered handlers |
 | **THREADMAN DelayThread** | Soft delay still KernelState/EE-side; not driven by these IOP alarms |
 | **IOMAN AddDrv registry** | Still deferred until multiple real backends need a general dispatcher |
 | **rom1: DVD-player ROM** | Name accepted; no second image binding |

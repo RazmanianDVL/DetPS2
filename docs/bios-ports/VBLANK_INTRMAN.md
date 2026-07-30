@@ -64,17 +64,19 @@ IOP IRQs used by VBLANK: `0` = VBLANK, `11` = EVBLANK (`ps2sdk iop_irq_list`).
 | WaitVblank* | — | Not exported as HLE methods; waiters use `KernelState` EF on `EventFlagId` |
 | Callback return-0 auto-free | — | **Not ported** (no R3000 callback exec) |
 | System status flag `0x200` on first start | — | **Not ported** |
-| RegisterIntrHandler / Release / Enable / Disable | `IopSystemHost` | One-per-IRQ + KE_* ✓ |
+| RegisterIntrHandler / Release / Enable / Disable | `IopSystemHost` | One-per-IRQ + KE_* + ILLEGAL_CONTEXT ✓ |
+| Query status (handler/mode/arg/pending/enable/dispatch) | `IopSystemHost` | `QueryIntrStatus` + getters ✓ |
+| RaiseIntr / AcknowledgeIntr pending | `IopSystemHost` | Pending latch + clear ✓ |
 | CpuSuspend/Resume/Enable/Disable | `IopSystemHost` | Nestable ✓ |
-| OnVblankIrqPulse (IRQ 0/11) | `BiosHle.OnVblank` → `IopSystemHost` | Bookkeeping raise when enabled ✓ |
+| OnVblankIrqPulse (IRQ 0/11) | `BiosHle.OnVblank` → `IopSystemHost` | Bookkeeping raise + pending when enabled ✓ |
 | Boot plants VBLANK IRQs | `BiosBootHost.FinishIopServices` | Handlers + EnableIntr for 0/11 ✓ |
-| TIMEMAN clock / SetAlarm | `IopSystemHost.Tick` / `SetAlarm` | Synthetic ✓; no hard-timer table |
+| TIMEMAN clock / SetAlarm | `IopSystemHost.Tick` / `SetAlarm` | Synthetic + hard-timer table ✓ |
 | EE INTC sticky VBlankStart | `Intc` + `Pcrtc` + `EmotionEngine` | Sticky STAT + CpuLatched + hold window ✓ |
 | EXCEPMAN | `IopExcepManHost` | Separate module — do not regress |
 
 ---
 
-## 4. Landed in this agent pass
+## 4. Landed (waves + Phase 2 deepen)
 
 1. **Correct EF bit layout** — was conflating END with bit `0x2`; real END is `0x4`, VBLANK combined is `0x2`.
 2. **Base-handler residual clear** after each edge (matches `FUN_000004b4` / `004fc`).
@@ -83,7 +85,10 @@ IOP IRQs used by VBLANK: `0` = VBLANK, `11` = EVBLANK (`ps2sdk iop_irq_list`).
 5. **Boot-time RegisterIntrHandler(0/11)+EnableIntr** so commercial IOP bring-up matches VBLANK._start.
 6. **`KernelState.SetEventFlag` wakes WaitEventFlag waiters** so IOP producers (vblank pulse) release parkers without requiring the EE syscall path.
 7. **EE INTC sticky VBlankStart smoke** (STAT vs CpuLatched + hold window).
-8. **Smokes:** `BiosHle_IopVblankEventFlag`, `BiosHle_IopVblankRegisterContracts`, `BiosHle_IopSystemIntrAndTime`, `Intc_VBlankStartStickyForPollers`.
+8. **Phase 2 (AGENT-I):** pending latch on Raise/OnVblankIrqPulse; `AcknowledgeIntr` clears; `QueryIntrStatus` + mode/arg/pending/dispatch getters; `Register`/`Release` reject interrupt context; `TryDisableIntr` reports -1 on illegal irq.
+9. **Smokes:** `BiosHle_IopVblankEventFlag`, `BiosHle_IopVblankRegisterContracts`, `BiosHle_IopSystemIntrAndTime` (deepened), `Intc_VBlankStartStickyForPollers`.
+
+**Gate:** INTRMANP / INTRMANI → **OK** (contract HLE + smokes; KE_* from binary + ps2sdk; residual = no R3000 dispatch / no ICR MMIO / no full Ghidra dump).
 
 ---
 
@@ -93,18 +98,16 @@ IOP IRQs used by VBLANK: `0` = VBLANK, `11` = EVBLANK (`ps2sdk iop_irq_list`).
 |------------|-----|
 | Callbacks not R3000-executed | Project does not run BIOS IRX on IOP R3000 yet; flag pulse + register contracts are the waiter path |
 | No auto-free on callback return 0 | Requires real callback return value |
-| TIMEMAN is a synthetic tick, not RTC0–5 hard timers | Full `timrman` table is a separate ROMDIR gap; VBLANK only needs clock advance |
-| INTRMAN RaiseIntr is bookkeeping only | No real IOP exception vector dispatch yet |
+| INTRMAN RaiseIntr is bookkeeping only | No real IOP exception vector dispatch yet; pending latch is the query surface |
 | EE OnVblank fires start+end in one host call | PCRTC is a single edge today; residual after full pulse is END (real hardware separates IRQ 0 and 11 in time) |
 
 ---
 
-## 6. Remaining ROMDIR / IRQ / vblank gaps
+## 6. Remaining ROMDIR / IRQ / vblank gaps (non-blocking)
 
 | Gap | Notes |
 |-----|-------|
-| **Full INTRMAN Ghidra dump** | `INTRMANP.bin` / `INTRMANI.bin` extracted; no `INTRMAN*_ALL.txt` yet — deepen mode-register save sets, multi-intr catch, ctx-switch callbacks when decomp lands |
-| **TIMEMAN / hard timers** | `AllocHardTimer` / compare IRQs not ported; PADMAN uses RTC0/1 on real hardware |
+| **Full INTRMAN Ghidra dump** | `INTRMANP.bin` / `INTRMANI.bin` extracted; no `INTRMAN*_ALL.txt` yet — mode-register save sets, multi-intr catch, ctx-switch callbacks when decomp lands |
 | **IOP IRQ controller MMIO** | Real INTRMAN programs ICR; DetPS2 has no IOP INTC MMIO model |
 | **Callback return-0 unlink** | Needs IOP exec or an explicit HLE “oneshot” register API |
 | **System status event flag bit 0x200** | First start-list dispatch side effect (`iSetEventFlag(GetSystemStatusFlag(), 0x200)`) |
