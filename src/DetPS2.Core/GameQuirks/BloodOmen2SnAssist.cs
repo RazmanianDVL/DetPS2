@@ -58,6 +58,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _cacheFlushSkips = 0;
         _snPrintfStubbed = false;
         _vtCallStubbed = false;
+        _fmtScanStubbed = false;
         _goeTokenEscapes = 0;
     }
 
@@ -441,86 +442,125 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
     private bool _snPrintfStubbed;
     private bool _vtCallStubbed;
+    private bool _fmtScanStubbed;
 
     private int _goeTokenEscapes;
 
     /// <summary>
-    /// Unstick post-KAIN goefile token thrash at <c>0x483040..0x483090</c>.
-    /// After pack KAIN.IMP (PRECODE) full-read @ <c>0xA242A0</c>, EE sticks scanning for
-    /// token <c>0x25</c> in a frame ending at epilogue <c>0x48444C</c>
-    /// (<c>ld ra,704(sp); addiu sp,720</c>). Soft-stub sibling <c>0x482E30</c>; unwind
-    /// the 0x2D0 frame so boot can continue toward CODE/MAINMENU Open.
+    /// Unstick post-KAIN format thrash.
+    /// Entry <c>0x482F60</c> is a 720-byte frame (<c>addiu sp,-720</c> … epilogue
+    /// <c>0x48444C</c> <c>ld ra,704(sp)</c>). Body contains the '%' scan loop at
+    /// <c>0x483040</c> (live thrash when PRECODE was served as KAIN.IMP). Soft-stub the
+    /// leaf after asset I/O so callers (<c>jal 0x482F60</c> @ <c>0x482F40</c>) get a clean
+    /// v0=0 without corrupting $sp. If already mid-frame: manually unwind the 0x2D0 frame
+    /// from a valid $sp (never jump to epilogue with $sp==0 — that zeroed $ra/$sp live).
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
-        uint head = sys.Memory.Read32(0x00482E30);
-        if (head != 0 && head != 0x03E00008u)
+        // Permanent leaf stub once past RKV/entity I/O — prevents re-entry thrash.
+        if (!_fmtScanStubbed && sys.Cdvd.SectorsRead >= 500)
         {
-            sys.Memory.Write32(0x00482E30, 0x03E00008u); // jr ra
-            sys.Memory.Write32(0x00482E34, 0x0000102Du); // daddu v0, zero, zero
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && _goeTokenEscapes == 0)
-                Console.Error.WriteLine("[BO2] soft-stub goefile process @ 0x482E30 (jr ra; v0=0)");
+            uint head = sys.Memory.Read32(0x00482F60);
+            if (head != 0 && head != 0x03E00008u)
+            {
+                sys.Memory.Write32(0x00482F60, 0x03E00008u); // jr ra
+                sys.Memory.Write32(0x00482F64, 0x0000102Du); // daddu v0, zero, zero
+                _fmtScanStubbed = true;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        "[BO2] soft-stub format leaf @ 0x482F60 (jr ra; v0=0)");
+            }
         }
 
-        if (_goeTokenEscapes >= 16) return;
-        if (c - _lastTitleSmCyc < 120_000) return;
+        if (_goeTokenEscapes >= 32) return;
+        if (c - _lastTitleSmCyc < 80_000) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
 
-        bool midFrame = pc is >= 0x00483018 and <= 0x00484474;
+        // Soft-stubbed leaf is two words (jr ra; v0=0). Let it return naturally —
+        // treating PC@entry as "inFmtFrame" re-unwound $sp and parked on exception vectors
+        // (live: rescue 0x482F60 → 0x2B9E28 → vector storm → host exit -1).
+        if (_fmtScanStubbed && pc is >= 0x00482F60 and <= 0x00482F68)
+            return;
+
+        bool inFmtFrame = pc is > 0x00482F68 and <= 0x00484474;
         bool dataThrash = pc is < 0x00120000
-            || (pc is >= 0x00500000 and < 0x02000000);
-        if (!midFrame && !dataThrash) return;
+            || (pc is >= 0x00500000 and < 0x02000000)
+            || (pc is >= 0x00800000 and < 0x02000000);
+        if (!inFmtFrame && !dataThrash) return;
 
-        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-        uint resume = 0;
-        if (midFrame && sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x2D0u)
+        if (inFmtFrame)
         {
-            uint raSlot = sys.Memory.Read32(sp + 0x2C0) & 0x1FFFFFFFu;
-            if (raSlot is >= 0x00200000 and < 0x004A0000
-                && (raSlot < 0x00483018u || raSlot >= 0x00484480u)
-                && IsSafeCodeTarget(sys, raSlot))
+            uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+            if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x2D0u)
             {
-                resume = raSlot;
-                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + 0x2D0 });
+                uint raSlot = sys.Memory.Read32(sp + 0x2C0) & 0x1FFFFFFFu;
+                uint resume = 0;
+                if (raSlot is >= 0x00200000 and < 0x004A0000
+                    && (raSlot < 0x00482F60u || raSlot > 0x00484480u)
+                    && IsSafeCodeTarget(sys, raSlot))
+                {
+                    resume = raSlot;
+                    sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + 0x2D0 });
+                }
+                if (resume != 0)
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                    sys.EE.PC = resume;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    ArmGifPath3(sys);
+                    EnsureMainThreadRunning(sys);
+                    _goeTokenEscapes++;
+                    _titleSmEscapes++;
+                    _lastTitleSmCyc = c;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
+                        Console.Error.WriteLine(
+                            $"[BO2] unwind format frame 0x{pc:X8} -> 0x{resume:X8} " +
+                            $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+                    return;
+                }
             }
         }
-        if (resume == 0)
-        {
-            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            if (IsColdSafeResume(sys, ra) && ra != pc
-                && (ra < 0x00483018u || ra >= 0x00484480u))
-                resume = ra;
-        }
-        if (resume == 0)
-            resume = PickSafeResume(sys, pc);
-        if (resume is >= 0x00483018 and <= 0x00484474)
-            resume = 0;
-        if (resume == 0 || resume == pc || !IsSafeCodeTarget(sys, resume))
-            resume = 0x0048A980;
 
+        // Data thrash / bad SP: prefer $ra / stack / last-good; re-start tid1 if dead.
+        uint resume2 = PickSafeResume(sys, pc);
+        if (resume2 is >= 0x00482F60 and <= 0x00484474)
+            resume2 = 0;
+        if (resume2 == 0 || resume2 == pc || !IsSafeCodeTarget(sys, resume2))
+            resume2 = 0x0048A980;
+        // If $sp was zeroed, give the EE a sane stack near the RPC worker BSS.
+        uint spNow = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (spNow < 0x00100000u || spNow >= (uint)SystemMemory.RDRAM_SIZE)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-        sys.EE.PC = resume;
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume2 });
+        sys.EE.PC = resume2;
         sys.EE.COP0_Status &= ~0x6u;
-        try
-        {
-            foreach (var t in sys.Hle.Kernel.AllThreads)
-            {
-                if (t.Alive && t.Id == 1 && !t.Started)
-                    sys.Hle.Kernel.StartAndMaybeSwitch(sys.EE, 1, switchNow: true, arg: 0, fromSyscall: false);
-            }
-        }
-        catch { /* ignore */ }
         ArmGifPath3(sys);
+        EnsureMainThreadRunning(sys);
         _goeTokenEscapes++;
         _titleSmEscapes++;
         _lastTitleSmCyc = c;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
             Console.Error.WriteLine(
-                $"[BO2] unwind goefile frame 0x{pc:X8} -> 0x{resume:X8} " +
+                $"[BO2] rescue format/data thrash 0x{pc:X8} -> 0x{resume2:X8} " +
                 $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+    }
+
+    private static void EnsureMainThreadRunning(Ps2System sys)
+    {
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (!t.Alive || t.Id != 1) continue;
+                if (!t.Started)
+                    sys.Hle.Kernel.StartAndMaybeSwitch(sys.EE, 1, switchNow: true, arg: 0, fromSyscall: false);
+            }
+        }
+        catch { /* ignore */ }
     }
 
     /// <summary>
@@ -789,9 +829,11 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (addr is >= 0x0035C000 and <= 0x0035E000) return false;
         // 0x2F17xx epilogue delay parks are real code but cold-resume without frame is dead.
         if (addr is >= 0x002F1700 and <= 0x002F1780) return false;
-        // Post-KAIN goefile token-scan frame - cold re-entry re-thrash.
-        if (addr is >= 0x00483018 and <= 0x00484474) return false;
+        // Format leaf / mid-body — only natural $ra after jal 0x482F60 may re-enter.
+        if (addr is >= 0x00482F60 and <= 0x00484474) return false;
         if (addr is >= 0x00482E30 and <= 0x00482E40) return false;
+        // Live vector storm after bad format unwind: stack held 0x2B9E28 mid-utility.
+        if (addr is >= 0x002B9E00 and <= 0x002B9F00) return false;
         return true;
     }
 

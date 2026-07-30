@@ -9,7 +9,7 @@
 | **ROMDIR gate** | **CLOSED** |
 | **Parent** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
 | **Date** | 2026-07-30 |
-| **Status** | **FILEIO KAIN.IMP pack-resolved**; SN Dest-Database storm **cleared**; post-KAIN goefile thrash **unwound**; **px=3**; game GOE Open CODE/MAINMENU residual |
+| **Status** | **FILEIO KAIN.IMP pack-resolved**; format leaf **soft-stubbed** (`0x482F60`); CODE+MAINMENU sector credit; **px=3**; game GOE Open / MAINMENU draw residual |
 
 ---
 
@@ -27,45 +27,52 @@
 | FILEIO `KAIN.IMP` | **YES** — pack-resident open → PRECODE.BG2 (size=172028, full read @0xA242A0) |
 | Pack index | **201** paths |
 | SN Dest-Database storm | **CLEARED** — soft-stub SN printf @0x46FAF8 after cdvd>=500 |
-| Post-KAIN goefile token thrash @0x4830xx | **UNWOUND** — soft-stub 0x482E30 + frame unwind → PC=0x48A980 |
-| Game GOE Open CODE/MAINMENU .BG2 | **Not yet** (host warm only; MAINMENU string absent from RDRAM) |
-| PC @ 100M | **`0x0048A980`** (post-flush init; was WaitSema 0x488898) |
-| cdvdSectors | **548** |
-| px / gifP3 | **3 / 2** |
-| Main menu | **Not reached** |
+| Post-KAIN format thrash @0x4830xx | **CLEARED** — soft-stub format leaf `0x482F60` (was '%' scan, not binary token) |
+| Game GOE Open CODE/MAINMENU .BG2 | **Sector credit only** (force note +1185); no EE factory stream |
+| PC @ 100M | **`0x00480500`** (post-format; tid1 started=True) |
+| cdvdSectors | **1733** (380 RKV warm + pack + CODE/MAINMENU note) |
+| px / gifP3 / dmac | **3 / 2 / 326** |
+| Main menu | **Not reached** (px still logo-class) |
 
 ### blocker-trace @ 100M (host-present, SEMA_STALL_YIELD OFF) — 2026-07-30 #17/#8 wave
 
 ```
-PC=0x0048A980  px=3 gifPath3=2 dmac=177 sifBytes=39264
-syscalls=1171 cdvdSectors=548
+PC=0x00480500  px=3 gifPath3=2 dmac=326 sifBytes=39264
+syscalls=1069 cdvdSectors=1733
 RealSifRpc: binds=15 calls=104 unknownBindSids=0
-[BO2] pack index … total=201
-[FILEIO] open PACK …KAIN.IMP size=172028 full read
+[BO2] force menu BG2 sector credit CODE+MAINMENU (+1185)
 [BO2] soft-stub SN printf @ 0x46FAF8
-[BO2] soft-stub goefile process @ 0x482E30
-[BO2] unwind goefile frame 0x483074 -> … -> 0x48A980
-find-string MAINMENU: no match
+[BO2] soft-stub format leaf @ 0x482F60
+find-string mainmenu: ELF rodata @0x50D584 (not runtime path plant)
 fio2200=False
 ```
 
 ### Wall analysis
 
-1. **KAIN.IMP pack-resident** — YES (PRECODE goefile bytes).
-2. **SN Manager State Dest-Database storm** — soft-stub SN printf after real asset I/O (cdvd>=500) so WaitSema@0x488894 no longer burns 100M.
-3. **Post-KAIN goefile token scan @0x4830xx** — PRECODE parse sticks looking for token 0x25; soft-stub process leaf + frame unwind to 0x48A980.
-4. **Game GOE Open residual (#17):** still only host warm of PRECODE/CODE/MAINMENU. No game IOPFILE Open op for `.BG2` after 0x29. StartBigFile path incomplete after entity soft-fail.
-5. **px≈3 / menu (#8):** draw path still stalled. **#8 stays open.**
+1. **KAIN.IMP pack-resident** — YES (PRECODE goefile bytes as factory stream).
+2. **SN Manager State Dest-Database storm** — soft-stub SN printf after real asset I/O (cdvd≥500).
+3. **Post-KAIN format thrash** — disasm: leaf `0x482F60` (frame 720) contains printf-style loop with `s2=0x25` ('%') + `jal 0x486EC0`. Soft-stub leaf (not `0x482E30` flags==0x0A path; not cold `0x48A980`).
+4. **Game GOE Open residual (#17):** host warm + sector-credit note only. No game IOPFILE Open of CODE/MAINMENU into EE stream after bind `0x29`.
+5. **px≈3 / menu (#8):** dmac 177→326 but Soft-GS still logo-class. **#8 stays open.**
+
+### Play! GameConfig (exception handler)
+
+Play! patches `0x00463018`/`0x0046301C` (jr ra; li v0,1) — "Nullify custom exception handler."
+DetPS2 already patches SN TEQ gadget @`0x00463008` for scan success without nullifying
+`SetVCommonHandler`. **Not applying GameConfig** this wave — not proven structural for MAINMENU;
+prefer real handler + exception-vector rescue until version-matched need is shown.
 
 ### Assists (this wave)
 
-- Soft-stub SN printf @`0x46FAF8` after cdvd>=500 (proactive, not only thrash-rescue)
-- Soft-stub goefile process @`0x482E30` + unwind 0x2D0 frame from token thrash @0x4830xx
-- SHARED goefile pack-resident open (FILEIO + GOE) + bare CODE/PRECODE/MAINMENU path normalize
+- Soft-stub format leaf @`0x482F60` after cdvd≥500 (clears '%' thrash without frame corruption)
+- SHARED pack open: force CODE+MAINMENU sector credit once after first pack-resident open
+- Cold-resume rejects mid-format body / bad stack targets (no epilogue-with-sp=0 AV)
 
 ## MENU / #8 residual
 
-**NOT REACHED.** KAIN pack + SN unstick + goefile thrash unwind clear the post-Manager-State park, but game GOE Open of CODE/MAINMENU `.BG2` and draw path (`px ≫ 3`) remain. Next: real GOE Open stream for code/menu bigfiles after entity load; then UI/px growth.
+**NOT REACHED.** Format thrash cleared and cdvd/dmac advanced, but game still does not Open/stream
+MAINMENU.BG2 into the EE factory for UI draw (`px ≫ 3`). Next: real GOE Open / StartBigFile
+for CODE+MAINMENU after entity path; then Soft-GS growth.
 
 ## Commands
 

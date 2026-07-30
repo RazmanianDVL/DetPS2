@@ -9,7 +9,7 @@
 |-------|--------|-------|------------|----|-------|------|------|-----------------|-------------------------|
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | `0x4275C0` (pad) | 32.4M | **12** | **17** | 198840 | 23 / ~195 | Dense D-pad+CROSS; **"Kombat"**+**"Start"**; PC `0x4148EC`↔`0x4275xx` |
 | **Burnout 3** | SLUS_210.50 | **No** | `0x122A20` | 0 | **380** | **482** | 425 | 13 / **555** | Flip-wait bypass; GTFS SIDs; FILEIO fno=23 soft; gifP3 35→**380**; still IRX-only cdvd |
-| **Blood Omen 2** | SLUS_200.24 | **No** | `0x2CD7E0` | 3 | 2 | 8 | 1649 | 14 / ~64 | WaitSema→`0x46FB88` v0 match; post-match PATH3; MAINMENU.BG2 real; px stuck 3 |
+| **Blood Omen 2** | SLUS_200.24 | **No** | `0x480500` @100M | 3 | 2 | **326** | **1733** | 15 / 104 | Format leaf stub `0x482F60`; pack KAIN + CODE/MAINMENU sector credit; px stuck 3 |
 | **God of War** | SCUS_973.99 | **No** | residual | 0 | 0 | ~33 | 142 | 10 / ~59 | cache-wb + freelist stubs; stream-ready assist; still px=0 |
 
 ## Menu evidence bar
