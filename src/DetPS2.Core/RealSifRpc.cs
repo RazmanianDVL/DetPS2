@@ -333,6 +333,9 @@ public sealed class RealSifRpc
         _fioLastFd = -1;
         _pendingEndFuncs.Clear();
         _dtxChannels.Clear();
+        _mwFileHandles.Clear();
+        _mwFileNextHandle = 1;
+        _mwFileInited = false;
         _nextSlot = 0;
         ResetIopHeap();
         Binds = Calls = RdataOps = FileIoOps = SysmemOps = UnknownServiceCalls = UnknownBindSids = 0;
@@ -645,7 +648,8 @@ public sealed class RealSifRpc
             && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
-            && !IsBurnout3GtfsSid(sid))
+            && !IsBurnout3GtfsSid(sid)
+            && !IsMwFileSid(sid))
         {
             UnknownBindSids++;
             _unknownSidsSeen.Add(sid);
@@ -930,6 +934,14 @@ public sealed class RealSifRpc
             int fioResult = HandleFileIo(mem, iopModules, pad, cdvd, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
             if (recvBuf != 0 && recvSize >= 4)
                 mem.Write32(recvBuf, unchecked((uint)fioResult));
+            // SN ProDG (Midway Deception, BO2): send+4 is eeReply* the EE reads after CallRpc
+            // (sometimes distinct from packet recvBuf). Mirror the int result there.
+            if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 8)
+            {
+                uint eeReply = mem.Read32(argBuf + 4) & 0x1FFFFFFFu;
+                if (eeReply >= 0x100000 && eeReply + 4 <= SystemMemory.RDRAM_SIZE)
+                    mem.Write32(eeReply, unchecked((uint)fioResult));
+            }
             FileIoOps++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine($"[RPC] HandleCall sid=FILEIO fno={rpcNumber} result={fioResult}");
@@ -1010,6 +1022,21 @@ public sealed class RealSifRpc
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
                     $"[RPC] HandleCall sid=GTFS(0x{sid:X8}) fno=0x{rpcNumber:X} result={gr} " +
+                    $"recvBuf=0x{recvBuf:X8} send={sendSize} arg=0x{argBuf:X8}");
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return;
+        }
+
+        // Midway MWFILEFR.IRX (MK: Deception / Deadly Alliance / shared Midway FS).
+        // sids 0x000F0001 (main) + 0x000F0002 (aux fno 0xC8). Bridge to FILEIO/ISO.
+        if (IsMwFileSid(sid))
+        {
+            int mr = HandleMwFile(mem, iopModules, cdvd, sid, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
+            if (recvBuf != 0 && recvSize >= 4)
+                mem.Write32(recvBuf, unchecked((uint)mr));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] HandleCall sid=MWFILE(0x{sid:X8}) fno=0x{rpcNumber:X} result={mr} " +
                     $"recvBuf=0x{recvBuf:X8} send={sendSize} arg=0x{argBuf:X8}");
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
@@ -1102,7 +1129,14 @@ public sealed class RealSifRpc
                 return openRes;
             }
             case FioGetVersion:
-                // Match LOADFILE-style version probe; negative used to abort client init.
+                // SN ProDG / Midway FILEIO clients (MK: Deception, DA, BO2/B3) probe fno=0xFF
+                // and strcmp the 4-byte reply against the post-UDNL IOPRP digits ("3000"/
+                // "2800"/…). Returning the bare LOADFILE 2.0 token 0x00020000 overwrites a
+                // previously correct LOADFILE GetVersion cell and makes sceOpen return
+                // 0xFFFEFFFC forever (live Deci2: "Failed overlay load: <cdrom0:\GAMER.OVL;1>").
+                // Prefer the same post-reboot ASCII tag LOADFILE uses.
+                if (!string.IsNullOrEmpty(_lastIopRpVersionAscii))
+                    return PackAsciiVersion(_lastIopRpVersionAscii);
                 return 0x00020000;
             case FioClose:
             {
@@ -1161,6 +1195,7 @@ public sealed class RealSifRpc
                 // fd omitted — use last open (or word0 if it is a bare ps2sdk packet).
                 DecodeSnFioLseekArgs(mem, argBuf, sendSize, out int fd, out int off, out int whence);
                 int sr = iopModules.FileSeek(fd, off, whence);
+                // SN eeReply* mirror is done in HandleCall for all FILEIO fnos.
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
                         $"[FILEIO] lseek fd={fd} off={off} whence={whence} result={sr} send={sendSize}");
@@ -1489,10 +1524,48 @@ public sealed class RealSifRpc
 
         if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 28)
         {
-            // SN: +20 offset, +24 whence; fd = last open
+            // Two SN ProDG lseek packings exist:
+            //   BO2 (Crystal Dynamics): +20 offset, +24 whence, +16 usually 0
+            //   Midway (Deception SLUS_208.81 @ 0x111600): +16 offset, +20 whence, +24 slot
+            // Live Deception: SEEK_END packs +16=0 +20=2 +24=slot; BO2 SEEK_END is +20=0 +24=2.
             fd = _fioLastFd >= 0 ? _fioLastFd : 0;
-            off = (int)mem.Read32(argBuf + 20);
-            whence = (int)mem.Read32(argBuf + 24);
+            int o16 = (int)mem.Read32(argBuf + 16);
+            int w20 = (int)mem.Read32(argBuf + 20);
+            int w24 = (int)mem.Read32(argBuf + 24);
+            bool w20IsWhence = w20 is >= 0 and <= 2;
+            bool w24IsWhence = w24 is >= 0 and <= 2;
+            bool midway;
+            if (w20IsWhence && !w24IsWhence)
+                midway = true; // slot id > 2 at +24
+            else if (!w20IsWhence && w24IsWhence)
+                midway = false; // large offset at +20, whence at +24
+            else if (w20IsWhence && w24IsWhence)
+            {
+                // Ambiguous small fields. Midway SEEK_END uses whence@+20==2; BO2 SEEK_END
+                // uses offset@+20==0 + whence@+24==2. Midway SEEK_SET uses whence@+20==0
+                // with slot@+24!=0; BO2 SEEK_SET uses whence@+24==0.
+                if (w20 == 2)
+                    midway = true;
+                else if (w24 == 2 && w20 == 0)
+                    midway = false;
+                else if (w20 == 0 && w24 != 0)
+                    midway = true; // Midway SEEK_SET (slot at +24)
+                else
+                    midway = o16 != 0; // non-zero +16 only Midway stores offset there
+            }
+            else
+                midway = false;
+
+            if (midway)
+            {
+                off = o16;
+                whence = w20;
+            }
+            else
+            {
+                off = w20;
+                whence = w24;
+            }
             if (whence < 0 || whence > 2) whence = 0;
             return;
         }
@@ -2253,9 +2326,15 @@ public sealed class RealSifRpc
             case SidB3Aux:
                 return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
 
+            case SidMwFileMain:
+            case SidMwFileAux:
+                return HandleMwFile(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
+
             default:
                 if (IsBurnout3GtfsSid(sid))
                     return HandleGtfs(mem, cdvd, iopModules, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x40);
+                if (IsMwFileSid(sid))
+                    return HandleMwFile(mem, iopModules, cdvd, sid, fno, argBuf, sendSize: 0, recvBuf, recvSize: 4);
                 // Prefer 0 (common IOP "OK") over 1. Callers that treat non-zero as success
                 // still pass with our specialized handlers above; 989snd treats 1 as fail.
                 UnknownServiceCalls++;
@@ -2750,6 +2829,301 @@ public sealed class RealSifRpc
 
     private static bool IsBurnout3GtfsSid(uint sid) =>
         sid == SidGtfsStg || sid == SidB3Aux || sid == 0x53465447u /* "GTFS" fourCC */;
+
+    // -------------------------------------------------------------------------
+    // Midway MWFILEFR.IRX — proprietary FS RPC used by MK: Deception (SLUS_208.81),
+    // MK: Deadly Alliance, and other Midway titles after DNAS300/IOPRP300 GetVersion.
+    //
+    // Ground-truthed from disc MODULES/MWFILEFR.IRX (R3000, MW MIPS C Compiler 2.4.1):
+    //   sceSifRegisterRpc(sd, 0x000F0002, handler@0xA08, buf)  — aux (fno 0xC8 only)
+    //   sceSifRegisterRpc(sd, 0x000F0001, handler@0xA40, buf)  — main jump table fno 0..13
+    // EE client (SLUS_208.81 @ 0x3D6144): CallRpc fno=1 send=20 recv=4  = MWF_RPC_INIT
+    // Real INIT success returns 0 (result cell @ module+0x61C0); EE continues on *recv==0.
+    // Open/read/write/close map onto IOMAN/FILEIO over host/cdrom0/atfile devices.
+    // HLE bridges those to Iso FILEIO so titles leave IRX-only boot and open OVL/assets.
+    // -------------------------------------------------------------------------
+    /// <summary>MWFILEFR.IRX primary service (EE→IOP file commands).</summary>
+    public const uint SidMwFileMain = 0x000F0001;
+    /// <summary>MWFILEFR.IRX auxiliary service (fno 0xC8 buffer-release / reverse path).</summary>
+    public const uint SidMwFileAux = 0x000F0002;
+    /// <summary>EE-side reverse RPC server id (IOP binds to this; not an IOP service).</summary>
+    public const uint SidMwFileEeServer = 0x000F1002;
+
+    private static bool IsMwFileSid(uint sid) =>
+        sid is SidMwFileMain or SidMwFileAux;
+
+    // MWFILE main jump-table fnos (IRX handler @ 0xA40, table @ module+0x5A20).
+    private const uint MwFnoInit = 1;
+    private const uint MwFnoShutdown = 2;
+    private const uint MwFnoClose = 4;
+    private const uint MwFnoOpenPath = 5;   // path @ send+12
+    private const uint MwFnoOpen2 = 6;
+    private const uint MwFnoRead = 7;
+    private const uint MwFnoFlush = 8;
+    private const uint MwFnoWrite = 9;
+    private const uint MwFnoSeek = 10;
+    private const uint MwFnoConfig = 11;
+    private const uint MwFnoNop = 12;
+    private const uint MwFnoStat = 13;
+    private const uint MwFnoAuxRelease = 0xC8; // 200 — aux sid only
+
+    /// <summary>Live MWFILE handles: synthetic id → FILEIO fd.</summary>
+    private readonly Dictionary<int, int> _mwFileHandles = new();
+    private int _mwFileNextHandle = 1;
+    private bool _mwFileInited;
+
+    /// <summary>
+    /// Midway MWFILEFR RPC HLE. Prefer shared FILEIO/ISO over title-local PC patches.
+    /// Returns the 4-byte result word the EE client reads from recv (INIT/CLOSE: 0 = ok;
+    /// OPEN: non-zero handle; READ/WRITE: byte count or 0; errors: negative).
+    /// </summary>
+    private int HandleMwFile(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+    {
+        _ = cdvd; _ = recvBuf; _ = recvSize;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+
+        if (trace && argBuf != 0 && sendSize > 0)
+        {
+            uint n = Math.Min(sendSize, 64u);
+            var sb = new System.Text.StringBuilder(160);
+            sb.Append($"[MWFILE] sid=0x{sid:X8} fno=0x{fno:X} send={sendSize}:");
+            for (uint o = 0; o + 4 <= n; o += 4)
+                sb.Append($" {mem.Read32(argBuf + o):X8}");
+            // Path probes at common offsets.
+            foreach (uint off in new uint[] { 0, 4, 8, 12, 16 })
+            {
+                if (off + 4 > sendSize) break;
+                string p = ReadCString(mem, argBuf + off, 96);
+                if (LooksLikeFsPath(p) || (p.Length > 2 && p.IndexOf('.') >= 0))
+                    sb.Append($" +{off}=\"{p}\"");
+                uint maybePtr = mem.Read32(argBuf + off);
+                if (maybePtr >= 0x00100000 && maybePtr < SystemMemory.RDRAM_SIZE)
+                {
+                    string pp = ReadCString(mem, maybePtr, 96);
+                    if (LooksLikeFsPath(pp) || (pp.Length > 2 && pp.IndexOf('.') >= 0))
+                        sb.Append($" *+{off}=\"{pp}\"");
+                }
+            }
+            Console.Error.WriteLine(sb.ToString());
+        }
+
+        // Aux sid: only fno 0xC8 is special (IRX 0xA08); everything else returns OK buffer.
+        if (sid == SidMwFileAux)
+        {
+            // Real handler: if fno==200, call release with *buf; always returns result-cell ptr.
+            // Soft-success 0 is the EE expectation (Deci2-style done).
+            return 0;
+        }
+
+        switch (fno)
+        {
+            case MwFnoInit:
+                // Real IRX: allocate command/file pools from send (20B config), set inited=1,
+                // return 0. EE (0x3D618C) continues when *recv==0.
+                _mwFileInited = true;
+                return 0;
+
+            case MwFnoShutdown:
+                foreach (var fd in _mwFileHandles.Values)
+                {
+                    try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                }
+                _mwFileHandles.Clear();
+                _mwFileInited = false;
+                return 0;
+
+            case MwFnoClose:
+            {
+                // EE fno=4: send=4, *send = handle (or IOP object ptr we minted).
+                int handle = argBuf != 0 && sendSize >= 4 ? (int)mem.Read32(argBuf) : 0;
+                if (_mwFileHandles.TryGetValue(handle, out int fd))
+                {
+                    iopModules.FileClose(fd);
+                    _mwFileHandles.Remove(handle);
+                }
+                return 0;
+            }
+
+            case MwFnoOpenPath:
+            case MwFnoOpen2:
+            {
+                // IRX fno5: path inline at +12; fno6: alternate layout.
+                // Also accept EE pointer-at-+0 / +4 path forms used by async open packers.
+                if (!_mwFileInited)
+                    _mwFileInited = true; // tolerate open-before-init
+                string path = MwFileExtractPath(mem, argBuf, sendSize);
+                if (string.IsNullOrEmpty(path))
+                {
+                    if (trace) Console.Error.WriteLine("[MWFILE] open: empty path");
+                    return 0; // fail as null handle (EE checks non-zero)
+                }
+                path = MwFileNormalizePath(path);
+                int mode = 1; // O_RDONLY default
+                if (argBuf != 0 && sendSize >= 8)
+                {
+                    uint m = mem.Read32(argBuf + 4);
+                    if (m <= 3) mode = (int)m;
+                }
+                int fd = iopModules.FileOpen(path, mode);
+                if (fd < 0)
+                {
+                    // Retry without device prefix and with cdrom0:
+                    string leaf = path;
+                    int colon = leaf.IndexOf(':');
+                    if (colon >= 0) leaf = leaf[(colon + 1)..].TrimStart('\\', '/');
+                    fd = iopModules.FileOpen("cdrom0:\\" + leaf, mode);
+                    if (fd < 0) fd = iopModules.FileOpen(leaf, mode);
+                }
+                if (fd < 0)
+                {
+                    if (trace) Console.Error.WriteLine($"[MWFILE] open FAIL path=\"{path}\"");
+                    return 0;
+                }
+                int handle = _mwFileNextHandle++;
+                _mwFileHandles[handle] = fd;
+                if (trace)
+                    Console.Error.WriteLine($"[MWFILE] open OK path=\"{path}\" handle={handle} fd={fd}");
+                return handle;
+            }
+
+            case MwFnoRead:
+            case MwFnoWrite:
+            {
+                // Layout (IRX fno7/9): +0 handle-ish, +4 eeBuf, +8 size, +12 more.
+                // EE also packs complex async command blobs; probe for handle+ptr+size.
+                if (argBuf == 0 || sendSize < 12)
+                    return 0;
+                int handle = (int)mem.Read32(argBuf);
+                uint eeBuf = mem.Read32(argBuf + 4);
+                int size = (int)mem.Read32(argBuf + 8);
+                // Alternate: handle at +0, size at +4, eeBuf at +8
+                if (size <= 0 || size > 0x800000 || eeBuf < 0x100000)
+                {
+                    int size2 = (int)mem.Read32(argBuf + 4);
+                    uint ee2 = mem.Read32(argBuf + 8);
+                    if (size2 > 0 && size2 <= 0x800000 && ee2 >= 0x100000)
+                    {
+                        size = size2;
+                        eeBuf = ee2;
+                    }
+                }
+                if (!_mwFileHandles.TryGetValue(handle, out int fd))
+                {
+                    // Handle might be raw FILEIO fd if open returned fd directly in older path.
+                    if (handle > 0 && handle < 256)
+                        fd = handle;
+                    else
+                        return 0;
+                }
+                if (size <= 0) return 0;
+                if (fno == MwFnoRead)
+                {
+                    int got = iopModules.FileRead(mem, fd, eeBuf, (uint)Math.Min(size, 0x100000));
+                    if (trace)
+                        Console.Error.WriteLine(
+                            $"[MWFILE] read handle={handle} fd={fd} ee=0x{eeBuf:X8} size={size} got={got}");
+                    return got;
+                }
+                else
+                {
+                    int put = iopModules.FileWrite(mem, fd, eeBuf, (uint)Math.Min(size, 0x100000));
+                    if (trace)
+                        Console.Error.WriteLine(
+                            $"[MWFILE] write handle={handle} fd={fd} ee=0x{eeBuf:X8} size={size} put={put}");
+                    return put;
+                }
+            }
+
+            case MwFnoFlush:
+            case MwFnoNop:
+            case MwFnoConfig:
+            case MwFnoAuxRelease:
+                return 0;
+
+            case MwFnoSeek:
+            {
+                if (argBuf == 0 || sendSize < 8) return 0;
+                int handle = (int)mem.Read32(argBuf);
+                int off = (int)mem.Read32(argBuf + 4);
+                int whence = sendSize >= 12 ? (int)mem.Read32(argBuf + 8) : 0;
+                if (!_mwFileHandles.TryGetValue(handle, out int fd))
+                    return -1;
+                return iopModules.FileSeek(fd, off, whence);
+            }
+
+            case MwFnoStat:
+            {
+                // Prefer path at +12; try getstat via a scratch io_stat_t in high RDRAM.
+                string path = MwFileExtractPath(mem, argBuf, sendSize);
+                if (string.IsNullOrEmpty(path)) return 0;
+                path = MwFileNormalizePath(path);
+                const uint scratch = 0x01FE8000;
+                int rc = iopModules.FileGetStat(mem, path, scratch);
+                if (rc < 0) return 0;
+                // io_stat_t size often at +8 (ps2sdk); return non-zero success token.
+                uint stSize = mem.Read32(scratch + 8);
+                return stSize > 0 ? (int)stSize : 1;
+            }
+
+            default:
+                // IRX invalid fno (0, 3, >13) returns -1; soft-success 0 is safer for probes.
+                if (fno is 0 or 3)
+                    return -1;
+                return 0;
+        }
+    }
+
+    private static string MwFileExtractPath(SystemMemory mem, uint argBuf, uint sendSize)
+    {
+        if (argBuf == 0) return "";
+        // Inline path at +12 (IRX fno5).
+        if (sendSize >= 16)
+        {
+            string p = ReadCString(mem, argBuf + 12, 240);
+            if (LooksLikeFsPath(p) || (p.Length > 0 && p.IndexOf('.') >= 0))
+                return p;
+        }
+        // Inline at +0
+        if (sendSize >= 4)
+        {
+            string p = ReadCString(mem, argBuf, Math.Min((int)sendSize, 240));
+            if (LooksLikeFsPath(p) || (p.Length > 2 && p.IndexOf('.') >= 0 && p.IndexOf('\0') < 0))
+                return p;
+        }
+        // Pointer forms at +0 / +4 / +8
+        foreach (uint off in new uint[] { 0, 4, 8, 12 })
+        {
+            if (off + 4 > sendSize) break;
+            uint ptr = mem.Read32(argBuf + off);
+            if (ptr < 0x00100000 || ptr >= SystemMemory.RDRAM_SIZE) continue;
+            string p = ReadCString(mem, ptr, 240);
+            if (LooksLikeFsPath(p) || (p.Length > 2 && p.IndexOf('.') >= 0))
+                return p;
+        }
+        return "";
+    }
+
+    private static string MwFileNormalizePath(string path)
+    {
+        path = path.Trim().Replace('/', '\\');
+        // host0: / atfile: → still try as-is; FILEIO host maps cdrom.
+        if (path.StartsWith("host0:", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("host:", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("atfile:", StringComparison.OrdinalIgnoreCase))
+        {
+            int c = path.IndexOf(':');
+            string rest = c >= 0 ? path[(c + 1)..].TrimStart('\\', '/') : path;
+            return "cdrom0:\\" + rest;
+        }
+        if (path.StartsWith("cdrom0:", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("cdrom:", StringComparison.OrdinalIgnoreCase))
+            return path;
+        // Bare relative → cdrom0
+        if (path.Length > 0 && path.IndexOf(':') < 0)
+            return "cdrom0:\\" + path.TrimStart('\\', '/');
+        return path;
+    }
 
     private static int HandleDbcMan(SystemMemory mem, uint fno, uint argBuf, uint recvBuf)
     {
