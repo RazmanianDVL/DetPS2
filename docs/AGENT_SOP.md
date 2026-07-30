@@ -119,8 +119,12 @@ Scoreboard **heuristic** (`NEAR?` / `GS?`) is **not** a claim. Claims need issue
 | Doc | Role |
 |-----|------|
 | `docs/PLAY_HLE_ORACLE.md` | Play! module map |
+| `docs/TOOLING.md` | Master tooling / budgets / oracles index |
+| `docs/AGENT_PROMPT_TEMPLATE.md` | Copy-paste commercial subagent prompt |
 | `docs/bios-ports/BIOS_COMPLETION_PLAN.md` | BIOS G0 (done) |
 | `docs/title-ports/SCOREBOARD.md` | Last scoreboard run output |
 | `tools/scoreboard.ps1` | Multi-title metrics |
 | `tools/run-title.ps1` | Single-title budgets |
 | `tools/play-lookup.ps1` | GameConfig + wall map |
+| `tools/media-map.ps1` | Media JSON inventory |
+| `tools/clean-traces.ps1` | Archive root-level trace noise |

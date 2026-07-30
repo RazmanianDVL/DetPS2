@@ -5,6 +5,10 @@ every subsystem, the HLE/interrupt architecture, and (§7) the `GameQuirks` SDK 
 per-title fixes without touching shared core files. This document is the process/rules layer on
 top of that.
 
+**Commercial bring-up agents/operators:** start with [`docs/AGENT_SOP.md`](docs/AGENT_SOP.md) and
+[`tools/README.md`](tools/README.md) (prompt template + tooling index: `docs/AGENT_PROMPT_TEMPLATE.md`,
+`docs/TOOLING.md`).
+
 ## Principles
 
 1. **Determinism first** — no host clocks in core or save paths (`FLOAT_POLICY.md`).
