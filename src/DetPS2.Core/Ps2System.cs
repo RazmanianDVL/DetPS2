@@ -442,6 +442,7 @@ public sealed class Ps2System
                     (>= 0x0015F2C0UL and <= 0x0015FA80UL)
                     or (>= 0x001312C0UL and <= 0x001312F0UL)  // link-search thrash
                     or (>= 0x00293C00UL and <= 0x00293C80UL)  // WaitSema empty SIF poll
+                    or (>= 0x00294800UL and <= 0x002948A0UL)  // SIF-cmd poll caller (loops WaitSema)
                     or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
                     or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC

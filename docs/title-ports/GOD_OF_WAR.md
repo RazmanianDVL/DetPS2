@@ -10,8 +10,20 @@
 | **Media config** | `user-media-god-of-war.json` |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | CDVD 142; RPC 16/443; dmac=463 sif=95k; tick-wait + free-search escaped; still `px=0` |
+| **Status** | CDVD 142; RPC 16/443; dmac=463 sif=95k; tick-wait + free-search escaped; still `px=0` / `gifPath3=0` |
 | **Last updated** | 2026-07-30 |
+
+### Bring-up note (agent 2026-07-30)
+
+- **Diagnose wall** `PC=0x2849C4` is soft-float decode prologue (jal `0x284618`), not a list hang.
+  Band `0x2847xx` is IEEE754 mantissa rotate — PcProfiler heat is expected. Removing the
+  residual `TryEscapeListCompareWalk` force-exit **regressed** dmac 463→5; keep until a
+  soft-float-aware gate exists.
+- **Claim residual** `PC=0x293C68` = WaitSema trampoline (syscall 0x44); worker empty SIF-cmd
+  poll at `0x294810`. Main often `started=False` at 100M.
+- **Hot secondary** flag countdown `0x17A32C` (`*0x29C7D0==1`) and freelist `0x23A978`.
+- **Play!** GameConfig: no SCUS_973.99 entry. Walls FILEIO/LOADFILE/SIF → generic IOP HLE.
+- **First real GS: No** (px=0). Gate is first Soft-GS px>0 non-black, not MK MAINMENU.
 
 ---
 

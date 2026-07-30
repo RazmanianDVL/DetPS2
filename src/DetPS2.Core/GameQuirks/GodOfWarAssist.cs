@@ -604,9 +604,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Sorted list compare / merge walk at 0x2847xx (live profiler #2 after exception
-    /// vector). Advances <c>a1</c>/<c>t0</c> via <c>lw *,4(*)</c> until equal. When either
-    /// cursor is null/OOB the loop never hits the done branch at 0x2848AC.
+    /// Band 0x2847xx is primarily soft-float compare/normalize (disasm 2026-07-30:
+    /// 0x284618 decodes IEEE754 doubles; 0x2847D0 is mantissa rotate — PcProfiler heat is
+    /// expected soft-float cost, not a list thrash). Residual force-exit on OOB a1/t0 or
+    /// periodic post-CDVD still required: full removal regressed dmac 463→5 (claim 100M).
     /// </summary>
     private void TryEscapeListCompareWalk(Ps2System sys, uint pc, ulong c)
     {
@@ -1263,28 +1264,42 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"[GOW] re-home residual pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
-        // Dormant main after list escapes (live w2: started=False). Main only —
+        // Dormant main after list escapes (live claim: started=False while worker id=2
+        // spins WaitSema empty SIF poll at 0x293C68 / 0x294810). Main only —
         // peer re-start historically left garbage WaitSemaIds (menu17).
-        // Gate on CDVD alone — flag-set may never fire once list stub is planted.
+        // Gate on CDVD alone. switchNow when EE is on WaitSema trampoline so we leave the
+        // empty-SIF worker; otherwise re-start without steal.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
-            && (_worldKickPulses % 8) == 0)
+            && (_worldKickPulses % 4) == 0)
         {
             var kk = sys.Hle?.Kernel;
             if (kk != null)
             {
+                bool onWaitSemaTrampoline = pc is >= 0x00293C00 and <= 0x00293C80
+                    || pc is >= 0x00294800 and <= 0x00294890;
                 foreach (var t in kk.AllThreads)
                 {
-                    if (t.Id != 1 || !t.Alive || t.Started || t.Entry == 0) continue;
+                    if (t.Id != 1 || !t.Alive || t.Entry == 0) continue;
                     if (t.Entry is < 0x00100000 or >= 0x00300000) continue;
-                    try
+                    if (!t.Started)
                     {
-                        kk.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false);
-                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                            && _worldKickPulses <= 48)
-                            Console.Error.WriteLine(
-                                $"[GOW] re-start dormant main entry=0x{t.Entry:X8} cyc={c}");
+                        try
+                        {
+                            kk.StartAndMaybeSwitch(sys.EE, t.Id,
+                                switchNow: onWaitSemaTrampoline, arg: 0, fromSyscall: false);
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                                && _worldKickPulses <= 64)
+                                Console.Error.WriteLine(
+                                    $"[GOW] re-start dormant main entry=0x{t.Entry:X8} " +
+                                    $"switch={onWaitSemaTrampoline} cyc={c}");
+                        }
+                        catch { /* ignore */ }
                     }
-                    catch { /* ignore */ }
+                    else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank
+                             && onWaitSemaTrampoline)
+                    {
+                        try { kk.WakeupThread(t.Id); } catch { /* ignore */ }
+                    }
                 }
             }
         }
