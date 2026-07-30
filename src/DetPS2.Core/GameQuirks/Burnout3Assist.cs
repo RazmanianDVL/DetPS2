@@ -136,6 +136,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _stageAssetsPlanted = false;
         _stageHedEeAddr = 0;
         _stageHedSize = 0;
+        _postTxdEscapes = 0;
+        _lastPostTxdEscapeCyc = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -218,9 +220,17 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // Plant STAGEHED only after residual LGDEV CallRpc has stabilized (menu4/final10:
         // residual ~48× at sp@FC10 then STG). Planting mid-residual (escapes≪48) or at
         // force-cycle disturbed frames and left cdvd plant-only (609) without STG bind.
-        if (_lgDevFullyDone && sys.MasterCycles >= 30_000_000 && _lgDevEscapes >= 48
+        // Wave-7: also plant once STG+full Global.txd already advanced cdvd (≫2000) even
+        // if residual n stayed short (preferIopRp=OFF force@pristine residual n=2–3).
+        if (_lgDevFullyDone && sys.MasterCycles >= 30_000_000
+            && (_lgDevEscapes >= 48 || sys.Cdvd.SectorsRead >= 2000)
             && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
+
+        // Post full-TXD presentation: leave kernel MMIO thrash (0x10FBB0) so workers can
+        // issue FRONTEND.TXD fno=3/5. Does not touch residual force timing / STG bind.
+        if (_lgDevFullyDone && sys.Cdvd.SectorsRead >= 2000 && sys.MasterCycles >= 72_000_000)
+            MaybeEscapePostTxdHang(sys);
 
         if (sys.MasterCycles < 16_000_000) return;
         if (sys.Gif.Path3Transfers < 4) return;
@@ -860,6 +870,105 @@ public sealed class Burnout3Assist : IGameQuirkModule
     }
 
     private int _deadEpiLeaves;
+    private int _postTxdEscapes;
+    private ulong _lastPostTxdEscapeCyc;
+
+    /// <summary>
+    /// After STG + full Global.txd (cdvd≥2000), live wave-7 parks in the SIF transfer
+    /// byte-copy at <c>0x10FB80..0x10FBCC</c> (disasm: <c>lbu/sb</c> loop with
+    /// <c>*(a3+4)</c> size and <c>*(a3+12)|0x20000000</c> dest) when size/dest are
+    /// garbage → UnknownMmioRead flood. Exit the real loop epilogue at <c>0x10FD9C</c>
+    /// so CallRpc/DBC peers can resume and open FRONTEND via SHARED GTFS.
+    /// Never rewrites residual LGDEV force cadence.
+    /// </summary>
+    private void MaybeEscapePostTxdHang(Ps2System sys)
+    {
+        if (_postTxdEscapes >= 256) return;
+        if (sys.MasterCycles - _lastPostTxdEscapeCyc < 40_000) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // SIF DMA copy body (0x10FB30 first path + 0x10FB80 second path).
+        bool sifCopy = pc is (>= 0x0010FB30 and <= 0x0010FB7C)
+            or (>= 0x0010FB80 and <= 0x0010FBD0);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        bool waitOnWorker = pc is >= 0x0010BE60 and <= 0x0010BE70
+                            && ra is >= 0x00242A40 and <= 0x00242B80;
+
+        if (!sifCopy && !waitOnWorker) return;
+
+        // Only break absurd SIF copies (huge size or dest outside RDRAM).
+        if (sifCopy)
+        {
+            uint a3 = (uint)(sys.EE.GetGpr(7).Lo & 0x1FFFFFFFUL);
+            uint size = 0, dest = 0;
+            if (a3 is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16)
+            {
+                size = sys.Memory.Read32(a3 + 4);
+                dest = sys.Memory.Read32(a3 + 12);
+            }
+            uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
+            bool absurd = size > 0x00040000 || a2 > 0x00040000
+                          || (dest != 0 && (dest & 0x1FFFFFFFu) >= 0x02000000u)
+                          || (dest & 0x1FFFFFFFu) is > 0 and < 0x00010000u;
+            if (!absurd && size != 0 && size <= 0x10000 && a2 < size)
+                return; // let a sane small copy finish
+
+            _lastPostTxdEscapeCyc = sys.MasterCycles;
+            _postTxdEscapes++;
+
+            // Clamp size so blez paths would also leave; then jump loop exit.
+            if (a3 is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16)
+            {
+                sys.Memory.Write32(a3 + 0, 0);
+                sys.Memory.Write32(a3 + 4, 0);
+            }
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0 }); // v1
+            sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2 cursor
+            sys.EE.PC = 0x0010FD9C; // post-copy continue (disasm beq → 0x10FD9C)
+            sys.EE.COP0_Status &= ~0x6u;
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_postTxdEscapes <= 16 || _postTxdEscapes % 16 == 0))
+                Console.Error.WriteLine(
+                    $"[B3] post-TXD SIF-copy exit pc=0x{pc:X8} a3=0x{a3:X8} size={size} " +
+                    $"dest=0x{dest:X8} a2={a2} -> 0x10FD9C n={_postTxdEscapes} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // WaitSema worker path — pulse high waiters only (no PC rewrite).
+        _lastPostTxdEscapeCyc = sys.MasterCycles;
+        _postTxdEscapes++;
+        var k = sys.Hle?.Kernel;
+        if (k != null)
+        {
+            foreach (var t in k.AllThreads)
+            {
+                if (!t.Alive || !t.Sleeping) continue;
+                if (t.WaitSemaId >= 32)
+                {
+                    try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                }
+            }
+        }
+
+        try
+        {
+            uint buttons = (_postTxdEscapes % 4) < 2
+                ? (uint)PadInput.Button.Start
+                : (uint)PadInput.Button.Cross;
+            sys.Pad.SetButtons(buttons);
+            _padInjectPulses++;
+        }
+        catch { /* ignore */ }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_postTxdEscapes <= 12 || _postTxdEscapes % 16 == 0))
+            Console.Error.WriteLine(
+                $"[B3] post-TXD worker WaitSema pulse ra=0x{ra:X8} n={_postTxdEscapes} " +
+                $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+    }
 
     /// <summary>
     /// Function epilogue park at <c>0x219C74..0x219C84</c> (jr ra / sp+=48) after empty
