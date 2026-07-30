@@ -2462,6 +2462,29 @@ public sealed class RealSifRpc
         int openedFd = TryGtfsPathOpenOrRead(mem, iopModules, cdvd, fno, argBuf, sendSize,
             recvBuf, recvSize, out openedSize);
 
+        // fno=4 (live B3 thrash after Global open): close / status. Soft-OK with cursor
+        // so EE does not spin fno=3↔4 without advancing; do not DMA.
+        if (fno == 4)
+        {
+            uint sz4 = openedSize != 0 ? openedSize
+                : (_gtfsLastPathSize != 0 ? _gtfsLastPathSize
+                    : (_gtfsFrontendSize != 0 ? _gtfsFrontendSize : _gtfsStageHedSize));
+            uint h4 = openedFd >= 0 ? (uint)(1 + (openedFd & 0xFF))
+                : (_gtfsLastPathFd >= 0 ? (uint)(1 + (_gtfsLastPathFd & 0xFF)) : 1u);
+            if (recvBuf != 0)
+            {
+                uint limit = recvSize > 0 ? Math.Min(recvSize, 0x40u) : 0x20u;
+                for (uint o = 0; o + 4 <= limit; o += 4)
+                    mem.Write32(recvBuf + o, 0);
+                mem.Write32(recvBuf, 0);
+                if (limit >= 8) mem.Write32(recvBuf + 4, h4);
+                if (limit >= 12) mem.Write32(recvBuf + 8, sz4);
+                if (limit >= 16) mem.Write32(recvBuf + 12, _gtfsReadOffset);
+                if (limit >= 20) mem.Write32(recvBuf + 16, _gtfsTotalDmaBytes);
+            }
+            return 0;
+        }
+
         // fno=5 multi-layout / multi-chunk full TXD (wave-1 256KiB + w0==0 gate blocked live B3).
         uint dmaBytes = 0;
         if (fno == 5 && argBuf != 0 && sendSize >= 8)
@@ -2816,31 +2839,52 @@ public sealed class RealSifRpc
         uint fsz = 0;
         if (iopModules.TryGetOpenFileSize(fd, out fsz) && fsz > 0)
         {
+            // Same path re-open keeps multi-chunk cursor (FRONTEND multi-call stream).
+            bool same = _gtfsLastPathFd == fd && _gtfsLastPathSize == fsz;
             openedSize = fsz;
             _gtfsLastPathFd = fd;
             _gtfsLastPathSize = fsz;
-            _gtfsReadOffset = 0; // new open restarts multi-chunk cursor
-            _gtfsTotalDmaBytes = 0;
-            cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 2048));
+            if (!same)
+            {
+                _gtfsReadOffset = 0;
+                _gtfsTotalDmaBytes = 0;
+            }
+            // Track FRONTEND / STAGEHED by name so fno=5 can fall back correctly.
+            string upPath = (resolved.Length > 0 ? resolved : path).ToUpperInvariant();
+            if (upPath.Contains("FRONTEND") && (_gtfsFrontendFd < 0 || _gtfsFrontendSize != fsz))
+            {
+                _gtfsFrontendFd = fd;
+                _gtfsFrontendSize = fsz;
+            }
+            if (upPath.Contains("STAGEHED") && (_gtfsStageHedFd < 0 || _gtfsStageHedSize != fsz))
+            {
+                _gtfsStageHedFd = fd;
+                _gtfsStageHedSize = fsz;
+            }
+            // Credit open once per new path (DMA credits separately).
+            if (!same)
+                cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 2048));
         }
 
         if (dest != 0 && size != 0 && dest < (uint)SystemMemory.RDRAM_SIZE)
         {
             uint want = Math.Min(size, fsz != 0 ? fsz : size);
             want = Math.Min(want, (uint)SystemMemory.RDRAM_SIZE - dest);
-            want = Math.Min(want, 4u * 1024 * 1024);
-            if (iopModules.TryReadOpenFileBytes(fd, 0, (int)want, out byte[]? data) && data != null)
+            // FRONTEND.TXD is multi-MB — allow full remaining via multi-chunk helper.
+            uint total = GtfsDmaChunks(mem, cdvd, iopModules, fd, dest, 0, want);
+            if (total > 0)
             {
-                for (int i = 0; i < data.Length; i++)
-                    mem.Write8(dest + (uint)i, data[i]);
+                _gtfsLastDmaDest = dest;
+                _gtfsReadOffset = total;
+                _gtfsTotalDmaBytes += total;
                 if (recvBuf != 0 && recvSize >= 8)
                 {
                     mem.Write32(recvBuf, 0);
-                    mem.Write32(recvBuf + 4, (uint)data.Length);
+                    mem.Write32(recvBuf + 4, total);
                 }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[GTFS] read path=\"{path}\" -> 0x{dest:X8} n={data.Length} fno=0x{fno:X}");
+                        $"[GTFS] read path=\"{path}\" -> 0x{dest:X8} n={total} fno=0x{fno:X}");
             }
         }
         else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
