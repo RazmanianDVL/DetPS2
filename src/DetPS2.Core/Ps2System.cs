@@ -432,7 +432,18 @@ public sealed class Ps2System
                 bool criHot = pcPhys is (>= 0x0041D0C0UL and <= 0x0041D1E4UL)
                     or (>= 0x00417F80UL and <= 0x00418020UL)
                     or (>= 0x01FD4000UL and < 0x01FD4080UL);
-                ulong slice = criHot ? sliceCri : sliceDefault;
+                // God of War: list/flag/object-init/exception thrash bands need tight slices
+                // so GodOfWarAssist soft escapes fire before 50k-cycle windows burn out.
+                bool gowHot = ActiveQuirk is GodOfWarAssist && pcPhys is
+                    (>= 0x0015F2C0UL and <= 0x0015FA80UL)
+                    or (>= 0x00183880UL and <= 0x001838D0UL)
+                    or (>= 0x0017A320UL and <= 0x0017A360UL)
+                    or (>= 0x00233AD0UL and <= 0x00233B44UL)
+                    or (>= 0x00284780UL and <= 0x002848B0UL)
+                    or (>= 0x0021FF00UL and <= 0x00220600UL)
+                    or (>= 0x0013DED0UL and <= 0x0013DEF8UL)
+                    or (>= 0x80000180UL and <= 0x80000200UL);
+                ulong slice = (criHot || gowHot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never
                 // reached). One-shot kick of only thread 2 left ADX (entry 0x4147F8) and every
