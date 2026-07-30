@@ -61,9 +61,9 @@
 | XLOADFILE / XFILEIO / NCDVDMAN / XPADMAN / XSIO2MAN / … | Aliases / X paths share primary HLE (`IopExtendedBiosHost`) | **OK** (alias) |
 | MCMAN / MCSERV | MCSERV.md full RPC + dual-format FAT (PS1/PS2) | MCSERV **OK**, MCMAN **OK** |
 | LIBSD | LIBSD.md · IopLibSdHost (sceSdInit/param/key-on) | **OK** (core; mixer residual in LIBSD.md) |
-| SECRMAN | Secr*BootFile passthrough; no MagicGate crypto | **PARTIAL** |
+| SECRMAN | Secr*BootFile plain ELF OK; encrypted clear fail; no MagicGate crypto | **PARTIAL** |
 | CLEARSPU | Spu2 soft-reset on boot + UDNL handoff | **OK** |
-| UDNL | IOPRP version + module re-register (not full image unpack) | **PARTIAL** |
+| UDNL | IOPRP/DNAS ROMDIR+IOPBTCONF apply + LoadIrx + version (see UDNL.md) | **OK** |
 | ADDDRV / RMRESET / XMTAPMAN | Name + related hosts | **PARTIAL** |
 
 Full 101-entry map: **ROMDIR_FULL_AUDIT.md**.

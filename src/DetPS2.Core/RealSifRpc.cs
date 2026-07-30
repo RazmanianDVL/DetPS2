@@ -2148,12 +2148,13 @@ public sealed class RealSifRpc
             case LfMgModLoad:
             {
                 // struct _lf_module_load_arg { union{arg_len,result} p; int modres; char path[252]; char args[252]; }
-                // decomp FUN_00000150 / FUN_000001fc
+                // decomp FUN_00000150 / FUN_000001fc (MG shares path load; SecrDiskBootFile when bytes present)
                 string path = argBuf != 0 ? ReadCString(mem, argBuf + 8, LfPathMax) : "";
-                result = LoadModuleByPath(mem, iopModules, cdvd, path, out modres);
+                bool mg = fno == LfMgModLoad;
+                result = LoadModuleByPath(mem, iopModules, cdvd, path, out modres, magicGate: mg);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[LOADFILE] MOD_LOAD path=\"{path}\" result={result} modres={modres}");
+                        $"[LOADFILE] {(mg ? "MG_MOD_LOAD" : "MOD_LOAD")} path=\"{path}\" result={result} modres={modres}");
                 break;
             }
             case LfElfLoad:
@@ -2162,11 +2163,13 @@ public sealed class RealSifRpc
                 // struct _lf_elf_load_arg { u32 epc; u32 gp; char path[252]; char secname[252]; }
                 // decomp FUN_00000240 / FUN_000002fc — success fills epc/gp; open fail → -203;
                 // load fail → epc=0 so client returns -SCE_ELOADMISS.
+                // MG_ELF_LOAD (FUN_000002fc) shares plain path when payload is ELF; encrypted → miss.
                 elfReply = true;
                 string path = argBuf != 0 ? ReadCString(mem, argBuf + 8, LfPathMax) : "";
                 // secname at +8+252 = +260; used by encrypted/part loaders — HLE treats "all"/empty same.
                 string secname = argBuf != 0 ? ReadCString(mem, argBuf + 8 + (uint)LfPathMax, LfArgMax) : "";
-                result = LoadElfByPath(mem, iopModules, path, secname, out epc, out gp);
+                bool mgElf = fno == LfMgElfLoad;
+                result = LoadElfByPath(mem, iopModules, path, secname, out epc, out gp, magicGate: mgElf);
                 if (result >= 0)
                 {
                     // Success: epc/gp are the payload (decomp DAT_00001e80/1e84); result word is epc.
@@ -2289,10 +2292,15 @@ public sealed class RealSifRpc
         }
     }
 
-    /// <summary>LF_F_MOD_LOAD / LF_F_MG_MOD_LOAD path load (decomp FUN_00000150).</summary>
-    private int LoadModuleByPath(SystemMemory mem, IopModuleHost iopModules, Cdvd? cdvd, string path, out int modres)
+    /// <summary>
+    /// LF_F_MOD_LOAD / LF_F_MG_MOD_LOAD path load (decomp FUN_00000150 / FUN_000001fc).
+    /// MG shares the plain path loader; when disc bytes are present SECRMAN classifies
+    /// plain ELF vs encrypted (encrypted → clear <see cref="LfErrNotIrx"/>, no fake secrets).
+    /// IOPRP/DNAS <c>.IMG</c> containers are parsed (ROMDIR + IOPBTCONF + LoadIrx when ELF).
+    /// </summary>
+    private int LoadModuleByPath(SystemMemory mem, IopModuleHost iopModules, Cdvd? cdvd, string path,
+        out int modres, bool magicGate = false)
     {
-        _ = mem;
         modres = 0;
         if (string.IsNullOrWhiteSpace(path))
             return LfErrNotIrx; // decomp path-check fail → 0xffffff37
@@ -2369,14 +2377,35 @@ public sealed class RealSifRpc
             // Disc-backed IRX/IMG reads are real ISO traffic (Burnout 3 IOP/* load list).
             cdvd?.NoteHostReadSectors((discElf.Length + 2047) / 2048);
 
-            // IOPRP*.IMG is not an IRX — treat as soft success (reboot image already applied HLE).
-            if (discElf.Length >= 4 &&
+            // IOPRP/DNAS *.IMG — ROMDIR-in-IMG container (not a single IRX).
+            // Parse IOPBTCONF / ROMDIR and LoadIrx extractable ELFs (UDNL-class apply).
+            if (discElf.Length >= 32 &&
                 (modKey.StartsWith("IOPRP", StringComparison.OrdinalIgnoreCase) ||
-                 baseName.EndsWith(".IMG", StringComparison.OrdinalIgnoreCase)))
+                 modKey.StartsWith("DNAS", StringComparison.OrdinalIgnoreCase) ||
+                 baseName.EndsWith(".IMG", StringComparison.OrdinalIgnoreCase) ||
+                 IopExtendedBiosHost.TryParseIopRpContainer(discElf, out _)))
             {
+                // MG on an image is still a container apply (not MagicGate IRX body).
+                IopExtendedBiosHost.ApplyIopRpImageBytes(iopModules, mem, discElf, modKey, out _);
                 modres = 0;
                 return iopModules.RegisterModule(modKey);
             }
+
+            // MG_MOD_LOAD: SECRMAN classify — plain ELF passthrough; encrypted → clear fail.
+            if (magicGate)
+            {
+                int secr = IopExtendedBiosHost.ClassifySecrBoot(discElf);
+                if (secr == IopExtendedBiosHost.SecrErrCannotDecrypt)
+                {
+                    // SecrDiskBootFile: "Cannot decrypt" — no MagicGate secrets in HLE.
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                        Console.Error.WriteLine(
+                            $"[LOADFILE] MG_MOD_LOAD encrypted/non-ELF reject path=\"{path}\" len={discElf.Length}");
+                    return LfErrNotIrx;
+                }
+                // SecrOk / missing handled below via plain load.
+            }
+
             if (discElf.Length < 52 || discElf[0] != 0x7F || discElf[1] != (byte)'E')
                 return LfErrNotIrx;
             try
@@ -2385,6 +2414,12 @@ public sealed class RealSifRpc
                 if (lr.Success && iopModules.TryGetModule(lr.ModuleName, out int mid))
                 {
                     // HLE does not run module _start; real modres would be start()'s return.
+                    modres = 0;
+                    return mid;
+                }
+                // Also try by requested key (LoadIrx nameOverride may uppercase).
+                if (lr.Success && iopModules.TryGetModule(modKey, out mid))
+                {
                     modres = 0;
                     return mid;
                 }
@@ -2398,6 +2433,8 @@ public sealed class RealSifRpc
 
         // No disc bytes: HLE register presence for rom0:/host: probes and BiosBootHost names.
         // Distinct from a proven open failure on a mounted cdrom path with a real ISO.
+        // MG with no bytes cannot decrypt — same soft rom0 path as plain for missing host probes;
+        // mounted cdrom miss stays -203.
         if (iopModules.DiscVolume != null &&
             path.StartsWith("cdrom", StringComparison.OrdinalIgnoreCase))
         {
@@ -2418,8 +2455,12 @@ public sealed class RealSifRpc
     }
 
     /// <summary>LF_F_ELF_LOAD / LF_F_MG_ELF_LOAD — load EE ELF, return epc/gp (decomp FUN_00000240).</summary>
+    /// <summary>
+    /// LF_F_ELF_LOAD / LF_F_MG_ELF_LOAD — load EE ELF, return epc/gp (decomp FUN_00000240 / FUN_000002fc).
+    /// MG shares plain path when payload is ELF; encrypted non-ELF → epc=0 load miss (no MG secrets).
+    /// </summary>
     private int LoadElfByPath(SystemMemory mem, IopModuleHost iopModules, string path, string secname,
-        out uint epc, out uint gp)
+        out uint epc, out uint gp, bool magicGate = false)
     {
         _ = secname;
         epc = 0;
@@ -2436,6 +2477,18 @@ public sealed class RealSifRpc
                 path.StartsWith("cdrom", StringComparison.OrdinalIgnoreCase))
                 return LfErrFileNotFound;
             return 0; // epc stays 0 → client -SCE_ELOADMISS
+        }
+
+        if (magicGate)
+        {
+            int secr = IopExtendedBiosHost.ClassifySecrBoot(elfBytes);
+            if (secr == IopExtendedBiosHost.SecrErrCannotDecrypt)
+            {
+                // FUN_000002fc on decrypt fail → epc=0 (client -SCE_ELOADMISS)
+                epc = 0;
+                gp = 0;
+                return 0;
+            }
         }
 
         if (elfBytes[0] != 0x7F || elfBytes[1] != (byte)'E' || elfBytes[2] != (byte)'L' || elfBytes[3] != (byte)'F')
@@ -6364,8 +6417,11 @@ public sealed class RealSifRpc
 
     // libmc-common.h result / type codes used by EE-side endFunc + probes.
     private const int McResSucceed = 0;
+    private const int McResChangedCard = -1;
+    private const int McResNoFormat = -2;
     private const int McResNoEntry = -4;
     private const int McResDeniedPermit = -5; // sceMcResDeniedPermit — unhandled / bad fd
+    private const int McTypePs1 = 1;
     private const int McTypePs2 = 2;
 
     // sceMcFileAttr* bits commonly set on directory table entries.
@@ -6392,8 +6448,8 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// MCSERV RPC dispatcher. Arg layouts from ps2sdk <c>mcDescParam_t</c> (fd ops) and
-    /// <c>libmc_name_param_stru</c> (path ops). Backend is DetPS2 <see cref="MemoryCard"/> —
-    /// not a byte-exact MCMAN FAT port (scoped out; see BIOS_DISSECTION §6.8).
+    /// <c>libmc_name_param_stru</c> (path ops). Backend is dual-format <see cref="MemoryCard"/>
+    /// (DetPS2 native / Sony PS2 MCFS / PS1) — see <c>docs/bios-ports/MCSERV.md</c>.
     /// Unmapped classic fnos return <see cref="McResDeniedPermit"/>. XMCSERV init
     /// (<c>0xFE</c>) and getInfo (<c>0x01</c>) are accepted so disc MCSERV.IRX clients
     /// (MK: Deadly Alliance after LoadModule MCSERV) do not Exit on probe failure.
@@ -6419,8 +6475,8 @@ public sealed class RealSifRpc
             McFnoDelete => McservDelete(mem, card, argBuf),
             McFnoFlush => McservFlush(mem, card, argBuf),
             McFnoChDir => McservChDir(mem, argBuf),
-            McFnoSetInfo => McResSucceed, // accept attr/time updates; no-op on HLE card
-            McFnoEraseBlock => McResSucceed, // page/block primitives: success stubs
+            McFnoSetInfo => McservSetInfo(mem, card, argBuf),
+            McFnoEraseBlock => McservEraseBlock(mem, card, argBuf),
             McFnoReadPage => McservReadPage(mem, card, argBuf),
             McFnoWritePage => McservWritePage(mem, card, argBuf),
             McFnoUnformat => McservUnformat(mem, card, argBuf),
@@ -6645,12 +6701,16 @@ public sealed class RealSifRpc
         return count;
     }
 
-    /// <summary>0x77 FORMAT — desc port@4 slot@8.</summary>
+    /// <summary>
+    /// 0x77 FORMAT — desc port@4 slot@8.
+    /// Produces a Sony PS2 MCFS image (magic + "1.1.0.0" superblock + IFC/FAT) so MCMAN
+    /// dual-format probes (FUN_000005ac type=2) and raw page readers see a real layout.
+    /// </summary>
     private int McservFormat(SystemMemory mem, MemoryCard card, uint argBuf)
     {
         _ = McDescPort(mem, argBuf);
         _ = McDescSlot(mem, argBuf);
-        card.Format();
+        card.FormatSonyPs2();
         _mcFds.Clear();
         _mcCwd = "/";
         return McResSucceed;
@@ -6659,6 +6719,7 @@ public sealed class RealSifRpc
     /// <summary>
     /// 0x78 GET_INFO — desc port@4 slot@8; size/offset/origin are want-type/free/format flags
     /// for rom0 MCSERV; result type/free written to param (mcEndParam_t) for EE endFunc.
+    /// Type comes from dual-format <see cref="MemoryCard.CardType"/>; free from FAT/block free list.
     /// </summary>
     private static int McservGetInfo(SystemMemory mem, MemoryCard card, uint argBuf)
     {
@@ -6667,10 +6728,27 @@ public sealed class RealSifRpc
         int wantFmt = McDescOrigin(mem, argBuf);   // origin flag → format (emulated)
         uint param = McDescParam(mem, argBuf);
 
-        int type = card.Formatted ? McTypePs2 : 0;
-        // Plausible free-cluster count; DetPS2 card is not Sony cluster-sized.
-        int free = card.Formatted ? Math.Max(1, 8000 - card.FileCount * 3) : 0;
-        int formatted = card.Formatted ? 1 : 0;
+        if (!card.Formatted)
+        {
+            // Unformatted: type may still be reported as present media; free=0.
+            if (param != 0)
+            {
+                if (wantType != 0) mem.Write32(param + 0, McTypePs2);
+                if (wantFree != 0) mem.Write32(param + 4, 0);
+                if (wantFmt != 0) mem.Write32(param + 144, 0);
+                if (wantType == 0 && wantFree == 0)
+                {
+                    mem.Write32(param + 0, McTypePs2);
+                    mem.Write32(param + 4, 0);
+                }
+            }
+            return McResNoFormat;
+        }
+
+        int type = (int)card.CardType;
+        if (type == 0) type = McTypePs2;
+        int free = Math.Max(0, card.FreeUnits);
+        int formatted = 1;
 
         if (param != 0)
         {
@@ -6687,8 +6765,33 @@ public sealed class RealSifRpc
             }
         }
 
-        // mcSync result: 0 = same card. (Changed/unformatted card codes not tracked.)
+        // mcSync result: 0 = same card. (Hotplug change −1 not tracked without media model.)
         return McResSucceed;
+    }
+
+    /// <summary>0x7C SET_INFO — name param; accept and succeed (attrs not persisted on all kinds).</summary>
+    private static int McservSetInfo(SystemMemory mem, MemoryCard card, uint argBuf)
+    {
+        // Real MCSERV updates create/modify times + attr mask from name-param payload.
+        // HLE: validate name exists when non-empty; still succeed for create-path probes.
+        string name = NormalizeMcPath(McNameString(mem, argBuf));
+        if (!string.IsNullOrEmpty(name) && !card.HasFile(name))
+        {
+            // Directory / not-yet-written entries: still OK (games may set info before flush).
+        }
+        return McResSucceed;
+    }
+
+    /// <summary>
+    /// 0x7D ERASE_BLOCK — dual-format aware.
+    /// MCSERV decomp FUN_00000ab8: port&amp;1+2 type probe; PS2 erases 16 pages/block, PS1 uses 0x80 frame path.
+    /// </summary>
+    private static int McservEraseBlock(SystemMemory mem, MemoryCard card, uint argBuf)
+    {
+        int block = McDescOffset(mem, argBuf); // block index commonly in offset/origin; accept fd field too
+        if (block == 0) block = McDescFd(mem, argBuf);
+        if (block < 0) block = 0;
+        return card.EraseBlock(block) ? McResSucceed : McResDeniedPermit;
     }
 
     /// <summary>0x79 DELETE — name param.</summary>
@@ -6767,13 +6870,16 @@ public sealed class RealSifRpc
         return McResSucceed;
     }
 
-    /// <summary>0x80 UNFORMAT — wipe card image.</summary>
+    /// <summary>0x80 UNFORMAT — wipe and re-init as empty Sony PS2 dual-format card.</summary>
     private int McservUnformat(SystemMemory mem, MemoryCard card, uint argBuf)
     {
         _ = McDescPort(mem, argBuf);
         _ = McDescSlot(mem, argBuf);
-        card.Format();
+        // Real unformat leaves media unformatted; HLE re-formats to Sony PS2 so subsequent
+        // getInfo still sees present media (titles rarely distinguish unformat vs format here).
+        card.FormatSonyPs2();
         _mcFds.Clear();
+        _mcCwd = "/";
         return McResSucceed;
     }
 

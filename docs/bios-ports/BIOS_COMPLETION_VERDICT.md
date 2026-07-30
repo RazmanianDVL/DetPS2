@@ -20,7 +20,7 @@ Against the **declared project gate** (“full BIOS HLE before commercial title 
 4. `BiosBootHost_IopBtConfContracts` and `BiosRomdirGate_PortDocsForRequiredModules` are green.
 5. Full `Tests` smoke suite: **`=== ALL SMOKE TESTS PASSED (Phase 56 + media) ===`**.
 
-This is **not** a claim that every PS2 BIOS feature is fully ported. Intentional residuals (R3000 IRX exec, THREADMAN Mbx/Vpl/Fpl, full MCMAN FAT, etc.) remain and **do not block** the gate.
+This is **not** a claim that every PS2 BIOS feature is fully ported. Intentional residuals (R3000 IRX exec, THREADMAN Mbx/Vpl/Fpl, MCMAN ECC, etc.) remain and **do not block** the gate.
 
 Authority cross-check: `docs/bios-ports/ROMDIR_GATE.md` already records Status **CLOSED** (2026-07-30). This document re-verifies that claim from code + live smokes.
 
@@ -85,7 +85,7 @@ Smoke primary: `BiosBootHost_IopBtConfContracts` (name load) + module-specific s
 | REBOOT | false | **OK** | `Sif` RESET + `ApplyPostIopRebootContracts` |
 | XLOADFILE / XFILEIO / NCDVDMAN | false | **PARTIAL** | Aliases share primary HLE |
 | MCSERV | false | **OK** | `RealSifRpc` sid MC — `RealSifRpc_McservRealFunctionNumbers` |
-| MCMAN | false | **PARTIAL** | FAT scoped; not boot-critical for gate |
+| MCMAN | false | **OK** | Dual-format FAT (PS1/PS2) + MCSERV; ECC residual |
 | LIBSD | false | **PARTIAL** (name only) | Sound; not boot-critical |
 
 ---
@@ -125,7 +125,7 @@ From `ROMDIR_GATE.md` and port docs — honest incomplete vs a literal BIOS:
 |----------|------------------------|
 | Literal R3000 execution of BIOS IRX | Architecture path optional; contract HLE presents destinations |
 | THREADMAN Mbx / Vpl / Fpl + priority ready queues | Semas/threads/sleep cover commercial WaitSema/SignalSema fast path; PARTIAL documented |
-| Full MCMAN dual-format FAT | MCSERV RPC present; MCMAN not RequiredForCommercialFastPath |
+| MCMAN ECC / wear-leveling | Dual-format FAT + MCSERV OK; ECC residual; not RequiredForCommercialFastPath |
 | IOP DMAC/SSBUS MMIO shared with hosts | PARTIAL hosts usable for boot bookkeeping |
 | INTRMAN full Ghidra dump parity | PARTIAL register/enable/dispatch enough for VBLANK plant |
 | LIBSD deep audio | Optional name registration only |

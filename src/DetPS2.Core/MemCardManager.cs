@@ -4,7 +4,9 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Memory card file manager (Phase 37): load/save host images for Desktop UX.
+/// Memory card file manager: load/save host images for Desktop UX.
+/// Supports DetPS2 native, Sony PS2 MCFS, and classic PS1 dual-format images
+/// via <see cref="MemoryCard"/> auto-detect.
 /// </summary>
 public static class MemCardManager
 {
@@ -13,16 +15,27 @@ public static class MemCardManager
     public static void SaveToFile(MemoryCard card, string path) =>
         File.WriteAllBytes(path, card.ToRawBytes());
 
-    /// <summary>Loads a card image previously written by SaveToFile. The directory
-    /// table lives inside the image itself (see MemoryCard.cs's own doc comment), so
-    /// this recovers every named file exactly as it was saved — no raw-blob fallback
-    /// needed for DetPS2's own images. A file with the wrong magic (not one of ours)
-    /// comes back as a freshly formatted, empty card rather than misread garbage.</summary>
+    /// <summary>
+    /// Loads a card image. Magic auto-detect covers DetPS2 ("DETPS2MC"), Sony PS2
+    /// ("Sony PS2 Memory Card Format "), and PS1 ("MC"). Unknown/corrupt images
+    /// fall back to a freshly formatted DetPS2 card of the same size.
+    /// </summary>
     public static MemoryCard LoadFromFile(string path)
     {
         if (!File.Exists(path))
             return new MemoryCard();
         return new MemoryCard(File.ReadAllBytes(path));
+    }
+
+    /// <summary>Create a blank card of the requested dual-format kind and save it.</summary>
+    public static MemoryCard CreateAndSave(string path, McImageKind kind, int pages = MemoryCard.DefaultPages)
+    {
+        var card = MemoryCard.Create(kind, pages);
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        SaveToFile(card, path);
+        return card;
     }
 
     public static bool TryImportFile(MemoryCard card, string name, string hostFile)
