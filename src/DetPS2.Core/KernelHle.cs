@@ -30,6 +30,10 @@ public sealed class KernelState
         /// drains it (independent of SleepThread / WaitSema). Was a no-op stub — ADX workers
         /// burned 160k+ SuspendThread calls/80M cycles with no yield.</summary>
         public int SuspendCount;
+        /// <summary>BIOS THREADMAN SleepThread wakeup counter (thread+0x1e). WakeupThread on a
+        /// non-SLEEP-waiting thread increments; SleepThread consumes one without parking when
+        /// &gt; 0. CancelWakeupThread returns-and-clears. Distinct from WaitSema (wait type 3).</summary>
+        public int WakeupCount;
         public int WaitSemaId;
         /// <summary>0 = not waiting on an event flag. See WaitEventFlag/SetEventFlag in
         /// SonyKernelHle.cs and KernelState.EventFlagSatisfied/ConsumeEventFlag/ParkOnEventFlag.</summary>
@@ -37,6 +41,10 @@ public sealed class KernelState
         public uint WaitEfPattern;
         public uint WaitEfMode;
         public uint WaitEfResultAddr;
+        /// <summary>Bits observed when SetEventFlag last released this waiter (for result_ptr write).</summary>
+        public uint WaitEfLastBits;
+        /// <summary>True after SetEventFlag released this waiter until the result_ptr is written.</summary>
+        public bool WaitEfNeedsResultWrite;
         public uint Entry;
         public uint Gp;
         public uint Stack;
@@ -68,6 +76,9 @@ public sealed class KernelState
         public int Id;
         public int Count;
         public int MaxCount;
+        /// <summary>CreateSema init_count (THREADMAN +0x28) — ReferSemaStatus reports this
+        /// separately from the live <see cref="Count"/>.</summary>
+        public int InitCount;
     }
 
     public sealed class EventFlag
@@ -152,6 +163,10 @@ public sealed class KernelState
             w.Write(t.Sleeping);
             w.Write(t.WaitVblank);
             w.Write(t.Started);
+            w.Write(t.EverStarted);
+            w.Write(t.SoftSuspended);
+            w.Write(t.SuspendCount);
+            w.Write(t.WakeupCount);
             w.Write(t.WaitSemaId);
             w.Write(t.WaitEfId);
             w.Write(t.WaitEfPattern);
@@ -185,6 +200,7 @@ public sealed class KernelState
             w.Write(kv.Value.Id);
             w.Write(kv.Value.Count);
             w.Write(kv.Value.MaxCount);
+            w.Write(kv.Value.InitCount);
         }
 
         w.Write(_flags.Count);
@@ -219,6 +235,10 @@ public sealed class KernelState
                 Sleeping = r.ReadBoolean(),
                 WaitVblank = r.ReadBoolean(),
                 Started = r.ReadBoolean(),
+                EverStarted = r.ReadBoolean(),
+                SoftSuspended = r.ReadBoolean(),
+                SuspendCount = r.ReadInt32(),
+                WakeupCount = r.ReadInt32(),
                 WaitSemaId = r.ReadInt32(),
                 WaitEfId = r.ReadInt32(),
                 WaitEfPattern = r.ReadUInt32(),
@@ -251,7 +271,13 @@ public sealed class KernelState
         int semaCount = r.ReadInt32();
         for (int i = 0; i < semaCount; i++)
         {
-            var s = new Sema { Id = r.ReadInt32(), Count = r.ReadInt32(), MaxCount = r.ReadInt32() };
+            var s = new Sema
+            {
+                Id = r.ReadInt32(),
+                Count = r.ReadInt32(),
+                MaxCount = r.ReadInt32(),
+                InitCount = r.ReadInt32()
+            };
             _semas[s.Id] = s;
         }
 
@@ -311,11 +337,34 @@ public sealed class KernelState
         return 0;
     }
 
+    /// <summary>BIOS THREADMAN SleepThread (FUN_0000200c): if a pending
+    /// <see cref="Thread.WakeupCount"/> exists, consume one and return without parking;
+    /// otherwise mark pure-sleep (WaitSemaId stays 0) and yield.</summary>
     public int SleepThread()
     {
         var t = FindThread(_currentTid);
-        if (t != null) t.Sleeping = true;
+        if (t == null) return -1;
+        if (t.WakeupCount > 0)
+        {
+            t.WakeupCount--;
+            return 0;
+        }
+        t.Sleeping = true;
+        // Pure SleepThread: not a WaitSema park (WaitSemaId must stay 0 so WakeupThread
+        // — not SignalSema — is the matching producer).
+        t.WaitSemaId = 0;
         return 0;
+    }
+
+    /// <summary>BIOS THREADMAN CancelWakeupThread (FUN_000022dc): return the pending
+    /// wakeup count and clear it. Does not wake a currently-sleeping thread.</summary>
+    public int CancelWakeupThread(int id)
+    {
+        var t = FindThread(id == 0 ? _currentTid : id);
+        if (t == null || !t.Alive) return -1;
+        int old = t.WakeupCount;
+        t.WakeupCount = 0;
+        return old;
     }
 
     /// <summary>BIOS THREADMAN SuspendThread — nestable; thread not runnable while count &gt; 0.</summary>
@@ -380,6 +429,8 @@ public sealed class KernelState
         t.Sleeping = true;
         t.Started = false;
         t.WaitSemaId = 0;
+        t.WakeupCount = 0;
+        t.WaitEfId = 0;
     }
 
     public int WakeupThread(int id)
@@ -427,9 +478,16 @@ public sealed class KernelState
         if (th.WaitSemaId != 0)
             return SignalSema(th.WaitSemaId);
         th.WaitVblank = false;
-        // WakeupThread does not cancel SuspendThread — only ResumeThread does.
-        if (th.SuspendCount == 0)
-            th.Sleeping = false;
+        // Decomp FUN_000020e4: if currently WAIT+SLEEP → mark READY; else increment
+        // wakeup-count (+0x1e). Pending wakes are consumed by the next SleepThread.
+        if (th.Sleeping && th.WaitSemaId == 0 && !th.WaitVblank)
+        {
+            // WakeupThread does not cancel SuspendThread — only ResumeThread does.
+            if (th.SuspendCount == 0)
+                th.Sleeping = false;
+            return 0;
+        }
+        th.WakeupCount++;
         return 0;
     }
 
@@ -655,6 +713,19 @@ public sealed class KernelState
         return RestoreContext(ee, next, fromSyscall: false);
     }
 
+    /// <summary>
+    /// Switch to another runnable thread if one exists, without the SwitchToNext self-wake
+    /// fallback. Used by EmotionEngine's sema-stall recovery when the current waiter is still
+    /// Sleeping but drain (or another path) made a different thread ready.
+    /// </summary>
+    public bool TryYieldToOtherRunnable(EmotionEngine ee)
+    {
+        int next = FindNextRunnable(_currentTid);
+        if (next == _currentTid) return false;
+        SaveCurrentContext(ee, fromSyscall: false);
+        return RestoreContext(ee, next, fromSyscall: false);
+    }
+
     private uint _preemptQuantum = 0x10000; // ~65536 EE cycles per timeslice
     private ulong _cyclesSinceLastPreempt;
 
@@ -815,14 +886,35 @@ public sealed class KernelState
     public int CreateSema(int init, int max)
     {
         int id = _nextSema++;
-        _semas[id] = new Sema { Id = id, Count = init, MaxCount = max > 0 ? max : 1 };
+        int m = max > 0 ? max : 1;
+        int c = init < 0 ? 0 : (init > m ? m : init);
+        _semas[id] = new Sema { Id = id, Count = c, MaxCount = m, InitCount = c };
         return id;
     }
 
     /// <summary>
-    /// BIOS THREADMAN DeleteSema: remove the object and wake every waiter (they observe
-    /// failure on re-check). Leaving waiters Sleeping forever is a hang source once games
-    /// tear down RPC client semaphores.
+    /// Materialize a semaphore at a specific id (Sony WaitSema race-tolerant auto-create).
+    /// Plain <see cref="CreateSema"/> always allocates <c>_nextSema++</c>, which cannot
+    /// satisfy a waiter that already holds a concrete id from a peer Create that HLE never
+    /// observed. No-ops if the id already exists.
+    /// </summary>
+    public int EnsureSema(int id, int init = 0, int max = 1)
+    {
+        if (id <= 0) return -1;
+        if (_semas.ContainsKey(id)) return id;
+        int m = max > 0 ? max : 1;
+        int c = init < 0 ? 0 : (init > m ? m : init);
+        _semas[id] = new Sema { Id = id, Count = c, MaxCount = m, InitCount = c };
+        if (id >= _nextSema)
+            _nextSema = id + 1;
+        return id;
+    }
+
+    /// <summary>
+    /// BIOS THREADMAN DeleteSema (FUN_00003164): remove the object and wake every waiter.
+    /// Real IOP writes waiter return <c>0xfffffe57</c>; EE HLE clears the wait and leaves
+    /// Suspend nest intact (do not make a Suspend-parked peer runnable just because its
+    /// WaitSema was torn down).
     /// </summary>
     public int DeleteSema(int id)
     {
@@ -830,10 +922,7 @@ public sealed class KernelState
         foreach (var t in _threads)
         {
             if (t.Alive && t.Sleeping && t.WaitSemaId == id)
-            {
-                t.Sleeping = false;
-                t.WaitSemaId = 0;
-            }
+                ClearSemaWait(t);
         }
         return 0;
     }
@@ -841,8 +930,38 @@ public sealed class KernelState
     /// <summary>Non-mutating existence check — unlike WaitSemaBlocking, does not consume a count.</summary>
     public bool SemaExists(int id) => _semas.ContainsKey(id);
 
+    /// <summary>Live count for ReferSemaStatus / diagnostics; −1 if missing.</summary>
+    public int GetSemaCount(int id) => _semas.TryGetValue(id, out var s) ? s.Count : -1;
+
+    /// <summary>Create-time init_count (THREADMAN +0x28); −1 if missing.</summary>
+    public int GetSemaInitCount(int id) => _semas.TryGetValue(id, out var s) ? s.InitCount : -1;
+
+    /// <summary>Create-time max_count; −1 if missing.</summary>
+    public int GetSemaMaxCount(int id) => _semas.TryGetValue(id, out var s) ? s.MaxCount : -1;
+
+    /// <summary>Number of threads currently parked on this sema (THREADMAN +0x10 waiter count).</summary>
+    public int CountSemaWaiters(int id)
+    {
+        int n = 0;
+        foreach (var t in _threads)
+            if (t.Alive && t.Sleeping && t.WaitSemaId == id) n++;
+        return n;
+    }
+
     /// <summary>
-    /// BIOS THREADMAN SignalSema (Ghidra tools/bios-decomp/THREADMAN_ALL.txt):
+    /// Drop a WaitSema park without violating SuspendThread. Mirrors WakeupThread /
+    /// OnVblank: Suspend nest keeps Sleeping=true so ReferThreadStatus still shows
+    /// THS_SUSPEND (and FIND-NEXT does not schedule the peer).
+    /// </summary>
+    private static void ClearSemaWait(Thread t)
+    {
+        t.WaitSemaId = 0;
+        if (t.SuspendCount == 0)
+            t.Sleeping = false;
+    }
+
+    /// <summary>
+    /// BIOS THREADMAN SignalSema (Ghidra FUN_0000328c / tools/bios-decomp/THREADMAN_ALL.txt):
     /// if any waiter is queued → wake exactly one (do not also bump count);
     /// else if count &lt; max → count++;
     /// else error (full). EE RPC uses CreateSema(init=0,max=1) then WaitSema;
@@ -857,8 +976,7 @@ public sealed class KernelState
         {
             if (t.Alive && t.Sleeping && t.WaitSemaId == id)
             {
-                t.Sleeping = false;
-                t.WaitSemaId = 0;
+                ClearSemaWait(t);
                 // No count++: the wake *is* the unit of signal consumption.
                 return s.Count;
             }
@@ -933,10 +1051,28 @@ public sealed class KernelState
         return id;
     }
 
+    /// <summary>
+    /// Set bits on an event flag and wake any parked WaitEventFlag threads whose condition
+    /// is now satisfied. Mirrors THREADMAN iSetEventFlag wake semantics so IOP producers
+    /// (e.g. <see cref="IopVblankHost"/> PCRTC pulse) release EE/IOP waiters without requiring
+    /// the Sony syscall path to run first.
+    /// </summary>
     public int SetEventFlag(int id, uint bits)
     {
         if (!_flags.TryGetValue(id, out var f)) return -1;
         f.Bits |= bits;
+        foreach (var t in _threads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitEfId != id) continue;
+            if (!EventFlagSatisfied(id, t.WaitEfPattern, t.WaitEfMode)) continue;
+            // Consume clear-on-exit before clearing WaitEfId so mode bit 0x10 works.
+            t.WaitEfLastBits = ConsumeEventFlag(id, t.WaitEfPattern, t.WaitEfMode);
+            t.WaitEfNeedsResultWrite = t.WaitEfResultAddr != 0;
+            t.WaitEfId = 0;
+            // Suspend nest keeps Sleeping (same rule as SignalSema / OnVblank).
+            if (t.SuspendCount == 0)
+                t.Sleeping = false;
+        }
         return 0;
     }
 

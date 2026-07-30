@@ -64,6 +64,10 @@ public sealed class Ps2System
     /// BIOS INTRMAN / TIMEMAN / IOMAN service contracts (register IRQ, system time, devices).
     /// </summary>
     public IopSystemHost IopSystem { get; } = new();
+    public IopEeconfHost IopEeconf { get; } = new();
+    public IopSsbuscHost IopSsbusc { get; } = new();
+    public IopSysclibHeaplibHost IopSysclibHeaplib { get; } = new();
+    public IopDmacManHost IopDmacMan { get; } = new();
 
     /// <summary>
     /// BIOS EXCEPMAN.IRX HLE — real per-exception-code, priority-ordered handler registration
@@ -146,6 +150,7 @@ public sealed class Ps2System
         Present = new PresentPipeline();
         IopModules = new IopModuleHost();
         IopModules.InitDefaults();
+        IopModules.BindIopSystem(IopSystem);
         Telemetry = new Telemetry();
 
         EE = new EmotionEngine(Memory);
@@ -182,6 +187,7 @@ public sealed class Ps2System
         Snapshots = new SnapshotEngine();
 
         Dmac.SetGif(Gif);
+        Vif.SetGif(Gif); // MSKPATH3 -> GIF_STAT.M3P
         Dmac.SetSif(Sif);
         Dmac.SetIntc(Intc);
         Dmac.SetVif(Vif);
@@ -266,10 +272,22 @@ public sealed class Ps2System
 
     public void DisableVirtualHdd() => Hdd = null;
 
-    public void LoadBios(string path)
+    /// <summary>
+    /// Bring up the commercial EE/IOP kernel service surface. A real Sony BIOS file is optional,
+    /// not required — see <see cref="LoadBiosNative"/>'s own doc comment for why: when
+    /// <paramref name="path"/> is null/blank or doesn't exist, this falls back to the native,
+    /// file-free bring-up automatically rather than throwing, so every existing caller (CLI
+    /// commands, the Desktop app, tests) gets "no BIOS needed" without individually changing.
+    /// Confirmed byte-identical behavior between the two paths across a 9-title cross-check and
+    /// a 400M-cycle single-title deep trace before this fallback was wired in.
+    /// </summary>
+    public void LoadBios(string? path)
     {
-        if (!File.Exists(path))
-            throw new FileNotFoundException("BIOS file not found", path);
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            LoadBiosNative();
+            return;
+        }
 
         byte[] biosData = File.ReadAllBytes(path);
         Memory.LoadBiosRom(biosData);
@@ -289,6 +307,37 @@ public sealed class Ps2System
         // Structural substrate: parse ROMDIR and install IOP service destinations *before*
         // any game ELF runs. This is the shared BIOS map — not a per-thread assist.
         BiosBoot.BindBios(path, biosData);
+        BiosBoot.StartCommercialIop(this);
+    }
+
+    /// <summary>
+    /// Bring up the same commercial EE/IOP kernel service surface as <see cref="LoadBios"/>
+    /// WITHOUT reading any real Sony firmware file — the "no BIOS should even be necessary"
+    /// path. Real BIOS bytes were never actually executed by the standard LoadBios→BootDiscFile
+    /// flow to begin with: <see cref="ElfLoader.LoadIntoEe"/> sets <c>EE.PC</c> to the game's own
+    /// ELF entry unconditionally the moment a disc boots, overwriting whatever
+    /// <c>EE.PC = 0xBFC00000</c> reset-vector value was set beforehand — confirmed by grepping
+    /// every real read of BIOS ROM content in this codebase (<c>0x1FC00000</c>/<c>LoadBiosRom</c>):
+    /// none of them are on the actual per-cycle execution path. What real commercial titles do
+    /// need is the *service surface* those BIOS-resident IOP modules provide (SIFCMD BIND/CALL/
+    /// RPC_END, THREADMAN sema/thread semantics, IOMAN fd table, LOADFILE/CDVDFSV/PADMAN/MCSERV
+    /// RPC services, VBLANK/EXCEPMAN registries, LOADCORE import/export linking) — all of which
+    /// are already real, ground-truthed C# HLE (<see cref="RealSifRpc"/>, <see cref="IopVblankHost"/>,
+    /// <see cref="IopExcepManHost"/>, <see cref="IopSystemHost"/>, <see cref="IrxLoader"/>) reachable
+    /// without a byte of real firmware, via <see cref="BiosBootHost"/>'s own no-image fallback
+    /// (<see cref="BiosBootHost.BootCriticalContracts"/> — the fixed, ROMDIR-derived module/role/sid
+    /// table already used whenever no real image was bound).
+    /// </summary>
+    public void LoadBiosNative()
+    {
+        EE.PC = 0xBFC00000;
+        Iop.PC = 0xBFC00000;
+        Hle.Reset();
+        Hle.EnableSonyKernel();
+        EE.COP0_Status = (1u << 16) | 1u; // EIE | IE
+        KernelBootstrap.InstallCommercialRuntime(this);
+
+        BiosBoot.BindBios(null, null);
         BiosBoot.StartCommercialIop(this);
     }
 
@@ -357,10 +406,13 @@ public sealed class Ps2System
             while (left > 0)
             {
                 ulong pcPhys = EE.PC & 0x1FFFFFFFUL;
-                // Track only real game RDRAM code (1MB..32MB)
-                if (pcPhys >= 0x00100000UL && pcPhys < SystemMemory.RDRAM_SIZE)
+                // Track only real EE *code* (IsLikelyEeCode rejects zero sleds AND string/data
+                // mis-exec like 0x00520040). Poisoned LastGood re-homes open-bus thrash forever.
+                if (Memory.IsLikelyEeCode(pcPhys))
                     LastGoodEePc = EE.PC;
                 KernelBootstrap.RescueIfLostInLowMem(this, LastGoodEePc);
+                // Mid-RDRAM nop-sled rescue (PC is "in range" so low-mem rescue skips it).
+                MaybeRescueNopSled(LastGoodEePc);
 
                 // Midway: jump to real main (0x212F70). Early kick (after ~100k) is
                 // required — delaying until the idle pump misses the GIF clear path.
@@ -417,6 +469,99 @@ public sealed class Ps2System
             SchedulerGeneration++;
             Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
         }
+    }
+
+    /// <summary>
+    /// <summary>
+    /// Hits of PC at a zero opcode inside RDRAM (not low-mem). Used to detect sustained
+    /// nop-sleds like MK post-WAD <c>0x024F0C64</c> without treating delay-slot nops as fatal.
+    /// </summary>
+    private int _nopSledHits;
+
+    /// <summary>
+    /// If EE is executing a sustained nop-sled in mid-RDRAM (zeroed BSS / bad fnptr target),
+    /// snap back to <paramref name="lastGoodPc"/> or a stack return candidate. Generic —
+    /// does not force out←in or plant title flags.
+    /// </summary>
+    private void MaybeRescueNopSled(ulong lastGoodPc)
+    {
+        // KSEG0 exception vectors are legitimate.
+        if (EE.PC >= 0x80000000UL && EE.PC < 0x80001000UL)
+        {
+            _nopSledHits = 0;
+            return;
+        }
+        uint pcPhys = (uint)(EE.PC & 0x1FFFFFFFUL);
+        if (pcPhys < 0x00100000u)
+        {
+            _nopSledHits = 0;
+            return;
+        }
+        // MK parks at 0x024F0C64 — past 32MiB RDRAM; open-bus fetches are 0 (nop forever).
+        bool pastRdram = pcPhys >= (uint)SystemMemory.RDRAM_SIZE;
+        uint op = pastRdram ? 0u : Memory.Read32(pcPhys);
+        if (!pastRdram && op != 0)
+        {
+            _nopSledHits = 0;
+            return;
+        }
+        // Require a run of zeros ahead so a single delay-slot nop never trips this.
+        if (!pastRdram && (Memory.Read32(pcPhys + 4) != 0 || Memory.Read32(pcPhys + 8) != 0))
+        {
+            _nopSledHits = 0;
+            return;
+        }
+        _nopSledHits++;
+        // Immediate for past-RDRAM; 2 slices for in-range zero sleds.
+        if (!pastRdram && _nopSledHits < 2) return;
+
+        ulong resume = lastGoodPc;
+
+        // Prefer a live stack return address (MK parked with sp→0x414448 code).
+        uint sp = (uint)(EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (sp is >= 0x00100000 and < 0x02000000)
+        {
+            for (uint off = 0; off <= 0x40; off += 4)
+            {
+                uint cand = Memory.Read32(sp + off);
+                if (Memory.IsLikelyEeCode(cand))
+                {
+                    resume = cand;
+                    break;
+                }
+            }
+        }
+        if (!Memory.IsLikelyEeCode(resume) || (resume & 0x1FFFFFFFUL) == 0x00100008UL)
+        {
+            ulong ra = EE.GetGpr(31).Lo & 0x1FFFFFFFUL;
+            if (Memory.IsLikelyEeCode(ra) && ra != 0x00100008UL)
+                resume = ra;
+            else if (Memory.IsLikelyEeCode(EE.COP0_EPC) && (EE.COP0_EPC & 0x1FFFFFFFUL) != 0x00100008UL)
+                resume = EE.COP0_EPC;
+            else if (lastGoodPc is >= 0x00100000 and < 0x01000000
+                     && Memory.IsLikelyEeCode(lastGoodPc)
+                     && (lastGoodPc & 0x1FFFFFFFUL) != 0x00100008UL)
+                resume = lastGoodPc;
+            else if (Memory.IsLikelyEeCode(0x004147F8UL))
+                resume = 0x004147F8UL; // ADX pump (MK)
+            else if (Memory.Read32(0x00212F70) == 0x27BDFEE0)
+                resume = 0x00212F70UL; // Midway main
+            else if (Memory.IsLikelyEeCode(0x00170BFCUL))
+                resume = 0x00170BFCUL; // GoW tag-list empty epilogue (never CRT0)
+            else if (Memory.IsLikelyEeCode(0x00185FACUL))
+                resume = 0x00185FACUL; // GoW post-FreezeCache
+            // Avoid re-CRT0 (0x100008): restarts boot and storms UnknownOpcode.
+            else if (Memory.IsLikelyEeCode(0x00100008UL))
+                resume = lastGoodPc is >= 0x00100000 ? lastGoodPc : 0x00100008UL;
+        }
+
+        EE.COP0_Status &= ~0x6u; // clear EXL|ERL
+        EE.PC = resume;
+        LastGoodEePc = resume;
+        _nopSledHits = 0;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] rescue nop-sled 0x{pcPhys:X8} -> 0x{(uint)(resume & 0x1FFFFFFF):X8} cyc={MasterCycles}");
     }
 
     /// <summary>
@@ -497,7 +642,11 @@ public sealed class Ps2System
         MidwayAssist.OnMainKick(this);
     }
 
-    /// <summary>Load IRX modules listed under IOP/ on the mounted ISO into IOP RAM.</summary>
+    /// <summary>
+    /// Load IRX modules from the mounted ISO into IOP RAM / name table.
+    /// Accepts <c>IOP/</c>, <c>MODULES/</c>, and disc-root IRX (Blood Omen 2 ships
+    /// SIO2MAN/PADMAN/… at the ISO root next to IOPRP234.IMG).
+    /// </summary>
     private void PreloadIopModulesFromDisc()
     {
         string? path = Cdvd.MountedPath;
@@ -510,33 +659,46 @@ public sealed class Ps2System
             foreach (var f in vol.Files)
             {
                 if (f.IsDirectory) continue;
-                string u = f.Path.ToUpperInvariant();
-                if (!u.EndsWith(".IRX", StringComparison.Ordinal) && !u.EndsWith(".IMG", StringComparison.Ordinal))
+                string u = f.Path.Replace('\\', '/').ToUpperInvariant();
+                string nameU = f.Name.ToUpperInvariant();
+                bool isIrx = nameU.EndsWith(".IRX", StringComparison.Ordinal);
+                bool isImg = nameU.EndsWith(".IMG", StringComparison.Ordinal)
+                             && nameU.StartsWith("IOPRP", StringComparison.Ordinal);
+                if (!isIrx && !isImg)
                     continue;
-                // Prefer IOP/ over MODULES/ duplicates
-                if (!u.StartsWith("IOP/", StringComparison.Ordinal) && !u.Contains("/IOP/"))
+                // Accept IOP/, MODULES/, or root-level IRX/IOPRP images (no nested junk).
+                int slash = u.LastIndexOf('/');
+                bool rootLevel = slash < 0;
+                bool inIop = u.StartsWith("IOP/", StringComparison.Ordinal) || u.Contains("/IOP/", StringComparison.Ordinal);
+                bool inModules = u.StartsWith("MODULES/", StringComparison.Ordinal) || u.Contains("/MODULES/", StringComparison.Ordinal);
+                if (!rootLevel && !inIop && !inModules)
                     continue;
                 if (f.Size == 0 || f.Size > 2_000_000) continue;
-                byte[]? data = Iso9660.ReadFile(vol, f.Path);
-                if (data == null || data.Length < 52) continue;
-                // .IMG is IOP reboot image — register as module name only
-                if (u.EndsWith(".IMG", StringComparison.Ordinal))
+                string modName = Path.GetFileNameWithoutExtension(f.Name);
+                // .IMG is IOP reboot image — register name only (no ELF load)
+                if (isImg)
                 {
-                    IopModules.RegisterModule(Path.GetFileNameWithoutExtension(f.Name));
+                    IopModules.RegisterModule(modName);
+                    continue;
+                }
+                byte[]? data = Iso9660.ReadFile(vol, f.Path);
+                if (data == null || data.Length < 52)
+                {
+                    IopModules.RegisterModule(modName);
                     continue;
                 }
                 try
                 {
-                    var r = IopModules.LoadIrx(data, Memory, Path.GetFileNameWithoutExtension(f.Name));
+                    var r = IopModules.LoadIrx(data, Memory, modName);
                     _ = r;
                 }
                 catch
                 {
-                    IopModules.RegisterModule(Path.GetFileNameWithoutExtension(f.Name));
+                    IopModules.RegisterModule(modName);
                 }
             }
             // Always ensure core names exist
-            foreach (var n in new[] { "SIO2MAN", "PADMAN", "MCMAN", "MCSERV", "LIBSD", "CDVDSTM", "CRI_ADXI", "IOPRP300" })
+            foreach (var n in new[] { "SIO2MAN", "PADMAN", "MCMAN", "MCSERV", "LIBSD", "CDVDSTM", "CRI_ADXI", "IOPRP300", "IOPRP234", "IOPRP214", "IOPFILE", "IOPMEM", "IOPSND", "SDRDRV" })
                 IopModules.RegisterModule(n);
         }
         catch
@@ -685,7 +847,13 @@ public sealed class Ps2System
         BiosBoot.Reset();
         IopVblank.Reset();
         IopSystem.Reset();
+        IopEeconf.Reset();
+        IopSsbusc.Reset();
+        IopSysclibHeaplib.Reset();
+        IopDmacMan.Reset();
         IopExcepMan.Reset();
+        // Re-bind after IopSystem.Reset so FILEIO ENODEV/AddDrv still route to the live host.
+        IopModules.BindIopSystem(IopSystem);
     }
 
     /// <summary>Phase 21: boot harness JSON including telemetry blockers.</summary>

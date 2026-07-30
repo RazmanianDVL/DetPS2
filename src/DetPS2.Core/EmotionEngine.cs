@@ -47,6 +47,9 @@ public sealed class EmotionEngine : ISchedulable
     /// `[MSGBUF-A0] a0=0xB ra=0` / `[ABORT-CALLER] ra=0` traces). Checked at the top of Step();
     /// cleared automatically the moment SwitchToNext finds a real thread to run.</summary>
     private bool _pendingThreadStall;
+    /// <summary>Break open-bus rescue thrash when the same non-progressing target is re-chosen.</summary>
+    private uint _openBusLastResume;
+    private int _openBusSameTargetHits;
 
     /// <summary>Set by SonyKernelHle's WaitSema handler when a thread genuinely blocks on a
     /// semaphore AND there is a real, already-queued SIF RPC (Sif.RealRpcQueueCount &gt; 0) that
@@ -369,7 +372,16 @@ public sealed class EmotionEngine : ISchedulable
             COP0_Cause &= ~(1u << 15);
 
         bool ie = (COP0_Status & 1) != 0 || (COP0_Status & (1u << 16)) != 0;
-        bool blocked = (COP0_Status & 0x6) != 0; // EXL | ERL
+        // EXL | ERL block delivery on real R5900. Our HLE also refuses nested
+        // TryDispatchRegisteredIntcHandler while an outer frame is still live
+        // (_savedGprAcrossIntcDispatch non-empty), even if software cleared EXL mid-handler
+        // via an ERL critical section (God of War 0x00299820). Real BIOS dispatchers save
+        // EPC on a private stack and can re-enter; we only have one COP0_EPC + a LIFO GPR
+        // frame stack that must fully unwind before another handler is entered. Without
+        // this, post-ERL EXL=0 windows nested SIF/VBlank dispatches unbounded (eretStack
+        // 3000+ observed @ cyc≈34M) until SP/ra are garbage and PC lands in BSS.
+        bool blocked = (COP0_Status & 0x6) != 0
+            || _savedGprAcrossIntcDispatch.Count > 0;
         // Real MIPS gates each Cause.IPx bit (8-15) by the matching Status.IMx bit at the
         // same position — software (e.g. a busy-poll on INTC_STAT with IM left at 0 while it
         // hasn't set up a dispatcher yet) can leave IE=1 with all IM bits clear specifically
@@ -551,6 +563,9 @@ public sealed class EmotionEngine : ISchedulable
             // RPC to resolve this semaphore via SignalSema, instead of calling SwitchToNext (whose
             // own "wake ourselves" fallback would undo the Sleeping state before the real response
             // ever arrives) or fabricating a fake signal.
+            // Also: if drain woke a *different* waiter (or another thread was always runnable),
+            // clear the stall and SwitchToNext — otherwise one wrong-sema WaitSema freezes the EE
+            // forever after the RPC that was never going to signal it completes.
             if (_pendingSemaStall)
             {
                 var stalledThread = _hle?.Kernel.GetThread(_hle.Kernel.CurrentThreadId);
@@ -559,6 +574,16 @@ public sealed class EmotionEngine : ISchedulable
                     _pendingSemaStall = false;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
                         Console.Error.WriteLine($"[STALLCLEAR-SEMA] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle?.Kernel.CurrentThreadId}");
+                }
+                else if (Environment.GetEnvironmentVariable("DETPS2_SEMA_STALL_YIELD") == "1"
+                         && _hle != null && _hle.Kernel.TryYieldToOtherRunnable(this))
+                {
+                    // Opt-in only. Yielding out of a WaitSema stall when another thread is
+                    // runnable kills MK Shaolin Monks WAD (cdvdSectors collapses 198k→1).
+                    // GoW DualInfo works with pure stall + PollSema-id; leave yield off by default.
+                    _pendingSemaStall = false;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                        Console.Error.WriteLine($"[STALLCLEAR-SEMA-YIELD] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle.Kernel.CurrentThreadId}");
                 }
                 else
                 {
@@ -730,6 +755,100 @@ public sealed class EmotionEngine : ISchedulable
             if ((PC & 0x1FFFFFFF) == 0x00475D24 && _memory.Read32(PC) == 0x5C400006 && GetGpr(18).Lo == 0)
                 SetGpr(2, new Gpr128 { Lo = 0 }); // v0 = 0, so bgtzl correctly doesn't take the branch
 
+            // Past-RDRAM open-bus fetch (e.g. MK post-WAD 0x024F0C64 — 32MiB RDRAM ends at
+            // 0x02000000; Read32 returns 0 → perpetual nop). Recover immediately. Generic:
+            // never hardcode title addresses (MK 0x4145A8 yanked BO2 off its own boot path).
+            // Resume targets MUST pass IsLikelyEeCode — plain non-zero rejects fail on string
+            // data (0x00520040 "port"/path) and thrash open-bus forever (2026-07-30).
+            {
+                uint pcPhysFetch = (uint)(PC & 0x1FFFFFFFUL);
+                if (pcPhysFetch >= (uint)SystemMemory.RDRAM_SIZE)
+                {
+                    ulong resumePc = 0;
+                    // Prefer another runnable thread only if its saved PC is real code.
+                    if (_hle != null)
+                    {
+                        int cur = _hle.Kernel.CurrentThreadId;
+                        int next = _hle.Kernel.FindNextRunnable(cur);
+                        if (next != cur)
+                        {
+                            var nt = _hle.Kernel.GetThread(next);
+                            uint nPhys = nt != null
+                                ? (uint)((nt.SavedPc != 0 ? nt.SavedPc : nt.Entry) & 0x1FFFFFFFUL)
+                                : 0;
+                            if (_memory.IsLikelyEeCode(nPhys)
+                                && _hle.Kernel.TryYieldToOtherRunnable(this))
+                            {
+                                executed++;
+                                continue;
+                            }
+                        }
+                    }
+                    // Stack return candidates (prefer over raw $ra — $ra often holds data ptrs).
+                    uint spPhys = (uint)(GetGpr(29).Lo & 0x1FFFFFFFUL);
+                    if (spPhys is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+                    {
+                        for (uint off = 0; off <= 0x80; off += 4)
+                        {
+                            uint cand = _memory.Read32(spPhys + off);
+                            if (_memory.IsLikelyEeCode(cand))
+                            {
+                                resumePc = cand;
+                                break;
+                            }
+                        }
+                    }
+                    if (resumePc == 0 && _memory.IsLikelyEeCode(GetGpr(31).Lo))
+                        resumePc = GetGpr(31).Lo & 0x1FFFFFFFUL;
+                    if (resumePc == 0 && _memory.IsLikelyEeCode(COP0_EPC))
+                        resumePc = COP0_EPC & 0x1FFFFFFFUL;
+                    // Prefer Midway main / CRT0 over ADX pump — forcing pump PC from open-bus
+                    // mid-boot (pre-WAD) corrupts streaming state. Pump is resumed by its own
+                    // thread scheduler, not by open-bus re-home.
+                    if (resumePc == 0 && _memory.Read32(0x00212F70) == 0x27BDFEE0)
+                        resumePc = 0x00212F70UL;
+                    if (resumePc == 0 && _memory.IsLikelyEeCode(0x0011C200UL))
+                        resumePc = 0x0011C200UL;
+                    if (resumePc == 0)
+                        resumePc = 0x00100008UL; // ELF entry fallback
+
+                    // Same bad resume re-chosen every time (target immediately jumps back past
+                    // RDRAM): escalate to main/CRT0 after a few hits so we stop thrashing
+                    // millions of open-bus cycles (was 0x520040 ↔ 0x6403800 for entire post-WAD).
+                    uint resumeU = (uint)(resumePc & 0x1FFFFFFFUL);
+                    if (resumeU == _openBusLastResume)
+                    {
+                        _openBusSameTargetHits++;
+                        if (_openBusSameTargetHits >= 4)
+                        {
+                            if (_memory.Read32(0x00212F70) == 0x27BDFEE0)
+                                resumePc = 0x00212F70UL;
+                            else if (_memory.IsLikelyEeCode(0x0011C200UL))
+                                resumePc = 0x0011C200UL;
+                            else
+                                resumePc = 0x00100008UL;
+                            resumeU = (uint)(resumePc & 0x1FFFFFFFUL);
+                            _openBusSameTargetHits = 0;
+                        }
+                    }
+                    else
+                    {
+                        _openBusLastResume = resumeU;
+                        _openBusSameTargetHits = 0;
+                    }
+
+                    COP0_Status &= ~0x6u;
+                    PC = resumePc;
+                    // Rate-limit: every ~1M instr, not every 64k (stderr flood killed long runs).
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (executed & 0xFFFFF) == 0)
+                        Console.Error.WriteLine(
+                            $"[BIOS] EE open-bus rescue 0x{pcPhysFetch:X8} -> 0x{resumeU:X8} cyc={cyc}");
+                    executed++;
+                    continue;
+                }
+            }
+
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
             if (SystemMemory.WatchAddr.HasValue || SystemMemory.TrackLastWriter)
@@ -746,7 +865,7 @@ public sealed class EmotionEngine : ISchedulable
                 Console.Error.WriteLine($"[PCBREAK] pc=0x{PC:X8} op=0x{opcode:X8} v0=0x{GetGpr(2).Lo:X} v1=0x{GetGpr(3).Lo:X} a0=0x{GetGpr(4).Lo:X} a1=0x{GetGpr(5).Lo:X} a2=0x{GetGpr(6).Lo:X} a3=0x{GetGpr(7).Lo:X} " +
                     $"t0=0x{GetGpr(8).Lo:X} t1=0x{GetGpr(9).Lo:X} t2=0x{GetGpr(10).Lo:X} " +
                     $"s0=0x{GetGpr(16).Lo:X} s1=0x{GetGpr(17).Lo:X} s2=0x{GetGpr(18).Lo:X} s3=0x{GetGpr(19).Lo:X} s4=0x{GetGpr(20).Lo:X} s5=0x{GetGpr(21).Lo:X} s6=0x{GetGpr(22).Lo:X} s7=0x{GetGpr(23).Lo:X} sp=0x{GetGpr(29).Lo:X} ra=0x{GetGpr(31).Lo:X} " +
-                    $"COP0_Status=0x{COP0_Status:X8} COP0_Cause=0x{COP0_Cause:X8} InterruptPending={InterruptPending} takeExceptions={_takeExceptions} cyc={cyc}");
+                    $"COP0_Status=0x{COP0_Status:X8} COP0_Cause=0x{COP0_Cause:X8} EPC=0x{COP0_EPC:X8} ErrorEPC=0x{_cop0ErrorEpc:X8} eretStack={_savedGprAcrossIntcDispatch.Count} InterruptPending={InterruptPending} takeExceptions={_takeExceptions} cyc={cyc}");
             _branchWasLikely = false;
             HleRedirectPc = null;
             bool tookBranch = ExecuteInstruction(opcode);
@@ -829,9 +948,19 @@ public sealed class EmotionEngine : ISchedulable
         // usual InterruptPending/blocked gate entirely, so a wild jump landing on a misaligned
         // address WHILE already mid-exception (EXL=1) could previously clobber the outer
         // exception's EPC here, corrupting its eventual eret target.
-        bool nested = (COP0_Status & 0x2) != 0; // EXL already set
+        // Real MIPS nests on Status.EXL. Our HLE also keeps an outstanding frame in
+        // _savedGprAcrossIntcDispatch for every TryDispatchRegisteredIntcHandler episode.
+        // Games (God of War SCUS_973.99 helper @ 0x00299820) deliberately clear EXL while
+        // inside a registered handler via an ERL critical section (ori EXL|ERL; xori EXL;
+        // mtc0; …; mtc0 ErrorEPC; eret). After that eret, COP0 shows EXL=0 but the HLE frame
+        // is still live — a subsequent interrupt must NOT recapture EPC, or the outer vector
+        // eret returns into the middle of the handler with restored *user* GPRs (stack
+        // clobber → ra=0 → jr-ra-exit stall at 0x00290040). Treat an outstanding dispatch
+        // frame as nested for EPC purposes even when software cleared EXL.
+        bool nested = (COP0_Status & 0x2) != 0
+            || _savedGprAcrossIntcDispatch.Count > 0;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_NESTED_EXC") == "1" && nested)
-            Console.Error.WriteLine($"[NESTED-EXC] cyc={CurrentCycle()} pc=0x{PC:X8} excCode={causeExcCode} epc(unchanged)=0x{COP0_EPC:X8}");
+            Console.Error.WriteLine($"[NESTED-EXC] cyc={CurrentCycle()} pc=0x{PC:X8} excCode={causeExcCode} epc(unchanged)=0x{COP0_EPC:X8} eretStack={_savedGprAcrossIntcDispatch.Count}");
         if (!nested)
         {
             COP0_EPC = PC;
@@ -873,7 +1002,12 @@ public sealed class EmotionEngine : ISchedulable
         {
             if ((pending & (1u << src)) == 0) continue;
 
-            bool found = sony.TryGetIntcHandler(src, out uint handlerAddr) && handlerAddr != 0;
+            // Multi-handler chain: real BIOS walks every AddIntcHandler for this cause.
+            // TryTakeNext advances the cursor; moreIntcRemain means leave the COP0 latch
+            // armed so the next eret dispatches the following registration.
+            bool moreIntcRemain = false;
+            bool found = sony.TryTakeNextIntcHandler(src, out uint handlerAddr, out moreIntcRemain)
+                         && handlerAddr != 0;
             int handlerArg = src;
 
             // Real hardware routes SIF0 DMA-channel completion (our INTC "Sif" summary bit)
@@ -909,8 +1043,32 @@ public sealed class EmotionEngine : ISchedulable
                 viaDmacFallback = true;
             }
 
+            // INTC source 14 (DmaController) is the summary bit for every DMAC channel
+            // completion. Real BIOS walks AddDmacHandler's per-channel table; we never
+            // installed that trampoline. Without this, Burnout 3's VIF1/GIF handler at
+            // 0x001F1778 (registered via AddDmacHandler ch1/ch2 + EnableDmac) never ran on
+            // completion — only the software a0=-1 poll path did, which early-outs while
+            // the pending-count byte is non-zero, so the GS flip-queue (gp-24120/gp-24116)
+            // never drained and main spun forever at 0x001F24E0.
+            if (!found && src == (int)Intc.InterruptSource.DmaController &&
+                sony.TryTakePendingDmacHandler(out uint chHandler, out int chNum))
+            {
+                handlerAddr = chHandler;
+                handlerArg = chNum;
+                found = true;
+                viaDmacFallback = true;
+            }
+
             if (!found) continue;
-            if (viaDmacFallback) _intc.Acknowledge((Intc.InterruptSource)src);
+            if (viaDmacFallback)
+            {
+                _intc.Acknowledge((Intc.InterruptSource)src);
+                // Acknowledge is a no-op while the STAT hold window is active (busy-poller
+                // assist). Without also clearing the COP0 latch, viaDmacFallback storms
+                // for the entire hold (2M cycles) — denser after multi-handler eret sync.
+                if (_intc.IsPending((Intc.InterruptSource)src))
+                    _intc.ClearCpuLatch((Intc.InterruptSource)src);
+            }
 
             // Traced (2026-07-27, Mortal Kombat: Shaolin Monks): the same interrupt-storm class
             // documented above for the SIF/DMAC-fallback case also hits Timer0-3, but via a
@@ -937,10 +1095,19 @@ public sealed class EmotionEngine : ISchedulable
             // / software write-1-clear); without clearing the latch, eret immediately re-enters
             // the same handler forever and leaves EXL effectively stuck (Shaolin Monks DI spin
             // at 0x485FE4 with Status EXL=1 for 80M+ cycles after preemption fix, 2026-07-29).
+            //
+            // Consume COP0 edge latch, then re-Raise when more AddIntcHandler registrations
+            // remain so the next eret dispatches the next handler (real BIOS walks the whole
+            // list in one ISR; we serialize one handler per episode).
+            // Burnout 3 VBlankStart: 0x2370A0 → 0x1F1CE8 → 0x22B830.
             if (!viaDmacFallback
                 && src is not ((int)Intc.InterruptSource.Timer0 or (int)Intc.InterruptSource.Timer1
                     or (int)Intc.InterruptSource.Timer2 or (int)Intc.InterruptSource.Timer3))
+            {
                 _intc.ClearCpuLatch((Intc.InterruptSource)src);
+                if (moreIntcRemain)
+                    _intc.Raise((Intc.InterruptSource)src);
+            }
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
                 Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedGprAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
@@ -948,12 +1115,18 @@ public sealed class EmotionEngine : ISchedulable
             // thread's SaveFullContext so a handler that WaitSema/SwitchToNext mid-ISR cannot
             // partial-restore this thread with ISR garbage (v1=0x44 instead of 0x1000F000 on
             // MKSM INTC poll, 2026-07-29).
+            //
+            // Push the frame AFTER EnterException so the nested-EPC check
+            // (`_savedGprAcrossIntcDispatch.Count > 0`) only sees *prior* outstanding
+            // dispatches — not the frame we are creating for this one. Pushing first made
+            // every dispatch look nested and froze EPC at the first exception forever
+            // (God of War VBlank wait at 0x0021FF24 never resumed to the right PC).
             var savedGpr = new ulong[32];
             for (int i = 0; i < 32; i++)
                 savedGpr[i] = GetGpr(i).Lo;
-            _savedGprAcrossIntcDispatch.Push(savedGpr);
             _hle?.Kernel.CaptureInterruptedContext(this, savedGpr);
             EnterException(GetExceptionVector(general: true), causeExcCode: 0);
+            _savedGprAcrossIntcDispatch.Push(savedGpr);
             PC = handlerAddr;
             SetGpr(4, new Gpr128 { Lo = (ulong)(uint)handlerArg }); // a0 = cause
             SetGpr(31, new Gpr128 { Lo = KernelBootstrap.Kseg0Interrupt }); // ra = vector's eret
@@ -1418,9 +1591,22 @@ public sealed class EmotionEngine : ISchedulable
             static bool LooksLikeShiftedByte(ulong x) => x != 0 && (x & 0x00FFFFFFUL) == 0;
             if (LooksLikeShiftedByte(a) || LooksLikeShiftedByte(b))
                 return;
+            // memcpy/memset unaligned tails commonly do:
+            //   addiu a2, a2, -1; lbu; sb; bne a2, -1, loop
+            // with the sentinel held as 0xFFFFFFFFFFFFFFFF. |len - (-1)| is always
+            // enormous for any small positive remaining count, so the old dist>50k
+            // snap forced len→-1 after the first byte — every unaligned memcpy became
+            // 1 byte (Blood Omen 2: "cdrom0:" → "c", SifIopReset "rom0:UDNL c").
+            // Refuse the snap when one side is the all-ones sentinel and the other is a
+            // modest remaining count (real copy tails). Huge Midway spins that count
+            // toward -1 from tens of millions still snap via the dist check below.
+            const ulong modestCopyTail = 1_048_576UL; // 1 MiB
+            if ((a == ulong.MaxValue && b < modestCopyTail) ||
+                (b == ulong.MaxValue && a < modestCopyTail))
+                return;
             // Distance in 64-bit space
             ulong dist = a > b ? a - b : b - a;
-            // Software delay loops (e.g. Midway spin counting to -1) burn tens of millions
+            // Software delay loops (e.g. Midway spin counting to 0/-1) burn tens of millions
             // of EE cycles; snap earlier so commercial boot reaches graph init.
             if (dist > 50_000UL)
             {
@@ -1935,10 +2121,26 @@ public sealed class EmotionEngine : ISchedulable
                 SetGpr(rd, PackW(new[] { aw[0], bw[0], aw[1], bw[1] }));
                 break;
             }
+            // PPACW/PPACH/PPACB/PEXT5/PPAC5 — MMI0 pack family. Verified against PCSX2's
+            // pcsx2/MMI.cpp (interpreter). God of War (SCUS_973.99) hits PPACW early in
+            // CRT0 (UnknownOpcode 0x9C0004C8 = key (sa=19)<<6|func=0x08) four times by
+            // cyc=5M and stalls there if unimplemented.
+            case (19u << 6) | 0x08: // PPACW — pack even words: rd={rt[0],rt[2],rs[0],rs[2]}
+            {
+                var aw = ExtractW(a); var bw = ExtractW(b);
+                SetGpr(rd, PackW(new[] { bw[0], bw[2], aw[0], aw[2] }));
+                break;
+            }
             case (22u << 6) | 0x08: // PEXTLH
             {
                 var ah = ExtractH(a); var bh = ExtractH(b);
                 SetGpr(rd, PackH(new[] { ah[0], bh[0], ah[1], bh[1], ah[2], bh[2], ah[3], bh[3] }));
+                break;
+            }
+            case (23u << 6) | 0x08: // PPACH — pack even halfwords of each word lane
+            {
+                var ah = ExtractH(a); var bh = ExtractH(b);
+                SetGpr(rd, PackH(new[] { bh[0], bh[2], bh[4], bh[6], ah[0], ah[2], ah[4], ah[6] }));
                 break;
             }
             case (26u << 6) | 0x08: // PEXTLB
@@ -1947,6 +2149,47 @@ public sealed class EmotionEngine : ISchedulable
                 var r = new byte[16];
                 for (int i = 0; i < 8; i++) { r[i * 2] = ab[i]; r[i * 2 + 1] = bb[i]; }
                 SetGpr(rd, PackB(r));
+                break;
+            }
+            case (27u << 6) | 0x08: // PPACB — pack even bytes of each halfword lane
+            {
+                var ab = ExtractB(a); var bb = ExtractB(b);
+                var r = new byte[16];
+                for (int i = 0; i < 8; i++) r[i] = bb[i * 2];
+                for (int i = 0; i < 8; i++) r[8 + i] = ab[i * 2];
+                SetGpr(rd, PackB(r));
+                break;
+            }
+            case (30u << 6) | 0x08: // PEXT5 — expand 15-bit 5:5:5:1 color in each word of Rt
+            {
+                // PCSX2: ((c&0x1F)<<3)|((c&0x3E0)<<6)|((c&0x7C00)<<9)|((c&0x8000)<<16)
+                var tw = ExtractW(b);
+                var r = new uint[4];
+                for (int i = 0; i < 4; i++)
+                {
+                    uint c = tw[i];
+                    r[i] = ((c & 0x0000001Fu) << 3)
+                         | ((c & 0x000003E0u) << 6)
+                         | ((c & 0x00007C00u) << 9)
+                         | ((c & 0x00008000u) << 16);
+                }
+                SetGpr(rd, PackW(r));
+                break;
+            }
+            case (31u << 6) | 0x08: // PPAC5 — pack 32-bit channel words back to 15-bit 5:5:5:1
+            {
+                // PCSX2: ((c>>3)&0x1F)|((c>>6)&0x3E0)|((c>>9)&0x7C00)|((c>>16)&0x8000)
+                var tw = ExtractW(b);
+                var r = new uint[4];
+                for (int i = 0; i < 4; i++)
+                {
+                    uint c = tw[i];
+                    r[i] = ((c >> 3) & 0x0000001Fu)
+                         | ((c >> 6) & 0x000003E0u)
+                         | ((c >> 9) & 0x00007C00u)
+                         | ((c >> 16) & 0x00008000u);
+                }
+                SetGpr(rd, PackW(r));
                 break;
             }
 
@@ -2407,8 +2650,23 @@ public sealed class EmotionEngine : ISchedulable
     private void ExecuteEret()
     {
         // No delay slot; Step() always PC+=4 after non-branch → preload target-4.
+        //
+        // Two distinct hardware uses of eret (R5900 COP0):
+        //   1. ERL path — Status.ERL set: clear ERL, PC = ErrorEPC. Games use this as a
+        //      software "return-with-Status-change" for DI/critical sections that write
+        //      uncached hardware (e.g. God of War helper at 0x00299820: mtc0 Status with
+        //      ERL, sw to 0xB0001xxx, mtc0 ra ErrorEPC, eret). This is NOT an interrupt
+        //      return and must not touch the HLE INTC GPR save stack.
+        //   2. EXL path — normal exception/interrupt return: clear EXL, PC = EPC. Our
+        //      TryDispatchRegisteredIntcHandler snapshots user GPRs before redirecting into
+        //      a registered handler; only THIS path restores them (handler jr ra → vector
+        //      eret). Popping on the ERL path while eretStack>0 (handler mid-flight called
+        //      an ERL critical section) restored user GPRs into the ISR, zeroed ErrorEPC
+        //      via corrupted ra, then wedged forever at the eret itself (PC=EPC=eret).
+        //      Traced God of War SCUS_973.99 @ cyc≈17.05M, 2026-07-30.
         ulong target;
-        if ((COP0_Status & 0x4) != 0)
+        bool erlPath = (COP0_Status & 0x4) != 0;
+        if (erlPath)
         {
             COP0_Status &= ~0x4u;
             target = _cop0ErrorEpc;
@@ -2421,7 +2679,8 @@ public sealed class EmotionEngine : ISchedulable
         InterruptPending = false;
         EretCount++;
         PC = target - 4;
-        if (_savedGprAcrossIntcDispatch.Count > 0)
+        // Restore HLE interrupt-dispatch GPRs only on the real exception-return (EXL) path.
+        if (!erlPath && _savedGprAcrossIntcDispatch.Count > 0)
         {
             ulong[] savedGpr = _savedGprAcrossIntcDispatch.Pop();
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
@@ -2432,6 +2691,13 @@ public sealed class EmotionEngine : ISchedulable
             // later SwitchToNext cannot resurrect this (now stale) full save.
             _hle?.Kernel.ClearFullSaveIfCurrent();
         }
+        // Re-evaluate COP0 delivery when a latched source is still waiting (multi-handler
+        // AddIntcHandler chain re-Raise, multi-channel DMAC re-Raise). eret forced
+        // InterruptPending=false above; without a sync the next handler waits up to 64
+        // instructions. Only sync when something is actually latched — unconditional sync
+        // densified SIF storms during the STAT hold window.
+        if (!erlPath && _intc != null && _intc.AnyPending)
+            SyncInterruptsFromIntc();
     }
 
     private void ExecuteLd(uint opcode)

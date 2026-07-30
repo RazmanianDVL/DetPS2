@@ -74,16 +74,34 @@ public sealed class MmioBus
         if (_readExact.TryGetValue(address, out var h))
             return h();
 
-        // IPU window 0x10002000–0x10002FFF (games polls past 0x800)
+        // IPU control 0x10002000–0x10002FFF; in/out FIFO 0x10007000–0x1000701F (ps2tek)
         if (address >= Ipu.MmioBase && address < Ipu.MmioBase + 0x1000 && _ipu != null)
             return _ipu.ReadRegister(address);
+        if (address >= 0x10007000 && address < 0x10007020 && _ipu != null)
+            return _ipu.ReadFifoWord(address);
 
         if (address >= 0x10000000 && address < 0x10002000 && _timers != null)
             return _timers.ReadRegister(address);
 
         // GIF control + FIFO window
         if (address >= 0x10003000 && address < 0x10003100 && _gif != null)
+        {
+            // GIF_STAT (…3020) poll: path-sync loops (Burnout 3 @ 0x001F1A28) spin on FQC
+            // immediately after kicking a masked PATH3 DMA. EE.Step quanta can run thousands
+            // of those poll instructions before the scheduler turns hit DMAC, so FQC never
+            // rises inside the spin. Pump a few GIF/VIF-relevant DMAC steps on STAT read —
+            // not a blanket force-finish of every channel (MK WAD path is sensitive to that).
+            if ((address & 0xFF) == 0x20 && _dmac != null)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    if (_dmac.Step(128) == 0) break;
+                    // FQC already non-zero — poller will observe it; stop early.
+                    if ((_gif.ReadStat() & 0x1F00_0000u) != 0) break;
+                }
+            }
             return _gif.ReadRegister(address);
+        }
         if (address >= 0x10006000 && address < 0x10006010 && _gif != null)
             return 0; // FIFO write-only
 
@@ -158,6 +176,11 @@ public sealed class MmioBus
         if (address >= Ipu.MmioBase && address < Ipu.MmioBase + 0x1000 && _ipu != null)
         {
             _ipu.WriteRegister(address, value);
+            return;
+        }
+        if (address >= 0x10007000 && address < 0x10007020 && _ipu != null)
+        {
+            _ipu.WriteFifoWord(address, value);
             return;
         }
 

@@ -251,6 +251,16 @@ public sealed class MemoryCard
         Reads++;
     }
 
+    /// <summary>Raw page write used by MCSERV 0x7F (mcWritePage) HLE. Out-of-range is a no-op.</summary>
+    public void WritePage(int page, ReadOnlySpan<byte> src)
+    {
+        int off = page * PageSize;
+        if (off < 0 || off + PageSize > _data.Length) return;
+        int n = Math.Min(PageSize, src.Length);
+        src[..n].CopyTo(_data.AsSpan(off, n));
+        Writes++;
+    }
+
     /// <summary>Raw page dump for host persistence (MemCardManager.SaveToFile) — the
     /// directory table is part of this, so reloading it (via the byte[] constructor)
     /// recovers every named file, not just the data bytes.</summary>

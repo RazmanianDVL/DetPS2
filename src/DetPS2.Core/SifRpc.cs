@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace DetPS2.Core;
@@ -56,34 +57,86 @@ public readonly struct SifRpcPacket
     };
 }
 
-public sealed class LoadedIrx
+/// <summary>MODLOAD/LOADCORE module lifecycle (contract-level HLE). Real ModuleInfo_t lives on
+/// LOADCORE's image_info list; DetPS2 tracks the same states without executing IRX _start.</summary>
+public enum IopModuleState
 {
-    public int Id { get; init; }
-    public string Name { get; init; } = "";
-    public uint Entry { get; init; }
-    public uint LoadBase { get; init; }
-    public int Segments { get; init; }
+    /// <summary>Name registered, no image (HLE stub / pending).</summary>
+    Registered = 0,
+    /// <summary>IRX image relocated into IOP RAM; <c>_start</c> not yet run.</summary>
+    Loaded = 1,
+    /// <summary><c>_start</c> completed (or HLE boot module presented as already up).</summary>
+    Started = 2,
+    /// <summary>Stopped after a prior start; eligible for unload when non-resident.</summary>
+    Stopped = 3,
 }
 
 /// <summary>
-/// IOP module registry + RPC + IRX load (Phases 13/22).
+/// One IOP module table entry — HLE mirror of LOADCORE <c>ModuleInfo_t</c> fields games care about
+/// (id / name / entry / text_start / size / start order) plus MODLOAD start/stop state.
+/// </summary>
+public sealed class LoadedIrx
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+    public uint Entry { get; set; }
+    public uint LoadBase { get; set; }
+    public int Segments { get; set; }
+    /// <summary>Real loaded extent (0 if name-only HLE registration).</summary>
+    public uint Size { get; set; }
+    public IopModuleState State { get; set; }
+    /// <summary>Monotonic order assigned on each successful Start (1-based). 0 = never started.</summary>
+    public int StartOrder { get; set; }
+    /// <summary>Last <c>_start</c> / stop return (MODULE_RESIDENT_END=0, NO_RESIDENT=1, REMOVABLE=2).</summary>
+    public int LastModRes { get; set; }
+    /// <summary>True when real IRX bytes were placed in IOP RAM via <see cref="IopModuleHost.LoadIrx"/>.</summary>
+    public bool HasImage { get; set; }
+    /// <summary>Boot/default HLE modules that must not be unloaded (InitDefaults / system).</summary>
+    public bool SystemResident { get; set; }
+}
+
+/// <summary>
+/// IOP module registry + RPC + IRX load (Phases 13/22) + MODLOAD contract HLE.
+/// Module table / load / start / stop / unload / search-by-name|address are ground-truthed against
+/// BIOS MODLOAD.IRX (tools/bios-decomp/MODLOAD_ALL.txt) and ps2sdk <c>modload.h</c> / LOADFILE RPC.
+/// Cross-module export linking remains LOADCORE's domain via <see cref="IrxLoader"/>.
 /// </summary>
 public sealed class IopModuleHost
 {
     private readonly Dictionary<string, int> _modules = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Full module table keyed by MODLOAD id (also backs legacy <see cref="TryGetIrx"/>).</summary>
     private readonly Dictionary<int, LoadedIrx> _irxById = new();
     private readonly Dictionary<int, string> _openFiles = new();
     private readonly Dictionary<int, OpenHostFile> _hostFiles = new();
     private readonly Dictionary<int, OpenDir> _openDirs = new();
     private int _nextModuleId = 1;
+    private int _nextStartOrder = 1;
+    /// <summary>Legacy synthetic SifRpcCmd.Open path only (unbounded). Real FILEIO/IOMAN
+    /// allocation uses <see cref="AllocIoManFd"/> over slots 0..15.</summary>
     private int _nextFd = 3;
-    private int _nextDirFd = 1000;
     private uint _nextIopBase = IrxLoader.DefaultLoadBase;
     private MemoryCard _memcard = new();
     private Iso9660.Volume? _discVolume;
     private string? _discPath;
+    /// <summary>Bound BIOS image for ROMDRV <c>rom0:</c> content (null = synthetic empty stubs).</summary>
+    private byte[]? _romBios;
+    private List<RomdirExtractor.RomdirEntry>? _romdirCache;
+    /// <summary>Optional IOMAN/STDIO host for AddDrv/DelDrv + tty write routing.</summary>
+    private IopSystemHost? _ioSystem;
 
-    // fio / iox_stat mode bits (ps2sdk iox_stat.h)
+    // --- MODLOAD / loadcore result codes (ps2sdk loadcore.h + MODLOAD decomp) ---
+    /// <summary>Module _start returned "stay resident" (cannot unload).</summary>
+    public const int ModuleResidentEnd = 0;
+    /// <summary>Module _start returned non-resident (unloadable after stop).</summary>
+    public const int ModuleNoResidentEnd = 1;
+    /// <summary>Module _start returned removable (modload &gt; v1.2).</summary>
+    public const int ModuleRemovableEnd = 2;
+    /// <summary>StartModule: id not on image_info list (decomp FUN_000005a0 → 0xFFFFFF36).</summary>
+    public const int ModloadErrNotFound = unchecked((int)0xFFFFFF36); // -202
+    /// <summary>Illegal boot device / cannot unload resident (decomp / LOADFILE 0xFFFFFF37).</summary>
+    public const int ModloadErrIllegal = unchecked((int)0xFFFFFF37); // -201
+
+    // fio / iox_stat mode bits (ps2sdk iox_stat.h / io_common.h)
     public const uint FioSIfDir = 0x1000;
     public const uint FioSIfReg = 0x2000;
     public const uint FioSIfmt = 0xF000;
@@ -92,16 +145,16 @@ public sealed class IopModuleHost
     public const uint FioSIxusr = 0x0040;
 
     // Real BIOS IOMAN.IRX file-descriptor table, ground-truthed via Ghidra decompile
-    // (tools/bios-decomp/IOMAN_ALL.txt) rather than assumed: FUN_00000b98 (fd allocator) scans a
-    // fixed 16-slot table (bound confirmed independently by FUN_00000c3c's `0xf < fd` validity
-    // check) and, when every slot is in use, returns real errno 24 (EMFILE, "out of file
-    // descriptors" -- the real BIOS's own debug string) rather than failing silently or growing
-    // unbounded. DetPS2's own fd numbering previously had no such limit at all (_nextFd just
-    // incremented forever) -- a title that deliberately exhausts descriptors to test its own
-    // error handling (a real, if uncommon, defensive pattern) would never see the failure path
-    // real hardware guarantees.
+    // (tools/bios-decomp/IOMAN_ALL.txt): FUN_00000b98 scans a fixed 16-slot table; FUN_00000c3c
+    // validates with `0xf < fd`. Exhaustion returns real errno -24 (EMFILE, module string
+    // "out of file descriptors"). sceOpen and sceDopen share the same allocator; successful
+    // open returns the slot index 0..15 (not an unbounded counter).
     private const int IoManMaxDescriptors = 16;
-    private const int IoManErrnoOutOfDescriptors = -24;
+    public const int IoManErrnoOutOfDescriptors = -24; // EMFILE
+    public const int IoManErrnoBadFile = -9;           // EBADF
+    public const int IoManErrnoNoDevice = -19;         // ENODEV (unknown device)
+    public const int IoManErrnoInvalid = -22;          // EINVAL (bad lseek whence)
+    public const int IoManErrnoNoEntry = -2;           // ENOENT (missing path on mounted disc)
 
     private sealed class OpenHostFile
     {
@@ -110,6 +163,8 @@ public sealed class IopModuleHost
         public int Position;
         public uint Lba;
         public uint Size;
+        /// <summary>Extra byte offset within the first sector for virtual sub-streams (RKV entries).</summary>
+        public int BaseOffset;
     }
 
     private sealed class OpenDir
@@ -120,11 +175,30 @@ public sealed class IopModuleHost
     }
 
     public ulong RpcHandled { get; private set; }
+    /// <summary>FILEIO open/read/stat hits that resolved real ROMDIR bytes via ROMDRV HLE.</summary>
+    public ulong Rom0BytesServed { get; private set; }
+    /// <summary>True when a BIOS image is bound for <c>rom0:</c> content serving.</summary>
+    public bool RomBiosBound => _romBios != null && _romBios.Length > 0;
+    /// <summary>ROMDIR entry count when a BIOS image is bound; 0 otherwise.</summary>
+    public int RomdirEntryCount => _romdirCache?.Count ?? 0;
     public int ModuleCount => _modules.Count;
-    public int IrxLoadedCount => _irxById.Count;
+    /// <summary>Modules that currently have a real IRX image in IOP RAM.</summary>
+    public int IrxLoadedCount
+    {
+        get
+        {
+            int n = 0;
+            foreach (var m in _irxById.Values)
+                if (m.HasImage) n++;
+            return n;
+        }
+    }
     public MemoryCard MemCard => _memcard;
     public ulong IrxLoads { get; private set; }
     public ulong DiscBytesRead { get; private set; }
+    public ulong ModuleStarts { get; private set; }
+    public ulong ModuleStops { get; private set; }
+    public ulong ModuleUnloads { get; private set; }
 
     /// <summary>Share system memory card instance (Phase 31).</summary>
     public void BindMemCard(MemoryCard card) => _memcard = card ?? new MemoryCard();
@@ -137,14 +211,64 @@ public sealed class IopModuleHost
         _hostFiles.Clear();
         _openDirs.Clear();
         _nextModuleId = 1;
+        _nextStartOrder = 1;
         _nextFd = 3;
-        _nextDirFd = 1000;
         _nextIopBase = IrxLoader.DefaultLoadBase;
         RpcHandled = 0;
         IrxLoads = 0;
         DiscBytesRead = 0;
-        // keep disc volume + bound card
+        Rom0BytesServed = 0;
+        ModuleStarts = 0;
+        ModuleStops = 0;
+        ModuleUnloads = 0;
+        ImportsResolved = 0;
+        ImportsUnresolved = 0;
+        _exportRegistry.Clear();
+        // keep disc volume + ROM bios binding + bound card
         _memcard.Format();
+    }
+
+    /// <summary>
+    /// Bind a BIOS ROM image so FILEIO/IOMAN <c>rom0:</c> paths serve real ROMDIR content
+    /// (ROMDRV contract). Pass null/empty to clear and fall back to synthetic empty stubs.
+    /// </summary>
+    public void BindRomBios(byte[]? biosImage)
+    {
+        if (biosImage == null || biosImage.Length == 0)
+        {
+            _romBios = null;
+            _romdirCache = null;
+            return;
+        }
+        _romBios = biosImage;
+        _romdirCache = RomdirExtractor.ParseRomdir(biosImage);
+    }
+
+    /// <summary>IOMAN-shaped first free slot in 0..15 across file + directory opens.
+    /// Returns -1 if the table is full (caller maps to EMFILE).</summary>
+    private int AllocIoManFd()
+    {
+        for (int fd = 0; fd < IoManMaxDescriptors; fd++)
+        {
+            if (!_hostFiles.ContainsKey(fd) && !_openDirs.ContainsKey(fd))
+                return fd;
+        }
+        return -1;
+    }
+
+    /// <summary>Non-cdrom device prefixes that must not be rejected just because a disc is
+    /// mounted (boot probes open host:/mc0:/rom0: without ISO entries).</summary>
+    private static bool IsNonDiscDevicePath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        // Require colon form ("host:foo") so bare names still resolve against the ISO.
+        int colon = path.IndexOf(':');
+        if (colon <= 0) return false;
+        string dev = path[..colon].ToLowerInvariant();
+        // Strip trailing unit digit: mc0, host0, rom0, tty00 → mc/host/rom/tty
+        while (dev.Length > 0 && char.IsDigit(dev[^1]))
+            dev = dev[..^1];
+        return dev is "host" or "mc" or "rom" or "tty" or "dev" or "hdd" or "pfs" or "mass";
     }
 
     /// <summary>Mounted ISO volume (null if none). Used by LOADFILE disc path loads.</summary>
@@ -163,22 +287,78 @@ public sealed class IopModuleHost
 
     public void InitDefaults()
     {
-        RegisterModule("FILEIO");
-        RegisterModule("PADMAN");
-        RegisterModule("CDVDMAN");
-        RegisterModule("SIO2MAN");
-        RegisterModule("MCMAN");
-        RegisterModule("MCSERV");
-        RegisterModule("LIBSD");
+        // System-resident HLE destinations (commercial boot assumes these already Started).
+        RegisterModule("FILEIO", systemResident: true);
+        RegisterModule("PADMAN", systemResident: true);
+        RegisterModule("CDVDMAN", systemResident: true);
+        RegisterModule("SIO2MAN", systemResident: true);
+        RegisterModule("MCMAN", systemResident: true);
+        RegisterModule("MCSERV", systemResident: true);
+        RegisterModule("LIBSD", systemResident: true);
     }
 
-    public int RegisterModule(string name)
+    
+    /// <summary>
+    /// Resolve a single import library against the current registry (test / diagnostics helper).
+    /// Returns the table if present with matching major version, else null.
+    /// </summary>
+    public IrxLoader.ExportTable? LookupExportLibrary(string name, byte versionMajor = 1)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        if (!_exportRegistry.TryGetValue(name, out var lib)) return null;
+        if (lib.VersionMajor != versionMajor) return null;
+        return lib;
+    }
+
+    
+    /// <summary>
+    /// Register (or replace) an export library by name without loading a real IRX image.
+    /// Used by BIOS HLE hosts (SYSCLIB/HEAPLIB, etc.) so <see cref="IrxLoader.LinkImports"/>
+    /// resolves stubs to non-null function pointers when the real module is not executed on
+    /// R3000. Same last-wins semantics as scanning a freshly loaded IRX export table.
+    /// </summary>
+    public void RegisterExportLibrary(IrxLoader.ExportTable table)
+    {
+        if (table == null || string.IsNullOrEmpty(table.Name)) return;
+        if (table.Exports == null || table.Exports.Length == 0) return;
+        // Reject all-null export arrays — LinkImports would J to 0.
+        bool any = false;
+        for (int i = 0; i < table.Exports.Length; i++)
+            if (table.Exports[i] != 0) { any = true; break; }
+        if (!any) return;
+        _exportRegistry[table.Name] = table;
+    }
+
+    /// <summary>
+    /// Register a module name in the MODLOAD/LOADCORE table. Existing name → same id (search/load
+    /// idempotent). New entries are marked <see cref="IopModuleState.Started"/> so BIOS/boot HLE
+    /// and LOADFILE path loads present as already running (real LoadStartModule path).
+    /// </summary>
+    /// <param name="systemResident">If true, UnloadModule refuses (InitDefaults / BIOS stack).</param>
+    public int RegisterModule(string name, bool systemResident = false)
     {
         name = NormalizeName(name);
+        if (string.IsNullOrEmpty(name))
+            return ModloadErrIllegal;
         if (_modules.TryGetValue(name, out int id))
+        {
+            if (systemResident && _irxById.TryGetValue(id, out var existing))
+                existing.SystemResident = true;
             return id;
+        }
         id = _nextModuleId++;
         _modules[name] = id;
+        _irxById[id] = new LoadedIrx
+        {
+            Id = id,
+            Name = name,
+            State = IopModuleState.Started,
+            StartOrder = _nextStartOrder++,
+            LastModRes = ModuleResidentEnd,
+            HasImage = false,
+            SystemResident = systemResident,
+        };
+        ModuleStarts++;
         return id;
     }
 
@@ -191,6 +371,178 @@ public sealed class IopModuleHost
     public bool IsModuleLoaded(string name) => TryGetModule(name, out _);
 
     public bool TryGetIrx(int id, out LoadedIrx irx) => _irxById.TryGetValue(id, out irx!);
+
+    /// <summary>Snapshot of the module table in ascending id order (LOADCORE image_info walk).</summary>
+    public IReadOnlyList<LoadedIrx> GetModuleTable()
+    {
+        var list = new List<LoadedIrx>(_irxById.Count);
+        foreach (var kv in _irxById.OrderBy(k => k.Key))
+            list.Add(kv.Value);
+        return list;
+    }
+
+    /// <summary>MODLOAD GetModuleIdList — positive ids currently in the table, ascending.</summary>
+    public int GetModuleIdList(Span<int> dest)
+    {
+        int n = 0;
+        foreach (var kv in _irxById.OrderBy(k => k.Key))
+        {
+            if (n >= dest.Length) break;
+            dest[n++] = kv.Key;
+        }
+        return n;
+    }
+
+    /// <summary>MODLOAD SearchModuleByName / LOADFILE LF_F_SEARCH_MOD_BY_NAME. Returns id or -1.</summary>
+    public int SearchModuleByName(string name)
+        => TryGetModule(name, out int id) ? id : -1;
+
+    /// <summary>
+    /// MODLOAD SearchModuleByAddress / LOADFILE LF_F_SEARCH_MOD_BY_ADDRESS.
+    /// Accepts IOP physical or EE-mapped (0x1Cxxxxxx) addresses; name-only stubs never match.
+    /// Module <see cref="LoadedIrx.LoadBase"/> is stored EE-mapped (IOP_RAM_BASE + local).
+    /// </summary>
+    public int SearchModuleByAddress(uint addr)
+    {
+        static uint ToPhys(uint a) =>
+            a >= SystemMemory.IOP_RAM_BASE ? a - SystemMemory.IOP_RAM_BASE : a;
+        uint physAddr = ToPhys(addr);
+        foreach (var m in _irxById.Values)
+        {
+            if (!m.HasImage) continue;
+            uint size = m.Size == 0 ? 0x1000u : m.Size;
+            uint physBase = ToPhys(m.LoadBase);
+            if (physAddr >= physBase && physAddr < physBase + size)
+                return m.Id;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// MODLOAD StartModule(id) — decomp FUN_00000358 / FUN_000005a0 case 2.
+    /// Returns module id on success, <see cref="ModloadErrNotFound"/> if id unknown.
+    /// <paramref name="modres"/> is the HLE _start return (MODULE_*_END).
+    /// </summary>
+    public int StartModule(int id, out int modres)
+    {
+        modres = 0;
+        if (!_irxById.TryGetValue(id, out var m))
+            return ModloadErrNotFound;
+        if (m.State == IopModuleState.Started)
+        {
+            modres = m.LastModRes;
+            return id;
+        }
+        // HLE: no real R3000 entry — treat success as resident stay (matches most BIOS IRX).
+        m.LastModRes = ModuleResidentEnd;
+        m.State = IopModuleState.Started;
+        m.StartOrder = _nextStartOrder++;
+        modres = m.LastModRes;
+        ModuleStarts++;
+        return id;
+    }
+
+    /// <summary>
+    /// MODLOAD StopModule / LOADFILE LF_F_MOD_STOP. Returns id on success, error if unknown.
+    /// </summary>
+    public int StopModule(int id, out int modres)
+    {
+        modres = 0;
+        if (!_irxById.TryGetValue(id, out var m))
+            return ModloadErrNotFound;
+        if (m.State == IopModuleState.Stopped || m.State == IopModuleState.Registered
+            || m.State == IopModuleState.Loaded)
+        {
+            // Already not running — success with zero modres (idempotent stop).
+            m.State = IopModuleState.Stopped;
+            modres = 0;
+            return id;
+        }
+        m.State = IopModuleState.Stopped;
+        modres = 0;
+        ModuleStops++;
+        return id;
+    }
+
+    /// <summary>
+    /// MODLOAD UnloadModule / LOADFILE LF_F_MOD_UNLOAD. Removes table entry when allowed.
+    /// System-resident (InitDefaults) modules refuse with <see cref="ModloadErrIllegal"/>.
+    /// Auto-stops if still Started (client may omit an explicit stop).
+    /// </summary>
+    
+    /// <summary>
+    /// LOADFILE <c>LF_F_SEARCH_MOD_BY_ADDRESS</c>: find a relocated IRX whose load range
+    /// contains <paramref name="addr"/> (EE-mapped 0x1Cxxxxxx or IOP physical).
+    /// Name-only registrations (no real load base) are not searchable by address.
+    /// </summary>
+    public bool TryFindModuleByAddress(uint addr, out int id)
+    {
+        id = -1;
+        static uint ToIopPhys(uint a)
+        {
+            if (a >= SystemMemory.IOP_RAM_BASE)
+                a -= SystemMemory.IOP_RAM_BASE;
+            return a & 0x1FFFFFu; // 2 MiB IOP window
+        }
+        uint phys = ToIopPhys(addr);
+        // Prefer the tightest (highest LoadBase) match — modules are placed contiguously and a
+        // fixed 64 KiB guess window can overlap the next module's base. Real LOADCORE uses exact
+        // extents; HLE LoadedIrx only has Segments, so this is the least-surprising approximation.
+        uint bestStart = 0;
+        bool found = false;
+        foreach (var kv in _irxById)
+        {
+            var irx = kv.Value;
+            // LoadedIrx.LoadBase is EE-mapped (0x1Cxxxxxx) from IrxLoader; normalize both sides.
+            uint start = ToIopPhys(irx.LoadBase);
+            uint end = start + 0x10000u;
+            if (phys >= start && phys < end && (!found || start >= bestStart))
+            {
+                bestStart = start;
+                id = irx.Id;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    public int UnloadModule(int id)
+    {
+        if (!_irxById.TryGetValue(id, out var m))
+            return ModloadErrNotFound;
+        if (m.SystemResident)
+            return ModloadErrIllegal;
+        if (m.State == IopModuleState.Started)
+            StopModule(id, out _);
+        // Real resident modules (LastModRes==MODULE_RESIDENT_END with image) refuse unload.
+        // HLE LoadIrx always records modres=0 (resident) because _start is not executed.
+        // Name-only RegisterModule stubs remain unloadable so LF_F_MOD_UNLOAD is still useful.
+        if (m.HasImage && m.LastModRes == ModuleResidentEnd)
+            return ModloadErrIllegal;
+        _irxById.Remove(id);
+        _modules.Remove(m.Name);
+        ModuleUnloads++;
+        return id;
+    }
+
+    /// <summary>
+    /// MODLOAD IsIllegalBootDevice (FUN_00000bb8): rejects mc*/hd*/net*/dev* device prefixes.
+    /// LOADFILE refuses LoadModule on these with 0xFFFFFF37.
+    /// </summary>
+    public static bool IsIllegalBootDevice(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        // Strip whitespace like the real skip loop.
+        int i = 0;
+        while (i < path.Length && (path[i] == ' ' || path[i] == '\t')) i++;
+        if (i >= path.Length) return false;
+        // Device name before ':' if present, else whole string prefix check.
+        int colon = path.IndexOf(':', i);
+        string head = (colon > i ? path[i..colon] : path[i..]).ToLowerInvariant();
+        while (head.Length > 0 && char.IsDigit(head[^1]))
+            head = head[..^1];
+        return head is "mc" or "hd" or "hdd" or "net" or "dev";
+    }
 
     // Real cross-module import/export linking registry (IrxLoader.ScanExports/LinkImports,
     // ground-truthed against the real BIOS LOADCORE module — see IrxLoader.cs's own doc comment
@@ -206,7 +558,7 @@ public sealed class IopModuleHost
     /// cross-module linking: register any libraries this module exports, then resolve this
     /// module's own unresolved imports against every library registered so far (real boot order
     /// matters exactly as on real hardware — a module can only call into libraries loaded before
-    /// it).</summary>
+    /// it). Matches MODLOAD LoadStartModule: image load then implicit start (modres resident).</summary>
     public IrxLoader.LoadResult LoadIrx(byte[] elf, SystemMemory mem, string? nameOverride = null)
     {
         uint baseLocal = _nextIopBase;
@@ -217,15 +569,7 @@ public sealed class IopModuleHost
         string name = !string.IsNullOrEmpty(nameOverride)
             ? nameOverride!
             : (string.IsNullOrEmpty(result.ModuleName) ? $"IRX{_nextModuleId}" : result.ModuleName);
-        int id = RegisterModule(name);
-        _irxById[id] = new LoadedIrx
-        {
-            Id = id,
-            Name = NormalizeName(name),
-            Entry = result.Entry,
-            LoadBase = result.LoadBase,
-            Segments = result.Segments
-        };
+        name = NormalizeName(name);
 
         // Real cross-module linking: scan this module's own real loaded extent (result.Size,
         // not a fixed guess) for both directions (it may both export libraries and import from
@@ -233,6 +577,36 @@ public sealed class IopModuleHost
         // size is 0x6C94 (~27KB), confirmed live via `load-irx --scan-exports` against the real
         // extracted module, well past a fixed 16KB window.
         uint moduleSize = Math.Max(result.Size, 0x1000u); // sane floor for the legacy no-Size path
+
+        int id;
+        if (_modules.TryGetValue(name, out id) && _irxById.TryGetValue(id, out var prior))
+        {
+            // Upgrade existing name registration with a real image (keep id).
+            prior.Entry = result.Entry;
+            prior.LoadBase = result.LoadBase;
+            prior.Segments = result.Segments;
+            prior.Size = moduleSize;
+            prior.HasImage = true;
+            prior.State = IopModuleState.Loaded;
+        }
+        else
+        {
+            id = _nextModuleId++;
+            _modules[name] = id;
+            _irxById[id] = new LoadedIrx
+            {
+                Id = id,
+                Name = name,
+                Entry = result.Entry,
+                LoadBase = result.LoadBase,
+                Segments = result.Segments,
+                Size = moduleSize,
+                HasImage = true,
+                State = IopModuleState.Loaded,
+                SystemResident = false,
+            };
+        }
+
         uint scanStart = result.LoadBase;
         uint scanEnd = result.LoadBase + moduleSize;
         foreach (var lib in IrxLoader.ScanExports(mem, scanStart, scanEnd))
@@ -240,6 +614,10 @@ public sealed class IopModuleHost
         var (resolved, unresolved) = IrxLoader.LinkImports(mem, scanStart, scanEnd, _exportRegistry);
         ImportsResolved += (ulong)resolved;
         ImportsUnresolved += (ulong)unresolved;
+
+        // MODLOAD LoadStartModule: call _start after load. HLE has no R3000 exec — mark Started
+        // with MODULE_RESIDENT_END (0), the return value almost every BIOS IRX uses.
+        StartModule(id, out _);
 
         // Advance base for next load, rounded up to a 16KB boundary past this module's real
         // extent — previously a fixed +0x4000 regardless of real size, which silently let a
@@ -258,7 +636,8 @@ public sealed class IopModuleHost
             Gp = result.Gp,
             LoadBase = result.LoadBase,
             Segments = result.Segments,
-            ModuleName = NormalizeName(name)
+            Size = moduleSize,
+            ModuleName = name
         };
     }
 
@@ -267,6 +646,10 @@ public sealed class IopModuleHost
         name = name.Trim();
         int slash = name.LastIndexOfAny(new[] { '/', '\\' });
         if (slash >= 0) name = name[(slash + 1)..];
+        int colon = name.IndexOf(':');
+        if (colon >= 0) name = name[(colon + 1)..];
+        int semi = name.IndexOf(';');
+        if (semi >= 0) name = name[..semi];
         int dot = name.IndexOf('.');
         if (dot > 0) name = name[..dot];
         return name.ToUpperInvariant();
@@ -365,7 +748,7 @@ public sealed class IopModuleHost
         // Stream from disc by LBA for large files
         if (_discVolume?.Disc != null && hf.Size > 0 && hf.Lba != 0)
         {
-            long off = (long)hf.Lba * Iso9660.SectorSize + hf.Position;
+            long off = (long)hf.Lba * Iso9660.SectorSize + hf.BaseOffset + hf.Position;
             int n = (int)Math.Min(want, (uint)Math.Max(0, (int)hf.Size - hf.Position));
             if (n <= 0) return 0;
             byte[] buf = new byte[n];
@@ -400,82 +783,313 @@ public sealed class IopModuleHost
 
     // ---- Public FILEIO ops used by RealSifRpc sid=0x80000001 ----
 
-    /// <summary>fio open by path string; returns fd, or a real negative errno on failure
-    /// (-24/EMFILE when the real 16-descriptor table is full — see IoManMaxDescriptors's doc
-    /// comment).</summary>
+    /// <summary>fio open by path string; returns IOMAN slot 0..15, or a real negative errno
+    /// (-24 EMFILE, -2 ENOENT, -9 EBADF, -19 ENODEV on later ops).</summary>
+    /// <summary>Size of an open FILEIO fd (host Data length or ISO Size); false if bad fd.</summary>
+    public bool TryGetOpenFileSize(int fd, out uint size)
+    {
+        size = 0;
+        if (!_hostFiles.TryGetValue(fd, out var hf)) return false;
+        size = hf.Size != 0 ? hf.Size : (uint)(hf.Data?.Length ?? 0);
+        return true;
+    }
+
+    /// <summary>ISO extent LBA for a streamed open file; false if not disc-backed.</summary>
+    public bool TryGetOpenFileLba(int fd, out uint lba)
+    {
+        lba = 0;
+        if (!_hostFiles.TryGetValue(fd, out var hf)) return false;
+        if (hf.Lba == 0) return false;
+        lba = hf.Lba;
+        return true;
+    }
+
+    /// <summary>
+    /// Host-side byte read from an open fd (for TOC parse etc.). Does not advance the fd
+    /// position permanently — saves/restores <see cref="OpenHostFile.Position"/>.
+    /// </summary>
+    public bool TryReadOpenFileBytes(int fd, int offset, int count, out byte[]? data)
+    {
+        data = null;
+        if (!_hostFiles.TryGetValue(fd, out var hf) || count <= 0) return false;
+        count = Math.Min(count, 2 * 1024 * 1024);
+        var buf = new byte[count];
+        int saved = hf.Position;
+        try
+        {
+            if (hf.Data != null)
+            {
+                if (offset < 0 || offset >= hf.Data.Length) return false;
+                int n = Math.Min(count, hf.Data.Length - offset);
+                Buffer.BlockCopy(hf.Data, offset, buf, 0, n);
+                if (n < count) Array.Resize(ref buf, n);
+                data = buf;
+                return n > 0;
+            }
+            if (_discVolume?.Disc != null && hf.Size > 0 && hf.Lba != 0)
+            {
+                long off = (long)hf.Lba * Iso9660.SectorSize + hf.BaseOffset + offset;
+                int n = (int)Math.Min(count, Math.Max(0, (int)hf.Size - offset));
+                if (n <= 0) return false;
+                if (n != buf.Length) buf = new byte[n];
+                int got = _discVolume.Disc.ReadAt(off, buf);
+                if (got < n) Array.Resize(ref buf, got);
+                data = buf;
+                return got > 0;
+            }
+            return false;
+        }
+        finally
+        {
+            hf.Position = saved;
+        }
+    }
+
+    /// <summary>True when open fd serves from LBA streaming (no in-memory Data preload).</summary>
+    public bool OpenFileIsStreamed(int fd) =>
+        _hostFiles.TryGetValue(fd, out var hf) && hf.Data == null && hf.Lba != 0 && hf.Size > 0;
+
+    /// <summary>
+    /// Open a virtual stream backed by an absolute byte offset within the mounted disc image
+    /// (e.g. PS2.RKV entry: base LBA of archive + byte offset). Used by GOE/RKV TOC HLE.
+    /// </summary>
+    public int FileOpenVirtualStream(string path, uint discByteOffset, uint size)
+    {
+        if (_discVolume?.Disc == null || size == 0)
+            return IoManErrnoNoEntry;
+        int fd = AllocIoManFd();
+        if (fd < 0) return IoManErrnoOutOfDescriptors;
+        // Lba = sector of archive byte; BaseOffset = remainder so seek(0) still hits entry start.
+        uint lba = discByteOffset / Iso9660.SectorSize;
+        int baseOff = (int)(discByteOffset % Iso9660.SectorSize);
+        var hf = new OpenHostFile
+        {
+            Path = path,
+            Data = null,
+            Lba = lba,
+            BaseOffset = baseOff,
+            Size = size,
+            Position = 0,
+        };
+        _openFiles[fd] = path;
+        _hostFiles[fd] = hf;
+        return fd;
+    }
+
+    /// <summary>Open an in-memory stub (empty or caller-provided) so ENOENT does not abort boot.</summary>
+    public int FileOpenMemoryStub(string path, byte[] data)
+    {
+        int fd = AllocIoManFd();
+        if (fd < 0) return IoManErrnoOutOfDescriptors;
+        var hf = new OpenHostFile
+        {
+            Path = path,
+            Data = data ?? Array.Empty<byte>(),
+            Size = (uint)(data?.Length ?? 0),
+            Position = 0,
+            Lba = 0,
+        };
+        _openFiles[fd] = path;
+        _hostFiles[fd] = hf;
+        return fd;
+    }
+
     public int FileOpen(string path, int mode = 0)
     {
-        if (string.IsNullOrEmpty(path)) return -1;
-        if (_hostFiles.Count >= IoManMaxDescriptors) return IoManErrnoOutOfDescriptors;
-        int fd = _nextFd++;
-        _openFiles[fd] = path;
+        if (string.IsNullOrEmpty(path)) return IoManErrnoNoEntry;
+        // IOMAN FUN_00000d28: colon path with unknown device → ENODEV (-19).
+        // Relative (no colon) paths stay allowed for disc-relative probes.
+        // Only enforce when the registry has been seeded (DeviceCount > 0).
+        if (_ioSystem != null && _ioSystem.DeviceCount > 0
+            && path.IndexOf(':') >= 0 && !_ioSystem.IsKnownDevicePath(path))
+            return IoManErrnoNoDevice;
+        int fd = AllocIoManFd();
+        if (fd < 0) return IoManErrnoOutOfDescriptors;
+
         var hf = new OpenHostFile { Path = path, Position = 0 };
-        if (_discVolume != null)
+        bool nonDisc = IsNonDiscDevicePath(path);
+
+        // ROMDRV: rom0:/rom: file content from bound BIOS ROMDIR (or synthetic empty stubs).
+        if (TryResolveRom0Path(path, out string? romName))
+        {
+            byte[]? romData = ResolveRom0Content(romName!);
+            if (romData != null)
+            {
+                hf.Data = romData;
+                hf.Size = (uint)romData.Length;
+                Rom0BytesServed += (uint)romData.Length;
+            }
+            else if (RomBiosBound)
+            {
+                // Real ROM image present but name not in ROMDIR — commercial probes branch on ENOENT.
+                return IoManErrnoNoEntry;
+            }
+            else
+            {
+                // No BIOS bound: empty stub so host/boot probes that open rom0:FOO still succeed.
+                hf.Data = Array.Empty<byte>();
+                hf.Size = 0;
+            }
+        }
+        else if (_discVolume != null && !nonDisc)
         {
             string norm = NormalizeDiscPath(path);
             var entry = FindDiscEntry(norm) ?? FindDiscEntryAny(norm);
-            if (entry != null && !entry.IsDirectory && entry.Size > 0)
+            if (entry != null && !entry.IsDirectory)
             {
-                if (entry.Size <= 16 * 1024 * 1024)
+                if (entry.Size > 0 && entry.Size <= 16 * 1024 * 1024)
                     hf.Data = Iso9660.ReadFile(_discVolume, entry.Path);
+                else if (entry.Size == 0)
+                    hf.Data = Array.Empty<byte>();
                 hf.Lba = entry.ExtentLba;
                 hf.Size = entry.Size;
             }
-            else if (entry == null && (mode & 0x200) != 0)
+            else if (entry != null && entry.IsDirectory)
             {
-                // O_CREAT-ish: allow empty host file for write probes
+                // Opening a directory via sceOpen is rejected by most cdvd drivers.
+                return IoManErrnoNoEntry;
+            }
+            else if ((mode & 0x200) != 0) // FIO_O_CREAT
+            {
                 hf.Data = Array.Empty<byte>();
             }
-            else if (entry == null && !_discVolume.Files.Exists(f => !f.IsDirectory))
+            else if (!_discVolume.Files.Exists(f => !f.IsDirectory))
             {
-                // no disc files — still return fd for boot probes
+                // Empty volume — allow open for boot probes (no real content).
             }
-            else if (entry == null)
+            else
             {
-                // Missing path on real disc — fail open (commercial games check this)
-                _openFiles.Remove(fd);
-                return -1;
+                // Missing path on a real mounted disc — commercial titles branch on this.
+                return IoManErrnoNoEntry;
             }
         }
+        else if (nonDisc || _discVolume == null)
+        {
+            // host:/mc0: probes, or no disc: empty file so open succeeds.
+            hf.Data ??= Array.Empty<byte>();
+        }
+
+        _openFiles[fd] = path;
         _hostFiles[fd] = hf;
         _ = mode;
         return fd;
     }
 
+    /// <summary>IOMAN sceClose: free slot; EBADF (-9) if invalid (FUN_000003a4 / FUN_00000c3c).</summary>
     public int FileClose(int fd)
     {
+        if (fd < 0 || fd >= IoManMaxDescriptors)
+            return IoManErrnoBadFile;
+        bool hadFile = _hostFiles.Remove(fd);
+        bool hadDir = _openDirs.Remove(fd);
         _openFiles.Remove(fd);
-        _hostFiles.Remove(fd);
+        if (!hadFile && !hadDir)
+            return IoManErrnoBadFile;
         return 0;
     }
 
+    /// <summary>fio read into EE buffer. Invalid fd → EBADF (does not zero-fill — that legacy
+    /// path remains only on the synthetic SifRpcCmd.Read dispatcher).</summary>
     public int FileRead(SystemMemory mem, int fd, uint buf, uint size)
     {
-        var pkt = new SifRpcPacket
+        if (!_hostFiles.TryGetValue(fd, out var hf))
+            return IoManErrnoBadFile;
+        if (buf == 0) return 0;
+        uint want = Math.Min(size, 0x200000u);
+        if (want == 0) return 0;
+
+        if (hf.Data != null)
         {
-            Cmd = SifRpcCmd.Read,
-            EeBuffer = buf,
-            Size = size,
-            Result = unchecked((uint)fd)
-        };
-        return unchecked((int)DoRead(pkt, mem));
+            int avail = Math.Max(0, hf.Data.Length - hf.Position);
+            int n = (int)Math.Min(want, (uint)avail);
+            for (int i = 0; i < n; i++)
+                mem.Write8(buf + (uint)i, hf.Data[hf.Position + i]);
+            hf.Position += n;
+            DiscBytesRead += (uint)n;
+            return n;
+        }
+
+        if (_discVolume?.Disc != null && hf.Size > 0 && hf.Lba != 0)
+        {
+            long off = (long)hf.Lba * Iso9660.SectorSize + hf.BaseOffset + hf.Position;
+            int n = (int)Math.Min(want, (uint)Math.Max(0, (int)hf.Size - hf.Position));
+            if (n <= 0) return 0;
+            byte[] tmp = new byte[n];
+            int got = _discVolume.Disc.ReadAt(off, tmp);
+            for (int i = 0; i < got; i++)
+                mem.Write8(buf + (uint)i, tmp[i]);
+            hf.Position += got;
+            DiscBytesRead += (uint)got;
+            return got;
+        }
+
+        // Empty host file / no backing — EOF
+        return 0;
     }
 
     public int FileWrite(SystemMemory mem, int fd, uint buf, uint size)
     {
-        var pkt = new SifRpcPacket
+        if (!_hostFiles.TryGetValue(fd, out var hf))
+            return IoManErrnoBadFile;
+        // STDIO tty/stderr: route bytes to the optional IOMAN/STDIO sink (non-fatal log).
+        if (IsStdioPath(hf.Path) && mem != null && buf != 0 && size > 0)
         {
-            Cmd = SifRpcCmd.Write,
-            EeBuffer = buf,
-            Size = size,
-            Result = unchecked((uint)fd)
-        };
-        return unchecked((int)DoWrite(pkt, mem));
+            int n = (int)Math.Min(size, 0x1000u);
+            if (_ioSystem != null)
+                return _ioSystem.StdioWriteBytes(mem, buf, (uint)n);
+            // Fallback: swallow as successful write (no sink bound).
+            return n;
+        }
+        // Read-only ISO + empty host stubs: report the requested size as written so write
+        // probes don't spin; no durable store beyond the open lifetime.
+        // (Blood Omen 2 opens GAME.ERG RDWR and writes short config lines; success keeps boot moving.)
+        _ = mem; _ = buf;
+        return (int)Math.Min(size, 0x100000u);
     }
 
+    private static bool IsStdioPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        int colon = path.IndexOf(':');
+        string dev = colon > 0 ? path[..colon] : path;
+        while (dev.Length > 0 && char.IsDigit(dev[^1]))
+            dev = dev[..^1];
+        return dev.Equals("tty", StringComparison.OrdinalIgnoreCase)
+            || dev.Equals("stderr", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Optional bind to <see cref="IopSystemHost"/> for IOMAN AddDrv/DelDrv + STDIO write
+    /// routing. Called from <see cref="Ps2System"/> construction.
+    /// </summary>
+    public void BindIopSystem(IopSystemHost? io) => _ioSystem = io;
+
+    /// <summary>IOMAN AddDrv via bound system host (or local name-only fallback).</summary>
+    public int AddDrv(string name)
+    {
+        if (_ioSystem != null)
+            return _ioSystem.AddDrv(name);
+        // Fallback without IopSystem: accept name so FILEIO fno 15 does not fail hard.
+        if (string.IsNullOrWhiteSpace(name)) return -1;
+        return 0;
+    }
+
+    /// <summary>IOMAN DelDrv via bound system host.</summary>
+    public int DelDrv(string name)
+    {
+        if (_ioSystem != null)
+            return _ioSystem.DelDrv(name);
+        if (string.IsNullOrWhiteSpace(name)) return -1;
+        return 0;
+    }
+
+    /// <summary>fio lseek. Invalid fd → EBADF; whence ∉ {0,1,2} → EINVAL (IOMAN FUN_000001bc).</summary>
     public int FileSeek(int fd, int offset, int whence)
     {
-        if (!_hostFiles.TryGetValue(fd, out var hf)) return -1;
+        if (!_hostFiles.TryGetValue(fd, out var hf))
+            return IoManErrnoBadFile;
+        if (whence < 0 || whence > 2)
+            return IoManErrnoInvalid;
         int max = (int)(hf.Size != 0 ? hf.Size : (uint)(hf.Data?.Length ?? 0));
         int pos = whence switch
         {
@@ -488,48 +1102,96 @@ public sealed class IopModuleHost
     }
 
     /// <summary>
-    /// fio getstat / chstat. Writes io_stat_t-shaped fields into <paramref name="statAddr"/>
-    /// when non-zero: +0 mode, +4 attr, +8 size (u32), +0x28 hisize.
+    /// fio getstat. Writes <c>io_stat_t</c> (ps2sdk io_common.h) into <paramref name="statAddr"/>
+    /// when non-zero: +0 mode, +4 attr, +8 size, +0x0C..+0x23 times, +0x24 hisize.
     /// </summary>
     public int FileGetStat(SystemMemory mem, string path, uint statAddr)
     {
-        if (string.IsNullOrEmpty(path)) return -1;
-        string norm = NormalizeDiscPath(path);
-        var entry = FindDiscEntryAny(norm);
+        if (string.IsNullOrEmpty(path)) return IoManErrnoNoEntry;
         uint mode = FioSIrusr | FioSIwusr | FioSIxusr;
         uint size = 0;
-        if (entry != null)
+
+        if (TryResolveRom0Path(path, out string? romName))
         {
-            mode |= entry.IsDirectory ? FioSIfDir : FioSIfReg;
-            size = entry.Size;
-        }
-        else if (_discVolume == null)
-        {
-            // No disc: claim regular empty file so probes succeed
-            mode |= FioSIfReg;
+            if (RomBiosBound)
+            {
+                if (_romBios != null && RomdirExtractor.TryFindEntry(_romBios, romName!, out var re))
+                {
+                    mode |= FioSIfReg;
+                    size = re.Size;
+                }
+                else
+                    return IoManErrnoNoEntry;
+            }
+            else
+            {
+                // No BIOS: synthetic empty regular file for probes.
+                mode |= FioSIfReg;
+                size = 0;
+            }
         }
         else
-            return -1; // missing on mounted disc
+        {
+            bool nonDisc = IsNonDiscDevicePath(path);
+            string norm = NormalizeDiscPath(path);
+            var entry = nonDisc ? null : FindDiscEntryAny(norm);
+            if (entry != null)
+            {
+                mode |= entry.IsDirectory ? FioSIfDir : FioSIfReg;
+                size = entry.Size;
+            }
+            else if (_discVolume == null || nonDisc)
+            {
+                // No disc or host/mc probe: claim regular empty file so probes succeed.
+                mode |= FioSIfReg;
+            }
+            else
+                return IoManErrnoNoEntry;
+        }
 
         if (statAddr != 0)
         {
             mem.Write32(statAddr + 0, mode);
             mem.Write32(statAddr + 4, 0); // attr
             mem.Write32(statAddr + 8, size);
-            // ctime/atime/mtime 8 bytes each at +0xC,+0x14,+0x1C — leave zero
-            mem.Write32(statAddr + 0x28, 0); // hisize
+            // ctime/atime/mtime 8 bytes each at +0x0C,+0x14,+0x1C — leave zero
+            mem.Write32(statAddr + 0x24, 0); // hisize (io_stat_t ends at 0x28)
         }
         return 0;
     }
 
+    /// <summary>IOMAN sceDopen — same 16-slot allocator as sceOpen (FUN_000004c0 / FUN_00000b98).</summary>
     public int DirOpen(string path)
     {
-        // Real IOMAN.IRX's sceDopen (FUN_000004c0) allocates from the exact same 16-slot fd
-        // table as sceOpen (both call the same FUN_00000b98) -- not a separate pool.
-        if (_hostFiles.Count + _openDirs.Count >= IoManMaxDescriptors) return IoManErrnoOutOfDescriptors;
-        string norm = NormalizeDiscPath(path ?? "");
-        if (norm.Length == 0) norm = "";
+        int dfd = AllocIoManFd();
+        if (dfd < 0) return IoManErrnoOutOfDescriptors;
+        string raw = path ?? "";
         var list = new List<Iso9660.FileEntry>();
+
+        // ROMDRV: dopen("rom0:") / dopen("rom0:\\") lists ROMDIR entry names when BIOS is bound.
+        if (TryResolveRom0Path(raw, out string? romRest) &&
+            (string.IsNullOrEmpty(romRest) || romRest is "/" or "\\" or "."))
+        {
+            if (_romdirCache != null)
+            {
+                foreach (var e in _romdirCache)
+                {
+                    if (string.IsNullOrEmpty(e.Name) || e.Name == "-") continue;
+                    list.Add(new Iso9660.FileEntry
+                    {
+                        Name = e.Name,
+                        Path = e.Name,
+                        Size = e.Size,
+                        IsDirectory = false
+                    });
+                }
+            }
+            _openDirs[dfd] = new OpenDir { Path = "rom0:", Entries = list, Index = 0 };
+            return dfd;
+        }
+
+        string norm = NormalizeDiscPath(raw);
+        if (norm.Length == 0) norm = "";
         if (_discVolume != null)
         {
             string prefix = norm.TrimEnd('/');
@@ -563,42 +1225,43 @@ public sealed class IopModuleHost
                 }
             }
         }
-        int dfd = _nextDirFd++;
         _openDirs[dfd] = new OpenDir { Path = norm, Entries = list, Index = 0 };
         return dfd;
     }
 
     public int DirClose(int dfd)
     {
-        return _openDirs.Remove(dfd) ? 0 : -1;
+        if (dfd < 0 || dfd >= IoManMaxDescriptors)
+            return IoManErrnoBadFile;
+        return _openDirs.Remove(dfd) ? 0 : IoManErrnoBadFile;
     }
 
-    /// <summary>fio dread: write io_dirent_t name + stat into <paramref name="direntAddr"/>.</summary>
+    /// <summary>fio dread: write <c>io_dirent_t</c> (stat @0, name @+0x28) into
+    /// <paramref name="direntAddr"/>. Returns 1 on entry, -1 at end / EBADF.</summary>
     public int DirRead(SystemMemory mem, int dfd, uint direntAddr)
     {
-        if (!_openDirs.TryGetValue(dfd, out var dir)) return -1;
-        if (dir.Index >= dir.Entries.Count) return -1; // end
+        if (!_openDirs.TryGetValue(dfd, out var dir)) return IoManErrnoBadFile;
+        if (dir.Index >= dir.Entries.Count) return -1; // end of directory
         var e = dir.Entries[dir.Index++];
         if (direntAddr != 0)
         {
-            // io_dirent_t: io_stat_t stat; char name[256];
+            // io_dirent_t (ps2sdk io_common.h): io_stat_t (0x28) + char name[256] + privdata*
             uint mode = FioSIrusr | FioSIwusr | FioSIxusr | (e.IsDirectory ? FioSIfDir : FioSIfReg);
             mem.Write32(direntAddr + 0, mode);
             mem.Write32(direntAddr + 4, 0);
             mem.Write32(direntAddr + 8, e.Size);
-            uint nameAddr = direntAddr + 0x40; // common padding; also try +0x30
-            WriteCString(mem, nameAddr, e.Name, 255);
-            // Alternate layout used by some SDK builds: name at +0x20 after shorter stat
-            WriteCString(mem, direntAddr + 0x20, e.Name, 255);
+            mem.Write32(direntAddr + 0x24, 0); // hisize
+            WriteCString(mem, direntAddr + 0x28, e.Name, 255);
         }
-        return dir.Index; // positive remaining-ish / success
+        return 1;
     }
 
     public int FileRemove(string path)
     {
-        // Read-only ISO: pretend success for temp paths, fail for disc files
-        if (_discVolume != null && FindDiscEntryAny(NormalizeDiscPath(path)) != null)
-            return -1;
+        // Read-only ISO: pretend success for temp/host paths, fail for disc files
+        if (_discVolume != null && !IsNonDiscDevicePath(path ?? "") &&
+            FindDiscEntryAny(NormalizeDiscPath(path ?? "")) != null)
+            return IoManErrnoNoEntry;
         return 0;
     }
 
@@ -647,24 +1310,76 @@ public sealed class IopModuleHost
     private Iso9660.FileEntry? FindDiscEntry(string normPath)
     {
         if (_discVolume == null) return null;
+        string want = normPath.Replace('\\', '/').ToUpperInvariant();
         foreach (var f in _discVolume.Files)
         {
             if (f.IsDirectory) continue;
             string p = f.Path.Replace('\\', '/').ToUpperInvariant();
             string n = f.Name.ToUpperInvariant();
-            if (p == normPath || n == normPath || p.EndsWith("/" + normPath, StringComparison.Ordinal) ||
-                p.EndsWith(normPath, StringComparison.Ordinal))
+            if (p == want || n == want || p.EndsWith("/" + want, StringComparison.Ordinal) ||
+                p.EndsWith(want, StringComparison.Ordinal))
                 return f;
         }
         // basename match
-        string baseName = Path.GetFileName(normPath);
+        string baseName = Path.GetFileName(want);
         foreach (var f in _discVolume.Files)
         {
             if (f.IsDirectory) continue;
             if (string.Equals(f.Name, baseName, StringComparison.OrdinalIgnoreCase))
                 return f;
         }
+        // ISO 9660 Level-1 short-name segment match (RESOURCES↔RESOUR~1, …).
+        // Blood Omen 2 retail has no Joliet; long paths must alias onto 8.3 names.
+        if (want.IndexOf('/') >= 0 || want.IndexOf('~') < 0)
+        {
+            string[] wantSegs = want.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var f in _discVolume.Files)
+            {
+                if (f.IsDirectory) continue;
+                string p = f.Path.Replace('\\', '/').ToUpperInvariant();
+                string[] haveSegs = p.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (haveSegs.Length != wantSegs.Length) continue;
+                bool ok = true;
+                for (int i = 0; i < wantSegs.Length; i++)
+                {
+                    if (!IsoSegmentMatch(wantSegs[i], haveSegs[i]))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) return f;
+            }
+        }
         return null;
+    }
+
+    /// <summary>Match a long path segment to an ISO 8.3 name (e.g. RESOURCES vs RESOUR~1).</summary>
+    private static bool IsoSegmentMatch(string want, string have)
+    {
+        if (want == have) return true;
+        // Strip version ";1" if present on either side.
+        int sw = want.IndexOf(';'); if (sw >= 0) want = want[..sw];
+        int sh = have.IndexOf(';'); if (sh >= 0) have = have[..sh];
+        if (want == have) return true;
+        // 8.3 with tilde: PREFIX~N[.EXT]
+        int tilde = have.IndexOf('~');
+        if (tilde > 0)
+        {
+            string prefix = have[..tilde];
+            // Extension on have
+            int dotH = have.LastIndexOf('.');
+            int dotW = want.LastIndexOf('.');
+            if (dotH > tilde && dotW > 0)
+            {
+                string extH = have[(dotH + 1)..];
+                string extW = want[(dotW + 1)..];
+                string nameW = want[..dotW];
+                return nameW.StartsWith(prefix, StringComparison.Ordinal) && extH == extW;
+            }
+            return want.StartsWith(prefix, StringComparison.Ordinal);
+        }
+        return false;
     }
 
     private static string NormalizeDiscPath(string path)
@@ -678,6 +1393,49 @@ public sealed class IopModuleHost
         int semi = path.IndexOf(';');
         if (semi >= 0) path = path[..semi];
         return path.Replace('\\', '/').ToUpperInvariant();
+    }
+
+    /// <summary>
+    /// Parse <c>rom0:NAME</c> / <c>rom:NAME</c> / <c>rom0:\NAME;1</c> into a bare ROMDIR module name.
+    /// Returns true when the path targets the rom device (including bare <c>rom0:</c> for dopen).
+    /// </summary>
+    public static bool TryResolveRom0Path(string path, out string? moduleName)
+    {
+        moduleName = null;
+        if (string.IsNullOrEmpty(path)) return false;
+        string p = path.Trim();
+        string rest;
+        if (p.StartsWith("rom0:", StringComparison.OrdinalIgnoreCase))
+            rest = p[5..];
+        else if (p.StartsWith("rom:", StringComparison.OrdinalIgnoreCase))
+            rest = p[4..];
+        else if (p.StartsWith("rom1:", StringComparison.OrdinalIgnoreCase))
+            rest = p[5..];
+        else
+            return false;
+
+        rest = rest.TrimStart('\\', '/');
+        int semi = rest.IndexOf(';');
+        if (semi >= 0) rest = rest[..semi];
+        // Strip extension sometimes used in probes (rom0:PADMAN.IRX → PADMAN)
+        int dot = rest.LastIndexOf('.');
+        if (dot > 0)
+        {
+            string ext = rest[(dot + 1)..];
+            if (ext.Equals("IRX", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals("IMG", StringComparison.OrdinalIgnoreCase))
+                rest = rest[..dot];
+        }
+        moduleName = rest.Trim();
+        return true;
+    }
+
+    /// <summary>Resolve ROMDIR bytes for a bare module name. Null if unbound or missing.</summary>
+    public byte[]? ResolveRom0Content(string moduleName)
+    {
+        if (_romBios == null || _romBios.Length == 0 || string.IsNullOrWhiteSpace(moduleName))
+            return null;
+        return RomdirExtractor.ExtractModuleContent(_romBios, moduleName);
     }
 
     private static uint DoPad(SifRpcPacket pkt, SystemMemory mem, PadInput pad)

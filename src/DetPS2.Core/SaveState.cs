@@ -5,6 +5,10 @@ using System.IO.Compression;
 namespace DetPS2.Core;
 
 /// <summary>
+/// Save state v6: same layout as v5 plus KernelState THREADMAN fields that v5 omitted
+/// (EverStarted/SoftSuspended/SuspendCount/WakeupCount/Sema.InitCount). Older v5 files
+/// refuse to load once Kernel.ReadState advances (see <see cref="CurrentVersion"/>).
+///
 /// Save state v5: deflate compression, full-system snapshot.
 ///
 /// v4 and earlier saved a narrow slice of state: EE/IOP GPRs and three COP0 fields each, raw
@@ -29,7 +33,7 @@ namespace DetPS2.Core;
 public static class SaveState
 {
     private const uint Magic = 0x44505332; // 'DPS2'
-    private const uint CurrentVersion = 5;
+    private const uint CurrentVersion = 6;
 
     public static byte[] Save(Ps2System system) => Save(system, compress: true);
 
@@ -154,9 +158,15 @@ public static class SaveState
                 system.Memory.Write8(SystemMemory.SPR_BASE + (uint)i, spr[i]);
         }
 
-        bool ok = version >= 5
+        // v5 and v6 share LoadV5 sequencing; Kernel.ReadState itself is only compatible with
+        // the writer that produced the file. CurrentVersion=6 writers emit the extended
+        // THREADMAN fields — loading a v5 blob into a v6 Kernel.ReadState would desync the
+        // stream, so v5 is no longer accepted once we ship v6.
+        bool ok = version >= 6
             ? LoadV5(system, reader)
-            : LoadV3OrV4(system, reader, version);
+            : version >= 5
+                ? false // v5 kernel blob is not forward-compatible with v6 THREADMAN fields
+                : LoadV3OrV4(system, reader, version);
         if (!ok) return false;
 
         system.Scheduler.SetMasterCycles(savedMasterCycles);

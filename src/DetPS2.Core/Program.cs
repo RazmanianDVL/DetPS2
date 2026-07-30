@@ -236,7 +236,16 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             TransferLog.Enabled = true; // implied
         }
 
-    if (!cfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
+    // --native-bios: force the native, file-free bring-up (LoadBiosNative) even when a real
+    // BIOS path IS configured, for direct A/B comparison against the real-file baseline
+    // (--cycles/--host-present etc. all still apply identically). Without this flag, LoadBios
+    // itself already falls back to the native path automatically whenever no real BIOS file is
+    // configured -- a real BIOS was never required, confirmed byte-identical across a 9-title
+    // cross-check and a 400M-cycle single-title deep trace (docs/DEVELOPER_GUIDE.md) -- so this
+    // command no longer hard-exits when user-media.json has no biosPath.
+    bool nativeBios = args.Contains("--native-bios");
+    if (!cfg.HasBios && !nativeBios)
+        Console.WriteLine("No real BIOS in user-media.json -- using native (file-free) BIOS bring-up.");
     foreach (var title in cfg.Titles)
     {
         if (!title.Exists) { Console.WriteLine($"[{title.Id}] missing: {title.Path}"); continue; }
@@ -246,7 +255,10 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         TransferLog.Reset();
         var traceSys = new Ps2System();
         traceSys.Telemetry.Reset();
-        traceSys.LoadBios(cfg.BiosPath);
+        if (nativeBios)
+            traceSys.LoadBiosNative();
+        else
+            traceSys.LoadBios(cfg.BiosPath);
         string msg;
         if ((title.Kind ?? "iso").ToLowerInvariant() == "elf")
         {

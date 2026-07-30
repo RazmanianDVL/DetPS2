@@ -13,8 +13,20 @@ public sealed class SonyKernelHle
 {
     private readonly Ps2System _system;
     private readonly KernelState _kernel;
-    private readonly Dictionary<int, uint> _intcHandlers = new();
-    private readonly Dictionary<int, uint> _dmacHandlers = new();
+    /// <summary>Per-cause ordered list of AddIntcHandler registrations. Real BIOS keeps a
+    /// linked list and the ISR walks every entry; a single-slot dictionary silently dropped
+    /// every registration but the last (Burnout 3: cause=2 registers 0x2370A0 then 0x1F1CE8
+    /// then 0x22B830 — only the counter stub survived, so the VBlank thread-wakeup never ran).
+    /// </summary>
+    private readonly Dictionary<int, List<uint>> _intcHandlers = new();
+    /// <summary>Next handler index to dispatch for each cause within the current interrupt
+    /// episode (reset to 0 after the last handler of the chain runs).</summary>
+    private readonly Dictionary<int, int> _intcNextIndex = new();
+    private readonly Dictionary<int, uint> _vTlbRefillHandlers = new();
+    private readonly Dictionary<int, uint> _vCommonHandlers = new();
+    private readonly Dictionary<int, uint> _vInterruptHandlers = new();
+    /// <summary>Stand-in for the BIOS default exception vector (real hardware: 0x80000180).</summary>
+    private const uint DefaultExceptionHandlerSentinel = 0x80000180;
     private readonly uint[] _sifRegs = new uint[32];
     /// <summary>SifSetReg/SifGetReg with the high bit set (id | 0x80000000) is a distinct,
     /// software-defined "virtual register" namespace some SDKs build on top of real SIF
@@ -48,6 +60,8 @@ public sealed class SonyKernelHle
     private readonly (uint device, uint bufferAddr)?[] _deci2Handlers = new (uint, uint)?[8];
     public RealSifRpc RealRpc => _realRpc;
 
+    private readonly Dictionary<int, uint> _dmacHandlers = new();
+
     /// <summary>Drains real (retail sifrpc.c) bind/call packets queued by HleSifCmdFromEe
     /// that are strictly older than <paramref name="currentGeneration"/> — called once per
     /// ambient scheduler tick (Ps2System.ISchedulable.Step) with that tick's own generation,
@@ -61,13 +75,142 @@ public sealed class SonyKernelHle
     /// 2026-07-28 — Shaolin Monks' CDVD bind, sid=0x80000592, retried literally millions of
     /// times once the queue's answer was delayed by even one tick). See Sif.cs's
     /// _realRpcQueue doc comment for the full mechanism.</summary>
+    private bool _inRpcEndFuncInvoke;
+
     public void DrainRealRpcQueue(ulong currentGeneration)
     {
+        // Nested Step() during end_function invoke re-enters drain; skip to avoid reentrancy.
+        if (_inRpcEndFuncInvoke) return;
+
         while (_system.Sif.TryDequeueRealRpc(currentGeneration, out uint addr))
         {
             if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, _system.IopModules, addr))
                 _system.Intc.Raise(Intc.InterruptSource.Sif);
         }
+
+        // ps2sdk _request_end: after CALL, run end_function(end_param) then SignalSema.
+        // CompleteRpcEnd already SignalSema'd and queued callbacks; invoke them now so
+        // 989snd/libmc done-flags land before the waiter inspects them.
+        while (_realRpc.TryDequeueEndFunc(out uint fn, out uint param))
+            InvokeRpcEndFunction(fn, param);
+    }
+
+    /// <summary>
+    /// Run EE <c>void end_function(void *end_param)</c> briefly. Saves/restores PC/a0/ra.
+    /// Fast path already wrote <c>*end_param=1</c> when param is in RDRAM.
+    /// </summary>
+    private void InvokeRpcEndFunction(uint func, uint param)
+    {
+        if (func < 0x1000 || func >= SystemMemory.RDRAM_SIZE) return;
+        var ee = _system.EE;
+        if (ee == null) return;
+
+        // Emulate common leaf: store 1 to *a0 / absolute then jr ra. Avoid full nested Step
+        // when the body is the classic done-flag pattern (covers 989snd + most libmc ends).
+        if (TryHleSimpleEndFunction(func, param))
+            return;
+
+        ulong savedPc = ee.PC;
+        var savedA0 = ee.GetGpr(4);
+        var savedRa = ee.GetGpr(31);
+        const uint SentinelRa = 0xFFFFFFFC; // unmapped; jr ra stops the mini-run
+
+        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = param });
+        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = SentinelRa });
+        ee.PC = func;
+        ee.HleRedirectPc = null;
+
+        _inRpcEndFuncInvoke = true;
+        try
+        {
+            for (int i = 0; i < 512; i++)
+            {
+                uint pc = (uint)(ee.PC & 0x1FFFFFFF);
+                if (pc == (SentinelRa & 0x1FFFFFFF) || pc == 0) break;
+                // One instruction; Step may take exceptions — cap total.
+                ee.Step(1);
+            }
+        }
+        finally
+        {
+            _inRpcEndFuncInvoke = false;
+            ee.PC = savedPc;
+            ee.SetGpr(4, savedA0);
+            ee.SetGpr(31, savedRa);
+        }
+    }
+
+    /// <summary>
+    /// HLE common end_function bodies without nested EE Step:
+    /// <c>*(int*)end_param = 1; return;</c> or store-1 to an absolute address via lui/addiu.
+    /// </summary>
+    private bool TryHleSimpleEndFunction(uint func, uint param)
+    {
+        var mem = _system.Memory;
+        uint w0 = mem.Read32(func);
+        uint w1 = mem.Read32(func + 4);
+        uint w2 = mem.Read32(func + 8);
+        uint w3 = mem.Read32(func + 12);
+
+        // sw reg, 0(a0)  encoding: op=0x2B, base=a0=4, rt=?, imm=0
+        // jr ra = 0x03E00008; nop = 0x00000000
+        static bool IsJrRa(uint w) => w == 0x03E00008;
+        static bool IsSwToA0(uint w, out int rt, out int imm)
+        {
+            rt = (int)((w >> 16) & 0x1F);
+            imm = (short)(w & 0xFFFF);
+            return ((w >> 26) == 0x2B) && (((w >> 21) & 0x1F) == 4);
+        }
+        static bool IsLiOrAddiuToReg(uint w, out int rt, out int imm)
+        {
+            // addiu rt, rs, imm — often rs=0 for li
+            rt = (int)((w >> 16) & 0x1F);
+            imm = (short)(w & 0xFFFF);
+            return (w >> 26) == 0x09; // ADDIU
+        }
+        static bool IsLui(uint w, out int rt, out int imm)
+        {
+            rt = (int)((w >> 16) & 0x1F);
+            imm = (short)(w & 0xFFFF);
+            return (w >> 26) == 0x0F;
+        }
+
+        // Pattern: sw XX, imm(a0); jr ra; nop  — write 1 (or whatever) already done if param set
+        if (IsSwToA0(w0, out _, out int off0) && IsJrRa(w1))
+        {
+            if (param != 0 && param < SystemMemory.RDRAM_SIZE - 4)
+                mem.Write32(param + (uint)off0, 1);
+            return true;
+        }
+        // Pattern: addiu r, zero, 1; sw r, 0(a0); jr ra
+        if (IsLiOrAddiuToReg(w0, out int rLi, out int immLi) && immLi == 1
+            && IsSwToA0(w1, out int rSw, out int off1) && rSw == rLi
+            && IsJrRa(w2))
+        {
+            if (param != 0 && param < SystemMemory.RDRAM_SIZE - 4)
+                mem.Write32(param + (uint)off1, 1);
+            return true;
+        }
+        // Pattern: lui at, HI; ... sw reg, LO(at) for global flag — try first 4 words
+        if (IsLui(w0, out int rAt, out int hi))
+        {
+            for (int i = 1; i < 4; i++)
+            {
+                uint w = i == 1 ? w1 : i == 2 ? w2 : w3;
+                // sw rt, imm(at-base)
+                if ((w >> 26) == 0x2B && ((int)((w >> 21) & 0x1F) == rAt))
+                {
+                    int imm = (short)(w & 0xFFFF);
+                    uint addr = (uint)((hi << 16) + imm);
+                    if (addr < SystemMemory.RDRAM_SIZE - 4)
+                        mem.Write32(addr, 1);
+                    return true;
+                }
+            }
+        }
+
+        // Unknown body — caller may nested-Step.
+        return false;
     }
 
     /// <summary>Called from VBlank path — fulfills sceSetVSyncFlag pointers.</summary>
@@ -90,21 +233,132 @@ public sealed class SonyKernelHle
         }
     }
 
-    /// <summary>Looks up a game-registered AddIntcHandler entry so EmotionEngine can
-    /// dispatch directly to it instead of the synthesized (no-op) interrupt vector.</summary>
-    public bool TryGetIntcHandler(int cause, out uint handlerAddr) =>
-        _intcHandlers.TryGetValue(cause, out handlerAddr);
+    /// <summary>Peek the first registered AddIntcHandler for <paramref name="cause"/>
+    /// without advancing the multi-handler dispatch cursor (diagnostics / save-state tests).</summary>
+    public bool TryGetIntcHandler(int cause, out uint handlerAddr)
+    {
+        if (_intcHandlers.TryGetValue(cause, out var list) && list.Count > 0)
+        {
+            handlerAddr = list[0];
+            return handlerAddr != 0;
+        }
+        handlerAddr = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Take the next AddIntcHandler for <paramref name="cause"/> in registration order.
+    /// Real BIOS walks the whole list inside one ISR; we serialize one handler per exception
+    /// episode. When <paramref name="moreRemain"/> is true the caller must leave the COP0
+    /// edge latch armed (or re-Raise) so the next eret dispatches the following handler —
+    /// same pattern as multi-channel DMAC owed-handler re-raise.
+    /// </summary>
+    public bool TryTakeNextIntcHandler(int cause, out uint handlerAddr, out bool moreRemain)
+    {
+        moreRemain = false;
+        handlerAddr = 0;
+        if (!_intcHandlers.TryGetValue(cause, out var list) || list.Count == 0)
+            return false;
+
+        int idx = _intcNextIndex.GetValueOrDefault(cause, 0);
+        if (idx < 0 || idx >= list.Count)
+        {
+            _intcNextIndex[cause] = 0;
+            return false;
+        }
+
+        handlerAddr = list[idx];
+        int next = idx + 1;
+        if (next >= list.Count)
+        {
+            _intcNextIndex[cause] = 0;
+            moreRemain = false;
+        }
+        else
+        {
+            _intcNextIndex[cause] = next;
+            moreRemain = true;
+        }
+        return handlerAddr != 0;
+    }
 
     /// <summary>Same registration the AddIntcHandler syscall (case 0x10) performs — exposed
     /// directly for callers that already know the (cause, handler) pair without going through
-    /// a syscall dispatch (e.g. save-state round-trip tests).</summary>
-    public void RegisterIntcHandler(int cause, uint handlerAddr) => _intcHandlers[cause] = handlerAddr;
+    /// a syscall dispatch (e.g. save-state round-trip tests). Appends to the per-cause chain
+    /// (does not replace), matching real linked-list semantics.</summary>
+    public void RegisterIntcHandler(int cause, uint handlerAddr)
+    {
+        if (!_intcHandlers.TryGetValue(cause, out var list))
+        {
+            list = new List<uint>(4);
+            _intcHandlers[cause] = list;
+        }
+        list.Add(handlerAddr);
+    }
 
     /// <summary>Looks up a game-registered AddDmacHandler entry (keyed by DMA channel, e.g.
     /// DMA_CHANNEL_SIF0=5) — real hardware routes DMA-channel completion here, not through
     /// AddIntcHandler; e.g. ps2sdk's sceSifInitCmd installs _SifCmdIntHandler this way.</summary>
     public bool TryGetDmacHandler(int channel, out uint handlerAddr) =>
         _dmacHandlers.TryGetValue(channel, out handlerAddr);
+
+    /// <summary>Same registration the AddDmacHandler syscall (case 0x12) performs — for tests
+    /// and save-state round-trips that already know the (channel, handler) pair.</summary>
+    public void RegisterDmacHandler(int channel, uint handlerAddr) =>
+        _dmacHandlers[channel] = handlerAddr;
+
+    /// <summary>
+    /// Pick one pending DMAC channel that both has a sticky D_STAT completion bit (and is
+    /// IRQ-enabled) and a registered <c>AddDmacHandler</c>. Used by the HLE DmaController
+    /// (INTC source 14) dispatcher — real BIOS walks this table; we never installed that
+    /// MIPS trampoline, so EmotionEngine must call handlers directly. Clears the chosen
+    /// channel's status bit (handler still may W1C it — no-op) so the next completion can
+    /// re-arm. Returns false when nothing is dispatchable.
+    /// </summary>
+    public bool TryTakePendingDmacHandler(out uint handlerAddr, out int channel)
+    {
+        var dmac = _system.Dmac;
+        // Prefer sticky D_STAT completion bits (hardware-accurate path).
+        for (int ch = 0; ch < 10; ch++)
+        {
+            if ((dmac.DStat & (1u << ch)) == 0) continue;
+            if (!dmac.IsChannelIrqEnabled(ch)) continue;
+            if (!_dmacHandlers.TryGetValue(ch, out handlerAddr) || handlerAddr == 0) continue;
+            dmac.ClearChannelStatus(ch);
+            // Also consume one owed-call credit so the soft queue doesn't double-fire.
+            dmac.TryConsumeOwedHandlerCall(ch);
+            channel = ch;
+            // If other channels still need service, re-raise so the next instruction after
+            // this handler's eret dispatches them (EXL blocks nesting mid-handler).
+            if (dmac.HasPendingChannelIrq() || HasAnyOwedDmacHandler(dmac))
+                _system.Intc.Raise(Intc.InterruptSource.DmaController);
+            return true;
+        }
+        // Fall back to owed-call queue: path-sync force-step can FinishChannel + Raise, then
+        // the game W1C's D_STAT before EE dispatches (Burnout 3). The soft queue still owes
+        // the AddDmacHandler invocation so flip pending-count can drain.
+        for (int ch = 0; ch < 10; ch++)
+        {
+            if (!dmac.HasOwedHandlerCall(ch)) continue;
+            if (!dmac.IsChannelIrqEnabled(ch)) continue;
+            if (!_dmacHandlers.TryGetValue(ch, out handlerAddr) || handlerAddr == 0) continue;
+            dmac.TryConsumeOwedHandlerCall(ch);
+            channel = ch;
+            if (dmac.HasPendingChannelIrq() || HasAnyOwedDmacHandler(dmac))
+                _system.Intc.Raise(Intc.InterruptSource.DmaController);
+            return true;
+        }
+        handlerAddr = 0;
+        channel = -1;
+        return false;
+    }
+
+    private static bool HasAnyOwedDmacHandler(Dmac dmac)
+    {
+        for (int ch = 0; ch < 10; ch++)
+            if (dmac.HasOwedHandlerCall(ch)) return true;
+        return false;
+    }
 
     public ulong Handled { get; private set; }
     public ulong Unknown { get; private set; }
@@ -125,6 +379,7 @@ public sealed class SonyKernelHle
     public void Reset()
     {
         _intcHandlers.Clear();
+        _intcNextIndex.Clear();
         _dmacHandlers.Clear();
         Array.Clear(_sifRegs);
         Array.Clear(_sifVirtualRegs);
@@ -140,6 +395,28 @@ public sealed class SonyKernelHle
         Array.Clear(RecentSyscalls);
         _syscallHistogram.Clear();
         _realRpc.Reset();
+        // SIFINIT/EESYNC/SIFCMD contracts: present post-IOPBTCONF handoff so commercial
+        // sceSifInitCmd / sceSifInitRpc do not spin (docs/bios-ports/SIFINIT_EESYNC.md).
+        PlantSifInitSyncContracts();
+    }
+
+    /// <summary>
+    /// Present the EE-visible effects of a completed BIOS IOPBTCONF SIF stack
+    /// (SIFMAN → SIFCMD → … → SIFINIT + EESYNC): SMFLAG ready bits, SUBADDR command buffer,
+    /// SYSREG_RPCINIT already acknowledged, EE ready-slot table planted.
+    /// </summary>
+    public void PlantSifInitSyncContracts()
+    {
+        _system.Sif.PresentIopBootReady();
+        // SIF_REG_SUBADDR (2): IOP SIFCMD receive buffer — sceSifInitCmd DMA dest.
+        _sifRegs[Sif.SifRegSubAddr] = Sif.DefaultIopSifCmdBufAddr;
+        // SIF_SYSREG_SUBADDR (0x80000000): software mirror used by SifIopReset / InitCmd first path.
+        _sifVirtualRegs[0] = Sif.DefaultIopSifCmdBufAddr;
+        // SIF_SYSREG_RPCINIT (0x80000002): non-zero → sceSifInitRpc skips INIT_CMD wait.
+        _sifVirtualRegs[2] = 1;
+        // Shadow SMFLAG software copy matches hardware presentation.
+        _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
+        Sif.PlantEeSifReadySlots(_system.Memory);
     }
 
     /// <summary>Game-registered handler tables + SIF register state for SaveState.cs.
@@ -153,8 +430,12 @@ public sealed class SonyKernelHle
     /// one-time boot-assist scan state that's safe to recompute, not correctness-affecting.</summary>
     public void WriteState(BinaryWriter w)
     {
-        w.Write(_intcHandlers.Count);
-        foreach (var kv in _intcHandlers) { w.Write(kv.Key); w.Write(kv.Value); }
+        // Flatten (cause, handler) pairs — multiple handlers may share a cause.
+        int intcTotal = 0;
+        foreach (var list in _intcHandlers.Values) intcTotal += list.Count;
+        w.Write(intcTotal);
+        foreach (var kv in _intcHandlers)
+            foreach (uint h in kv.Value) { w.Write(kv.Key); w.Write(h); }
         w.Write(_dmacHandlers.Count);
         foreach (var kv in _dmacHandlers) { w.Write(kv.Key); w.Write(kv.Value); }
         for (int i = 0; i < _sifRegs.Length; i++) w.Write(_sifRegs[i]);
@@ -184,8 +465,14 @@ public sealed class SonyKernelHle
     public void ReadState(BinaryReader r)
     {
         _intcHandlers.Clear();
+        _intcNextIndex.Clear();
         int nInt = r.ReadInt32();
-        for (int i = 0; i < nInt; i++) { int k = r.ReadInt32(); uint v = r.ReadUInt32(); _intcHandlers[k] = v; }
+        for (int i = 0; i < nInt; i++)
+        {
+            int k = r.ReadInt32();
+            uint v = r.ReadUInt32();
+            RegisterIntcHandler(k, v);
+        }
         _dmacHandlers.Clear();
         int nDma = r.ReadInt32();
         for (int i = 0; i < nDma; i++) { int k = r.ReadInt32(); uint v = r.ReadUInt32(); _dmacHandlers[k] = v; }
@@ -243,7 +530,7 @@ public sealed class SonyKernelHle
         if (_customSyscalls.TryGetValue(num, out uint hook) && hook != 0 && !IsHleForcedSyscall(num))
         {
             uint phys = hook & 0x1FFFFFFFu;
-            if (phys >= 0x100000u && phys < SystemMemory.RDRAM_SIZE)
+            if (phys != 0 && phys < SystemMemory.RDRAM_SIZE)
             {
                 // Midway FindAddress hook: plant CRT0 success patch before entering it
                 if (num == 0x83)
@@ -290,16 +577,29 @@ public sealed class SonyKernelHle
             case 0x0A: // AddSbusIntcHandler
             case 0x0B: // RemoveSbusIntcHandler
             case 0x0C: // Interrupt2Iop
-            case 0x0D:
-            case 0x0E:
-            case 0x0F:
-                result = 0;
+            case 0x0D: // SetVTLBRefillHandler(cause, handler) — return previous (or BIOS default)
+                result = SetExceptionVectorHandler(_vTlbRefillHandlers, (int)a0, a1);
+                break;
+            case 0x0E: // SetVCommonHandler(cause, handler) — return previous (or BIOS default)
+                result = SetExceptionVectorHandler(_vCommonHandlers, (int)a0, a1);
+                break;
+            case 0x0F: // SetVInterruptHandler(cause, handler) — return previous (or BIOS default)
+                result = SetExceptionVectorHandler(_vInterruptHandlers, (int)a0, a1);
                 break;
             case 0x10: // AddIntcHandler(cause, handler, next, arg, flag)
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_HANDLERS") == "1")
                     Console.Error.WriteLine($"[ADDINTC] cause={a0} handler=0x{a1:X8}");
-                _intcHandlers[(int)a0] = a1;
-                result = (int)a0; // handler id
+                // Append to the per-cause chain (real BIOS linked list). Do NOT replace —
+                // Burnout 3 registers three VBlankStart handlers; keeping only the last
+                // left the VBlank thread-wakeup at 0x2370A0 dead and wedged boot on a
+                // SleepThread flag poll at 0x23719x (flags @ gp-23820 never set).
+                if (!_intcHandlers.TryGetValue((int)a0, out var intcList))
+                {
+                    intcList = new List<uint>(4);
+                    _intcHandlers[(int)a0] = intcList;
+                }
+                intcList.Add(a1);
+                result = intcList.Count - 1; // handler id within this cause
                 // KernelBootstrap deliberately leaves EE.TakeExceptions off after fast-boot
                 // ("without a full ISR that ACKs INTC, VBlank would storm the EE... games
                 // that install their own handlers via AddIntcHandler can enable later") but
@@ -310,9 +610,17 @@ public sealed class SonyKernelHle
                 // handshakes, ever resolve instead of spinning forever) to start taking
                 // exceptions.
                 _system.EE.TakeExceptions = true;
+                // If this cause already fired (sticky STAT) and the no-handler path consumed
+                // its COP0 latch before we owned it, re-arm so the newly registered handler
+                // actually runs. God of War: VBlankStart raised at cyc≈250k, AddIntcHandler
+                // cause=2 arrives after Timer2's registration already flipped TakeExceptions
+                // and ClearCpuLatch'd the still-unhandled VBlank edge.
+                if (a0 < 15)
+                    _system.Intc.RearmCpuLatch((Intc.InterruptSource)(int)a0);
                 break;
-            case 0x11: // RemoveIntcHandler
+            case 0x11: // RemoveIntcHandler(cause, id) — clear the whole cause chain for now
                 _intcHandlers.Remove((int)a0);
+                _intcNextIndex.Remove((int)a0);
                 result = 0;
                 break;
             case 0x12: // AddDmacHandler
@@ -325,10 +633,40 @@ public sealed class SonyKernelHle
                 _dmacHandlers.Remove((int)a0);
                 result = 0;
                 break;
-            case 0x14: // EnableIntc
-            case 0x15: // DisableIntc
-            case 0x16: // EnableDmac
-            case 0x17: // DisableDmac
+            case 0x14: // EnableIntc(cause) — OR the cause bit into INTC_MASK
+                if (a0 < 15)
+                {
+                    uint bit = 1u << (int)a0;
+                    _system.Intc.SetMask(_system.Intc.Mask | bit);
+                    _system.Intc.RearmCpuLatch((Intc.InterruptSource)(int)a0);
+                }
+                result = 1;
+                break;
+            case 0x15: // DisableIntc(cause)
+                if (a0 < 15)
+                    _system.Intc.SetMask(_system.Intc.Mask & ~(1u << (int)a0));
+                result = 1;
+                break;
+            case 0x16: // EnableDmac(channel) — arm D_STAT mask + INTC DmaController
+                if (a0 < 10)
+                {
+                    _system.Dmac.EnableChannelIrq((int)a0);
+                    _system.Intc.SetMask(_system.Intc.Mask | (1u << (int)Intc.InterruptSource.DmaController));
+                    // Same rationale as AddIntcHandler: once the game owns a DMA completion
+                    // callback it must be allowed to take the IRQ (Burnout 3 path-sync drain).
+                    _system.EE.TakeExceptions = true;
+                    // If this channel (or any enabled channel) already completed before the
+                    // mask was armed, Raise so the handler actually runs (sticky D_STAT).
+                    if (_system.Dmac.HasPendingChannelIrq())
+                        _system.Intc.Raise(Intc.InterruptSource.DmaController);
+                    else
+                        _system.Intc.RearmCpuLatch(Intc.InterruptSource.DmaController);
+                }
+                result = 1;
+                break;
+            case 0x17: // DisableDmac(channel)
+                if (a0 < 10)
+                    _system.Dmac.DisableChannelIrq((int)a0);
                 result = 1;
                 break;
             case 0x18: // SetAlarm
@@ -383,13 +721,20 @@ public sealed class SonyKernelHle
                 result = ReferThreadStatus((int)a0, a1);
                 break;
             case 0x32: // SleepThread — switch to another runnable thread
-                _kernel.SleepThread();
-                if (!_kernel.SwitchToNext(ee))
                 {
-                    // No other runnable thread: self-wake so boot never deadlocks
-                    _kernel.WakeupThread(_kernel.CurrentThreadId);
+                    // THREADMAN: pending WakeupCount is consumed without parking. Only yield
+                    // when we actually slept; the no-runnable fallback must not WakeupThread
+                    // a still-awake self (that would bump WakeupCount per decomp FUN_000020e4's
+                    // "not waiting" path and poison the next Sleep).
+                    _kernel.SleepThread();
+                    var selfAfter = _kernel.GetThread(_kernel.CurrentThreadId);
+                    if (selfAfter != null && selfAfter.Sleeping)
+                    {
+                        if (!_kernel.SwitchToNext(ee))
+                            _kernel.WakeupThread(_kernel.CurrentThreadId);
+                    }
+                    result = 0;
                 }
-                result = 0;
                 break;
             case 0x33: // WakeupThread
             case 0x34: // iWakeupThread — same semantics, interrupt-safe variant
@@ -397,8 +742,8 @@ public sealed class SonyKernelHle
                     Console.Error.WriteLine($"[WAKEUP] from tid={_kernel.CurrentThreadId} target={a0} cyc={_system.MasterCycles}");
                 result = _kernel.WakeupThread((int)a0);
                 break;
-            case 0x35: // CancelWakeupThread
-                result = 0;
+            case 0x35: // CancelWakeupThread — THREADMAN FUN_000022dc: return+clear wakeup count
+                result = _kernel.CancelWakeupThread((int)a0);
                 break;
             case 0x37: // SuspendThread(tid) — was a no-op stub; ADX thrash path
                 {
@@ -507,7 +852,16 @@ public sealed class SonyKernelHle
                 result = _kernel.DeleteSema((int)a0);
                 break;
             case 0x42: // SignalSema
-                result = _kernel.SignalSema((int)a0);
+                {
+                    // Real THREADMAN returns the semaphore id on success (not remaining count).
+                    // libcdvd / SN ProDG check `SignalSema(id) == id`. DETPS2_SIGNALSEMA_COUNT=1
+                    // returns remaining count for A/B diagnostics.
+                    int sr = _kernel.SignalSema((int)a0);
+                    if (sr < 0) result = sr;
+                    else if (Environment.GetEnvironmentVariable("DETPS2_SIGNALSEMA_COUNT") == "1")
+                        result = sr;
+                    else result = (int)a0;
+                }
                 break;
             case 0x44: // WaitSema — block + yield to another thread when empty
                 {
@@ -517,61 +871,75 @@ public sealed class SonyKernelHle
                     // consume a legitimate signal (e.g. one our own synchronous SIF RPC handling
                     // just posted) before the real wait below ever sees it, forcing a spurious
                     // block on every semaphore that starts at count 1.
+                    // EnsureSema(id) materializes the *requested* id — plain CreateSema returns
+                    // a fresh _nextSema id and left WaitSemaBlocking(a0) still missing → fake
+                    // success (wr=-1, LastWaitSemaBlocked=false → result 0).
                     if (a0 != 0 && !_kernel.SemaExists((int)a0))
-                    {
-                        _kernel.CreateSema(0, 1);
-                        // fall through with new id only if a0 was out of range — use given id map
-                    }
+                        _kernel.EnsureSema((int)a0, init: 0, max: 1);
                     int wr = _kernel.WaitSemaBlocking((int)a0);
                     if (_kernel.LastWaitSemaBlocked)
                     {
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                            Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8}");
+                            Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} gp=0x{ee.GetGpr(28).Lo:X8}");
+                        // When a real SIF RPC is already queued, stall the EE rather than
+                        // SwitchToNext's self-wake (which undoes WaitSemaBlocking and fabricates
+                        // success — Shaolin Monks bind-retry storm, 2026-07-28).
+                        // EmotionEngine also yields out of the stall if drain wakes a *different*
+                        // waiter (God of War wrong-sema deadlock, 2026-07-30). Do NOT prefer
+                        // TryYield here when queue>0: that diverted MK's ADX/WAD path (cdvdSectors
+                        // collapsed 198k→1 in the same session).
                         if (_system.Sif.RealRpcQueueCount > 0)
                         {
-                            // A real SIF RPC is already queued to resolve this (or some other)
-                            // semaphore for real via DrainRealRpcQueue -> RealSifRpc.TryHandle ->
-                            // SignalSema. Do NOT call SwitchToNext here: with nothing else
-                            // runnable, its own fallback (KernelHle.cs) would immediately undo
-                            // WaitSemaBlocking's Sleeping=true/WaitSemaId=a0 bookkeeping, and the
-                            // old code then fabricated a fake signal on top of that — faking
-                            // success before the real response ever had a chance to land, so the
-                            // game read stale/uninitialized data and retried forever (confirmed
-                            // live via Shaolin Monks' sceSifBindRpc retry storm, 2026-07-28).
-                            // Genuinely stall instead; EmotionEngine's _pendingSemaStall clears
-                            // itself the moment the real SignalSema call wakes this thread.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
                             ee.RequestSemaStall();
-                            wr = 0;
                         }
-                        else if (!_kernel.SwitchToNext(ee))
+                        else if (!_kernel.TryYieldToOtherRunnable(ee))
                         {
                             // Nobody else runnable and no real SIF RPC pending: park on VBlank
                             // instead of busy-spin. Next PCRTC VBlank wakes us so the frame loop
                             // can progress. Preserved as-is for waits unrelated to SIF RPC.
+                            // Use TryYield (no self-wake) then fabricate only if still alone.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no runnable thread)");
                             _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
-                            wr = 0;
                         }
-                        result = wr < 0 ? 0 : wr;
+                        // On block (and on later wake): return the sema id as the success token
+                        // so SN ProDG `WaitSema(id) == id` checks pass. Same rationale as SignalSema.
+                        result = (int)a0;
                     }
-                    else result = wr < 0 ? 0 : wr;
+                    else if (wr < 0)
+                        result = wr; // missing sema / hard error
+                    else
+                        result = (int)a0; // acquired without sleep — return id, not remaining count
                 }
                 break;
             case 0x43: // iSignalSema — interrupt-safe SignalSema (Sony EE #67)
-                result = _kernel.ISignalSema((int)a0);
+                {
+                    int ir = _kernel.ISignalSema((int)a0);
+                    result = ir < 0 ? ir : (int)a0;
+                }
                 break;
             case 0x45: // PollSema — non-blocking (never sleep); BIOS THREADMAN PollSema
             case 0x46: // iPollSema — same rules, interrupt context
-                result = _kernel.PollSema((int)a0);
+                {
+                    // DETPS2_POLLSEMA_COUNT=1: return remaining count (legacy). Default: return
+                    // semaphore id on success — required by libcdvd _CdCheckSCmd/NCmd
+                    // (PollSema(id)==id). Count return made DualInfo fail forever (GoW).
+                    int pr = _kernel.PollSema((int)a0);
+                    if (pr < 0)
+                        result = pr;
+                    else if (Environment.GetEnvironmentVariable("DETPS2_POLLSEMA_COUNT") == "1")
+                        result = pr;
+                    else
+                        result = (int)a0;
+                }
                 break;
             case 0x47: // ReferSemaStatus
-            case 0x48: // iReferSemaStatus
-                result = 0;
+            case 0x48: // iReferSemaStatus — same fill, interrupt-safe variant
+                result = ReferSemaStatus((int)a0, a1);
                 break;
 
             // ---- OSD / GS params ----
@@ -739,30 +1107,52 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x79: // SifSetReg(reg, val)
-                if ((a0 & 0x80000000u) != 0) _sifVirtualRegs[(a0 & 0x1F)] = a1;
-                else if (a0 < _sifRegs.Length) _sifRegs[a0] = a1;
-                // Mirror MSFLAG onto SIF MMIO (offset 0x20). Do not write MAINADDR
-                // through MsCom (that would enqueue a fake SBUS command).
-                if (a0 == 3) _system.Sif.WriteRegister(0x20, a1);
+                if ((a0 & 0x80000000u) != 0)
+                {
+                    _sifVirtualRegs[(a0 & 0x1F)] = a1;
+                }
+                else if (a0 == Sif.SifRegSmFlag)
+                {
+                    // SMFLAG is write-1-to-clear (ps2sdk SifIopReset clears BOOTEND/SIFINIT/CMDINIT
+                    // by writing the corresponding SIF_STAT_* bits).
+                    _system.Sif.ClearSmFlagBits(a1);
+                    _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
+                    _system.Sif.WriteRegister(0x30, _system.Sif.SmFlag);
+                }
+                else if (a0 < _sifRegs.Length)
+                {
+                    _sifRegs[a0] = a1;
+                    // Mirror MSFLAG onto SIF MMIO (offset 0x20). Do not write MAINADDR
+                    // through MsCom (that would enqueue a fake SBUS command).
+                    if (a0 == Sif.SifRegMsFlag) _system.Sif.WriteRegister(0x20, a1);
+                }
                 result = 0;
                 break;
             case 0x7A: // SifGetReg
                 {
                     SifGetRegCalls++;
-                    // Always report IOP alive for commercial fast-boot:
-                    // SIF_STAT_SIFINIT|CMDINIT|BOOTEND = 0x70000 on SMFLAG (reg 4)
-                    const uint IopReady = 0x10000u | 0x20000u | 0x40000u;
-                    if (a0 == 4)
+                    if (a0 == Sif.SifRegSmFlag)
                     {
-                        result = IopReady | (_sifRegs.Length > 4 ? _sifRegs[4] : 0);
+                        // Deferred IOP reboot completion: real SifIopReset clears SMFLAG bits
+                        // *after* RESET_CMD DMA; EESYNC re-posts BOOTEND once IOP reloads.
+                        // Complete on first SMFLAG poll after those clears.
+                        if (_system.Sif.TryCompletePendingIopReboot())
+                            OnIopRebootCompleted();
+                        result = _system.Sif.SmFlag;
+                        _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
                         break;
                     }
-                    if (a0 == 5) // SUBRESET / legacy ready poll
+                    if (a0 == 5) // SUBRESET / legacy ready poll — treat as SMFLAG snapshot
                     {
-                        result = IopReady;
+                        if (_system.Sif.TryCompletePendingIopReboot())
+                            OnIopRebootCompleted();
+                        result = _system.Sif.SmFlag;
                         break;
                     }
                     if ((a0 & 0x80000000u) != 0) { result = _sifVirtualRegs[(a0 & 0x1F)]; break; }
+                    // SUBADDR: ensure non-zero when IOP CMD layer is up (sceSifInitCmd path).
+                    if (a0 == Sif.SifRegSubAddr && _sifRegs[Sif.SifRegSubAddr] == 0 && _system.Sif.CmdInitApplied)
+                        _sifRegs[Sif.SifRegSubAddr] = Sif.DefaultIopSifCmdBufAddr;
                     if (a0 < _sifRegs.Length) result = _sifRegs[a0];
                     else result = 0;
                 }
@@ -897,8 +1287,10 @@ public sealed class SonyKernelHle
         DrainRealRpcQueue(_system.SchedulerGeneration);
 
         _system.Sif.Step(64);
-        // Mark SMFLAG that IOP saw the transfer (retail polls this)
-        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | 0x10000u);
+        // Mark SMFLAG that IOP saw the transfer (retail polls SIFINIT) — but not during a
+        // pending IOP reboot, where EE deliberately clears SIFINIT/CMDINIT after this returns.
+        if (!_system.Sif.IopRebootPending)
+            _system.Sif.ApplySifInit();
         // Return a non-zero DMA id; -1 from SifDmaStat means complete
         return unchecked((int)(1 + (count & 0x7FFF)));
     }
@@ -933,32 +1325,88 @@ public sealed class SonyKernelHle
             Console.Error.WriteLine($"[SIFCMD] cid=0x{cid:X8} dest=0x{dest:X8} opt=0x{opt:X8} psize={psize} dsize={dsize} eePacket=0x{eePacket:X8}");
 
         // System commands (Sony SIFCMD.IRX — BIOS FUN_000006c0 registers these).
+        // CIDs: CHANGE_SADDR=0, SET_SREG=1, INIT_CMD=2, RESET_CMD=3 (sifcmd-common.h).
         switch (cid)
         {
             case 0x80000000: // CHANGE_SADDR / SIF_CMD_CHANGE_SADDR
-                if ((cid & 0x1F) < _sifRegs.Length)
-                    _sifRegs[cid & 0x1F] = dest;
-                break;
-            case 0x80000001: // SET_SREG — packet often carries index/value after header
+                // EE publishes its receive buffer; IOP also tracks reverse. Store as MAINADDR-ish.
+                if (size >= 0x14)
                 {
-                    // Layout seen in DEVELOPER_GUIDE: +0x10 index, +0x14 value
+                    uint buf = _system.Memory.Read32(eePacket + 0x10);
+                    if (buf != 0) _sifRegs[Sif.SifRegMainAddr] = buf;
+                }
+                else if (dest != 0)
+                    _sifRegs[Sif.SifRegMainAddr] = dest;
+                // ProDG / retail cmd-handler SDKs register a DMAC-5 consumer that drains
+                // IOP→EE packets from this buffer. After the EE publishes MAINADDR, IOP
+                // SIFCMD typically posts a SET_SREG(SIF_SREG_RPCINIT, 1) style notify so
+                // the EE handler can mark its ready-flag table (Burnout 3 @ 0x4E4140,
+                // MK:DA @ 0x40C780, MK:Deception @ 0x5D8840 — shared SN ProDG pattern).
+                DeliverIopSifCmdToEe(0x80000001, 0, 0, 1);
+                break;
+            case 0x80000001: // SET_SREG — packet: SifCmdSRegData_t { hdr(16), index, value }
+                {
                     uint idx = size >= 0x18 ? _system.Memory.Read32(eePacket + 0x10) : opt;
                     uint val = size >= 0x18 ? _system.Memory.Read32(eePacket + 0x14) : dest;
                     uint reg = idx & 0x1F;
                     if (reg < _sifRegs.Length) _sifRegs[reg] = val;
                     if (reg < _sifVirtualRegs.Length) _sifVirtualRegs[reg] = val;
-                    // SMFLAG writes from IOP side — mirror into Sif SMFLAG when reg==0-style boot bits
-                    if ((val & (Sif.SifStatSifInit | Sif.SifStatCmdInit | Sif.SifStatBootEnd)) != 0)
-                        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | val);
+                    // SIF_SREG_RPCINIT (index 0): IOP ack that RPC init completed — also
+                    // reflect into SIF_SYSREG_RPCINIT so sceSifInitRpc's GetReg path sees it.
+                    if (reg == 0 && val != 0)
+                        _sifVirtualRegs[2] = val;
+                    // SMFLAG-style boot bits in value — OR into hardware SMFLAG (IOP→EE post).
+                    if ((val & Sif.SifStatIopBootReady) != 0)
+                        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30) | (val & Sif.SifStatIopBootReady));
+                    // Echo SET_SREG back to EE receive buffer so registered cmd handlers see it
+                    // (real IOP SIFCMD reverse-path; required for ProDG flag-table SDKs).
+                    DeliverIopSifCmdToEe(0x80000001, 0, idx, val);
                 }
                 break;
-            case 0x80000002: // INIT_CMD
-                _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30)
-                    | Sif.SifStatSifInit | Sif.SifStatCmdInit);
-                if (2 < _sifRegs.Length) _sifRegs[2] = 1;
+            case 0x80000002: // INIT_CMD — SIFCMD.IRX FUN_0000006c
+                // opt==0: SIFCMD init → CMDINIT + publish SUBADDR
+                // opt!=0: RPC init path → set SREG/SYSREG RPCINIT (sceSifInitRpc)
+                _system.Sif.ApplySifInit();
+                _system.Sif.ApplyCmdInit();
+                if (_sifRegs[Sif.SifRegSubAddr] == 0)
+                    _sifRegs[Sif.SifRegSubAddr] = Sif.DefaultIopSifCmdBufAddr;
+                if (_sifVirtualRegs[0] == 0)
+                    _sifVirtualRegs[0] = Sif.DefaultIopSifCmdBufAddr;
+                if (opt != 0)
+                {
+                    // RPC init: equivalent of IOP SET_SREG(SIF_SREG_RPCINIT, 1)
+                    _sifRegs[0] = 1;
+                    _sifVirtualRegs[2] = 1;
+                    DeliverIopSifCmdToEe(0x80000001, 0, 0, 1);
+                }
+                _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
                 break;
-            case 0x80000003: // RESET_CMD
-                if (3 < _sifRegs.Length) _sifRegs[3] = 1;
+            case 0x80000003: // RESET_CMD — SifIopReset / REBOOT.IRX payload
+                // SifCmdResetData_t (ps2sdk iopcontrol.c): header(16) + arglen + mode + arg[80].
+                // Defer SMFLAG re-post: EE clears SIFINIT/CMDINIT *after* this DMA returns.
+                // Completion (SIFINIT+CMDINIT+EESYNC BOOTEND) runs on next SMFLAG GetReg.
+                {
+                    int argLen = size >= 0x18 ? (int)_system.Memory.Read32(eePacket + 0x10) : 0;
+                    int mode = size >= 0x18 ? (int)_system.Memory.Read32(eePacket + 0x14) : (int)opt;
+                    if (argLen < 0) argLen = 0;
+                    if (argLen > Sif.IopRebootArgMax) argLen = Sif.IopRebootArgMax;
+                    string arg = "";
+                    if (argLen > 0 && size >= 0x18u + (uint)argLen)
+                    {
+                        var sb = new System.Text.StringBuilder(argLen);
+                        for (int i = 0; i < argLen; i++)
+                        {
+                            byte c = _system.Memory.Read8(eePacket + 0x18 + (uint)i);
+                            if (c == 0) break;
+                            if (c >= 0x20 && c < 0x7F) sb.Append((char)c);
+                        }
+                        arg = sb.ToString();
+                    }
+                    _system.Sif.MarkIopRebootPending(arg, mode, argLen);
+                }
+                _sifVirtualRegs[2] = 0; // SYSREG_RPCINIT cleared like SifIopReset
+                _sifVirtualRegs[0] = 0; // SYSREG_SUBADDR cleared
+                _sifRegs[Sif.SifRegSubAddr] = 0;
                 break;
             case 0x80000008: // RPC_END arriving EE→IOP (unusual) — treat as free/ack
                 break;
@@ -969,7 +1417,6 @@ public sealed class SonyKernelHle
         // EE SIF library effect of a successful IOP ack (normally _SifCmdIntHandler after
         // SIF0 DMA). sceSifInitRpc polls a ready-slot table — without this write the EE
         // spins forever even when SMFLAG already has CMDINIT|BOOTEND (BIOS HLE path).
-        // Confirmed: MK Shaolin Monks table base 0x00778800 (getter 0x00482740).
         AcknowledgeEeSifCmdReady(cid);
 
         // Midway / custom: if dest looks like EE buffer, write a success result dword
@@ -1006,25 +1453,68 @@ public sealed class SonyKernelHle
     }
 
     /// <summary>
+    /// Deliver one IOP→EE SIFCMD packet into the EE receive buffer published via
+    /// CHANGE_SADDR / SIF_REG_MAINADDR, then raise the SIF INTC source so a game-registered
+    /// AddDmacHandler(SIF0) can drain it.
+    /// <para>
+    /// Packet layout matches real SIF0 16-byte header + payload (ps2sdk <c>SifCmdHeader_t</c>):
+    /// word0 low 8 bits = total packet size in bytes (ProDG handlers <c>lbu</c> this as a
+    /// length prefix, then copy that many bytes and clear it); +8 = cid; +16/+20 = optional
+    /// SET_SREG index/value. Ground-truthed against PCSX2 SIF0 traces for Burnout 3
+    /// (docs/DEVELOPER_GUIDE.md §7.13–7.14): without this write, the EE handler sees a zero
+    /// length prefix at the buffer and never reaches the flag-table setter.
+    /// </para>
+    /// Generic BIOS HLE — no title PCs. Safe no-op when MAINADDR is unset or not in RDRAM.
+    /// </summary>
+    private void DeliverIopSifCmdToEe(uint cid, uint opt, uint word0, uint word1)
+    {
+        uint dest = _sifRegs[Sif.SifRegMainAddr];
+        if (dest == 0) return;
+        dest &= 0x1FFFFFFFu;
+        if (dest < 0x1000 || dest + 0x30 >= SystemMemory.RDRAM_SIZE) return;
+
+        // 24-byte packet: 16B header + 8B payload (index, value for SET_SREG).
+        const uint pktSize = 0x18;
+        _system.Memory.Write32(dest + 0x00, pktSize); // psize in low byte; dsize=0
+        _system.Memory.Write32(dest + 0x04, 0);
+        _system.Memory.Write32(dest + 0x08, cid);
+        _system.Memory.Write32(dest + 0x0C, opt);
+        _system.Memory.Write32(dest + 0x10, word0);
+        _system.Memory.Write32(dest + 0x14, word1);
+        // Pad to 48 bytes like real SIF0 DMA quanta (harmless zeros if handler only copies psize).
+        _system.Memory.Write32(dest + 0x18, 0);
+        _system.Memory.Write32(dest + 0x1C, 0);
+        _system.Memory.Write32(dest + 0x20, 0);
+        _system.Memory.Write32(dest + 0x24, 0);
+        _system.Memory.Write32(dest + 0x28, 0);
+        _system.Memory.Write32(dest + 0x2C, 0);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[SIFCMD] IOP→EE dest=0x{dest:X8} cid=0x{cid:X8} w0=0x{word0:X8} w1=0x{word1:X8}");
+    }
+
+    /// <summary>
     /// Mark EE-side SIFCMD/RPC "queue registered / cmd ready" slots after an EE→IOP
     /// command is accepted. Real hardware: IOP replies over SIF0 → EE DMAC IRQ →
     /// <c>_SifCmdIntHandler</c> fills the handler table. HLE has no IOP R3000, so we
-    /// apply the same EE memory side effects here (docs/BIOS_DISSECTION.md §3).
+    /// apply the same EE memory side effects here (docs/BIOS_DISSECTION.md §3,
+    /// docs/bios-ports/SIFINIT_EESYNC.md).
     /// </summary>
     private void AcknowledgeEeSifCmdReady(uint cid)
     {
-        // Primary: MK / common Midway EE sifrpc BSS ready-array base
-        const uint MkSifReadyBase = 0x00778800;
-        for (uint i = 0; i < 8; i++)
-            _system.Memory.Write32(MkSifReadyBase + i * 4, 1);
+        // Do not re-assert SMFLAG during a pending IOP reboot — EE intentionally cleared
+        // bits and is waiting for EESYNC's deferred BOOTEND re-post via GetReg.
+        if (!_system.Sif.IopRebootPending)
+            _system.Sif.PresentIopBootReady();
 
-        // Also ensure SMFLAG reflects full SIFCMD bring-up for any GetReg polls
-        _system.Sif.WriteRegister(0x30, _system.Sif.ReadRegister(0x30)
-            | Sif.SifStatSifInit | Sif.SifStatCmdInit | Sif.SifStatBootEnd);
+        Sif.PlantEeSifReadySlots(_system.Memory);
+        _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
 
         // INIT family: wake a waiter that may be parked on the init handshake sema.
         // Prefer signaling only if someone is blocked — mirrors RPC_END iSignalSema.
-        if (cid is 0x80000000 or 0x80000001 or 0x80000002 or 0x80000003)
+        // RESET_CMD does not wake here (reboot completion does via GetReg path).
+        if (cid is 0x80000000 or 0x80000001 or 0x80000002)
         {
             foreach (var t in _kernel.AllThreads)
             {
@@ -1033,6 +1523,38 @@ public sealed class SonyKernelHle
                     _kernel.ISignalSema(t.WaitSemaId);
                     break; // one wake per ack, like SignalSema
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// After deferred IOP reboot completes (REBOOT.IRX + SIFINIT + SIFCMD + EESYNC):
+    /// re-publish SUBADDR / RPCINIT, re-install IOMAN default devices + STDIO/IGREETING
+    /// contracts so a subsequent <c>sceSifInitRpc</c> sees a live post-IOPBTCONF IOP.
+    /// </summary>
+    private void OnIopRebootCompleted()
+    {
+        _sifRegs[Sif.SifRegSubAddr] = Sif.DefaultIopSifCmdBufAddr;
+        _sifVirtualRegs[0] = Sif.DefaultIopSifCmdBufAddr;
+        _sifVirtualRegs[2] = 1;
+        _sifRegs[Sif.SifRegSmFlag] = _system.Sif.SmFlag;
+        Sif.PlantEeSifReadySlots(_system.Memory);
+        _system.Sif.WriteRegister(0x30, _system.Sif.SmFlag);
+
+        // REBOOT.IRX / IOPBTCONF reload side effects (generic HLE — no title PCs):
+        // re-present IOMAN device table, STDIO tty sink, IGREETING done flag.
+        BiosBootHost.ApplyPostIopRebootContracts(_system);
+
+        // PADMAN open-port table dies with the IOP image; clear so post-reboot OPEN works.
+        RealRpc.OnIopReboot();
+
+        // Wake one WaitSema sleeper if any (EESYNC post → EE SifIopSync consumer).
+        foreach (var t in _kernel.AllThreads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitSemaId > 0)
+            {
+                _kernel.ISignalSema(t.WaitSemaId);
+                break;
             }
         }
     }
@@ -1155,6 +1677,27 @@ public sealed class SonyKernelHle
             if (init > max) init = max;
         }
         return _kernel.CreateSema(init, max);
+    }
+
+    /// <summary>
+    /// BIOS THREADMAN ReferSemaStatus (FUN_0000365c / FUN_000036a4). Fills ps2sdk
+    /// <c>ee_sema_t</c>: count@+0, max_count@+4, init_count@+8, wait_threads@+C,
+    /// attr@+10, option@+14. Decomp copies attr/option/init/max/count/numWaiters from
+    /// the live sema object; attr/option are not tracked by HLE and are written 0.
+    /// </summary>
+    private int ReferSemaStatus(int id, uint statusAddr)
+    {
+        if (!_kernel.SemaExists(id)) return -1;
+        if (statusAddr != 0)
+        {
+            _system.Memory.Write32(statusAddr + 0, (uint)_kernel.GetSemaCount(id));
+            _system.Memory.Write32(statusAddr + 4, (uint)_kernel.GetSemaMaxCount(id));
+            _system.Memory.Write32(statusAddr + 8, (uint)_kernel.GetSemaInitCount(id));
+            _system.Memory.Write32(statusAddr + 12, (uint)_kernel.CountSemaWaiters(id));
+            _system.Memory.Write32(statusAddr + 16, 0); // attr
+            _system.Memory.Write32(statusAddr + 20, 0); // option
+        }
+        return 0;
     }
 
     /// <summary>Real Deci2Call sub-dispatch (function/param convention and struct layouts
@@ -1350,4 +1893,20 @@ public sealed class SonyKernelHle
         }
         return 0;
     }
+    /// <summary>
+    /// Install an EE exception-vector handler (SetVTLBRefill / SetVCommon / SetVInterrupt).
+    /// Returns the previous handler, or a non-zero BIOS-default sentinel when none was
+    /// registered yet — matching retail BIOS where the default exception vector is always live.
+    /// Passing handler=0 clears the registration and still returns the previous value.
+    /// </summary>
+    private static long SetExceptionVectorHandler(Dictionary<int, uint> table, int cause, uint handler)
+    {
+        long previous = table.TryGetValue(cause, out uint prev) ? prev : DefaultExceptionHandlerSentinel;
+        if (handler == 0)
+            table.Remove(cause);
+        else
+            table[cause] = handler;
+        return previous;
+    }
+
 }

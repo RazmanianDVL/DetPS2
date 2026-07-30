@@ -10,6 +10,9 @@ They should NOT be hand-edited into shared core files.
 
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|
-| Mortal Kombat: Shaolin Monks (USA) | `SLUS_210.87` | `MidwayBootAssist.cs` (968 lines) — **migrated to `IGameQuirkModule`, correctly serial-gated as of 2026-07-25** (see DEVELOPER_GUIDE.md §7.3): FMV logo playback from cached decoded frames, forced jump into CRT0's real `main()` when fast-boot never reaches it, forced re-entry into the SIF-init routine, synthetic SIF worklist/ring planting, and several PC-range-gated "unstick" patches that force a wait loop's expected return value when our IOP-side HLE can't complete the real handshake. | Real IOP module execution (SIF RPC handshakes driven by proprietary/undocumented middleware — SNDF_Driver, CRI ADX, SDRDRV) and full BIOS execution are both out of scope for now; these hacks let the disc boot and render in the meantime. | 2026-07 |
+| Mortal Kombat: Shaolin Monks (USA) | `SLUS_210.87` | `MidwayBootAssist` — ADX multi-table scrub, list-walk break, format-stall→main (gifP3 5→12), **post-spine memset break @0x385278**, dense pad. No `*0x75C0D0` plant. | CRI ADX / WAD under HLE; format/list/memset parks | 2026-07-30 |
+| Burnout 3: Takedown (USA) | `SLUS_210.50` | `Burnout3Assist` + **`HandleLgDev`**; **lgDeviceInit entry stub @`0x4438E0`** + residual CallRpc complete; IOPRP `"2800"`; flip re-arm | lgDeviceInit thrash → left VBlank; still no game FILEIO | 2026-07-30 |
+| Blood Omen 2 (USA) | `SLUS_200.24` | `BloodOmen2SnAssist` — SN stubs, IOPRP `"2340"`, real BG2, **cache-flush leaf stub**, exception-vector rescue, pad | MAINMENU loaded; px=3 draw stall | 2026-07-30 |
+| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`, FreezeCache, BST, **tag empty-exit only** (no mid-fn $ra), freelist guards, pad | CDVD 142; RPC calls↑; still px=0 | 2026-07-30 |
 
 Format: short description + link to issue/commit when available.
