@@ -81,3 +81,15 @@ $env:DETPS2_TRACE_RPC='1'
 dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
 # expect: HandleLgDev fno=0xC, force CallRpc→lgDev epilogue n=1, calls≥500, unknownBindSids=0
 ```
+
+## Wave-7 (2026-07-30 post-G0)
+
+| Field | Value |
+|-------|-------|
+| STG / full TXD | YES (deliver) fno=5 n=1146112; FRONTEND open |
+| cdvd | 2425 (deliver 80M) |
+| gifP3 / dmac / calls | 656 / 831 / 602 |
+| px / MENU | 0 / No |
+| Wall | post-TXD MMIO probe 0x21A5xx / PC 0x1F308C |
+| Assist | e90eaef post-TXD MMIO leave |
+| Residual | #20 presentation px>0; tip residual-STG flaky after SM RR |
