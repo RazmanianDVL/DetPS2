@@ -94,6 +94,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _linkSearchEscapes;
     private int _streamArmPulses;
     private int _globalFreeEscapes;
+    private int _tickWaitEscapes;
     private ulong _lastWorldKickCyc;
     private bool _heapDefaultsPlanted;
     /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
@@ -116,9 +117,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint HeapNodeUpgrade = HeapDefaultNodeBase + 0x140;
 
     /// <summary>Payload arena after config nodes (see <see cref="PlantFreelistHeader"/>).</summary>
+    /// <remarks>Must stay under 32 MiB RDRAM (base 0x01FD8200 leaves ~160 KiB).</remarks>
     public const uint HeapArenaBase = HeapDefaultNodeBase + 0x200;
-    public const uint HeapArenaBytes = 0x00180000; // 1.5 MiB
-    public const uint HeapBlockSize = 0x1000; // 4 KiB carve units
+    public const uint HeapArenaBytes = 0x00025000; // ~148 KiB, end 0x01FFD200
+    public const uint HeapBlockSize = 0x400; // 1 KiB carve units
+
+    /// <summary>Software tick counter polled by wait leaf 0x17A1D0 (*0x29C7D4).</summary>
+    public const uint SoftTickPtr = 0x0029C7D4;
+    /// <summary>Flag polled by software delay 0x17A328 / 0x183880.</summary>
+    public const uint SoftSpinFlagPtr = 0x0029C7D0;
+    /// <summary>Nonzero → tick-wait takes fast clear+return after tick satisfied.</summary>
+    public const uint SoftTickFastPtr = 0x0029C664;
 
     /// <summary>
     /// Default hero/slot/upgrade heap sizes (bytes) when dict miss returns NULL.
@@ -179,6 +188,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _linkSearchEscapes = 0;
         _streamArmPulses = 0;
         _globalFreeEscapes = 0;
+        _tickWaitEscapes = 0;
         _lastWorldKickCyc = 0;
         _heapDefaultsPlanted = false;
         _arenaBump = HeapArenaBase;
@@ -215,6 +225,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public void Step(Ps2System sys)
     {
         ulong c = sys.Scheduler.MasterCycles;
+
+        // Keep software tick moving every Step after early boot — VBlank handler at
+        // 0x182F28 only runs when INTC fires; busy-wait paths disable progress otherwise.
+        if (c >= 30_000_000 && (c % 50_000) < 5_000)
+            AdvanceSoftTick(sys, minTarget: 0);
 
         // Re-plant after ELF load (PT_LOAD overwrites OnDiscMounted plants).
         if (!_versionPlanted && c >= 500_000)
@@ -353,22 +368,25 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= 0x001312C0 and <= 0x001312E8)
             TryEscapeLinkSearch(sys, pc, c);
 
-        // Software delay + flag poll — two sibling sites share *0x29C7D0:
-        //   0x17A328..0x17A35C (live PC 0x17A334): countdown 20000 while *flag==1
-        //   0x183880..0x1838C8 (wave-2 profiler #1: countdown 20000 while flag==1)
-        // Flag stuck at 1 → forever. Clear AND snap past the outer beq (not just mid-count).
-        if (c >= 38_000_000
-            && (pc is >= 0x0017A320 and <= 0x0017A360
+        // Tick-wait leaf 0x17A1D0 (PcProfiler #1 @ 0x17A204): while *0x29C7D4 < a0
+        // busy-delay 2000. Tick stuck at 0 → forever, starving FILEIO past IRX (cdvd=142).
+        if (c >= 35_000_000 && pc is >= 0x0017A1D0 and <= 0x0017A294)
+            TryEscapeTickWait(sys, pc, c);
+
+        // Software delay + flag poll — *0x29C7D0. Clear flag, advance tick, land at 0x17A360
+        // so jal 0x17A1D0 still runs with tick already satisfied.
+        if (c >= 35_000_000
+            && (pc is >= 0x0017A320 and <= 0x0017A370
                 || pc is >= 0x00183880 and <= 0x001838C8))
         {
-            uint fl = sys.Memory.Read32(0x0029C7D0);
+            uint fl = sys.Memory.Read32(SoftSpinFlagPtr);
             if (fl == 1 || fl != 0)
-                sys.Memory.Write32(0x0029C7D0, 0);
+                sys.Memory.Write32(SoftSpinFlagPtr, 0);
+            AdvanceSoftTick(sys, minTarget: 0);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
             sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0 }); // v1 != 1 so outer exits
             if (pc is >= 0x00183880 and <= 0x001838C8)
             {
-                // 0x1838C8 is jr ra — only take it when $ra is real code.
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
                 if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x002C0000
                     && ra is not (>= 0x00183880 and <= 0x001838D0))
@@ -379,8 +397,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
             else
             {
-                // Skip past beq flag,1,0x17A328 — land on post-loop body at 0x17A360.
-                // Mid-count snap to 0x17A350 re-reads flag via a2 and can restart if a2 bad.
                 sys.EE.PC = 0x0017A360;
                 sys.EE.COP0_Status &= ~0x6u;
             }
@@ -514,8 +530,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // multi-M SetSyscall thrash): soft-escape + stream-ready poll so we can leave heap
         // and re-enter world kick without permanent freelist stubs.
         if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
-            && pc is >= 0x00239300 and <= 0x002396EF
-            && (_free2Escapes < 96))
+            && pc is >= 0x00239300 and <= 0x00239810)
             TryEscapeSecondaryFreelist(sys, pc, c);
     }
 
@@ -622,6 +637,56 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[GOW] escape list-cmp walk pc=0x{pc:X8} a1=0x{a1:X8} t0=0x{t0:X8} " +
                 $"-> 0x{resume:X8} n={_listCmpEscapes} cyc={c}");
+    }
+
+
+    /// <summary>
+    /// Bump software tick *0x29C7D4 so wait leaf 0x17A1D0 can exit.
+    /// Ensures *0x29C664 != 0 for the fast clear+return path.
+    /// </summary>
+    private static void AdvanceSoftTick(Ps2System sys, uint minTarget)
+    {
+        uint tick = sys.Memory.Read32(SoftTickPtr);
+        uint next = tick + 1u;
+        if (minTarget != 0 && next < minTarget)
+            next = minTarget;
+        if (next == 0 || next > 0x7FFF_FFF0u)
+            next = minTarget != 0 ? minTarget : 1u;
+        sys.Memory.Write32(SoftTickPtr, next);
+        if (sys.Memory.Read32(SoftTickFastPtr) == 0)
+            sys.Memory.Write32(SoftTickFastPtr, 1);
+    }
+
+    /// <summary>
+    /// Tick-wait leaf 0x17A1D0: while *0x29C7D4 &lt; a0 busy-delay 2000.
+    /// Snap to jr ra at 0x17A294 WITHOUT zeroing tick (0x17A290 zeros it → re-stall).
+    /// </summary>
+    private void TryEscapeTickWait(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc is >= 0x0017A294 and <= 0x0017A298)
+            return;
+        if (_tickWaitEscapes >= 1024)
+            return;
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint tick = sys.Memory.Read32(SoftTickPtr);
+        uint target = a0 == 0xFFFFFFFFu ? tick + 1u : a0;
+        bool midDelay = pc is >= 0x0017A1FC and <= 0x0017A288;
+        bool unsatisfied = tick < target || (target == 0 && midDelay);
+        if (!unsatisfied && !midDelay)
+            return;
+
+        if (target == 0) target = 1;
+        AdvanceSoftTick(sys, minTarget: target);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = 0x0017A294; // jr ra — do not take 0x17A290 (zeros tick)
+        sys.EE.COP0_Status &= ~0x6u;
+        _tickWaitEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _tickWaitEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape tick-wait pc=0x{pc:X8} a0=0x{a0:X8} tick was 0x{tick:X8} " +
+                $"-> 0x17A294 n={_tickWaitEscapes} cyc={c}");
     }
 
     /// <summary>
@@ -797,6 +862,16 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _lastWorldKickCyc = c;
         if (_worldKickPulses >= 768) return;
         _worldKickPulses++;
+
+        AdvanceSoftTick(sys, minTarget: 0);
+        sys.Memory.Write32(SoftSpinFlagPtr, 0);
+        if (pc is >= 0x0017A1D0 and <= 0x0017A294)
+            TryEscapeTickWait(sys, pc, c);
+        if (pc is >= 0x0017A320 and <= 0x0017A35C)
+        {
+            sys.EE.PC = 0x0017A360;
+            sys.EE.COP0_Status &= ~0x6u;
+        }
 
         // Live final PC 0x26C0E0: do { v0 = 0x26BB98(); } while (v0==0);
         // 0x26BB98 is the 989snd wait leaf: returns 1 when *0x2A1338==0 OR pending has
@@ -1926,17 +2001,26 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// </summary>
     private uint AllocArenaBlock(Ps2System sys, uint minSize = HeapBlockSize)
     {
+        const uint rdramEnd = (uint)SystemMemory.RDRAM_SIZE; // 0x02000000
+        uint arenaEnd = HeapArenaBase + HeapArenaBytes;
+        if (arenaEnd > rdramEnd - 0x40u)
+            arenaEnd = rdramEnd - 0x40u;
         uint size = minSize < HeapBlockSize ? HeapBlockSize : (minSize + 0xFu) & ~0xFu;
-        if (_arenaBump < HeapArenaBase || _arenaBump >= HeapArenaBase + HeapArenaBytes)
+        if (size > 0x1000u) size = 0x1000u;
+        if (_arenaBump < HeapArenaBase || _arenaBump >= arenaEnd)
             _arenaBump = HeapArenaBase;
-        if (_arenaBump + size > HeapArenaBase + HeapArenaBytes)
-            _arenaBump = HeapArenaBase; // wrap — better than returning header
+        if (_arenaBump + size > arenaEnd)
+            _arenaBump = HeapArenaBase;
         uint block = _arenaBump;
         _arenaBump += size;
+        if (block < 0x00100000u || block + size > rdramEnd)
+        {
+            block = HeapArenaBase;
+            _arenaBump = HeapArenaBase + size;
+        }
         uint zeroLen = size > 0x200u ? 0x200u : size;
         for (uint o = 0; o < zeroLen; o += 4)
             sys.Memory.Write32(block + o, 0);
-        // Self-link first word so naïve list walks terminate (cursor == next).
         sys.Memory.Write32(block, block);
         return block;
     }
@@ -2029,7 +2113,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (pc is (>= 0x00239744 and <= 0x00239750) or (>= 0x002397FC and <= 0x0023980C))
             return;
         // Soft-cap; never permanent freelist .text stub (wave-5 tip).
-        if (_free2Escapes >= 96)
+        // Uncapped soft-escape — permanent .text plant regressed RPC/dmac.
+        if (_free2Escapes >= 100000)
             return;
 
         uint s0 = (uint)sys.EE.GetGpr(16).Lo;
@@ -2136,11 +2221,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 sys.Memory.Write32(a1 + 0x80, 0);
         }
         _heapNullEscapes++;
-        // After many hits: return block via epilogue (0x23AA28) — still never the header.
-        if (_heapNullEscapes > 32)
+        // After few hits / synthetic header thrash: return via epilogue (never header).
+        if (_heapNullEscapes > 8 || onSynthetic)
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block });
             sys.EE.PC = 0x0023AA28;
+            sys.EE.COP0_Status &= ~0x6u;
         }
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _heapNullEscapes <= 8)
             Console.Error.WriteLine(

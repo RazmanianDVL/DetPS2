@@ -442,10 +442,12 @@ public sealed class Ps2System
                     (>= 0x0015F2C0UL and <= 0x0015FA80UL)
                     or (>= 0x001312C0UL and <= 0x001312F0UL)  // link-search thrash
                     or (>= 0x00293C00UL and <= 0x00293C80UL)  // WaitSema empty SIF poll
+                    or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
                     or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
                     or (>= 0x00183880UL and <= 0x001838D0UL)
-                    or (>= 0x0017A320UL and <= 0x0017A360UL)
+                    or (>= 0x0017A1D0UL and <= 0x0017A298UL)  // soft-tick wait leaf (*0x29C7D4)
+                    or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait
                     or (>= 0x00233AD0UL and <= 0x00233B44UL)
                     or (>= 0x00284780UL and <= 0x002848B0UL)
                     or (>= 0x0021FF00UL and <= 0x00220600UL)
