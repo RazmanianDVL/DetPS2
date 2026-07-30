@@ -1,0 +1,83 @@
+# Burnout 3: Takedown (USA) — title port notes
+
+| Field | Value |
+|-------|--------|
+| **Id** | `burnout-3-takedown` |
+| **Serial** | `SLUS_210.50` |
+| **ISO** | `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` |
+| **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
+| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
+| **Agent date** | 2026-07-30 |
+| **ROMDIR gate** | **CLOSED** |
+| **Status** | Flip-wait bypass + GTFS SIDs + FILEIO fno=23 soft → gifP3=**380** / dmac=**482**; still cdvd=425 IRX-only; menu not reached |
+
+---
+
+## How far
+
+| Checkpoint | Result |
+|------------|--------|
+| Disc / ELF | OK — `SLUS_210.50` entry `0x00100008` |
+| IOPRP `"2800"` plant | **Yes** |
+| IRX list (SIO2…GTFS…LGDEVW…NETWORK) | **Yes** |
+| **lgDeviceInit version** | **CLEARED** — fno=12 → `0x010B1B00` |
+| **lgDeviceInit fno=18 thrash** | **BROKEN** — CallRpc→epilogue + **entry stub @ `0x4438E0`** + residual complete |
+| cdvdSectors | **425** (IRX only — no game FILEIO yet) |
+| RealSifRpc | binds=13 calls=**555** unknown=**0** |
+| PC @ 100M | **`0x00122A20`** (post flip-wait bypass) |
+| gifP3 / dmac | **380 / 482** (was 30/24 → 90/72) |
+| Main menu | **No** |
+| Pad inject | Armed once `SectorsRead>0` |
+
+### Telemetry @ 100M (host-present, SEMA_STALL_YIELD OFF)
+
+```
+PC=0x002B34D8  px=0 gifPath3=30 dmac=24 sifBytes=279788 syscalls=4441037 cdvdSectors=425
+RealSifRpc: binds=11 calls=444 unknownServiceCalls=0 unknownBindSids=0
+```
+
+### Root causes ground-truthed
+
+1. **Version assert `0x443A9C`**: fno=12 must return `*(recv+4)==0x010B1B00` (LGDEVW 1.11.027).  
+   Fix: `RealSifRpc.HandleLgDev`.
+
+2. **Post-version fno=18 thrash**: CallRpc WaitSema with `s1==0x01ECDF00` + cid=0 SIFCMD.  
+   Fix (this session): rewrite CallRpc's saved `$ra` at `sp+176` to `0x443C44`, then run real CallRpc success epilogue `0x10F3A8` (v0=0, restore, sp+=192) so lgDeviceInit epilogue sees a valid frame. Sticky `j 0x443C44` at `0x443C20`.
+
+3. **VBlank wait `0x237120`**: residual after LGDEV — workers re-enter; not the asset path by itself.
+
+## Fixes this session
+
+| Fix | Notes |
+|-----|--------|
+| CallRpc→lgDev epilogue via saved-ra | One-shot `_lgDevFullyDone`; main high-stack only |
+| Sticky `j 0x443C44` at `0x443C20` | In HandleLgDev + ForceLgDevSuccess |
+| High WaitSema id pulse (≥32) | After LGDEV done — avoid low RPC semas |
+| No blind SignalSema on RPC ids | Held |
+
+## Remaining
+
+1. First game-data FILEIO/NCMD after LGDEV (GTFS table / Criterion assets) — `cdvd≫425`.  
+2. Leave WaitSema(3) SIF-cmd poll + VBlank-only workers.  
+3. GS menu frame (`px>0`) + pad confirm.
+
+## Policy
+
+- No `DETPS2_SEMA_STALL_YIELD`
+- PollSema-id
+- No global DMAC force-finish
+- out←in **never** forced
+
+## MENU
+
+**NOT REACHED.** LGDEV entry+CallRpc-leaf stubs; boot-wait `*(gp-23028)` / `*(s0+0x13A4)`; left flip park `0x1F24E0` → **gifP3=90**. Table-walk absurd-bounds stub @ `0x3E9B40`. Still **cdvd=425** IRX-only — no game FILEIO/GTFS assets.
+
+## Reproduce
+
+```powershell
+# do NOT set DETPS2_SEMA_STALL_YIELD
+$env:DETPS2_TRACE_BIOS='1'
+$env:DETPS2_TRACE_RPC='1'
+dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
+# expect: HandleLgDev fno=0xC, force CallRpc→lgDev epilogue n=1, calls≥500, unknownBindSids=0
+```

@@ -85,8 +85,75 @@ public sealed class Sif : ISchedulable
     public const uint SifStatCmdInit = 0x20000;
     public const uint SifStatBootEnd = 0x40000;
 
+    /// <summary>All three SMFLAG boot-progress bits (SIFMAN+SIFCMD+EESYNC handoff complete).</summary>
+    public const uint SifStatIopBootReady = SifStatSifInit | SifStatCmdInit | SifStatBootEnd;
+
+    // ps2sdk sifdma.h SIF_REG_* indices (physical SBUS mailbox regs via SifGetReg/SifSetReg).
+    public const uint SifRegMainAddr = 1;
+    public const uint SifRegSubAddr = 2;
+    public const uint SifRegMsFlag = 3;
+    public const uint SifRegSmFlag = 4;
+
+    // ps2sdk sifdma.h software sysregs (SIF_REG_ID_SYSTEM | n).
+    public const uint SifSysregSubAddr = 0x80000000;
+    public const uint SifSysregMainAddr = 0x80000001;
+    public const uint SifSysregRpcInit = 0x80000002;
+
+    /// <summary>
+    /// IOP-side SIFCMD receive buffer (SIF_REG_SUBADDR). Real SIFCMD.IRX publishes this after
+    /// init; EE <c>sceSifInitCmd</c> reads it as the DMA destination for EE→IOP command packets.
+    /// HLE places it in high IOP RAM (physical), away from early module load ranges.
+    /// </summary>
+    public const uint DefaultIopSifCmdBufAddr = 0x0001F000;
+
+    /// <summary>
+    /// Common EE BSS base used by several retail/sceSifInitRpc builds as the RPC "queue ready"
+    /// / cmd-handler-slot table (polled as non-zero words). Confirmed live against Midway titles
+    /// at 0x00778800; planted generically so pure-BIOS HLE matches the post-handshake state
+    /// without game PCs. Not a title assist — the same table shape appears across SDK variants.
+    /// </summary>
+    public const uint EeSifReadySlotBase = 0x00778800;
+    public const int EeSifReadySlotCount = 8;
+
     /// <summary>Last RPC result written (for tests).</summary>
     public uint LastRpcResult { get; private set; }
+
+    /// <summary>
+    /// IOP reboot in flight: EE <c>SifIopReset</c> clears SMFLAG bits + SYSREG after sending
+    /// RESET_CMD; real IOP reloads SIFMAN→SIFCMD→…→SIFINIT and EESYNC re-posts BOOTEND.
+    /// HLE defers re-post until the next SMFLAG GetReg (after EE clears) — see
+    /// <see cref="MarkIopRebootPending"/> / <see cref="TryCompletePendingIopReboot"/>.
+    /// </summary>
+    public bool IopRebootPending { get; private set; }
+
+    /// <summary>Monotonic IOP reboot generation (RESET_CMD completions). For diagnostics/smokes.</summary>
+    public ulong IopRebootGeneration { get; private set; }
+
+    /// <summary>
+    /// Last RESET_CMD arg string captured from the EE reset packet (ps2sdk
+    /// <c>SifCmdResetData_t.arg</c>). Empty string = default IOPBTCONF reload
+    /// (real <c>SifIopReset("", 0)</c>). Non-empty often starts with
+    /// <c>rom0:UDNL …</c> (SifIopReboot path).
+    /// </summary>
+    public string LastIopRebootArg { get; private set; } = "";
+
+    /// <summary>Last RESET_CMD mode field (<c>SifCmdResetData_t.mode</c>).</summary>
+    public int LastIopRebootMode { get; private set; }
+
+    /// <summary>Last RESET_CMD arglen field (bytes of arg copied by EE).</summary>
+    public int LastIopRebootArgLen { get; private set; }
+
+    /// <summary>ps2sdk RESET_ARG_MAX — max arg chars in SifCmdResetData_t.</summary>
+    public const int IopRebootArgMax = 80;
+
+    /// <summary>SIFINIT applied (SMFLAG bit SIFINIT). Idempotent — decomp "Skip SIF init".</summary>
+    public bool SifInitApplied => (SmFlag & SifStatSifInit) != 0;
+
+    /// <summary>SIFCMD layer up (SMFLAG CMDINIT).</summary>
+    public bool CmdInitApplied => (SmFlag & SifStatCmdInit) != 0;
+
+    /// <summary>EESYNC SyncEE posted BOOTEND.</summary>
+    public bool BootEndPosted => (SmFlag & SifStatBootEnd) != 0;
 
     public Sif(SystemMemory memory, Intc? intc = null)
     {
@@ -111,11 +178,132 @@ public sealed class Sif : ISchedulable
         RpcProcessed = 0;
         LastRpcResult = 0;
         MsCom = SmCom = MsFlag = 0;
-        SmFlag = SifStatSifInit | SifStatCmdInit | SifStatBootEnd;
+        IopRebootPending = false;
+        IopRebootGeneration = 0;
+        LastIopRebootArg = "";
+        LastIopRebootMode = 0;
+        LastIopRebootArgLen = 0;
+        // BIOS handoff: SIFMAN SIFINIT + SIFCMD CMDINIT + EESYNC BOOTEND already complete.
+        SmFlag = SifStatIopBootReady;
         _cmdQueue.Clear();
         _rpcPacketAddrs.Clear();
         _realRpcQueue.Clear();
     }
+
+    // ---- SIFINIT / EESYNC / SIFCMD boot contracts (decomp + ps2sdk) ----
+
+    /// <summary>
+    /// SIFINIT.IRX / SIFMAN init effect: set SIF_STAT_SIFINIT. Decomp string "Skip SIF init" —
+    /// if already set, no-op (returns false).
+    /// </summary>
+    public bool ApplySifInit()
+    {
+        if ((SmFlag & SifStatSifInit) != 0)
+            return false;
+        SmFlag |= SifStatSifInit;
+        return true;
+    }
+
+    /// <summary>
+    /// SIFCMD.IRX init effect (IOP side FUN_0000006c opt==0 / FUN_000016d0): set CMDINIT.
+    /// </summary>
+    public bool ApplyCmdInit()
+    {
+        if ((SmFlag & SifStatCmdInit) != 0)
+            return false;
+        SmFlag |= SifStatCmdInit;
+        return true;
+    }
+
+    /// <summary>
+    /// EESYNC.IRX export SyncEE (decomp FUN_0000007c): posts SIF_STAT_BOOTEND (0x40000) via
+    /// sifman so EE <c>SifIopSync</c> / boot waiters observe full IOP bring-up.
+    /// </summary>
+    public void PostBootEnd()
+    {
+        SmFlag |= SifStatBootEnd;
+    }
+
+    /// <summary>
+    /// Full IOPBTCONF SIF stack handoff after SIFMAN→SIFCMD→…→SIFINIT (+ EESYNC): all three
+    /// SMFLAG bits set. Idempotent.
+    /// </summary>
+    public void PresentIopBootReady()
+    {
+        SmFlag |= SifStatIopBootReady;
+    }
+
+    /// <summary>
+    /// SMFLAG write-1-to-clear (ps2sdk <c>SifIopReset</c> / real SBUS): each 1-bit in
+    /// <paramref name="bits"/> clears the corresponding SMFLAG bit.
+    /// </summary>
+    public void ClearSmFlagBits(uint bits)
+    {
+        SmFlag &= ~bits;
+    }
+
+    /// <summary>
+    /// EE sent SIF_CMD_RESET_CMD. Defer re-post until after EE clears SIFINIT/CMDINIT/BOOTEND
+    /// and SYSREG (real SifIopReset order: SetDma then SetReg clears). Next SMFLAG poll
+    /// completes the sequence (SIFINIT + CMDINIT + EESYNC BOOTEND).
+    /// </summary>
+    public void MarkIopRebootPending() => MarkIopRebootPending(null, 0, 0);
+
+    /// <summary>
+    /// RESET_CMD with full <c>SifCmdResetData_t</c> payload (REBOOT.IRX / IOP-side helper
+    /// contract). Captures arg/mode for diagnostics and post-reboot path selection.
+    /// Empty/null <paramref name="arg"/> = default IOPBTCONF (commercial cold-boot equivalent).
+    /// </summary>
+    public void MarkIopRebootPending(string? arg, int mode, int argLen = -1)
+    {
+        IopRebootPending = true;
+        // Mirror pre-reboot clear of BOOTEND if EE hadn't already (SifIopReset clears it first).
+        SmFlag &= ~SifStatBootEnd;
+        LastIopRebootArg = arg ?? "";
+        if (LastIopRebootArg.Length > IopRebootArgMax)
+            LastIopRebootArg = LastIopRebootArg[..IopRebootArgMax];
+        LastIopRebootMode = mode;
+        LastIopRebootArgLen = argLen >= 0 ? argLen : LastIopRebootArg.Length;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1")
+            Console.Error.WriteLine(
+                $"[REBOOT] pending arglen={LastIopRebootArgLen} mode={LastIopRebootMode} " +
+                $"arg=\"{LastIopRebootArg}\"");
+    }
+
+    /// <summary>
+    /// If a RESET_CMD reboot is pending, re-apply SIFINIT→CMDINIT→EESYNC BOOTEND (as real
+    /// IOPBTCONF reload + REBOOT.IRX + EESYNC SyncEE would). Returns true when a pending
+    /// reboot completed.
+    /// </summary>
+    public bool TryCompletePendingIopReboot()
+    {
+        if (!IopRebootPending)
+            return false;
+        IopRebootPending = false;
+        IopRebootGeneration++;
+        // SIFMAN re-init + SIFCMD re-init + EESYNC SyncEE post (REBOOT completes bring-up).
+        SmFlag |= SifStatIopBootReady;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1")
+            Console.Error.WriteLine(
+                $"[REBOOT] complete gen={IopRebootGeneration} smflag=0x{SmFlag:X} " +
+                $"arg=\"{LastIopRebootArg}\"");
+        return true;
+    }
+
+    /// <summary>
+    /// Plant EE-side SIF "queue ready" slots so <c>sceSifInitRpc</c>-style polls succeed under
+    /// pure BIOS HLE (no IOP R3000 to run the real SIF0→_SifCmdIntHandler path).
+    /// </summary>
+    public static void PlantEeSifReadySlots(SystemMemory mem, uint baseAddr = EeSifReadySlotBase, int count = EeSifReadySlotCount)
+    {
+        if (mem == null) return;
+        if (count <= 0) count = EeSifReadySlotCount;
+        for (uint i = 0; i < (uint)count; i++)
+            mem.Write32(baseAddr + i * 4, 1);
+    }
+
+    /// <summary>True when SMFLAG has the full SIFINIT|CMDINIT|BOOTEND handoff.</summary>
+    public bool IsIopBootReady => (SmFlag & SifStatIopBootReady) == SifStatIopBootReady;
 
     public void SendCommand(uint command)
     {

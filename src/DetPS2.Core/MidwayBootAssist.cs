@@ -192,10 +192,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _initLocksSavedPc = 0;
         _initLocksSavedGpr = null;
         _resourceLoadForced = false;
+        _lastListWalkBreakCyc = 0;
+        _lastFormatStallCyc = 0;
+        _formatStallEscapes = 0;
         _resourceForceScans = 0;
         _vblankPollNudgeArmed = false;
         _lastPostResourceResumeCycle = 0;
         _adxGateCompleted = false;
+        _adxPumpLockYields = 0;
+        _lastAdxPumpLockCyc = 0;
         _logoPrepared = false;
         _logoActive = false;
         _midwayDone = false;
@@ -751,6 +756,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 safe = 0x0011C200; // CRT0 SetupThread region
             sys.EE.COP0_Status &= ~(1u << 1);
             sys.EE.PC = safe;
+            // Post-WAD only (internal gate) — early Escape must not move SP (WAD regression).
+            ReHomeSpIfInHleScratch(sys);
             sys.Intc.ClearCpuLatchPending();
             Assists++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
@@ -1106,6 +1113,32 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         MaybeCompleteAdxInitGate(sys);
         // After bulk disc stream, force resource-manager load slots out of "still loading".
         MaybeCompleteResourceLoadGate(sys);
+        // Repair corrupted ADX waiter s0 (must poll 0x5341D8, never plant *0x75C0D0).
+        if (c >= 55_000_000)
+            MaybeRepairAdxWaiterS0(sys);
+        // Main sets DAT_00534164=1 then busy-polls ReferThreadStatus without Sleep/yield —
+        // ADX pump never runs to clear the flag. Service after bulk WAD.
+        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeServiceAdxPumpLock(sys);
+        // Post-WAD bad fnptr → past-RDRAM open bus (0x024Fxxxx): recover every Step once WAD is real.
+        if (sys.Cdvd.SectorsRead >= 100_000)
+            MaybeRescuePostWadNopSled(sys);
+        // Runaway linked-list walk at 0x475608 with corrupted count (s0 >> real list size)
+        // freezes boot forever after resource gate (live 2026-07-30: s0≈0x3037953D).
+        if (c >= 50_000_000)
+            MaybeBreakRunawayListWalk(sys);
+        // Post-list format/itoa stall at 0x47670C (jr ra delay) with all workers asleep —
+        // force natural return + wake pump/menu path so gifP3 can leave logo spine (5→11+).
+        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeEscapePostListFormatStall(sys);
+        // Pad inject START/CROSS after bulk WAD so title/menu can observe input.
+        // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeInjectMenuPad(sys);
+        // Post-spine memset loop at 0x385278 (a1..a2 clear) with absurd end parks the
+        // EE after gifP3=12 — force epilogue so title/menu can run (pad then moves PC).
+        if (c >= 65_000_000 && sys.Gif.Path3Transfers >= 11)
+            MaybeBreakMenuMemset(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
 
@@ -1500,6 +1533,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine($"[MANAGERINIT] forcing call, savedPc=0x{_managerInitSavedPc:X8} cyc={sys.MasterCycles}");
 
         sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ManagerInitReturnTrampoline });
+        // Keep force SP at 0x01FF0000 when invalid — WAD stream (cdvd=198840) is load-bearing
+        // and was killed by re-homing to 0x01FC0000 during early force (2026-07-30 recheck).
+        // Post-WAD SP re-home runs only after bulk disc I/O (see ReHomeSpIfInHleScratch).
         ulong sp = sys.EE.GetGpr(29).Lo;
         if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
             sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
@@ -1508,6 +1544,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _managerInitResumePending = true;
         Assists++;
     }
+
+    /// <summary>Stack top for post-WAD SP re-home — below HLE scratch, 16-byte aligned.</summary>
+    private const uint ManagerInitSafeSp = 0x01FC0000;
 
     /// <summary>Mirror of MaybeResumeAfterForcedSifInit for the manager-init forced call.</summary>
     private void MaybeResumeAfterForcedManagerInit(Ps2System sys)
@@ -1521,8 +1560,27 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_managerInitSavedGpr != null)
             for (int i = 1; i < 32; i++) // skip $zero
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _managerInitSavedGpr[i] });
+        // Do NOT re-home SP here — early resume is mid-boot; re-home only post-WAD.
         sys.LastGoodEePc = _managerInitSavedPc;
         _managerInitResumePending = false;
+    }
+
+    /// <summary>
+    /// If $sp lands in HLE scratch (0x01FD0000–0x01FFFFFF) or is null/low, move it to
+    /// <see cref="ManagerInitSafeSp"/>. Only safe AFTER bulk WAD I/O (cdvdSectors gate).
+    /// Does not restore pre-force GPRs.
+    /// </summary>
+    private static void ReHomeSpIfInHleScratch(Ps2System sys)
+    {
+        // WAD-preserving gate: never touch SP before the resource stream is real.
+        if (sys.Cdvd.SectorsRead < 100_000) return;
+        uint spPhys = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (spPhys < 0x100000 || spPhys >= 0x01FD0000)
+        {
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = ManagerInitSafeSp });
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine($"[BIOS] re-home SP 0x{spPhys:X8} -> 0x{ManagerInitSafeSp:X8}");
+        }
     }
 
     /// <summary>Force-calls InitLocksFn (0x486020) — same non-destructive technique as the other
@@ -1874,10 +1932,18 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (sys.Memory.Read32(0x00534180) == 0)
             sys.Memory.Write32(0x00534180, 1);
 
-        // Mirror FUN_00427410(6, 0x414568, 0): register group-6 ADX callback so the pump
-        // worker's FUN_00427678 → FUN_00427518(6) / FUN_00427468(6) is not a pure no-op.
-        // Live dumps showed 0x75E9E0 and 0x75E7A0 all-zero for entire boots (DEVELOPER_GUIDE).
-        // Single-slot table: base 0x75E9E0, stride 8, group 6 → 0x75EA10.
+        // Mirror FUN_00427410(6, 0x414568, 0): single-slot group table at 0x75E9E0 (stride 8).
+        // FUN_00427468(6) reads slot 6 → 0x75EA10; streaming-tick callers (FUN_0043ce78 etc.)
+        // use that path. Live dumps often leave it zero under HLE if ADX init never finished
+        // registration — plant only the single-slot entry.
+        //
+        // CRITICAL: do NOT plant 0x414568 into the multi-slot table at 0x75E7A0.
+        // Pump worker 0x4147F8 → FUN_00427678 → FUN_00427518(6) walks 0x75E7A0 (stride 0x48).
+        // FUN_00414568 is itself the lock-wait (tail-calls FUN_00414480 which sets *0x534164=1
+        // and busy-polls the pump). Putting it in the multi table makes the pump call the
+        // lock-wait on itself → self-deadlock; both main and pump thrash at 0x4144F0 forever
+        // (observed 2026-07-30: directed switch lands pump still at lock-wait PCs). Empty
+        // multi table = correct boot-time no-op (DEVELOPER_GUIDE §7.24 live dump).
         const uint AdxGroup6Fn = 0x00414568;
         const uint AdxGroupTable = 0x0075E9E0;
         const uint AdxGroup6Slot = AdxGroupTable + 6 * 8;
@@ -1886,16 +1952,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             sys.Memory.Write32(AdxGroup6Slot, AdxGroup6Fn);
             sys.Memory.Write32(AdxGroup6Slot + 4, 0);
         }
-        // Multi-slot table (stride 0x48): plant one live entry for group 6 first sub-slot.
-        // Layout unknown beyond "non-zero func pointer"; store fn at +0 and arg at +4.
+        // Scrub a prior-session / older-build self-deadlock plant if present.
         const uint AdxMultiBase = 0x0075E7A0;
-        // Group index * 0x48 * 5? DEVELOPER_GUIDE: table for group 6 scanned with stride 0x48.
-        // FUN_00427518(6) — plant at base + small offset if still empty.
-        if (sys.Memory.Read32(AdxMultiBase) == 0)
+        if (sys.Memory.Read32(AdxMultiBase) == AdxGroup6Fn)
         {
-            sys.Memory.Write32(AdxMultiBase, AdxGroup6Fn);
+            sys.Memory.Write32(AdxMultiBase, 0);
             sys.Memory.Write32(AdxMultiBase + 4, 0);
-            sys.Memory.Write32(AdxMultiBase + 8, 1); // active / count-ish
+            sys.Memory.Write32(AdxMultiBase + 8, 0);
         }
 
         // Wake anyone parked via SuspendThread waiting on these flags.
@@ -2018,6 +2081,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
             // Re-arm only the ADX pump worker (0x4147F8) after bulk load — not one-shot
             // flag waiters (0x4145A8 etc.) which correctly ExitThread once flags are set.
+            // Do NOT YieldToWorker here: switching mid-gate onto a half-init worker has been
+            // observed to land in corrupted list walks (0x475608) and ra=0 thread death.
             if (kernel != null)
             {
                 foreach (var t in kernel.AllThreads)
@@ -2029,7 +2094,6 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                         Console.Error.WriteLine(
                             $"[BIOS] re-Start ADX pump tid={t.Id} entry=0x{t.Entry:X8} cyc={sys.MasterCycles}");
                 }
-                kernel.YieldToWorker(sys.EE);
             }
             // Drop host logo overlay once bulk resources are in — game GS (Path3) should
             // own the framebuffer past this point (was pinning px≈77M on logo blit).
@@ -2041,16 +2105,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 Status = "post-wad-gs";
             }
 
-            // Soft-suspend exited ADX waiters permanently so lock/unlock stops re-Suspend thrash.
-            if (kernel != null)
-            {
-                foreach (var t in kernel.AllThreads)
-                {
-                    if (t.Alive && t.EverStarted && !t.Started
-                        && t.Entry is >= 0x00414000u and < 0x00416000u)
-                        t.SoftSuspended = true;
-                }
-            }
+            // NOTE: do NOT SoftSuspend exited ADX waiters here. SoftSuspend + Yield after the
+            // resource poke previously combined with the multi-table self-deadlock plant to
+            // thrash; without SoftSuspend, pump/main can re-arm cleanly. Exited waiters are
+            // already !Started so they won't run.
+
+            // NOTE (2026-07-30): Prior gifP3=11 spine showed post-WAD wait at 0x4145xx with
+            // s0=0x75C0D0. ELF has ZERO address forms for 0x75C0D0 — not a static flag.
+            // FUN_004145A8 always polls 0x5341D8 when entered cleanly; s0=0x75C0D0 is register
+            // corruption (ManagerInit force SP=0x01FF0000 / Escape). Planting *0x75C0D0=1 hits
+            // ExitThread → process Exit() ~61M. Do NOT plant. See docs/title-ports/MK_SHAOLIN_MONKS.md.
+            // Instead: re-home SP + repair waiter s0 to 0x5341D8 when parked in the poll loop.
+            ReHomeSpIfInHleScratch(sys);
+            MaybeRepairAdxWaiterS0(sys);
+            // Clear pump lock flag so FUN_00414480 does not busy-spin forever (see MaybeServiceAdxPumpLock).
+            if (sys.Memory.Read32(0x00534164) != 0)
+                sys.Memory.Write32(0x00534164, 0);
+            sys.Memory.Write32(0x00534218, 0); // pump-stop must stay clear
+            // Post-WAD often jumps into zeroed BSS (0x024Fxxxx) via bad fnptr — recover now.
+            MaybeRescuePostWadNopSled(sys);
 
             Assists++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
@@ -2059,6 +2132,516 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     $"[BIOS] MaybeCompleteResourceLoadGate: fixed={fixedSlots} " +
                     $"cdvd={sys.Cdvd.SectorsRead} adxfPumps={_adxfPumpCount} cyc={sys.MasterCycles}");
         }
+    }
+
+    /// <summary>
+    /// After bulk WAD I/O, if EE PC lands on a zero opcode (bad function pointer into BSS),
+    /// snap to a stack return candidate or ADX waiter epilogue. Complements
+    /// <c>Ps2System.MaybeRescueNopSled</c> which can miss when a 50k slice walks off zeros.
+    /// </summary>
+    private void MaybeRescuePostWadNopSled(Ps2System sys)
+    {
+        if (sys.Cdvd.SectorsRead < 100_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // 0x024F0C64 is PAST 32MiB RDRAM (0x02000000) — open bus reads as 0 / nop forever.
+        // Also catch in-range zero sleds. Do NOT require pc < RDRAM_SIZE.
+        if (pc < 0x00100000) return;
+        bool pastRdram = pc >= (uint)SystemMemory.RDRAM_SIZE;
+        uint op = pastRdram ? 0u : sys.Memory.Read32(pc);
+        if (!pastRdram && op != 0) return;
+        if (!pastRdram && sys.Memory.Read32(pc + 4) != 0 && sys.Memory.Read32(pc + 8) != 0) return;
+
+        uint resume = 0;
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            for (uint off = 0; off <= 0x80; off += 4)
+            {
+                uint cand = sys.Memory.Read32(sp + off);
+                if (!sys.Memory.IsLikelyEeCode(cand)) continue;
+                resume = cand & 0x1FFFFFFFu;
+                break;
+            }
+        }
+        // Prefer ADX pump / ready-waiter / main if stack scan failed (code-validated).
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8;
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x004145A8UL))
+            resume = 0x004145A8;
+        if (resume == 0 && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+            resume = 0x00212F70;
+        if (resume == 0 && sys.Memory.IsLikelyEeCode(sys.LastGoodEePc))
+            resume = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
+        if (resume == 0) return;
+
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        ReHomeSpIfInHleScratch(sys);
+        // Ensure ADX ready flags so waiter at 0x4145A8 can exit.
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] post-WAD nop-sled rescue 0x{pc:X8} -> 0x{resume:X8} pastRdram={pastRdram} cyc={sys.MasterCycles}");
+    }
+
+    private ulong _lastMenuPadCyc;
+    private int _menuPadPulses;
+    private int _menuSpineKicks;
+
+    private ulong _lastMemsetBreakCyc;
+    private int _memsetBreaks;
+
+    /// <summary>
+    /// Post-spine clear loop at <c>0x385278</c>: <c>sw zero,0(a1); a1+=4; bne a1,a2</c>.
+    /// Live pad-inject parks here with a2-a1 enormous after gifP3 hits 12 — pad cannot
+    /// be observed until the loop ends. Force <c>jr ra</c> when remaining words &gt; 256K.
+    /// </summary>
+    private void MaybeBreakMenuMemset(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x00385278 or > 0x00385290) return;
+        if (sys.MasterCycles - _lastMemsetBreakCyc < 200_000) return;
+        if (_memsetBreaks >= 32) return;
+
+        uint a1 = (uint)(sys.EE.GetGpr(5).Lo & 0x1FFFFFFFUL); // cursor
+        uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0x1FFFFFFFUL); // end
+        ulong remain = a2 >= a1 ? (ulong)(a2 - a1) : ulong.MaxValue;
+        if (remain < 0x100000) return; // < 1MB remaining is plausible
+
+        // Snap to epilogue jr ra (0x385294).
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a2 }); // a1 = end
+        sys.EE.PC = 0x00385294;
+        sys.LastGoodEePc = 0x00385294;
+        _lastMemsetBreakCyc = sys.MasterCycles;
+        _memsetBreaks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_memsetBreaks <= 8 || _memsetBreaks % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] break menu memset a1=0x{a1:X8} a2=0x{a2:X8} remain=0x{remain:X} " +
+                $"-> 0x385294 n={_memsetBreaks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Dense START / CROSS after WAD so pad-gated title/menu can advance.
+    /// Once gifP3 has left the logo spine (≥11), hold longer press windows and
+    /// occasionally re-wake ADX pump / SleepThread peers so CROSS can accept.
+    /// Menu-class PCs observed under pad: <c>0x3BF654</c> (VU math), <c>0x4156F4</c>
+    /// (callback dispatch), <c>0x47EAxx</c> (post-spine title). Heavy CROSS once there.
+    /// Live pad-inject final: PC oscillates <c>0x4148xx</c>/<c>0x4275xx</c> with
+    /// "Kombat"+"Start" — denser D-pad+CROSS to push accept-to-submenu.
+    /// </summary>
+    private void MaybeInjectMenuPad(Ps2System sys)
+    {
+        // Faster cadence once logo spine is restored (historical gifP3≥11).
+        // Even faster once in interactive pad-poll / ADX title bands (gifP3≥12).
+        ulong interval = sys.Gif.Path3Transfers >= 12 ? 25_000UL
+            : sys.Gif.Path3Transfers >= 11 ? 50_000UL
+            : 200_000UL;
+        if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
+        _lastMenuPadCyc = sys.MasterCycles;
+        _menuPadPulses++;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // Menu / title bands: memset, ADX title, pad-poll 0x4275xx (live final), CROSS target.
+        bool inMenuBand = pc is (>= 0x003BF000 and <= 0x003C0000)
+            or (>= 0x00415000 and <= 0x00416000)
+            or (>= 0x0047E800 and <= 0x0047F000)
+            or (>= 0x00384000 and <= 0x00386000)
+            or (>= 0x00427000 and <= 0x00428000)
+            or (>= 0x00414000 and <= 0x00415000)
+            or (>= 0x00414800 and <= 0x00414A00); // live ADX title 0x4148EC
+
+        int phase = (int)((sys.MasterCycles / 1_000_000) % 6);
+        // After spine: longer START hold then CROSS accept (menu confirm pattern).
+        // Include D-pad so selection index can move before CROSS accept.
+        uint buttons;
+        if (sys.Gif.Path3Transfers >= 11)
+        {
+            // In menu-class PC bands: D-pad then CROSS so selection/accept advances.
+            // Accept-heavy once gifP3≥12 (interactive-class): more CROSS edges + occasional
+            // Circle/Triangle for alternate confirm bindings Midway titles use.
+            if (inMenuBand || sys.Gif.Path3Transfers >= 12)
+            {
+                phase = _menuPadPulses % 12;
+                buttons = phase switch
+                {
+                    0 => 0u, // release edge
+                    1 => (uint)PadInput.Button.Down,
+                    2 => 0u,
+                    3 or 4 => (uint)PadInput.Button.Cross,
+                    5 => (uint)PadInput.Button.Up,
+                    6 => 0u,
+                    7 or 8 => (uint)PadInput.Button.Cross,
+                    9 => (uint)PadInput.Button.Start,
+                    10 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                    _ => (uint)PadInput.Button.Cross
+                };
+                // Occasional Right/Left so horizontal menus also move.
+                if (_menuPadPulses % 17 == 0)
+                    buttons = (uint)PadInput.Button.Right;
+                if (_menuPadPulses % 19 == 0)
+                    buttons = (uint)PadInput.Button.Left;
+            }
+            else
+            {
+                phase = _menuPadPulses % 8;
+                buttons = phase switch
+                {
+                    0 or 1 or 2 => (uint)PadInput.Button.Start,
+                    3 => 0u,
+                    4 or 5 or 6 => (uint)PadInput.Button.Cross,
+                    _ => (uint)(PadInput.Button.Start | PadInput.Button.Cross)
+                };
+            }
+        }
+        else
+        {
+            buttons = phase switch
+            {
+                1 or 2 => (uint)PadInput.Button.Start,
+                3 or 4 => (uint)PadInput.Button.Cross,
+                5 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                _ => 0u
+            };
+        }
+        try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+
+        // Keep workers alive so pad edge is observed on a running thread.
+        if (sys.Gif.Path3Transfers >= 11 && (_menuPadPulses % 2) == 0)
+        {
+            var kernel = sys.Hle?.Kernel;
+            if (kernel != null)
+            {
+                foreach (var t in kernel.AllThreads)
+                {
+                    if (!t.Alive) continue;
+                    if (t.SoftSuspended) t.SoftSuspended = false;
+                    while (t.SuspendCount > 0)
+                        kernel.ResumeThread(t.Id);
+                    if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                        kernel.WakeupThread(t.Id);
+                    // Menu accept often WaitSema's the pad/RPC path — pulse lightly.
+                    if ((inMenuBand || sys.Gif.Path3Transfers >= 12)
+                        && t.Sleeping && t.WaitSemaId > 0 && t.WaitSemaId < 64)
+                    {
+                        try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                }
+            }
+            _menuSpineKicks++;
+        }
+    }
+
+    /// <summary>
+    /// FUN_004755xx linked-list apply: walks <c>s2</c> nodes, each with count at +4 and
+    /// element array at +8 (stride 0x58). Live post-WAD (2026-07-30) lands here with a
+    /// garbage count in <c>s0</c> (e.g. 0x3037953D) so the inner loop at 0x475608 never
+    /// finishes — PC frozen, gifP3 stuck at logo spine, pad injects inert. Force the
+    /// function epilogue when the remaining count is absurd for any real Midway list.
+    /// </summary>
+    private ulong _lastListWalkBreakCyc;
+    private ulong _lastFormatStallCyc;
+    private int _formatStallEscapes;
+
+    private void MaybeBreakRunawayListWalk(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Inner loop: lh v0,12(s1) / beql / bgez back
+        if (pc is < 0x00475608 or > 0x00475628) return;
+        long s0 = unchecked((int)(uint)sys.EE.GetGpr(16).Lo); // signed remaining count
+        // Real lists are tiny (bucket counts << 1k). Negative after underflow also means done.
+        if (s0 >= 0 && s0 < 4096) return;
+        if (sys.MasterCycles - _lastListWalkBreakCyc < 100_000) return;
+        _lastListWalkBreakCyc = sys.MasterCycles;
+
+        // Clamp counters and skip `lw s2,0(s2)` (that load from s2=0 pulls kernel-vector
+        // garbage and re-enters the walk). Land on the `bnel s2,zero` with s2 already 0 so
+        // control falls into the real epilogue with intact $ra/$sp.
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFUL }); // s0 = -1
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = 0 }); // s2 = null
+        sys.EE.PC = 0x00475630; // bnel s2, zero → fall through to epilogue
+        sys.LastGoodEePc = 0x00475630;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] break runaway list-walk s0=0x{(uint)s0:X8} -> natural exit cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Post-list-walk plateau: PC parks in the format/itoa helper band around
+    /// <c>0x47670C</c> (often <c>jr ra</c> delay) while workers Sleep/WaitSema(5).
+    /// gifP3 stays at logo spine (5). Resume via live <c>$ra</c> when it is code, else
+    /// re-home to ADX pump / main; always wake peers so pad and GS can advance.
+    /// </summary>
+    private void MaybeEscapePostListFormatStall(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Format/vsnprintf family + fatal message builders that park after list-walk break.
+        bool inFormatBand = pc is (>= 0x00475BA0 and <= 0x00476840)
+            or (>= 0x004766E0 and <= 0x00476740);
+        if (!inFormatBand) return;
+        if (sys.MasterCycles - _lastFormatStallCyc < 200_000) return;
+        _lastFormatStallCyc = sys.MasterCycles;
+        if (_formatStallEscapes >= 64) return;
+
+        // Prefer natural return when $ra looks like EE code (format epilogue).
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0;
+        // After a few self-chase cycles (format→caller→format), skip stack/$ra and go
+        // straight to a known live post-WAD target — 0x475998 was re-entering 0x475BA4.
+        bool forceKnown = _formatStallEscapes >= 4;
+
+        if (!forceKnown && sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00800000
+            && ra is not (>= 0x00475000 and <= 0x00476840))
+            resume = ra;
+
+        // Stack scan for a caller return if $ra is bad (0 / inside helper).
+        if (!forceKnown && resume == 0)
+        {
+            uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+            if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+            {
+                for (uint off = 0; off <= 0xC0; off += 4)
+                {
+                    uint cand = sys.Memory.Read32(sp + off) & 0x1FFFFFFFu;
+                    if (!sys.Memory.IsLikelyEeCode(cand)) continue;
+                    if (cand is >= 0x00475000 and <= 0x00476840) continue;
+                    if (cand < 0x00100000 || cand >= 0x00800000) continue;
+                    resume = cand;
+                    break;
+                }
+            }
+        }
+
+        // Known live boot targets once bulk WAD is in (prefer main over pump after thrash).
+        if (resume == 0 || forceKnown)
+        {
+            if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+                resume = 0x00212F70; // Midway main
+            else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
+                resume = 0x004147F8; // ADX pump
+            else if (sys.Memory.IsLikelyEeCode(0x004145A8UL))
+                resume = 0x004145A8; // ADX ready waiter
+            else if (sys.Memory.IsLikelyEeCode(0x00414590UL))
+                resume = 0x00414590; // historical gifP3=11 waiter spine
+        }
+
+        if (resume != 0 && resume != pc)
+        {
+            // Format helpers return int length in v0 — 0 is a safe "nothing written".
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = resume;
+            sys.LastGoodEePc = resume;
+            ReHomeSpIfInHleScratch(sys);
+            // Ensure main has a sane stack if we re-home to Midway main.
+            if (resume == 0x00212F70)
+            {
+                uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                if (sp < 0x00100000 || sp >= (uint)SystemMemory.RDRAM_SIZE || sp < 0x01000000)
+                    sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+            }
+        }
+
+        // Keep ADX ready + pump-stop clear so re-entered waiters/pump can run.
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        sys.Memory.Write32(0x00534218, 0);
+        if (sys.Memory.Read32(0x00534164) != 0)
+            sys.Memory.Write32(0x00534164, 0);
+
+        // Wake peers — pad is inert while everyone Sleeps/WaitSema.
+        var kernel = sys.Hle?.Kernel;
+        if (kernel != null)
+        {
+            foreach (var t in kernel.AllThreads)
+            {
+                if (!t.Alive) continue;
+                if (t.SoftSuspended) t.SoftSuspended = false;
+                while (t.SuspendCount > 0)
+                    kernel.ResumeThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId != 0)
+                {
+                    try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                }
+                else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                    kernel.WakeupThread(t.Id);
+                // Re-start ADX pump if it exited.
+                if (!t.Started && t.Entry == 0x004147F8u)
+                    kernel.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false);
+            }
+        }
+
+        _formatStallEscapes++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_formatStallEscapes <= 8 || _formatStallEscapes % 16 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] escape post-list format stall pc=0x{pc:X8} -> 0x{resume:X8} " +
+                $"ra=0x{ra:X8} n={_formatStallEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// FUN_004145A8 waiter: <c>s0</c> must be <c>0x5341D8</c> (ready flag). Corrupted
+    /// <c>s0=0x75C0D0</c> polls forever — repair register only, never plant *0x75C0D0.
+    /// </summary>
+    private void MaybeRepairAdxWaiterS0(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Poll loop body: ld v0,0(s0); beq v0,zero,loop  @ 0x4145D0..0x4145E0
+        if (pc is < 0x004145D0 or > 0x004145E0) return;
+        uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+        if (s0 == 0x005341D8) return;
+        // Only repair when s0 looks like the known garbage table cursor / unmapped BSS.
+        if (s0 is not (0x0075C0D0 or 0) && (s0 < 0x0075B000 || s0 > 0x0075D000))
+            return;
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0x005341D8 }); // s0
+        // Ensure the real flag is ready so the repaired waiter can exit.
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        ReHomeSpIfInHleScratch(sys);
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] repair ADX waiter s0 0x{s0:X8} -> 0x5341D8 pc=0x{pc:X8} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// FUN_00414480 lock-wait: sets <c>DAT_00534164=1</c> then busy-polls
+    /// <c>ReferThreadStatus</c>/<c>ResumeThread</c> on the ADX pump (tid usually 6) until the
+    /// pump clears the flag. Main never Sleeps, so cooperative scheduling never runs the pump
+    /// and the loop burns millions of ReferThreadStatus (syscall 0x30) at PC 0x414988.
+    /// Live (2026-07-30): pump body at 0x41487C does <c>if (*0x534164==1) { *0x534164=0; … }</c>.
+    /// After bulk WAD, yield to the pump; if still stuck, clear the flag (same store the pump would).
+    /// </summary>
+    private int _adxPumpLockYields;
+    private ulong _lastAdxPumpLockCyc;
+
+    private void MaybeServiceAdxPumpLock(Ps2System sys)
+    {
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+        // Lock-wait loop body / ReferThreadStatus helpers it hammers.
+        bool inLockWait = (pc is >= 0x004144D0 and <= 0x00414510)
+            || (pc is >= 0x00414988 and <= 0x00414A50)
+            || (pc is >= 0x0047FD60 and <= 0x0047FDF8); // ReferThreadStatus / Resume stubs
+        if (!inLockWait) return;
+
+        // Scrub multi-table self-deadlock plant (0x414568 in 0x75E7A0) every visit.
+        if (sys.Memory.Read32(0x0075E7A0) == 0x00414568u)
+        {
+            sys.Memory.Write32(0x0075E7A0, 0);
+            sys.Memory.Write32(0x0075E7A4, 0);
+            sys.Memory.Write32(0x0075E7A8, 0);
+        }
+
+        uint flag = sys.Memory.Read32(0x00534164);
+        if (flag == 0)
+        {
+            _adxPumpLockYields = 0;
+            return;
+        }
+
+        // Rate-limit: Step runs every instruction window; only act every ~50k cycles.
+        if (sys.MasterCycles - _lastAdxPumpLockCyc < 50_000) return;
+        _lastAdxPumpLockCyc = sys.MasterCycles;
+
+        // Keep pump-stop clear so 0x4147F8 stays in its work loop.
+        sys.Memory.Write32(0x00534218, 0);
+        sys.Memory.Write32(0x0053421C, 0);
+
+        var kernel = sys.Hle?.Kernel;
+        int pumpTid = -1;
+        if (kernel != null)
+        {
+            // Re-Start ADX pump if it exited / never started; remember its tid for a directed switch.
+            foreach (var t in kernel.AllThreads)
+            {
+                if (!t.Alive || t.Entry != 0x004147F8u) continue;
+                pumpTid = t.Id;
+                if (!t.Started)
+                    kernel.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false);
+                if (t.SoftSuspended) t.SoftSuspended = false;
+                while (t.SuspendCount > 0)
+                    kernel.ResumeThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId == 0)
+                    kernel.WakeupThread(t.Id);
+            }
+
+            // If the CURRENT thread is the pump but PC is in lock-wait, the multi-table
+            // self-deadlock already happened: pump is waiting on itself. Clear flag and
+            // re-home PC to the pump loop head so it can resume real work.
+            if (pumpTid > 0 && kernel.CurrentThreadId == pumpTid && inLockWait)
+            {
+                sys.Memory.Write32(0x00534164, 0);
+                if (sys.Memory.Read32(0x00534174) == 1)
+                    sys.Memory.Write32(0x00534174, 0);
+                sys.EE.PC = 0x00414860; // pump loop head (heartbeat / FUN_00427678)
+                sys.LastGoodEePc = 0x00414860;
+                _adxPumpLockYields = 0;
+                Assists++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[BIOS] ADX pump-lock self-deadlock rescue tid={pumpTid} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                return;
+            }
+
+            // Prefer directed switch to the ADX pump (not a random worker) so it can clear
+            // *0x534164 itself. YieldToWorker alone often landed on non-pump threads.
+            // After multi-table scrub, 2 yields is enough — pump clears flag at 0x41488C.
+            if (_adxPumpLockYields < 4 && pumpTid > 0 && pumpTid != kernel.CurrentThreadId)
+            {
+                kernel.SaveCurrentContext(sys.EE, fromSyscall: false);
+                bool switched = kernel.RestoreContext(sys.EE, pumpTid, fromSyscall: false);
+                if (!switched)
+                    switched = kernel.YieldToWorker(sys.EE);
+                if (switched)
+                {
+                    // If restored pump context is itself mid lock-wait (old self-deadlock
+                    // stack), re-home to loop head so the next slice clears the flag.
+                    uint pumpPc = (uint)(sys.EE.PC & 0x1FFFFFFF);
+                    if (pumpPc is (>= 0x00414480 and <= 0x00414560)
+                        or (>= 0x00414988 and <= 0x00414A50)
+                        or (>= 0x0047FD60 and <= 0x0047FDF8))
+                    {
+                        sys.EE.PC = 0x00414860;
+                        sys.LastGoodEePc = 0x00414860;
+                    }
+                    _adxPumpLockYields++;
+                    Assists++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _adxPumpLockYields <= 4)
+                        Console.Error.WriteLine(
+                            $"[BIOS] ADX pump-lock switch tid={pumpTid} n={_adxPumpLockYields} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                    return;
+                }
+            }
+        }
+
+        // Fallback: perform the same store the pump would (0x41488C sw zero,0(s2)).
+        // Also clear sibling busy at 0x534174 so re-entry does not re-arm immediately.
+        sys.Memory.Write32(0x00534164, 0);
+        if (sys.Memory.Read32(0x00534174) == 1)
+            sys.Memory.Write32(0x00534174, 0);
+        _adxPumpLockYields = 0;
+        // Pad inject once bulk WAD + lock service: START then CROSS so any pad-gated
+        // title/menu transition can observe input (pad-inject API allowed).
+        if (sys.MasterCycles >= 60_000_000)
+        {
+            int phase = (int)((sys.MasterCycles / 1_000_000) % 6);
+            uint buttons = phase switch
+            {
+                1 or 2 => (uint)PadInput.Button.Start,
+                3 or 4 => (uint)PadInput.Button.Cross,
+                _ => 0u
+            };
+            try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        }
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] ADX pump-lock clear *0x534164 (main busy-wait) pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>Write resource handle status field +0x48 to "done" (non-zero). Returns 1 if changed.</summary>

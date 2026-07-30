@@ -47,6 +47,20 @@ public sealed class Dmac : ISchedulable
     public void SetBus(BusContention bus) => _bus = bus;
     public void SetIpu(Ipu ipu) => _ipu = ipu;
 
+    /// <summary>
+    /// Raise INTC DmaController, ensuring MASK bit 14 is set. Burnout 3 EnableDmac arms
+    /// the bit then a later SetMask/DisableIntc path can drop it while D_STAT channel
+    /// masks stay live — AddDmacHandler then never runs and flip pending-count wedges.
+    /// </summary>
+    private void RaiseDmacIrq()
+    {
+        if (_intc == null) return;
+        uint bit = 1u << (int)Intc.InterruptSource.DmaController;
+        if ((_intc.Mask & bit) == 0)
+            _intc.SetMask(_intc.Mask | bit);
+        _intc.Raise(Intc.InterruptSource.DmaController);
+    }
+
     public void Reset()
     {
         for (int i = 0; i < _channels.Length; i++)
@@ -56,6 +70,8 @@ public sealed class Dmac : ISchedulable
         MfifoBase = MfifoEnd = MfifoWptr = MfifoRptr = 0;
         TransfersCompleted = 0;
         ChainTagsProcessed = 0;
+        Array.Clear(_owedHandlerCalls);
+        Array.Clear(_preEnableCompletions);
     }
 
     /// <summary>Per-channel DMA state for SaveState.cs — previously not saved at all, so a
@@ -72,8 +88,8 @@ public sealed class Dmac : ISchedulable
         w.Write(_channels.Length);
         foreach (var ch in _channels)
         {
-            w.Write(ch.MADR); w.Write(ch.QWC); w.Write(ch.CHCR); w.Write(ch.TADR);
-            w.Write(ch.Active); w.Write(ch.Mode); w.Write(ch.OriginalQWC); w.Write(ch.StartMADR);
+            w.Write(ch.MADR); w.Write(ch.QWC); w.Write(ch.CHCR); w.Write(ch.TADR); w.Write(ch.SADR);
+            w.Write(ch.Active); w.Write(ch.Mode); w.Write(ch.OriginalQWC); w.Write(ch.StartMADR); w.Write(ch.StartSADR);
             w.Write(ch.Stalled);
         }
     }
@@ -90,7 +106,9 @@ public sealed class Dmac : ISchedulable
         {
             var ch = _channels[i];
             ch.MADR = r.ReadUInt32(); ch.QWC = r.ReadUInt32(); ch.CHCR = r.ReadUInt32(); ch.TADR = r.ReadUInt32();
+            ch.SADR = r.ReadUInt32();
             ch.Active = r.ReadBoolean(); ch.Mode = r.ReadInt32(); ch.OriginalQWC = r.ReadUInt32(); ch.StartMADR = r.ReadUInt32();
+            ch.StartSADR = r.ReadUInt32();
             ch.Stalled = r.ReadBoolean();
         }
     }
@@ -109,10 +127,13 @@ public sealed class Dmac : ISchedulable
         public uint QWC;
         public uint CHCR;
         public uint TADR;
+        /// <summary>Scratchpad address for SPR_FROM/SPR_TO (Dn_SADR @ +0x80). 14-bit, QW aligned.</summary>
+        public uint SADR;
         public bool Active;
         public int Mode;
         public uint OriginalQWC;
         public uint StartMADR;
+        public uint StartSADR;
         public bool Stalled;
     }
 
@@ -126,15 +147,17 @@ public sealed class Dmac : ISchedulable
         var ch = _channels[(int)channel];
         if ((ch.CHCR & 0x100) == 0) return;
         ch.Active = true;
-        ch.Stalled = (ch.CHCR & 0x80) != 0 && (DCtrl & 1) != 0; // simplified stall ctrl
+        // CHCR bit7 is TIE (tag IRQ enable), NOT a stall request. Real stall control is
+        // D_CTRL source/drain + D_STADR — do not freeze transfers that set TIE (common on
+        // VIF1 chain/path-sync packets; previous misparse left STR set but Active=false forever).
+        ch.Stalled = false;
         ch.Mode = (int)((ch.CHCR >> 2) & 0x3);
         ch.OriginalQWC = ch.QWC;
         ch.StartMADR = ch.MADR;
+        ch.StartSADR = ch.SADR;
         if (TransferLog.Enabled)
             TransferLog.Log("DMA:" + channel, ch.MADR, ch.TADR, ch.QWC * 16,
-                $"chcr=0x{ch.CHCR:X8} mode={ch.Mode} stalled={ch.Stalled}");
-        if (ch.Stalled)
-            ch.Active = false; // wait for stall release
+                $"chcr=0x{ch.CHCR:X8} mode={ch.Mode} sadr=0x{ch.SADR:X} stalled={ch.Stalled}");
     }
 
     public void ReleaseStall(Channel channel)
@@ -245,7 +268,85 @@ public sealed class Dmac : ISchedulable
             case Channel.IPU_FROM when _ipu != null:
                 _ipu.DmaOut(_memory, ch.StartMADR, ch.OriginalQWC);
                 break;
+            case Channel.SPR_FROM:
+                // Scratchpad → main memory (Burnout 3 path-sync builds GIF tags in SPR then SPR_FROM)
+                CopySprSegment(ch, toMemory: true);
+                break;
+            case Channel.SPR_TO:
+                // Main memory → scratchpad
+                CopySprSegment(ch, toMemory: false);
+                break;
         }
+    }
+
+    /// <summary>
+    /// SPR_FROM (toMemory=true): SPR[SADR..] → MADR. SPR_TO: MADR → SPR[SADR..].
+    /// SADR is a 14-bit offset into the 16 KB scratchpad; MADR is EE main memory.
+    /// </summary>
+    private void CopySprSegment(ChannelState ch, bool toMemory)
+    {
+        uint bytes = ch.OriginalQWC * 16;
+        if (bytes == 0) return;
+        uint sadr = ch.StartSADR & (SystemMemory.SPR_SIZE - 1u);
+        // Keep QW alignment; wrap within SPR
+        sadr &= ~0xFu;
+        uint madr = ch.StartMADR;
+        if (TransferLog.Enabled)
+            TransferLog.Log(toMemory ? "DMA:SPR_FROM->MEM" : "DMA:MEM->SPR_TO",
+                toMemory ? SystemMemory.SPR_BASE + sadr : madr,
+                toMemory ? madr : SystemMemory.SPR_BASE + sadr,
+                bytes);
+
+        for (uint i = 0; i < bytes; i += 4)
+        {
+            uint sprOff = (sadr + i) & (SystemMemory.SPR_SIZE - 1u);
+            uint sprAddr = SystemMemory.SPR_BASE + sprOff;
+            uint memAddr = madr + i;
+            if (toMemory)
+                _memory.Write32(memAddr, _memory.Read32(sprAddr));
+            else
+                _memory.Write32(sprAddr, _memory.Read32(memAddr));
+        }
+    }
+
+    /// <summary>
+    /// Per-channel "owed" AddDmacHandler invocations that survive D_STAT W1C.
+    /// FinishChannel increments when IRQ is enabled; TryTakePendingDmacHandler drains.
+    /// Prevents path-sync force-step completions from being lost when the game W1C's
+    /// D_STAT before EE can dispatch (Burnout 3 flip pending-count stuck at 2).
+    /// </summary>
+    private readonly int[] _owedHandlerCalls = new int[10];
+    /// <summary>Completions that finished while the channel IRQ was still masked.
+    /// Promoted to owed handler calls on EnableChannelIrq (level-sensitive catch-up).</summary>
+    private readonly int[] _preEnableCompletions = new int[10];
+
+    /// <summary>True when any channel still owes an AddDmacHandler call (queue or D_STAT).</summary>
+    public bool HasOwedHandlerCall(int channel) =>
+        (uint)channel < 10 && _owedHandlerCalls[channel] > 0;
+
+    /// <summary>Consume one owed handler call for <paramref name="channel"/>. Returns false if none.</summary>
+    public bool TryConsumeOwedHandlerCall(int channel)
+    {
+        if ((uint)channel >= 10 || _owedHandlerCalls[channel] <= 0) return false;
+        _owedHandlerCalls[channel]--;
+        return true;
+    }
+
+    /// <summary>
+    /// Credit owed AddDmacHandler invocations for a channel and raise DmaController.
+    /// Used when a title's flip/path-sync consumer (Burnout 3 @ 0x1F1778) must run to
+    /// decrement pending and drain out→in — without force-finishing active DMA transfers
+    /// and without poking queue pointers (out←in is unsafe).
+    /// </summary>
+    public void CreditOwedHandlerCall(int channel, int count = 1)
+    {
+        if ((uint)channel >= 10 || count <= 0) return;
+        int add = Math.Min(count, 8);
+        _owedHandlerCalls[channel] = Math.Min(64, _owedHandlerCalls[channel] + add);
+        // Sticky CIS so TryTakePendingDmacHandler prefers the D_STAT path when possible.
+        DStat |= 1u << channel;
+        if (IsChannelIrqEnabled(channel))
+            RaiseDmacIrq();
     }
 
     private void FinishChannel(Channel channel, ChannelState ch)
@@ -256,12 +357,96 @@ public sealed class Dmac : ISchedulable
         ch.CHCR &= ~0x100u;
         TransfersCompleted++;
 
+        int chNum = (int)channel;
         // Channel complete bit in D_STAT (low 10 bits)
-        DStat |= 1u << (int)channel;
+        DStat |= 1u << chNum;
         // Mask lives in high half of D_STAT on real HW; we also keep DMask mirror
-        uint maskBit = 1u << (16 + (int)channel);
-        if ((DStat & maskBit) != 0 || (DMask & (1u << (int)channel)) != 0)
-            _intc?.Raise(Intc.InterruptSource.DmaController);
+        if (IsChannelIrqEnabled(chNum))
+        {
+            // Queue a handler call that survives a racey D_STAT W1C before EE dispatch.
+            if (_owedHandlerCalls[chNum] < 64)
+                _owedHandlerCalls[chNum]++;
+            RaiseDmacIrq();
+        }
+        else
+        {
+            // Remember for EnableChannelIrq catch-up (Burnout registers handlers then
+            // EnableDmac after some path-sync DMA has already finished).
+            if (_preEnableCompletions[chNum] < 64)
+                _preEnableCompletions[chNum]++;
+        }
+    }
+
+    /// <summary>Whether channel <paramref name="channel"/>'s completion IRQ is unmasked
+    /// (D_STAT bit 16+ch and/or <see cref="DMask"/>).</summary>
+    public bool IsChannelIrqEnabled(int channel)
+    {
+        if ((uint)channel >= 10) return false;
+        uint bit = 1u << channel;
+        return (DStat & (bit << 16)) != 0 || (DMask & bit) != 0;
+    }
+
+    /// <summary>
+    /// EnableDmac(channel) — arm per-channel completion IRQ (D_STAT mask bit 16+ch + DMask).
+    /// Was a pure no-op; Burnout 3 registers AddDmacHandler(VIF1/GIF) then EnableDmac, and the
+    /// GIF path-sync consumer at 0x001F1778 only drains the flip-queue on the IRQ path (a0=ch).
+    /// Without the mask, FinishChannel never raised DmaController and the queue never drained.
+    /// </summary>
+    /// <remarks>
+    /// If a completion status bit is already sticky when the mask is first armed, raise
+    /// DmaController immediately — real DMAC is level-sensitive on (CIS &amp; CIM). Without this,
+    /// path-sync DMA that finished before EnableDmac permanently loses its AddDmacHandler call
+    /// and Burnout's pending-count byte never decrements (soft-poll a0=-1 early-outs while
+    /// pending≠0).
+    /// </remarks>
+    public void EnableChannelIrq(int channel)
+    {
+        if ((uint)channel >= 10) return;
+        uint bit = 1u << channel;
+        DMask |= bit;
+        DStat |= bit << 16;
+        // Promote completions that finished while masked into owed handler calls.
+        if (_preEnableCompletions[channel] > 0)
+        {
+            int n = _preEnableCompletions[channel];
+            _preEnableCompletions[channel] = 0;
+            // Cap: game pending-count is a byte; don't flood dozens of stale IRQs.
+            if (n > 4) n = 4;
+            _owedHandlerCalls[channel] = Math.Min(64, _owedHandlerCalls[channel] + n);
+            // Ensure CIS sticky so D_STAT path also sees work.
+            DStat |= bit;
+        }
+        // Level-sensitive: already-complete + newly unmasked → IRQ now.
+        if ((DStat & bit) != 0 || _owedHandlerCalls[channel] > 0)
+            RaiseDmacIrq();
+    }
+
+    /// <summary>DisableDmac(channel) — mask off per-channel completion IRQ.</summary>
+    public void DisableChannelIrq(int channel)
+    {
+        if ((uint)channel >= 10) return;
+        uint bit = 1u << channel;
+        DMask &= ~bit;
+        DStat &= ~(bit << 16);
+    }
+
+    /// <summary>Write-1-clear a channel's D_STAT completion bit (low 10). Used by the HLE
+    /// DmaController dispatcher after handing the channel to its AddDmacHandler callback.</summary>
+    public void ClearChannelStatus(int channel)
+    {
+        if ((uint)channel >= 10) return;
+        DStat &= ~(1u << channel);
+    }
+
+    /// <summary>True when any channel has a sticky completion bit and is IRQ-enabled.</summary>
+    public bool HasPendingChannelIrq()
+    {
+        for (int ch = 0; ch < 10; ch++)
+        {
+            if ((DStat & (1u << ch)) != 0 && IsChannelIrqEnabled(ch))
+                return true;
+        }
+        return false;
     }
 
     private void DoNormalTransfer(Channel channel, ChannelState ch)
@@ -275,6 +460,9 @@ public sealed class Dmac : ISchedulable
         uint qwToTransfer = Math.Min(ch.QWC, budget);
         ch.MADR += qwToTransfer * 16;
         ch.QWC -= qwToTransfer;
+        // SPR channels advance SADR in lockstep with MADR
+        if (channel is Channel.SPR_FROM or Channel.SPR_TO)
+            ch.SADR = (ch.SADR + qwToTransfer * 16) & (SystemMemory.SPR_SIZE - 1u);
         // MFIFO drain: advance read pointer when enabled
         if ((DCtrl & 0x4) != 0 && MfifoEnd > MfifoBase)
         {
@@ -289,7 +477,27 @@ public sealed class Dmac : ISchedulable
 
         uint tagLow = _memory.Read32(ch.TADR);
         uint tagHigh = _memory.Read32(ch.TADR + 4);
+        uint tagW2 = _memory.Read32(ch.TADR + 8);
+        uint tagW3 = _memory.Read32(ch.TADR + 12);
         ChainTagsProcessed++;
+
+        // TTE (CHCR bit 6): transfer upper 64 bits of DMAtag to the VIF/GIF as a QW.
+        // VIF1 path-sync chains (CHCR=0x145) put MSKPATH3/DIRECT/… in this half.
+        if ((ch.CHCR & 0x40) != 0 && channel is Channel.VIF0 or Channel.VIF1 or Channel.GIF)
+        {
+            if (channel is Channel.VIF0 or Channel.VIF1 && _vif != null)
+            {
+                // Process the two upper words as a mini stream (pad to QW with zeros for ALIGN)
+                // Real HW feeds tag[64:127] as one QW; we push words via ProcessStream scratch.
+                // Use a transient in-place feed: ProcessVifCode/FeedData on w2/w3.
+                _vif.ProcessVifCode(tagW2);
+                // If DIRECT was just latched, remaining data follows in subsequent segments
+                // not in the tag half — only command words live here typically.
+                if (tagW3 != 0)
+                    _vif.ProcessVifCode(tagW3);
+            }
+            // GIF TTE is rare; Path3 data still comes from ADDR/QWC
+        }
 
         ch.QWC = tagLow & 0xFFFF;
         // ADDR field (lower 31 bits; bit31 = SPR select — ignore for now)
@@ -370,6 +578,7 @@ public sealed class Dmac : ISchedulable
             0x1 => ch.MADR,
             0x2 => ch.QWC,
             0x3 => ch.TADR,
+            0x8 => ch.SADR, // Dn_SADR (SPR channels)
             _ => 0
         };
     }
@@ -419,11 +628,27 @@ public sealed class Dmac : ISchedulable
             case 0x0: // CHCR
                 ch.CHCR = value;
                 if ((value & 0x100) != 0)
+                {
                     StartTransfer((Channel)channel);
+                    // Path-sync (Burnout 3 @ 0x001F1A4C after FQC wait) kicks VIF1/GIF chain
+                    // with CHCR=0x145 and immediately expects completion side-effects (MSKPATH3
+                    // unmask, flip-queue advance via AddDmacHandler). A full EE.Step quantum
+                    // of GIF_STAT polling can run before the scheduler hits DMAC, leaving
+                    // M3P sticky + busy flag set forever. Drain ONLY VIF1/GIF while PATH3 is
+                    // masked — not a global force-finish (MK WAD is sensitive to that).
+                    if (_gif != null && _gif.Path3MaskedByVif &&
+                        (channel == (int)Channel.VIF1 || channel == (int)Channel.GIF ||
+                         channel == (int)Channel.VIF0))
+                    {
+                        for (int i = 0; i < 256 && _channels[channel].Active; i++)
+                            Step(256);
+                    }
+                }
                 break;
             case 0x1: ch.MADR = value; break;
             case 0x2: ch.QWC = value; break;
             case 0x3: ch.TADR = value; break;
+            case 0x8: ch.SADR = value & 0x3FF0u; break; // Dn_SADR — 14-bit, QW aligned
         }
     }
 

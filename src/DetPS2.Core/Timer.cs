@@ -4,12 +4,19 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Single EE timer channel (Phase 8).
-/// Mode bits (simplified): bit 7 = count enable, bit 8 = compare IRQ enable, bit 9 = overflow IRQ.
-/// Prescale: bits 0-1 → 1, 16, 256, 1 (bus clocks per tick).
+/// Mode bits (ps2tek): bit 7 = count enable, bit 8 = compare IRQ enable, bit 9 = overflow IRQ
+/// enable, bit 10 = compare interrupt flag (R sticky / W1C), bit 11 = overflow interrupt flag
+/// (R sticky / W1C). Prescale: bits 0-1 → 1, 16, 256, 1; bits 13-14 clock-select override.
 /// </summary>
 public sealed class TimerChannel
 {
+    /// <summary>MODE bit 10 — compare (equal) interrupt flag.</summary>
+    public const uint ModeCompareFlag = 0x400;
+    /// <summary>MODE bit 11 — overflow interrupt flag.</summary>
+    public const uint ModeOverflowFlag = 0x800;
+
     public uint Count { get; private set; }
+    /// <summary>Configuration bits only — sticky IRQ flags live in CompareIrqRaised/OverflowIrqRaised and are ORed onto reads.</summary>
     public uint Mode { get; private set; }
     public uint Compare { get; private set; }
     public bool CompareIrqRaised { get; private set; }
@@ -99,40 +106,52 @@ public sealed class TimerChannel
             uint prev = Count;
             Count = (Count + 1) & 0xFFFF;
 
-            if (Compare != 0 && prev < Compare && Count >= Compare)
+            // Compare match when COUNT lands on COMP (including COMP==0 after wrap).
+            // Previous `Compare != 0 && prev < Compare` skipped COMP=0 — Burnout 3's Timer2
+            // alarm ISR gates callback work on MODE bit10, so a silent flag meant permanent
+            // early-out of the alarm list walk (jr ra with ra=0 death at ~30M).
+            if (Count == Compare)
             {
+                bool wasRaised = CompareIrqRaised;
                 CompareIrqRaised = true;
-                if (CompareIrqEnable)
+                if (CompareIrqEnable && !wasRaised)
                     _intc.Raise(_irq);
-                // clear count on compare if mode bit 6 set (common PS2 option)
                 if ((Mode & 0x40) != 0)
                     Count = 0;
             }
 
             if (Count == 0 && prev == 0xFFFF)
             {
+                bool wasOv = OverflowIrqRaised;
                 OverflowIrqRaised = true;
-                if (OverflowIrqEnable)
+                if (OverflowIrqEnable && !wasOv)
                     _intc.Raise(_irq);
             }
         }
     }
 
     public void WriteCount(uint value) => Count = value & 0xFFFF;
+
+    /// <summary>
+    /// Write TN_MODE. Bits 10/11 are write-1-to-clear of sticky interrupt flags (ps2tek);
+    /// they are not latched as configuration.
+    /// </summary>
     public void WriteMode(uint value)
     {
-        Mode = value;
-        // writing mode often clears IRQ flags — clear our local flags
-        if ((value & 0x400) != 0)
-        {
+        if ((value & ModeCompareFlag) != 0)
             CompareIrqRaised = false;
+        if ((value & ModeOverflowFlag) != 0)
             OverflowIrqRaised = false;
-        }
+        // Strip sticky flag bits from stored configuration.
+        Mode = value & ~(ModeCompareFlag | ModeOverflowFlag);
     }
     public void WriteCompare(uint value) => Compare = value & 0xFFFF;
 
     public uint ReadCount() => Count;
-    public uint ReadMode() => Mode;
+    public uint ReadMode() =>
+        Mode
+        | (CompareIrqRaised ? ModeCompareFlag : 0)
+        | (OverflowIrqRaised ? ModeOverflowFlag : 0);
     public uint ReadCompare() => Compare;
 }
 

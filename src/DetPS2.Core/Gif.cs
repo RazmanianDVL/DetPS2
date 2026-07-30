@@ -26,9 +26,30 @@ public sealed class Gif : ISchedulable
     private readonly uint[] _fifo = new uint[64]; // 16 QW max
     private int _fifoR, _fifoW, _fifoCount;
 
+    /// <summary>
+    /// PATH3 temporarily masked by VIF1 <c>MSKPATH3</c> (GIF_STAT bit 1 = M3P).
+    /// Distinct from GIF_MODE bit 0 (M3R, permanent mask). Ground-truthed against
+    /// ps2tek / PCSX2 GIF_STAT layout; commercial path-sync loops (e.g. Burnout 3
+    /// at <c>0x001F19C0</c>) poll M3P and hang forever if it is never raised.
+    /// </summary>
+    private bool _m3p;
+
+    /// <summary>Active output path while a transfer is in flight (GIF_STAT APATH, bits 10–12).</summary>
+    private uint _apath;
+
+    // PATH3 held while M3P/M3R masks — real HW fills the GIF FIFO (FQC rises) until unmasked.
+    // Burnout 3 path-sync @ 0x001F1A28 spins on GIF_STAT.FQC (bits 24–28) after starting a
+    // masked PATH3 DMA; instant-drain left FQC=0 forever.
+    private uint _heldPath3Addr;
+    private uint _heldPath3Qwc;
+    private bool _path3Held;
+
     public ulong Path3Transfers => _path3Transfers;
     public ulong Path2Transfers => _path2Transfers;
     public ulong Path1Transfers => _path1Transfers;
+
+    /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
+    public bool Path3MaskedByVif => _m3p;
 
     public Gif(Gs gs)
     {
@@ -43,6 +64,66 @@ public sealed class Gif : ISchedulable
         _nreg = 0;
         _ctrl = _mode = 0;
         _fifoR = _fifoW = _fifoCount = 0;
+        _m3p = false;
+        _apath = 0;
+        _heldPath3Addr = _heldPath3Qwc = 0;
+        _path3Held = false;
+    }
+
+    /// <summary>
+    /// VIF1 MSKPATH3 effect: IMM bit 15 (0x8000) = 1 masks PATH3 (M3P=1), 0 unmasks.
+    /// (ps2tek: "Sets the VIF-side PATH3 mask to bit 15 of IMMEDIATE.")
+    /// Real hardware latches this until the opposite MSKPATH3; GIF_STAT.M3P mirrors it.
+    /// Unmask drains any held PATH3 FIFO data into the GS.
+    /// </summary>
+    public void SetMskPath3(bool masked)
+    {
+        _m3p = masked;
+        if (!masked)
+            DrainHeldPath3();
+    }
+
+    private bool Path3Masked => _m3p || (_mode & 1) != 0;
+
+    private void DrainHeldPath3()
+    {
+        if (!_path3Held) return;
+        _path3Held = false;
+        _fifoR = _fifoW = _fifoCount = 0;
+        uint addr = _heldPath3Addr;
+        uint qwc = _heldPath3Qwc;
+        _heldPath3Addr = _heldPath3Qwc = 0;
+        if (qwc == 0) return;
+        _apath = 3;
+        ProcessTransfer(addr, qwc);
+        _apath = 0;
+    }
+
+    /// <summary>
+    /// Compose GIF_STAT (0x10003020). Bits (ps2tek / PCSX2):
+    /// 0 M3R, 1 M3P, 2 IMT, 3 PSE, 5 IP3, 6 P3Q, 7 P2Q, 8 P1Q, 9 OPH,
+    /// 10–12 APATH, 13 DIR, 24–31 FQC.
+    /// </summary>
+    public uint ReadStat()
+    {
+        uint fqc = (uint)Math.Min(Math.Max(_fifoCount / 4, 0), 16);
+        // Path-sync (Burnout 3 @ 0x001F1A28): after MSKPATH3 the EE spins on FQC!=0
+        // before kicking the next VIF1/GIF chain. Real HW has the just-started PATH3
+        // DMA already filling the FIFO under the mask. Our HLE can race such that the
+        // fill DMA completed unmasked (FQC drained) or never delivered, leaving
+        // M3P=1 with FQC=0 forever and the busy-flag in the flip-queue consumer stuck.
+        // While PATH3 is masked, report at least 1 QW so the poller proceeds; the next
+        // chain re-validates against real DMA state. Unmasked path is unchanged.
+        if (Path3Masked && fqc == 0)
+            fqc = 1;
+        uint oph = (_fifoCount > 0 || _apath != 0 || (Path3Masked && fqc > 0)) ? 1u : 0u;
+        uint imt = (_mode & 2) != 0 ? 1u : 0u; // GIF_MODE.IMT → STAT.IMT
+        return (_mode & 1)                      // M3R
+               | (_m3p ? 2u : 0u)               // M3P
+               | (imt << 2)                     // IMT
+               | (oph << 9)                     // OPH
+               | ((_apath & 7) << 10)           // APATH
+               | (fqc << 24);                   // FQC
     }
 
     /// <summary>GIF_CTRL / MODE / STAT / FIFO at 0x10003000–0x10006000.</summary>
@@ -53,8 +134,7 @@ public sealed class Gif : ISchedulable
         {
             0x3000 => 0, // GIF_CTRL write-only
             0x3010 => _mode,
-            // GIF_STAT: idle, empty FIFO after instant drain
-            0x3020 => (_mode & 1) | ((_fifoCount > 0 ? 1u : 0u) << 9) | ((uint)Math.Min(_fifoCount / 4, 16) << 24),
+            0x3020 => ReadStat(),
             0x3040 or 0x3050 or 0x3060 or 0x3070 => 0,
             0x3080 or 0x3090 or 0x30A0 => 0,
             _ => 0
@@ -71,11 +151,21 @@ public sealed class Gif : ISchedulable
                 if ((value & 1) != 0) // reset
                 {
                     _fifoR = _fifoW = _fifoCount = 0;
+                    _m3p = false;
+                    _apath = 0;
+                    _path3Held = false;
+                    _heldPath3Addr = _heldPath3Qwc = 0;
                 }
                 break;
             case 0x3010: // GIF_MODE
+            {
+                uint prev = _mode;
                 _mode = value;
+                // Clearing M3R unmasks PATH3 — drain held FIFO like MSKPATH3 unmask.
+                if ((prev & 1) != 0 && (value & 1) == 0)
+                    DrainHeldPath3();
                 break;
+            }
         }
     }
 
@@ -86,9 +176,13 @@ public sealed class Gif : ISchedulable
         _fifo[_fifoW] = value;
         _fifoW = (_fifoW + 1) % _fifo.Length;
         _fifoCount++;
-        // When we have a full QW (4 words), try to process if we can buffer a packet in GS via path3-like path
-        // For simplicity: every 4 words form a QW pushed into a mini buffer; when EOP tags complete we ProcessTransfer isn't memory-based.
-        // Path: collect into EE scratch via ProcessFifoQuad when 4 words ready — store to a ring in GS local and process if tag complete.
+        // When PATH3 is masked (M3P/M3R), FIFO data must stay and raise FQC — Burnout 3
+        // path-sync @ 0x001F1A28 polls FQC after MSKPATH3 + FIFO/DMA fill. Instant-drain
+        // left FQC=0 and the spin never exited.
+        if (Path3Masked)
+            return;
+        // Unmasked: every full QW is fair game to consume (DMA is the usual path; FIFO
+        // pokes are rare and treated as fire-and-forget for telemetry).
         if (_fifoCount >= 4 && (_fifoCount % 4) == 0)
             DrainFifoQuadwords();
     }
@@ -106,9 +200,30 @@ public sealed class Gif : ISchedulable
     /// <summary>Path3 — DMAC GIF channel.</summary>
     public void ReceivePath3Data(uint address, uint qwc)
     {
+        if (qwc == 0) return;
         _path3Transfers++;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path3->GS", address, 0, qwc * 16);
+
+        if (Path3Masked)
+        {
+            // Hold in FIFO: raise FQC so path-sync loops that poll STAT.FQC can proceed.
+            // ps2tek: masked PATH3 data resides in the FIFO until the mask is lifted.
+            _heldPath3Addr = address;
+            _heldPath3Qwc = qwc;
+            _path3Held = true;
+            // FQC is words/4 capped at 16; report min(qwc,16) QWs pending.
+            int words = (int)Math.Min(qwc, 16u) * 4;
+            _fifoCount = Math.Min(words, _fifo.Length);
+            _fifoR = 0;
+            _fifoW = _fifoCount;
+            // P3Q / OPH: path queued while masked (bit 6 of STAT via oph when fifo non-empty)
+            return;
+        }
+
+        // Unmasked: process immediately (instant HLE).
+        _apath = 3;
         ProcessTransfer(address, qwc);
+        _apath = 0;
     }
 
     /// <summary>Path2 — from VIF1 DIRECT/HL.</summary>
@@ -116,7 +231,9 @@ public sealed class Gif : ISchedulable
     {
         _path2Transfers++;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
+        _apath = 2;
         ProcessTransfer(address, qwc);
+        _apath = 0;
     }
 
     /// <summary>Path1 — VU1 XGKICK style: process tags from memory.</summary>

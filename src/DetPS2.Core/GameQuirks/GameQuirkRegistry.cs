@@ -25,6 +25,9 @@ public static class GameQuirkRegistry
     {
         // Register new titles here:
         Register("SLUS_210.87", () => new MidwayBootAssist());
+        Register("SLUS_200.24", () => new BloodOmen2SnAssist());
+        Register("SCUS_973.99", () => new GodOfWarAssist());
+        Register("SLUS_210.50", () => new Burnout3Assist());
         // Register("SLUS_XXXXX", () => new MyNewTitleQuirks());
     }
 

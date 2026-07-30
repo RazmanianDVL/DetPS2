@@ -5,15 +5,56 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// CDVD (Phases 8/16/24): sector reads, async IRQ, dual-layer stub, stream scheduling.
+/// Drive state / error codes ground-truthed against ps2sdk <c>libcdvd-common.h</c> and the
+/// decompiled CDVDFSV.IRX mechacon-status checks (ready when <c>(status &amp; 0xc0) == 0x40</c>).
 /// </summary>
 public sealed class Cdvd : ISchedulable
 {
     public const int SectorSize = 2048;
 
+    // SCECdvdErrorCode (ps2sdk libcdvd-common.h)
+    public const int ErNO = 0x00;
+    public const int ErABRT = 0x01;
+    public const int ErOPENS = 0x11;
+    public const int ErNODISC = 0x12;
+    public const int ErNORDY = 0x13;
+    public const int ErREAD = 0x30;
+    public const int ErTRMOPN = 0x31;
+    public const int ErEOM = 0x32;
+
+    // SCECdvdDriveState
+    public const int StatStop = 0x00;
+    public const int StatShellOpen = 0x01;
+    public const int StatSpin = 0x02;
+    public const int StatRead = 0x06;
+    public const int StatPause = 0x0A;
+    public const int StatSeek = 0x12;
+    public const int StatEmg = 0x20;
+
+    // SCECdvdInterruptCode / DiskReady replies
+    public const int ReadyComplete = 0x02; // SCECdComplete
+    public const int ReadyNotReady = 0x06; // SCECdNotReady
+
+    // SCECdvdTrayReqMode
+    public const int TrayReqOpen = 0;
+    public const int TrayReqClose = 1;
+    public const int TrayReqCheck = 2;
+
+    // Stream subcommands (ps2sdk CdvdStCmd_t / NCMD STREAM arg[3])
+    public const int StCmdStart = 1;
+    public const int StCmdRead = 2;
+    public const int StCmdStop = 3;
+    public const int StCmdSeek = 4;
+    public const int StCmdInit = 5;
+    public const int StCmdStat = 6;
+    public const int StCmdPause = 7;
+    public const int StCmdResume = 8;
+    public const int StCmdSeekF = 9;
+
     public bool DiscPresent { get; private set; } = true;
     public string DiscId { get; private set; } = "PS2DEMO";
     public bool TrayOpen { get; private set; }
-    public uint DiscType { get; private set; } = 0x14; // PS2 DVD
+    public uint DiscType { get; private set; } = 0x14; // SCECdPS2DVD
     public uint LastSector { get; private set; }
     public ulong SectorsRead { get; private set; }
     public bool ReadPending { get; private set; }
@@ -22,7 +63,16 @@ public sealed class Cdvd : ISchedulable
     public uint StreamCursor { get; private set; }
     public ulong StreamBytes { get; private set; }
     public uint SectorLatencyCycles { get; set; } = 1000; // Det-stable timing
-    public uint MechaconStatus { get; private set; } = 0x40; // ready-ish
+    /// <summary>Raw mechacon ready bits used by DiskReady: ready when <c>(MechaconStatus &amp; 0xc0) == 0x40</c>
+    /// (decomp FUN_00003ee0 / FUN_000032d8).</summary>
+    public uint MechaconStatus { get; private set; } = 0x40;
+    /// <summary>Last SCECd error (SCMD GetError / FUN_00003e60 → FUN_00004810).</summary>
+    public int LastError { get; private set; }
+    /// <summary>sceCdStatus drive state (SCECdStat*).</summary>
+    public int DriveState { get; private set; } = StatSpin;
+    public bool StreamActive { get; private set; }
+    public uint StreamBankSectors { get; private set; }
+    public uint StreamBanks { get; private set; }
 
     private IDiscImage? _disc;
     private readonly byte[] _sectorBuffer = new byte[SectorSize];
@@ -36,6 +86,8 @@ public sealed class Cdvd : ISchedulable
     /// <summary>Completion event-flag id (THREADMAN) optional wake for sceCdSync waiters.</summary>
     private int _completionEfId;
     private KernelState? _kernelForComplete;
+    private uint _streamBufMax;
+    private uint _streamIopBuf;
 
     public uint TocTracks { get; private set; } = 1;
     public uint TocLeadOutSector { get; private set; } = 100_000;
@@ -64,8 +116,15 @@ public sealed class Cdvd : ISchedulable
         _kernelForComplete = null;
         StreamCursor = 0;
         StreamBytes = 0;
+        StreamActive = false;
+        StreamBankSectors = 0;
+        StreamBanks = 0;
+        _streamBufMax = 0;
+        _streamIopBuf = 0;
         LayerBreakLba = 0;
         MechaconStatus = 0x40;
+        LastError = ErNO;
+        DriveState = StatSpin;
         Array.Clear(_sectorBuffer);
         // Do not dispose disc on soft reset mid-boot; use Unmount for full clear
     }
@@ -227,10 +286,38 @@ public sealed class Cdvd : ISchedulable
 
     private uint ToggleTray()
     {
-        TrayOpen = !TrayOpen;
-        DiscPresent = !TrayOpen;
-        MechaconStatus = TrayOpen ? 0x01u : 0x40u;
-        return 0;
+        return TrayRequest(TrayOpen ? TrayReqClose : TrayReqOpen);
+    }
+
+    /// <summary>
+    /// sceCdTrayReq (SCMD case 5 / FUN_00003e88). Modes from SCECdvdTrayReqMode.
+    /// Returns 1 on success; tray-change flag is available via <see cref="TrayOpen"/>.
+    /// </summary>
+    public uint TrayRequest(int mode)
+    {
+        switch (mode)
+        {
+            case TrayReqOpen:
+                TrayOpen = true;
+                DiscPresent = false;
+                CancelAsyncInternal(keepError: false);
+                LastError = ErOPENS;
+                DriveState = StatShellOpen;
+                MechaconStatus = 0x01;
+                return 1;
+            case TrayReqClose:
+                TrayOpen = false;
+                DiscPresent = true;
+                LastError = ErNO;
+                DriveState = StatSpin;
+                MechaconStatus = 0x40;
+                return 1;
+            case TrayReqCheck:
+                // Report current tray state only; no transition.
+                return 1;
+            default:
+                return 1;
+        }
     }
 
     public uint ReadToc(uint field) => field switch
@@ -246,14 +333,15 @@ public sealed class Cdvd : ISchedulable
 
     public uint BeginAsyncReadN(uint lba, uint count)
     {
-        if (!DiscPresent || TrayOpen) return 0;
+        if (!CanAccessDisc(out _)) return 0;
         _pendingLba = lba;
         _pendingCount = Math.Max(1u, count);
         _pendingDest = 0;
         _memForAsync = null;
         _readCyclesLeft = SectorLatencyCycles * _pendingCount;
         ReadPending = true;
-        MechaconStatus = 0x80; // busy
+        DriveState = StatRead;
+        MechaconStatus = 0x80; // busy (bits 7:6 != 01)
         return 1;
     }
 
@@ -264,7 +352,7 @@ public sealed class Cdvd : ISchedulable
     public uint BeginAsyncReadTo(SystemMemory mem, uint lba, uint count, uint destAddr,
         KernelState? kernel = null, int completionEfId = 0)
     {
-        if (!DiscPresent || TrayOpen) return 0;
+        if (!CanAccessDisc(out _)) return 0;
         _pendingLba = lba;
         _pendingCount = Math.Max(1u, Math.Min(count, 512u));
         _pendingDest = destAddr;
@@ -274,50 +362,211 @@ public sealed class Cdvd : ISchedulable
         // Short but non-zero latency so RPC_END can land before busy clears when polled same-slice.
         _readCyclesLeft = Math.Max(200u, SectorLatencyCycles) * Math.Min(_pendingCount, 8u);
         ReadPending = true;
-        MechaconStatus = 0x80; // SCECdStatShellOpen / busy-ish
+        DriveState = StatRead;
+        MechaconStatus = 0x80;
         return 1;
     }
 
     /// <summary>Synchronous multi-sector fill used when NCMD must complete inside RPC_END.</summary>
     public uint ReadSectorsTo(SystemMemory mem, uint lba, uint count, uint destAddr)
     {
+        if (!CanAccessDisc(out _)) return 0;
         count = Math.Min(count, 512u);
         uint ok = 0;
+        DriveState = StatRead;
+        MechaconStatus = 0x80;
         for (uint i = 0; i < count; i++)
         {
             if (!ReadSector(lba + i)) break;
             if (destAddr != 0) CopySectorToMemory(mem, destAddr + i * (uint)SectorSize);
             ok++;
         }
+        if (ok == count)
+            LastError = ErNO;
+        else if (LastError == ErNO)
+            LastError = ErREAD;
+        SetReadySpin();
         return ok;
+    }
+
+    /// <summary>NCMD SEEK (case 5): update head position; return 1 on accept.</summary>
+    public int SeekTo(uint lsn)
+    {
+        if (!CanAccessDisc(out _)) return 0;
+        LastSector = lsn;
+        StreamCursor = lsn;
+        DriveState = StatSeek;
+        // Seek completes inside RPC (decomp does FUN_00004828(2) after seek).
+        SetReadySpin();
+        LastError = ErNO;
+        return 1;
+    }
+
+    /// <summary>NCMD STANDBY (case 6).</summary>
+    public int Standby()
+    {
+        if (TrayOpen) { LastError = ErOPENS; return 0; }
+        CancelAsyncInternal(keepError: false);
+        DiscPresent = true;
+        DriveState = StatSpin;
+        MechaconStatus = 0x40;
+        LastError = ErNO;
+        return 1;
+    }
+
+    /// <summary>NCMD STOP (case 7). Command completes inside RPC (decomp + sceCdSync(2));
+    /// drive is stopped but not mid-command-busy, so DiskReady stays Complete.</summary>
+    public int Stop()
+    {
+        CancelAsyncInternal(keepError: false);
+        StreamActive = false;
+        DriveState = StatStop;
+        // Mechacon command-ready bit stays 0x40 after stop completes (not mid-NCMD busy).
+        MechaconStatus = 0x40;
+        LastError = ErNO;
+        return 1;
+    }
+
+    /// <summary>NCMD PAUSE (case 8).</summary>
+    public int Pause()
+    {
+        CancelAsyncInternal(keepError: false);
+        DriveState = StatPause;
+        MechaconStatus = 0x40; // not mid-command; paused drive is "ready" for DiskReady
+        LastError = ErNO;
+        return 1;
+    }
+
+    /// <summary>
+    /// NCMD DISK READY (case 0xe / FUN_00003ee0) and SID 0x8000059a (FUN_000032d8):
+    /// SCECdComplete (2) when ready, SCECdNotReady (6) when busy/not ready.
+    /// Decomp: ready iff <c>(DAT_bf402005 &amp; 0xc0) == 0x40</c>.
+    /// </summary>
+    public int DiskReady()
+    {
+        // In-flight async NCMD or tray open → not ready.
+        if (ReadPending || TrayOpen)
+            return ReadyNotReady;
+        if ((MechaconStatus & 0xc0) != 0x40)
+            return ReadyNotReady;
+        return ReadyComplete;
     }
 
     /// <summary>sceCdSync-style: 0=complete/ready, 1=busy.</summary>
     public int SyncStatus => ReadPending ? 1 : 0;
 
-    /// <summary>Cancel in-flight async read (sceCdBreak).</summary>
+    /// <summary>Cancel in-flight async read (sceCdBreak / SCMD 0x16).</summary>
     public void CancelAsync()
+    {
+        if (ReadPending)
+            LastError = ErABRT;
+        CancelAsyncInternal(keepError: true);
+    }
+
+    private void CancelAsyncInternal(bool keepError)
     {
         ReadPending = false;
         _readCyclesLeft = 0;
         _pendingDest = 0;
         _memForAsync = null;
-        MechaconStatus = 0x40;
+        _kernelForComplete = null;
+        _completionEfId = 0;
+        if (!TrayOpen)
+        {
+            // Preserve Stop/Pause visual state; clear mid-command busy bit so DiskReady completes.
+            if (DriveState != StatStop && DriveState != StatPause)
+                DriveState = StatSpin;
+            MechaconStatus = 0x40;
+        }
+        if (!keepError && LastError == ErABRT)
+            LastError = ErNO;
     }
 
-    /// <summary>Start sequential stream from LBA for `count` sectors (Step delivers).</summary>
+    /// <summary>Start sequential stream from LBA (legacy single-arg path / ST_CMD_START).</summary>
     public uint BeginStream(uint lba)
     {
-        if (!DiscPresent || TrayOpen) return 0;
+        if (!CanAccessDisc(out _)) return 0;
         StreamCursor = lba;
+        StreamActive = true;
+        DriveState = StatSpin;
+        MechaconStatus = 0x40;
         return 1;
+    }
+
+    /// <summary>
+    /// NCMD STREAM (case 9 / FUN_00001d5c): subcommand in <paramref name="cmd"/> (CdvdStCmd_t).
+    /// Args match ps2sdk <c>sceCdStream</c>: lbn, nsectors, buf, cmd.
+    /// </summary>
+    public int StreamCommand(uint lbn, uint nsectors, uint buf, int cmd, SystemMemory? mem = null)
+    {
+        switch (cmd)
+        {
+            case StCmdInit:
+                // sceCdStInit(bufmax, bankmax, buf): lbn=bufmax sectors, nsectors=banks, buf=IOP buffer
+                _streamBufMax = lbn;
+                StreamBanks = Math.Max(1u, nsectors);
+                StreamBankSectors = StreamBanks == 0 ? 0 : _streamBufMax / StreamBanks;
+                _streamIopBuf = buf;
+                StreamActive = false;
+                StreamCursor = 0;
+                return 1;
+            case StCmdStart:
+                return (int)BeginStream(lbn);
+            case StCmdStop:
+                StreamActive = false;
+                return 1;
+            case StCmdSeek:
+            case StCmdSeekF:
+                StreamCursor = lbn;
+                return 1;
+            case StCmdPause:
+                StreamActive = false;
+                DriveState = StatPause;
+                return 1;
+            case StCmdResume:
+                StreamActive = true;
+                DriveState = StatSpin;
+                MechaconStatus = 0x40;
+                return 1;
+            case StCmdStat:
+                // Sectors available in stream buffer — report full bank when active.
+                return StreamActive ? (int)Math.Max(1u, StreamBankSectors) : 0;
+            case StCmdRead:
+            {
+                if (!StreamActive && StreamCursor == 0 && lbn == 0)
+                    return 0;
+                uint toRead = Math.Max(1u, Math.Min(nsectors == 0 ? 1u : nsectors, 64u));
+                if (mem != null && buf != 0)
+                {
+                    uint got = ReadSectorsTo(mem, StreamCursor, toRead, buf);
+                    return (int)got;
+                }
+                // No EE dest: advance cursor and count as success for IOP-side buffer paths.
+                for (uint i = 0; i < toRead; i++)
+                {
+                    if (!ReadSector(StreamCursor + i))
+                        return (int)i;
+                }
+                return (int)toRead;
+            }
+            default:
+                return 1;
+        }
     }
 
     public bool ReadSector(uint lba)
     {
-        if (!DiscPresent || TrayOpen)
+        if (TrayOpen)
         {
             Array.Clear(_sectorBuffer);
+            LastError = ErOPENS;
+            DriveState = StatShellOpen;
+            return false;
+        }
+        if (!DiscPresent)
+        {
+            Array.Clear(_sectorBuffer);
+            LastError = ErNODISC;
             return false;
         }
 
@@ -328,8 +577,12 @@ public sealed class Cdvd : ISchedulable
         if (_disc != null)
         {
             long offset = (long)lba * SectorSize;
-            if (offset < _disc.Length)
-                _disc.ReadAt(offset, _sectorBuffer.AsSpan(0, SectorSize));
+            if (offset >= _disc.Length)
+            {
+                LastError = ErEOM;
+                return false;
+            }
+            _disc.ReadAt(offset, _sectorBuffer.AsSpan(0, SectorSize));
         }
         else
         {
@@ -348,8 +601,24 @@ public sealed class Cdvd : ISchedulable
         // waiters (and our HLE) observe activity. Also IPU was historically used
         // as a stand-in — keep SIF as the primary notify.
         _intc?.Raise(Intc.InterruptSource.Sif);
-        MechaconStatus = 0x40;
+        LastError = ErNO;
+        if (!ReadPending)
+            SetReadySpin();
         return true;
+    }
+
+    private bool CanAccessDisc(out int error)
+    {
+        if (TrayOpen) { error = ErOPENS; LastError = ErOPENS; DriveState = StatShellOpen; return false; }
+        if (!DiscPresent) { error = ErNODISC; LastError = ErNODISC; return false; }
+        error = ErNO;
+        return true;
+    }
+
+    private void SetReadySpin()
+    {
+        DriveState = StatSpin;
+        MechaconStatus = 0x40;
     }
 
     /// <summary>Count host-side ISO reads (CRI HLE etc.) toward <see cref="SectorsRead"/> telemetry.</summary>
@@ -394,11 +663,13 @@ public sealed class Cdvd : ISchedulable
             if (_pendingDest != 0 && _memForAsync != null)
                 CopySectorToMemory(_memForAsync, _pendingDest + i * (uint)SectorSize);
         }
-        MechaconStatus = 0x40; // ready
+        SetReadySpin();
         if (_completionEfId != 0 && _kernelForComplete != null)
             _kernelForComplete.SetEventFlag(_completionEfId, 1u);
         _pendingDest = 0;
         _memForAsync = null;
+        _kernelForComplete = null;
+        _completionEfId = 0;
         return (int)used;
     }
 }

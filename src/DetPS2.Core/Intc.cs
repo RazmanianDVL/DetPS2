@@ -90,16 +90,36 @@ public sealed class Intc : ISchedulable
         uint bit = 1u << (int)source;
         bool edge = (Stat & bit) == 0;
         Stat |= bit;
-        // Edge into sticky STAT also arms COP0 delivery. Re-Raise while already sticky does
-        // not re-arm (matches "already pending"); software write-1-clear then next Raise
-        // produces a fresh edge.
+        // Always re-arm COP0 delivery on each hardware Raise, even when STAT is already sticky.
+        // Real INTC keeps IP2 asserted while STAT&MASK is set; we model delivery as a
+        // one-shot latch that the CPU consumes (ClearCpuLatch / Acknowledge) so bare-eret
+        // doesn't storm, but each *new hardware event* (next VBlank period, next SIF DMA,
+        // …) must re-arm or the source goes permanently silent after the first accept.
+        // Edge-only re-arm left God of War's VBlankStart handler (cause=2 @ 0x00182F28)
+        // dead after the first pre-registration ClearCpuLatch: STAT stayed sticky, every
+        // subsequent Pcrtc Raise saw alreadyRaised=true, CpuLatched never came back, and
+        // the frame-counter wait at 0x0021FF00 spun forever on a counter that never moved.
+        CpuLatched |= bit;
         if (edge)
         {
-            CpuLatched |= bit;
             int idx = (int)source;
             if ((uint)idx < (uint)_statHoldUntil.Length)
                 _statHoldUntil[idx] = CurrentCycleForTrace + StatHoldCycles;
         }
+        _onChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Re-arm COP0 delivery for a source whose STAT bit is already sticky (e.g. right after
+    /// <c>AddIntcHandler</c> registers ownership of a cause that fired before the handler
+    /// existed and was consumed by the no-handler ClearCpuLatch path).
+    /// </summary>
+    public void RearmCpuLatch(InterruptSource source)
+    {
+        uint bit = 1u << (int)source;
+        if ((Stat & bit) == 0) return;
+        if ((CpuLatched & bit) != 0) return;
+        CpuLatched |= bit;
         _onChanged?.Invoke();
     }
 

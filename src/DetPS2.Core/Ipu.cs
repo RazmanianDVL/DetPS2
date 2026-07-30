@@ -211,6 +211,42 @@ public sealed class Ipu : ISchedulable
         return n;
     }
 
+    /// <summary>
+    /// EE MMIO IPU FIFO window (ps2tek): 0x10007000 out (read), 0x10007010 in (write).
+    /// Games (Burnout 3) SQ command/bitstream words here; previously fell through as unknown MMIO.
+    /// </summary>
+    public uint ReadFifoWord(uint address)
+    {
+        // Out FIFO: return next decoded word if any
+        if ((address & 0xF0) == 0x00)
+        {
+            if (_outPos + 3 < _outLen)
+            {
+                uint w = (uint)(_fifoOut[_outPos] | (_fifoOut[_outPos + 1] << 8)
+                    | (_fifoOut[_outPos + 2] << 16) | (_fifoOut[_outPos + 3] << 24));
+                _outPos += 4;
+                return w;
+            }
+            return 0;
+        }
+        return 0;
+    }
+
+    public void WriteFifoWord(uint address, uint value)
+    {
+        // In FIFO @ 0x10007010: push little-endian bytes into bitstream buffer
+        if ((address & 0xF0) == 0x10 || (address & 0xF0) == 0x00)
+        {
+            if (_inLen + 4 <= _fifoIn.Length)
+            {
+                _fifoIn[_inLen++] = (byte)value;
+                _fifoIn[_inLen++] = (byte)(value >> 8);
+                _fifoIn[_inLen++] = (byte)(value >> 16);
+                _fifoIn[_inLen++] = (byte)(value >> 24);
+            }
+        }
+    }
+
     public uint ReadRegister(uint address)
     {
         uint off = address - MmioBase;

@@ -23,16 +23,23 @@ public sealed class Vif : ISchedulable
     public const uint CmdMscal = 0x14;
     public const uint CmdMscnt = 0x17;
     public const uint CmdMscalf = 0x15;
+    public const uint CmdDirect = 0x50;
+    public const uint CmdDirectHl = 0x51;
     public const uint CmdUnpack = 0x60; // base; actual 0x60-0x6F
 
     private readonly SystemMemory _memory;
     private Vu0? _vu0;
     private Vu1? _vu1;
+    private Gif? _gif;
+    /// <summary>Remaining QWs expected by DIRECT/DIRECTHL (PATH2 → GIF).</summary>
+    private uint _directRemaining;
 
     public ulong CommandsProcessed { get; private set; }
     public ulong UnpackWords { get; private set; }
     public ulong MpgWords { get; private set; }
     public ulong MscalCount { get; private set; }
+    /// <summary>Count of MSKPATH3 commands processed (diagnostics / smokes).</summary>
+    public ulong MskPath3Count { get; private set; }
     public uint Itop { get; private set; }
     public uint Base { get; private set; }
     public uint Cycle { get; private set; } = 0x0101;
@@ -54,10 +61,13 @@ public sealed class Vif : ISchedulable
 
     public void SetVu0(Vu0 vu0) => _vu0 = vu0 ?? throw new ArgumentNullException(nameof(vu0));
     public void SetVu1(Vu1 vu1) => _vu1 = vu1 ?? throw new ArgumentNullException(nameof(vu1));
+    /// <summary>Optional GIF link so MSKPATH3 can raise GIF_STAT.M3P (PATH3 mask).</summary>
+    public void SetGif(Gif gif) => _gif = gif ?? throw new ArgumentNullException(nameof(gif));
 
     public void Reset()
     {
         CommandsProcessed = UnpackWords = MpgWords = MscalCount = 0;
+        MskPath3Count = 0;
         UnpackV4_32 = 0;
         UnpackOther = 0;
         Itop = Base = 0;
@@ -67,6 +77,7 @@ public sealed class Vif : ISchedulable
         _unpackRemaining = 0;
         _unpackDest = 0;
         _unpackVnVl = 0;
+        _directRemaining = 0;
     }
 
     public int Step(ulong maxCycles)
@@ -95,9 +106,14 @@ public sealed class Vif : ISchedulable
             case CmdFlush:
             case CmdFlushE:
             case CmdFlushA:
-            case CmdMskPath3:
             case CmdMark:
             case CmdStMod:
+                break;
+            case CmdMskPath3:
+                // ps2tek / GS manuals: PATH3 mask is IMM bit 15 (0x8000), not bit 0.
+                // Commercial streams (Burnout 3 stack word 0x06008000) set bit 15; bit 0 is unused.
+                MskPath3Count++;
+                _gif?.SetMskPath3((imm & 0x8000) != 0);
                 break;
             case CmdStcycl:
                 Cycle = imm;
@@ -125,6 +141,11 @@ public sealed class Vif : ISchedulable
                 MscalCount++;
                 _vu1?.Mscnt();
                 break;
+            case CmdDirect:
+            case CmdDirectHl:
+                // IMM = number of QWs to forward to GIF PATH2 (0 means 65536)
+                _directRemaining = imm == 0 ? 65536u : imm;
+                break;
             default:
                 if (cmd >= 0x60 && cmd <= 0x6F)
                 {
@@ -141,7 +162,12 @@ public sealed class Vif : ISchedulable
         }
     }
 
-    /// <summary>Feed data word following a command (MPG/UNPACK).</summary>
+    /// <summary>
+    /// Feed one word from the VIF FIFO MMIO window (0x10004000 / 0x10005000).
+    /// When a prior MPG/UNPACK still expects data, consume as payload; otherwise treat
+    /// the word as a VIF code (NOP/MSKPATH3/DIRECT/…). Previously non-data words were
+    /// silently dropped, so MSKPATH3 written via FIFO never raised GIF_STAT.M3P.
+    /// </summary>
     public void FeedData(uint word)
     {
         if (_inMpg && _mpgRemaining > 0 && _vu1 != null)
@@ -182,44 +208,49 @@ public sealed class Vif : ISchedulable
                 _unpackRemaining--;
                 _unpackDest++;
             }
+            return;
         }
+
+        // Idle VIF: FIFO poke is a command word (matches DMAC ProcessStream path).
+        ProcessVifCode(word);
     }
 
     /// <summary>Process a stream of VIF words from memory (tag + data).</summary>
     public void ProcessStream(uint address, uint wordCount)
     {
-        for (uint i = 0; i < wordCount; i++)
+        uint i = 0;
+        while (i < wordCount)
         {
+            // DIRECT/DIRECTHL: next N QWs go to GIF PATH2 as a contiguous packet
+            if (_directRemaining > 0 && _gif != null)
+            {
+                uint qws = Math.Min(_directRemaining, (wordCount - i) / 4);
+                if (qws > 0)
+                {
+                    _gif.ReceivePath2Data(address + i * 4, qws);
+                    _directRemaining -= qws;
+                    i += qws * 4;
+                    continue;
+                }
+                // Partial QW left — fall through word-by-word (shouldn't happen for aligned DMA)
+            }
+
             uint w = _memory.Read32(address + i * 4);
             if (_inMpg || _unpackRemaining > 0)
                 FeedData(w);
             else
                 ProcessVifCode(w);
+            i++;
         }
     }
 
+    /// <summary>
+    /// One QW of VIF1/VIF0 DMA. Always run as a VIF command/data stream (not raw VU mem).
+    /// Previous allow-list omitted MSKPATH3/DIRECT/FLUSH/… so PATH3 mask via DMA never latched
+    /// (Burnout 3 path-sync @ 0x001F19C0 spins on GIF_STAT.M3P forever).
+    /// </summary>
     public void SendQuadwordToVu1(uint address)
     {
-        if (_vu1 == null) return;
-        uint w0 = _memory.Read32(address);
-        uint w1 = _memory.Read32(address + 4);
-        uint w2 = _memory.Read32(address + 8);
-        uint w3 = _memory.Read32(address + 12);
-
-        uint cmd = (w0 >> 24) & 0xFF;
-        if (cmd is CmdMpg or CmdMscal or CmdMscalf or CmdMscnt or CmdITop or CmdBase
-            || (cmd >= 0x60 && cmd <= 0x6F))
-        {
-            ProcessVifCode(w0);
-            FeedData(w1);
-            FeedData(w2);
-            FeedData(w3);
-            return;
-        }
-
-        _vu1.ReceiveFromVif1(w0);
-        _vu1.ReceiveFromVif1(w1);
-        _vu1.ReceiveFromVif1(w2);
-        _vu1.ReceiveFromVif1(w3);
+        ProcessStream(address, 4);
     }
 }

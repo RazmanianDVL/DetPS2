@@ -22,6 +22,54 @@ public sealed class SystemMemory
     public const uint MMIO_BASE = 0x10000000;
     public const uint MMIO_END = 0x1BFFFFFF;
 
+    /// <summary>
+    /// True if <paramref name="addr"/> looks like EE user code, not string/data.
+    /// Used by open-bus / nop-sled rescue so we never re-home into ASCII .rodata
+    /// (MK thrash: 0x06403800 ↔ 0x00520040 data words, 2026-07-30).
+    /// Requires two consecutive plausible instructions — a single REGIMM-looking
+    /// data word (e.g. 0x04089300) previously slipped through.
+    /// </summary>
+    public bool IsLikelyEeCode(ulong addr)
+    {
+        uint p = (uint)(addr & 0x1FFFFFFFUL);
+        // Commercial EE .text sits in low RDRAM; high ELF image is data/BSS/strings.
+        if (p < 0x00100000u || p >= 0x00580000u) return false;
+        if ((p & 3u) != 0) return false;
+        return WordLooksLikeInsn(Read32(p)) && WordLooksLikeInsn(Read32(p + 4));
+    }
+
+    private static bool WordLooksLikeInsn(uint op)
+    {
+        if (op == 0) return false; // nop alone is weak; dual-check needs real work
+        // Reject ASCII-heavy words (3+ printable bytes) — classic string mis-exec.
+        int printable = 0, zeros = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            byte b = (byte)(op >> (8 * i));
+            if (b is >= 0x20 and <= 0x7E) printable++;
+            if (b == 0) zeros++;
+        }
+        if (printable >= 3) return false;
+        // Sparse words (3 zero bytes) are almost always data, not real ALU/branch ops.
+        if (zeros >= 3) return false;
+        uint primary = op >> 26;
+        if (primary == 1) // REGIMM — only known rt sub-ops
+        {
+            uint rt = (op >> 16) & 0x1F;
+            return rt is 0 or 1 or 2 or 3 or 8 or 9 or 10 or 11 or 12 or 14
+                or 16 or 17 or 18 or 19;
+        }
+        // Common R5900 primary opcodes (SPECIAL/J/branches/ALU/COP/loads/stores/MMI).
+        return primary is 0 or 2 or 3 or 4 or 5 or 6 or 7
+            or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15
+            or 16 or 17 or 18
+            or 20 or 21 or 22 or 23
+            or 28 or 31
+            or 32 or 33 or 34 or 35 or 36 or 37 or 38 or 39
+            or 40 or 41 or 42 or 43 or 44 or 45 or 46 or 47
+            or 49 or 51 or 53 or 57 or 59 or 61;
+    }
+
     private readonly byte[] _rdram = new byte[RDRAM_SIZE];
     private readonly byte[] _scratchpad = new byte[SPR_SIZE];
     private readonly byte[] _iopRam = new byte[IOP_RAM_SIZE];
@@ -143,7 +191,15 @@ public sealed class SystemMemory
         if (paddr >= Spu2.PhysBase && paddr < Spu2.PhysBase + 0x800 && _spu2 != null)
             return _spu2.ReadRegister((uint)paddr);
 
-        // MMIO window (EE hardware regs) — after SPR so 0x7000_0000 is not stolen
+        // Real EE I/O windows only (64 KB device space + GS privileged). Holes in
+        // 0x10010000–0x11FFFFFF (except VU at 0x1100xxxx, still hole here) often appear
+        // as game pointers with bit28 set (e.g. Burnout 3 SQ to 0x108D5Cxx for DMA tags);
+        // alias those to RDRAM so CPU stores and DMAC reads share the same bytes.
+        if (IsRealEeDeviceWindow(paddr) && _mmio != null)
+            return _mmio.Read32((uint)paddr);
+        if (TryRdramAliasFromMmioHole(paddr, out uint aliasRd) && aliasRd + 3 < (uint)RDRAM_SIZE)
+            return Unsafe.ReadUnaligned<uint>(ref _rdram[aliasRd]);
+        // Legacy full-window MMIO decode for anything else still in 0x10–0x1B (e.g. rare probes)
         if (paddr >= MMIO_BASE && paddr <= MMIO_END && _mmio != null)
             return _mmio.Read32((uint)paddr);
 
@@ -298,6 +354,18 @@ public sealed class SystemMemory
             return;
         }
 
+        if (IsRealEeDeviceWindow(paddr) && _mmio != null)
+        {
+            _mmio.Write32((uint)paddr, value);
+            return;
+        }
+        if (TryRdramAliasFromMmioHole(paddr, out uint aliasWr) && aliasWr + 3 < (uint)RDRAM_SIZE)
+        {
+            if (ProtectKernelVectors && aliasWr < 0x300)
+                return;
+            Unsafe.WriteUnaligned(ref _rdram[aliasWr], value);
+            return;
+        }
         if (paddr >= MMIO_BASE && paddr <= MMIO_END && _mmio != null)
         {
             _mmio.Write32((uint)paddr, value);
@@ -363,4 +431,35 @@ public sealed class SystemMemory
 
     public ReadOnlySpan<byte> GetRDRAMSpan() => _rdram;
     public Span<byte> GetIopRamSpan() => _iopRam;
+
+    /// <summary>
+    /// True EE device windows that must hit <see cref="MmioBus"/> (not RDRAM alias).
+    /// 0x10000000–0x1000FFFF: timers/IPU/GIF/VIF/DMAC/INTC/SIF/MCH.
+    /// 0x12000000–0x12001FFF: GS privileged.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsRealEeDeviceWindow(ulong paddr) =>
+        (paddr >= 0x10000000UL && paddr < 0x10010000UL) ||
+        (paddr >= 0x12000000UL && paddr < 0x12002000UL);
+
+    /// <summary>
+    /// MMIO-window holes (bit28 set pointers used by commercial titles) alias into RDRAM.
+    /// Burnout 3 writes GIF DMA tags via SQ to 0x108D5Cxx; DMAC then reads 0x008D5Cxx —
+    /// without this, tags live only in MmioBus's unmapped dict and PATH3 chain sees zeros.
+    /// Excludes real device windows and the VU mem window (0x11000000–0x1100FFFF).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryRdramAliasFromMmioHole(ulong paddr, out uint rdramOff)
+    {
+        rdramOff = 0;
+        if (paddr < 0x10000000UL || paddr > 0x1BFFFFFFUL)
+            return false;
+        if (IsRealEeDeviceWindow(paddr))
+            return false;
+        // VU0/VU1 micro/data mem — not RDRAM (left to MmioBus / future VU window).
+        if (paddr >= 0x11000000UL && paddr < 0x11010000UL)
+            return false;
+        rdramOff = (uint)(paddr & 0x01FFFFFFUL);
+        return rdramOff < (uint)RDRAM_SIZE;
+    }
 }
