@@ -47,3 +47,13 @@ See `docs/PLAY_HLE_ORACLE.md`.
 ## Media JSON
 
 Create `user-media-<id>.json` with UNC `path` + shared `biosPath`. Keep gitignored local configs out of commits when they embed secrets or absolute-only personal paths; UNC library paths are fine to document.
+
+## Wiki (mandatory when you pull a title)
+
+Per [Compatibility Database](https://github.com/RazmanianDVL/DetPS2/wiki/Compatibility-Database.) and user policy:
+
+1. **Create a dedicated wiki page** for that game **when it is pulled** (not after MENU YES).  
+2. Format: `# Title - Date` → `## Current progress` → `## Active issues` → `## Fixed issues`.  
+3. Link it from [Commercial-Titles](https://github.com/RazmanianDVL/DetPS2/wiki/Commercial-Titles) and [Home](https://github.com/RazmanianDVL/DetPS2/wiki) scoreboards.  
+4. **Update the page after every scout report** (wall, metrics, Play!/PINE notes, commits).  
+5. Close GitHub issues only when that title’s wall is truly done; keep Active/Fixed in sync.
