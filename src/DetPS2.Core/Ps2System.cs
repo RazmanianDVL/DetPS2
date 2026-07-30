@@ -466,7 +466,10 @@ public sealed class Ps2System
                 // later worker permanently unstarted — traced 2026-07-29 at 120M cycles:
                 // threads 3–6 Alive/!Started while main spun SetVSyncFlag at 0x463960.
                 // Re-arm per thread so each new CreateThread gets its own grace then Start.
-                if (!DisableMidwayAssist && ActiveQuirk is MidwayBootAssist)
+                // MidwayFamilyAssist (DA/Dec/Arm): same CreateThread→DORMANT pattern for
+                // MWFILE reverse-RPC / post-MSL workers while main thrash-sleeps.
+                if (!DisableMidwayAssist
+                    && ActiveQuirk is MidwayBootAssist or MidwayFamilyAssist)
                     KickAllDormantCommercialWorkers();
 
                 ulong n = left > slice ? slice : left;

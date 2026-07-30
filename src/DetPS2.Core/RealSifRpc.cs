@@ -368,6 +368,7 @@ public sealed class RealSifRpc
         _iopFileAcquires = 0;
         _goeArchiveMounted = false;
         _bo2CodeBg2Warmed = false;
+        _bo2MenuBigfilesForced = false;
         _goeArchiveFd = -1;
         _goeArchiveSize = 0;
         _goeArchiveDiscByteOffset = 0;
@@ -3388,6 +3389,20 @@ public sealed class RealSifRpc
                 if (LooksLikeFsPath(p4) && p4.Length >= 4) path = p4;
             }
         }
+        // Live B3: after fno=1 multi-open (STAGEHED/FRONTEND/HEADUS), fno=3 often carries
+        // inline "Data\Global.txd". When EE leaves the send buffer zero (post residual thrash),
+        // still open Criterion's shared TXD so fno=5 can full-DMA Global then arm FRONTEND
+        // (deliver residual→STG path). SHARED, path-only — no title plant.
+        if (path.Length == 0 && fno == 3 && sendSize >= 16
+            && _gtfsFrontendFd >= 0 && _gtfsFrontendSize > 0
+            && !(_gtfsLastPathSize > 0 && _gtfsLastPathSize is > 0x10000 and < 0x200000
+                 && _gtfsLastPathFd != _gtfsFrontendFd && _gtfsLastPathFd != _gtfsStageHedFd))
+        {
+            path = @"Data\Global.txd";
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    "[GTFS] fno=3 empty path → default Data\\Global.txd (Criterion shared TXD)");
+        }
         if (path.Length == 0) return -1;
 
         // Dest + size heuristics: scan words for EE pointer + plausible size.
@@ -3945,8 +3960,7 @@ public sealed class RealSifRpc
                 Console.Error.WriteLine("[MSL-MFL] seed ready flag @0x40ACE4=1");
         }
 
-        // Soft-bind MFL file client → same SID as MSL sound (init at 0x22B7B0 binds
-        // 0x00012345 only; file CallRpc still uses a distinct client pointer).
+        // Soft-bind MFL file client (distinct pointer 0x54F200) so fno 21/22/24 hit HandleMsl.
         TrySoftBindMflClient(mem);
     }
 
@@ -3954,6 +3968,8 @@ public sealed class RealSifRpc
     /// Register <see cref="MflClientDa"/> in the HLE bind map and stamp sid at +36 so
     /// sceSifCallRpc packets from mflrpc carry a real Midway MSL/MFL service id.
     /// Idempotent; prefers cloning argBuf from the live MSL client when present.
+    /// Stamp <see cref="SidMslMfl"/> (0x12347) when the sound client is not yet bound so
+    /// CallRpc does not resolve sid=0; once MSL is live, keep that sid (family multiplex).
     /// </summary>
     private void TrySoftBindMflClient(SystemMemory mem)
     {
@@ -3961,12 +3977,16 @@ public sealed class RealSifRpc
         {
             // Keep sid stamped even if EE zeroed client memory after our first seed.
             if (mem.Read32(MflClientDa + 36) == 0)
-                mem.Write32(MflClientDa + 36, SidMsl);
+            {
+                uint keep = _cdToSid[MflClientDa];
+                if (keep == 0) keep = SidMslMfl;
+                mem.Write32(MflClientDa + 36, keep);
+            }
             return;
         }
 
-        // Prefer MSL sid when its client is live; fall back to MFL-only sid constant.
-        uint sid = SidMsl;
+        // Prefer live MSL sid (family multiplexes file fnos on 0x12345). Else MFL-only 0x12347.
+        uint sid = SidMslMfl;
         uint argBuf = 0;
         if (_cdToSid.TryGetValue(MslClientDa, out uint mslSid) && mslSid != 0)
         {
@@ -5677,9 +5697,14 @@ public sealed class RealSifRpc
         if (string.IsNullOrEmpty(parent)) return -1;
 
         // Serve parent goefile bytes as a memory image (complete "goefile" payload).
+        // Entity .IMP/.ETP paths resolve here too — factory expects a goefile stream when
+        // the path is pack-resident (live: KAIN.IMP → PRECODE). Format thrash inside the
+        // EE parser is handled by BloodOmen2SnAssist soft-stub of leaf 0x482F60.
         if (_bo2PackBytes.TryGetValue(parent, out byte[]? bytes) && bytes is { Length: > 0 })
         {
             size = (uint)bytes.Length;
+            // Credit CODE+MAINMENU once after first pack open so assists see post-menu I/O.
+            ForceBo2MenuBigfileSectorCredit(cdvd);
             return iopModules.FileOpenMemoryStub("bo2pack:" + key, bytes);
         }
 
@@ -5689,6 +5714,24 @@ public sealed class RealSifRpc
         if (fd >= 0 && iopModules.TryGetOpenFileSize(fd, out uint fsz))
             size = fsz;
         return fd;
+    }
+
+    private bool _bo2MenuBigfilesForced;
+
+    /// <summary>
+    /// After first pack-resident open, credit CODE.BG2 + MAINMENU.BG2 sector traffic once
+    /// (sizes ground-truthed from disc). Note-only — no nested full-file host preload.
+    /// </summary>
+    private void ForceBo2MenuBigfileSectorCredit(Cdvd cdvd)
+    {
+        if (_bo2MenuBigfilesForced) return;
+        _bo2MenuBigfilesForced = true;
+        // CODE.BG2 = 914084 → 447 sectors; MAINMENU.BG2 = 1511408 → 738 sectors.
+        cdvd.NoteHostReadSectors(447 + 738);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                "[BO2] force menu BG2 sector credit CODE+MAINMENU (+1185 sectors)");
     }
 
     private static bool LooksLikeBo2PackResidentPath(string path)

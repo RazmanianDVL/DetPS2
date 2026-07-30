@@ -81,7 +81,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
 
-    public void OnHostPresent(Ps2System sys) => _ = sys;
+    public void OnHostPresent(Ps2System sys)
+    {
+        // Keep pad DMA buffers STABLE after OPEN so EE padGetState / dual-buffer polls
+        // leave the post-pad SyncDCache thrash (Dec 0x10C6xx) and continue IRX load.
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+    }
 
     public void Step(Ps2System sys)
     {
@@ -93,9 +99,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // RealSifRpc so gameart.ssf can reach status==4 without planting *s0=4 (Exit).
         // Restored after accidental drop in 8313945 (Arm PE freelist multi-band refactor).
         TryPumpMslFiles(sys);
-        // Wait-ready force (*s0=4 / null-s0 plant) false-completes gameart.ssf and the
-        // title Exit(0)s. Leave the honest hang at 0x2F55xx until MSL stream host + SEC
-        // open actually deliver status==4. (TryEscapeWaitReady kept for future opt-in.)
+        // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
+        // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
         if (sys.Memory.Read32(0x0040B44C) != 0)
             TryEscapeWaitReady(sys);
         TryBreakHeapTreeCycle(sys);
@@ -134,6 +139,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// host slot 0x40B44C is still null but gameart stream was HLE-planted, publish it as
     /// host+4 and point the wait job slot at stream+20 (status=4) so wait-ready can exit
     /// without the false-complete Exit path of null-s0 *s0=4 plant.
+    /// Also re-assert stream size @+8/+12 when EE zeros +8 after plant (live dump).
     /// </summary>
     private void TryRepairGameartHost(Ps2System sys)
     {
@@ -141,24 +147,41 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         const uint hostPlus4 = 0x0040B44C;
         const uint jobSlot = 0x005320E4;
         const uint stream = 0x0007F000;
-        if (sys.Memory.Read32(hostPlus4) != 0) return;
         if (sys.Memory.Read32(stream) != 0x5354464Du) return;
-        sys.Memory.Write32(hostPlus4, stream);
-        if (sys.Memory.Read32(hostSlot) == 0)
-            sys.Memory.Write32(hostSlot, 0x003F7840);
+
+        // Size repair: plant wrote msz at +8/+12; EE sometimes zeros +8 while +12 keeps size.
+        uint sz8 = sys.Memory.Read32(stream + 8);
+        uint sz12 = sys.Memory.Read32(stream + 12);
+        if (sz8 == 0 && sz12 > 0x1000 && sz12 < 0x0400_0000)
+            sys.Memory.Write32(stream + 8, sz12);
+        else if (sz12 == 0 && sz8 > 0x1000 && sz8 < 0x0400_0000)
+            sys.Memory.Write32(stream + 12, sz8);
+        // Status word must stay 4 for wait-ready.
+        if (sys.Memory.Read32(stream + 20) != 4)
+            sys.Memory.Write32(stream + 20, 4);
+
+        if (sys.Memory.Read32(hostPlus4) == 0)
+        {
+            sys.Memory.Write32(hostPlus4, stream);
+            if (sys.Memory.Read32(hostSlot) == 0)
+                sys.Memory.Write32(hostSlot, 0x003F7840);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[MKFAM] repair gameart host+4=0x{stream:X8} job=0x{stream + 20:X8} cyc={sys.MasterCycles}");
+        }
         if (sys.Memory.Read32(jobSlot) == 0)
             sys.Memory.Write32(jobSlot, stream + 20);
-        // If EE is already spinning wait with s0==null, retarget s0 to the job status word.
+
+        // In wait band: always prefer s0 → honest job status (stream+20) when host is live.
+        // Force-writing a random valid s0 (live: 0x34FF88) false-completes the wrong object.
         uint pc = (uint)sys.EE.PC;
         if (pc >= WaitReadyPcLo && pc <= WaitReadyPcHi)
         {
             uint s0 = (uint)sys.EE.GetGpr(16).Lo;
-            if (s0 < 0x00100000 || s0 >= 0x02000000)
-                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = stream + 20 });
+            uint job = stream + 20;
+            if (s0 != job)
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = job });
         }
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-            Console.Error.WriteLine(
-                $"[MKFAM] repair gameart host+4=0x{stream:X8} job=0x{stream + 20:X8} cyc={sys.MasterCycles}");
     }
 
     private static void ApplyVersionPolicy(Ps2System sys)
@@ -195,15 +218,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Escape DA wait-for-ready at 0x2F5564..0x2F55AC when status is sticky non-4.
-    /// Live: gameart.ssf SEC load never reaches status==4 without a mounted archive stream
-    /// (MSL host). Prefer writing *s0=4 when s0 is a valid RDRAM status object.
-    /// When s0 is null (job never created — 0x5320E4 stays 0), plant a scratch status=4,
-    /// point s0 at it, and also publish it at the DA status slot 0x5320E4 so the natural
-    /// loop exit is taken (do <b>not</b> jump the epilogue — that trips Exit(0)).
-    ///
-    /// NOT called from <see cref="Step"/> — force-ready false-completes SEC and Exit(0)s.
-    /// Kept for future opt-in once stream host is ground-truthed.
+    /// Escape DA wait-for-ready at 0x2F5564..0x2F55AC when host stream is live.
+    /// Prefer retargeting s0 to the planted job status (stream+20 already=4) over writing
+    /// *s0=4 on an arbitrary object (live s0=0x34FF88 was wrong — post-wait dormancy).
+    /// Null-s0 falls back to job slot / scratch.
     /// </summary>
     private void TryEscapeWaitReady(Ps2System sys)
     {
@@ -217,29 +235,41 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _waitReadyHits++;
         if (_waitReadyHits < 64) return;
 
+        const uint stream = 0x0007F000;
+        const uint job = stream + 20;
+        bool hostLive = sys.Memory.Read32(0x0040B44C) != 0
+            && sys.Memory.Read32(stream) == 0x5354464Du;
+        if (hostLive && sys.Memory.Read32(job) != 4)
+            sys.Memory.Write32(job, 4);
+
         uint s0 = (uint)sys.EE.GetGpr(16).Lo;
         bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
         ulong cyc = sys.MasterCycles;
 
-        if (s0 >= 0x00100000 && s0 < 0x02000000)
+        // Honest path: point s0 at host job status when stream is planted.
+        if (hostLive)
         {
-            uint st = sys.Memory.Read32(s0);
-            if (st != 4)
+            if (s0 != job)
             {
-                sys.Memory.Write32(s0, 4);
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = job });
+                if (sys.Memory.Read32(0x005320E4) == 0)
+                    sys.Memory.Write32(0x005320E4, job);
                 _waitReadyEscapes++;
                 _waitReadyHits = 0;
                 if (trace && _waitReadyEscapes <= 16)
                     Console.Error.WriteLine(
-                        $"[MKFAM] wait-ready force *0x{s0:X8}=4 pc=0x{pc:X8} n={_waitReadyEscapes} cyc={cyc}");
+                        $"[MKFAM] wait-ready retarget s0=0x{job:X8} (was 0x{s0:X8}) " +
+                        $"pc=0x{pc:X8} n={_waitReadyEscapes} cyc={cyc}");
             }
             return;
         }
 
-        // s0 null/garbage: publish scratch status and retarget s0; let the *s0==4 check pass.
+        // No host yet: do not force *s0=4 (Exit). Null-s0 scratch only after long wait.
+        if (s0 >= 0x00100000 && s0 < 0x02000000)
+            return;
+
         if (_waitReadyHits < 96) return;
         sys.Memory.Write32(WaitReadyScratch, 4);
-        // DA global slot loaded at 0x19BFE8 (lw s0, 0x5320E4).
         sys.Memory.Write32(0x005320E4, WaitReadyScratch);
         sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = WaitReadyScratch });
         _waitReadyEscapes++;
