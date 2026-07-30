@@ -340,6 +340,12 @@ public sealed class RealSifRpc
         _goeArchiveDiscByteOffset = 0;
         _rkvToc.Clear();
         _rkvTocCount = 0;
+        _mkdaPakMounted = false;
+        _mkdaPakFd = -1;
+        _mkdaPakDiscByteOffset = 0;
+        _mkdaPakSize = 0;
+        _mkdaPakTocCount = 0;
+        _mkdaPakToc.Clear();
         _cdToSid.Clear();
         _cdToArgBuf.Clear();
         _fioEeArgSnap.Clear();
@@ -1091,6 +1097,7 @@ public sealed class RealSifRpc
                 // an EE path pointer — treating those 4 pointer bytes as an inline C string
                 // yields garbage like "ðûþ" (LE of 0x00FEFBF0) and open → ENOENT (Blood Omen 2).
                 DecodeFioOpenArgs(mem, argBuf, sendSize, out int mode, out string path);
+                path = AliasMidwayPakPath(path);
                 int openRes = iopModules.FileOpen(path, mode);
                 // PS2.RKV virtual open for archive-only audio paths (Blood Omen 2).
                 if (openRes < 0)
@@ -1105,6 +1112,21 @@ public sealed class RealSifRpc
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                             Console.Error.WriteLine(
                                 $"[FILEIO] open RKV path=\"{path}\" fd={rkvFd} size={rkvSz}");
+                    }
+                }
+                // Midway MKDA.PAK members (Deception / Deadly Alliance shared art archive).
+                if (openRes < 0)
+                {
+                    EnsureMkdaPakMounted(iopModules, cdvd);
+                    int pakFd = TryOpenFromMkdaPak(iopModules, path, out uint pakSz);
+                    if (pakFd >= 0)
+                    {
+                        openRes = pakFd;
+                        if (pakSz > 0)
+                            cdvd.NoteHostReadSectors((int)Math.Min((pakSz + 2047) / 2048, 256));
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine(
+                                $"[FILEIO] open MKDA.PAK path=\"{path}\" fd={pakFd} size={pakSz}");
                     }
                 }
                 // Prefer real PRECODE/CODE/MAINMENU .BG2 disc payloads (ISO 8.3 aliases).
@@ -2933,7 +2955,7 @@ public sealed class RealSifRpc
     private int HandleMwFile(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
         uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
-        _ = cdvd; _ = recvBuf; _ = recvSize;
+        _ = recvBuf; _ = recvSize;
         bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
 
         if (trace && argBuf != 0 && sendSize > 0)
@@ -3012,6 +3034,7 @@ public sealed class RealSifRpc
                     return 0; // fail as null handle (EE checks non-zero)
                 }
                 path = MwFileNormalizePath(path);
+                path = AliasMidwayPakPath(path);
                 int mode = 1; // O_RDONLY default
                 if (argBuf != 0 && sendSize >= 8)
                 {
@@ -3027,6 +3050,12 @@ public sealed class RealSifRpc
                     if (colon >= 0) leaf = leaf[(colon + 1)..].TrimStart('\\', '/');
                     fd = iopModules.FileOpen("cdrom0:\\" + leaf, mode);
                     if (fd < 0) fd = iopModules.FileOpen(leaf, mode);
+                }
+                // Midway MKDA.PAK virtual members (art \ps2dvd\art\*.ssf etc.).
+                if (fd < 0)
+                {
+                    EnsureMkdaPakMounted(iopModules, cdvd);
+                    fd = TryOpenFromMkdaPak(iopModules, path, out _);
                 }
                 if (fd < 0)
                 {
@@ -3167,14 +3196,39 @@ public sealed class RealSifRpc
         {
             int c = path.IndexOf(':');
             string rest = c >= 0 ? path[(c + 1)..].TrimStart('\\', '/') : path;
-            return "cdrom0:\\" + rest;
+            return AliasMidwayPakPath("cdrom0:\\" + rest);
         }
         if (path.StartsWith("cdrom0:", StringComparison.OrdinalIgnoreCase) ||
             path.StartsWith("cdrom:", StringComparison.OrdinalIgnoreCase))
-            return path;
+            return AliasMidwayPakPath(path);
         // Bare relative → cdrom0
         if (path.Length > 0 && path.IndexOf(':') < 0)
-            return "cdrom0:\\" + path.TrimStart('\\', '/');
+            return AliasMidwayPakPath("cdrom0:\\" + path.TrimStart('\\', '/'));
+        return AliasMidwayPakPath(path);
+    }
+
+    /// <summary>
+    /// Midway Deception/DA path aliases: retail EE opens <c>/game/mkda.pak</c> (host-style)
+    /// while the ISO root file is <c>MKDA.PAK</c>. Also normalize bare <c>mkda.pak</c>.
+    /// </summary>
+    private static string AliasMidwayPakPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return path;
+        string n = path.Replace('/', '\\').Trim();
+        // Strip device for matching.
+        string leaf = n;
+        int colon = leaf.IndexOf(':');
+        if (colon >= 0) leaf = leaf[(colon + 1)..].TrimStart('\\', '/');
+        int semi = leaf.IndexOf(';');
+        if (semi >= 0) leaf = leaf[..semi];
+        if (leaf.Equals("MKDA.PAK", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("GAME\\MKDA.PAK", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("GAME/MKDA.PAK", StringComparison.OrdinalIgnoreCase)
+            || leaf.EndsWith("\\MKDA.PAK", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("game\\mkda.pak", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("game/mkda.pak", StringComparison.OrdinalIgnoreCase))
+            return @"cdrom0:\MKDA.PAK";
+        // Art member paths often arrive as host0:\ps2dvd\art\foo.ssf or \ps2dvd\art\...
         return path;
     }
 
@@ -3918,6 +3972,245 @@ public sealed class RealSifRpc
         int vfd = iopModules.FileOpenVirtualStream(
             "rkv:" + key, (uint)abs, ent.Size);
         return vfd;
+    }
+
+    // -------------------------------------------------------------------------
+    // Midway MKDA.PAK — shared Deception (SLUS_208.81) / Deadly Alliance archive.
+    //
+    // Ground-truthed 2026-07-30 from retail ISOs:
+    //   Header @0 (LE u32): magic 0x50414B20 ('PAK '), ver 0x100, count N,
+    //   payload_size, first_data_hint.
+    //   Trailing TOC of (file_size - payload_size) bytes at EOF:
+    //     skip 4 B, then N × { u32 offset, u32 size, u32 name_rel }
+    //     name table starts immediately after entries; names are
+    //     "\ps2dvd\art\foo.ssf" (Deception) / "\ps2dvd\artps2\foo.ssf" (DA).
+    //     name_rel is relative to (name_table_base - first_name_rel), empirically
+    //     name_table_start - 4 when the first string begins 4 B before entry_end.
+    //   Members are nested SEC containers (magic 'SEC '), not MWo3 overlays.
+    //   GAMEFD.ovl is NOT in the PAK — GAMER.OVL is a 384 B MWo3 stub on ISO root.
+    // -------------------------------------------------------------------------
+    private bool _mkdaPakMounted;
+    private int _mkdaPakFd = -1;
+    private uint _mkdaPakDiscByteOffset;
+    private uint _mkdaPakSize;
+    private int _mkdaPakTocCount;
+    /// <summary>Normalized lowercase path → (offset within PAK, size).</summary>
+    private readonly Dictionary<string, (uint Offset, uint Size)> _mkdaPakToc =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Mount ISO-root MKDA.PAK and parse trailing TOC once.</summary>
+    private void EnsureMkdaPakMounted(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_mkdaPakMounted) return;
+        _mkdaPakMounted = true;
+        string[] candidates =
+        {
+            @"cdrom0:\MKDA.PAK",
+            @"cdrom0:/MKDA.PAK;1",
+            @"cdrom0:\MKDA.PAK;1",
+        };
+        int fd = -1;
+        string pakPath = candidates[0];
+        foreach (string c in candidates)
+        {
+            fd = iopModules.FileOpen(c, 1);
+            if (fd >= 0) { pakPath = c; break; }
+        }
+        if (fd < 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine("[IOPFILE] MKDA.PAK mount FAIL");
+            return;
+        }
+        _mkdaPakFd = fd;
+        if (!iopModules.TryGetOpenFileSize(fd, out uint fsz) || fsz < 64)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[IOPFILE] MKDA.PAK bad size={fsz}");
+            return;
+        }
+        _mkdaPakSize = fsz;
+        if (iopModules.TryGetOpenFileLba(fd, out uint lba))
+            _mkdaPakDiscByteOffset = lba * 2048u;
+        // Token sectors (do not preload ~750 MiB).
+        cdvd.NoteHostReadSectors(8);
+        ParseMkdaPakToc(iopModules, fd, fsz);
+        // Free the mount FD — virtual member streams only need disc byte offset + TOC.
+        // (Keeps IOMAN slots free for the title's own MKDA.PAK / FILEIO opens.)
+        try { iopModules.FileClose(fd); } catch { /* ignore */ }
+        _mkdaPakFd = -1;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[IOPFILE] MKDA.PAK mounted path=\"{pakPath}\" size={_mkdaPakSize} " +
+                $"tocEntries={_mkdaPakTocCount} discOff=0x{_mkdaPakDiscByteOffset:X}");
+    }
+
+    private void ParseMkdaPakToc(IopModuleHost iopModules, int fd, uint fsz)
+    {
+        _mkdaPakToc.Clear();
+        _mkdaPakTocCount = 0;
+        // Header: magic, ver, count, payload_size, field16
+        if (!iopModules.TryReadOpenFileBytes(fd, 0, 20, out byte[]? head) || head == null || head.Length < 20)
+            return;
+        uint magic = BitConverter.ToUInt32(head, 0);
+        // On disk LE of 'PAK ' is bytes 20 4B 41 50 → u32 0x50414B20.
+        if (magic != 0x50414B20u)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[IOPFILE] MKDA.PAK bad magic 0x{magic:X8}");
+            return;
+        }
+        uint ver = BitConverter.ToUInt32(head, 4);
+        uint count = BitConverter.ToUInt32(head, 8);
+        uint payload = BitConverter.ToUInt32(head, 12);
+        if (ver != 0x100 || count is 0 or > 100_000 || payload >= fsz)
+            return;
+        uint tocBytes = fsz - payload;
+        if (tocBytes < 16 || tocBytes > 2 * 1024 * 1024)
+            return;
+        // Read trailing TOC.
+        if (!iopModules.TryReadOpenFileBytes(fd, (int)payload, (int)tocBytes, out byte[]? toc)
+            || toc == null || toc.Length < 16)
+            return;
+
+        // Entries start at +4: {off, size, name_rel} × count
+        int entryBase = 4;
+        int need = entryBase + (int)count * 12;
+        if (need > toc.Length) return;
+        int nameTable = need; // immediately after entries
+
+        // Name heap: first path C-string near entry_end (often 4 B earlier for leading '\').
+        // Live Deception: firstString@0x6CC, first nrel=0x18 → name at firstString+nrel (ashrah.ssf).
+        int firstStringOff = nameTable;
+        for (int probe = Math.Max(0, nameTable - 8); probe < Math.Min(toc.Length, nameTable + 8); probe++)
+        {
+            if (toc[probe] is (byte)'\\' or (byte)'/')
+            {
+                firstStringOff = probe;
+                break;
+            }
+        }
+        uint firstNrel = BitConverter.ToUInt32(toc, entryBase + 8);
+        int[] baseCandidates =
+        {
+            firstStringOff,                  // abs = firstString + nrel (validated Deception)
+            firstStringOff - (int)firstNrel, // abs = origin + nrel maps first nrel → firstString
+            nameTable,
+            0,
+        };
+        int nameBase = firstStringOff;
+        foreach (int cand in baseCandidates)
+        {
+            string? trial = ReadMkdaTocName(toc, cand + (int)firstNrel);
+            if (trial != null && trial.IndexOf('.') >= 0 && (trial.Contains('\\') || trial.Contains('/')))
+            {
+                nameBase = cand;
+                break;
+            }
+        }
+
+        int parsed = 0;
+        for (int i = 0; i < (int)count; i++)
+        {
+            int p = entryBase + i * 12;
+            uint off = BitConverter.ToUInt32(toc, p);
+            uint sz = BitConverter.ToUInt32(toc, p + 4);
+            uint nrel = BitConverter.ToUInt32(toc, p + 8);
+            if (off >= fsz || sz == 0 || off + sz > fsz + 0x1000)
+                continue;
+            string? name = ReadMkdaTocName(toc, nameBase + (int)nrel);
+            if (name == null)
+                name = ReadMkdaTocName(toc, (int)nrel);
+            if (name == null)
+                continue;
+            parsed++;
+            string key = NormalizeMkdaMemberKey(name);
+            if (key.Length == 0) continue;
+            _mkdaPakToc[key] = (off, sz);
+            // Basename key for loose lookups (startup.ssf).
+            int slash = key.LastIndexOf('/');
+            if (slash >= 0)
+            {
+                string baseName = key[(slash + 1)..];
+                if (!_mkdaPakToc.ContainsKey(baseName))
+                    _mkdaPakToc[baseName] = (off, sz);
+            }
+        }
+        _mkdaPakTocCount = _mkdaPakToc.Count;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[IOPFILE] MKDA.PAK TOC count={count} parsed={parsed} keys={_mkdaPakTocCount} " +
+                $"tocBytes={tocBytes} nameBase=0x{nameBase:X}");
+    }
+
+    private static string? ReadMkdaTocName(byte[] toc, int off)
+    {
+        if (off < 0 || off >= toc.Length) return null;
+        int e = off;
+        while (e < toc.Length && e - off < 200 && toc[e] != 0)
+        {
+            byte b = toc[e];
+            if (b < 32 || b > 126) return null;
+            e++;
+        }
+        if (e == off) return null;
+        if (e < toc.Length && toc[e] != 0) return null;
+        return System.Text.Encoding.ASCII.GetString(toc, off, e - off);
+    }
+
+    private static string NormalizeMkdaMemberKey(string name)
+    {
+        string k = name.Replace('\\', '/').Trim().ToLowerInvariant();
+        int semi = k.IndexOf(';');
+        if (semi >= 0) k = k[..semi];
+        // Strip device if present.
+        int colon = k.IndexOf(':');
+        if (colon >= 0) k = k[(colon + 1)..];
+        while (k.StartsWith('/')) k = k[1..];
+        return k;
+    }
+
+    /// <summary>Open a path from the mounted MKDA.PAK TOC as a virtual disc stream.</summary>
+    private int TryOpenFromMkdaPak(IopModuleHost iopModules, string path, out uint size)
+    {
+        size = 0;
+        if (_mkdaPakTocCount == 0 || _mkdaPakSize == 0) return -1;
+        string key = NormalizeMkdaMemberKey(path);
+        if (key.Length == 0) return -1;
+
+        (uint Offset, uint Size) ent = default;
+        bool found = false;
+        var alts = new List<string> { key };
+        if (key.StartsWith("game/")) alts.Add(key["game/".Length..]);
+        alts.Add("ps2dvd/art/" + key);
+        alts.Add("ps2dvd/artps2/" + key);
+        if (key.StartsWith("ps2dvd/art/")) alts.Add(key["ps2dvd/art/".Length..]);
+        if (key.StartsWith("ps2dvd/artps2/")) alts.Add(key["ps2dvd/artps2/".Length..]);
+        if (key.StartsWith("ps2dvd/")) alts.Add(key["ps2dvd/".Length..]);
+        int slash = key.LastIndexOf('/');
+        if (slash >= 0) alts.Add(key[(slash + 1)..]);
+
+        foreach (string a in alts)
+        {
+            if (_mkdaPakToc.TryGetValue(a, out ent) && ent.Size > 0)
+            {
+                found = true;
+                key = a;
+                break;
+            }
+        }
+        if (!found) return -1;
+
+        size = ent.Size;
+        if (_mkdaPakDiscByteOffset == 0 && _mkdaPakFd >= 0)
+        {
+            if (iopModules.TryGetOpenFileLba(_mkdaPakFd, out uint lba))
+                _mkdaPakDiscByteOffset = lba * 2048u;
+        }
+        if (_mkdaPakDiscByteOffset == 0) return -1;
+        long abs = (long)_mkdaPakDiscByteOffset + ent.Offset;
+        if (abs > uint.MaxValue) return -1;
+        return iopModules.FileOpenVirtualStream("mkda:" + key, (uint)abs, ent.Size);
     }
 
     /// <summary>
