@@ -24,7 +24,7 @@
 
 ## Verdict
 
-- **MK**: **NEAR-MENU / interactive-class** — gifP3=12 / dmac=17 under dense pad-inject (START/CROSS/DOWN); CROSS/DOWN moves PC `0x4148EC`↔`0x4275xx`; **"Kombat"** @ `0x57FA64/B8` and many **"Start"** strings in RDRAM. Full accept-to-submenu / second UI chrome still soft → **MENU = NEAR (not full YES)**.
+- **MK**: **NEAR-MENU / interactive-class** — gifP3=12 / dmac=17 under dense pad-inject (START/CROSS/DOWN); CROSS/DOWN moves PC `0x4148EC`↔`0x4275xx`; **"Kombat"** @ `0x57FA64/B8` and many **"Start"** strings in RDRAM. Full accept-to-submenu / second UI chrome still soft → **MENU = NEAR (not full YES)**. Wave-8: stream cookie plant + sticky lock/VU escapes; syscalls~4.3M @150M; gifP3 still 11; selection index unproven.
 - **B3**: Permanent flip-wait bypass + GTFS RPC (`0x00475453` / `0x00150276`) + FILEIO fno=23 soft-success + table-walk stub → **gifP3=380 / dmac=482**, binds unknown=0, calls=555. Still **cdvd=425** IRX-only (no game FILEIO open of Criterion assets). Exception residual after flip leave when peers mis-started (reverted to main-only).
 - **BO2**: Real MAINMENU.BG2; WaitSema complete to caller `0x46FB88` (v0 match); post-match PATH3 arm at `0x46FC74` then kick to `0x2CD7E0`. Still **px=3**. Draw path after match body not producing UI frames.
 - **GoW**: Freelist/list escapes + permanent cache-wb/freelist stubs + stream-ready assist; still **px=0** / list/KSEG residual; RPC calls low vs historical 386 peak.

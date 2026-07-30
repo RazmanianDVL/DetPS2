@@ -14,7 +14,42 @@
 
 ---
 
-## Result this session (wave-7)
+## Result this session (wave-8)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — cookie init + sticky thrash escapes; **selection index + second chrome unproven** |
+| WAD stream | **Yes** — `cdvd=198840` |
+| gifP3 | **11** (no second-chrome lift to 12–14) |
+| dmac | **16** |
+| Frame cb | **`*0x75BDD8=0x43F920` held** + arg `0x5BB860` |
+| Group-6 multi | **`*0x75E950=0x43F920` held** cookie `0x5BB860` |
+| Stream cookie | **`*0x5BB860=1` planted** (later live word0 may become `0x5BB8`) |
+| Stream work gate | **`*0x55E1EC=1` held** |
+| Pad | Dense START/CROSS/DOWN/UP; sticky lock→pump; syscalls **~4.34M** @150M |
+| UI strings | **Kombat**, **Start** in RDRAM |
+| Accept | Soft thrash walls escaped; **selection index + second UI chrome not proven** |
+| Constraints | `DETPS2_SEMA_STALL_YIELD` OFF; **no `*0x75C0D0` plant** |
+| Smokes | **ALL PASSED** |
+
+### pad-inject @ 150M (host-present, wave-8)
+
+```
+  60000000  group-6 + frame-cb + cookie=1 + stream gate
+  75000000  CROSS; gifP3 5→11; VU pastEp escape → ADX pump
+  76850000  lock hot break
+  89150000+ stickyBand lock thrash → 0x4147F8 (syscalls climb hard)
+ 150000000  final PC~0x480A88 gifP3=11 dmac=16 syscalls~4.34M cdvd=198840
+```
+
+### Residual wall (wave-8)
+
+1. **gifP3 plateau 11** — second chrome / historical 12–14 YES band not reached.
+2. **Selection index location still unknown** — D-pad does not move a stable 0..N cell under pad telemetry (`*54E610/*54E618` flags move only).
+3. **Hard accept-to-submenu unproven** — no new UI string set after CROSS.
+4. Late PC often in commercial-worker / lock / pad bands rather than a clear menu accept leaf.
+
+## Result prior session (wave-7)
 
 | Goal | Status |
 |------|--------|
