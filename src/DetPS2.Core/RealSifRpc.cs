@@ -3091,11 +3091,20 @@ public sealed class RealSifRpc
             _gtfsLastDmaDest = dest;
             _gtfsReadOffset = offset + total;
             _gtfsTotalDmaBytes += total;
-            // After completing a non-FRONTEND file, keep FRONTEND fd ready for next stream.
+            // After completing a non-FRONTEND file (live: full Global.txd), proactively rebind
+            // last-path to FRONTEND so the next EE fno=3/5 (or pathless fno=5 with fresh dest)
+            // streams FRONTEND without a stale Global cursor. SHARED second-path arm (B3 w9).
             if (_gtfsReadOffset >= maxSz && _gtfsFrontendFd >= 0
-                && fd != _gtfsFrontendFd && maxSz == _gtfsLastPathSize)
+                && fd != _gtfsFrontendFd
+                && (maxSz == _gtfsLastPathSize || maxSz > 0x10000u))
             {
-                // Cursor exhausted — next open/DMA can bind FRONTEND without stale Global cursor.
+                _gtfsLastPathFd = _gtfsFrontendFd;
+                _gtfsLastPathSize = _gtfsFrontendSize;
+                _gtfsReadOffset = 0;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[GTFS] fno=5 arm FRONTEND stream after full prior TXD dest=0x{dest:X8} " +
+                        $"priorSize={maxSz} feSize={_gtfsFrontendSize} totalDma={_gtfsTotalDmaBytes}");
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
