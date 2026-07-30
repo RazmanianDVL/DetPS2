@@ -33,7 +33,9 @@ param(
     [string]$TraceDir = "out/traces",
     [switch]$SkipBuild,
     [switch]$NoHostPresent,
-    [switch]$UpdateDoc
+    [switch]$UpdateDoc,
+    # Prefer Core CLI scoreboard-metrics (clean JSON) over log-parsing run-title
+    [switch]$NativeMetrics
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,8 +62,19 @@ if (-not $SkipBuild) {
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $results = @()
+$budgetMap = @{ diagnose = [ulong]20000000; verify = [ulong]50000000; claim = [ulong]100000000 }
+$cycles = $budgetMap[$Budget]
+$dll = Join-Path $BuildOut "DetPS2.Core.dll"
 
-Write-Host "=== Scoreboard budget=$Budget titles=$($selected.Count) ==="
+function Get-MenuHeuristic([ulong]$pxN, [int]$gifN) {
+    $menu = "No"
+    if ($pxN -gt 0 -and $gifN -gt 0) { $menu = "GS?" }
+    if ($pxN -gt 10000 -and $gifN -ge 10) { $menu = "NEAR?" }
+    if ($pxN -gt 100000 -and $gifN -ge 12) { $menu = "LIKELY-NEAR" }
+    return $menu
+}
+
+Write-Host "=== Scoreboard budget=$Budget titles=$($selected.Count) native=$NativeMetrics ==="
 foreach ($t in $selected) {
     $media = Join-Path $repoRoot $t.media
     if (-not (Test-Path $media)) {
@@ -72,7 +85,6 @@ foreach ($t in $selected) {
         }
         continue
     }
-    # Check ISO path inside media
     try {
         $cfg = Get-Content $media -Raw | ConvertFrom-Json
         $iso = $cfg.titles[0].path
@@ -92,10 +104,38 @@ foreach ($t in $selected) {
     Write-Host ""
     Write-Host ">>> $($t.name) ($($t.id))"
     $hp = -not $NoHostPresent
+
+    if ($NativeMetrics -and (Test-Path $dll)) {
+        $metricsPath = Join-Path $TraceDir "$($t.id)-$Budget-$stamp-metrics.json"
+        $argList = @("exec", $dll, "scoreboard-metrics", $media, "--cycles=$cycles", "--out=$metricsPath")
+        if ($hp) { $argList += "--host-present" }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & dotnet @argList 2>&1 | Out-Null
+        $sw.Stop()
+        if (Test-Path $metricsPath) {
+            $m = Get-Content $metricsPath -Raw | ConvertFrom-Json
+            # multi-title media → array
+            if ($m -is [array]) { $m = $m[0] }
+            $pxN = [ulong]0; [void][ulong]::TryParse([string]$m.px, [ref]$pxN)
+            $gifN = 0; [void][int]::TryParse([string]$m.gifPath3, [ref]$gifN)
+            $results += [pscustomobject]@{
+                id = $t.id; name = $t.name; serial = $t.serial; menuKind = $t.menuKind
+                status = "RAN"; menuHeuristic = (Get-MenuHeuristic $pxN $gifN)
+                pc = $m.pc; px = $m.px; gifPath3 = $m.gifPath3; dmac = $m.dmac
+                cdvd = $m.cdvdSectors; syscalls = $m.syscalls
+                binds = $m.binds; calls = $m.calls; exitReq = $m.exitRequested
+                elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                outLog = $metricsPath
+            }
+            continue
+        }
+        Write-Warning "Native metrics failed for $($t.id); falling back to run-title"
+    }
+
     $r = & $runTitle -Media $t.media -Budget $Budget -BuildOut $BuildOut -TraceDir $TraceDir `
         -SkipBuild -HostPresent:$hp
     if ($r) {
-        $row = [pscustomobject]@{
+        $results += [pscustomobject]@{
             id             = $t.id
             name           = $t.name
             serial         = $t.serial
@@ -114,7 +154,6 @@ foreach ($t in $selected) {
             elapsedSec     = $r.elapsedSec
             outLog         = $r.outLog
         }
-        $results += $row
     }
 }
 
