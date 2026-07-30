@@ -3,7 +3,8 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Vexx (USA) SLUS_203.83 — IOPRP252 version plant + null-path basename unstick.
+/// Vexx (USA) SLUS_203.83 — IOPRP252 version plant + null-path basename unstick +
+/// CRT malloc jump-table plant + path-normalize thrash escape.
 ///
 /// <para>
 /// <b>Primary blocker (2026-07-30):</b> after IOP reboot
@@ -26,6 +27,17 @@ namespace DetPS2.Core;
 /// A small RDRAM stub null-checks a0 and returns v0=0 so callers take their existing
 /// <c>beq v0,zero</c> alt path.
 /// </para>
+///
+/// <para>
+/// <b>Tertiary wall (2026-07-30 secondary fleet):</b> post-pad / SearchFile bind, the
+/// path-normalize helper at <c>0x00372A80</c> calls string alloc which falls back through
+/// CRT trampolines <c>0x001CEBA0</c> → jump table <c>0x003BCD00</c>. Live dump: that table
+/// is still all-zero (heap never wired), so <c>jalr v0</c> hits the low-page JRGUARD and
+/// falls through; string alloc returns a near-null body pointer (live <c>sp+0x38=0xF</c>).
+/// Path munge then loops with length word at <c>-8(0xF)</c> ≈ <c>0x40000433</c> forever
+/// (PC stuck <c>0x00372ADx</c>, no FILEIO). Plant a bump allocator into the CRT table and
+/// escape the munge loop when the path base is still low/garbage.
+/// </para>
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -44,15 +56,40 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint StubA = 0x00090000;
     public const uint StubB = 0x00090040;
 
+    /// <summary>CRT malloc/free/realloc jump table (live all-zero after pad stack).</summary>
+    public const uint CrtMallocSlot = 0x003BCD00;
+    public const uint CrtFreeSlot = 0x003BCD04;
+    public const uint CrtReallocSlot = 0x003BCD08;
+
+    /// <summary>Bump-allocator stubs + cursor (low RDRAM, below ELF).</summary>
+    public const uint MallocStub = 0x00090100;
+    public const uint FreeStub = 0x00090140;
+    public const uint ReallocStub = 0x00090160;
+    public const uint BumpCursorCell = 0x00090180;
+    public const uint BumpArenaBase = 0x01800000;
+    public const uint BumpArenaEnd = 0x01C00000;
+
+    /// <summary>Path-normalize helper that thrash-loops on garbage path base.</summary>
+    public const uint PathNormalizeEntry = 0x00372A80;
+    public const uint PathNormalizeLoop = 0x00372ABC;
+    public const uint PathNormalizeAfterLoop = 0x00372B04;
+    public const uint EmptyStringSentinel = 0x003C4C58; // *0x003C4C60 points here; "" 
+
     private bool _pathPatched;
+    private bool _mallocPlanted;
     private int _versionReplants;
     private int _nullPathEscapes;
+    private int _pathNormEscapes;
+    private int _mallocReplants;
 
     public void Reset()
     {
         _pathPatched = false;
+        _mallocPlanted = false;
         _versionReplants = 0;
         _nullPathEscapes = 0;
+        _pathNormEscapes = 0;
+        _mallocReplants = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -61,8 +98,9 @@ public sealed class VexxAssist : IGameQuirkModule
         if (sys.Hle?.Sony?.RealRpc != null)
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantIopRpVersion(sys);
+        PlantCrtMallocTable(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
-            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 version plant ready");
+            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 + CRT malloc plant ready");
     }
 
     public void OnHostPresent(Ps2System sys) => _ = sys;
@@ -76,6 +114,14 @@ public sealed class VexxAssist : IGameQuirkModule
             _versionReplants++;
         }
 
+        // CRT table can be zeroed by BSS wipe / late init — re-plant when empty.
+        if (!_mallocPlanted || sys.Memory.Read32(CrtMallocSlot) == 0)
+        {
+            PlantCrtMallocTable(sys);
+            _mallocPlanted = true;
+            _mallocReplants++;
+        }
+
         // ELF PT_LOAD can overwrite .text after OnDiscMounted — re-apply path stubs once
         // the basename entry is back to a real addiu sp (not our j Stub).
         if (!_pathPatched || !PathStubActive(sys, PathBasenameA))
@@ -84,8 +130,9 @@ public sealed class VexxAssist : IGameQuirkModule
             _pathPatched = true;
         }
 
-        // Defense: if still inside reverse-scan body with s0==0, snap return v0=0.
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+
+        // Defense: if still inside reverse-scan body with s0==0, snap return v0=0.
         if ((pc is >= 0x0014619C and <= 0x001461BC) || (pc is >= 0x0014625C and <= 0x0014627C))
         {
             if (sys.EE.GetGpr(16).Lo == 0)
@@ -98,6 +145,29 @@ public sealed class VexxAssist : IGameQuirkModule
                         $"[VEXX] null-path scan escape #{_nullPathEscapes} cyc={sys.Scheduler.MasterCycles}");
             }
         }
+
+        // Path-normalize thrash: sp+0x38 holds path-body pointer; live garbage 0xF →
+        // length at -8(path) is open-bus huge → infinite '/'→'\' scan.
+        if (pc is >= PathNormalizeLoop and <= PathNormalizeAfterLoop)
+        {
+            uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFu);
+            if (sp >= 0x1000 && sp + 0x40 < SystemMemory.RDRAM_SIZE)
+            {
+                uint pathPtr = sys.Memory.Read32(sp + 0x38);
+                if (pathPtr < 0x10000u)
+                {
+                    sys.Memory.Write32(sp + 0x38, EmptyStringSentinel);
+                    // Empty sentinel length word at -8 is 0 (rodata zeros) → loop exits.
+                    sys.EE.SetGpr(7, new EmotionEngine.Gpr128 { Lo = EmptyStringSentinel }); // a3
+                    sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2 index
+                    sys.EE.PC = PathNormalizeAfterLoop;
+                    _pathNormEscapes++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+                        Console.Error.WriteLine(
+                            $"[VEXX] path-normalize escape #{_pathNormEscapes} wasPtr=0x{pathPtr:X} cyc={sys.Scheduler.MasterCycles}");
+                }
+            }
+        }
     }
 
     /// <summary>Plant IOPRP 2.5.2 version tag the LOADFILE client compares after GetVersion.</summary>
@@ -105,6 +175,93 @@ public sealed class VexxAssist : IGameQuirkModule
     {
         WriteCString4(sys, IopVersionCellA, "2520");
         WriteCString4(sys, IopVersionCellB, "2520");
+    }
+
+    /// <summary>
+    /// Install a simple bump malloc/free/realloc into the CRT jump table at 0x003BCD00.
+    /// Real hardware fills this during C runtime heap init; under HLE the table stays zero
+    /// so string alloc (path normalize → first FILEIO) returns garbage near-null pointers.
+    /// </summary>
+    public static void PlantCrtMallocTable(Ps2System sys)
+    {
+        // malloc(a0=size):
+        //   t0 = &cursor
+        //   v0 = *cursor
+        //   t1 = (size + 15) & ~15
+        //   t2 = v0 + t1
+        //   if (t2 >= end) return 0
+        //   *cursor = t2; return v0
+        uint cur = BumpCursorCell;
+        uint stub = MallocStub;
+        uint end = BumpArenaEnd;
+
+        // Initialize cursor once (do not rewind a live arena).
+        uint existing = sys.Memory.Read32(cur);
+        if (existing < BumpArenaBase || existing >= BumpArenaEnd)
+            sys.Memory.Write32(cur, BumpArenaBase);
+
+        uint[] mallocOps =
+        {
+            0x3C080000u | (cur >> 16),            // 00 lui t0, hi(cur)
+            0x35080000u | (cur & 0xFFFF),         // 04 ori t0, t0, lo(cur)
+            0x8D020000u,                          // 08 lw  v0, 0(t0)
+            0x2489000Fu,                          // 0C addiu t1, a0, 15
+            0x00094902u,                          // 10 srl t1, t1, 4
+            0x00094900u,                          // 14 sll t1, t1, 4   ; align16
+            0x00495021u,                          // 18 addu t2, v0, t1
+            0x3C0B0000u | (end >> 16),            // 1C lui t3, hi(end)
+            0x356B0000u | (end & 0xFFFF),         // 20 ori t3, t3, lo(end)
+            0x014B602Bu,                          // 24 sltu t4, t2, t3
+            0x11800003u,                          // 28 beq t4, zero, +3 → fail @0x38
+            0x00000000u,                          // 2C nop
+            0xAD0A0000u,                          // 30 sw t2, 0(t0)
+            0x03E00008u,                          // 34 jr ra
+            0x00000000u,                          // 38 nop (delay of jr) — ALSO fail target
+            0x03E00008u,                          // 3C jr ra (fail)
+            0x0000102Du,                          // 40 daddu v0, zero, zero
+        };
+        // Fix fail branch: beq at 0x28 with delay 0x2C; taken target = PC+4+4*imm = 0x2C+4*3 = 0x38
+        // At 0x38 we need jr ra / move v0,0 — but 0x38 is currently the success jr's delay nop.
+        // Re-layout success path to jr at 0x30 with delay nop at 0x34, fail at 0x38/0x3C.
+        mallocOps = new uint[]
+        {
+            0x3C080000u | (cur >> 16),            // 00 lui t0, hi(cur)
+            0x35080000u | (cur & 0xFFFF),         // 04 ori t0, t0, lo(cur)
+            0x8D020000u,                          // 08 lw  v0, 0(t0)
+            0x2489000Fu,                          // 0C addiu t1, a0, 15
+            0x00094902u,                          // 10 srl t1, t1, 4
+            0x00094900u,                          // 14 sll t1, t1, 4
+            0x00495021u,                          // 18 addu t2, v0, t1
+            0x3C0B0000u | (end >> 16),            // 1C lui t3, hi(end)
+            0x356B0000u | (end & 0xFFFF),         // 20 ori t3, t3, lo(end)
+            0x014B602Bu,                          // 24 sltu t4, t2, t3
+            0x11800004u,                          // 28 beq t4, zero, +4 → 0x3C fail
+            0x00000000u,                          // 2C nop
+            0xAD0A0000u,                          // 30 sw t2, 0(t0)
+            0x03E00008u,                          // 34 jr ra
+            0x00000000u,                          // 38 nop
+            0x03E00008u,                          // 3C jr ra (fail)
+            0x0000102Du,                          // 40 daddu v0, zero, zero
+        };
+        for (int i = 0; i < mallocOps.Length; i++)
+            sys.Memory.Write32(stub + (uint)(i * 4), mallocOps[i]);
+
+        // free: return immediately
+        sys.Memory.Write32(FreeStub + 0, 0x03E00008u); // jr ra
+        sys.Memory.Write32(FreeStub + 4, 0x00000000u); // nop
+
+        // realloc(old, size): ignore old, malloc(size) with a1→a0
+        sys.Memory.Write32(ReallocStub + 0, 0x00A0202Du); // daddu a0, a1, zero
+        sys.Memory.Write32(ReallocStub + 4, 0x08000000u | ((MallocStub >> 2) & 0x03FFFFFF));
+        sys.Memory.Write32(ReallocStub + 8, 0x00000000u);
+
+        sys.Memory.Write32(CrtMallocSlot, MallocStub);
+        sys.Memory.Write32(CrtFreeSlot, FreeStub);
+        sys.Memory.Write32(CrtReallocSlot, ReallocStub);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+            Console.Error.WriteLine(
+                $"[VEXX] CRT malloc table → bump 0x{BumpArenaBase:X}-0x{BumpArenaEnd:X} stub=0x{MallocStub:X}");
     }
 
     private static bool VersionCellsOk(Ps2System sys) =>
