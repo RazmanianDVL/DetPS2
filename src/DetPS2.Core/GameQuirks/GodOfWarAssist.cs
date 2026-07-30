@@ -91,8 +91,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _padInjectPulses;
     private int _objDispatchEscapes;
     private int _listCmpEscapes;
+    private int _streamArmPulses;
     private ulong _lastWorldKickCyc;
     private bool _heapDefaultsPlanted;
+    /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
+    private uint _arenaBump;
 
     /// <summary>
     /// Scratch for synthetic freelist header + 8-byte config entries (hash,size).
@@ -109,6 +112,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint HeapNodeHero = HeapDefaultNodeBase + 0x120;
     public const uint HeapNodeSlot = HeapDefaultNodeBase + 0x130;
     public const uint HeapNodeUpgrade = HeapDefaultNodeBase + 0x140;
+
+    /// <summary>Payload arena after config nodes (see <see cref="PlantFreelistHeader"/>).</summary>
+    public const uint HeapArenaBase = HeapDefaultNodeBase + 0x200;
+    public const uint HeapArenaBytes = 0x00180000; // 1.5 MiB
+    public const uint HeapBlockSize = 0x1000; // 4 KiB carve units
 
     /// <summary>
     /// Default hero/slot/upgrade heap sizes (bytes) when dict miss returns NULL.
@@ -136,8 +144,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint HeapNullPcLo = 0x0023A900;
     public const uint HeapNullPcHi = 0x0023AA00;
 
-    /// <summary>Secondary freelist insert/walk (live stall PC 0x2396F4 / 0x2397F0).</summary>
-    public const uint HeapFree2PcLo = 0x002396B0;
+    /// <summary>Secondary freelist insert/walk (live stall PC 0x23935C / 0x2396F4 / 0x2397F0).</summary>
+    public const uint HeapFree2PcLo = 0x00239300;
     public const uint HeapFree2PcHi = 0x00239810;
 
     public void Reset()
@@ -155,8 +163,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _padInjectPulses = 0;
         _objDispatchEscapes = 0;
         _listCmpEscapes = 0;
+        _streamArmPulses = 0;
         _lastWorldKickCyc = 0;
         _heapDefaultsPlanted = false;
+        _arenaBump = HeapArenaBase;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -278,46 +288,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= HeapFree2PcLo and <= HeapFree2PcHi)
             TryEscapeSecondaryFreelist(sys, pc, c);
 
-        // Wave-2: do NOT permanent-stub freelist / list-filter leaves after CDVD.
-        // menu14-style early jr-ra stubs returned v0=0 forever, left a1=0x401Axxxx
-        // corrupt object graphs, and dumped EE into exception-vector thrash (0x80000180
-        // + 0x2847xx list-cmp + 0x233AEx dispatch) — regressing vs soft-escape final3
-        // (PC=0x26C0E0, syscalls~436k, sifBytes~43k). Soft escapes below remain.
-        //
-        // Keep ONLY structural body-breaks that empty-exit known infinite walks:
-        // flag-set follow (0x15F560), parent-list entry after repeated escapes, cache-wb.
-        if (c >= 40_000_000 && sys.Gs.PixelsWritten == 0)
-        {
-            // Flag-set sibling at 0x15F538 (wave-1 residual 0x15F560).
-            // Body break only — soft escape plants this too; permanent so re-entry dies in 1 insn.
-            if (_flagSetEscapes >= 1)
-            {
-                if (sys.Memory.Read32(0x0015F538) != 0x03E00008u)
-                {
-                    sys.Memory.Write32(0x0015F538, 0x03E00008u); // jr ra
-                    sys.Memory.Write32(0x0015F53C, 0x00000000u); // nop
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                        Console.Error.WriteLine($"[GOW] plant flag-set list stub @ 0x15F538 cyc={c}");
-                }
-                // beq zero,zero,0x15F590  (unconditional) at follow body
-                uint followPatch = 0x10000000u | (((0x0015F590u - 0x0015F560u - 4u) >> 2) & 0xFFFFu);
-                if (sys.Memory.Read32(0x0015F560) != followPatch)
-                {
-                    sys.Memory.Write32(0x0015F560, followPatch);
-                    sys.Memory.Write32(0x0015F564, 0x00000000u);
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                        Console.Error.WriteLine($"[GOW] plant flag-set body break @ 0x15F560 cyc={c}");
-                }
-            }
-            // Parent object-list walker entry — only after soft escapes proved corrupt.
-            if (_parentListEscapes >= 4 && sys.Memory.Read32(0x0015F440) != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x0015F440, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x0015F444, 0x0000102Du); // v0=0
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant parent-list stub @ 0x15F440 cyc={c}");
-            }
-        }
+        // Wave-5 tip: NO permanent freelist / list-filter / parent jr-ra stubs.
+        // Permanent empty-exits left a1=0x401Axxxx poison and empty stream graphs forever
+        // (cdvd stuck 142). Soft escapes below + bump-arena freelist blocks only.
 
         // Post-freelist object list walk at 0x15F2xx: after synthetic/empty heap returns,
         // list heads often hold OOB pointers (live: s1=0x401A6800 past 32MiB RDRAM). The
@@ -371,30 +344,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 Console.Error.WriteLine($"[GOW] exit spin @0x{pc:X8} flag was {fl} cyc={c}");
         }
 
-        // Permanent list-filter stub only (NOT freelist — freelist stubs caused exception
-        // storms). Soft escapes miss 50k-cycle slices so 0x15F2C8 re-thrash burns millions.
-        // Also patch mid-body (0x15F2C8) → branch to empty epilogue so in-flight thrash dies.
-        if (c >= 40_000_000 && sys.Gs.PixelsWritten == 0
-            && _listWalkEscapes >= 8 && sys.Cdvd.SectorsRead > 0)
-        {
-            if (sys.Memory.Read32(0x0015F2C0) != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x0015F2C0, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x0015F2C4, 0x0000102Du); // v0=0
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant list-walk stub @ 0x15F2C0 cyc={c}");
-            }
-            // beq zero,zero,0x15F414 at follow body
-            uint bodyPatch = 0x10000000u | (((0x0015F414u - 0x0015F2C8u - 4u) >> 2) & 0xFFFFu);
-            if (sys.Memory.Read32(0x0015F2C8) != bodyPatch)
-            {
-                sys.Memory.Write32(0x0015F2C8, bodyPatch);
-                sys.Memory.Write32(0x0015F2CC, 0x00000000u);
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine($"[GOW] plant list-walk body break @ 0x15F2C8 cyc={c}");
-            }
-        }
-
         // Object-block init at 0x15F6F0..0x15F9xx (live w2 PC 0x15F7C4 / residual 0x15F928):
         // fill loops then jal 0x13DC78 (real 8KiB alloc — never stub). When s0 is null/OOB
         // (poison freelist), writing open-bus forever. HARD return via $ra / PickSafeResume
@@ -407,10 +356,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 // Always leave the entire 0x15Fxxx object/list band — $ra often points at
                 // the next insn inside the same poison function (live: 0x15F908).
                 uint resume = PickSafeResume(sys, 0x00185FAC);
-                const uint synth = 0x01FD7E00;
-                for (uint o = 0; o < 0x40; o += 4)
-                    sys.Memory.Write32(synth + o, 0);
-                sys.Memory.Write32(synth, synth);
+                uint synth = AllocArenaBlock(sys, 0x80);
                 sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = synth }); // s0
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128
                 {
@@ -476,9 +422,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     resume = PickSafeResume(sys, 0x0027CC08);
                 // Return a small in-RDRAM block instead of NULL — callers often store without
                 // null-check and then OOB-fault (live object-init s0=0).
-                const uint block = 0x01FD7C00;
-                for (uint o = 0; o < 0x100; o += 4)
-                    sys.Memory.Write32(block + o, 0);
+                uint block = AllocArenaBlock(sys, 0x100);
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block }); // v0
                 sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
@@ -503,13 +447,21 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
         // re-escape empty/corrupt list walks, wake peers, and inject pad so world/UI path
-        // can reach a GS frame.
-        if (c >= 45_000_000 && sys.Cdvd.SectorsRead > 0)
+        // can reach a GS frame. Also freelist residual 0x2393xx (live w5).
+        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0)
             MaybeKickWorldProgress(sys, pc, c);
 
         // Pre-CDVD freelist thrash at 0x23A9xx / 0x13DCxx: keep escaping so first CDVD lands.
         if (c >= 35_000_000 && sys.Cdvd.SectorsRead == 0 && pc is >= 0x0023A900 and <= 0x0023AA30)
             TryEscapeNullHeapWalk(sys, pc, c);
+
+        // Post-CDVD freelist residual outside soft-escape windows (live w5 PC=0x23935C with
+        // multi-M SetSyscall thrash): soft-escape + stream-ready poll so we can leave heap
+        // and re-enter world kick without permanent freelist stubs.
+        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x00239300 and <= 0x002396EF
+            && (_free2Escapes < 96))
+            TryEscapeSecondaryFreelist(sys, pc, c);
     }
 
     /// <summary>
@@ -671,53 +623,70 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _worldKickPulses++;
 
         // Live final PC 0x26C0E0: do { v0 = 0x26BB98(); } while (v0==0);
-        // 0x26BB98 returns 1 immediately when *0x2A1338==0; otherwise waits on stream
-        // state that never completes under HLE → forever poll, px=0. Force ready.
-        // ONLY act on the poll jal/beq (0x26C0E0..E8) — never re-snap the post-ready
-        // body at 0x26C0EC (live menu18 self-kick thrash prevented body from running).
+        // 0x26BB98 is the 989snd wait leaf: returns 1 when *0x2A1338==0 OR pending has
+        // done-magic. Wave-5: SHARED-paint done-magic first; only clear pointer if still
+        // stuck after paint (bad/OOB pending). NEVER re-snap post-ready body 0x26C0EC.
         if (pc is >= 0x0026C0E0 and <= 0x0026C0E8 && sys.Gs.PixelsWritten == 0)
         {
-            // Clear the pending-stream pointer so 0x26BB98 takes the fast v0=1 path.
-            sys.Memory.Write32(0x002A1338, 0);
+            TryArmPendingStreamJob(sys, c);
+            uint pend = sys.Memory.Read32(0x002A1338);
+            uint pPhys = pend & 0x1FFFFFFFu;
+            bool pendingOk = pend != 0 && pPhys >= 0x00100000u
+                && pPhys + 12 < (uint)SystemMemory.RDRAM_SIZE && (pPhys & 3) == 0
+                && sys.Memory.Read32(pPhys) == 0xFFFFFFFFu
+                && sys.Memory.Read32(pPhys + 8) == 0xFFFFFFFFu;
+            if (!pendingOk)
+                sys.Memory.Write32(0x002A1338, 0); // unusable pending — force empty ready
+            // else leave pending; 0x26BB98 natural path should now return v0=1
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 }); // v0 = ready
-            // Fall through past beq v0,zero,0x26C0E0 into the post-ready body.
             sys.EE.PC = 0x0026C0EC;
             sys.EE.COP0_Status &= ~0x6u;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses <= 32 || _worldKickPulses % 16 == 0))
                 Console.Error.WriteLine(
-                    $"[GOW] force stream-ready poll pc=0x{pc:X8} -> 0x26C0EC *0x2A1338=0 " +
-                    $"n={_worldKickPulses} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+                    $"[GOW] 989snd-ready poll pc=0x{pc:X8} -> 0x26C0EC arms={_streamArmPulses} " +
+                    $"pendOk={pendingOk} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
         }
-        // Post-ready body at 0x26C0EC: table lookup *0x2A1378 → object; if null skips
-        // jal 0x26C4B8 and just returns. Plant a non-null slot so the work path runs.
-        else if (pc is >= 0x0026C0EC and <= 0x0026C130 && sys.Gs.PixelsWritten == 0
+        // Post-ready body / work path: zero the work table so null-skip is taken (no synthetic
+        // stream-work plant — poison objects → data PC / UnknownSyscall 0x2A1358, cdvd stuck).
+        // Live w5b residual 0x26C4B4 mid-work after garbage table entry.
+        else if (pc is >= 0x0026C0EC and <= 0x0026C600 && sys.Gs.PixelsWritten == 0
                  && sys.Cdvd.SectorsRead > 0)
         {
+            TryArmPendingStreamJob(sys, c);
             sys.Memory.Write32(0x002A1338, 0);
-            // Index 0 into table at 0x2A1358; plant pointer to a tiny synthetic object
-            // whose first word is non-zero so beq v0,zero is not taken.
-            const uint synthObj = 0x01FD7F00;
-            const uint tableBase = 0x002A1358;
-            sys.Memory.Write32(0x002A1378, 0); // index = 0
-            sys.Memory.Write32(tableBase, synthObj); // table[0] = &obj
-            sys.Memory.Write32(synthObj, synthObj + 16); // *obj = payload ptr (non-null)
-            sys.Memory.Write32(synthObj + 16, 1); // payload non-zero
-            sys.Memory.Write32(0x002A137C, 0); // allow jal 0x26C4B8 (bne v0,zero skip)
-            // Also ensure s0 load source *0x305604 looks sane later.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (_worldKickPulses % 32) == 0)
-                Console.Error.WriteLine(
-                    $"[GOW] plant stream-work object @ 0x{synthObj:X8} pc=0x{pc:X8} " +
-                    $"n={_worldKickPulses} cyc={c}");
+            // Ensure null-skip: table[0]=0, index=0 so body does not jal 0x26C4B8 with garbage.
+            sys.Memory.Write32(0x002A1358, 0);
+            sys.Memory.Write32(0x002A1378, 0);
+            if (pc is >= 0x0026C4B0 and <= 0x0026C5F0)
+            {
+                // Mid-work body with bad frame — soft return via $ra / post-ready continue.
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint resume = 0x0026C130; // past body toward return
+                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                    && ra is not (>= 0x0026C0E0 and <= 0x0026C600))
+                    resume = ra;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_worldKickPulses % 16) == 0)
+                    Console.Error.WriteLine(
+                        $"[GOW] leave stream-work body pc=0x{pc:X8} -> 0x{resume:X8} " +
+                        $"n={_worldKickPulses} cyc={c}");
+            }
         }
-        // Also clear periodically if still px=0 after CDVD (poll may live on another thread).
         else if (sys.Gs.PixelsWritten == 0 && sys.Cdvd.SectorsRead > 0
                  && (_worldKickPulses % 8) == 0)
         {
+            // Only clear *0x2A1338 when the pending pointer is clearly unusable.
             uint streamPtr = sys.Memory.Read32(0x002A1338);
-            if (streamPtr != 0)
+            uint spPhys = streamPtr & 0x1FFFFFFFu;
+            if (streamPtr != 0 && (spPhys < 0x00100000u || spPhys >= (uint)SystemMemory.RDRAM_SIZE
+                                  || (spPhys & 3) != 0))
                 sys.Memory.Write32(0x002A1338, 0);
+            else if (streamPtr != 0)
+                TryArmPendingStreamJob(sys, c);
         }
 
         // If still in list-walk body with a cursor that will never match sentinel, force empty exit.
@@ -914,18 +883,16 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 }
                 if (t.Sleeping && t.WaitSemaId != 0)
                 {
-                    // Wave-3: SHARED QueueMaySignalSema + CompleteRpcEnd + AcknowledgeEeSifCmdReady
-                    // own real BIND/CALL and SIFCMD acks. Residual only:
-                    //   • WaitSema(3) SIF-cmd poll (worker 0x27CCxx) when no more SIF traffic
-                    //   • high ids ≥32 (game-private, no HLE producer — B3 class)
+                    // SHARED QueueMaySignalSema + CompleteRpcEnd own real BIND/CALL leave.
+                    // Residual empty poll only:
+                    //   • WaitSema(3) SIF-cmd poll when no more SIF traffic
+                    //   • WaitSema(0x20) worker 0x27CCxx (empty after IRX load)
+                    //   • high ids >32 (game-private)
                     // Never blanket-pulse 1..16 (races RPC_END). SEMA_STALL_YIELD OFF.
-                    bool sifCmdPoll = t.WaitSemaId == 3
-                        && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
-                        && (_worldKickPulses % 4) == 0;
-                    bool high = t.WaitSemaId >= 32
+                    bool emptyPoll = (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId >= 32)
                         && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
                         && (_worldKickPulses % 2) == 0;
-                    if (high || sifCmdPoll)
+                    if (emptyPoll)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
                     }
@@ -976,18 +943,23 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             catch { /* ignore */ }
         }
 
-        // Stream-ready leaf 0x26BB98: when *0x2A1338==0 it should return v0=1 immediately.
-        // Live residual agent5: PC lands on jr-ra delay 0x26BC3C with corrupt $ra after we
-        // mid-jumped into the poll body without a frame. Force clean v0=1 return via $ra
-        // only when $ra is real code; else post-FreezeCache continue.
+        // 989snd wait leaf 0x26BB98: paint SHARED done-magic, then soft-return if still stuck.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && pc is >= 0x0026BB98 and <= 0x0026BC3C
             && (_worldKickPulses % 4) == 0)
         {
-            sys.Memory.Write32(0x002A1338, 0);
+            TryArmPendingStreamJob(sys, c);
+            uint pend = sys.Memory.Read32(0x002A1338);
+            uint pPhys = pend & 0x1FFFFFFFu;
+            bool pendingOk = pend != 0 && pPhys >= 0x00100000u
+                && pPhys + 12 < (uint)SystemMemory.RDRAM_SIZE && (pPhys & 3) == 0
+                && sys.Memory.Read32(pPhys) == 0xFFFFFFFFu
+                && sys.Memory.Read32(pPhys + 8) == 0xFFFFFFFFu;
+            if (!pendingOk)
+                sys.Memory.Write32(0x002A1338, 0);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            uint resume = 0x00185FAC;
+            uint resume = 0x0026C0EC; // prefer post-ready body over FreezeCache re-entry
             if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
                 && ra is not (>= 0x0026BB98 and <= 0x0026C200))
                 resume = ra;
@@ -996,7 +968,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
-                    $"[GOW] force stream-ready return pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+                    $"[GOW] 989snd-wait return pc=0x{pc:X8} -> 0x{resume:X8} pendOk={pendingOk} " +
+                    $"n={_worldKickPulses} cyc={c}");
         }
 
         // Post-list residual jr-ra delay thrash (live agent4 PC=0x186110). Do NOT mid-jump
@@ -1097,38 +1070,29 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"[GOW] escape 0x21FFxx thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
-        // Wave-3: after CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (live w3
-        // PC=0x293C48, multi-M 0x44/0x42, RPC plateau 44, sifBytes~10k). SHARED
-        // QueueMaySignalSema + AcknowledgeEeSifCmdReady already complete real RPCs;
-        // empty SIF-cmd poll still re-WaitSema forever. Prefer stream-ready POLL entry
-        // 0x26C0E0 (historical peak) — mid-body 0x26C0EC without a frame nop-sleds
-        // (live w3b: 0x26C288 → BIOS rescue). Also catch residual 0x2993xx / 0x289Axx.
+        // After CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (empty SIF-cmd poll +
+        // worker 0x27CCxx). SHARED QueueMaySignalSema + CompleteRpcEnd own real BIND/CALL.
+        // Wave-5: paint 989snd done-magic + residual SignalSema. When still stuck mid-leaf,
+        // soft-return via live $ra (SIF poll caller is 0x294810 / worker 0x27CC08) — do NOT
+        // snap to 0x26C0E0 mid-frame (live w5c data PC / UnknownSyscall 0x2A1364).
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && _worldKickPulses >= 8 && (_worldKickPulses % 4) == 0
             && (pc is >= 0x00293C00 and <= 0x00293C80
                 || pc is >= 0x00299300 and <= 0x00299400
-                || pc is >= 0x00289A00 and <= 0x00289B00
-                || pc is >= 0x0026BF80 and <= 0x0026C300 && pc is not (>= 0x0026C0E0 and <= 0x0026C130)))
+                || pc is >= 0x00289A00 and <= 0x00289B00))
         {
-            sys.Memory.Write32(0x002A1338, 0);
+            TryArmPendingStreamJob(sys, c);
             sys.Memory.Write32(0x0029C7D0, 0);
-            // Plant stream-work object so poll→body can jal work path.
-            const uint synthObj = 0x01FD7F00;
-            sys.Memory.Write32(0x002A1378, 0);
-            sys.Memory.Write32(0x002A1358, synthObj);
-            sys.Memory.Write32(synthObj, synthObj + 16);
-            sys.Memory.Write32(synthObj + 16, 1);
-            sys.Memory.Write32(0x002A137C, 0);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-            sys.EE.PC = 0x0026C0E0; // poll entry — force-ready block advances to 0x26C0EC
-            sys.EE.COP0_Status &= ~0x6u;
-            // Wake worker WaitSema(3) / high waiters so peers can run alongside main.
+            const uint Done = 0xFFFFFFFFu;
+            sys.Memory.Write32(0x00305600, Done);
+            sys.Memory.Write32(0x00305604, 0);
+            sys.Memory.Write32(0x00305608, Done);
             if (k != null)
             {
                 foreach (var t in k.AllThreads)
                 {
                     if (!t.Alive || !t.Sleeping) continue;
-                    if (t.WaitSemaId == 3 || t.WaitSemaId >= 32)
+                    if (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId >= 32)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
                     }
@@ -1136,10 +1100,23 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                         k.WakeupThread(t.Id);
                 }
             }
+            // Soft-return from WaitSema leaf via $ra so poll body can take the empty-queue path.
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is (>= 0x0027CC00 and <= 0x0027CD00)
+                    or (>= 0x00294800 and <= 0x00294900)
+                    or (>= 0x00297600 and <= 0x00297700)
+                    or (>= 0x00297300 and <= 0x00297400))
+            {
+                // WaitSema success convention: v0 = sema id (libcdvd / sifrpc check v0==id).
+                uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = a0 != 0 ? a0 : 3UL });
+                sys.EE.PC = ra;
+                sys.EE.COP0_Status &= ~0x6u;
+            }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
-                    $"[GOW] leave sifrpc/stream residual pc=0x{pc:X8} -> 0x26C0E0 " +
+                    $"[GOW] SHARED empty-sifrpc wake pc=0x{pc:X8} ra=0x{ra:X8} arms={_streamArmPulses} " +
                     $"n={_worldKickPulses} cyc={c}");
         }
 
@@ -1231,25 +1208,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         _flagSetEscapes++;
 
-        // Always hard-return: soft bucket advance left a0/a1 corrupt across 50k slices
-        // (live: a0=0x59FA68 → a0=0) and re-entered the thrash. jr ra is safe for empty world.
+        // Soft hard-return only — no permanent .text stub (wave-5: avoid freelist/list poison plants).
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
         sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = a1 });
         sys.EE.PC = 0x0015F590; // jr ra
         sys.EE.COP0_Status &= ~0x6u;
-
-        // Permanent body break so the next 50k-cycle slice cannot re-thrash mid-function.
-        uint followPatch = 0x10000000u | (((0x0015F590u - 0x0015F560u - 4u) >> 2) & 0xFFFFu);
-        if (sys.Memory.Read32(0x0015F560) != followPatch)
-        {
-            sys.Memory.Write32(0x0015F560, followPatch);
-            sys.Memory.Write32(0x0015F564, 0x00000000u);
-        }
-        if (sys.Memory.Read32(0x0015F538) != 0x03E00008u)
-        {
-            sys.Memory.Write32(0x0015F538, 0x03E00008u);
-            sys.Memory.Write32(0x0015F53C, 0x00000000u);
-        }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _flagSetEscapes <= 16)
             Console.Error.WriteLine(
@@ -1312,11 +1275,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         sys.EE.COP0_Status &= ~0x6u;
         _parentListEscapes++;
 
-        if (_parentListEscapes >= 2 && sys.Memory.Read32(0x0015F440) != 0x03E00008u)
-        {
-            sys.Memory.Write32(0x0015F440, 0x03E00008u);
-            sys.Memory.Write32(0x0015F444, 0x0000102Du);
-        }
+        // Soft only — no permanent parent-list jr-ra plant (wave-5).
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _parentListEscapes <= 12)
             Console.Error.WriteLine(
@@ -1653,10 +1612,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     {
         const uint header = HeapDefaultNodeBase;
         const uint freeNode = HeapDefaultNodeBase + 0x80;
-        // Arena payload after free-node header (~1.5 MiB in high RDRAM scratch — keep clear of 0x01FE*).
-        // Entries occupy +0x100..+0x118; put arena after that.
-        const uint arena = HeapDefaultNodeBase + 0x200;
-        const uint arenaBytes = 0x00180000; // 1.5 MiB
+        const uint arena = HeapArenaBase;
+        const uint arenaBytes = HeapArenaBytes;
 
         // Header: tag=1, sizeUnits large.
         sys.Memory.Write32(header + 0x00, 0x2000_0001u);
@@ -1680,23 +1637,115 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Escape freelist walk at 0x2396B0. Live: after HERO sizes resolve, PC sticks at
-    /// 0x2396F4 for tens of M cycles on a circular/garbage free chain. Healthy path is a
-    /// few dozen instructions — after the first assist (or any primary freelist help),
-    /// snap straight to the epilogue at 0x239744.
+    /// Carve a zeroed block from the synthetic arena. Never returns the freelist header —
+    /// callers that treat v0 as an object/list node poison OOB links when given the header.
+    /// </summary>
+    private uint AllocArenaBlock(Ps2System sys, uint minSize = HeapBlockSize)
+    {
+        uint size = minSize < HeapBlockSize ? HeapBlockSize : (minSize + 0xFu) & ~0xFu;
+        if (_arenaBump < HeapArenaBase || _arenaBump >= HeapArenaBase + HeapArenaBytes)
+            _arenaBump = HeapArenaBase;
+        if (_arenaBump + size > HeapArenaBase + HeapArenaBytes)
+            _arenaBump = HeapArenaBase; // wrap — better than returning header
+        uint block = _arenaBump;
+        _arenaBump += size;
+        uint zeroLen = size > 0x200u ? 0x200u : size;
+        for (uint o = 0; o < zeroLen; o += 4)
+            sys.Memory.Write32(block + o, 0);
+        // Self-link first word so naïve list walks terminate (cursor == next).
+        sys.Memory.Write32(block, block);
+        return block;
+    }
+
+    /// <summary>
+    /// SHARED-side assist for the EE 989snd wait leaf at <c>0x26BB98</c> (and its caller poll
+    /// at <c>0x26C0E0</c>). Ground truth (RealSifRpc.Handle989Snd / SCUS_973.99):
+    /// <list type="bullet">
+    /// <item><c>*0x2A1338</c> is the pending RPC recv pointer (not a CD stream job).</item>
+    /// <item>Wait requires <c>pending[0]==0xFFFFFFFF &amp;&amp; pending[2]==0xFFFFFFFF</c>
+    ///   (index=1 slot at +8); result lives at <c>pending[1]</c>.</item>
+    /// <item>Handle989Snd already paints this shape on CallRpc; residual waits still see a
+    ///   zeroed pending when CallRpc completed without writing EE recv, or index skew.</item>
+    /// </list>
+    /// Prefer painting the SHARED done-magic over zeroing the pointer (zeroing skips real
+    /// completion checks and empties the stream/sound graph). Also try a CD sector fill if
+    /// the pointer looks like a disc job instead (secondary path).
+    /// </summary>
+    private void TryArmPendingStreamJob(Ps2System sys, ulong c)
+    {
+        if (_streamArmPulses >= 512) return;
+        uint pending = sys.Memory.Read32(0x002A1338);
+        uint pPhys = pending & 0x1FFFFFFFu;
+        if (pending == 0 || pPhys < 0x00100000u || pPhys + 0x20 >= (uint)SystemMemory.RDRAM_SIZE
+            || (pPhys & 3) != 0)
+            return;
+
+        // Primary: 989snd pending recv — paint done-magic (SHARED Handle989Snd contract).
+        const uint Done = 0xFFFFFFFFu;
+        uint w0 = sys.Memory.Read32(pPhys);
+        uint w2 = sys.Memory.Read32(pPhys + 8);
+        if (w0 != Done || w2 != Done)
+        {
+            sys.Memory.Write32(pPhys + 0, Done);
+            // Keep existing result if already set; else success.
+            if (sys.Memory.Read32(pPhys + 4) == 0 || sys.Memory.Read32(pPhys + 4) == Done)
+                sys.Memory.Write32(pPhys + 4, 0); // ResultOk
+            sys.Memory.Write32(pPhys + 8, Done);
+            // Extra index slots used by some bank loads (recvSize up to 44+).
+            for (uint off = 12; off < 48; off += 4)
+            {
+                if (pPhys + off + 4 >= (uint)SystemMemory.RDRAM_SIZE) break;
+                sys.Memory.Write32(pPhys + off, Done);
+            }
+            _streamArmPulses++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _streamArmPulses <= 32)
+                Console.Error.WriteLine(
+                    $"[GOW] SHARED 989snd-done pending=0x{pPhys:X8} was w0=0x{w0:X8} w2=0x{w2:X8} " +
+                    $"n={_streamArmPulses} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+            // Leave *0x2A1338 intact so the natural wait path observes done-magic and clears.
+            return;
+        }
+
+        // Secondary: look like a disc stream job (lba/nsec/dest) — SHARED CDVD fill.
+        uint lba = sys.Memory.Read32(pPhys + 4);
+        uint nsec = sys.Memory.Read32(pPhys + 8);
+        uint dest = sys.Memory.Read32(pPhys + 12);
+        if (lba == 0 || lba > 0x00400000u)
+        {
+            lba = sys.Memory.Read32(pPhys + 8);
+            nsec = sys.Memory.Read32(pPhys + 12);
+            dest = sys.Memory.Read32(pPhys + 16);
+        }
+        if (nsec == 0 || nsec > 64) nsec = 1;
+        if (nsec > 16) nsec = 16;
+        uint destPhys = dest & 0x1FFFFFFFu;
+        bool lbaOk = lba is >= 1 and <= 0x00400000u;
+        bool destOk = destPhys is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x8000u
+                      && (destPhys & 3) == 0;
+        if (!lbaOk || !destOk)
+            return;
+
+        uint got = sys.Cdvd.ReadSectorsTo(sys.Memory, lba, nsec, dest);
+        _streamArmPulses++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _streamArmPulses <= 32)
+            Console.Error.WriteLine(
+                $"[GOW] SHARED cd-stream-arm job=0x{pPhys:X8} lba={lba} n={nsec} dest=0x{destPhys:X8} " +
+                $"got={got} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+    }
+
+    /// <summary>
+    /// Escape freelist walk at 0x2393xx..0x2398xx. Live w5 residual 0x23935C and classic
+    /// 0x2396F4/0x2397F0 circular free chains. Soft-cap only — never permanent freelist stubs.
     /// </summary>
     private void TryEscapeSecondaryFreelist(Ps2System sys, uint pc, ulong c)
     {
-        // Only snap walk bodies (not setup prologues / epilogues which must run).
-        // Two sibling walkers: 0x2396F0..740 and 0x2397A0..7F8 (live final 0x2397F0).
-        // Do NOT re-snap epilogue (0x239744..750 / 0x2397FC..80C) — live menu13 thrash.
+        // Epilogues must run once entered.
         if (pc is (>= 0x00239744 and <= 0x00239750) or (>= 0x002397FC and <= 0x0023980C))
             return;
-        if (pc is < 0x002396F0 or (> 0x00239740 and < 0x002397A0) or > 0x002397F8)
-            return;
-        // Cap escapes — endless snap→re-entry can corrupt callers (live final7: EXL 0x80000200
-        // after permanent entry stubs). Soft-cap without patching .text.
-        if (_free2Escapes >= 48)
+        // Soft-cap; never permanent freelist .text stub (wave-5 tip).
+        if (_free2Escapes >= 96)
             return;
 
         uint s0 = (uint)sys.EE.GetGpr(16).Lo;
@@ -1707,12 +1756,38 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         if (sp is >= 0x00100000 and < 0x02000000)
         {
-            // sp+0 = sentinel, sp+4 = cursor — make them equal so bne never restarts.
             uint sent = sys.Memory.Read32(sp + 0);
             sys.Memory.Write32(sp + 4, sent);
         }
 
-        uint epi = pc >= 0x002397A0 ? 0x002397FCu : 0x00239744u;
+        // Prefer known epilogues; for pre-walk residual 0x2393xx return a real arena block
+        // via $ra when available (header poison → OOB lists).
+        uint epi;
+        if (pc >= 0x002397A0)
+            epi = 0x002397FCu;
+        else if (pc >= 0x002396F0)
+            epi = 0x00239744u;
+        else
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x00239300 and <= 0x00239810))
+                epi = ra;
+            else
+                epi = sys.Cdvd.SectorsRead > 0 ? 0x0026C0E0u : 0x00239744u;
+            // Publish usable block in v0 for callers that expect an alloc result.
+            uint block = AllocArenaBlock(sys);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block });
+            sys.EE.PC = epi;
+            sys.EE.COP0_Status &= ~0x6u;
+            _free2Escapes++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _free2Escapes <= 24)
+                Console.Error.WriteLine(
+                    $"[GOW] escape freelist residual pc=0x{pc:X8} s0=0x{s0:X8} block=0x{block:X8} " +
+                    $"-> 0x{epi:X8} n={_free2Escapes} cyc={c}");
+            return;
+        }
+
         sys.EE.PC = epi;
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
         sys.EE.COP0_Status &= ~0x6u;
@@ -1749,7 +1824,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         else
             PlantFreelistHeader(sys);
 
-        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = HeapDefaultNodeBase }); // s0
+        // Wave-5: return a real arena block, never the freelist header (header-as-object
+        // poisons list heads → OOB walks → empty stream graphs → cdvd stuck 142).
+        uint block = AllocArenaBlock(sys);
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = HeapDefaultNodeBase }); // s0 = header for walk
         // sp[0] = end marker (s0+0x38), sp[4] = walk cursor — force both to end so loop exits.
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         if (sp is >= 0x00100000 and < 0x02000000)
@@ -1758,31 +1836,31 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(sp + 0, end);
             sys.Memory.Write32(sp + 4, end);
         }
-        // Mid-walk (0x23A978..C8): skip to empty-list continuation which returns s0.
+        // Mid-walk (0x23A978..C8): skip to empty-list continuation.
         if (pc is >= 0x0023A978 and <= 0x0023A9C8)
             sys.EE.PC = 0x0023A9CC;
-        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = HeapDefaultNodeBase }); // v0
+        // v0 = carved block (usable object memory), not header.
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block });
         uint a1 = (uint)sys.EE.GetGpr(5).Lo;
-        // Heap descriptor freelist table slot (a1+0x80 was the index); publish header at a1 if null.
+        // Heap descriptor freelist table slot: publish header so re-walks have a bucket.
         if (a1 is >= 0x00300000 and < 0x01000000)
         {
             if (sys.Memory.Read32(a1) == 0)
                 sys.Memory.Write32(a1, HeapDefaultNodeBase);
-            // Clear negative freelist index so re-entry takes s0 from table not zero.
             int idx = (int)sys.Memory.Read32(a1 + 0x80);
             if (idx < 0)
                 sys.Memory.Write32(a1 + 0x80, 0);
         }
         _heapNullEscapes++;
-        // Hard bail after many hits: return header as allocated block (epilogue at 0x23AA28).
+        // After many hits: return block via epilogue (0x23AA28) — still never the header.
         if (_heapNullEscapes > 32)
         {
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = HeapDefaultNodeBase });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block });
             sys.EE.PC = 0x0023AA28;
         }
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _heapNullEscapes <= 8)
             Console.Error.WriteLine(
-                $"[GOW] escape null heap walk pc=0x{pc:X8} s0=0x{s0:X8} -> 0x{HeapDefaultNodeBase:X8} " +
+                $"[GOW] escape null heap walk pc=0x{pc:X8} s0=0x{s0:X8} -> block=0x{block:X8} " +
                 $"n={_heapNullEscapes} cyc={c}");
     }
 
