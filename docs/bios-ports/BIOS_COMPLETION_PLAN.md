@@ -33,7 +33,7 @@ Every PS2 title assumes the BIOS/IOP service surface (THREADMAN, SIF, LOADFILE, 
       │
   Phase 2  INTRMAN + TIMEMAN + DMACMAN + SSBUSC deepen           [AGENT-I]
       │
-  Phase 3  UDNL IOPRP image apply + SECRMAN/LOADFILE MG path    [AGENT-U]
+  Phase 3  UDNL IOPRP image apply + SECRMAN/LOADFILE MG path    [AGENT-U] **DONE**
       │
   Phase 4  MCMAN dual-format FAT + MCSERV residual              [AGENT-M]
       │

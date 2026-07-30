@@ -51,9 +51,9 @@ See `ROMDIR_GATE.md` rows 1–26 + PADMAN/SIO2MAN/EESYNC.
 | Module | Ghidra notes | C# HLE |
 |--------|--------------|--------|
 | **ADDDRV** | tiny; string `romdrv` | Name + IOMAN AddDrv path |
-| **SECRMAN** | SecrAuthCard / SecrCardBootFile / SecrDiskBootFile / mechacon auth strings | Export table + passthrough boot success; LOADFILE `MG_*` uses plain path load |
+| **SECRMAN** | SecrAuthCard / SecrCardBootFile / SecrDiskBootFile / mechacon auth strings | Export table; plain ELF `SecrDiskBootFile`/`SecrCardBootFile` → 0; non-ELF → `SecrErrCannotDecrypt`; LOADFILE `MG_*` shares plain path + classify |
 | **CLEARSPU** | `clearspu: completed`, SPU T/O waits, `bf90xxxx` SPU regs | `Spu2.Reset()` on install + UDNL handoff |
-| **UDNL** | `IOPBTCONF`, open/panic strings; loads IOPRP image | Version ASCII + module re-register + CLEARSPU; `RealSifRpc.OnIopReboot` GetVersion |
+| **UDNL** | `IOPBTCONF`, open/panic strings; loads IOPRP image | Version ASCII + **ROMDIR-in-IMG parse** + IOPBTCONF register + LoadIrx when ELF; disc path resolve; CLEARSPU; see `UDNL.md` |
 | **LIBSD** | `Sound Device Library` | Export table stubs for LinkImports |
 | **X\*** / **T\*** / **NCDVDMAN** | retail X-path twins | Aliases to primary HLE modules |
 | **XMTAPMAN** | `mtapman` | Name registration; multitap HW via `Sio2`/`Multitap` |
@@ -79,15 +79,17 @@ See `ROMDIR_GATE.md` rows 1–26 + PADMAN/SIO2MAN/EESYNC.
 | Contract table | `BiosBootHost.BootCriticalContracts` |
 | Extended HLE host | `IopExtendedBiosHost.cs` |
 | ROMDIR parse | `RomdirExtractor.cs` |
-| UDNL / reboot | `BiosBootHost.ApplyPostIopRebootContracts` → `ApplyUdnlHandoff` |
-| Smokes | `BiosBootHost_IopBtConfContracts`, `BiosRomdirGate_PortDocsForRequiredModules`, `BiosExtendedRomdir_SecrClearSpuLibSdUdnl` |
+| UDNL / reboot | `BiosBootHost.ApplyPostIopRebootContracts` → `ApplyUdnlHandoff` → optional `ApplyIopRpImage` |
+| IOPRP parse | `IopExtendedBiosHost.TryParseIopRpContainer` / `BuildSyntheticIopRpImage` |
+| Port doc | `docs/bios-ports/UDNL.md` |
+| Smokes | `BiosBootHost_IopBtConfContracts`, `BiosRomdirGate_PortDocsForRequiredModules`, `BiosExtendedRomdir_SecrClearSpuLibSdUdnl`, `BiosUdnl_IopRpImageApplyAndSecrMgPath` |
 
 ---
 
 ## 5. Remaining honest gaps (not “unimplemented by accident”)
 
-1. **MagicGate** decrypt (SECRMAN real crypto) — requires console secrets; intentionally not faked.
-2. **Full IOPRP.img unpack** — HLE registers names + version; does not parse every IRX out of arbitrary DNAS images into IOP RAM.
+1. **MagicGate** decrypt (SECRMAN real crypto) — requires console secrets; intentionally not faked (encrypted → clear fail).
+2. **IOPRP.img unpack residual** — ROMDIR + IOPBTCONF + LoadIrx when ELF extractable is implemented; multi-image merge with full rom0 overlay and R3000 `_start` still residual.
 3. **THREADMAN Mbx/Vpl/Fpl object model** on EE — EE has no CreateMbx syscalls; IOP export stubs link only. Deeper object HLE still open (#14).
 4. **Literal IRX execution** (#12).
 5. **OSD / browser / PS1 classic** firmware paths.
