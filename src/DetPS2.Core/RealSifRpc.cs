@@ -205,6 +205,15 @@ public sealed class RealSifRpc
     public bool PreferIopRpGetVersion { get; set; }
 
     /// <summary>
+    /// When true, FILEIO stays on SN ProDG / Midway layouts (eeReply* mirror, open returns fd,
+    /// immediate read completion). Suppresses Play! FILEIO-2200 arming even when IOPRP≥3000
+    /// digits match SotC. Midway (Deception/DA/Arm) ships IOPRP300 + SN FILEIO — false 2200
+    /// arming left GAMER.OVL as open/lseek/close with only a 3-byte magic probe (no full 384 B
+    /// read), so the MWo3 stub never settled and member <c>.ssf</c> opens never started.
+    /// </summary>
+    public bool PreferSnFileIo { get; set; }
+
+    /// <summary>
     /// Last IOPRP/DNAS image version tag derived from <c>SifIopReset</c> arg
     /// (e.g. <c>"2430"</c> for <c>IOPRP243.IMG</c>). Empty until a RESET_CMD with an
     /// image name completes. Used by <c>LF_F_GET_VERSION</c> so SN ProDG / Midway
@@ -1163,11 +1172,23 @@ public sealed class RealSifRpc
                 // an EE path pointer — treating those 4 pointer bytes as an inline C string
                 // yields garbage like "ðûþ" (LE of 0x00FEFBF0) and open → ENOENT (Blood Omen 2).
                 // FILEIO-2200: COMMANDHEADER(12) + flags + somePtr + fileName[256] (path @+20).
+                // Prefer SN ProDG residual layout (BO2/B3/Midway) — never auto-arm 2200 from
+                // SN packets (SotC IOPRP300 arms via Init fno=255 with dual result pointers).
+                // PreferSnFileIo (MidwayFamilyAssist): hard-block 2200 even when IOPRP=3000.
                 int mode;
                 string path;
                 uint openSema = 0;
-                if (TryDecodeFio2200Open(mem, argBuf, sendSize, out openSema, out mode, out path))
-                    _fio2200Armed = true;
+                if (!PreferSnFileIo
+                    && !LooksLikeSnFioWrapper(mem, argBuf, sendSize)
+                    && TryDecodeFio2200Open(mem, argBuf, sendSize, out openSema, out mode, out path))
+                {
+                    // Only arm when already Init-armed or header looks strictly 2200
+                    // (resultPtr0 already set, or resultSize in reply range).
+                    if (_fio2200ResultPtr0 != 0 || openSema is > 0 and < 0x1000)
+                        _fio2200Armed = true;
+                    else
+                        openSema = 0; // decode path only; keep classic return-fd ABI
+                }
                 else
                     DecodeFioOpenArgs(mem, argBuf, sendSize, out mode, out path);
                 path = AliasMidwayPakPath(path);
@@ -1253,21 +1274,41 @@ public sealed class RealSifRpc
                 //
                 // FILEIO-2200 Init (Play! CFileIoHandler2200 method 255): args[0]/args[1] are
                 // EE reply-buffer pointers used by later Getstat/Open replies. Capture them so
-                // SotC (IOPRP300 → module version ≥2200) can receive GETSTATREPLY.
-                if (argBuf != 0 && sendSize >= 8)
+                // SotC (IOPRP300 → FILEIO module ≥2200) can receive GETSTATREPLY.
+                //
+                // Do NOT arm from IOPRP version digits alone: PreferIopRp plants "2340" for
+                // BO2 IOPRP234 and "3000" for SotC IOPRP300 — 2340 ≥ 2200 would falsely arm
+                // FILEIO-2200 for SN ProDG clients (Blood Omen 2), which still use classic
+                // recv/eeReply results. Arm only when BOTH args are EE pointers (true Init)
+                // AND IOPRP ≥ 3000 (SotC-class), or when a later Open/Getstat is strictly 2200.
+                // Midway PreferSnFileIo also ships IOPRP300 digits but must stay SN FILEIO.
+                if (PreferSnFileIo)
+                {
+                    _fio2200Armed = false;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                        Console.Error.WriteLine("[FILEIO] GetVersion PreferSnFileIo — FILEIO-2200 disarmed");
+                }
+                else if (argBuf != 0 && sendSize >= 8)
                 {
                     uint rp0 = mem.Read32(argBuf);
                     uint rp1 = mem.Read32(argBuf + 4);
-                    if (IsEeRamPointer(rp0))
+                    // SN GetVersion: {seq, eeReply*} — seq is not an EE result buffer pointer.
+                    if (IsEeRamPointer(rp0) && IsEeRamPointer(rp1))
                     {
                         _fio2200ResultPtr0 = rp0 & 0x1FFFFFFFu;
-                        _fio2200ResultPtr1 = IsEeRamPointer(rp1) ? (rp1 & 0x1FFFFFFFu) : 0;
-                        // PreferIopRp with numeric IOPRP ≥2200 (IOPRP300 → "3000") arms 2200.
-                        if (PreferIopRpGetVersion && TryParseIopRpVersionNumber(out int iopVer) && iopVer >= 2200)
+                        _fio2200ResultPtr1 = rp1 & 0x1FFFFFFFu;
+                        if (PreferIopRpGetVersion && TryParseIopRpVersionNumber(out int iopVer) && iopVer >= 3000)
                             _fio2200Armed = true;
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                             Console.Error.WriteLine(
                                 $"[FILEIO] Init/GetVersion resultPtr0=0x{_fio2200ResultPtr0:X8} resultPtr1=0x{_fio2200ResultPtr1:X8} armed={_fio2200Armed}");
+                    }
+                    else if (IsEeRamPointer(rp0) && !IsEeRamPointer(rp1)
+                             && Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    {
+                        // Single EE pointer — likely SN eeReply*, not 2200 Init dual buffers.
+                        Console.Error.WriteLine(
+                            $"[FILEIO] GetVersion SN-shaped rp0=0x{rp0:X8} rp1=0x{rp1:X8} (not arming 2200)");
                     }
                 }
                 if (PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii))
@@ -1689,7 +1730,10 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Play! <c>OPENCOMMAND</c>: header(12) + flags + somePtr + fileName[256] (path @+20).
-    /// Distinct from SN BO2 residual path@+20 with mode@+0 when header fields look like 2200.
+    /// Must <b>not</b> match SN ProDG residual path@+20 (BO2/B3/Midway): that packet has
+    /// <c>{seq, eeReply*, 4, …, path@+0x14}</c>. Mis-classifying SN as 2200 returns CallRpc=1
+    /// (Play GENERICREPLY) instead of the host fd, skips SN eeReply mirror, and stalls the
+    /// Manager State → FILEIO KAIN.IMP / .BG2 Open transition (live BO2 @ thrash 0x5387xx).
     /// </summary>
     private static bool TryDecodeFio2200Open(SystemMemory mem, uint argBuf, uint sendSize,
         out uint semaId, out int mode, out string path)
@@ -1698,6 +1742,10 @@ public sealed class RealSifRpc
         mode = 0;
         path = "";
         if (argBuf == 0 || sendSize < 24) return false;
+
+        // SN ProDG wrapper: never 2200 (Play! COMMANDHEADER.resultSize is not 4).
+        if (LooksLikeSnFioWrapper(mem, argBuf, sendSize))
+            return false;
 
         // Classic/SN: mode@+0, path often @+4. If path@+4 is real, not 2200.
         string nameAt4 = ReadCString(mem, argBuf + 4, 256);
@@ -1708,11 +1756,20 @@ public sealed class RealSifRpc
         if (!LooksLikeFsPath(nameAt20) || (nameAt20.IndexOf(':') < 0 && nameAt20.IndexOf('.') < 0))
             return false;
 
-        // 2200 header: small-ish sema id, EE resultPtr, resultSize, then flags.
+        // 2200 COMMANDHEADER: semaphoreId, resultPtr (EE), resultSize (reply buf size).
+        // SN residual also has path@+20 with eeReply* @+4 — reject non-reply-size @+8.
         uint w0 = mem.Read32(argBuf);
         uint w1 = mem.Read32(argBuf + 4);
-        // SN seq can also be large; require resultPtr-like word at +4 or armed-size packet.
-        if (!IsEeRamPointer(w1) && sendSize < 0x40) return false;
+        uint w2 = mem.Read32(argBuf + 8);
+        if (!IsEeRamPointer(w1))
+            return false;
+        // resultSize: Play uses small reply sizes (0x10..0x80). Reject SN field==4 and junk.
+        if (w2 is < 0x10 or > 0x100)
+            return false;
+        // semaphoreId is a small EE kernel id — SN seq cookies climb past 0x100 quickly but
+        // early ones can be low; resultSize gate above is the main SN filter.
+        if (w0 > 0x10000)
+            return false;
 
         semaId = w0;
         mode = (int)mem.Read32(argBuf + 12); // flags
@@ -3966,6 +4023,9 @@ public sealed class RealSifRpc
                     uint m = mem.Read32(argBuf + 4);
                     if (m <= 3) mode = (int)m;
                 }
+                // Always warm MKDA TOC so subsequent member .ssf opens (same or later CallRpc)
+                // hit virtual streams even when this open is the archive root itself.
+                EnsureMkdaPakMounted(iopModules, cdvd);
                 int fd = iopModules.FileOpen(path, mode);
                 if (fd < 0)
                 {
@@ -3977,11 +4037,9 @@ public sealed class RealSifRpc
                     if (fd < 0) fd = iopModules.FileOpen(leaf, mode);
                 }
                 // Midway MKDA.PAK virtual members (art \ps2dvd\art\*.ssf etc.).
+                uint memberSz = 0;
                 if (fd < 0)
-                {
-                    EnsureMkdaPakMounted(iopModules, cdvd);
-                    fd = TryOpenFromMkdaPak(iopModules, path, out _);
-                }
+                    fd = TryOpenFromMkdaPak(iopModules, path, out memberSz);
                 if (fd < 0)
                 {
                     if (trace) Console.Error.WriteLine($"[MWFILE] open FAIL path=\"{path}\"");
@@ -3989,8 +4047,32 @@ public sealed class RealSifRpc
                 }
                 int handle = _mwFileNextHandle++;
                 _mwFileHandles[handle] = fd;
+                uint fsz = memberSz;
+                if (fsz == 0)
+                    iopModules.TryGetOpenFileSize(fd, out fsz);
+                if (fsz > 0)
+                    cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 64));
+                // Live open send word0 is an EE file-object pointer (Dec: 0xCDD420). Real
+                // MWFILEFR fills object fields the post-open queue at 0x3D87xx inspects.
+                // Stamp size at +8/+12 when those cells are still zero (ground-truthed: without
+                // this the queue never drains after MKDA.PAK open). Leave +0 intact.
+                if (argBuf != 0 && sendSize >= 4 && fsz > 0)
+                {
+                    uint obj = mem.Read32(argBuf);
+                    if (obj >= 0x00100000 && obj + 16 <= SystemMemory.RDRAM_SIZE)
+                    {
+                        if (mem.Read32(obj + 8) == 0)
+                            mem.Write32(obj + 8, fsz);
+                        if (mem.Read32(obj + 12) == 0)
+                            mem.Write32(obj + 12, fsz);
+                    }
+                }
+                // Multi-word recv: +0 handle (HandleCall), +4 size when present.
+                if (recvBuf != 0 && recvSize >= 8 && fsz > 0)
+                    mem.Write32(recvBuf + 4, fsz);
                 if (trace)
-                    Console.Error.WriteLine($"[MWFILE] open OK path=\"{path}\" handle={handle} fd={fd}");
+                    Console.Error.WriteLine(
+                        $"[MWFILE] open OK path=\"{path}\" handle={handle} fd={fd} size={fsz}");
                 return handle;
             }
 

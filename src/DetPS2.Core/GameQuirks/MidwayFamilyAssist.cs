@@ -101,6 +101,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (rpc == null) return;
         rpc.PadModVerMajor4 = true;
         rpc.PreferIopRpGetVersion = true;
+        // IOPRP300 digits would otherwise arm Play! FILEIO-2200 (SotC path). Midway EE is SN
+        // ProDG FILEIO — keep classic open/read/lseek reply shapes so GAMER.OVL full-read and
+        // later MKDA.PAK member opens complete.
+        rpc.PreferSnFileIo = true;
     }
 
     /// <summary>
