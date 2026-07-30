@@ -341,6 +341,7 @@ public sealed class RealSifRpc
         _padAreasGhost.Clear();
         _padFrame = 0;
         _lastIopRpVersionAscii = "";
+        ResetGtfsState();
     }
 
     /// <summary>
@@ -2264,34 +2265,50 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Criterion GTFS / Burnout 3 stage RPC HLE (GTFSCDVD.IRX / sid <c>"STG\\0"</c>).
-    /// Live B3: fno=1 recv@0x4E2730 send=48, fno=3 recv@0x66E080 send=64, fno=5 send=16.
-    /// Soft-only replies left <c>cdvdSectors</c> stuck at IRX-only 425. Now opens real
-    /// <c>DATA/STAGEHED.BIN</c> (and optionally FRONTEND) via Iso FILEIO host so TOC-style
-    /// status carries real sizes and host sector counters advance past IRX.
+    /// Live B3: fno=1 recv@0x4E2730 send=48, fno=3 recv@0x66E080 send=64, fno=5 send=16
+    /// with dest in w0 (<c>0x0067D880</c>) + handle in w1. Soft-only / 256KiB-cap left the
+    /// front-end incomplete; multi-chunk DMA of the full TXD is required for menu workers.
     /// </summary>
     private static int _gtfsStageHedFd = -1;
     private static uint _gtfsStageHedSize;
     private static int _gtfsFrontendFd = -1;
     private static uint _gtfsFrontendSize;
     private static bool _gtfsTocOpened;
+    private static int _gtfsLastPathFd = -1;
+    private static uint _gtfsLastPathSize;
+    private static uint _gtfsReadOffset; // multi-chunk cursor into last opened path
+    private static uint _gtfsLastDmaDest;
+    private static uint _gtfsTotalDmaBytes;
+
+    /// <summary>Reset GTFS host open state (new disc / new Ps2System).</summary>
+    public static void ResetGtfsState()
+    {
+        _gtfsStageHedFd = -1;
+        _gtfsStageHedSize = 0;
+        _gtfsFrontendFd = -1;
+        _gtfsFrontendSize = 0;
+        _gtfsTocOpened = false;
+        _gtfsLastPathFd = -1;
+        _gtfsLastPathSize = 0;
+        _gtfsReadOffset = 0;
+        _gtfsLastDmaDest = 0;
+        _gtfsTotalDmaBytes = 0;
+    }
 
     private static int HandleGtfs(SystemMemory mem, Cdvd cdvd, IopModuleHost iopModules,
         uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
         _ = sid;
-        // Dump send buffer so we can reverse path/handle layouts under TRACE_RPC.
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1" && argBuf != 0 && sendSize > 0)
         {
             uint n = Math.Min(sendSize, 64u);
-            var sb = new System.Text.StringBuilder(128);
+            var sb = new System.Text.StringBuilder(160);
             sb.Append($"[GTFS] fno=0x{fno:X} send={sendSize} arg=0x{argBuf:X8}:");
             for (uint o = 0; o + 4 <= n; o += 4)
                 sb.Append($" {mem.Read32(argBuf + o):X8}");
-            // Inline path if send looks like a C string (device:/name).
             string probe = ReadCString(mem, argBuf, 96);
             if (LooksLikeFsPath(probe))
                 sb.Append($" path=\"{probe}\"");
-            // Or path at +4 / +8 (pointer or inline after header words).
             if (sendSize >= 8)
             {
                 uint p4 = mem.Read32(argBuf + 4);
@@ -2309,15 +2326,10 @@ public sealed class RealSifRpc
             Console.Error.WriteLine(sb.ToString());
         }
 
-        // Ensure stage header is open on the host (Criterion stage TOC) — STG sid only.
-        // SidB3Aux (0x00150276) is a residual post-LGDEV service (likely B3ROUTE family);
-        // do NOT DMA STAGEHED into its send dest (live dest 0x01E7AC80 collides with EE stacks).
+        // SidB3Aux (0x00150276) residual post-LGDEV: soft-OK only, never DMA into stack dests.
         bool isStg = sid == SidGtfsStg || sid == 0x53465447u;
-        if (isStg)
-            EnsureGtfsStageAssets(iopModules, cdvd);
-        else
+        if (!isStg)
         {
-            // Soft-success only for aux: zeroed-OK reply, no disc DMA.
             if (recvBuf != 0)
             {
                 uint limit = recvSize > 0 ? Math.Min(recvSize, 0x40u) : 0x40u;
@@ -2327,67 +2339,43 @@ public sealed class RealSifRpc
             return 0;
         }
 
-        // Path open (fno=3 live: inline "Data\\Global.txd") + dest/size DMA heuristics.
+        EnsureGtfsStageAssets(iopModules, cdvd);
+
         uint openedSize = 0;
         int openedFd = TryGtfsPathOpenOrRead(mem, iopModules, cdvd, fno, argBuf, sendSize,
             recvBuf, recvSize, out openedSize);
 
-        // fno=5 live: {0, handle?, dest, …} — read previously opened Global.txd slice only.
-        // Cap size so we never blast multi-MB FRONTEND into a small EE buffer.
-        if (fno == 5 && argBuf != 0 && sendSize >= 12)
-        {
-            uint w0 = mem.Read32(argBuf + 0);
-            uint w1 = mem.Read32(argBuf + 4);
-            uint dest = mem.Read32(argBuf + 8) & 0x1FFFFFFFu;
-            // Reject stack/high scratch dests (0x01E00000+) — live stack band.
-            if (w0 == 0 && IsEeRamPointer(dest) && dest < 0x01E00000u)
-            {
-                int fd = _gtfsLastPathFd >= 0 ? _gtfsLastPathFd : openedFd;
-                uint maxSz = _gtfsLastPathSize != 0 ? _gtfsLastPathSize
-                    : (openedSize != 0 ? openedSize : 0x10000u);
-                uint want = Math.Min(maxSz, 0x40000u); // cap 256KiB per fno=5
-                if (fd >= 0 && dest + want <= (uint)SystemMemory.RDRAM_SIZE
-                    && iopModules.TryReadOpenFileBytes(fd, 0, (int)want, out byte[]? data)
-                    && data != null)
-                {
-                    for (int i = 0; i < data.Length; i++)
-                        mem.Write8(dest + (uint)i, data[i]);
-                    cdvd.NoteHostReadSectors((data.Length + 2047) / 2048);
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                        Console.Error.WriteLine(
-                            $"[GTFS] fno=5 DMA fd={fd} -> 0x{dest:X8} n={data.Length} h={w1}");
-                }
-            }
-        }
+        // fno=5 multi-layout / multi-chunk full TXD (wave-1 256KiB + w0==0 gate blocked live B3).
+        uint dmaBytes = 0;
+        if (fno == 5 && argBuf != 0 && sendSize >= 8)
+            dmaBytes = TryGtfsFno5Dma(mem, cdvd, iopModules, argBuf, sendSize, openedFd, openedSize);
 
         uint assetSize = openedSize != 0 ? openedSize
             : (_gtfsLastPathSize != 0 ? _gtfsLastPathSize
                 : (_gtfsStageHedSize != 0 ? _gtfsStageHedSize
                     : (_gtfsFrontendSize != 0 ? _gtfsFrontendSize : 0x10000u)));
-        uint handle = 1u + (fno & 0xF);
+        uint handle = 1;
         if (openedFd >= 0)
-            handle = (uint)(0x100 + openedFd);
+            handle = (uint)(1 + (openedFd & 0xFF));
         else if (_gtfsLastPathFd >= 0)
-            handle = (uint)(0x100 + _gtfsLastPathFd);
+            handle = (uint)(1 + (_gtfsLastPathFd & 0xFF));
         else if (_gtfsStageHedFd >= 0)
-            handle = (uint)(0x100 + _gtfsStageHedFd);
+            handle = (uint)(1 + (_gtfsStageHedFd & 0xFF));
 
         if (recvBuf != 0)
         {
             uint limit = recvSize > 0 ? Math.Min(recvSize, 0x100u) : 0x40u;
             for (uint o = 0; o + 4 <= limit; o += 4)
                 mem.Write32(recvBuf + o, 0);
-            // Word0 = status OK; +4 = handle; +8 = size; +12 = count; +16 = sectors.
             mem.Write32(recvBuf, 0);
             if (limit >= 8)
                 mem.Write32(recvBuf + 4, handle);
             if (limit >= 12)
                 mem.Write32(recvBuf + 8, assetSize);
             if (limit >= 16)
-                mem.Write32(recvBuf + 12, 1);
+                mem.Write32(recvBuf + 12, dmaBytes != 0 ? dmaBytes : 1u);
             if (limit >= 20)
                 mem.Write32(recvBuf + 16, (assetSize + 2047) / 2048);
-            // fno=1 init / fno=3 path-open — advertise real file size.
             if ((fno == 1 || fno == 3) && limit >= 8)
             {
                 mem.Write32(recvBuf, 0);
@@ -2395,12 +2383,130 @@ public sealed class RealSifRpc
                 if (limit >= 12)
                     mem.Write32(recvBuf + 8, assetSize);
             }
+            if (fno == 5 && limit >= 12)
+            {
+                mem.Write32(recvBuf, 0);
+                mem.Write32(recvBuf + 4, handle);
+                mem.Write32(recvBuf + 8, dmaBytes != 0 ? dmaBytes : assetSize);
+                if (limit >= 16)
+                    mem.Write32(recvBuf + 12, _gtfsReadOffset);
+                if (limit >= 20)
+                    mem.Write32(recvBuf + 16, _gtfsTotalDmaBytes);
+            }
         }
         return 0;
     }
 
-    private static int _gtfsLastPathFd = -1;
-    private static uint _gtfsLastPathSize;
+    /// <summary>
+    /// fno=5 multi-layout DMA. Transfers remaining file bytes in ≤2MiB host chunks until
+    /// full TXD is in EE (or dest+size exhausts). Advances <see cref="_gtfsReadOffset"/>.
+    /// </summary>
+    private static uint TryGtfsFno5Dma(SystemMemory mem, Cdvd cdvd, IopModuleHost iopModules,
+        uint argBuf, uint sendSize, int openedFd, uint openedSize)
+    {
+        uint w0 = mem.Read32(argBuf + 0);
+        uint w1 = sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
+        uint w2 = sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+        uint w3 = sendSize >= 16 ? mem.Read32(argBuf + 12) : 0;
+
+        uint dest = 0, size = 0, offset = 0;
+        // Layout B (live): dest in w0, handle in w1, optional size/offset in w2/w3.
+        if (IsEeRamPointer(w0) && (w0 & 0x1FFFFFFFu) < 0x01E00000u)
+        {
+            dest = w0 & 0x1FFFFFFFu;
+            if (w2 is > 0 and <= 0x02000000u && !IsEeRamPointer(w2))
+                size = w2;
+            else if (w3 is > 0 and <= 0x02000000u && !IsEeRamPointer(w3))
+                size = w3;
+            if (w2 < 0x01000000u && w2 != size && !IsEeRamPointer(w2) && w2 > 0x100u)
+                offset = w2;
+            if (w3 < 0x01000000u && w3 != size && !IsEeRamPointer(w3) && w3 > 0x100u
+                && offset == 0)
+                offset = w3;
+        }
+        else if (w0 == 0 && IsEeRamPointer(w2) && (w2 & 0x1FFFFFFFu) < 0x01E00000u)
+        {
+            dest = w2 & 0x1FFFFFFFu;
+            if (w3 is > 0 and <= 0x02000000u) size = w3;
+        }
+        else if (w0 < 0x01000000u && w1 is > 0 and <= 0x02000000u
+                 && IsEeRamPointer(w2) && (w2 & 0x1FFFFFFFu) < 0x01E00000u)
+        {
+            offset = w0;
+            size = w1;
+            dest = w2 & 0x1FFFFFFFu;
+        }
+        else if (IsEeRamPointer(w0) && w1 is > 0x100 and <= 0x02000000u
+                 && !IsEeRamPointer(w1))
+        {
+            dest = w0 & 0x1FFFFFFFu;
+            size = w1;
+            if (w2 < 0x01000000u && !IsEeRamPointer(w2)) offset = w2;
+        }
+
+        if (dest == 0 || dest >= 0x01E00000u) return 0;
+
+        int fd = _gtfsLastPathFd >= 0 ? _gtfsLastPathFd
+            : (openedFd >= 0 ? openedFd
+                : (_gtfsFrontendFd >= 0 ? _gtfsFrontendFd : _gtfsStageHedFd));
+        uint maxSz = _gtfsLastPathSize != 0 ? _gtfsLastPathSize
+            : (openedSize != 0 ? openedSize
+                : (_gtfsFrontendSize != 0 ? _gtfsFrontendSize
+                    : (_gtfsStageHedSize != 0 ? _gtfsStageHedSize : 0x10000u)));
+        if (fd < 0 || maxSz == 0) return 0;
+
+        if (offset == 0 && _gtfsReadOffset > 0 && _gtfsReadOffset < maxSz
+            && (_gtfsLastDmaDest == 0 || dest == _gtfsLastDmaDest
+                || dest == _gtfsLastDmaDest + _gtfsReadOffset))
+            offset = _gtfsReadOffset;
+        if (offset == 0 && dest == _gtfsLastDmaDest && _gtfsReadOffset > 0)
+            offset = _gtfsReadOffset;
+
+        uint remaining = maxSz > offset ? maxSz - offset : 0;
+        if (remaining == 0) return 0;
+        uint want = size != 0 ? Math.Min(size, remaining) : remaining;
+        want = Math.Min(want, remaining);
+        want = Math.Min(want, (uint)SystemMemory.RDRAM_SIZE - dest);
+        if (want == 0) return 0;
+
+        uint total = GtfsDmaChunks(mem, cdvd, iopModules, fd, dest, offset, want);
+        if (total > 0)
+        {
+            _gtfsLastDmaDest = dest;
+            _gtfsReadOffset = offset + total;
+            _gtfsTotalDmaBytes += total;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] fno=5 DMA fd={fd} -> 0x{dest:X8} off=0x{offset:X} n={total} " +
+                    $"file={maxSz} cursor=0x{_gtfsReadOffset:X} totalDma={_gtfsTotalDmaBytes} " +
+                    $"w=[{w0:X8} {w1:X8} {w2:X8} {w3:X8}]");
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Host-read into EE in ≤2MiB loops so one fno=5 can complete a multi-MB TXD.
+    /// </summary>
+    private static uint GtfsDmaChunks(SystemMemory mem, Cdvd cdvd, IopModuleHost iopModules,
+        int fd, uint dest, uint fileOff, uint want)
+    {
+        uint done = 0;
+        const uint HostChunk = 2u * 1024 * 1024;
+        while (done < want)
+        {
+            uint chunk = Math.Min(HostChunk, want - done);
+            if (!iopModules.TryReadOpenFileBytes(fd, (int)(fileOff + done), (int)chunk, out byte[]? data)
+                || data == null || data.Length == 0)
+                break;
+            for (int i = 0; i < data.Length; i++)
+                mem.Write8(dest + done + (uint)i, data[i]);
+            done += (uint)data.Length;
+            if (data.Length < (int)chunk) break;
+        }
+        if (done > 0)
+            cdvd.NoteHostReadSectors((int)((done + 2047) / 2048));
+        return done;
+    }
 
     /// <summary>
     /// Open <c>DATA/STAGEHED.BIN</c> + <c>DATA/FRONTEND.TXD</c> once via FILEIO host.
@@ -2559,6 +2665,8 @@ public sealed class RealSifRpc
             openedSize = fsz;
             _gtfsLastPathFd = fd;
             _gtfsLastPathSize = fsz;
+            _gtfsReadOffset = 0; // new open restarts multi-chunk cursor
+            _gtfsTotalDmaBytes = 0;
             cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 2048));
         }
 
