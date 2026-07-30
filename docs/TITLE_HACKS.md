@@ -13,6 +13,6 @@ They should NOT be hand-edited into shared core files.
 | Mortal Kombat: Shaolin Monks (USA) | `SLUS_210.87` | `MidwayBootAssist` — ADX multi-table scrub, list-walk break, format-stall→main (gifP3 5→12), **post-spine memset break @0x385278**, dense pad. No `*0x75C0D0` plant. | CRI ADX / WAD under HLE; format/list/memset parks | 2026-07-30 |
 | Burnout 3: Takedown (USA) | `SLUS_210.50` | `Burnout3Assist` + **`HandleLgDev`**; **lgDeviceInit entry stub @`0x4438E0`** + residual CallRpc complete; IOPRP `"2800"`; flip re-arm | lgDeviceInit thrash → left VBlank; still no game FILEIO | 2026-07-30 |
 | Blood Omen 2 (USA) | `SLUS_200.24` | `BloodOmen2SnAssist` — SN stubs, IOPRP `"2340"`, real BG2, **cache-flush leaf stub**, exception-vector rescue, pad | MAINMENU loaded; px=3 draw stall | 2026-07-30 |
-| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`, FreezeCache, BST, freelist bump-alloc, list empty-head plant, WaitSema a0 clamp, PickSafeResume hard-cap &lt;0x2C0000 | CDVD 142; RPC 45/207; sif↑; still px=0 | 2026-07-30 |
+| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`, FreezeCache, BST, freelist bump-alloc, list empty-head plant, WaitSema a0 clamp, PickSafeResume hard-cap &lt;0x2C0000, **global free-search plant** `*0x29BEB0` | CDVD 142; RPC 45/207; sif↑; free-search unstuck; still px=0 | 2026-07-30 |
 
 Format: short description + link to issue/commit when available.

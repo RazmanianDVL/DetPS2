@@ -93,6 +93,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _listCmpEscapes;
     private int _linkSearchEscapes;
     private int _streamArmPulses;
+    private int _globalFreeEscapes;
     private ulong _lastWorldKickCyc;
     private bool _heapDefaultsPlanted;
     /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
@@ -149,6 +150,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint HeapFree2PcLo = 0x00239300;
     public const uint HeapFree2PcHi = 0x00239810;
 
+    /// <summary>
+    /// Global free-range search (disasm 0x13E1C0..0x13E1F4): walks <c>*0x29BEB0</c> via
+    /// <c>next@+0xC</c>; accepts when <c>!(a0 &lt; size@+0x10) &amp;&amp; !(field@+0x18 &lt; a0)</c>.
+    /// Live residual (2026-07-30): head in-RDRAM forms a long ring → infinite loop at
+    /// <c>0x13E1C8</c>, freezing RPC/cdvd metrics for tens of M cycles (55M≡100M).
+    /// </summary>
+    public const uint GlobalFreeHeadPtr = 0x0029BEB0;
+    public const uint GlobalFreeSearchPcLo = 0x0013E1C0;
+    public const uint GlobalFreeSearchPcHi = 0x0013E1EC;
+    public const uint GlobalFreeSearchReturn = 0x0013E1F0; // jr ra; daddu v0,v1
+
     public void Reset()
     {
         _versionPlanted = false;
@@ -166,6 +178,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _listCmpEscapes = 0;
         _linkSearchEscapes = 0;
         _streamArmPulses = 0;
+        _globalFreeEscapes = 0;
         _lastWorldKickCyc = 0;
         _heapDefaultsPlanted = false;
         _arenaBump = HeapArenaBase;
@@ -466,6 +479,16 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
+        // Global free-range search @ 0x13E1C0 — circular *0x29BEB0 freezes EE at 0x13E1C8
+        // with zero RPC/cdvd progress past ~50M (live 55M≡100M metrics).
+        // Also plant a healthy head proactively once freelist soft-escapes have run so the
+        // natural search does not enter a long ring (force mid-walk can race with Exit).
+        if (c >= 42_000_000 && sys.Cdvd.SectorsRead > 0 && _free2Escapes >= 8
+            && _globalFreeEscapes == 0 && (c % 500_000) < 50_000)
+            PlantGlobalFreeHead(sys, sizeHint: 0); // size=0 matches any a0
+        if (c >= 45_000_000 && pc is >= GlobalFreeSearchPcLo and <= GlobalFreeSearchPcHi)
+            TryEscapeGlobalFreeSearch(sys, pc, c);
+
         // Wave-2 live residual: object virtual dispatch at 0x233AEx with a1=0x401Axxxx
         // or s0 OOB → jalr garbage → exception vector thrash. Soft escape from 38M —
         // w3c gated-after-CDVD left EE in silent non-syscall spin (syscalls~20k, main
@@ -602,6 +625,114 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// Plant a null-terminated free-range node at <c>*0x29BEB0</c> that matches any
+    /// reasonable <paramref name="sizeHint"/> (size@+0x10 ≤ a0 ≤ field@+0x18).
+    /// </summary>
+    private uint PlantGlobalFreeHead(Ps2System sys, uint sizeHint)
+    {
+        uint node = AllocArenaBlock(sys, 0x40);
+        // size@+0x10 must be ≤ a0 so (a0 < size) is false. size=0 accepts every a0.
+        // field@+0x18 must be ≥ a0; ~0 accepts every a0. next@+0xC = 0 terminates.
+        uint size = sizeHint; // 0 is intentional (universal match)
+        if (size > 0x00100000u) size = 0x00100000u;
+        sys.Memory.Write32(node + 0x00, node);
+        sys.Memory.Write32(node + 0x04, 0);
+        sys.Memory.Write32(node + 0x08, 0);
+        sys.Memory.Write32(node + 0x0C, 0);           // next = null
+        sys.Memory.Write32(node + 0x10, size);        // size@+0x10
+        sys.Memory.Write32(node + 0x14, 0);
+        sys.Memory.Write32(node + 0x18, 0xFFFFFFFFu); // field@+0x18
+        sys.Memory.Write32(node + 0x1C, 0);
+        sys.Memory.Write32(GlobalFreeHeadPtr, node);
+        if (_globalFreeEscapes == 0)
+            _globalFreeEscapes = 1; // mark planted so force re-escape still works
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[GOW] plant global free-head node=0x{node:X8} size=0x{size:X8} @0x{GlobalFreeHeadPtr:X8}");
+        return node;
+    }
+
+    /// <summary>
+    /// Global free-range search at <c>0x13E1C0</c> (head <c>*0x29BEB0</c>, next@+0xC,
+    /// size@+0x10, field@+0x18). Returns first node where size &lt;= a0 &lt;= field (unsigned).
+    /// Circular/long rings freeze at <c>0x13E1C8</c>. Plant a matching null-terminated node
+    /// and return via epilogue. Gated to post-freelist soft-escapes so early boot is not starved.
+    /// </summary>
+    private void TryEscapeGlobalFreeSearch(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc >= GlobalFreeSearchReturn)
+            return; // already at jr ra
+        if (_globalFreeEscapes >= 128)
+            return;
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint head = sys.Memory.Read32(GlobalFreeHeadPtr);
+        uint hPhys = head & 0x1FFFFFFFu;
+        uint v1 = (uint)sys.EE.GetGpr(3).Lo;
+        uint v1Phys = v1 & 0x1FFFFFFFu;
+
+        bool broken = head == 0
+            || hPhys < 0x00100000u
+            || hPhys + 0x20u >= (uint)SystemMemory.RDRAM_SIZE
+            || (hPhys & 3u) != 0;
+        if (!broken)
+        {
+            uint next = sys.Memory.Read32(hPhys + 0x0Cu);
+            uint nPhys = next & 0x1FFFFFFFu;
+            if (next == head || nPhys == hPhys)
+                broken = true;
+            else if (next != 0 && (nPhys < 0x00100000u || nPhys + 0x20u >= (uint)SystemMemory.RDRAM_SIZE))
+                broken = true;
+            else if (v1 != 0 && v1Phys != hPhys
+                     && (v1Phys < 0x00100000u || v1Phys + 0x20u >= (uint)SystemMemory.RDRAM_SIZE
+                         || (v1Phys & 3u) != 0))
+                broken = true;
+            else if (next != 0)
+            {
+                uint next2 = sys.Memory.Read32(nPhys + 0x0Cu);
+                if ((next2 & 0x1FFFFFFFu) == hPhys)
+                    broken = true;
+            }
+            // Our planted head: next==0 and size matches — leave natural path alone unless
+            // still mid-walk after re-entry (v1 not head / not null with a0 unsatisfied).
+            else if (next == 0 && _globalFreeEscapes > 0 && pc is >= 0x0013E1C8 and <= 0x0013E1EC)
+            {
+                uint sz = sys.Memory.Read32(hPhys + 0x10);
+                // a0 < size → would loop forever on null next with no progress (beq null exits).
+                // With next==0 the beq v1,zero path exits — only force if v1 is non-null mid-walk
+                // with unusable size (a0 < size keeps branching to 0x13E1C8 with delay next=0 → null exit).
+                // Actually next==0 terminates via delay-slot load of null → beq exits. Healthy.
+                _ = sz;
+            }
+        }
+        // Mid-walk force after freelist soft-escapes (long in-RDRAM ring, live head 0xCB73D8).
+        if (!broken && pc is >= 0x0013E1C8 and <= 0x0013E1EC)
+        {
+            if (_globalFreeEscapes > 0)
+                broken = true;
+            else if (c >= 48_000_000 && _free2Escapes >= 8)
+                broken = true;
+        }
+
+        if (!broken)
+            return;
+
+        // size=0 accepts any a0 (a0 < 0 is false unsigned).
+        uint node = PlantGlobalFreeHead(sys, sizeHint: 0);
+
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = node }); // v1
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = node }); // v0
+        sys.EE.PC = GlobalFreeSearchReturn;
+        sys.EE.COP0_Status &= ~0x6u;
+        _globalFreeEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _globalFreeEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape global free-search pc=0x{pc:X8} a0=0x{a0:X8} head=0x{head:X8} " +
+                $"-> node=0x{node:X8} n={_globalFreeEscapes} cyc={c}");
+    }
+
+    /// <summary>
     /// Pick a safe resume PC after exception/KSEG thrash. Never re-enter known death
     /// mid-bodies (0x233AEx dispatch, 0x2847xx list-cmp, exception vector, CRT0).
     /// </summary>
@@ -620,6 +751,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0021FF00 and <= 0x00220600)
             or (>= 0x0015F2C0 and <= 0x0015FB00)  // list / object-init thrash
             or (>= 0x0013DED0 and <= 0x0013DEF8)  // heap-align spin
+            or (>= 0x0013E1C0 and <= 0x0013E1F4)  // global free-search circular thrash
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
             or (>= 0x0017A320 and <= 0x0017A360)  // software delay + flag poll
@@ -746,6 +878,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeObjectDispatch(sys, pc, c);
         if (pc is >= 0x00284780 and <= 0x002848B0)
             TryEscapeListCompareWalk(sys, pc, c);
+        if (pc is >= GlobalFreeSearchPcLo and <= GlobalFreeSearchPcHi)
+            TryEscapeGlobalFreeSearch(sys, pc, c);
 
         // Live final PC band 0x170BBx — list tag walk (sb flags @ node+0x18). With empty/
         // corrupt a1 (often zeroed then movn'd) the loop at 0x170BB0..BF8 never hits the
