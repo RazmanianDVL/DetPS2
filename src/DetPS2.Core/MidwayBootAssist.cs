@@ -2484,10 +2484,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         // Faster cadence once logo spine is restored (historical gifP3≥11).
         // Even faster once in interactive pad-poll / ADX title bands (gifP3≥12).
-        // Wave-4 denser pad: 8k cycle cadence once interactive (gifP3≥12) so edge-triggered
+        // Wave-5 heavy pad: 5k cycle cadence once interactive (gifP3≥12) so edge-triggered
         // menu code sees more press/release pairs; ghost PADMAN DMA refreshed each pulse.
-        ulong interval = sys.Gif.Path3Transfers >= 12 ? 8_000UL
-            : sys.Gif.Path3Transfers >= 11 ? 30_000UL
+        // gifP3≥14 (frame-cb + group-6 live): even denser 3k for accept-to-submenu push.
+        ulong interval = sys.Gif.Path3Transfers >= 14 ? 3_000UL
+            : sys.Gif.Path3Transfers >= 12 ? 5_000UL
+            : sys.Gif.Path3Transfers >= 11 ? 20_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2516,10 +2518,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             // Circle/Triangle for alternate confirm bindings Midway titles use.
             if (inMenuBand || sys.Gif.Path3Transfers >= 12)
             {
-                // Accept-heavy cadence: denser CROSS + D-pad so selection index moves then
-                // accept. Live interactive band oscillates 0x4148EC↔0x4275xx / lock 0x426Fxx
-                // — need release edges between presses for edge-triggered menu code.
-                phase = _menuPadPulses % 20;
+                // Wave-5 accept-heavy: denser CROSS + D-pad so selection index moves then
+                // accept. Live: gifP3=14 with *0x75BDD8=*0x75E950=0x43F920; pad moves PC;
+                // thrash wall was 0x385674 VU blit — escape that separately. Need release
+                // edges between presses for edge-triggered menu code.
+                phase = _menuPadPulses % 24;
                 buttons = phase switch
                 {
                     0 => 0u, // release edge
@@ -2537,13 +2540,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     16 => 0u,
                     17 => (uint)PadInput.Button.Right,
                     18 => 0u,
+                    19 => (uint)PadInput.Button.Down,
+                    20 => 0u,
+                    21 or 22 => (uint)PadInput.Button.Cross,
                     _ => (uint)PadInput.Button.Cross
                 };
                 // Occasional Left so horizontal menus also move.
-                if (_menuPadPulses % 23 == 0)
+                if (_menuPadPulses % 19 == 0)
                     buttons = (uint)PadInput.Button.Left;
                 // After many pulses still in pad-poll / ADX title band: hold CROSS for accept.
-                if (_menuPadPulses >= 48 && inMenuBand && (_menuPadPulses % 3) < 2)
+                if (_menuPadPulses >= 32 && inMenuBand && (_menuPadPulses % 3) < 2)
+                    buttons = (uint)PadInput.Button.Cross;
+                // Wave-5: once frame-cb path is live (gifP3≥14), alternate Down+Cross harder.
+                if (sys.Gif.Path3Transfers >= 14 && (_menuPadPulses % 5) == 0)
+                    buttons = (uint)PadInput.Button.Down;
+                if (sys.Gif.Path3Transfers >= 14 && (_menuPadPulses % 5) == 1)
                     buttons = (uint)PadInput.Button.Cross;
             }
             else
@@ -2612,6 +2623,28 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             _menuSpineKicks++;
         }
 
+        // Wave-5 selection chrome telemetry: menu tick cluster around 0x54E5E0..0x54E620.
+        // Live: index-6 tick at 0x54E600 climbs under pad; dump for accept-to-submenu proof.
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && sys.Gif.Path3Transfers >= 12
+            && (_menuPadPulses == 16 || _menuPadPulses == 64 || _menuPadPulses == 128
+                || _menuPadPulses == 256 || (_menuPadPulses > 0 && _menuPadPulses % 512 == 0)))
+        {
+            uint t0 = sys.Memory.Read32(0x0054E5E0);
+            uint t1 = sys.Memory.Read32(0x0054E5E4);
+            uint t2 = sys.Memory.Read32(0x0054E5E8);
+            uint t3 = sys.Memory.Read32(0x0054E5EC);
+            uint t4 = sys.Memory.Read32(0x0054E600);
+            uint t5 = sys.Memory.Read32(0x0054E610);
+            uint fcb = sys.Memory.Read32(0x0075BDD8);
+            uint g6 = sys.Memory.Read32(0x0075E950);
+            Console.Error.WriteLine(
+                $"[BIOS] menu-sel *54E5E0={t0:X8}/{t1:X8}/{t2:X8}/{t3:X8} " +
+                $"*54E600={t4:X8} *54E610={t5:X8} fcb=0x{fcb:X8} g6=0x{g6:X8} " +
+                $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
+                $"n={_menuPadPulses} cyc={sys.MasterCycles}");
+        }
+
         // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
         // (*0x75E950 all zero — live dump), yield once toward Midway main so title/menu
         // state machine can observe the pad edge we just wrote.
@@ -2657,38 +2690,69 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"n={_titleHash2Breaks} cyc={sys.MasterCycles}");
     }
 
+    private int _vuBlitVisits;
+    private ulong _lastVuBlitVisitCyc;
+
     /// <summary>
     /// VU copy at <c>0x385660..0x385688</c>: 4× <c>lqc2 / mix / sqc2 vi5,0(a0); a0+=16</c>.
     /// Live find-writer: <c>a0</c> can point into the ELF image so <c>sqc2</c> @ <c>0x385674</c>
-    /// zeros Midway main. Redirect <c>a0</c> to a scratch page or force <c>jr ra</c> when dest
-    /// is code. Scratch is high RDRAM unused by typical Midway heaps.
+    /// zeros Midway main. Wave-5 wall: final PC parks at <c>0x385674</c> even after frame-cb
+    /// re-arm (gifP3=14) — thrash without always having a0 in the ELF image. Escape when:
+    /// (1) dest is code-image, or (2) sticky thrash in the blit band (re-entry without exit).
+    /// Redirect <c>a0</c> to scratch and/or force <c>jr ra</c>. Prefer natural <c>$ra</c>
+    /// when it is live EE code outside this band.
     /// </summary>
     private void MaybeGuardVuBlitCodeDest(Ps2System sys)
     {
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         if (pc is < 0x00385650 or > 0x00385688) return;
-        if (sys.MasterCycles - _lastVuBlitGuardCyc < 10_000) return;
-        if (_vuBlitGuards >= 128) return;
+        if (_vuBlitGuards >= 256) return;
+
+        // Sticky thrash counter: re-visits within a short window without leaving the band.
+        if (sys.MasterCycles - _lastVuBlitVisitCyc < 200_000)
+            _vuBlitVisits++;
+        else
+            _vuBlitVisits = 1;
+        _lastVuBlitVisitCyc = sys.MasterCycles;
+
+        if (sys.MasterCycles - _lastVuBlitGuardCyc < 5_000) return;
 
         uint a0 = (uint)(sys.EE.GetGpr(4).Lo & 0x1FFFFFFFUL);
         // Dest in ELF code/rodata image → code wipe.
-        if (a0 is < 0x00100000 or >= 0x00780000) return;
-        // Allow writes into known high BSS-ish if we ever need; for now any code-image dest is bad.
+        bool a0InCode = a0 is >= 0x00100000 and < 0x00780000;
+        // Unmapped / kernel / very low dest also cannot be a valid GS blit dest.
+        bool a0Nonsense = a0 < 0x00100000 || a0 >= (uint)SystemMemory.RDRAM_SIZE;
+        // Wave-5: thrash escape after repeated visits even if a0 looks "plausible" high BSS
+        // (corrupt count keeps us in the band forever).
+        bool stickyThrash = _vuBlitVisits >= 8;
+        if (!a0InCode && !a0Nonsense && !stickyThrash) return;
+
         const uint scratch = 0x01F00000;
-        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = scratch }); // a0 -> scratch
-        // Also force countdown done so we don't keep blitting 4 quads into scratch needlessly
-        // when the real dest was nonsense — exit via jr ra at 0x385688.
+        if (a0InCode || a0Nonsense)
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = scratch }); // a0 -> scratch
+        // Force countdown done so we don't keep blitting quads needlessly.
         sys.EE.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 }); // a3 = 0
-        sys.EE.PC = 0x00385688;
-        sys.LastGoodEePc = 0x00385688;
+
+        // Prefer natural return when $ra is live code outside the blit band (menu/UI path).
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0x00385688; // jr ra epilogue of the blit itself
+        if (ra is >= 0x00100000 and < 0x00800000
+            && ra is not (>= 0x00385650 and <= 0x00385690)
+            && sys.Memory.IsLikelyEeCode(ra))
+            resume = ra;
+
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
         _lastVuBlitGuardCyc = sys.MasterCycles;
         _vuBlitGuards++;
+        _vuBlitVisits = 0;
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_vuBlitGuards <= 12 || _vuBlitGuards % 8 == 0))
+            && (_vuBlitGuards <= 16 || _vuBlitGuards % 8 == 0))
             Console.Error.WriteLine(
-                $"[BIOS] guard VU blit code-dest a0 was 0x{a0:X8} -> scratch/exit " +
-                $"n={_vuBlitGuards} cyc={sys.MasterCycles}");
+                $"[BIOS] escape VU blit thrash a0=0x{a0:X8} pc=0x{pc:X8} -> 0x{resume:X8} " +
+                $"(code={a0InCode} nonsense={a0Nonsense} thrash={stickyThrash}) " +
+                $"n={_vuBlitGuards} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
     }
 
 
