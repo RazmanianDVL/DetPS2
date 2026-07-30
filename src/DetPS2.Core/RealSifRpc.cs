@@ -61,6 +61,11 @@ public sealed class RealSifRpc
     /// which shares the same numeric value in the *command-id* namespace, not RPC sid space.
     /// </summary>
     public const uint SidFileIo = 0x80000001;
+    /// <summary>
+    /// SotC (SCUS_974.72) binds this after <c>PL2303.IRX</c> / <c>USBD.IRX</c> load.
+    /// Soft-HLE: bind completes; calls return 0. Not required for STARTUP.XFF path.
+    /// </summary>
+    public const uint SidPl2303Usb = 0x80000220;
     /// <summary>CDVDFSV <c>sceCdInit</c> service (FUN_00000204 registered at 0x80000592).</summary>
     public const uint SidCdBase = 0x80000592;
     /// <summary>CDVDFSV <c>sceCdSearchFile</c> (FUN_000002f0 registered at 0x80000597).</summary>
@@ -288,6 +293,25 @@ public sealed class RealSifRpc
     private readonly Dictionary<uint, byte[]> _fioEeArgSnap = new();
     /// <summary>Last successful FILEIO open fd (SN wrapper omits fd on lseek/write/read).</summary>
     private int _fioLastFd = -1;
+    /// <summary>
+    /// FILEIO module ≥2200 (IOPRP2.2+/Play! <c>CFileIoHandler2200</c>): EE result buffer
+    /// pointers registered by fno=255 Init. Replies are written here and the command
+    /// <c>semaphoreId</c> is signaled (Play sends SIFCMD <c>0x80000011</c>; we collapse to
+    /// <see cref="KernelState.ISignalSema"/> + filled reply).
+    /// </summary>
+    private uint _fio2200ResultPtr0;
+    private uint _fio2200ResultPtr1;
+    /// <summary>True after a 2200-shaped Init or Getstat/Open packet was observed.</summary>
+    private bool _fio2200Armed;
+    /// <summary>
+    /// Play! FileIoHandler2200 delays READ replies by one frame so SotC can reschedule EE
+    /// threads. Hold the filled READREPLY until <see cref="ProcessPendingFileIoReplies"/>.
+    /// </summary>
+    private bool _fio2200ReadPending;
+    private uint _fio2200ReadSema;
+    private uint _fio2200ReadResult;
+    private uint _fio2200ReadCmdResultPtr;
+    private uint _fio2200ReadCmdResultSize;
     private int _nextSlot;
 
     /// <summary>
@@ -350,6 +374,10 @@ public sealed class RealSifRpc
         _cdToArgBuf.Clear();
         _fioEeArgSnap.Clear();
         _fioLastFd = -1;
+        _fio2200ResultPtr0 = 0;
+        _fio2200ResultPtr1 = 0;
+        _fio2200Armed = false;
+        _fio2200ReadPending = false;
         _pendingEndFuncs.Clear();
         _dtxChannels.Clear();
         _mwFileHandles.Clear();
@@ -395,6 +423,11 @@ public sealed class RealSifRpc
                 _padAreasGhost[kv.Key] = kv.Value;
         }
         _padAreas.Clear();
+        // FILEIO-2200 result buffers die with the IOP image; EE re-Inits after rebind.
+        _fio2200ResultPtr0 = 0;
+        _fio2200ResultPtr1 = 0;
+        _fio2200Armed = false;
+        _fio2200ReadPending = false;
         if (!string.IsNullOrEmpty(rebootArg))
         {
             string ver = ExtractIopRpVersionAscii(rebootArg);
@@ -665,6 +698,7 @@ public sealed class RealSifRpc
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
             && sid != SidMsl && sid != SidMslMfl
+            && sid != SidPl2303Usb // SotC binds after PL2303.IRX; soft-HLE, no unknown
             && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
@@ -949,14 +983,16 @@ public sealed class RealSifRpc
         }
 
         // FILEIO (sid=0x80000001) — BIOS FILEIO.IRX / sceOpen family.
+        // Also XFILEIO / IOPRP≥2200 EE client (same sid; Play! CFileIoHandler2200 layouts).
         if (sid == SidFileIo)
         {
-            int fioResult = HandleFileIo(mem, iopModules, pad, cdvd, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
+            int fioResult = HandleFileIo(mem, kernel, iopModules, pad, cdvd, rpcNumber, argBuf, sendSize, recvBuf, recvSize);
             if (recvBuf != 0 && recvSize >= 4)
                 mem.Write32(recvBuf, unchecked((uint)fioResult));
             // SN ProDG (Midway Deception, BO2): send+4 is eeReply* the EE reads after CallRpc
             // (sometimes distinct from packet recvBuf). Mirror the int result there.
-            if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 8)
+            // Skip when FILEIO-2200 is armed — +4 is COMMANDHEADER.resultPtr, not SN eeReply*.
+            if (!_fio2200Armed && LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 8)
             {
                 uint eeReply = mem.Read32(argBuf + 4) & 0x1FFFFFFFu;
                 if (eeReply >= 0x100000 && eeReply + 4 <= SystemMemory.RDRAM_SIZE)
@@ -1078,6 +1114,17 @@ public sealed class RealSifRpc
             return;
         }
 
+        // PL2303 / USB serial (SotC binds 0x80000220 after PL2303.IRX) — soft success.
+        if (sid == SidPl2303Usb)
+        {
+            if (recvBuf != 0 && recvSize >= 4)
+                mem.Write32(recvBuf, 0);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] HandleCall sid=PL2303(0x{sid:X8}) fno=0x{rpcNumber:X} result=0");
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return;
+        }
+
         int result = Dispatch(mem, cdvd, pad, iopModules, sid, rpcNumber, argBuf, recvBuf);
 
         if (recvBuf != 0)
@@ -1100,8 +1147,10 @@ public sealed class RealSifRpc
     /// BIOS FILEIO RPC (sid=0x80000001). Function numbers match ps2sdk fileio-common.h.
     /// Backed by <see cref="IopModuleHost"/> ISO-aware open/read/stat/dir so commercial
     /// <c>sceOpen("cdrom0:...")</c> returns real disc bytes and directory probes work.
+    /// Also accepts IOPRP≥2200 / Play! <c>CFileIoHandler2200</c> command packets
+    /// (<c>COMMANDHEADER</c> + payload) used by Shadow of the Colossus after IOPRP300.
     /// </summary>
-    private int HandleFileIo(SystemMemory mem, IopModuleHost iopModules, PadInput pad, Cdvd cdvd,
+    private int HandleFileIo(SystemMemory mem, KernelState kernel, IopModuleHost iopModules, PadInput pad, Cdvd cdvd,
         uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
         _ = pad; _ = recvSize;
@@ -1113,7 +1162,14 @@ public sealed class RealSifRpc
                 // Some retail / SN ProDG clients send { int mode; char *name; } (8B) where +4 is
                 // an EE path pointer — treating those 4 pointer bytes as an inline C string
                 // yields garbage like "ðûþ" (LE of 0x00FEFBF0) and open → ENOENT (Blood Omen 2).
-                DecodeFioOpenArgs(mem, argBuf, sendSize, out int mode, out string path);
+                // FILEIO-2200: COMMANDHEADER(12) + flags + somePtr + fileName[256] (path @+20).
+                int mode;
+                string path;
+                uint openSema = 0;
+                if (TryDecodeFio2200Open(mem, argBuf, sendSize, out openSema, out mode, out path))
+                    _fio2200Armed = true;
+                else
+                    DecodeFioOpenArgs(mem, argBuf, sendSize, out mode, out path);
                 path = AliasMidwayPakPath(path);
                 int openRes = iopModules.FileOpen(path, mode);
                 // PS2.RKV virtual open for archive-only audio paths (Blood Omen 2).
@@ -1177,7 +1233,14 @@ public sealed class RealSifRpc
                     WriteSnFioOpenSize(mem, argBuf, sendSize, recvBuf, recvSize, openedSz);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[FILEIO] open path=\"{path}\" mode=0x{mode:X} result={openRes} size={openedSz} argBuf=0x{argBuf:X8} send={sendSize}");
+                        $"[FILEIO] open path=\"{path}\" mode=0x{mode:X} result={openRes} size={openedSz} argBuf=0x{argBuf:X8} send={sendSize} fio2200={_fio2200Armed}");
+                // FILEIO-2200: Play returns 1 from Invoke and posts GENERICREPLY to resultPtr0
+                // + signals command.semaphoreId. Hybrid: still return open fd for classic clients.
+                if (_fio2200Armed && openSema != 0)
+                {
+                    WriteFio2200GenericReply(mem, kernel, openSema, FioOpen, unchecked((uint)openRes));
+                    return 1;
+                }
                 return openRes;
             }
             case FioGetVersion:
@@ -1187,23 +1250,73 @@ public sealed class RealSifRpc
                 // previously correct LOADFILE GetVersion cell and makes sceOpen return
                 // 0xFFFEFFFC forever (live Deci2: "Failed overlay load: <cdrom0:\GAMER.OVL;1>").
                 // Same PreferIopRpGetVersion gate as LOADFILE: SM needs classic 0x00020000.
+                //
+                // FILEIO-2200 Init (Play! CFileIoHandler2200 method 255): args[0]/args[1] are
+                // EE reply-buffer pointers used by later Getstat/Open replies. Capture them so
+                // SotC (IOPRP300 → module version ≥2200) can receive GETSTATREPLY.
+                if (argBuf != 0 && sendSize >= 8)
+                {
+                    uint rp0 = mem.Read32(argBuf);
+                    uint rp1 = mem.Read32(argBuf + 4);
+                    if (IsEeRamPointer(rp0))
+                    {
+                        _fio2200ResultPtr0 = rp0 & 0x1FFFFFFFu;
+                        _fio2200ResultPtr1 = IsEeRamPointer(rp1) ? (rp1 & 0x1FFFFFFFu) : 0;
+                        // PreferIopRp with numeric IOPRP ≥2200 (IOPRP300 → "3000") arms 2200.
+                        if (PreferIopRpGetVersion && TryParseIopRpVersionNumber(out int iopVer) && iopVer >= 2200)
+                            _fio2200Armed = true;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine(
+                                $"[FILEIO] Init/GetVersion resultPtr0=0x{_fio2200ResultPtr0:X8} resultPtr1=0x{_fio2200ResultPtr1:X8} armed={_fio2200Armed}");
+                    }
+                }
                 if (PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii))
                     return PackAsciiVersion(_lastIopRpVersionAscii);
                 return 0x00020000;
             case FioClose:
             {
                 // SN wrapper (send≈20): {seq, eeReply*, 4, …} — fd omitted; use last open.
-                int fd = DecodeSnFioFd(mem, argBuf, sendSize);
+                // FILEIO-2200 CLOSECOMMAND: header(12) + fd.
+                int fd;
+                uint closeSema = 0;
+                if (_fio2200Armed && argBuf != 0 && sendSize >= 16
+                    && mem.Read32(argBuf + 12) <= 15)
+                {
+                    closeSema = mem.Read32(argBuf);
+                    fd = (int)mem.Read32(argBuf + 12);
+                }
+                else
+                    fd = DecodeSnFioFd(mem, argBuf, sendSize);
                 int cr = iopModules.FileClose(fd);
                 if (fd == _fioLastFd) _fioLastFd = -1;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine($"[FILEIO] close fd={fd} result={cr} send={sendSize}");
+                if (_fio2200Armed && closeSema != 0)
+                {
+                    WriteFio2200GenericReply(mem, kernel, closeSema, FioClose, unchecked((uint)cr));
+                    return 1;
+                }
                 return cr;
             }
             case FioRead:
             {
-                DecodeSnFioRwArgs(mem, argBuf, sendSize, recvBuf, recvSize,
-                    out int fd, out uint buf, out uint size);
+                // FILEIO-2200 READCOMMAND: header(12)+fd+buffer+size (Play!).
+                // Classic/SN: DecodeSnFioRwArgs.
+                int fd;
+                uint buf, size;
+                uint readSema = 0, readCmdResultPtr = 0, readCmdResultSize = 0;
+                bool read2200 = false;
+                if (_fio2200Armed && TryDecodeFio2200Read(mem, argBuf, sendSize,
+                        out readSema, out readCmdResultPtr, out readCmdResultSize,
+                        out fd, out buf, out size))
+                {
+                    read2200 = true;
+                }
+                else
+                {
+                    DecodeSnFioRwArgs(mem, argBuf, sendSize, recvBuf, recvSize,
+                        out fd, out buf, out size);
+                }
                 buf &= 0x1FFFFFFFu;
                 // SN wrapper sometimes leaves size=0 in the DMA packet while eeArgs was
                 // cleared (Blood Omen 2 ENGLISH.DIR read). Fall back to remaining file
@@ -1225,19 +1338,46 @@ public sealed class RealSifRpc
                     cdvd.NoteHostReadSectors((nRead + 2047) / 2048);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[FILEIO] read fd={fd} buf=0x{buf:X8} size={size} result={nRead} send={sendSize}");
+                        $"[FILEIO] read fd={fd} buf=0x{buf:X8} size={size} result={nRead} send={sendSize} fio2200={read2200}");
+                // Play! delays READ reply one frame (SotC relies on EE reschedule).
+                if (read2200)
+                {
+                    _fio2200ReadPending = true;
+                    _fio2200ReadSema = readSema;
+                    _fio2200ReadResult = unchecked((uint)nRead);
+                    _fio2200ReadCmdResultPtr = readCmdResultPtr;
+                    _fio2200ReadCmdResultSize = readCmdResultSize;
+                    return 1;
+                }
                 return nRead;
             }
             case FioWrite:
             {
                 // Live BO2 write send=48:
                 //   +0 seq  +4 eeReply*  +8 4  +12 0  +16 buf*  +20 size  +24 0  …
-                DecodeSnFioRwArgs(mem, argBuf, sendSize, 0, 0, out int fd, out uint buf, out uint size);
+                // FILEIO-2200 WRITECOMMAND: header(12)+fd+buffer+size (+unaligned…).
+                int fd;
+                uint buf, size;
+                uint writeSema = 0;
+                bool write2200 = false;
+                if (_fio2200Armed && TryDecodeFio2200Read(mem, argBuf, sendSize,
+                        out writeSema, out _, out _, out fd, out buf, out size))
+                {
+                    // Same 24B prefix as READCOMMAND (Play WRITECOMMAND shares fd/buf/size).
+                    write2200 = true;
+                }
+                else
+                    DecodeSnFioRwArgs(mem, argBuf, sendSize, 0, 0, out fd, out buf, out size);
                 buf &= 0x1FFFFFFFu;
                 int nw = iopModules.FileWrite(mem, fd, buf, size);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[FILEIO] write fd={fd} buf=0x{buf:X8} size={size} result={nw} send={sendSize}");
+                        $"[FILEIO] write fd={fd} buf=0x{buf:X8} size={size} result={nw} send={sendSize} fio2200={write2200}");
+                if (write2200)
+                {
+                    WriteFio2200GenericReply(mem, kernel, writeSema, FioWrite, unchecked((uint)nw));
+                    return 1;
+                }
                 return nw;
             }
             case FioLseek:
@@ -1245,21 +1385,53 @@ public sealed class RealSifRpc
                 // Live BO2 lseek send=28:
                 //   +0 seq  +4 eeReply*  +8 4  +12 0  +16 0  +20 offset  +24 whence
                 // fd omitted — use last open (or word0 if it is a bare ps2sdk packet).
-                DecodeSnFioLseekArgs(mem, argBuf, sendSize, out int fd, out int off, out int whence);
+                // FILEIO-2200 SEEKCOMMAND: header(12)+fd+offset+whence.
+                int fd, off, whence;
+                uint seekSema = 0;
+                bool seek2200 = false;
+                if (_fio2200Armed && argBuf != 0 && sendSize >= 24
+                    && mem.Read32(argBuf + 12) <= 15)
+                {
+                    seekSema = mem.Read32(argBuf);
+                    fd = (int)mem.Read32(argBuf + 12);
+                    off = (int)mem.Read32(argBuf + 16);
+                    whence = (int)mem.Read32(argBuf + 20);
+                    seek2200 = true;
+                }
+                else
+                    DecodeSnFioLseekArgs(mem, argBuf, sendSize, out fd, out off, out whence);
                 int sr = iopModules.FileSeek(fd, off, whence);
                 // SN eeReply* mirror is done in HandleCall for all FILEIO fnos.
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[FILEIO] lseek fd={fd} off={off} whence={whence} result={sr} send={sendSize}");
+                        $"[FILEIO] lseek fd={fd} off={off} whence={whence} result={sr} send={sendSize} fio2200={seek2200}");
+                if (seek2200)
+                {
+                    WriteFio2200GenericReply(mem, kernel, seekSema, FioLseek, unchecked((uint)sr));
+                    return 1;
+                }
                 return sr;
             }
             case FioGetstat:
             {
-                // struct _fio_getstat_arg { union { io_stat_t *buf; int result; } p; char name[256]; }
-                // Also accept { io_stat_t *buf; char *name } pointer form (small send).
+                // Classic ps2sdk: struct _fio_getstat_arg { io_stat_t *buf; char name[256]; }
+                // FILEIO-2200 (Play! GETSTATCOMMAND): COMMANDHEADER(sema,resultPtr,resultSize)
+                //   + statBuffer + fileName[256]  — path @+16, not @+4.
+                // SotC live: classic decode saw pointer LE garbage at +4 → ENOENT thrash.
                 string path = "";
                 uint statAddr = 0;
-                if (argBuf != 0)
+                uint cmdSema = 0;
+                uint cmdResultPtr = 0;
+                uint cmdResultSize = 0;
+                bool is2200 = TryDecodeFio2200Getstat(mem, argBuf, sendSize,
+                    out cmdSema, out cmdResultPtr, out cmdResultSize, out statAddr, out path);
+                if (is2200)
+                {
+                    _fio2200Armed = true;
+                    if (_fio2200ResultPtr0 == 0 && IsEeRamPointer(cmdResultPtr))
+                        _fio2200ResultPtr0 = cmdResultPtr & 0x1FFFFFFFu;
+                }
+                else if (argBuf != 0)
                 {
                     uint p0 = mem.Read32(argBuf);
                     uint p1 = sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
@@ -1287,7 +1459,12 @@ public sealed class RealSifRpc
                         }
                         else
                         {
-                            path = nameAt4.Length > 0 ? nameAt4 : ReadCString(mem, argBuf, 256);
+                            // Last resort: scan for device path in the send blob (same class as open).
+                            uint scanLimit = sendSize > 0 ? Math.Min(sendSize, 512u) : 64u;
+                            if (TryFindDevicePathInBuffer(mem, argBuf, scanLimit, out string found))
+                                path = found;
+                            else
+                                path = nameAt4.Length > 0 ? nameAt4 : ReadCString(mem, argBuf, 256);
                             if (IsEeRamPointer(p0))
                                 statAddr = p0 & 0x1FFFFFFFu;
                         }
@@ -1298,7 +1475,22 @@ public sealed class RealSifRpc
                     }
                 }
                 if (statAddr == 0) statAddr = recvBuf;
-                return iopModules.FileGetStat(mem, path, statAddr);
+                int gs = iopModules.FileGetStat(mem, path, statAddr);
+                // Do NOT alias truncated probes (KERNEL.X / STARTUP.) to .XFF — real IOP
+                // returns ENOENT and SotC continues to open the full name. Forcing success
+                // caused getstat thrash and blocked KERNEL.XFF open (live 100c).
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[FILEIO] getstat path=\"{path}\" result={gs} stat=0x{statAddr:X8} " +
+                        $"fio2200={is2200} sema={cmdSema} arg=0x{argBuf:X8} send={sendSize}");
+                if (is2200 || (_fio2200Armed && cmdSema != 0))
+                {
+                    WriteFio2200GetstatReply(mem, kernel, cmdSema, cmdResultPtr, cmdResultSize,
+                        unchecked((uint)gs), statAddr);
+                    // Play! InvokeGetStat returns 1; real result is in GETSTATREPLY.
+                    return 1;
+                }
+                return gs;
             }
             case FioChstat:
                 // struct _fio_chstat_arg — ISO/host HLE has no mutable attributes.
@@ -1410,6 +1602,226 @@ public sealed class RealSifRpc
         (path.StartsWith("cdrom", StringComparison.OrdinalIgnoreCase)
          || path.StartsWith("cdrom0", StringComparison.OrdinalIgnoreCase)
          || (!path.Contains(':') && LooksLikeFsPath(path)));
+
+    /// <summary>Parse IOPRP/DNAS ASCII tag (e.g. <c>"3000"</c>) to int; false if non-numeric.</summary>
+    private bool TryParseIopRpVersionNumber(out int version)
+    {
+        version = 0;
+        if (string.IsNullOrEmpty(_lastIopRpVersionAscii)) return false;
+        // Tag may be "3000", "2200", or "3000...." — take leading digits.
+        int i = 0;
+        while (i < _lastIopRpVersionAscii.Length && char.IsDigit(_lastIopRpVersionAscii[i])) i++;
+        if (i == 0) return false;
+        return int.TryParse(_lastIopRpVersionAscii.AsSpan(0, i), out version);
+    }
+
+    /// <summary>
+    /// Play! <c>GETSTATCOMMAND</c> (FileIoHandler2200):
+    /// <c>COMMANDHEADER{sema,resultPtr,resultSize}</c> + <c>statBuffer</c> + <c>fileName[256]</c>.
+    /// Path lives at +16; classic ps2sdk puts the path at +4.
+    /// Live SotC may DMA a short send (&lt;272) — clamp path read to remaining send bytes so
+    /// ReadCString cannot run into adjacent scratch ("STARTUP.XFF" → "STARTUP.ldsys…").
+    /// </summary>
+    private static bool TryDecodeFio2200Getstat(SystemMemory mem, uint argBuf, uint sendSize,
+        out uint semaId, out uint cmdResultPtr, out uint cmdResultSize, out uint statBuffer, out string path)
+    {
+        semaId = 0;
+        cmdResultPtr = 0;
+        cmdResultSize = 0;
+        statBuffer = 0;
+        path = "";
+        if (argBuf == 0 || sendSize < 20) return false;
+
+        // Classic wins if name@+4 is a real device path (ps2sdk _fio_getstat_arg).
+        int maxAt4 = (int)Math.Min(256u, sendSize > 4 ? sendSize - 4 : 0);
+        string nameAt4 = maxAt4 > 0 ? ReadCString(mem, argBuf + 4, maxAt4) : "";
+        if (LooksLikeFsPath(nameAt4) && (nameAt4.IndexOf(':') >= 0 || nameAt4.IndexOf('.') >= 0))
+            return false;
+
+        int maxAt16 = (int)Math.Min(256u, sendSize > 16 ? sendSize - 16 : 0);
+        string nameAt16 = maxAt16 > 0 ? ReadCString(mem, argBuf + 16, maxAt16) : "";
+        nameAt16 = SanitizeFioPath(nameAt16);
+        if (!LooksLikeFsPath(nameAt16)) return false;
+        // Prefer device-looking paths for 2200; bare names still accepted if send is large.
+        if (nameAt16.IndexOf(':') < 0 && nameAt16.IndexOf('.') < 0 && sendSize < 32)
+            return false;
+
+        semaId = mem.Read32(argBuf);
+        cmdResultPtr = mem.Read32(argBuf + 4);
+        cmdResultSize = mem.Read32(argBuf + 8);
+        statBuffer = mem.Read32(argBuf + 12);
+        path = nameAt16;
+
+        // statBuffer should be EE RAM; if not, still accept when path looks solid (recv fallback).
+        if (IsEeRamPointer(statBuffer))
+            statBuffer &= 0x1FFFFFFFu;
+        else
+            statBuffer = 0;
+        return true;
+    }
+
+    /// <summary>
+    /// Trim IOP/EE path noise: stop at first control char, collapse trailing garbage after
+    /// a valid <c>;1</c> version, and reject merged string-table bleed.
+    /// </summary>
+    private static string SanitizeFioPath(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        // Stop at first control (except nothing — already filtered by ReadCString often).
+        int end = s.Length;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c < 0x20 || c > 0x7E) { end = i; break; }
+        }
+        s = s[..end];
+        // "cdrom0:\STARTUP.XFF;1" — if ";1" present, cut after version digit run.
+        int semi = s.IndexOf(';');
+        if (semi >= 0)
+        {
+            int j = semi + 1;
+            while (j < s.Length && char.IsDigit(s[j])) j++;
+            s = s[..j];
+        }
+        // Truncated "cdrom0:\STARTUP." without extension — common short-DMA bleed; do not invent.
+        return s.Trim();
+    }
+
+    /// <summary>
+    /// Play! <c>OPENCOMMAND</c>: header(12) + flags + somePtr + fileName[256] (path @+20).
+    /// Distinct from SN BO2 residual path@+20 with mode@+0 when header fields look like 2200.
+    /// </summary>
+    private static bool TryDecodeFio2200Open(SystemMemory mem, uint argBuf, uint sendSize,
+        out uint semaId, out int mode, out string path)
+    {
+        semaId = 0;
+        mode = 0;
+        path = "";
+        if (argBuf == 0 || sendSize < 24) return false;
+
+        // Classic/SN: mode@+0, path often @+4. If path@+4 is real, not 2200.
+        string nameAt4 = ReadCString(mem, argBuf + 4, 256);
+        if (LooksLikeFsPath(nameAt4) && (nameAt4.IndexOf(':') >= 0 || nameAt4.IndexOf('.') >= 0))
+            return false;
+
+        string nameAt20 = ReadCString(mem, argBuf + 20, 256);
+        if (!LooksLikeFsPath(nameAt20) || (nameAt20.IndexOf(':') < 0 && nameAt20.IndexOf('.') < 0))
+            return false;
+
+        // 2200 header: small-ish sema id, EE resultPtr, resultSize, then flags.
+        uint w0 = mem.Read32(argBuf);
+        uint w1 = mem.Read32(argBuf + 4);
+        // SN seq can also be large; require resultPtr-like word at +4 or armed-size packet.
+        if (!IsEeRamPointer(w1) && sendSize < 0x40) return false;
+
+        semaId = w0;
+        mode = (int)mem.Read32(argBuf + 12); // flags
+        path = nameAt20;
+        return true;
+    }
+
+    /// <summary>
+    /// Write Play! <c>GETSTATREPLY</c> to the Init result buffer and signal command sema.
+    /// Layout: REPLYHEADER(16) + result + dstPtr + io_stat_t(40) = 64 bytes.
+    /// Also ensures <paramref name="statAddr"/> already holds the stat (caller FileGetStat).
+    /// </summary>
+    private void WriteFio2200GetstatReply(SystemMemory mem, KernelState kernel,
+        uint semaId, uint cmdResultPtr, uint cmdResultSize, uint result, uint statAddr)
+    {
+        uint replyDest = _fio2200ResultPtr0;
+        if (replyDest == 0 && IsEeRamPointer(cmdResultPtr))
+            replyDest = cmdResultPtr & 0x1FFFFFFFu;
+        if (replyDest != 0 && replyDest + 64 <= (uint)SystemMemory.RDRAM_SIZE)
+        {
+            // REPLYHEADER
+            mem.Write32(replyDest + 0, semaId);
+            mem.Write32(replyDest + 4, FioGetstat); // commandId
+            mem.Write32(replyDest + 8, cmdResultPtr);
+            mem.Write32(replyDest + 12, cmdResultSize);
+            mem.Write32(replyDest + 16, result);
+            mem.Write32(replyDest + 20, statAddr); // dstPtr
+            // Copy io_stat_t (40B) from statAddr into reply +24 when available.
+            if (statAddr != 0 && statAddr + 40 <= (uint)SystemMemory.RDRAM_SIZE)
+            {
+                for (uint i = 0; i < 40; i += 4)
+                    mem.Write32(replyDest + 24 + i, mem.Read32(statAddr + i));
+            }
+        }
+        // Collapse Play SIFCMD 0x80000011: signal the command semaphore so EE leaves WaitSema.
+        if (semaId != 0 && semaId < 0x10000)
+            kernel.ISignalSema((int)semaId);
+    }
+
+    /// <summary>Play! GENERICREPLY (header + result + 3 pad words) + signal command sema.</summary>
+    private void WriteFio2200GenericReply(SystemMemory mem, KernelState kernel,
+        uint semaId, uint commandId, uint result)
+    {
+        uint replyDest = _fio2200ResultPtr0;
+        if (replyDest != 0 && replyDest + 32 <= (uint)SystemMemory.RDRAM_SIZE)
+        {
+            mem.Write32(replyDest + 0, semaId);
+            mem.Write32(replyDest + 4, commandId);
+            mem.Write32(replyDest + 8, 0);
+            mem.Write32(replyDest + 12, 0);
+            mem.Write32(replyDest + 16, result);
+            mem.Write32(replyDest + 20, 0);
+            mem.Write32(replyDest + 24, 0);
+            mem.Write32(replyDest + 28, 0);
+        }
+        if (semaId != 0 && semaId < 0x10000)
+            kernel.ISignalSema((int)semaId);
+    }
+
+    /// <summary>
+    /// Play! <c>READCOMMAND</c>: header(12) + fd + buffer + size. Armed only when FILEIO-2200
+    /// is active so classic/SN decode stays the default.
+    /// </summary>
+    private static bool TryDecodeFio2200Read(SystemMemory mem, uint argBuf, uint sendSize,
+        out uint semaId, out uint cmdResultPtr, out uint cmdResultSize,
+        out int fd, out uint buf, out uint size)
+    {
+        semaId = 0;
+        cmdResultPtr = 0;
+        cmdResultSize = 0;
+        fd = -1;
+        buf = 0;
+        size = 0;
+        if (argBuf == 0 || sendSize < 24) return false;
+        semaId = mem.Read32(argBuf);
+        cmdResultPtr = mem.Read32(argBuf + 4);
+        cmdResultSize = mem.Read32(argBuf + 8);
+        fd = (int)mem.Read32(argBuf + 12);
+        buf = mem.Read32(argBuf + 16);
+        size = mem.Read32(argBuf + 20);
+        // fd must be a plausible IOMAN slot; buffer an EE pointer.
+        if (fd < 0 || fd > 15) return false;
+        if (!IsEeRamPointer(buf) && buf != 0) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Deliver deferred FILEIO-2200 READ replies (Play! one-frame delay). Called from
+    /// <see cref="BiosHle.OnVblank"/> so SotC EE threads can reschedule between CallRpc and
+    /// the command-sema wake.
+    /// </summary>
+    public void ProcessPendingFileIoReplies(SystemMemory mem, KernelState kernel)
+    {
+        if (!_fio2200ReadPending) return;
+        _fio2200ReadPending = false;
+        WriteFio2200GenericReply(mem, kernel, _fio2200ReadSema, FioRead, _fio2200ReadResult);
+        // Also stamp cmd resultPtr fields into the reply header for EE clients that check them.
+        uint replyDest = _fio2200ResultPtr0;
+        if (replyDest != 0 && replyDest + 16 <= (uint)SystemMemory.RDRAM_SIZE)
+        {
+            mem.Write32(replyDest + 8, _fio2200ReadCmdResultPtr);
+            mem.Write32(replyDest + 12, _fio2200ReadCmdResultSize);
+        }
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[FILEIO] delayed-read-reply result={_fio2200ReadResult} sema={_fio2200ReadSema}");
+    }
+
+
 
     /// <summary>
     /// Decode FILEIO OPEN send buffer.
