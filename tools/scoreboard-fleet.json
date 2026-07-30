@@ -1,0 +1,91 @@
+{
+  "description": "Default commercial menu campaign fleet for tools/scoreboard.ps1",
+  "defaultCycles": {
+    "diagnose": 20000000,
+    "verify": 50000000,
+    "claim": 100000000
+  },
+  "hostPresent": true,
+  "titles": [
+    {
+      "id": "mk-shaolin-monks",
+      "name": "MK Shaolin Monks",
+      "serial": "SLUS_210.87",
+      "media": "user-media-mk.json",
+      "menuKind": "mk-mainmenu",
+      "playSearch": "SLUS_210.87|Shaolin"
+    },
+    {
+      "id": "burnout-3",
+      "name": "Burnout 3: Takedown",
+      "serial": "SLUS_210.50",
+      "media": "burnout-only.json",
+      "menuKind": "logo-frontend",
+      "playSearch": "SLUS_210.50|Burnout"
+    },
+    {
+      "id": "blood-omen-2",
+      "name": "Blood Omen 2",
+      "serial": "SLUS_200.24",
+      "media": "user-media-bloodomen2.json",
+      "menuKind": "mainmenu-bg2",
+      "playSearch": "SLUS_200.24|Blood Omen"
+    },
+    {
+      "id": "god-of-war",
+      "name": "God of War",
+      "serial": "SCUS_973.99",
+      "media": "user-media-god-of-war.json",
+      "menuKind": "first-gs-interactive",
+      "playSearch": "SCUS_973.99|God of War"
+    },
+    {
+      "id": "mk-deception",
+      "name": "MK Deception",
+      "serial": "SLUS_208.81",
+      "media": "user-media-deception.json",
+      "menuKind": "midway-menu",
+      "playSearch": "SLUS_208.81|Deception"
+    },
+    {
+      "id": "mk-deadly-alliance",
+      "name": "MK Deadly Alliance",
+      "serial": "SLUS_204.23",
+      "media": "user-media-da.json",
+      "menuKind": "midway-menu",
+      "playSearch": "SLUS_204.23|Deadly Alliance"
+    },
+    {
+      "id": "vexx",
+      "name": "Vexx",
+      "serial": "SLUS_203.83",
+      "media": "user-media-vexx.json",
+      "menuKind": "title-surface",
+      "playSearch": "SLUS_203.83|Vexx"
+    },
+    {
+      "id": "whiplash",
+      "name": "Whiplash",
+      "serial": "SLUS_206.84",
+      "media": "user-media-whiplash.json",
+      "menuKind": "title-surface",
+      "playSearch": "SLUS_206.84|Whiplash"
+    },
+    {
+      "id": "haven",
+      "name": "Haven: Call of the King",
+      "serial": "",
+      "media": "user-media-haven.json",
+      "menuKind": "title-surface",
+      "playSearch": "Haven|Call of the King"
+    },
+    {
+      "id": "sotc",
+      "name": "Shadow of the Colossus",
+      "serial": "SCUS_974.72",
+      "media": "user-media-sotc.json",
+      "menuKind": "first-gs-interactive",
+      "playSearch": "SCUS_974.72|Colossus"
+    }
+  ]
+}

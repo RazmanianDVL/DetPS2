@@ -40,6 +40,22 @@ tools/bios-extract/
 # they land here, never commit them)
 mk-*.txt
 d[0-9]*.txt
+out/
+out/traces/
+# Root-level one-off investigation logs (use out/traces/ instead)
+b3-*.txt
+bo2-*.txt
+gow-*.txt
+sm-*.txt
+dec-*.txt
+*-err.txt
+*-out.txt
+v2-*.txt
+snap-*.txt
+*-final*.txt
+*-score*.txt
+*-menu*.txt
+*-rpc*.txt
 
 # OS
 Thumbs.db
