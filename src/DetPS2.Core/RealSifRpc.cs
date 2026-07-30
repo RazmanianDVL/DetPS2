@@ -3250,12 +3250,31 @@ public sealed class RealSifRpc
                 return got;
             }
 
-            case MflFnoStat:
+            case MflFnoStat: // 21 / 0x15 — DA "get file info" (0x22CC00), not a bare poll
             {
-                // Non-zero / 0 = ready (EE treats 0 as OK on several MFL polls).
-                if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
-                    mem.Write32(recvBuf, 0);
-                return 0;
+                // EE CallRpc fno=21 send=4 (handle) recv=40; then *(recv+4) & 8
+                // (andi v0,v0,8 @ 0x22CC98). poll@0x2F5C6C abandons if that is 0.
+                // +4 is FLAGS with bit3=ready; size lives at +16 (DA WAVE 3).
+                int h = argBuf != 0 && sendSize >= 4 ? (int)mem.Read32(argBuf) : 0;
+                uint fsz = 0;
+                if (_mflHandles.TryGetValue(h, out int fdInfo))
+                    iopModules.TryGetOpenFileSize(fdInfo, out fsz);
+                if (fsz == 0 && h > 0)
+                    fsz = 1;
+                const uint InfoReadyFlag = 0x8;
+                if (recvBuf != 0)
+                {
+                    uint lim = recvSize != 0 ? recvSize : 4u;
+                    for (uint o = 0; o + 4 <= lim && o < 40; o += 4)
+                        mem.Write32(recvBuf + o, 0);
+                    if (lim >= 4) mem.Write32(recvBuf, unchecked((uint)h));
+                    if (lim >= 8) mem.Write32(recvBuf + 4, InfoReadyFlag | (h > 0 ? 1u : 0u));
+                    if (lim >= 12) mem.Write32(recvBuf + 8, 0);
+                    if (lim >= 16) mem.Write32(recvBuf + 12, 1);
+                    if (lim >= 20) mem.Write32(recvBuf + 16, fsz);
+                    if (lim >= 24) mem.Write32(recvBuf + 20, fsz);
+                }
+                return h > 0 ? unchecked((int)InfoReadyFlag) : 0;
             }
 
             case MflFnoClose:
