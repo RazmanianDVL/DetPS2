@@ -3817,7 +3817,10 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Touch real PRECODE.BG2 + CODE.BG2 on disc (Blood Omen 2 usebigfile path) so path
-    /// resolution and cdvd telemetry prove the goefile payloads are reachable before title.
+    /// resolution proves goefile payloads are reachable before title.
+    /// Does <b>not</b> credit <see cref="Cdvd.SectorsRead"/> — host warm ≠ game load.
+    /// Inflating cdvd via warm (≈+1130 sectors) tripped title assists (WaitSema leave /
+    /// menu-kick at cdvd≥1600) before GOE bind sid=0x29 and ENGLISH.DIR / PRECODE Open.
     /// </summary>
     private void WarmBo2CodeBg2(IopModuleHost iopModules, Cdvd cdvd)
     {
@@ -3825,12 +3828,14 @@ public sealed class RealSifRpc
         _bo2CodeBg2Warmed = true;
         foreach (string name in new[] { "PRECODE.BG2", "CODE.BG2", @"RESOURCES\LEVELS\UI\MAINMENU.BG2" })
         {
-            int fd = TryOpenBo2RealBg2(iopModules, cdvd, @"cdrom0:\GOGAMES\BO2\" + name);
+            // countSectors: false — probe open only; game Open will credit real sectors.
+            int fd = TryOpenBo2RealBg2(iopModules, cdvd, @"cdrom0:\GOGAMES\BO2\" + name,
+                countSectors: false);
             if (fd >= 0)
             {
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                     && iopModules.TryGetOpenFileSize(fd, out uint sz))
-                    Console.Error.WriteLine($"[BO2] warm {name} size={sz}");
+                    Console.Error.WriteLine($"[BO2] warm {name} size={sz} (no sector credit)");
                 iopModules.FileClose(fd);
             }
         }
@@ -4360,7 +4365,12 @@ public sealed class RealSifRpc
     /// Open real PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2 (and other level .BG2) from the ISO,
     /// including ISO 9660 Level-1 short-name aliases (RESOURCES→RESOUR~1, etc.).
     /// </summary>
-    private int TryOpenBo2RealBg2(IopModuleHost iopModules, Cdvd cdvd, string path)
+    /// <param name="countSectors">
+    /// When false (host warm probe only), skip <see cref="Cdvd.NoteHostReadSectors"/> so
+    /// telemetry and title assists reflect game-initiated I/O only.
+    /// </param>
+    private int TryOpenBo2RealBg2(IopModuleHost iopModules, Cdvd cdvd, string path,
+        bool countSectors = true)
     {
         if (string.IsNullOrEmpty(path)) return -1;
         string p = path.Replace('/', '\\');
@@ -4412,7 +4422,10 @@ public sealed class RealSifRpc
         {
             int fd = iopModules.FileOpen(c, 1);
             if (fd < 0) continue;
-            if (iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+            // Only credit sectors for game-initiated opens (default). Host warm probes must
+            // not inflate cdvdSectors or title assists fire before GOE sid=0x29 / asset Open.
+            if (countSectors
+                && iopModules.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
             {
                 int sectors = fsz <= 16u * 1024 * 1024
                     ? (int)((fsz + 2047) / 2048)
@@ -4420,7 +4433,8 @@ public sealed class RealSifRpc
                 cdvd.NoteHostReadSectors(sectors);
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                Console.Error.WriteLine($"[BO2] real BG2 open path=\"{c}\" fd={fd}");
+                Console.Error.WriteLine(
+                    $"[BO2] real BG2 open path=\"{c}\" fd={fd} countSectors={countSectors}");
             return fd;
         }
         return -1;

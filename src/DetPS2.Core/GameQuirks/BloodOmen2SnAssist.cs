@@ -255,8 +255,10 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private void PulseWaiters(Ps2System sys)
     {
         ulong c = sys.Scheduler.MasterCycles;
-        // Faster pulse once RKV/FILEIO is live — residual WaitSema park at 0x488898.
-        ulong interval = sys.Cdvd.SectorsRead >= 100 ? 80_000UL : 250_000UL;
+        // PulseWaiters only as backup — CompleteRpcEnd owns RPC WaitSema wake.
+        // Over-dense SignalSema (live w2 40k) can race STALLING completion and leave
+        // CallRpc with a half-updated frame → thrash at 0x5387xx after SN "Manager State".
+        ulong interval = sys.Cdvd.SectorsRead >= 100 ? 200_000UL : 250_000UL;
         if (c - _lastPulseCyc < interval) return;
         _lastPulseCyc = c;
         var k = sys.Hle.Kernel;
@@ -286,95 +288,19 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             _snQuietPatches++;
         }
 
-        // Soft-stub SN ProDG printf (entry 0x46FAF8 → CallRpc sid=0x534E03) after GOE/RKV
-        // is live. Debug prints park on WaitSema and flood SIFCMD ASCII; they are not the
-        // MAINMENU draw path. Permanent jr-ra so boot can open PRECODE/CODE.BG2 instead.
-        if (sys.Cdvd.SectorsRead >= 1000 && sys.Gs.PixelsWritten < 50_000)
+        // Soft-stub SN only after real asset I/O (cdvd past RKV token ≈380). Stubbing
+        // during the post-0x29 SN storm cuts calls 95→61 and still thrashes (live w2j).
+        // Leave natural SN CallRpc until ENGLISH.DIR / PRECODE push cdvd.
+        if (sys.Cdvd.SectorsRead >= 450 && sys.Gs.PixelsWritten < 50_000)
             SoftStubSnPrintf(sys);
 
-        // Post-GOE: EE parks in WaitSema body at 0x488898. Callers vary:
-        //   - SN printf (0x46FB80): jal WaitSema; lw v1,(gp-32752); bne v1,v0,fail
-        //   - RPC Bind/Call complete (0x48AF30 / 0x48B1D8 / 0x48BCxx): natural ra resume
-        // Live menu14–19 always forced 0x46FB88 — that hijacked EVERY RPC completion into
-        // SN printf with a wrong frame, thrashing exception vectors / data-as-code and
-        // preventing PRECODE/CODE/MAINMENU Open (find-string .BG2 still empty @30M).
-        // Only force the SN match path when $ra is actually in the SN printf body.
-        if (sys.Cdvd.SectorsRead >= 1600 && sys.Gs.PixelsWritten < 50_000)
-        {
-            uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-            if (pcW is >= 0x00488890 and <= 0x00488920 && (c - _lastTitleSmCyc) >= 100_000)
-            {
-                uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-                uint a0Sema = (uint)(sys.EE.GetGpr(4).Lo & 0xFFFFFFFFUL); // WaitSema arg
-                uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
-                uint expected = 0;
-                if (gp is >= 0x00400000 and < 0x01000000)
-                {
-                    uint cell = unchecked((uint)((int)gp - 32752));
-                    if (cell is >= 0x00400000 and < 0x01000000)
-                        expected = sys.Memory.Read32(cell);
-                }
+        // WaitSema body: do not force PC. CompleteRpcEnd + STALLING owns RPC leave.
+        // Structural SignalSema is enough (PulseWaiters above). Forcing $ra/$pc here
+        // was the menu14–19 thrash class and blocked post-0x29 FILEIO (live w2d/e).
 
-                bool snCaller = raW is >= 0x0046FAF8 and <= 0x0046FC80;
-                // Policy: WaitSema returns semaphore id (a0). SN match needs v0==*(gp-32752).
-                uint v0Out = snCaller && expected != 0 ? expected : (a0Sema != 0 ? a0Sema : expected);
-                uint resumeW = 0;
-                if (snCaller)
-                {
-                    // SN: complete delay-slot match at 0x46FB88.
-                    resumeW = 0x0046FB88;
-                    sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = expected }); // v1 match
-                }
-                else if (IsSafeCodeTarget(sys, raW) && raW is >= 0x0048AF00 and <= 0x0048C800)
-                {
-                    // RPC client complete — return to real caller (do NOT divert to SN).
-                    resumeW = raW;
-                }
-                else if (IsSafeCodeTarget(sys, raW) && raW != pcW)
-                {
-                    resumeW = raW;
-                }
-
-                if (resumeW == 0)
-                {
-                    // Unknown frame: leave PC alone after SignalSema; only soft-nudge v0.
-                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v0Out });
-                    _lastTitleSmCyc = c;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                        && _menuDrawKicks < 8)
-                        Console.Error.WriteLine(
-                            $"[BO2] WaitSema Signal only ra=0x{raW:X8} v0=0x{v0Out:X8} cyc={c}");
-                }
-                else
-                {
-                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v0Out });
-                    sys.EE.PC = resumeW;
-                    sys.EE.COP0_Status &= ~0x6u;
-                    _menuDrawKicks++;
-                    _lastTitleSmCyc = c;
-                    ArmGifPath3(sys);
-                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                    catch { /* ignore */ }
-
-                    // After SN leaves still thrash: soft-stub whole SN printf entry (preferred
-                    // over nop'ing only the WaitSema jal — keeps epilogue $ra frames intact).
-                    if (snCaller && _menuDrawKicks >= 2)
-                        SoftStubSnPrintf(sys);
-
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
-                        Console.Error.WriteLine(
-                            $"[BO2] leave WaitSema park ra=0x{raW:X8} -> 0x{resumeW:X8} " +
-                            $"v0=0x{v0Out:X8} sn={snCaller} n={_menuDrawKicks} " +
-                            $"px={sys.Gs.PixelsWritten} cyc={c}");
-                }
-            }
-        }
-
-        // After MAINMENU.BG2, main sometimes ends started=False (live menu5/15) — re-start
-        // so UI/draw path can run past RPC-complete plateau. Also re-start any dead peer
-        // with a real entry once assets are warm.
-        if (sys.Cdvd.SectorsRead >= 1600)
+        // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
+        // started=False — re-start so boot can continue past RPC-complete plateau.
+        if (sys.Cdvd.SectorsRead >= 200)
         {
             foreach (var t in k.AllThreads)
             {
@@ -394,96 +320,26 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // After leave WaitSema→0x46FB88, live menu15 hit exception→0xA227xx data thrash.
-        // If PC is past ELF .text or high unpacked blob, force safe resume + PATH3 arm.
-        // Live menu16 final PC 0x46FC74 (post-match body) with px=3 — arm PATH3 + pad and
-        // after many visits walk to mid-title draw sites.
-        if (sys.Cdvd.SectorsRead >= 1600 && sys.Gs.PixelsWritten < 50_000)
+        // Data thrash / SN body rescue only after real asset I/O (cdvd≥500). During the
+        // post-0x29 SN storm any PC yank races CallRpc and blocks ENGLISH.DIR (live w2).
+        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 50_000)
         {
             uint pcBad = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             if (pcBad is >= 0x00A00000 or (>= 0x004A0000 and < 0x02000000)
                 || pcBad is >= 0x001C0000 and <= 0x001C1000)
             {
                 uint resume = PickSafeResume(sys, pcBad);
-                if (resume == 0) resume = 0x002D71E4; // live stable final band
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.PC = resume;
-                sys.EE.COP0_Status &= ~0x6u;
-                ArmGifPath3(sys);
-                _titleSmEscapes++;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_titleSmEscapes <= 12 || _titleSmEscapes % 16 == 0))
-                    Console.Error.WriteLine(
-                        $"[BO2] rescue post-MAINMENU data thrash 0x{pcBad:X8} -> 0x{resume:X8} cyc={c}");
-            }
-            else if (pcBad is >= 0x0046FC54 and <= 0x0046FC78 && (c - _lastTitleSmCyc) >= 100_000)
-            {
-                // SN-channel function epilogue (jr ra @ 0x46FC70 / delay 0x46FC74).
-                // Follow stack/live $ra into real caller instead of thrashing PATH3 here.
-                uint raEpi = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-                uint spEpi = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-                uint resumeEpi = IsSafeCodeTarget(sys, raEpi) ? raEpi : 0;
-                if (resumeEpi == 0 && spEpi is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0xA0)
+                if (resume != 0 && resume != pcBad)
                 {
-                    uint stackRa = sys.Memory.Read32(spEpi + 144) & 0x1FFFFFFFu;
-                    if (IsSafeCodeTarget(sys, stackRa))
-                        resumeEpi = stackRa;
-                }
-                if (resumeEpi == 0)
-                    resumeEpi = IsSafeCodeTarget(sys, 0x002D71E4) ? 0x002D71E4u : 0x0048A980u;
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.PC = resumeEpi;
-                sys.EE.COP0_Status &= ~0x6u;
-                ArmGifPath3(sys);
-                _menuDrawKicks++;
-                _lastTitleSmCyc = c;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_menuDrawKicks <= 20 || _menuDrawKicks % 16 == 0))
-                    Console.Error.WriteLine(
-                        $"[BO2] SN epilogue follow ra -> 0x{resumeEpi:X8} n={_menuDrawKicks} " +
-                        $"px={sys.Gs.PixelsWritten} cyc={c}");
-            }
-            else if (pcBad is >= 0x0046FB88 and <= 0x0046FD00 && (c - _lastTitleSmCyc) >= 200_000)
-            {
-                // Residual in SN printf body — soft-stub entry and jump to epilogue with v0=0
-                // so caller $ra resumes natural boot (FILEIO/GOE Open of PRECODE/CODE).
-                SoftStubSnPrintf(sys);
-                ArmGifPath3(sys);
-                try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                catch { /* ignore */ }
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.PC = 0x0046FC54; // epilogue restore / jr ra
-                sys.EE.COP0_Status &= ~0x6u;
-                _menuDrawKicks++;
-                _lastTitleSmCyc = c;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_menuDrawKicks <= 20 || _menuDrawKicks % 16 == 0))
-                    Console.Error.WriteLine(
-                        $"[BO2] SN body → epilogue pc was 0x{pcBad:X8} n={_menuDrawKicks} " +
-                        $"px={sys.Gs.PixelsWritten} cyc={c}");
-            }
-            // List-walk thrash at 0x2CD7E0 (lw v0,16392(s1)) with bad s1 after false resume.
-            else if (pcBad is >= 0x002CD7C0 and <= 0x002CD810 && (c - _lastTitleSmCyc) >= 150_000)
-            {
-                uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
-                bool badS1 = s1 < 0x00100000 || s1 >= (uint)SystemMemory.RDRAM_SIZE || (s1 & 3) != 0;
-                if (badS1 || sys.Gs.PixelsWritten < 100)
-                {
-                    // Skip to post-loop jal 0x4815C8 path with v0 safe, or safer mid-title.
-                    uint resume = 0x002CD800;
-                    if (!IsSafeCodeTarget(sys, resume) || _menuDrawKicks >= 8)
-                        resume = IsSafeCodeTarget(sys, 0x002D71E4) ? 0x002D71E4u : 0x0048A980u;
-                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
                     sys.EE.PC = resume;
                     sys.EE.COP0_Status &= ~0x6u;
                     ArmGifPath3(sys);
-                    _menuDrawKicks++;
-                    _lastTitleSmCyc = c;
+                    _titleSmEscapes++;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
+                        && (_titleSmEscapes <= 12 || _titleSmEscapes % 16 == 0))
                         Console.Error.WriteLine(
-                            $"[BO2] escape 0x2CD7xx list s1=0x{s1:X8} -> 0x{resume:X8} " +
-                            $"n={_menuDrawKicks} cyc={c}");
+                            $"[BO2] rescue post-asset data thrash 0x{pcBad:X8} -> 0x{resume:X8} cyc={c}");
                 }
             }
         }
@@ -509,17 +365,15 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
         }
 
-        // After MAINMENU.BG2 warm: rescue PC when EE is executing DATA / NOP-sleds
-        // (prior "menu-draw kick" to 0x479E04 was mid bit-pack utility — not UI; 0x5387xx
-        // is goefile data tables mis-executed as code). Do NOT yank WaitSema@0x488898.
-        // Also leave exception vector (live score: PC=0x80000198 after bad resume).
-        if (sys.Cdvd.SectorsRead >= 400)
+        // Exception vector rescue only (always safe). Defer data/NOP rescue until assets
+        // (cdvd≥500) so post-0x29 SN storm is not PC-yanked mid-CallRpc.
+        if (sys.Cdvd.SectorsRead >= 200)
         {
             uint pcNow = (uint)(sys.EE.PC & 0xFFFFFFFFUL);
             if (pcNow is >= 0x80000180 and <= 0x80000200 || (pcNow & 0x1FFFFFFFu) < 0x00100000u)
             {
                 uint resume = PickSafeResume(sys, pcNow & 0x1FFFFFFFu);
-                if (resume == 0) resume = 0x0048AF30;
+                if (resume == 0) resume = 0x0048AF30; // RPC complete (not cold 0x48A980)
                 sys.EE.COP0_Status &= ~0x6u;
                 sys.EE.PC = resume;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -529,74 +383,19 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 _titleSmEscapes++;
                 _lastTitleSmCyc = c;
             }
-            else
+            else if (sys.Cdvd.SectorsRead >= 500)
                 MaybeRescueBadPc(sys, c);
         }
-        // Post-MAINMENU cache flush loop at 0x48A9xx (sync+cache, t2 countdown) parks
-        // for tens of M cycles under HLE cache-as-nop — clamp t2 so draw path can run.
-        if (sys.Cdvd.SectorsRead >= 1000)
+        // Cache-flush leaf: only after real asset I/O. Stubbing during post-0x29 SN storm
+        // (cdvd≈380) can corrupt frames if 0x48A8D0 is mid-call-chain (live w2h thrash).
+        if (sys.Cdvd.SectorsRead >= 500)
             MaybeSkipCacheFlush(sys, c);
-        if (sys.Cdvd.SectorsRead >= 1000 && sys.Gs.PixelsWritten < 10_000)
+        // Menu-draw kick only after real asset I/O (ENGLISH.DIR / PRECODE push cdvd≫500).
+        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 10_000)
             MaybeKickMenuDraw(sys, c);
 
-        // Live menu18: after SN leave, lands at 0x48A9B8 (j 0x48CF50 / sp+=64 early-out
-        // of post-flush init when *0x49C108 != 0). Force the jump target so EI / return
-        // completes and caller can resume toward MAINMENU draw.
-        if (sys.Cdvd.SectorsRead >= 1600 && sys.Gs.PixelsWritten < 50_000)
-        {
-            uint pcEi = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-            if (pcEi is >= 0x0048A9A8 and <= 0x0048A9C0 && (c - _lastTitleSmCyc) >= 100_000)
-            {
-                sys.EE.PC = 0x0048CF50; // mfc0 Status; ei; jr ra
-                sys.EE.COP0_Status &= ~0x6u;
-                // Ensure $ra is real so after 0x48CF50 returns we land somewhere useful.
-                uint raEi = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-                if (!IsSafeCodeTarget(sys, raEi))
-                {
-                    uint plant = IsSafeCodeTarget(sys, 0x0048A980) ? 0x0048A980u : 0x004891A0u;
-                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = plant });
-                }
-                ArmGifPath3(sys);
-                _menuDrawKicks++;
-                _lastTitleSmCyc = c;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
-                    Console.Error.WriteLine(
-                        $"[BO2] force post-flush EI path 0x{pcEi:X8} -> 0x48CF50 " +
-                        $"n={_menuDrawKicks} px={sys.Gs.PixelsWritten} cyc={c}");
-            }
-            // After EI helper (0x48CF50..64) with low px: only follow a real $ra.
-            // Never blind-kick 0x4520B0 — that prologue needs a live object in a0
-            // (live menu19 thrash + UnknownOpcode at 0x5378xx data).
-            else if (pcEi is >= 0x0048CF50 and <= 0x0048CF64 && (c - _lastTitleSmCyc) >= 150_000)
-            {
-                uint ra2 = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-                if (IsSafeCodeTarget(sys, ra2) && ra2 is not (>= 0x004520B0 and <= 0x004520D0))
-                {
-                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                    sys.EE.PC = ra2;
-                    sys.EE.COP0_Status &= ~0x6u;
-                    ArmGifPath3(sys);
-                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                    catch { /* ignore */ }
-                    _menuDrawKicks++;
-                    _lastTitleSmCyc = c;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                        && (_menuDrawKicks <= 16 || _menuDrawKicks % 16 == 0))
-                        Console.Error.WriteLine(
-                            $"[BO2] leave EI helper -> 0x{ra2:X8} n={_menuDrawKicks} " +
-                            $"px={sys.Gs.PixelsWritten} cyc={c}");
-                }
-                else
-                {
-                    // Let jr ra complete naturally; only arm PATH3 + pad.
-                    ArmGifPath3(sys);
-                    try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
-                    catch { /* ignore */ }
-                    _lastTitleSmCyc = c;
-                }
-            }
-        }
+        // Post-flush EI / menu path: only after real asset I/O (cdvd≥500). During the
+        // post-0x29 SN storm (cdvd≈380) any PC yank races CallRpc complete → 0x5387xx.
     }
 
     private bool _snPrintfStubbed;
@@ -604,7 +403,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// <summary>
     /// SN ProDG printf channel entry at <c>0x46FAF8</c> (sp-=160, CallRpc sid=0x534E03).
     /// Soft-stub to <c>jr ra; li v0,0</c> so debug prints cannot park WaitSema after GOE.
-    /// Not the MAINMENU draw path (disasm: a1=0x534E03).
+    /// Not the MAINMENU draw path (disasm: a1=0x534E03). Only after real asset I/O.
     /// </summary>
     private void SoftStubSnPrintf(Ps2System sys)
     {
