@@ -200,9 +200,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         else if (_lgDevPostCleared && (sys.MasterCycles % 500_000) < 50_000)
             sys.Memory.Write32(LgDevPostFlag, 0); // sticky: game may re-set
 
-        // After IRX/LGDEV path is open, periodically wake SleepThread parks + pad so boot can
-        // reach FILEIO assets and a presentable menu surface.
-        if (sys.MasterCycles >= 22_000_000 && sys.Cdvd.SectorsRead > 0)
+        // After first LGDEV force, wake SleepThread/pad. Delay past force so CallRpc frames
+        // settle (menu-kick at force-cycle planted STAGEHED + boot-wait and broke residual).
+        if (sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead > 0 && _lgDevFullyDone)
             MaybeKickPostGtfsMenu(sys);
 
         // Direct flip-leave once LGDEV is done — do not depend solely on menu-kick cadence
@@ -210,9 +210,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (_lgDevFullyDone && sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead >= 400)
             MaybeLeaveFlipPark(sys);
 
-        // After IRX/LGDEV, plant STAGEHED into EE RDRAM so empty-iovec / stream walks see
-        // non-zero size words and host cdvd leaves IRX-only 425 (pairs with RealSifRpc GTFS).
-        if (_lgDevFullyDone && sys.MasterCycles >= 30_000_000 && sys.Cdvd.SectorsRead >= 400)
+        // Plant STAGEHED only after residual LGDEV CallRpc has stabilized (menu4/final10:
+        // residual ~48× at sp@FC10 then STG). Planting at force-cycle (22M) disturbed
+        // frames and left PC in deep LGDEV (0x444904) with STG never bound.
+        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && _lgDevEscapes >= 8
+            && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
 
         if (sys.MasterCycles < 16_000_000) return;
@@ -433,27 +435,52 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // Sticky: after first clean exit, keep lgDeviceInit a no-op. Residual CallRpc on
         // the LGDEV client (leaf 0x443DB0): complete and stub the leaf so fno≠12 cannot
         // re-enter cid=0 thrash. Prefer epilogue 0x443D94 over re-entry into CallRpc.
+        // Wave-4: fix dead $ra at leaf delay-slot 0x443DA8 (parent post-jal). Residual
+        // only on main high-stack (menu4 stable FC10); rewrite whole LGDEV .text savedRa.
         if (_lgDevFullyDone)
         {
             PlantLgDevEntryStub(sys);
             PlantLgDevCallRpcLeafStub(sys);
             sys.Memory.Write32(LgDevPostFlag, 0);
+
+            // 0x443DA8 = delay slot of leaf jr ra (ld ra; jr ra; addiu sp,48). Dead $ra
+            // → parent post-jal 0x4427FC and re-issue jr. Do NOT hard-leave mid-body.
+            if (pc == 0x00443DA8u)
+            {
+                bool badRa = ra < 0x00100000 || ra >= 0x00400000
+                    || ra is (>= 0x00443800 and < 0x00445000)
+                    || ra is (>= 0x00443D80 and <= 0x00443DB0);
+                if (badRa)
+                {
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x004427FCu });
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                    sys.EE.PC = 0x00443DA4; // jr ra
+                    sys.EE.COP0_Status &= ~(1u << 1);
+                    _lgDevEscapes++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                        && (_lgDevEscapes <= 12 || _lgDevEscapes % 16 == 0))
+                        Console.Error.WriteLine(
+                            $"[B3] fix leaf jr-ra delay pc=0x443DA8 ra was 0x{ra:X8} " +
+                            $"-> ra=0x4427FC n={_lgDevEscapes} cyc={sys.MasterCycles}");
+                }
+                return;
+            }
+
             if (IsLgDevCallRpcThrash(sys, pc, ra) && _lgDevEscapes < 256)
             {
                 uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-                if (sp is >= 0x01E00000 and < 0x02000000)
+                // Main high-stack only — worker 0x01EDxxxx completes diverged residual vs menu4.
+                if (sp is >= 0x01FFF000 and < 0x02000000)
                 {
                     uint savedRa = sys.Memory.Read32(sp + 176) & 0x1FFFFFFFu;
-                    // Any return into LGDEV CallRpc leaf body → snap to its epilogue.
-                    if (savedRa is >= 0x00443D00 and <= 0x00443DAC
+                    // Whole LGDEV .text + CallRpc body → leaf epi (deep 0x443E30+ was unbound).
+                    if (savedRa is >= 0x00443800 and < 0x00445000
                         || savedRa is < 0x00100000 or >= 0x00800000
-                        || savedRa is (>= 0x0010BE00 and <= 0x0010F400)
-                        || savedRa is (>= 0x004438E0 and <= 0x00443C6C))
+                        || savedRa is (>= 0x0010BE00 and <= 0x0010F400))
                     {
-                        // 0x443D94 = ld s0 / restore / jr ra of the CallRpc leaf.
-                        sys.Memory.Write32(sp + 176, 0x00443D94);
+                        sys.Memory.Write32(sp + 176, 0x00443D94u);
                         sys.Memory.Write32(sp + 180, 0);
-                        savedRa = 0x00443D94;
+                        savedRa = 0x00443D94u;
                     }
                     sys.Memory.Write32(0x01ECDF00, 0);
                     sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -466,6 +493,19 @@ public sealed class Burnout3Assist : IGameQuirkModule
                             $"[B3] residual LGDEV CallRpc complete pc=0x{pc:X8} sp=0x{sp:X8} " +
                             $"savedRa=0x{savedRa:X8} n={_lgDevEscapes} cyc={sys.MasterCycles}");
                 }
+            }
+            // Deep LGDEV body after bad residual return — snap to parent post-jal.
+            else if (pc is >= 0x00443E00 and < 0x00445000 && _lgDevEscapes >= 2)
+            {
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = 0x004427FCu;
+                sys.EE.COP0_Status &= ~(1u << 1);
+                _lgDevEscapes++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_lgDevEscapes <= 12 || _lgDevEscapes % 16 == 0))
+                    Console.Error.WriteLine(
+                        $"[B3] leave deep LGDEV pc=0x{pc:X8} -> 0x4427FC n={_lgDevEscapes} " +
+                        $"cyc={sys.MasterCycles}");
             }
             return;
         }
@@ -517,7 +557,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // (0x10F3A0). Live: dest-climbing cid=0 SIFCMD on recv 0x01ECDF40.
         // Force the *entire* lgDeviceInit success epilogue so boot leaves the wheel path.
         // Only when CallRpc's s1 (cd) is the LGDEV client at 0x01ECDF00 — never other RPCs.
-        if (IsLgDevCallRpcThrash(sys, pc, ra) && sys.MasterCycles >= 22_000_000 && _lgDevEscapes < 256)
+        // Gate ≥18M (not 22M): FILEIO GetVersion now returns ASCII "2800" so version+thrash
+        // arrives earlier; waiting to 22M left force on already-diverged sp@FC10 (menu4 was
+        // force-at-version with sp@FC00 → stable residual → STG).
+        if (IsLgDevCallRpcThrash(sys, pc, ra) && sys.MasterCycles >= 18_000_000 && _lgDevEscapes < 256)
         {
             uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
             // Permanent structural break of fno=18 path.
@@ -736,9 +779,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // epilogue so callers can fall through to real FILEIO/NCMD open.
         MaybeEscapeEmptyIoQueue(sys);
 
-        // Proactive permanent table-walk stub once past flip (gifP3 climbing, still IRX-only).
-        if (_lgDevFullyDone && _vblankExits >= 2 && sys.Gif.Path3Transfers >= 30
-            && sys.Cdvd.SectorsRead < 800
+        // Proactive table-walk stub only after STG window — early stub blocked menu4 STG path.
+        if (_lgDevFullyDone && _vblankExits >= 4 && sys.Gif.Path3Transfers >= 90
+            && sys.Cdvd.SectorsRead is >= 600 and < 2000
+            && sys.MasterCycles >= 55_000_000
             && sys.Memory.Read32(0x003E9B40) != 0x03E00008u)
         {
             sys.Memory.Write32(0x003E9B40, 0x03E00008u); // jr ra
@@ -998,8 +1042,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.Cdvd.SectorsRead < 400) return;
         if (_ioQueueEscapes >= 256) return;
 
-        // Ensure STAGEHED is in EE before we try to plant an iovec.
-        if (!_stageAssetsPlanted)
+        // Ensure STAGEHED is in EE before we try to plant an iovec (same settle gate).
+        if (!_stageAssetsPlanted && sys.MasterCycles >= 28_000_000 && _lgDevEscapes >= 8)
             MaybePlantStageAssets(sys);
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
@@ -1008,10 +1052,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
             or (>= 0x00124020 and <= 0x00124050); // memcpy tail of same family (a2 countdown)
         if (!inScan)
         {
-            // Only permanent-stub empty heads when still IRX-only AND no stage plant.
-            // Once STAGEHED is in RDRAM, let natural iovec walk find planted entries.
-            if (!_ioQueueStubPlanted && _vblankExits >= 2 && sys.Gif.Path3Transfers >= 30
-                && sys.Cdvd.SectorsRead < 500 && _stageHedSize == 0)
+            // Do NOT permanent-stub empty iovec before STG bind (menu4 reached STG without).
+            if (!_ioQueueStubPlanted && _vblankExits >= 4 && sys.Gif.Path3Transfers >= 90
+                && sys.Cdvd.SectorsRead is >= 600 and < 900 && _stageHedSize == 0
+                && sys.MasterCycles >= 55_000_000)
             {
                 sys.Memory.Write32(0x00122990, 0x08048B2Fu); // j 0x00122CBC
                 sys.Memory.Write32(0x00122994, 0x0000102Du);

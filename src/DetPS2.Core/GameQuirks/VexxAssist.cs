@@ -58,6 +58,8 @@ public sealed class VexxAssist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
+        if (sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantIopRpVersion(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
             Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 version plant ready");

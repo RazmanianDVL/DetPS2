@@ -735,6 +735,136 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
     }
 
+    private int _syscallTrampolineEscapes;
+    private ulong _lastSyscallTrampolineEscCyc;
+    private int _logoSpineKicks;
+    private ulong _lastLogoSpineKickCyc;
+
+    /// <summary>
+    /// Post-merge / GetModVer-fixed path: EE thrives in ADX pump + pad-poll bands after WAD
+    /// (PC 0x414xxx / 0x4275xx / 0x429Cxx, syscalls climbing) but never re-enters the
+    /// list-walk→format-stall sequence that menu6 used to restore gifP3 5→12. Mirror that
+    /// format-stall re-home to Midway main when logo spine is still frozen post-WAD.
+    /// Does <b>not</b> set PreferIopRpGetVersion / PadModVerMajor4 (SM needs classic defaults).
+    /// </summary>
+    private void MaybeKickMainForLogoSpine(Ps2System sys)
+    {
+        if (_logoSpineKicks >= 8) return;
+        if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_000_000) return;
+        if (sys.Gif.Path3Transfers >= 11) return;
+        if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inPostWadThrash = pc is (>= 0x00414000 and <= 0x00416000)
+            or (>= 0x00427000 and <= 0x0042A000)
+            or (>= 0x0047FD00 and <= 0x0047FF80)
+            or (>= 0x00418000 and <= 0x00419000);
+        if (!inPostWadThrash) return;
+
+        // Prefer natural stack return when present.
+        uint resume = 0x00212F70;
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            for (uint off = 0; off <= 0x80; off += 4)
+            {
+                uint cand = sys.Memory.Read32(sp + off) & 0x1FFFFFFFu;
+                if (cand is >= 0x00212F70 and < 0x00214000 && sys.Memory.IsLikelyEeCode(cand))
+                {
+                    resume = cand;
+                    break;
+                }
+            }
+        }
+
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        if (sp < 0x01000000 || sp >= (uint)SystemMemory.RDRAM_SIZE)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        // Clear ADX pump-stop so main's frame path can re-arm pump.
+        if (sys.Memory.Read32(0x005341D8) == 0)
+            sys.Memory.Write32(0x005341D8, 1);
+        sys.Memory.Write32(0x00534164, 0);
+        sys.Memory.Write32(0x00534218, 0);
+
+        var kernel = sys.Hle?.Kernel;
+        if (kernel != null)
+        {
+            foreach (var t in kernel.AllThreads)
+            {
+                if (!t.Alive) continue;
+                if (t.SoftSuspended) t.SoftSuspended = false;
+                while (t.SuspendCount > 0) kernel.ResumeThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                    kernel.WakeupThread(t.Id);
+                if (t.Sleeping && t.WaitSemaId > 0 && t.WaitSemaId < 64)
+                {
+                    try { kernel.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                }
+            }
+        }
+
+        _lastLogoSpineKickCyc = sys.MasterCycles;
+        _logoSpineKicks++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_logoSpineKicks <= 12 || _logoSpineKicks % 4 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] logo-spine kick 0x{pc:X8} -> 0x{resume:X8} n={_logoSpineKicks} " +
+                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Live (GetModVer 0x0400 path / open-bus residual): EE walks the kernel syscall stub
+    /// table at <c>0x47FD80..0x47FF80</c> (<c>addiu v1,imm; syscall; jr ra</c>) with
+    /// <c>ra=0</c> and low SP — pure thrash, no game progress. Re-home to ADX pump / main
+    /// with a real stack so bulk WAD / logo spine can continue.
+    /// </summary>
+    private void MaybeEscapeSyscallTrampolineThrash(Ps2System sys)
+    {
+        if (_syscallTrampolineEscapes >= 32) return;
+        if (sys.MasterCycles - _lastSyscallTrampolineEscCyc < 200_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // Stub table: 16-byte entries, addiu v1 + syscall + jr ra + nop.
+        if (pc is < 0x0047FD00 or > 0x0047FF80) return;
+        uint op = sys.Memory.Read32(pc);
+        // Match either the addiu v1,imm (0x2403xxxx) or the jr ra (0x03E00008) of a stub.
+        bool looksStub = (op & 0xFFFF0000u) == 0x24030000u || op == 0x03E00008u || op == 0x0000000Cu;
+        if (!looksStub) return;
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        // Legitimate syscall path: ra points into the ELF image (e.g. ADX pump 0x4148EC).
+        // Only treat as thrash when $ra is clearly dead (0 / low / past RDRAM / open bus).
+        // Using !IsLikelyEeCode was too aggressive — yanked live pump↔syscall traffic and
+        // blocked list-walk / format-stall escapes that restore gifP3 5→12.
+        bool raDead = ra < 0x00100000 || ra >= (uint)SystemMemory.RDRAM_SIZE;
+        if (!raDead) return;
+
+        uint resume = 0;
+        if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+            resume = 0x00212F70; // Midway main (prefer for spine restore)
+        else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
+            resume = 0x004147F8; // ADX pump
+        else if (sys.Memory.IsLikelyEeCode(0x00414590UL))
+            resume = 0x00414590;
+        if (resume == 0) return;
+
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (sp < 0x00100000 || sp >= (uint)SystemMemory.RDRAM_SIZE || sp < 0x01000000)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+        _lastSyscallTrampolineEscCyc = sys.MasterCycles;
+        _syscallTrampolineEscapes++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_syscallTrampolineEscapes <= 8 || _syscallTrampolineEscapes % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] escape syscall trampoline thrash 0x{pc:X8} -> 0x{resume:X8} " +
+                $"ra=0x{ra:X8} n={_syscallTrampolineEscapes} cyc={sys.MasterCycles}");
+    }
+
     /// <summary>
     /// If EE is stuck forever at the synthesized interrupt vector (0x80000200 bare eret),
     /// or executing our HLE scratch (0x01FD0000–0x01FEFFFF: synthetic SIF packets / CRI stubs),
@@ -1131,6 +1261,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // force natural return + wake pump/menu path so gifP3 can leave logo spine (5→11+).
         if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeEscapePostListFormatStall(sys);
+        // Post-merge path parks in ADX/pad bands (0x414xxx/0x4275xx/0x429Cxx) at gifP3=5
+        // without ever re-entering format/list-walk. After bulk WAD, force the same main
+        // re-home menu6 used after format stall so logo spine can advance (gifP3 5→12).
+        if (c >= 58_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && sys.Gif.Path3Transfers < 11)
+            MaybeKickMainForLogoSpine(sys);
         // Pad inject START/CROSS after bulk WAD so title/menu can observe input.
         // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
@@ -1162,6 +1298,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeGuardVuBlitCodeDest(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
+        // EE syscall trampoline table thrash (ra=0 walk through 0x47FDxx) after open-bus.
+        if (c >= 12_000_000)
+            MaybeEscapeSyscallTrampolineThrash(sys);
 
         // --- PC-range Midway assists (opt-out via --no-assist) ---
         if (Ps2System.DisableMidwayAssist)
@@ -2221,35 +2360,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Clear loop at <c>0x385278</c>: <c>sw zero,0(a1); a1+=4; bne a1,a2</c>.
     /// When <c>a2 &lt; a1</c> or remain is huge the loop <b>zeros EE code</b> (live:
     /// main <c>0x212F70</c> wiped; progressive a1 walked 0x670→0x1081e0 across breaks).
-    /// After bulk WAD: permanently stub the clear function to <c>jr ra</c> so re-entry
-    /// cannot keep advancing a1 through the ELF image. No break-count cap.
+    /// Do NOT permanently jr-ra-stub on WAD load — legitimate clears of real heap ranges
+    /// must still run (early stub regressed object bases / spine restore). Prefer nop of
+    /// the back-edge after spine + full stub only after repeated absurd hits.
     /// </summary>
     private void MaybeBreakMenuMemset(Ps2System sys)
     {
-        // Permanent stub once WAD is bulk-loaded: replace clear body with jr ra / nop.
-        // Live: back-edge-only nop was not enough — caller re-entered with advancing a1
-        // and 128 break cap then allowed free wipe of 0x100000.. code.
-        if (sys.Cdvd.SectorsRead >= 100_000 && !_memsetFnStubbed)
-        {
-            // 0x385278 is the store; epilogue jr ra at 0x385294. Stub entry of the
-            // tight loop so any path into the clear becomes an immediate return.
-            // Keep delay-slot friendly: jr ra; nop at 0x385278.
-            sys.Memory.Write32(0x00385278, 0x03E00008u); // jr ra
-            sys.Memory.Write32(0x0038527C, 0x00000000u); // nop
-            // Also nop historical back-edge if present.
-            if (sys.Memory.Read32(0x0038528C) != 0u)
-                sys.Memory.Write32(0x0038528C, 0u);
-            _memsetFnStubbed = true;
-            Assists++;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                Console.Error.WriteLine(
-                    $"[BIOS] stub menu memset 0x385278 -> jr ra (code-wipe guard) " +
-                    $"gifP3={sys.Gif.Path3Transfers} cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
-        }
-
         // ONLY the tight clear loop (0x385278..0x385290). Live disasm: 0x3854C0.. is COP2
         // VU math (jr ra @ 0x3854C0/0x385534) — treating that band as memset false-positives
         // snapped a1/a2 mid-VU and thrashed title for tens of M cycles.
+        // Do NOT permanently jr-ra-stub the function on WAD load — legitimate clears of real
+        // heap ranges must still run (early stub regressed object bases / spine restore).
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         if (pc is < 0x00385270 or > 0x00385290) return;
         if (sys.MasterCycles - _lastMemsetBreakCyc < 10_000) return;
@@ -2259,9 +2380,30 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         ulong remain = a2 >= a1 ? (ulong)(a2 - a1) : ulong.MaxValue;
         bool absurd = remain >= 0x40000 || a2 < a1 || a2 >= 0x02000000 || a1 >= 0x02000000
             || (a1 < 0x00780000 && remain >= 0x1000);
-        // Permanent stub already makes the loop a jr ra — still clamp a1 if we land here
-        // before the stub fetch (branch delay / cached path).
-        if (!absurd && !_memsetFnStubbed) return;
+        if (!absurd) return;
+
+        // On first absurd clear after logo spine: nop the back-edge so re-entry cannot wipe
+        // the ELF image for millions of cycles (menu6-proven approach). Full jr-ra stub of
+        // the body is reserved for repeated absurd hits that still re-enter.
+        if (sys.Gif.Path3Transfers >= 11 && !_memsetFnStubbed
+            && sys.Memory.Read32(0x0038528C) != 0u)
+        {
+            sys.Memory.Write32(0x0038528C, 0u); // nop bne back-edge
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] plant memset back-edge nop @ 0x38528C gifP3={sys.Gif.Path3Transfers} " +
+                    $"cyc={sys.MasterCycles}");
+        }
+        if (_memsetBreaks >= 8 && !_memsetFnStubbed)
+        {
+            sys.Memory.Write32(0x00385278, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x0038527C, 0x00000000u); // nop
+            _memsetFnStubbed = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] stub menu memset 0x385278 -> jr ra after repeated absurd clears " +
+                    $"n={_memsetBreaks} cyc={sys.MasterCycles}");
+        }
 
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a2 == 0 ? a1 : a2 });
         sys.EE.PC = 0x00385294;
@@ -2580,8 +2722,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// </summary>
     private void MaybeKickMainFromPumpThrash(Ps2System sys)
     {
-        if (_mainFromPumpKicks >= 48) return;
-        if (sys.MasterCycles - _lastMainKickCyc < 500_000) return;
+        // After logo spine is restored, re-homing to main re-enters IOPRP RESET and storms
+        // gen=2..N (live pad-inject: gen 2→12). Prefer staying in pump/pad with ghost DMA.
+        if (sys.Gif.Path3Transfers >= 12) return;
+        if (_mainFromPumpKicks >= 12) return;
+        if (sys.MasterCycles - _lastMainKickCyc < 1_500_000) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         bool inPump = pc is (>= 0x004147F8 and <= 0x00414A80)
             or (>= 0x00427518 and <= 0x004276A0)
