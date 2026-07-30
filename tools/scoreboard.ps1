@@ -48,9 +48,18 @@ if (-not $FleetConfig) {
 $fleet = Get-Content $FleetConfig -Raw | ConvertFrom-Json
 $runTitle = Join-Path $PSScriptRoot "run-title.ps1"
 
-$selected = $fleet.titles
-if ($Titles.Count -gt 0) {
-    $selected = $fleet.titles | Where-Object { $Titles -contains $_.id }
+# Normalize -Titles (PowerShell often passes "a,b" as a single string)
+$titleIds = @()
+foreach ($t in $Titles) {
+    if ([string]::IsNullOrWhiteSpace($t)) { continue }
+    $titleIds += ($t -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$selected = @($fleet.titles)
+if ($titleIds.Count -gt 0) {
+    $selected = @($fleet.titles | Where-Object { $titleIds -contains $_.id })
+    if ($selected.Count -eq 0) {
+        Write-Warning "No fleet titles matched: $($titleIds -join ', '). Known ids: $(($fleet.titles | ForEach-Object { $_.id }) -join ', ')"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $TraceDir | Out-Null
