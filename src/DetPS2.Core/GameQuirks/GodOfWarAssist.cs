@@ -91,6 +91,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _padInjectPulses;
     private int _objDispatchEscapes;
     private int _listCmpEscapes;
+    private int _linkSearchEscapes;
     private int _streamArmPulses;
     private ulong _lastWorldKickCyc;
     private bool _heapDefaultsPlanted;
@@ -163,6 +164,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _padInjectPulses = 0;
         _objDispatchEscapes = 0;
         _listCmpEscapes = 0;
+        _linkSearchEscapes = 0;
         _streamArmPulses = 0;
         _lastWorldKickCyc = 0;
         _heapDefaultsPlanted = false;
@@ -263,6 +265,28 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
+        // Data/heap as PC (live 0x57xxxx after object-dispatch poison). Hard-cap resume
+        // below 0x2C0000 for GoW .text. CRT0 BSS band is in IsDeathBand (never re-home TO
+        // it) but is not force-escaped here — aggressive CRT0 leave regressed RPC (81 vs 153).
+        uint pcPhysEarly = pc & 0x1FFFFFFFu;
+        bool dataPc = pcPhysEarly >= 0x002C0000u
+            || pc is >= 0x80000180 and <= 0x80000200
+            || pcPhysEarly < 0x00100000;
+        if (c >= 35_000_000 && sys.Gs.PixelsWritten == 0 && dataPc)
+        {
+            uint resume = PickSafeResume(sys, 0x0026C0EC);
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (c % 5_000_000) < 50_000)
+                Console.Error.WriteLine(
+                    $"[GOW] early data-PC rescue pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+            pc = resume;
+        }
+
         // BST search walk guard — see class doc. Only after the dict pool exists (~3.5M).
         if (c >= 5_000_000 && pc is >= BstWalkPcLo and <= BstWalkPcHi)
             TryEscapeBstWalk(sys, pc, c);
@@ -311,10 +335,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= 0x0015F440 and <= 0x0015F514)
             TryEscapeParentObjectList(sys, pc, c);
 
+        // Linked-list search / splice at 0x1312D0 (PcProfiler #2 after filter thrash):
+        // while (*a0 != v1) a0 = *a0. Corrupt ring never hits sentinel → forever.
+        if (c >= 35_000_000 && pc is >= 0x001312C0 and <= 0x001312E8)
+            TryEscapeLinkSearch(sys, pc, c);
+
         // Software delay + flag poll — two sibling sites share *0x29C7D0:
-        //   0x17A328..0x17A35C (live PC 0x17A334)
+        //   0x17A328..0x17A35C (live PC 0x17A334): countdown 20000 while *flag==1
         //   0x183880..0x1838C8 (wave-2 profiler #1: countdown 20000 while flag==1)
-        // Flag stuck at 1 → forever. Clear AND snap to jr-ra / post-loop.
+        // Flag stuck at 1 → forever. Clear AND snap past the outer beq (not just mid-count).
         if (c >= 38_000_000
             && (pc is >= 0x0017A320 and <= 0x0017A360
                 || pc is >= 0x00183880 and <= 0x001838C8))
@@ -328,16 +357,19 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             {
                 // 0x1838C8 is jr ra — only take it when $ra is real code.
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x002C0000
                     && ra is not (>= 0x00183880 and <= 0x001838D0))
                     sys.EE.PC = 0x001838C8; // jr ra
                 else
                     sys.EE.PC = PickSafeResume(sys, 0x0026C0EC);
                 sys.EE.COP0_Status &= ~0x6u;
             }
-            else if (pc < 0x0017A350)
+            else
             {
-                sys.EE.PC = 0x0017A350;
+                // Skip past beq flag,1,0x17A328 — land on post-loop body at 0x17A360.
+                // Mid-count snap to 0x17A350 re-reads flag via a2 and can restart if a2 bad.
+                sys.EE.PC = 0x0017A360;
+                sys.EE.COP0_Status &= ~0x6u;
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (c % 10_000_000) < 50_000)
@@ -514,12 +546,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0
         sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a1
-        // Prefer live $ra when it is real code outside this leaf; else epilogue.
+        // Prefer live $ra when it is real code outside this leaf; else epilogue / PickSafeResume.
+        // Live: s0=0x00570648 heap object → epilogue $ra can re-enter 0x57xxxx data as PC.
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
         uint resume = 0x00233B38;
-        if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+        if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x002C0000
             && ra is not (>= 0x00233AD0 and <= 0x00233B44))
             resume = ra;
+        else if (_objDispatchEscapes >= 2)
+            resume = PickSafeResume(sys, 0x0026C0EC);
         sys.EE.PC = resume;
         sys.EE.COP0_Status &= ~0x6u;
         _objDispatchEscapes++;
@@ -572,9 +607,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// </summary>
     private static uint PickSafeResume(Ps2System sys, uint preferred)
     {
+        // GoW EE .text lives ~0x100000..0x2Bxxxx. IsLikelyEeCode allows up to 0x580000 and
+        // WordLooksLikeInsn false-positives on heap (live: rescue → 0x0057067C → UnknownOpcode
+        // storms, main dormant). Hard-cap resume candidates below 0x2C0000.
         static bool IsDeathBand(uint p) =>
             p is (>= 0x80000000 and <= 0x80020000)
             or (< 0x00100000)
+            or (>= 0x002C0000)                     // data / heap / high image (incl. 0x57xxxx)
             or (>= 0x00233AD0 and <= 0x00233B34)
             or (>= 0x00284780 and <= 0x002848A8)
             or (>= 0x002A0000 and <= 0x002B0000)
@@ -583,19 +622,23 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0013DED0 and <= 0x0013DEF8)  // heap-align spin
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
-            or (>= 0x00300000 and <= 0x00400000)  // post-ELF data / heap (live w3d 0x396xxx)
+            or (>= 0x0017A320 and <= 0x0017A360)  // software delay + flag poll
+            or (>= 0x00100000 and <= 0x00100200)  // CRT0 / BSS-clear re-entry (wipes heap)
             || p == 0x00100008u;
 
+        static bool IsSafeCode(Ps2System s, uint p) =>
+            !IsDeathBand(p) && p is >= 0x00100000 and < 0x002C0000 && s.Memory.IsLikelyEeCode(p);
+
         uint cand = preferred;
-        if (!IsDeathBand(cand) && sys.Memory.IsLikelyEeCode(cand))
+        if (IsSafeCode(sys, cand))
             return cand;
 
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-        if (!IsDeathBand(ra) && sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000)
+        if (IsSafeCode(sys, ra))
             return ra;
 
         uint lg = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-        if (!IsDeathBand(lg) && sys.Memory.IsLikelyEeCode(lg) && lg is >= 0x00100000 and < 0x00280000)
+        if (IsSafeCode(sys, lg))
             return lg;
 
         // Prefer stream poll entry (0x26C0E0) after CDVD — post-FreezeCache re-entry without
@@ -604,9 +647,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             return 0x0026C0E0;
         if (sys.Memory.IsLikelyEeCode(0x0027CC08UL))
             return 0x0027CC08;
+        // 0x185FAC is post-FreezeCache continue (real code at boot); prefer over CRT0.
         if (sys.Memory.IsLikelyEeCode(0x00185FACUL))
             return 0x00185FAC;
-        return 0x00185FAC;
+        return 0x0026C0E0;
     }
 
     /// <summary>
@@ -696,6 +740,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeFlagSetListWalk(sys, pc, c);
         if (pc is >= 0x0015F440 and <= 0x0015F514)
             TryEscapeParentObjectList(sys, pc, c);
+        if (pc is >= 0x001312C0 and <= 0x001312E8)
+            TryEscapeLinkSearch(sys, pc, c);
         if (pc is >= 0x00233AD0 and <= 0x00233B34)
             TryEscapeObjectDispatch(sys, pc, c);
         if (pc is >= 0x00284780 and <= 0x002848B0)
@@ -887,14 +933,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     // Residual empty poll only:
                     //   • WaitSema(3) SIF-cmd poll when no more SIF traffic
                     //   • WaitSema(0x20) worker 0x27CCxx (empty after IRX load)
-                    //   • high ids >32 (game-private)
+                    //   • high ids 33..256 (game-private) — NOT garbage 0x20000000
                     // Never blanket-pulse 1..16 (races RPC_END). SEMA_STALL_YIELD OFF.
-                    bool emptyPoll = (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId >= 32)
-                        && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
-                        && (_worldKickPulses % 2) == 0;
-                    if (emptyPoll)
+                    if (t.WaitSemaId is < 0 or > 256)
                     {
-                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                        t.WaitSemaId = 0;
+                        try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                    }
+                    else
+                    {
+                        bool emptyPoll = (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId >= 32)
+                            && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+                            && (_worldKickPulses % 2) == 0;
+                        if (emptyPoll)
+                        {
+                            try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                        }
                     }
                 }
                 else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
@@ -905,16 +959,18 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
-        // BIOS / KSEG0 thrash (live 0x800098xx), uncached alias (0x40xxxxxx), or data PC
-        // (0x396xxx) — re-home safely. Never re-enter 0x233AEx / 0x2847xx mid-body.
+        // BIOS / KSEG0 thrash (live 0x800098xx) or data/heap PC (0x396xxx / 0x57xxxx).
+        // Uncached aliases (0x4xxxxxxx) of *valid* code are OK — only rescue when phys is bad.
         uint pcPhys = pc & 0x1FFFFFFFu;
-        if (pc is >= 0x80000000 and <= 0x80020000 || pc < 0x00100000
+        bool uncachedBad = (pc & 0xE0000000u) == 0x40000000u
+            && (pcPhys < 0x00100000u || pcPhys >= 0x002C0000u || !sys.Memory.IsLikelyEeCode(pcPhys));
+        if (pc is >= 0x80000000 and <= 0x80020000 || pcPhys < 0x00100000
             || pcPhys >= (uint)SystemMemory.RDRAM_SIZE
-            || pc is >= 0x00300000 and < 0x00400000
-            || (pc & 0xE0000000u) == 0x40000000u // uncached EE phys (live w3e 0x40289328)
-            || !sys.Memory.IsLikelyEeCode(pcPhys) && pcPhys is >= 0x00300000)
+            || pcPhys >= 0x002C0000u // data/heap incl. live 0x57xxxx UnknownOpcode storms
+            || uncachedBad
+            || (!sys.Memory.IsLikelyEeCode(pcPhys) && pcPhys >= 0x002C0000u))
         {
-            uint resume = PickSafeResume(sys, (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL));
+            uint resume = PickSafeResume(sys, 0x0026C0EC);
             sys.Memory.Write32(0x002A1338, 0);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL });
             sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -1091,8 +1147,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             {
                 foreach (var t in k.AllThreads)
                 {
-                    if (!t.Alive || !t.Sleeping) continue;
-                    if (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId >= 32)
+                    if (!t.Alive) continue;
+                    // Live residual: WaitSemaId=0x20000000 / 0x200000 from poisoned a0 on the
+                    // WaitSema trampoline (worker 0x27CC00 delay-slot lw a0,4(v0) with bad v0).
+                    // Never SignalSema garbage ids — clear and wake instead.
+                    if (t.WaitSemaId is < 0 or > 256)
+                    {
+                        t.WaitSemaId = 0;
+                        if (t.Sleeping && !t.WaitVblank)
+                        {
+                            try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                        }
+                        continue;
+                    }
+                    if (!t.Sleeping) continue;
+                    // Residual empty poll only: SIF-cmd (3), worker (0x20), game-private (33..256).
+                    if (t.WaitSemaId == 3 || t.WaitSemaId == 0x20 || t.WaitSemaId is >= 32 and <= 256)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
                     }
@@ -1108,8 +1178,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     or (>= 0x00297300 and <= 0x00297400))
             {
                 // WaitSema success convention: v0 = sema id (libcdvd / sifrpc check v0==id).
+                // Only accept plausible THREADMAN ids — live a0=0x20000000 is poison.
                 uint a0 = (uint)sys.EE.GetGpr(4).Lo;
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = a0 != 0 ? a0 : 3UL });
+                uint sema = a0 is >= 1 and <= 256 ? a0 : 3u;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = sema });
+                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = sema }); // keep a0 coherent
                 sys.EE.PC = ra;
                 sys.EE.COP0_Status &= ~0x6u;
             }
@@ -1286,7 +1359,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// <summary>
     /// Object-list filter walk (disasm 0x15F280..0x15F438): <c>s1</c> walks a singly-linked
     /// list; end when <c>s1 == (s2+s4+s5)+0x34</c>. Corrupt/OOB <c>s1</c> never matches →
-    /// infinite loop. Snap to restore epilogue at 0x15F414 (same as empty-list exit).
+    /// infinite loop. Empty the head cell to a circular self-link so the next call takes the
+    /// natural empty branch at <c>0x15F2B8</c>, then snap to restore epilogue at 0x15F414.
     /// </summary>
     private void TryEscapeCorruptListWalk(Ps2System sys, uint pc, ulong c)
     {
@@ -1307,8 +1381,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 oob = true;
             else if (next == s1 || next == phys)
                 oob = true; // self-loop
+            else if (_listWalkEscapes >= 4 && pc is >= 0x0015F400 and <= 0x0015F40C)
+                oob = true; // periodic force: re-entry thrash with "valid" rings (profiler 1.7M)
             else
                 return; // healthy (possibly uncached) pointer — do not touch
+        }
+
+        // Sentinel = s2 + s4 + s5 + 0x34 (disasm 0x15F404..408). Empty list is *sent = sent.
+        uint s2 = (uint)sys.EE.GetGpr(18).Lo;
+        uint s4 = (uint)sys.EE.GetGpr(20).Lo;
+        uint s5 = (uint)sys.EE.GetGpr(21).Lo;
+        uint sent = s2 + s4 + s5 + 0x34u;
+        uint sentPhys = sent & 0x1FFFFFFFu;
+        if (sentPhys is >= 0x00100000u and < (uint)SystemMemory.RDRAM_SIZE - 4u && (sentPhys & 3) == 0)
+        {
+            sys.Memory.Write32(sentPhys, sent); // circular empty head
+            sys.EE.SetGpr(17, new EmotionEngine.Gpr128 { Lo = sent }); // s1 = sentinel
         }
 
         // Epilogue restores s0..s7/ra from the large frame and jr ra.
@@ -1317,7 +1405,69 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _listWalkEscapes++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _listWalkEscapes <= 12)
             Console.Error.WriteLine(
-                $"[GOW] escape corrupt list walk pc=0x{pc:X8} s1=0x{s1:X8} phys=0x{phys:X8} -> 0x15F414 n={_listWalkEscapes} cyc={c}");
+                $"[GOW] escape corrupt list walk pc=0x{pc:X8} s1=0x{s1:X8} phys=0x{phys:X8} " +
+                $"sent=0x{sent:X8} -> 0x15F414 n={_listWalkEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Linked-list search / splice (disasm 0x1312C0..0x1312F8):
+    /// <c>while (*a0 != v1) a0 = *a0;</c> then store. Corrupt ring never hits sentinel →
+    /// PcProfiler hot band after filter thrash (~230k samples @ 55M). Force done: a0=v1,
+    /// PC at the fall-through store/jr.
+    /// </summary>
+    private void TryEscapeLinkSearch(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc is >= 0x001312F0 and <= 0x001312F8)
+            return; // epilogue
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint v1 = (uint)sys.EE.GetGpr(3).Lo;
+        uint a0Phys = a0 & 0x1FFFFFFFu;
+        uint v1Phys = v1 & 0x1FFFFFFFu;
+
+        bool bad = a0 == 0
+            || a0Phys < 0x00100000u
+            || a0Phys >= (uint)SystemMemory.RDRAM_SIZE
+            || (a0Phys & 3) != 0;
+        if (!bad)
+        {
+            uint next = sys.Memory.Read32(a0Phys);
+            uint np = next & 0x1FFFFFFFu;
+            if (next == 0 || np < 0x00100000u || np >= (uint)SystemMemory.RDRAM_SIZE
+                || next == a0 || np == a0Phys)
+                bad = true;
+            // Periodic force after first detection — long healthy-looking rings still thrash.
+            else if (_linkSearchEscapes > 0 || (_worldKickPulses % 4) == 0)
+                bad = true;
+        }
+
+        // Sentinel must be a plausible pointer; otherwise force return via $ra.
+        bool sentOk = v1 != 0 && v1Phys is >= 0x00100000u and < (uint)SystemMemory.RDRAM_SIZE
+                      && (v1Phys & 3) == 0;
+
+        if (!bad && a0 == v1)
+            return; // already done
+
+        if (!bad && _linkSearchEscapes == 0 && pc is < 0x001312D0)
+            return; // let a short healthy search run once
+
+        if (sentOk)
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = v1 }); // a0 = sentinel → exit
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = sentOk ? sys.Memory.Read32(v1Phys) : 0UL });
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0x001312F0; // sw zero,24(a2) / jr ra
+        if (!sys.Memory.IsLikelyEeCode(resume)
+            || (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x001312C0 and <= 0x001312F8)
+                && !sentOk))
+            resume = ra;
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _linkSearchEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _linkSearchEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[GOW] escape link-search pc=0x{pc:X8} a0=0x{a0:X8} v1=0x{v1:X8} " +
+                $"-> 0x{resume:X8} n={_linkSearchEscapes} cyc={c}");
     }
 
     /// <summary>

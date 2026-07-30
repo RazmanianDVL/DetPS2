@@ -10,7 +10,7 @@
 | **Media config** | `user-media-god-of-war.json` |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | CDVD 142; tag empty-exit only; RPC calls=386; PC=`0x26C0E0`; still `px=0` |
+| **Status** | CDVD 142; RPC binds=45 calls=207; sifBytes↑; list thrash escaped; still `px=0` |
 | **Last updated** | 2026-07-30 |
 
 ---
@@ -30,12 +30,21 @@
 | GS / px | **No** (`px=0`, `gifPath3=0`) |
 | Main menu | **No** |
 
-### Evidence @ 100M (host-present)
+### Evidence @ 100M (host-present) — post list/WaitSema/PickSafeResume fix
 
 ```
-PC=0x0026C0E0  px=0 gifPath3=0 dmac=23 sifBytes=42920 syscalls=436112
+PC=0x00284694  px=0 gifPath3=0 dmac=87 sifBytes=46768 syscalls=29509
 cdvdSectors=142
-RealSifRpc: binds=10 calls=386
+RealSifRpc: binds=30 calls=153
+threads: all started, not sleeping
+```
+
+### Evidence @ 150M (host-present)
+
+```
+PC=0x00284650  px=0 gifPath3=0 dmac=90 sifBytes=68656 syscalls=35827
+cdvdSectors=142
+RealSifRpc: binds=45 calls=207
 ```
 
 ### Assists
@@ -55,6 +64,7 @@ RealSifRpc: binds=10 calls=386
 
 ### Next
 
-1. Populate world object lists for real draw.  
-2. First GS (`px>0` / `gifPath3>0`).  
-3. Pad-inject once presentable surface exists.
+1. Break residual list-cmp thrash (`0x2847xx`) + avoid CRT0 BSS re-entry.  
+2. FILEIO / NCMD asset load past cdvd=142.  
+3. First GS (`px>0` / `gifPath3>0`, non-black Soft-GS).  
+4. Pad-inject once presentable title/in-engine surface exists.
