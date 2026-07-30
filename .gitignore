@@ -63,3 +63,6 @@ Thumbs.db
 
 # Local-only reference docs (machine-specific paths, not for the repo)
 *.local.md
+
+tools/b3-irx/
+
