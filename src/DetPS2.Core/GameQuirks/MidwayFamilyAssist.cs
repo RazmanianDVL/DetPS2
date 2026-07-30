@@ -73,6 +73,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _waitReadyHits = 0;
         _waitReadyEscapes = 0;
         _mslRingSeeds = 0;
+        _mslFilePumps = 0;
     }
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
@@ -85,11 +86,40 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // but leave flags; cheap idempotent set in case a future path recreates RealRpc.
         ApplyVersionPolicy(sys);
         TrySeedMslRing(sys);
+        // SHARED: complete EE-queued MSL/MFL file opens (MKDA.PAK / artps2 members) via
+        // RealSifRpc so gameart.ssf can reach status==4 without planting *s0=4 (Exit).
+        TryPumpMslFiles(sys);
         // Wait-ready force (*s0=4 / null-s0 plant) false-completes gameart.ssf and the
         // title Exit(0)s. Leave the honest hang at 0x2F55xx until MSL stream host + SEC
         // open actually deliver status==4. (TryEscapeWaitReady kept for future opt-in.)
         // TryEscapeWaitReady(sys);
         TryBreakHeapTreeCycle(sys);
+    }
+
+    private int _mslFilePumps;
+
+    /// <summary>
+    /// Drive shared MFL ring completion while DA sits in wait-ready or after MSL init.
+    /// Throttled: once per ~64 steps in the wait band, else every ~4k steps globally.
+    /// </summary>
+    private void TryPumpMslFiles(Ps2System sys)
+    {
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null) return;
+        uint pc = (uint)sys.EE.PC;
+        bool inWait = pc >= WaitReadyPcLo && pc <= WaitReadyPcHi;
+        _mslFilePumps++;
+        if (inWait)
+        {
+            if ((_mslFilePumps & 63) != 0) return;
+        }
+        else if ((_mslFilePumps & 4095) != 0)
+            return;
+
+        var iop = sys.IopModules;
+        var cdvd = sys.Cdvd;
+        if (iop == null || cdvd == null) return;
+        rpc.PumpMslFileRequests(sys.Memory, iop, cdvd);
     }
 
     private static void ApplyVersionPolicy(Ps2System sys)
