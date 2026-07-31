@@ -11,7 +11,7 @@
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
 | **Branch** | `agent/menu-gow-w2` (base tip `3748553`) |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | WHIP WaitSema thrash **fixed** (SHARED); dmac≈93 binds=10; **px=0 gifPath3=0**; residual post-table 0x156324; LoadWad still open |
+| **Status** | WHIP WaitSema thrash **fixed** (SHARED); claim100d dmac=2992 calls=1047 binds=10; **px=0 gifPath3=0**; residual PC=0x294420 cache-wb; LoadWad still open |
 | **Last updated** | 2026-07-31 |
 
 ### MENU gate
@@ -34,6 +34,7 @@ FABRICATING signal for sema=0x3 (WHIP_SEMA_FIX_V2)  // forever
 ```
 @20M:  PC=0x283EF4 px=0 gifPath3=0 dmac=2 binds=10 calls=21 cdvd=142 WaitSema x36
 @100M: PC=0x156324 px=0 gifPath3=0 dmac=93 sifBytes=19080 binds=10 calls=88 cdvd=142
+@100M post-table: PC=0x294420 px=0 gifPath3=0 dmac=2992 sifBytes=203056 binds=10 calls=1047 cdvd=142
 ```
 
 No early SetIopRpVersionAscii. Post-reboot EnsureIopRp only.
