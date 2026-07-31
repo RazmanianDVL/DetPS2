@@ -15,3 +15,4 @@ Append-only. When pad/menu advances and Soft-GS shows a **new** wall, add a row.
 | 2026-07-31 | shared | DISPFB1/2+DISPLAY1/2 decode + circuit select (Play! layout); naturalDispfbPx metric | No DISPFB plants; FRAME/FBP0 residual still valid for B3 | S10 | GX-040 |
 | 2026-07-31 | tooling | `--pad-script=` on pad-inject / scoreboard-metrics / blocker-trace; T2 heuristic | T2 still `?` without script | S10 | PL-002 |
 | 2026-07-31 | GoW+DA | GX-010/011 Path2 sticky harden | path-owned sticky; EOP multi-pkt; FIFO DIRECT pad; IMM=0=65536; GoW abortNewDir=1 hold px=573440@20M; DA abort=0 px=2.8M | S8 | GX-010/011 |
+| 2026-07-31 | fleet | G2 Host→Local IMAGE + TEX sample | PSMCT32/16/24 + PSMT8/4; CLUT via TEX0.CLD; TBW swizzle; TEXA; L2L; procedural off when TEX0 valid; expandHits hold | S9 | GX-025…035 |
