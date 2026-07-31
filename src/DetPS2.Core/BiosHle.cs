@@ -113,6 +113,17 @@ public sealed class BiosHle
         ExitCode = code;
     }
 
+    /// <summary>
+    /// Soft-clear a pending <see cref="RequestExit"/> so EE.Step can resume after a title
+    /// assist re-homes PC (e.g. DA CRT Exit(0) after display-queue drain before Soft-GS chrome).
+    /// Only use when the exit is a documented false-complete residual, not real process end.
+    /// </summary>
+    public void ClearExitRequest()
+    {
+        ExitRequested = false;
+        ExitCode = 0;
+    }
+
     public void OnVblank()
     {
         _kernel.OnVblank();

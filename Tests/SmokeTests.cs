@@ -4886,9 +4886,9 @@ public static class SmokeTests
 
 
     /// <summary>
-    /// WAVE-3: VIF1 END+IRQ chain completes (STR clear). CHCR.TAG high-nibble latch is
-    /// intentionally off for DA — live IRQ success advances display head then Exit before
-    /// Soft-GS chrome. See <see cref="Dmac_Vif1EndAddr0_InlineDirectPath2"/> for Path2.
+    /// WAVE-4: VIF1 END+IRQ chain completes (STR clear) and latches CHCR.nTAG from the
+    /// DMAtag high half (Play!: bits 16–31 = tagLow&gt;&gt;16). DA IRQ @0x1B261C needs
+    /// CHCR&amp;0xF0000000 ∈ {0x8,0xF}. See also <see cref="Dmac_Vif1EndAddr0_InlineDirectPath2"/>.
     /// </summary>
     public static void Dmac_ChainEndIrq_LatchesChcrTag()
     {
@@ -4916,8 +4916,11 @@ public static class SmokeTests
         uint chcr = sys.Dmac.ReadRegister(vif1Base + 0x00);
         if ((chcr & 0x100u) != 0)
             throw new Exception($"STR still set chcr=0x{chcr:X8}");
+        // tag 0xF0000001 → nTAG high half 0xF000 → CHCR bits 31:16 = 0xF000
+        if ((chcr & 0xFFFF0000u) != 0xF0000000u)
+            throw new Exception($"CHCR.nTAG not latched chcr=0x{chcr:X8} expected high=0xF000");
 
-        Console.WriteLine($"[Smoke] Dmac_ChainEndIrq_LatchesChcrTag OK (complete chcr=0x{chcr:X8}, TAG latch off)");
+        Console.WriteLine($"[Smoke] Dmac_ChainEndIrq_LatchesChcrTag OK (complete chcr=0x{chcr:X8}, nTAG latched)");
     }
 
 
