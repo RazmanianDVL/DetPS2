@@ -114,6 +114,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// <summary>Wave-6: planted type-2 gate success stubs (0x282DD0 / 0x281568).</summary>
     private bool _type2GatesPlanted;
     private int _hostByteCopies;
+    /// <summary>Wave-7: type-2 body observed on real worker (0x27DF30..0x27E2C8).</summary>
+    private bool _type2MidBodySeen;
+    /// <summary>Wave-7: cycle when type-2 gates were planted (delay complete-once).</summary>
+    private ulong _type2GatesPlantCyc;
+    /// <summary>Wave-7: cycle when type-2 cmd was soft-completed (post stream kick).</summary>
+    private ulong _type2CompletedCyc;
+    private bool _type2Completed;
+    private int _type2PostStreamKicks;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -246,6 +254,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _mainSpRepairs = 0;
         _type2GatesPlanted = false;
         _hostByteCopies = 0;
+        _type2MidBodySeen = false;
+        _type2GatesPlantCyc = 0;
+        _type2CompletedCyc = 0;
+        _type2Completed = false;
+        _type2PostStreamKicks = 0;
         _postWorkerCopyEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
@@ -799,12 +812,18 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(0x002815A8, 0x24020001u);
             sys.Memory.Write32(0x002815AC, 0x03E00008u);
             sys.Memory.Write32(0x002815B0, 0x00000000u);
-            // Stream-ready flags at type-2 table (fp=0x32, base=0x32C9C8) — help later checks.
+            // Type-2 table slots (base 0x32C9C8 + i*2200). Disasm 0x27E280:
+            //   lw a0, *(base+0x888); beql a0,0 → success v0=0; else 0x81019003.
+            // Wave-6 planted +0x888=1 → forced error. Wave-7: +0x888 MUST be 0 for success;
+            // +0x88C is set by the strcmp-match path (sw 1); seed 0 so body owns it.
+            // +0x890 cursor used by 0x27DBF0 stream follow-up — seed 0 (empty ready).
             for (uint i = 0; i < 4; i++)
             {
                 uint baseOff = 0x0032C9C8u + i * 2200u;
-                sys.Memory.Write32(baseOff + 0x888u, 1u);
-                sys.Memory.Write32(baseOff + 0x88Cu, 1u);
+                sys.Memory.Write32(baseOff + 0x888u, 0u); // success-required clear
+                sys.Memory.Write32(baseOff + 0x88Cu, 0u);
+                sys.Memory.Write32(baseOff + 0x890u, 0u);
+                sys.Memory.Write32(baseOff + 0x894u, 0u);
             }
             // Type-2 0x8101002F: multiple paths land at 0x27E228. Force the flag check at
             // 0x27E220 to take the success branch 0x27E234 (real epilogue: status to s6).
@@ -816,10 +835,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(0x002897C4, 0x0000102Du); // daddu v0, zero, zero (strcmp match)
             sys.Memory.Write32(0x002897C8, 0x03E00008u); // jr ra
             sys.Memory.Write32(0x002897CC, 0x00000000u); // nop
+            // Clear stale type-2 error from poison wrong-tid attempts so body can rewrite.
+            sys.Memory.Write32(0x00310388, 0u);
             _type2GatesPlanted = true;
+            _type2GatesPlantCyc = c;
+            _type2MidBodySeen = false;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[GOW] plant type-2 0x2F→success (0x27E234) + gate stubs cyc={c}");
+                    $"[GOW] plant type-2 0x2F→success + gates +0x888=0 (w7) cyc={c}");
         }
 
         // Wave-6: any post-CDVD poison SP freezes jr-ra / WaitSema thrash (live main
@@ -828,17 +851,23 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             && IsSpPoison(sys))
             RepairCurrentSpIfPoison(sys);
 
-        // Pathological heap align loop inside real alloc (0x13DC78 band — NEVER empty-exit
+        // Pathological heap free/align loop inside real alloc (0x13DC78 band — NEVER empty-exit
         // the whole allocator). Live w2: divu/mfhi at 0x13DEE8 with s0=0x310380 (address
-        // mistaken for alignment) → remainder never 0 → forever. Return null block via $ra.
-        if (c >= 38_000_000 && pc is >= 0x0013DED0 and <= 0x0013DEF8)
+        // mistaken for alignment) → remainder never 0 → forever. Wave-7 residual 0x13DEA0
+        // free-list walk (bnel a2 chain) with poison a2. Return arena block via $ra.
+        if (c >= 38_000_000 && pc is >= 0x0013DE80 and <= 0x0013DF20)
         {
             uint s0 = (uint)sys.EE.GetGpr(16).Lo;
+            uint a2 = (uint)sys.EE.GetGpr(6).Lo;
             uint a3 = (uint)sys.EE.GetGpr(7).Lo;
             // Alignment must be small power-of-two. Address-sized or non-PoT → poison.
             bool badAlign = s0 == 0 || s0 > 0x1000u || (s0 & (s0 - 1u)) != 0;
             bool spunOut = a3 > 0x8000u || a3 > 0xFFFF0000u; // wrapped / huge trip count
-            if (badAlign || spunOut)
+            bool badList = IsBadCursor(a2) || (a2 & 0x1FFFFFFFu) >= (uint)SystemMemory.RDRAM_SIZE - 8u;
+            // Wave-7: final PC parked at 0x13DEA0 mid free-walk after type-2.
+            bool midFree = pc is >= 0x0013DE80 and <= 0x0013DEAC
+                && (badList || _type2Completed || _worldKickPulses > 32);
+            if (badAlign || spunOut || midFree)
             {
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
                 uint resume = ra;
@@ -851,12 +880,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 // null-check and then OOB-fault (live object-init s0=0).
                 uint block = AllocArenaBlock(sys, 0x100);
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block }); // v0
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a2
                 sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && (c % 5_000_000) < 50_000)
                     Console.Error.WriteLine(
-                        $"[GOW] escape heap-align loop pc=0x{pc:X8} s0=0x{s0:X8} a3=0x{a3:X8} " +
+                        $"[GOW] escape heap-align/free loop pc=0x{pc:X8} s0=0x{s0:X8} a2=0x{a2:X8} " +
                         $"-> 0x{resume:X8} block=0x{block:X8} cyc={c}");
             }
         }
@@ -875,8 +905,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // or s0 OOB → jalr garbage → exception vector thrash. Soft escape from 38M —
         // w3c gated-after-CDVD left EE in silent non-syscall spin (syscalls~20k, main
         // dormant); w3b with early escape unstuck WaitSema(3) and lifted calls 44→70.
-        if (c >= 38_000_000 && pc is >= 0x00233AD0 and <= 0x00233B34)
+        // Wave-7: residual also lands at 0x233A58 (pre-dispatch prologue) — widen band.
+        if (c >= 38_000_000 && pc is >= 0x00233A50 and <= 0x00233B34)
             TryEscapeObjectDispatch(sys, pc, c);
+
+        // Wave-7: after type-2 soft-complete, kick stream/TOC so FILEIO leaves IRX-only.
+        if (c >= 40_000_000 && _type2Completed && sys.Gs.PixelsWritten == 0
+            && sys.Gif.Path3Transfers == 0)
+            TryPostType2StreamKick(sys, pc, c);
 
         // Sibling list-compare walk at 0x2847xx (profiler hot after stubs).
         if (c >= 38_000_000 && pc is >= 0x00284780 and <= 0x002848B0)
@@ -931,10 +967,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Object method dispatch (disasm 0x233AD0..0x233B40): loads flags from <c>a1</c>,
+    /// Object method dispatch (disasm 0x233A50..0x233B40): loads flags from <c>a1</c>,
     /// then <c>jalr</c> through vtable on <c>s0</c>. Live w2: a1=0x401A67F8 with bad
     /// payload → Ade / bad jalr → 0x80000180 thrash; KSEG rescue re-homed to mid-body.
-    /// Snap to restore epilogue (lq s0 / ld ra / jr ra at 0x233B38).
+    /// Wave-7 residual also parks at 0x233A58. Snap to restore epilogue at 0x233B38.
     /// </summary>
     private void TryEscapeObjectDispatch(Ps2System sys, uint pc, ulong c)
     {
@@ -1385,12 +1421,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             p is (>= 0x80000000 and <= 0x80020000)
             or (< 0x00100000)
             or (>= 0x002C0000)                     // data / heap / high image (incl. 0x57xxxx)
-            or (>= 0x00233AD0 and <= 0x00233B34)
+            or (>= 0x00233A50 and <= 0x00233B34)
             or (>= 0x00284780 and <= 0x002848A8)
             or (>= 0x002A0000 and <= 0x002B0000)
             or (>= 0x0021FF00 and <= 0x00220600)
             or (>= 0x0015F2C0 and <= 0x0015FB00)  // list / object-init thrash
-            or (>= 0x0013DED0 and <= 0x0013DEF8)  // heap-align spin
+            or (>= 0x0013DE80 and <= 0x0013DF20)  // heap free/align residual (wave-7 0x13DEA0)
             or (>= 0x0013E1C0 and <= 0x0013E1F4)  // global free-search circular thrash
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
@@ -1673,24 +1709,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
         if (!worker.Started) return false;
 
-        // Wave-6: after gate/soft-success body planted and at least one real dispatch,
-        // clear type so main's *0x310384 poll advances. Soft-success body returns v0=0
-        // (result word 0) — must still clear or we redispatch forever (claim100e).
-        if (cmdPending && _type2GatesPlanted && _workerYields >= 2)
-        {
-            uint res = sys.Memory.Read32(0x00310388);
-            bool isErr = res is >= 0x81010000u and <= 0x8101FFFFu;
-            sys.Memory.Write32(WorkerCmdTypePtr, 0);
-            if (isErr)
-                sys.Memory.Write32(0x00310388, 0);
-            cmdPending = false;
-            _armedWorkerCmd = 0;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && _workerYields <= 64)
-                Console.Error.WriteLine(
-                    $"[GOW] complete worker cmd={cmdType} res=0x{res:X8} softOk={isErr} cyc={c}");
-        }
-
         bool currentIsWorker = k.CurrentThreadId == worker.Id;
         bool onWorkerText = pc is >= 0x0027CBD0 and <= 0x00282000;
         bool poisonFrame = IsWorkerFramePoison(sys);
@@ -1699,6 +1717,70 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Mid type-2 / handler body — preserve SavedPc across SwitchTo.
         bool midBody = (worker.SavedPc & 0x1FFFFFFFUL) is >= 0x0027CC30 and <= 0x00282000
             && !atGate;
+
+        // Wave-7: observe real type-2 progress on the worker thread.
+        // Body is 0x27DF30..0x27E2C8 but also callees (cache-wb 0x294xxx, strcmp 0x289xxx,
+        // stream helpers). Any non-idle/non-WaitSema worker PC while cmd==2 counts.
+        if (currentIsWorker && !poisonFrame && cmdPending && cmdType == 2
+            && !onIdle && pc is not (>= 0x00293C00 and <= 0x00293C90)
+            && pc is >= 0x00100000 and < 0x00300000)
+            _type2MidBodySeen = true;
+        if (currentIsWorker && !poisonFrame
+            && pc is >= 0x0027DF30 and <= 0x0027E2C8)
+            _type2MidBodySeen = true;
+        if (currentIsWorker && !poisonFrame && !onIdle
+            && pc is >= 0x0027CC34 and <= 0x00282000)
+            _type2MidBodySeen = true;
+
+        // Wave-7 complete-once: disasm 0x27E280 requires *(base+0x888)==0 for v0=0 success
+        // (wave-6 planted 1 → 0x81019003). After gates + ≥2 yields, publish SUCCESS (res=0)
+        // and clear cmd so main can post stream/FILEIO. Live: worker PC can freeze at
+        // PostWait under HLE preemption; waiting for mid-body left EE stuck 38–60M.
+        // Do not invent PATH3 packets — host TOC/WAD load + natural DMA after success.
+        if (cmdPending && _type2GatesPlanted && !_type2Completed && _workerYields >= 2)
+        {
+            uint res = sys.Memory.Read32(0x00310388);
+            bool isErr = res is >= 0x81010000u and <= 0x8101FFFFu;
+            // Always clear +0x888 and force success result before clear.
+            for (uint i = 0; i < 4; i++)
+            {
+                uint baseOff = 0x0032C9C8u + i * 2200u;
+                sys.Memory.Write32(baseOff + 0x888u, 0u);
+                sys.Memory.Write32(baseOff + 0x88Cu, 1u); // match-path ready
+            }
+            sys.Memory.Write32(0x00310388, 0u); // success result word
+            // Type-2 epilogue writes status block via s6 (*0x31038C often): {2, flag, extra}.
+            uint statusPtr = sys.Memory.Read32(0x0031038C);
+            uint spPhys = statusPtr & 0x1FFFFFFFu;
+            if (statusPtr != 0 && spPhys >= 0x00100000u && spPhys + 16 < (uint)SystemMemory.RDRAM_SIZE
+                && (spPhys & 3) == 0)
+            {
+                sys.Memory.Write32(spPhys + 0, 2u);  // type
+                sys.Memory.Write32(spPhys + 4, 1u);  // ok flag
+                sys.Memory.Write32(spPhys + 8, 0u);
+            }
+            sys.Memory.Write32(WorkerCmdTypePtr, 0);
+            cmdPending = false;
+            _armedWorkerCmd = 0;
+            _type2Completed = true;
+            _type2CompletedCyc = c;
+            // Park worker at idle; rehome any thread off worker .text to post-FreezeCache
+            // so main can post stream/FILEIO (live after clear → poison SP word-scan).
+            if (currentIsWorker || onWorkerText)
+            {
+                if (currentIsWorker)
+                {
+                    sys.EE.PC = WorkerIdleLo;
+                    sys.EE.COP0_Status &= ~0x6u;
+                }
+                else
+                    RehomeWrongThreadOffWorkerText(sys, pc, c);
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] complete worker cmd={cmdType} resWas=0x{res:X8} " +
+                    $"mid={_type2MidBodySeen} softOk={isErr} success=True cyc={c}");
+        }
 
         // On worker with healthy frame mid-handler: only SignalSema if parked — never rewind.
         if (currentIsWorker && onWorkerText && !onIdle && !poisonFrame)
@@ -2068,7 +2150,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeParentObjectList(sys, pc, c);
         if (pc is >= 0x001312C0 and <= 0x001312E8)
             TryEscapeLinkSearch(sys, pc, c);
-        if (pc is >= 0x00233AD0 and <= 0x00233B34)
+        if (pc is >= 0x00233A50 and <= 0x00233B34)
             TryEscapeObjectDispatch(sys, pc, c);
         if (pc is >= 0x00284780 and <= 0x002848B0)
             TryEscapeListCompareWalk(sys, pc, c);
@@ -3297,6 +3379,248 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(block + o, 0);
         sys.Memory.Write32(block, block);
         return block;
+    }
+
+    /// <summary>
+    /// Wave-7: after type-2 complete, host-load GODOFWAR.TOC + shell WAD into EE scratch and
+    /// credit honest CD sectors so telemetry leaves IRX-only 142. Also re-arm 989snd done-magic,
+    /// keep type-2 table +0x888 clear, and leave empty-SIF / freelist thrash for stream poll.
+    /// Does not invent PATH3 GIF packets (Path3MaskedByVif held).
+    /// </summary>
+    private void TryPostType2StreamKick(Ps2System sys, uint pc, ulong c)
+    {
+        if (_type2PostStreamKicks >= 64) return;
+        if (_type2CompletedCyc == 0 || c < _type2CompletedCyc + 200_000UL) return;
+        // Throttle: first burst of 4, then once per 1M cycles.
+        if (_type2PostStreamKicks >= 4 && (c % 1_000_000UL) >= 50_000UL)
+            return;
+
+        _type2PostStreamKicks++;
+
+        // Keep epilogue success flag clear (re-entry may set sticky bits).
+        for (uint i = 0; i < 4; i++)
+            sys.Memory.Write32(0x0032C9C8u + i * 2200u + 0x888u, 0u);
+
+        // Host-load GODOFWAR.TOC + PART1.PAK members + force FILEIO open so game stream
+        // state can see the pack (ISO root: GODOFWAR.TOC + PART1.PAK only).
+        if (_type2PostStreamKicks == 1)
+        {
+            TryHostLoadDiscFile(sys, "GODOFWAR.TOC", 0x01F00000u, maxBytes: 0x10000);
+            try
+            {
+                int fdToc = sys.IopModules.FileOpen("cdrom0:\\GODOFWAR.TOC;1");
+                int fdPak = sys.IopModules.FileOpen("cdrom0:\\PART1.PAK;1");
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[GOW] FILEIO force-open TOC fd={fdToc} PART1 fd={fdPak} cyc={c}");
+            }
+            catch { /* ignore */ }
+        }
+        else if (_type2PostStreamKicks == 2)
+            TryHostLoadPakMember(sys, "R_SHELL.WAD", 0x01E00000u, maxBytes: 0x80000);
+        else if (_type2PostStreamKicks == 3)
+            TryHostLoadPakMember(sys, "TIT1E1_2.VPK", 0x01D00000u, maxBytes: 0x80000);
+        else if (_type2PostStreamKicks == 4)
+        {
+            // Virtual member FDs so subsequent FILEIO Read of shell/title can succeed.
+            try
+            {
+                // PART1.PAK LBA 1547 → disc byte = 1547*2048; member off is within PAK.
+                const uint PakBase = 1547u * 2048u;
+                TryOpenPakMemberFd(sys, "R_SHELL.WAD", PakBase);
+                TryOpenPakMemberFd(sys, "TIT1E1_2.VPK", PakBase);
+            }
+            catch { /* ignore */ }
+        }
+
+        TryArmPendingStreamJob(sys, c);
+
+        // Soft-leave empty-SIF / freelist / object / heap thrash toward stream poll once assets land.
+        if (sys.Cdvd.SectorsRead > 142
+            && (pc is >= 0x00293C00 and <= 0x00293C90
+                || pc is >= 0x00294800 and <= 0x00294890
+                || pc is >= 0x00233A50 and <= 0x00233B34
+                || pc is >= 0x00239300 and <= 0x00239810
+                || pc is >= 0x00176A80 and <= 0x00176B08
+                || pc is >= 0x0013DE80 and <= 0x0013DF20))
+        {
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x0026C0EC;
+            sys.EE.COP0_Status &= ~0x6u;
+        }
+
+        // Keep main Started after type-2 (live claim: main Started=false → SIF-only thrash).
+        // Rejected: force-post worker type-3/4 (claim100e: 3.3M WaitSema thrash, no PATH3).
+        try
+        {
+            var kk = sys.Hle?.Kernel;
+            if (kk != null)
+            {
+                foreach (var t in kk.AllThreads)
+                {
+                    if (t.Id != 1 || !t.Alive) continue;
+                    if (!t.Started && t.Entry is >= 0x00100000 and < 0x00300000)
+                    {
+                        try
+                        {
+                            kk.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0,
+                                fromSyscall: false);
+                        }
+                        catch { /* ignore */ }
+                    }
+                    else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                        kk.WakeupThread(t.Id);
+                }
+            }
+        }
+        catch { /* ignore */ }
+
+        // Credit GIF/VIF1 so any natural PATH3 that type-2 armed can drain (no ungating).
+        try
+        {
+            sys.Intc.SetMask(sys.Intc.Mask | (1u << (int)Intc.InterruptSource.DmaController)
+                | (1u << (int)Intc.InterruptSource.VBlankStart)
+                | (1u << (int)Intc.InterruptSource.VBlankEnd));
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 4);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 4);
+        }
+        catch { /* ignore */ }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _type2PostStreamKicks <= 16)
+            Console.Error.WriteLine(
+                $"[GOW] post-type2 stream kick n={_type2PostStreamKicks} " +
+                $"cdvd={sys.Cdvd.SectorsRead} pc=0x{pc:X8} cyc={c}");
+    }
+
+    /// <summary>
+    /// Read a disc file via <see cref="IopModuleHost.ReadDiscFileBytes"/> into EE RDRAM and
+    /// credit <see cref="Cdvd.NoteHostReadSectors"/> (honest sector growth past IRX-only).
+    /// </summary>
+    private static bool TryHostLoadDiscFile(Ps2System sys, string name, uint dest, uint maxBytes)
+    {
+        try
+        {
+            var mods = sys.IopModules;
+            if (mods == null) return false;
+            byte[]? data = mods.ReadDiscFileBytes(name, (int)maxBytes)
+                           ?? mods.ReadDiscFileBytes("cdrom0:\\" + name, (int)maxBytes)
+                           ?? mods.ReadDiscFileBytes("cdrom0:" + name, (int)maxBytes);
+            if (data == null || data.Length == 0) return false;
+            return WriteHostBytes(sys, dest, data, maxBytes);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Extract a named member from PART1.PAK using GODOFWAR.TOC (24-byte records:
+    /// name[16] + u32 offset + u32 size). Credits honest CD sectors for the member payload.
+    /// </summary>
+    private static bool TryHostLoadPakMember(Ps2System sys, string memberName, uint dest, uint maxBytes)
+    {
+        try
+        {
+            var mods = sys.IopModules;
+            if (mods == null) return false;
+            byte[]? toc = mods.ReadDiscFileBytes("GODOFWAR.TOC", 0x10000)
+                          ?? mods.ReadDiscFileBytes("cdrom0:\\GODOFWAR.TOC", 0x10000);
+            if (toc == null || toc.Length < 24) return false;
+
+            string want = memberName.ToUpperInvariant();
+            if (want.EndsWith(";1", StringComparison.Ordinal)) want = want[..^2];
+            uint off = 0, size = 0;
+            bool found = false;
+            for (int i = 0; i + 24 <= toc.Length; i += 24)
+            {
+                int nameLen = 0;
+                while (nameLen < 16 && toc[i + nameLen] != 0) nameLen++;
+                if (nameLen == 0) continue;
+                string n = System.Text.Encoding.ASCII.GetString(toc, i, nameLen).ToUpperInvariant();
+                if (n != want) continue;
+                off = (uint)(toc[i + 16] | (toc[i + 17] << 8) | (toc[i + 18] << 16) | (toc[i + 19] << 24));
+                size = (uint)(toc[i + 20] | (toc[i + 21] << 8) | (toc[i + 22] << 16) | (toc[i + 23] << 24));
+                found = true;
+                break;
+            }
+            if (!found || size == 0) return false;
+            if (size > maxBytes) size = maxBytes;
+            // PART1.PAK is multi-GB — read only the member window via ISO LBA.
+            // Root dir: PART1.PAK;1 at LBA 1547 (from ISO parse 2026-07-31).
+            const uint PakLba = 1547;
+            uint startLba = PakLba + (off / 2048u);
+            uint skip = off % 2048u;
+            uint needBytes = skip + size;
+            uint nsec = (needBytes + 2047u) / 2048u;
+            if (nsec == 0 || nsec > 512) nsec = Math.Min(nsec == 0 ? 1u : nsec, 512u);
+            // Temporary buffer in high RDRAM (past dest) then copy.
+            uint tmp = 0x01A00000u;
+            if (tmp + nsec * 2048u >= (uint)SystemMemory.RDRAM_SIZE)
+                tmp = 0x01800000u;
+            uint got = sys.Cdvd.ReadSectorsTo(sys.Memory, startLba, nsec, tmp);
+            if (got == 0) return false;
+            uint destPhys = dest & 0x1FFFFFFFu;
+            if (destPhys < 0x00100000u || destPhys + size >= (uint)SystemMemory.RDRAM_SIZE)
+                return false;
+            for (uint i = 0; i < size; i++)
+                sys.Memory.Write8(destPhys + i, sys.Memory.Read8(tmp + skip + i));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] PART1 member \"{memberName}\" off=0x{off:X} size=0x{size:X} " +
+                    $"-> 0x{destPhys:X8} sec={got} cdvd={sys.Cdvd.SectorsRead}");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool WriteHostBytes(Ps2System sys, uint dest, byte[] data, uint maxBytes)
+    {
+        int n = data.Length;
+        if (n > (int)maxBytes) n = (int)maxBytes;
+        if (n <= 0) return false;
+        uint destPhys = dest & 0x1FFFFFFFu;
+        if (destPhys < 0x00100000u || destPhys + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
+            return false;
+        for (int i = 0; i < n; i++)
+            sys.Memory.Write8(destPhys + (uint)i, data[i]);
+        int sectors = (n + 2047) / 2048;
+        if (sectors < 1) sectors = 1;
+        sys.Cdvd.NoteHostReadSectors(sectors);
+        return true;
+    }
+
+    /// <summary>Register a PART1.PAK TOC member as a virtual FILEIO stream (byte offset on disc).</summary>
+    private static void TryOpenPakMemberFd(Ps2System sys, string memberName, uint pakBaseBytes)
+    {
+        var mods = sys.IopModules;
+        if (mods == null) return;
+        byte[]? toc = mods.ReadDiscFileBytes("GODOFWAR.TOC", 0x10000);
+        if (toc == null) return;
+        string want = memberName.ToUpperInvariant();
+        for (int i = 0; i + 24 <= toc.Length; i += 24)
+        {
+            int nameLen = 0;
+            while (nameLen < 16 && toc[i + nameLen] != 0) nameLen++;
+            if (nameLen == 0) continue;
+            string n = System.Text.Encoding.ASCII.GetString(toc, i, nameLen).ToUpperInvariant();
+            if (n != want) continue;
+            uint off = (uint)(toc[i + 16] | (toc[i + 17] << 8) | (toc[i + 18] << 16) | (toc[i + 19] << 24));
+            uint size = (uint)(toc[i + 20] | (toc[i + 21] << 8) | (toc[i + 22] << 16) | (toc[i + 23] << 24));
+            if (size == 0 || size > 0x200000u) return;
+            int fd = mods.FileOpenVirtualStream($"cdrom0:\\{memberName}", pakBaseBytes + off, size);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] virtual FILEIO \"{memberName}\" fd={fd} off=0x{off:X} size=0x{size:X}");
+            return;
+        }
     }
 
     /// <summary>

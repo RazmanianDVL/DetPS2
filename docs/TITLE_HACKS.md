@@ -13,6 +13,6 @@ They should NOT be hand-edited into shared core files.
 | Mortal Kombat: Shaolin Monks (USA) | SLUS_210.87 | MidwayBootAssist — Wave-6: C1C0 chrome bind (BFC0 force, type=2 D770, soft-complete); SearchFile gate; no type5/sm+0x28. | C1C0 YES slot0+obj; NEAR gifP3=11; second-chrome/sel-idx residual | 2026-07-31 |
 | Burnout 3: Takedown (USA) | `SLUS_210.50` | `Burnout3Assist` + **`HandleLgDev`**; residual→STG; FRONTEND 4MiB plant; Soft-GS **merge composite** + DA XYZ; GIF `0x2198xx` ring leave; denser pad post-chrome | STG+TXD+FRONTEND cdvd=6584 **px=24407048** dispfbPx=2273160 **logo-frontend MENU YES** (wave-6) | 2026-07-31 |
 | Blood Omen 2 (USA) | `SLUS_200.24` | `BloodOmen2SnAssist` — WAVE-7 dual list-stub + ofx title FB; stream CODE/MAINMENU; FILEIO EOF-rewind; **no** fake warm sector credit | **MENU YES** title-surface Soft-GS px=286720 gifP2=106 stream=2.4MB cdvd=6512 | 2026-07-31 |
-| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`; wave-5 real-thread type-2; **wave-6** poison-SP repair, word-scan 0x299354 escape, type-2 gate stubs + complete-once; Path3MaskedByVif held | CDVD 142 IRX-only; gifP2=962 gifP3=0; type-2 soft-ok; px=0 FILEIO/LoadWad | 2026-07-31 |
+| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`; type-2 soft-success (`+0x888=0`); **wave-7** PART1.PAK/TOC FILEIO + TOC-member extract (R_SHELL/TIT1); Path3MaskedByVif held | **cdvd=555** (was 142); type-2 success; gifP2=962 gifP3=0; **MENU NO** px=0 FRAME_1=0 | 2026-07-31 |
 
 Format: short description + link to issue/commit when available.
