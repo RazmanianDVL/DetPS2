@@ -9,11 +9,74 @@
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s1` |
-| Agent date | 2026-07-31 (S1 / PL-011 INTERACTIVE) |
+| Agent date | 2026-07-31 (S2 / PL-031 natural texture DMA) |
 | ROMDIR gate | **CLOSED** |
-| Branch | `agent/seat-s1/s1-g1` |
+| Branch | `agent/seat-s1/s2-g2` |
 | menuKind | **mk-mainmenu** MENU YES · **INTERACTIVE YES** (T2) |
 | Seat | **S1** MIDWAY-SM |
+
+---
+
+## S2 PL-031 — natural type-2 bind arm + demote assist PATH3 gap-fill
+
+**Season:** S2 FRONTEND. **Goal:** diagnose why second chrome needs assist PATH3; try real resource/bind path so game can issue PATH3/Path2; demote assist PATH3 while holding MENU Soft-GS + INTERACTIVE.
+
+### Diagnosis (ELF ground truth — why assist PATH3)
+
+| Finding | Evidence |
+|---------|----------|
+| **Natural gifP3 plateaus at 11** | Logo spine + first chrome only; pre-second-chrome px=573440 prims=2 |
+| **Type2 subtype=2 is state-only** | `FUN_0044D950`: subtype 2 runs `44DA10`+`44DAC0` then returns state=2 — **never** `44DE00→44ED40` |
+| **Texture arm is subtype 4/6** | Same worker: subtype 4/6 → `44DE00` gate → `44ED40` → `452678(group7,method6)` jalr |
+| **No GIF/DMAC MMIO in type-2 band** | Scan `0x44D000..0x452000`: zero `lui` of GIF/VIF/DMAC ports — PATH3 submit is **not** in D770→44D860 |
+| **Method tables are jr-ra stubs** | Arena method tables → `ResourceMethodStub` — even subtype-4 jalr cannot build GIF packets |
+| **C1C0 soft-complete** | Seals slot without full chrome setup; natural texture DMA still residual |
+
+**Conclusion:** Assist PATH3 is required because the Midway type-2 draw chain is a **resource state machine**, not a PATH3 submitter; real chrome DMA needs fully loaded texture graphs + method bodies we do not reconstruct. Gap-fill remains residual until PCSX2/PINE live object dump or natural method tables land.
+
+### Claim table (SEMA_OFF, host-present)
+
+| Budget | PC | px | prims | gifP1 | gifP2 | gifP3 | dmac | imgBytes | dispfbPx | exit | notes |
+|--------|-----|-----|-------|-------|-------|-------|------|----------|----------|------|-------|
+| **diagnose 20M** | `0x426E34` | **286720** | 1 | 0 | 0 | **5** | 7 | 1024 | 0 | F | logo spine hold |
+| **claim 100M** | `0x43FD4C` | **966656** | **9** | 0 | 0 | **18** | **100** | 1024 | 0 | F | **MENU YES + INTERACTIVE YES** · gap-fill ×4 after D770 sub=4 |
+
+**claim line:** `claim: px=966656 prims=9 gifP1=0 gifP2=0 gifP3=18 imgBytes=1024 dispfbPx=0 expandHits=0 gifCompleted=110605 gifAborted=1`  
+**Status:** **MENU YES** + **INTERACTIVE YES** (T2) · Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF**  
+**stamp:** `20260731-093853` · build `out/seat-s1`  
+**pad claim:** sel-idx max=**4** accepts≥**149** @100M · PC stream band (not trampoline)
+
+### PL-031 gap-fill telemetry
+
+| Signal | Evidence |
+|--------|----------|
+| **Natural at gap-fill start** | `PL-031 second-chrome gap-fill start natural gifP3=11 prims=2 sub=4 d770n=1` |
+| **Assist kicks** | still ×4 (11→12→14→16→18) — floor hold; early-stop when gifP3≥18∧prims≥9 |
+| **D770 subtype-4** | `force D770 … ty=2 sub=4 body=1` after C1C0; longer 800k budget |
+| **Trampoline stick fixed** | sanitize save-PC/$ra; escape spin on `0x01FE0030` when no force pending → final PC `0x43FD4C` |
+| **dmac↑** | claim dmac **100** (was 30) — more post-bind stream activity; still no natural gifP3 past 11 |
+
+### Change class (PL-031)
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `PlantResourceDrawBody`: subtype **4** arm; plant `44DE00` gates (`+0xA0C+0xB4`, `+0xFE0/+0xFFC`, idx 0x19/0x43/0x48)
+  - Enrich/reseal/force: prefer subtype 4; do not clobber natural 3/4/6
+  - `MaybeSubmitSecondChromePath3`: **gap-fill only** — after ≥1 D770 force, delay first kick, early-stop on MENU floor
+  - D770 budget 400k→800k with body; trampoline PC/$ra sanitize + orphan-trampoline escape
+- **Rejected / freezes held:** no invent new PATH3 plant shapes; no type5; no sm+0x28; no Gs/Gif/Dmac wholesale; SearchFile gate; Soft-GS truth; SEMA_OFF
+
+### Residual wall (post PL-031)
+
+1. **Natural gifP3 still 11** before gap-fill — subtype-4 D770 walks deeper but method stubs still issue no PATH3 (**PL-044** remove assist when natural draws; need PINE type-2 dump).
+2. Assist PATH3 gap-fill still supplies 11→18 (demoted gates, not removed).
+3. DISPFB unset; solid SPRITE chrome only; AnimMenuGUI natural submenu residual (**PL-021**).
+
+### Soft-GS scoreboard (S2 re-claim)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **S1 PL-011 claim 100M** | `0x421CF8` | **966656** | **9** | **18** | 30 | MENU+INTERACTIVE YES |
+| **S2 PL-031 claim 100M** | `0x43FD4C` | **966656** | **9** | **18** | **100** | subtype-4 bind + gap-fill demotion; T2 hold |
 
 ---
 
