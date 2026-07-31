@@ -1,10 +1,10 @@
 # DetPS2 Completeness Status
 
-**Product**: **v0.1.0 Foundation** — 0 commercial titles reach a main menu; engineering phases
-**0–56** done on synthetic/homebrew fixtures only (`v1.0.0` is reserved for real playability — see
-`src/DetPS2.Core/VersionInfo.cs` for the policy)  
+**Product**: **v0.1.0 Foundation** — engineering phases **0–56** synthetic; **commercial Soft-GS
+MENU YES 9/9** (2026-07-31, SEMA_OFF). **Not** fully playable / not interactive fleet-wide.
+`v1.0.0` reserved for ≥10% catalog fully playable — see `src/DetPS2.Core/VersionInfo.cs`.  
 **Smoke**: `dotnet run --project Tests -c Release`  
-**Checklist**: `commercial-checklist` → 11/11 (synthetic gates; not a playability claim)  
+**Scoreboard**: [docs/title-ports/SCOREBOARD.md](docs/title-ports/SCOREBOARD.md)  
 **Play guide**: [PLAY.md](PLAY.md) · `pwsh ./launch.ps1`
 
 This file is the **single source of truth** for what is complete vs open.
@@ -15,15 +15,17 @@ This file is the **single source of truth** for what is complete vs open.
 - Boot selected / double-click; File → Load ISO; Load ELF uses `Ps2System.LoadElf`  
 - Memcard path defaults to `{GamesFolder}\memcards\` (usage later)
 
-### L1/L2 commercial play — **In progress** (real bring-up active, not just tooling)
+### L1 commercial Soft-GS menus — **MENU YES 9/9** (2026-07-31)
 
-Using a real BIOS + Mortal Kombat: Shaolin Monks (`SLUS_210.87`) as the case study: boots past the
-logo into real gameplay/menu-adjacent code (hundreds of millions of cycles of genuine SIF activity),
-currently blocked on a specific runtime-library registry-lookup bug (traced to instruction level —
-see `docs/DEVELOPER_GUIDE.md`'s dated entries). Every blocker fixed this way so far has been a
-general emulation/HLE bug, not a title-specific one, matching the project's standing hypothesis that
-this work has broad value across the library. Not yet at a general "majority" gate — this is one
-title's boot path, not a catalog pass.
+Nine operator fleet titles reach Soft-GS **menuKind** surfaces (logo / title / midway keep-alive).
+Truth = Soft-GS metrics only (no FFmpeg). Residual: pad INTERACTIVE, natural DISPFB/IMAGE/tex,
+GameQuirk debt, IRX FILEIO purity. Plans: [NEXT_PLAN.md](NEXT_PLAN.md),
+[docs/POST_MENU_PHASE_PLAN.md](docs/POST_MENU_PHASE_PLAN.md),
+[docs/GRAPHICS_PIPELINE_PHASE_PLAN.md](docs/GRAPHICS_PIPELINE_PHASE_PLAN.md). Epic **#12**.
+
+### L2 first gameplay / interactive — **In progress**
+
+Season S1 INTERACTIVE + G1 Soft-GS path fidelity (10 concurrent seats).
 
 ---
 

@@ -9,19 +9,19 @@
 **Versioning policy**: the version number tracks real, user-visible commercial playability —
 **not** internal engineering completeness. **`1.0.0` is reserved for ≥10% of
 [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md)'s titles fully playable start-to-finish with no
-errors.** As of `v0.1.0`, **zero** commercial titles have even reached a main menu — an earlier
-version scheme reached "v3.1.0" purely from finishing internal/synthetic engineering phases, which
-was a misleading way to represent that, and has been retired (see `src/DetPS2.Core/VersionInfo.cs`).
+errors.** Product remains **v0.1.0 Foundation** until a formal release notes bump (e.g. v0.2 for
+interactive/playability milestones). See `src/DetPS2.Core/VersionInfo.cs`.
 
-**What is done**: a deterministic pure-C# PS2 engineering foundation — EE/IOP interpreters + real
-ALU JIT, software GS, kernel HLE, save states, netplay/rollback infrastructure, and CLI/Desktop
-tooling — all verified only against synthetic fixtures and homebrew, not real commercial play.
-**What is not done**: any commercial title reaching its main menu, let alone being playable.
-**Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
+**Commercial Soft-GS MENU YES: 9/9** (scoreboard `menuKind` bars, SEMA_OFF, Soft-GS truth only —
+not full playability). Scoreboard: **[docs/title-ports/SCOREBOARD.md](docs/title-ports/SCOREBOARD.md)** ·
+wiki: [Commercial Titles](https://github.com/RazmanianDVL/DetPS2/wiki/Commercial-Titles).
 
-**Active work (pivot 2026-07-30)**: the emulator **fully uses real BIOS/disc IRX on the IOP** (not
-an optional “mode”) — same model as other PS2 emulators. C# owns EE/Soft-GS/devices; IOP modules
-**load and execute**. Phase plan: **[docs/IRX_EXECUTION_PHASE_PLAN.md](docs/IRX_EXECUTION_PHASE_PLAN.md)**.
+**What is done**: pure-C# PS2 foundation (EE/IOP/Soft-GS/HLE/tooling) **plus** a 9-title commercial
+Soft-GS menu surface campaign. **What is not done**: pad-interactive menus fleet-wide, natural
+textures/DISPFB, first gameplay rooms, IRX-pure FILEIO. **Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
+
+**Active work (2026-07-31)**: **10-agent** post-MENU campaign —
+**[NEXT_PLAN.md](NEXT_PLAN.md)** → playability plan + **Soft-GS graphics pipeline** + IRX couple.
 Epic: GitHub **#12**. Emergency HLE bisect only: `DETPS2_FORCE_HLE_IOP=1`.
 
 ```bash
@@ -43,7 +43,10 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dump paths
 | [docs/TARGET_CATALOG.md](docs/TARGET_CATALOG.md) | Title list for majority math |
 | [RELEASE_NOTES.md](RELEASE_NOTES.md) | v0.1.0 release notes |
 | [ROADMAP.md](ROADMAP.md) | Full phase-by-phase history (0–56) |
-| [NEXT_PLAN.md](NEXT_PLAN.md) | Pointer to current focus |
+| [NEXT_PLAN.md](NEXT_PLAN.md) | **Current focus** — post-MENU + graphics + IRX |
+| [docs/POST_MENU_PHASE_PLAN.md](docs/POST_MENU_PHASE_PLAN.md) | 100 WPs, 10 seats, gates P0–P12 |
+| [docs/GRAPHICS_PIPELINE_PHASE_PLAN.md](docs/GRAPHICS_PIPELINE_PHASE_PLAN.md) | Soft-GS pipeline 80 WPs, G-GFX-0…9 |
+| [docs/title-ports/SCOREBOARD.md](docs/title-ports/SCOREBOARD.md) | Commercial MENU YES fleet |
 | [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE_FREEZE.md](ARCHITECTURE_FREEZE.md) | Contracts |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What runs |
 | [FLOAT_POLICY.md](FLOAT_POLICY.md) | Deterministic float rules |

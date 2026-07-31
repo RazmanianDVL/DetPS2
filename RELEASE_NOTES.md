@@ -1,3 +1,27 @@
+# DetPS2Sharp — Release Notes
+
+---
+
+## Unreleased (main tip, 2026-07-31) — commercial Soft-GS menus
+
+**Not a version bump yet** (still **v0.1.0** until formal tag). Milestone for operators:
+
+| Milestone | Status |
+|-----------|--------|
+| Soft-GS **MENU YES** on 9 commercial titles | **Done** (SEMA_OFF, Soft-GS truth) |
+| Pad **INTERACTIVE** fleet-wide (P1) | **In progress** (S1 wave) |
+| Soft-GS graphics pipeline past expand/PATH3 crutches | **In progress** (G0 metrics landed; G1+) |
+| First gameplay rooms (P4+) | Planned |
+| IRX-pure FILEIO/PAD | Planned (S7 couple) |
+
+**Scoreboard:** [docs/title-ports/SCOREBOARD.md](docs/title-ports/SCOREBOARD.md)  
+**Plans:** [NEXT_PLAN.md](NEXT_PLAN.md) · [POST_MENU_PHASE_PLAN](docs/POST_MENU_PHASE_PLAN.md) · [GRAPHICS_PIPELINE](docs/GRAPHICS_PIPELINE_PHASE_PLAN.md)  
+**Epic:** [#12](https://github.com/RazmanianDVL/DetPS2/issues/12)
+
+Notable Soft-GS infrastructure: Path2 sticky GIF, XYZ2/XYZ3 kick map, merge composite, ofx title-strip expand + **expandHits** telemetry, claim/scoreboard tier hooks.
+
+---
+
 # DetPS2Sharp v0.1.0 — Release Notes
 
 **Date**: 2026-07-27

@@ -1,9 +1,9 @@
 # Commercial title scoreboard — main menu campaign
 
-**Date**: 2026-07-30 (9-title concurrent wave)  
-**Branch / PR**: [`campaign/issue-knockout` #28](https://github.com/RazmanianDVL/DetPS2/pull/28) tip **`f807ab1`**  
-**Constraints**: `DETPS2_SEMA_STALL_YIELD` **OFF** · Soft-GS metrics = ground truth · no iGPU  
-**Smokes**: ALL PASSED after integrate  
+**Date**: 2026-07-31  
+**Tip**: **`7fded23`** on `main` (S0/G0 merge train; MENU YES 9/9 Soft-GS)  
+**Constraints**: `DETPS2_SEMA_STALL_YIELD` **OFF** · Soft-GS metrics = ground truth · no FFmpeg logos  
+**Active campaign**: [POST_MENU_PHASE_PLAN.md](../POST_MENU_PHASE_PLAN.md) + [GRAPHICS_PIPELINE_PHASE_PLAN.md](../GRAPHICS_PIPELINE_PHASE_PLAN.md) · epic [#12](https://github.com/RazmanianDVL/DetPS2/issues/12)  
 **Wiki**: [Commercial-Titles](https://github.com/RazmanianDVL/DetPS2/wiki/Commercial-Titles)
 
 | Title | Serial | Menu? | Key tip metric | Wall |
@@ -20,7 +20,7 @@
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
-> **MENU YES 9/9** on tip `649846b` (Soft-GS truth, SEMA_STALL_YIELD OFF). Residual polish: richer chrome / pad deep menus still open on several titles.
+> **MENU YES 9/9** Soft-GS (SEMA_OFF). **Next bars:** INTERACTIVE (P1) + graphics G-GFX-1…9 (path/tex/DISPFB). S0 charters + expandHits/gif metrics landed; S1 pad wave in flight.
 
 ## 9-title wave commits (`32b4e62..f807ab1`)
 
