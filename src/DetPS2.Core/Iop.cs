@@ -3,11 +3,17 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// IOP R3000A interpreter (Phase 8).
+/// IOP R3000A interpreter (Phase 8 / IRX WP-05+06).
 /// Delay slots, LO/HI, expanded loads/stores, minimal COP0, deterministic stepping.
+/// Public <see cref="RunInstructions"/> is the preferred quantum API for IRX module exec.
 /// </summary>
 public sealed class Iop : ISchedulable
 {
+    /// <summary>R3000A general exception vector when Status.BEV=0 (KSEG0 → phys 0x80).</summary>
+    public const uint VectorGeneral = 0x80000080u;
+    /// <summary>R3000A general exception vector when Status.BEV=1 (BIOS).</summary>
+    public const uint VectorGeneralBev = 0xBFC00180u;
+
     public Intc Intc { get; }
 
     public uint PC { get; set; } = 0xBFC00000;
@@ -25,7 +31,14 @@ public sealed class Iop : ISchedulable
     public uint SifMbxToEE { get; private set; }
 
     public bool Running { get; private set; } = true;
+    /// <summary>Total instruction slots retired (delay slots count as their own slots).</summary>
     public ulong InstructionsExecuted { get; private set; }
+    /// <summary>Number of times <see cref="EnterException"/> ran (SYSCALL/BREAK/…).</summary>
+    public ulong ExceptionCount { get; private set; }
+    /// <summary>Last COP0 Cause ExcCode (e.g. 8=SYSCALL, 9=BREAK).</summary>
+    public uint LastExceptionCode { get; private set; }
+    /// <summary>Code field from last SYSCALL/BREAK insn (bits 25:6), if any.</summary>
+    public uint LastSyscallCode { get; private set; }
 
     public static readonly bool TracePc = Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP") == "1";
     public static readonly ulong TracePcLimit =
@@ -35,6 +48,8 @@ public sealed class Iop : ISchedulable
     private uint _branchTarget;
     private bool _pendingVectorJump;
     private uint _vectorTarget;
+    private ulong _traceUnkMmioLogged;
+    private ulong _traceUnkCopLogged;
 
     public Iop(Intc intc, SystemMemory memory)
     {
@@ -56,9 +71,14 @@ public sealed class Iop : ISchedulable
         SifMbxToEE = 0;
         Running = true;
         InstructionsExecuted = 0;
+        ExceptionCount = 0;
+        LastExceptionCode = 0;
+        LastSyscallCode = 0;
         _branchTarget = 0;
         _pendingVectorJump = false;
         _vectorTarget = 0;
+        _traceUnkMmioLogged = 0;
+        _traceUnkCopLogged = 0;
     }
 
     /// <summary>Full IOP core state for SaveState.cs, including LO/HI (no public setters —
@@ -75,6 +95,9 @@ public sealed class Iop : ISchedulable
         w.Write(SifMbxFromEE); w.Write(SifMbxToEE);
         w.Write(Running);
         w.Write(InstructionsExecuted);
+        w.Write(ExceptionCount);
+        w.Write(LastExceptionCode);
+        w.Write(LastSyscallCode);
         w.Write(_branchTarget);
         w.Write(_pendingVectorJump);
         w.Write(_vectorTarget);
@@ -89,6 +112,9 @@ public sealed class Iop : ISchedulable
         SifMbxFromEE = r.ReadUInt32(); SifMbxToEE = r.ReadUInt32();
         Running = r.ReadBoolean();
         InstructionsExecuted = r.ReadUInt64();
+        ExceptionCount = r.ReadUInt64();
+        LastExceptionCode = r.ReadUInt32();
+        LastSyscallCode = r.ReadUInt32();
         _branchTarget = r.ReadUInt32();
         _pendingVectorJump = r.ReadBoolean();
         _vectorTarget = r.ReadUInt32();
@@ -149,6 +175,13 @@ public sealed class Iop : ISchedulable
         return executed;
     }
 
+    /// <summary>
+    /// Run up to <paramref name="count"/> instruction slots deterministically
+    /// (delay slots count). Preferred IRX quantum API (WP-05). Same budget semantics as
+    /// <see cref="Step"/>; returns how many slots were actually retired.
+    /// </summary>
+    public int RunInstructions(ulong count) => Step(count);
+
     private bool ExecuteInstruction(uint opcode)
     {
         uint primary = (opcode >> 26) & 0x3F;
@@ -172,6 +205,10 @@ public sealed class Iop : ISchedulable
             0x0E => ImmLogic(opcode, (a, i) => a ^ i),             // XORI
             0x0F => Lui(opcode),
             0x10 => ExecuteCop0(opcode),
+            // COP1/COP2: IOP R3000A has neither FPU nor COP2 — log + NOP for IRX diagnostics.
+            0x11 => UnknownCop(1, opcode),
+            0x12 => UnknownCop(2, opcode),
+            0x13 => UnknownCop(3, opcode),
             0x20 => LoadStore8(opcode, store: false, signed: true),   // LB
             0x21 => LoadStore16(opcode, store: false, signed: true),  // LH
             0x23 => LoadWord(opcode),                                 // LW
@@ -180,8 +217,30 @@ public sealed class Iop : ISchedulable
             0x28 => LoadStore8(opcode, store: true, signed: false),   // SB
             0x29 => LoadStore16(opcode, store: true, signed: false),  // SH
             0x2B => StoreWord(opcode),                                // SW
-            _ => false
+            _ => UnknownOpcode(primary, opcode)
         };
+    }
+
+    private bool UnknownOpcode(uint primary, uint opcode)
+    {
+        if (TracePc && _traceUnkCopLogged < TracePcLimit)
+        {
+            _traceUnkCopLogged++;
+            Console.Error.WriteLine(
+                $"[IOP-UNK-OP] pc=0x{PC:X8} primary=0x{primary:X2} op=0x{opcode:X8} n={InstructionsExecuted}");
+        }
+        return false;
+    }
+
+    private bool UnknownCop(int cop, uint opcode)
+    {
+        if (TracePc && _traceUnkCopLogged < TracePcLimit)
+        {
+            _traceUnkCopLogged++;
+            Console.Error.WriteLine(
+                $"[IOP-UNK-COP] pc=0x{PC:X8} cop={cop} op=0x{opcode:X8} n={InstructionsExecuted}");
+        }
+        return false;
     }
 
     private static uint Rs(uint op) => (op >> 21) & 0x1F;
@@ -252,9 +311,11 @@ public sealed class Iop : ISchedulable
                 if (rd != 0) _gprs[rd] = ret;
                 return BranchTo(target);
             case 0x0C: // SYSCALL — real R3000A exception entry (ExcCode 8), not a halt.
+                LastSyscallCode = (opcode >> 6) & 0xFFFFF;
                 EnterException(8);
                 break;
             case 0x0D: // BREAK (ExcCode 9)
+                LastSyscallCode = (opcode >> 6) & 0xFFFFF;
                 EnterException(9);
                 break;
             case 0x10: if (rd != 0) _gprs[rd] = HI; break; // MFHI
@@ -315,7 +376,8 @@ public sealed class Iop : ISchedulable
             0x11 => val >= 0, // BGEZAL
             _ => false
         };
-        if ((rt == 0x10 || rt == 0x11) && take)
+        // MIPS link always writes $ra, whether or not the branch is taken.
+        if (rt == 0x10 || rt == 0x11)
             _gprs[31] = PC + 8;
         return take && BranchIf(true, opcode);
     }
@@ -333,12 +395,25 @@ public sealed class Iop : ISchedulable
             case 0x04: // MTC0
                 WriteCop0(rd, _gprs[rt]);
                 break;
-            case 0x10: // RFE — real R3000A return-from-exception: shift the KUp/IEp pair
-                       // (bits 3:2) back down into KUc/IEc (bits 1:0), restoring the mode/
-                       // interrupt-enable state the exception handler was entered under. The
-                       // R3000A has no EXL bit (that's a later-MIPS/R5900 feature) — it's a
-                       // real 3-deep current/previous/old shift-register stack instead.
-                Cop0Status = (Cop0Status & ~0xFu) | ((Cop0Status & 0x3Cu) >> 2);
+            case 0x10: // COP0 CO — RFE is func=0x10
+                // RFE: shift the KUp/IEp pair (bits 3:2) back down into KUc/IEc (bits 1:0).
+                // R3000A has no EXL bit (later-MIPS/R5900) — 3-deep current/previous/old stack.
+                if ((opcode & 0x3F) == 0x10)
+                    Cop0Status = (Cop0Status & ~0xFu) | ((Cop0Status & 0x3Cu) >> 2);
+                else if (TracePc && _traceUnkCopLogged < TracePcLimit)
+                {
+                    _traceUnkCopLogged++;
+                    Console.Error.WriteLine(
+                        $"[IOP-UNK-COP] pc=0x{PC:X8} cop=0 co_func=0x{opcode & 0x3F:X2} op=0x{opcode:X8}");
+                }
+                break;
+            default:
+                if (TracePc && _traceUnkCopLogged < TracePcLimit)
+                {
+                    _traceUnkCopLogged++;
+                    Console.Error.WriteLine(
+                        $"[IOP-UNK-COP] pc=0x{PC:X8} cop=0 rs=0x{rs:X2} op=0x{opcode:X8} n={InstructionsExecuted}");
+                }
                 break;
         }
         return false;
@@ -362,9 +437,45 @@ public sealed class Iop : ISchedulable
         Cop0Epc = PC;
         Cop0Cause = (Cop0Cause & ~0x7Cu) | ((excCode & 0x1Fu) << 2);
         if (excCode == 4 || excCode == 5) Cop0BadVAddr = badVAddr; // AdEL/AdES
+        // Shift KU/IE stack: insert kernel-mode (KUc=0) + IE disabled (IEc=0) as new current.
         Cop0Status = (Cop0Status & ~0x3Fu) | ((Cop0Status & 0xFu) << 2);
-        _vectorTarget = bev ? 0xBFC00180u : 0x80000080u;
+        _vectorTarget = bev ? VectorGeneralBev : VectorGeneral;
         _pendingVectorJump = true;
+        LastExceptionCode = excCode;
+        ExceptionCount++;
+        if (TracePc && ExceptionCount <= TracePcLimit)
+        {
+            Console.Error.WriteLine(
+                $"[IOP-EXC] code={excCode} syscall=0x{LastSyscallCode:X} epc=0x{Cop0Epc:X8} " +
+                $"vec=0x{_vectorTarget:X8} bev={(bev ? 1 : 0)} n={InstructionsExecuted}");
+        }
+    }
+
+    /// <summary>
+    /// Install a minimal R3000 general-exception stub at the BEV=0 vector (phys 0x80):
+    /// skip the faulting insn (EPC+4) and RFE/return. Enough for synthetic IRX <c>_start</c>
+    /// and unit smokes that issue SYSCALL/BREAK without a full IOP BIOS handler (WP-06).
+    /// Does not touch BEV=1 BIOS vector (ROM).
+    /// </summary>
+    public void InstallMinimalExceptionStub()
+    {
+        // k0 = $26. Classic R3000: mfc0 k0,EPC; addiu k0,k0,4; jr k0; rfe (delay slot).
+        const uint k0 = 26;
+        uint Mfc0(uint rt, uint rd) => (0x10u << 26) | (0x00u << 21) | (rt << 16) | (rd << 11);
+        uint Addiu(uint rt, uint rs, short imm) =>
+            (0x09u << 26) | (rs << 21) | (rt << 16) | (ushort)imm;
+        uint Jr(uint rs) => (0x00u << 26) | (rs << 21) | 0x08u;
+        const uint Rfe = (0x10u << 26) | (0x10u << 21) | 0x10u; // COP0 CO RFE
+
+        uint[] stub =
+        {
+            Mfc0(k0, 14),      // mfc0 k0, $14 (EPC)
+            Addiu(k0, k0, 4),  // skip SYSCALL/BREAK
+            Jr(k0),            // jr k0
+            Rfe                // rfe in delay slot
+        };
+        for (int i = 0; i < stub.Length; i++)
+            _memory.IopWrite32(VectorGeneral + (uint)(i * 4), stub[i]);
     }
 
     private uint ReadCop0(uint reg) => reg switch
@@ -388,17 +499,64 @@ public sealed class Iop : ISchedulable
 
     private uint EffectiveAddress(uint opcode) => _gprs[Rs(opcode)] + (uint)Imm16(opcode);
 
+    /// <summary>
+    /// IOP bus regions currently backed by SystemMemory.Iop*: RAM, BIOS window, SIF mailbox.
+    /// Everything else is "unknown MMIO" for WP-05 diagnostics (real peripherals land here later).
+    /// </summary>
+    private static bool IsKnownIopMap(uint addr)
+    {
+        uint p = addr & 0x1FFFFFFFu;
+        if (p < (uint)SystemMemory.IOP_RAM_SIZE) return true;
+        if (p >= SystemMemory.IOP_SIF_BASE && p < SystemMemory.IOP_SIF_BASE + SystemMemory.IOP_SIF_SIZE)
+            return true;
+        if (p >= SystemMemory.BIOS_BASE && p < SystemMemory.BIOS_BASE + (uint)SystemMemory.BIOS_SIZE)
+            return true;
+        return false;
+    }
+
+    private void TraceUnknownMmio(string op, uint addr, uint value = 0)
+    {
+        if (!TracePc || _traceUnkMmioLogged >= TracePcLimit) return;
+        _traceUnkMmioLogged++;
+        Console.Error.WriteLine(
+            $"[IOP-UNK-MMIO] {op} addr=0x{addr:X8} val=0x{value:X8} pc=0x{PC:X8} n={InstructionsExecuted}");
+    }
+
+    private uint MemRead32(uint addr)
+    {
+        if (!IsKnownIopMap(addr)) TraceUnknownMmio("R32", addr);
+        return _memory.IopRead32(addr);
+    }
+
+    private void MemWrite32(uint addr, uint value)
+    {
+        if (!IsKnownIopMap(addr)) TraceUnknownMmio("W32", addr, value);
+        _memory.IopWrite32(addr, value);
+    }
+
+    private byte MemRead8(uint addr)
+    {
+        if (!IsKnownIopMap(addr)) TraceUnknownMmio("R8", addr);
+        return _memory.IopRead8(addr);
+    }
+
+    private void MemWrite8(uint addr, byte value)
+    {
+        if (!IsKnownIopMap(addr)) TraceUnknownMmio("W8", addr, value);
+        _memory.IopWrite8(addr, value);
+    }
+
     private bool LoadWord(uint opcode)
     {
         uint rt = Rt(opcode);
         uint addr = EffectiveAddress(opcode);
-        if (rt != 0) _gprs[rt] = _memory.IopRead32(addr);
+        if (rt != 0) _gprs[rt] = MemRead32(addr);
         return false;
     }
 
     private bool StoreWord(uint opcode)
     {
-        _memory.IopWrite32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
+        MemWrite32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
         return false;
     }
 
@@ -408,11 +566,11 @@ public sealed class Iop : ISchedulable
         uint rt = Rt(opcode);
         if (store)
         {
-            _memory.IopWrite8(addr, (byte)_gprs[rt]);
+            MemWrite8(addr, (byte)_gprs[rt]);
         }
         else if (rt != 0)
         {
-            byte b = _memory.IopRead8(addr);
+            byte b = MemRead8(addr);
             _gprs[rt] = signed ? (uint)(sbyte)b : b;
         }
         return false;
@@ -424,12 +582,12 @@ public sealed class Iop : ISchedulable
         uint rt = Rt(opcode);
         if (store)
         {
-            _memory.IopWrite8(addr, (byte)_gprs[rt]);
-            _memory.IopWrite8(addr + 1, (byte)(_gprs[rt] >> 8));
+            MemWrite8(addr, (byte)_gprs[rt]);
+            MemWrite8(addr + 1, (byte)(_gprs[rt] >> 8));
         }
         else if (rt != 0)
         {
-            ushort h = (ushort)(_memory.IopRead8(addr) | (_memory.IopRead8(addr + 1) << 8));
+            ushort h = (ushort)(MemRead8(addr) | (MemRead8(addr + 1) << 8));
             _gprs[rt] = signed ? (uint)(short)h : h;
         }
         return false;
@@ -445,5 +603,8 @@ public sealed class Iop : ISchedulable
         PC = address;
         Running = true;
         InstructionsExecuted = 0;
+        ExceptionCount = 0;
+        LastExceptionCode = 0;
+        LastSyscallCode = 0;
     }
 }
