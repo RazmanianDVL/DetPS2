@@ -1,299 +1,330 @@
-# Phase plan: Literal BIOS / disc IRX execution (IRX-first pivot)
+# IRX-first mega phase plan — orchestrator edition
 
-**Status:** ACTIVE — architectural pivot (2026-07-30)  
-**Supersedes:** HLE-first commercial campaign as the *primary* path to playability  
-**Related:** GitHub **#12** (literal IOP IRX), G0 HLE remains a *fallback / bootstrap aid*, not the product  
-**Doctrine conflict resolution:** Playability via **real module code** wins over inventing C# service clones. Soft-GS remains presentation truth. Host FFmpeg logos stay banned. Title `jr ra` plants are **debt to delete**, not strategy.
+**Status:** ACTIVE PIVOT — **ASAP playability** via literal BIOS/disc IRX  
+**Commit anchor:** main (keep this file authoritative)  
+**Epic:** [#12](https://github.com/RazmanianDVL/DetPS2/issues/12)  
+**Orchestration model:** **10 concurrent agents** on **isolated tracks** (file ownership below). Orchestrator merges, smokes, pushes, updates issues/wiki.  
+**Supersedes:** HLE plant waves as primary strategy; prior 6-phase sketch expanded here into **50 work packages (WP-00 … WP-49)** across **10 tracks**.
 
 ---
 
-## 0. Why this plan exists
+## Executive summary (read this first)
 
-### What we did wrong
+### The mistake
 
-| Approach | Result |
-|----------|--------|
-| Re-implement IOP services in C# (FILEIO, PAD, CRI-ish, GTFS, MWFILE, …) | Endless trial-and-error; every title dialect is a new plant |
-| GameQuirks thrash escapes / path plants / sector credit | Metrics move; games still not playable |
-| Treat “BIOS G0 HLE complete” as “platform done” | False confidence — games run **on top of** IOP modules + EE + GS |
+We spent enormous time **re-implementing IOP services in C#** and title plants.  
+Other PS2 emulators **load and run the real IRX**. DetPS2 already has:
 
-### What every other PS2 emulator does
+- `Iop` R3000 interpreter  
+- `IrxLoader` with real REL + import/export link  
+- ROMDIR / IOPBTCONF inventory  
+
+…but historically **“nothing ever executed loaded IOP module code”** (`IrxLoader.cs`).
+
+### The fix
 
 ```text
-EE game ELF  →  SIF  →  real IRX on IOP R3000  →  devices (CDVD, SIO2, …)
+EE game (C#)  →  SIF  →  IOP R3000 **executing real IRX**  →  C# devices (CDVD/SIO2/…)
 ```
 
-They do **not** re-write Sofdec, PADMAN, and FILEIO from scratch for each commercial title as the default path.
+C# = machine (EE, Soft-GS, devices, determinism).  
+**IRX = the software.** Stop inventing a second OS.
 
-### What DetPS2 already has (do not rebuild from zero)
-
-| Asset | State | Use |
-|-------|--------|-----|
-| `Iop` R3000A interpreter | Exists, stepped, savestate-aware | **Execute** module entry points |
-| `IrxLoader` | Real MIPS REL + export/import link | Load BIOS + disc IRX into IOP RAM |
-| `RomdirExtractor` / BIOS bind | SCPH70008 ROMDIR inventory | Feed real module bytes |
-| `BiosBootHost` IOPBTCONF order | Known | Boot order for real loads |
-| SIF / CDVD / SIO2 / DMAC (EE side) | Partial but real | Device model IRX talks to |
-| EE + Soft-GS | Commercial bring-up baseline | Keep; improve as needed |
-| GameQuirks / RealSifRpc mega-HLE | Large | **Demote** to fallback / delete over phases |
-
-**Critical quote (from `IrxLoader.cs`):** real modules were relocated but  
-**“nothing ever executed loaded IOP module code.”**  
-That single fact is the pivot: **stop inventing services; run the modules.**
-
-### What this project is for (restated)
-
-1. **Deterministic** EE+IOP+devices (state sync / netplay).  
-2. **C#** for controlled, known host code (EE JIT, scheduler, Soft-GS, device models).  
-3. **Playable commercial software** by running **the same IRX the console runs**, not a parallel fantasy OS.
-
-C# is **not** an excuse to reimplement Sony’s IOP stack. C# hosts the machine; **IRX is the software**.
-
-### Repo size note
-
-Rough workspace sizes (this tree): `src+docs+tools` ~**225 MB**; `out/` build artifacts ~**1.2 GB**; whole worktree multi‑GB with traces/dumps.  
-**Phase 0 hygiene** reclaims most of the “5 GB balloon” without deleting emulator capability.
-
----
-
-## 1. Success definition
-
-### North-star gate (end of plan)
+### North-star (when we stop saying “behind”)
 
 | Gate | Criteria |
 |------|----------|
-| **IRX-primary boot** | With operator BIOS + one commercial ISO, IOPBTCONF modules **and** disc IOPRP chain **execute** on `Iop` (instruction stream non-zero in module text), not only HLE `HandleBind` |
-| **SIF path live** | EE `sceSif*` / LOADFILE / FILEIO go through **real module code** ↔ SIF ↔ EE for at least one title’s pad + one file open |
-| **Playability slice** | At least **one** commercial title: Soft-GS **non-black interactive surface** (title’s real gate — menu or first GS) **without** new title-local thrash plants |
-| **Determinism** | Same ISO + same inputs + same cycle budget → identical MasterCycles + Soft-GS hash (smokes + one commercial replay tape) |
-| **Debt direction** | Net **deletion** of GameQuirk plants / FILEIO soft-success sprawl; no new FFmpeg-class host media cheats |
+| **G1** | IOPBTCONF modules from operator BIOS **execute** (non-zero insn in module text) |
+| **G2** | Disc IOPRP chain **executes**; GetVersion comes from live stack where applicable |
+| **G3** | ≥1 commercial title: **FILEIO open+read** of a real game file through **executing FILEIO IRX** |
+| **G4** | ≥1 commercial title: **pad OPEN** through **executing PADMAN** |
+| **G5** | ≥1 commercial title: **Soft-GS non-black interactive surface** (title’s real gate) **without new thrash plants** |
+| **G6** | Determinism: tape replay hash stable under `LITERAL_IRX=1` |
+| **G7** | Net deletion of GameQuirk plant LOC; HLE is fallback only |
 
-### Non-goals (explicit)
+### Absolute freezes (orchestrator enforces)
 
-- Shipping BIOS/ISO in git (operator-provided only).  
-- MagicGate / DRM crypto fidelity as a blocker.  
-- Perfect GS accuracy before first playable frame.  
-- Keeping every RealSifRpc HLE path forever.
+1. **No new multi-title HLE plant waves.**  
+2. **No host FFmpeg / synthetic logos.**  
+3. **No new GameQuirk** unless ticket says `blocks IRX WP-XX device X` and orchestrator approves.  
+4. Agents **own tracks only** — do not edit foreign files without handoff.  
+5. Every WP ends with: build + named smoke + comment on #12.
 
 ---
 
-## 2. Architecture target
+## 10 agent tracks (parallel ownership)
+
+| Track | Agent role | **OWNED files / areas** | Forbidden |
+|-------|------------|-------------------------|-----------|
+| **T0** | **Orchestrator** (you + this agent) | Merge, smoke, push, #12, wiki, `docs/IRX_*`, `NEXT_PLAN` | Day-to-day IRX impl |
+| **T1** | IOP core exec | `Iop.cs`, `IopDisassembler.cs`, exception/syscall vectors | RealSifRpc, Assists |
+| **T2** | IRX loader / modules | `IrxLoader.cs`, `IopModuleHost` (or wherever LoadIrx lives), module list | EE quirks |
+| **T3** | BIOS boot chain | `BiosBootHost.cs`, `RomdirExtractor.cs`, IOPBTCONF ordering | GameQuirks |
+| **T4** | SIF bridge | `Sif.cs`, SIF parts of `RealSifRpc` only as **bridge**, `SifRpc.cs` | Title assists |
+| **T5** | CDVD device | `Cdvd.cs`, ISO path, mechacon ready for IRX | Midway assists |
+| **T6** | SIO2 / pad / MC devices | `Sio2.cs`, `PadInput.cs`, `MemoryCard.cs` device surface | FILEIO HLE sprawl |
+| **T7** | EE kernel / LOADFILE surface | `SonyKernelHle.cs`, `KernelHle.cs`, LOADFILE EE side | IOP interpreter |
+| **T8** | Disc IOPRP / UDNL | `IopExtendedBiosHost.cs` UDNL path, disc IRX load | Soft-GS |
+| **T9** | Soft-GS / GIF / present | `Gs.cs`, `Gif.cs`, `Vif*.cs`, Desktop present only | IOP |
+| **T10** | Debt demolition + tooling | Strip GameQuirks / soft-success; `tools/*` IRX traces; size hygiene | New plants |
+
+> **Note:** 10 work agents = T1–T10; T0 is orchestrator. Fan-out max **10 parallel** when dependencies allow (see § Parallel waves).
+
+---
+
+## Work package catalog (WP-00 … WP-49)
+
+Each WP: **ID · Track · Depends · Deliverable · Exit test · Est**
+
+### Block A — Foundation & freeze (WP-00 … WP-04)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-00** | T0/T10 | — | Document `DETPS2_LITERAL_IRX=0\|1` (default **1** after WP-08); bisect switch design | Doc in tools/README + this file | 0.5d |
+| **WP-01** | T10 | — | Clean `out/`, traces, root dumps; `.gitignore` hardened; size report | Worktree rebuildable; sources dominate size | 0.5d |
+| **WP-02** | T0 | — | Freeze PR policy: reject plant waves; label `debt-hle` | Written in CONTRIBUTING + #12 | 0.25d |
+| **WP-03** | T10 | — | Inventory matrix: every RealSifRpc SID → “IRX name or DEBT” CSV/md | `docs/irx/HLE_TO_IRX_MATRIX.md` | 1d |
+| **WP-04** | T2 | — | Module registry API audit: LoadIrx, RegisterModule, export tables, start hooks | Design note in `docs/irx/MODULE_RUNTIME.md` | 0.5d |
+
+**Block A exit:** Policy + hygiene + matrix. Agents T1–T9 unblocked for B.
+
+---
+
+### Block B — Make IRX actually run (WP-05 … WP-14)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-05** | T1 | WP-04 | IOP step API: run N insns; trap unknown COP/MMIO to log | Unit: 1k insns deterministic | 1d |
+| **WP-06** | T1 | WP-05 | Exception/syscall vectors match R3000 enough for IRX `_start` | SYSCALL smoke | 1–2d |
+| **WP-07** | T2 | WP-04 | After Load+Link: **create runnable module context** (entry, gp, resched) | Struct + tests | 1d |
+| **WP-08** | T2+T1 | WP-05,07 | **First exec:** load synthetic IRX → set PC → run until return/halt | **Smoke `Irx_ExecutesMinimal`** | 1–2d |
+| **WP-09** | T2 | WP-08 | Import stubs call **real export** of already-loaded module | Two-module link smoke | 1–2d |
+| **WP-10** | T1 | WP-06 | IOP interrupts: VBlank/timer enough for module idle loops | IRX can WaitEventFlag-style loop without death | 1–2d |
+| **WP-11** | T0 | WP-08 | `Ps2System.RunFor` schedules **IOP quanta** when `LITERAL_IRX=1` | MasterCycles + IOP insn both advance | 1d |
+| **WP-12** | T2 | WP-08 | Savestate: module list + load bases + IOP PC/GPR | Round-trip smoke | 1d |
+| **WP-13** | T10 | WP-08 | `DETPS2_TRACE_IOP=1` samples PC → module name map | Trace file readable | 0.5d |
+| **WP-14** | T2+T3 | WP-08 | Load **one real BIOS IRX** (SYSMEM or HEAPLIB) from operator ROMDIR and run `_start` | Smoke `Irx_ExecutesBiosSysmem` (needs media) | 2d |
+
+**Block B exit = G1 partial:** IRX execution is real. **Critical path.**
+
+---
+
+### Block C — BIOS IOPBTCONF chain (WP-15 … WP-24)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-15** | T3 | WP-14 | Parse IOPBTCONF → ordered list of module names | Unit vs known SCPH70008 order | 0.5d |
+| **WP-16** | T3 | WP-15,14 | Boot: sequential extract+load+exec for first **5** modules | Log chain; no exception storm | 2d |
+| **WP-17** | T3 | WP-16 | Complete **@800 required** chain (G0 list) with exec | All required start or explicit trap | 3d |
+| **WP-18** | T5 | WP-11 | CDVD MMIO surface IRX expects (status/ready/read) | CDVDMAN can poll without hang (or logged trap) | 2–3d |
+| **WP-19** | T4 | WP-11 | SIF DMA/mailbox: EE write visible to IOP; IOP reply visible to EE | Round-trip smoke bytes | 2d |
+| **WP-20** | T4 | WP-19,09 | Prefer **executing SIFMAN** for sifcmd path (HLE DMA engine underneath OK) | EE sifcmd completes with live IOP | 3d |
+| **WP-21** | T6 | WP-11 | SIO2 MMIO + pad bytes for PADMAN | Device unit tests | 2d |
+| **WP-22** | T7 | WP-19 | EE LOADFILE path talks to **live** IOP LOADFILE when present | GetVersion non-fake under LITERAL_IRX | 2d |
+| **WP-23** | T3 | WP-17 | Reboot: `SifIopReset` tears down + reloads chain | Generation++ ; chain re-exec | 2d |
+| **WP-24** | T0 | WP-17,19 | Integration: BIOS-only boot report JSON (modules exec counts) | CLI `irx-boot-report` | 1d |
+
+**Block C exit = G1:** BIOS chain executes. EE can handshake.
+
+---
+
+### Block D — Disc IOPRP & commercial IRX (WP-25 … WP-34)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-25** | T8 | WP-23 | UDNL applies **disc IOPRP image** with **LoadIrx+exec** (not name-only register) | Log IRX starts from disc image | 2–3d |
+| **WP-26** | T8 | WP-25 | IOPRP version string path matches EE strcmp without RAM plant | Haven/GoW version check without plant | 2d |
+| **WP-27** | T5+T2 | WP-25 | FILEIO IRX from disc/BIOS executes; open `cdrom0:` file | **G3** on one title | 3–5d |
+| **WP-28** | T6+T2 | WP-25,21 | PADMAN IRX executes; pad OPEN port0 | **G4** on one title | 3–5d |
+| **WP-29** | T6 | WP-28 | MCMAN/MCSERV via IRX or thin device | MC probe no Exit | 2d |
+| **WP-30** | T4 | WP-27 | Demote FILEIO soft-success unknown fno when IRX owns sid | Diff removes soft-success | 1d |
+| **WP-31** | T8 | WP-25 | MOD_LOAD non-empty paths for Whiplash-class `/bin/*.IRX` | Trace real paths | 2d |
+| **WP-32** | T0 | WP-27,28 | Scoreboard `LITERAL_IRX=1` diagnose fleet (9 titles) metrics only | JSON artifacts | 1d |
+| **WP-33** | T10 | WP-30 | Delete BO2 sector-credit / warm-as-game-Open confusion | No credit without Open | 1d |
+| **WP-34** | T10 | WP-26 | Delete version RAM plants where IRX path works | Assists shrink | 1d |
+
+**Block D exit = G2+G3+G4** on at least one title each.
+
+---
+
+### Block E — First playable commercial surface (WP-35 … WP-41)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-35** | T0 | WP-32 | Pick title #1 (recommend simplest FILEIO+pad). Write oracle charter | Issue subtask | 0.25d |
+| **WP-36** | T0+any | WP-35 | **PCSX2+PINE** dump: threads, waits, first GS PC | `docs/irx/oracle-<title>.md` | 1–2d |
+| **WP-37** | T9 | WP-27 | Soft-GS: ensure GIF path not stuck M3P when game submits | gifP3↑ with real prims | 2d |
+| **WP-38** | T1–T8 | WP-36 | Fix **only** device/EE bugs on critical path (no plants) | Compare DetPS2 vs PINE | 3–7d |
+| **WP-39** | T9 | WP-38 | Non-black Soft-GS frame + pad interactive if required | **G5** | 2–5d |
+| **WP-40** | T10 | WP-39 | Remove all DEBT plants for title #1 | LOC down | 1d |
+| **WP-41** | T0 | WP-39 | Determinism tape replay | **G6** | 1d |
+
+**Block E exit = G5+G6.** This is the “we’re not behind on a ghost” gate.
+
+---
+
+### Block F — Second title free-ride + widen (WP-42 … WP-45)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-42** | T0 | WP-39 | Title #2 (different middleware: Midway vs Criterion vs SN) | Charter | 0.25d |
+| **WP-43** | T2–T8 | WP-42 | Only missing IRX/devices for title #2 | Open+pad+GS progress | 3–7d |
+| **WP-44** | T9 | WP-43 | Soft-GS surface title #2 | Non-black / interactive | 2–5d |
+| **WP-45** | T0 | WP-44 | Fleet report: IRX-primary vs HLE residual | Wiki + #12 | 0.5d |
+
+---
+
+### Block G — Demolish HLE debt (WP-46 … WP-49)
+
+| ID | Track | Depends | Deliverable | Exit test | Est |
+|----|-------|---------|-------------|-----------|-----|
+| **WP-46** | T10 | WP-39 | Strip MidwayBootAssist thrash/logo residue | Build green | 2d |
+| **WP-47** | T10 | WP-39 | Strip B3 flip/LGDEV stubs replaced by IRX | Build green | 2d |
+| **WP-48** | T10 | WP-39 | Strip BO2/GoW/Dec/DA plants replaced by IRX | Build green | 2d |
+| **WP-49** | T4+T10 | WP-46–48 | RealSifRpc: IRX-owned SIDs throw if HLE hit under LITERAL_IRX | Fail-fast bisect | 2d |
+
+**Block G exit = G7.**
+
+---
+
+## Parallel waves (10 agents ASAP)
+
+Orchestrator launches waves when deps met. **Do not start E before B+C.**
+
+### Wave 1 — NOW (max parallel after A)
+
+| Agent | WP |
+|-------|-----|
+| T10 | WP-01, WP-03 (serial in track) |
+| T0 | WP-00, WP-02 |
+| T2 | WP-04 |
+| T1 | WP-05 (start after WP-04 design note exists — can draft in parallel) |
+
+### Wave 2 — Exec (critical path)
+
+| Agent | WP |
+|-------|-----|
+| T1 | WP-05 → WP-06 → WP-10 |
+| T2 | WP-07 → WP-08 → WP-09 → WP-12 |
+| T0 | WP-11 (with T1/T2) |
+| T10 | WP-13 |
+
+### Wave 3 — BIOS chain + devices (wide parallel)
+
+| Agent | WP |
+|-------|-----|
+| T3 | WP-15 → WP-16 → WP-17 → WP-23 |
+| T5 | WP-18 |
+| T4 | WP-19 → WP-20 |
+| T6 | WP-21 |
+| T7 | WP-22 |
+| T0 | WP-24 |
+
+### Wave 4 — Disc commercial
+
+| Agent | WP |
+|-------|-----|
+| T8 | WP-25 → WP-26 → WP-31 |
+| T5+T2 | WP-27 |
+| T6+T2 | WP-28 → WP-29 |
+| T4 | WP-30 |
+| T0 | WP-32 |
+| T10 | WP-33, WP-34 |
+
+### Wave 5 — Playable
+
+| Agent | WP |
+|-------|-----|
+| T0 | WP-35, WP-36, WP-41, WP-42, WP-45 |
+| T9 | WP-37, WP-39, WP-44 |
+| T1–T8 | WP-38, WP-43 (bugfix only) |
+| T10 | WP-40, WP-46–49 |
+
+---
+
+## Agent prompt skeleton (orchestrator paste)
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│ EE (C# interp/JIT) — game ELF, kernel syscalls as needed    │
-│ Soft-GS / GIF / VU / DMAC (C# devices)                      │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ SIF (DMA + RPC mailbox) — real protocol
-┌───────────────────────────▼─────────────────────────────────┐
-│ IOP R3000 (C# interpreter) — **executes IRX text**            │
-│ Loaded from: BIOS ROMDIR + disc IOPRP / IRX files             │
-│ Devices: CDVD, SIO2, SPU2 stubs, INTC, timers (C# MMIO)     │
-└─────────────────────────────────────────────────────────────┘
-         optional thin HLE only when IRX cannot run (rare)
+You are DetPS2 IRX-first agent Track T# (see docs/IRX_EXECUTION_PHASE_PLAN.md).
+OWNED: <files>
+WP: WP-XX only. Depends satisfied: <ids>.
+LITERAL_IRX path. No GameQuirk plants. No FFmpeg. No foreign files.
+Done: build Release, smoke name <...>, report metrics, local commit only.
+Orchestrator merges. Comment #12 with WP-XX DONE + SHA.
 ```
 
-**Default:** `PreferLiteralIrx = true` (new).  
-**HLE:** opt-in fallback per-module or global kill-switch for bisect.
-
 ---
 
-## 3. Phase plan
-
-### Phase 0 — Hygiene & freeze (1–2 days)
-
-**Goal:** Stop the bleeding; make the tree workable.
-
-| # | Work | Done when |
-|---|------|-----------|
-| 0.1 | Delete/gitignore bloated `out/**` rebuild artifacts; `tools/clean-traces`; refuse root `*.txt` dumps | Worktree size dominated by sources, not 1 GB+ `out/` |
-| 0.2 | **Freeze** new GameQuirk thrash plants / path invents unless labeled `// DEBT-IRX` and linked to a device bug | PR policy |
-| 0.3 | Flag `DETPS2_LITERAL_IRX=0/1` (default **1** for new boots once Phase 2 lands; 0 = old HLE path for bisect) | Env documented in `tools/README.md` |
-| 0.4 | Inventory: list every `RealSifRpc` SID/fno that is pure soft-success → “replace by IRX” backlog | Table in this doc §5 |
-
-**Exit:** Clean default build; policy frozen; bisect switch designed.
-
----
-
-### Phase 1 — IOP execution substrate (3–7 days)
-
-**Goal:** Loaded IRX **runs** on `Iop`, not just sits in RAM.
-
-| # | Work | Done when |
-|---|------|-----------|
-| 1.1 | After `IrxLoader.Load` + `LinkImports`, **set IOP PC to module start** and schedule IOP quanta in `Ps2System` proportional to EE (tunable ratio) | `InstructionsExecuted` climbs inside module VA range |
-| 1.2 | IOP exception / syscall / interrupt path good enough for LOADCORE-style modules (COP0, vectors) | Minimal IRX test module completes `_start` → register library |
-| 1.3 | Export/import stubs: imports resolve to **real export addresses** of already-loaded modules (or device traps) | Link + call across two real BIOS modules |
-| 1.4 | Savestate: IOP PC/GPR + module list + load bases | Round-trip smoke |
-| 1.5 | Trace: `DETPS2_TRACE_IOP=1` dumps PC samples in module names | Debug usable |
-
-**Fixture:** Synthetic IRX (existing smoke) **plus** one tiny real BIOS module (e.g. SYSMEM or heaplib) from operator BIOS extract.
-
-**Exit:** “IRX loaded and **executed** end-to-end” smoke green.
-
----
-
-### Phase 2 — BIOS IOPBTCONF chain (1–2 weeks)
-
-**Goal:** Boot like a PS2: **real modules from ROMDIR in IOPBTCONF order**.
-
-| # | Work | Done when |
-|---|------|-----------|
-| 2.1 | `BiosBootHost`: for each IOPBTCONF entry, **extract ELF bytes → IrxLoader → start IOP thread/module** | Chain advances past first N modules without HLE `LoadIrx` no-exec |
-| 2.2 | Device MMIO: whatever SYSMEM/LOADCORE/IODMAN/SIFMAN need to not die (implement **devices**, not fake RPC) | Module `_start` returns / registers |
-| 2.3 | SIFMAN path: prefer **executing SIFMAN** over pure C# SIF where possible; keep C# DMA engine under it | EE can sifcmd to a live IOP service |
-| 2.4 | EE RESET / reboot protocol matches enough for game `SifIopReset` | Reboot generation increments; modules reloaded |
-| 2.5 | HLE dual-path: if `LITERAL_IRX=0`, old path remains for regression | Bisect works |
-
-**Oracle:** PCSX2+PINE optional; primarily **IOP PC trace vs expected entry** and no immediate exception storm.
-
-**Exit:** Operator BIOS alone: IOPBTCONF chain executes; EE can complete a **minimal** LOADFILE-style handshake with **live** IOP code (even if game not yet).
-
----
-
-### Phase 3 — Disc IOPRP + game IRX (1–2 weeks)
-
-**Goal:** Commercial discs load **their** IOP image the normal way.
-
-| # | Work | Done when |
-|---|------|-----------|
-| 3.1 | `SifLoadModule` / UDNL path: apply **disc IOPRPxxx.IMG** modules via real load+exec | GetVersion ASCII from **real** module behavior where possible |
-| 3.2 | FILEIO / PADMAN / SIO2MAN / MCMAN from **BIOS or disc IRX**, not only `RealSifRpc` | At least one title: pad OPEN via executing PADMAN |
-| 3.3 | CDVDMAN/CDVDFSV or HLE-CDVD **device** that IRX can call (device accuracy > RPC soft-success) | `sceOpen`/`sceRead` through IRX stack reads ISO bytes |
-| 3.4 | Strip or gate `PreferIopRp` RAM plants when real GetVersion works | Plants not required for Haven/GoW version checks |
-| 3.5 | Title matrix smoke: SM, B3, BO2, GoW, Dec, DA, Vexx, Whip, Haven — **diagnose 20M** under `LITERAL_IRX=1` | Scoreboard of *execution* metrics (IOP insn in module, binds via real sif) |
-
-**Exit:** One title opens a real game file through **IRX FILEIO** (not host warm + credit). Soft-GS may still be black.
-
----
-
-### Phase 4 — First commercial playable surface (2–4 weeks)
-
-**Goal:** Playability, not scoreboard theatre.
-
-| # | Work | Done when |
-|---|------|-----------|
-| 4.1 | Pick **one** title (recommend **SM** or simplest pad+file path). PCSX2+PINE map: threads, waits, first GS. | Written oracle notes in `docs/title-ports/` |
-| 4.2 | Fix **only** device/EE/GS bugs blocking that path (no new permanent thrash stubs) | Soft-GS px>0 non-black **or** interactive pad surface per title gate |
-| 4.3 | Delete DEBT plants for that title as IRX covers them | Diff removes assist code |
-| 4.4 | Determinism: input tape replay hash stable | Smoke + tape |
-| 4.5 | Repeat for 2nd title free-riding same IRX stack | Proves generality |
-
-**Exit:** **≥1 commercial title playable surface** under literal IRX path. Celebrate; then widen.
-
----
-
-### Phase 5 — Demote HLE / reclaim complexity (ongoing)
-
-| # | Work | Done when |
-|---|------|-----------|
-| 5.1 | `RealSifRpc`: mark paths **IRX-owned**; HLE only if module missing | Document matrix SID → IRX name |
-| 5.2 | Delete Midway/B3/BO2/GoW assist stubs replaced by IRX | File size / LOC down |
-| 5.3 | Optional: keep thin HLE for modules we refuse (SECRMAN stubs returning “no MagicGate”) | Explicit NONPORT list |
-| 5.4 | Netplay/rollback: include IOP module memory + PC in state | Sync test 2P synthetic |
-
-**Exit:** HLE is the exception; IRX is the default story in README/COMPLETENESS.
-
----
-
-### Phase 6 — Performance & sync polish (after playability)
-
-| # | Work |
-|---|------|
-| 6.1 | IOP dynarec / block cache **if** needed (still executes same IRX) |
-| 6.2 | EE/IOP cycle ratio tuning for speed without desync |
-| 6.3 | Soft-GS / present path only after IRX asset stream is real |
-
-Do **not** start here. Playability first.
-
----
-
-## 4. Phase dependency graph
+## Dependency DAG (compressed)
 
 ```text
-Phase 0 Hygiene ──► Phase 1 IOP exec ──► Phase 2 BIOS chain ──► Phase 3 Disc IOPRP
-                                                                      │
-                                                                      ▼
-                                                              Phase 4 First playable
-                                                                      │
-                                                                      ▼
-                                                              Phase 5 Demote HLE
-                                                                      │
-                                                                      ▼
-                                                              Phase 6 Perf / netplay polish
+A(00-04)
+  └─► B(05-14) exec   ──► C(15-24) BIOS chain
+                            ├─► D(25-34) disc IRX
+                            │     └─► E(35-41) first playable  ──► F(42-45) second title
+                            │                                      └─► G(46-49) demolish HLE
+                            └─ devices 18/19/21 parallel under C
 ```
 
-No parallel “another 9-title plant wave.” Parallel only: device bugs (CDVD vs SIO2) once Phase 1 is green.
+---
+
+## Metrics dashboard (update every merge)
+
+| Metric | How | Target |
+|--------|-----|--------|
+| `iop_insn_in_module` | Trace | >0 then climbing |
+| `modules_started` | Boot log | ≥ IOPBTCONF count |
+| `fileio_open_via_irx` | Flag | 1+ titles |
+| `pad_open_via_irx` | Flag | 1+ titles |
+| `softgs_px` / interactive | Scoreboard | G5 |
+| `gamequirk_loc` | cloc | decreasing after E |
+| `worktree_gb` | du | << multi-GB junk |
 
 ---
 
-## 5. Backlog: HLE to replace with IRX (initial)
-
-| Current HLE / plant | Replace with |
-|---------------------|--------------|
-| FILEIO soft-success unknown fno | Real FILEIO IRX + correct device |
-| PADMAN ghost / major version plants | Real PADMAN + SIO2 device |
-| LOADFILE GetVersion plants | Real LOADFILE/UDNL after IOPRP |
-| GTFS / LGDEV stubs (B3) | Disc IRX + CDVD device |
-| MWFILE / MFL path plants (Midway) | Real Midway IRX or correct FILEIO |
-| BO2 pack warm + sector credit | Real IOPFILE/FILEIO + pack in EE as game does |
-| GoW freelist soft escapes | Only if EE bug; else IRX won’t help — EE truth |
-| Host FMV / overlays | Already removed; IPU later |
-
-EE-only bugs (bad interpreters, Soft-GS) stay C# fixes — IRX does not fix a broken EE.
-
----
-
-## 6. Tooling & oracle (mandatory practice)
-
-| Tool | Role under IRX-first |
-|------|----------------------|
-| `DETPS2_TRACE_IOP` | Prove execution in module VA |
-| `play-lookup` | Still useful for EE-side expectations |
-| **PCSX2 + PINE** | Map EE waits / buffers when stuck; compare to DetPS2 PC |
-| `scoreboard.ps1` | Track playability metrics — **not** plant success |
-| `wall-save/load` | Optional IRX-era walls |
-
-**Rule:** If you don’t know what a thread waits on → **PINE first**, not a new assist.
-
----
-
-## 7. Risk register
+## Risk & mitigation
 
 | Risk | Mitigation |
 |------|------------|
-| IOP incomplete → IRX dies immediately | Phase 1 synthetic + one real module; MMIO trap log |
-| SIF timing desync | Deterministic quanta; log mailbox depth |
-| Perf regression | Accept slower until Phase 6; optional HLE bisect |
-| Some IRX need hardware we stub | Explicit stub device with logged fno; no silent success |
-| Team keeps adding plants | Phase 0 freeze; review rejects DEBT without device bug link |
+| IOP dies on first real IRX | WP-08 synthetic first; MMIO trap log (T1) |
+| 10 agents thrash same file | Track ownership; orchestrator rejects cross-track |
+| “Just one plant” creeps back | WP-02 freeze; PR bot / human reject |
+| Perf tank | Accept until G5; Phase F optional IOP cache later |
+| MagicGate modules | NONPORT stub; never block chain |
+| EE-only bugs | T7/T9; IRX won’t fix bad EE |
 
 ---
 
-## 8. Milestones & tracking
+## Orchestrator daily loop
 
-| Milestone | Approx | Artifact |
-|-----------|--------|----------|
-| M0 | Phase 0 done | Clean tree + policy |
-| M1 | Phase 1 done | Smoke: IRX executes |
-| M2 | Phase 2 done | BIOS chain executes |
-| M3 | Phase 3 done | Disc FILEIO via IRX on 1 title |
-| M4 | Phase 4 done | **First commercial playable surface** |
-| M5 | Phase 5 ongoing | HLE LOC declining |
-
-Track as GitHub issue epic (reactivate **#12**) with checklists per phase.
+1. `git fetch`; list open WPs with deps met.  
+2. Spawn ≤10 agents (worktree isolation) with track ownership.  
+3. On completion: smoke → merge → push `main` → comment #12 checklist.  
+4. Update this file’s dashboard if gates flip.  
+5. **Never** schedule HLE plant waves.
 
 ---
 
-## 9. Immediate next actions (start now)
+## Immediate “do this hour” list
 
-1. Merge this plan; update `NEXT_PLAN.md` pointer.  
-2. Phase 0: clean `out/`, document `DETPS2_LITERAL_IRX`.  
-3. Phase 1.1 spike: after load of minimal IRX, run IOP until module returns — **smallest possible PR**.  
-4. No new 9-title HLE plant waves.
+1. **WP-00/01/02** (T0+T10) — freeze + clean.  
+2. **WP-04** (T2) — module runtime design (short).  
+3. **WP-05+07+08** (T1+T2) — **first executed IRX smoke** — highest ROI in the entire plan.  
+4. Everything else waits on WP-08 green.
 
 ---
 
-## 10. One-line strategy
+## Relation to old HLE campaign
 
-**Stop rewriting the IOP operating system in C#. Load the IRX every other emulator runs, execute them on our deterministic IOP, and fix the device models until the game’s real code path lights Soft-GS.**
+| Old artifact | Fate |
+|--------------|------|
+| GameQuirks assists | Debt → Block G delete |
+| RealSifRpc mega tables | Bridge + demote → IRX-owned |
+| Scoreboard NEAR plants | Ignore until G5 under LITERAL_IRX |
+| BIOS G0 HLE | Fallback if `LITERAL_IRX=0` bisect |
+
+---
+
+## One-line strategy
+
+**50 work packages, 10 tracks, one rule: run the IRX; fix the machine under them until Soft-GS shows the real game — no more ghost-chasing HLE.**
