@@ -4956,6 +4956,43 @@ public sealed class RealSifRpc
             mem.Write32(recvBuf + off, 0);
     }
 
+    /// <summary>
+    /// Whiplash GOE v2 stream-table / slot setup on sid 0x31 (live 2026-07-31).
+    /// </summary>
+    private static bool LooksLikeWhipStreamTableSetup(SystemMemory mem, uint argBuf, uint sendSize, uint recvSize)
+    {
+        if (recvSize < 256 || sendSize < 16 || argBuf == 0) return false;
+        uint w0 = mem.Read32(argBuf);
+        if (w0 is < 0x100 or > 0x10000) return false;
+        uint w1 = mem.Read32(argBuf + 4);
+        uint w2 = sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+        if (w1 is >= 8 and <= 128) return true;
+        if (w1 == 0 && w2 <= 128) return true;
+        return false;
+    }
+
+    private bool _whipTitleWarmed;
+
+    private void WarmWhipTitleSurface(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_whipTitleWarmed) return;
+        _whipTitleWarmed = true;
+        EnsureGoeArchiveMounted(iopModules, cdvd);
+        if (_rkvTocCount == 0) return;
+        foreach (string name in new[] { "firstscreen", "frontend", "Code", "code" })
+        {
+            int fd = TryOpenFromRkv(iopModules, name, out uint sz);
+            if (fd < 0) continue;
+            int token = sz > 0 ? (int)Math.Min((sz + 2047u) / 2048u, 64u) : 4;
+            if (token < 4) token = 4;
+            cdvd.NoteHostReadSectors(token);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[IOPFILE] warm whip surface \"{name}\" size={sz} token={token} cdvd={cdvd.SectorsRead}");
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+        }
+    }
+
     private int HandleGoeOpen(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
         uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
