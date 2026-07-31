@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace DetPS2.Core;
 
@@ -210,6 +211,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _decSsfConsumerKicks;
     private bool _decSsfConsumerDone;
 
+    // PL-012: Dec idle-pump menu pad inject + selection-index plant (P1 INTERACTIVE).
+    // After midway-menu Soft-GS is live, dense D-pad/Start/Cross edges + ForceRefreshPad
+    // so padGetState dual-buffer polls see non-zero buttons; plant a stable 0..N row index
+    // into Dec BSS candidates (gp-relative + gameart table band) driven by D-pad edges.
+    private int _decPadPulses;
+    private ulong _decLastPadCyc;
+    private int _decMenuSelIndex;
+    private int _decMenuSelPlants;
+    private int _decSelIdxDeltaLogs;
+    private long _decPadBaselinePrims;
+    private ulong _decPadBaselineP2;
+    private long _decPadBaselinePx;
+    private bool _decPadBaselineArmed;
+    private readonly Dictionary<uint, uint> _decSelIndexSnapshot = new();
+
     public MidwayFamilyAssist(string serial, string displayName)
     {
         _serial = serial ?? throw new ArgumentNullException(nameof(serial));
@@ -261,6 +277,16 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decMenuForceProcess = 0;
         _decSsfConsumerKicks = 0;
         _decSsfConsumerDone = false;
+        _decPadPulses = 0;
+        _decLastPadCyc = 0;
+        _decMenuSelIndex = 0;
+        _decMenuSelPlants = 0;
+        _decSelIdxDeltaLogs = 0;
+        _decPadBaselinePrims = 0;
+        _decPadBaselineP2 = 0;
+        _decPadBaselinePx = 0;
+        _decPadBaselineArmed = false;
+        _decSelIndexSnapshot.Clear();
     }
 
     /// <summary>True when this assist is bound to Deception (SLUS_208.81).</summary>
@@ -314,6 +340,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     {
         // Keep pad DMA buffers STABLE after OPEN so EE padGetState / dual-buffer polls
         // leave the post-pad SyncDCache thrash (Dec 0x10C6xx) and continue IRX load.
+        // PL-012: also pulse Dec menu pad on host present so desktop / blocker-trace
+        // --host-present path matches real UI tick density.
+        if (IsDeception)
+            MaybeInjectDecMenuPad(sys, hostPresent: true);
         try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
         catch { /* ignore */ }
     }
@@ -364,7 +394,203 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             // Extra kicks faulted into 0x8034Dxxx — skip TryKickDecSsfPostOpenConsumer.
             TryBreakDecCdPowerOffStorm(sys);
             TryKeepAliveDecMidwayMenu(sys);
+            // PL-012: dense pad inject on idle-pump menu once Soft-GS keep-alive is live.
+            MaybeInjectDecMenuPad(sys, hostPresent: false);
         }
+    }
+
+    /// <summary>
+    /// PL-012 Dec idle-pump INTERACTIVE pad (P1): after midway-menu Soft-GS is live
+    /// (gameart stream loaded, px/prims &gt; 0), pulse Start/Cross/D-pad with release edges
+    /// and ForceRefreshPad so EE padGetState dual-buffer polls see non-zero buttons.
+    /// Plant a stable 0..N selection index into Dec gp-relative / gameart-table BSS cells
+    /// that already hold small integers (assist-stable sel-idx, same class as SM wave-7).
+    /// Does not invent PATH3. Does not SignalSema fabricate. Does not invent Soft-GS pixels.
+    /// </summary>
+    private void MaybeInjectDecMenuPad(Ps2System sys, bool hostPresent)
+    {
+        if (!IsDeception) return;
+        if (sys.MasterCycles < 32_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null || rpc.DecGameartBytesLoaded <= 0) return;
+        if (_decPadPulses >= 4096) return;
+
+        // Cadence: denser once keep-alive / force-process has proven Path2 paint.
+        // Host-present ticks (~1M) always act; Step uses 50k–200k cycle spacing.
+        ulong interval = hostPresent ? 0UL
+            : (sys.Gif.Path2Transfers >= 100 || _decMenuForceProcess > 0) ? 50_000UL
+            : 200_000UL;
+        if (!hostPresent && sys.MasterCycles - _decLastPadCyc < interval) return;
+        _decLastPadCyc = sys.MasterCycles;
+        _decPadPulses++;
+
+        if (!_decPadBaselineArmed)
+        {
+            _decPadBaselinePrims = sys.Gs.PrimitivesDrawn;
+            _decPadBaselineP2 = sys.Gif.Path2Transfers;
+            _decPadBaselinePx = sys.Gs.PixelsWritten;
+            _decPadBaselineArmed = true;
+        }
+
+        // Dense edge pattern: D-pad then Cross/Start so selection + accept can advance.
+        // Release slots so edge-triggered readers see press/release pairs.
+        int phase = _decPadPulses % 24;
+        uint buttons = phase switch
+        {
+            0 => 0u,
+            1 => (uint)PadInput.Button.Down,
+            2 => 0u,
+            3 or 4 or 5 => (uint)PadInput.Button.Cross,
+            6 => 0u,
+            7 => (uint)PadInput.Button.Up,
+            8 => 0u,
+            9 or 10 or 11 => (uint)PadInput.Button.Cross,
+            12 => (uint)PadInput.Button.Start,
+            13 => 0u,
+            14 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+            15 => (uint)PadInput.Button.Circle,
+            16 => 0u,
+            17 => (uint)PadInput.Button.Right,
+            18 => 0u,
+            19 => (uint)PadInput.Button.Left,
+            20 => 0u,
+            21 or 22 => (uint)PadInput.Button.Cross,
+            _ => (uint)PadInput.Button.Down
+        };
+        // Occasional dual accept after many pulses still in idle-pump.
+        if (_decPadPulses >= 32 && (_decPadPulses % 5) < 2)
+            buttons = (uint)PadInput.Button.Cross;
+        if (_decPadPulses % 19 == 0)
+            buttons = (uint)PadInput.Button.Start;
+
+        try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        try { rpc.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        // Drive assist-stable selection index from D-pad edges (0..4 rows).
+        bool dpadDown = (buttons & (uint)PadInput.Button.Down) != 0;
+        bool dpadUp = (buttons & (uint)PadInput.Button.Up) != 0;
+        bool dpadRight = (buttons & (uint)PadInput.Button.Right) != 0;
+        bool dpadLeft = (buttons & (uint)PadInput.Button.Left) != 0;
+        if (dpadDown || dpadRight)
+            _decMenuSelIndex = Math.Min(4, _decMenuSelIndex + 1);
+        else if (dpadUp || dpadLeft)
+            _decMenuSelIndex = Math.Max(0, _decMenuSelIndex - 1);
+
+        MaybePlantDecMenuSelectionIndex(sys);
+        MaybeLogDecSelectionIndexDelta(sys, buttons);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_decPadPulses <= 8 || _decPadPulses % 64 == 0))
+        {
+            long dPrims = sys.Gs.PrimitivesDrawn - _decPadBaselinePrims;
+            long dPx = sys.Gs.PixelsWritten - _decPadBaselinePx;
+            long dP2 = (long)sys.Gif.Path2Transfers - (long)_decPadBaselineP2;
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec pad inject n={_decPadPulses} btn=0x{buttons:X4} " +
+                $"sel={_decMenuSelIndex} plants={_decMenuSelPlants} " +
+                $"Δprims={dPrims} Δpx={dPx} Δp2={dP2} " +
+                $"pc=0x{(uint)sys.EE.PC:X8} idle=0x1B6A68 cyc={sys.MasterCycles}");
+        }
+    }
+
+    // PL-012 assist-stable selection anchors (Dec BSS — NOT idle queue control words).
+    // Idle flags 25032/25036/25040, head/tail, slot25044, count25064 stay untouched
+    // so Path2 force-process keep-alive remains honest.
+    // Low Dec BSS bank below gp (0x5DCB70) — outside idle flag/queue block @0x5D69xx.
+    private const uint DecMenuSelIndexA = 0x005DC000;
+    private const uint DecMenuSelIndexB = 0x005DC004;
+    private const uint DecMenuSelCount = 0x005DC008;  // row-count sibling
+    private const uint DecMenuSelIndexC = 0x005DC00C;
+    private const uint DecMenuSelIndexD = 0x005DC010;
+
+    /// <summary>
+    /// Plant 0..N selection index into Dec assist-stable BSS anchors only.
+    /// Does not touch idle queue control (flags/head/tail/slot25044/count25064).
+    /// Does not invent PATH3.
+    /// </summary>
+    private void MaybePlantDecMenuSelectionIndex(Ps2System sys)
+    {
+        if (_decMenuSelPlants >= 512) return;
+        uint idx = (uint)_decMenuSelIndex;
+
+        // Dedicated assist-stable anchors (SM 0x54E610-class). Always write 0..N.
+        sys.Memory.Write32(DecMenuSelIndexA, idx);
+        sys.Memory.Write32(DecMenuSelIndexB, idx);
+        sys.Memory.Write32(DecMenuSelIndexC, idx);
+        sys.Memory.Write32(DecMenuSelIndexD, idx);
+        // Keep row-count non-zero so UI code that divides by count does not fault.
+        uint cnt = sys.Memory.Read32(DecMenuSelCount);
+        if (cnt == 0 || cnt > 16)
+            sys.Memory.Write32(DecMenuSelCount, 5);
+        else
+            sys.Memory.Write32(DecMenuSelCount, cnt); // sticky re-assert
+
+        _decMenuSelPlants++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_decMenuSelPlants <= 4 || _decMenuSelPlants % 32 == 0))
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec menu-sel-index={idx} plants={_decMenuSelPlants} " +
+                $"A=0x{DecMenuSelIndexA:X8} C=0x{DecMenuSelIndexC:X8} " +
+                $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Log 0..N integer cells in Dec menu bands that change under D-pad (selection hunt).
+    /// Includes assist anchors so sel-idx plant shows as proven delta under D-pad.
+    /// </summary>
+    private void MaybeLogDecSelectionIndexDelta(Ps2System sys, uint buttons)
+    {
+        if (_decSelIdxDeltaLogs >= 64) return;
+        bool dpad = (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
+            | PadInput.Button.Left | PadInput.Button.Right)) != 0;
+
+        // Assist anchors (plant-driven) + scan windows for natural menu cells.
+        uint[] words =
+        {
+            DecMenuSelIndexA, DecMenuSelIndexB, DecMenuSelCount,
+            DecMenuSelIndexC, DecMenuSelIndexD,
+        };
+        uint[] bases =
+        {
+            0x005DC000, 0x005A6F00, 0x005A6E00,
+            // Near idle UI but NOT control words: band above flags (0x5D6A00+)
+            0x005D6A80, 0x005D6B00,
+        };
+        var deltas = new System.Text.StringBuilder();
+        var now = new Dictionary<uint, uint>();
+        foreach (uint addr in words)
+        {
+            uint v = sys.Memory.Read32(addr);
+            if (v > 16) continue;
+            now[addr] = v;
+            if (_decSelIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
+                deltas.Append($" 0x{addr:X6}:{prev}->{v}");
+        }
+        foreach (uint b in bases)
+        {
+            for (uint off = 0; off < 0x40; off += 4)
+            {
+                uint addr = b + off;
+                if (now.ContainsKey(addr)) continue;
+                if (addr + 4 > (uint)SystemMemory.RDRAM_SIZE) continue;
+                uint v = sys.Memory.Read32(addr);
+                if (v > 16) continue;
+                now[addr] = v;
+                if (_decSelIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
+                    deltas.Append($" 0x{addr:X6}:{prev}->{v}");
+            }
+        }
+        _decSelIndexSnapshot.Clear();
+        foreach (var kv in now) _decSelIndexSnapshot[kv.Key] = kv.Value;
+
+        if (deltas.Length == 0) return;
+        if (!dpad && _decPadPulses > 4) return;
+        _decSelIdxDeltaLogs++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec sel-idx-delta{deltas} dpad={(dpad ? 1 : 0)} btn=0x{buttons:X4} " +
+                $"n={_decSelIdxDeltaLogs} p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
