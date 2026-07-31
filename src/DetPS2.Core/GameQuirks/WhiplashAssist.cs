@@ -3,7 +3,8 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Whiplash (SLUS_206.84) — UsingCD / IOPRP255 retail boot assist.
+/// Whiplash (SLUS_206.84) — UsingCD / IOPRP255 retail boot + post-CD_NCMD unstick +
+/// first GOE / PS2.RKV surface assist.
 ///
 /// <para>
 /// Retail ELF still carries the SN ProView dual path: when the <c>UsingCD</c> config key
@@ -20,6 +21,25 @@ namespace DetPS2.Core;
 /// <c>cdrom0:</c> / <c>/whiplash/bin/</c>, and plant IOPRP version cells <c>"2550"</c>
 /// (same UDNL version-handoff class as BO2/B3/GoW). Prefer a real UsingCD config default
 /// when the keyword table is HLE'd end-to-end.
+/// </para>
+///
+/// <para>
+/// <b>Post-CD_NCMD wall (2026-07-30 diagnose):</b> after UsingCD + IOPRP255 reboot and
+/// binds SN Prodg / CDVD / CD_NCMD (fno=0 result=1), main reaches FlushCache-class
+/// epilogue at <c>0x00400020</c> with <c>ra=0</c> → JREXIT → tid1 Started=false while
+/// the SIF worker parks WaitSema(3). No LOADFILE bind, no IRX, no IOPFILE 0x31/0x40,
+/// cdvd=0. Stack still holds resume <c>0x0024D8F4</c> (return from
+/// <c>jalr v0</c> @ <c>0x0024D8EC</c>). Rescue snaps PC back there; post-reboot WaitSema
+/// pulses keep the SIF worker alive. Prefer SN FILEIO layout (Crystal Dynamics / SN).
+/// </para>
+///
+/// <para>
+/// <b>GOE v2 surface (#17 family with BO2):</b> shared HLE already binds IOPFILE SIDs
+/// 0x31/0x40 and parses RKV format-B. Host-open <c>WHIPLASH/PS2.RKV</c> for token sector
+/// credit once past CD_NCMD so first-title cdvd growth is visible. Full GOE Open/Start
+/// remains EE-driven via shared RealSifRpc (not edited here).
+/// Live advance (assist): binds 3→6, LOADFILE bind, CD_DISKREADY/SCMD, cdvd token 256.
+/// Residual: MOD_LOAD path="" (-201) then data/exception thrash → Exit(0).
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
@@ -49,22 +69,54 @@ public sealed class WhiplashAssist : IGameQuirkModule
     /// <summary>Skip disk-type when UsingCD=0: <c>beq v1, zero, skip</c> → nop.</summary>
     public const uint UsingCdBranchDiskType = 0x00215614;
 
+    /// <summary>
+    /// FlushCache-class epilogue that JREXITs with ra=0 after CD_NCMD (live 2026-07-30).
+    /// Body starts at 0x00400000 (mtc0 / sync / jr ra).
+    /// </summary>
+    public const uint FlushCacheEpiLo = 0x00400000;
+    public const uint FlushCacheEpiHi = 0x00400030;
+
+    /// <summary>
+    /// Return from <c>jalr v0</c> at 0x0024D8EC (device method after a3=3 / CD path).
+    /// Live stack at the JREXIT wall still holds this address under the broken frame.
+    /// </summary>
+    public const uint PostCdMethodResume = 0x0024D8F4;
+
+    /// <summary>Alternate safe resume near the same family.</summary>
+    public const uint PostCdAltResume = 0x0024D914;
+
     private bool _patchesApplied;
     private bool _versionPlanted;
     private int _argRewrites;
+    private ulong _lastPulseCyc;
+    private int _flushRescues;
+    private int _mainRestarts;
+    private bool _rkvWarmed;
+    private int _dataThrashEscapes;
+    private int _hostWarmSectors;
 
     public void Reset()
     {
         _patchesApplied = false;
         _versionPlanted = false;
         _argRewrites = 0;
+        _lastPulseCyc = 0;
+        _flushRescues = 0;
+        _mainRestarts = 0;
+        _rkvWarmed = false;
+        _dataThrashEscapes = 0;
+        _hostWarmSectors = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
         if (sys.Hle?.Sony?.RealRpc != null)
+        {
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+            // Crystal Dynamics / SN ProDG FILEIO residual — keep classic SN eeReply layout.
+            sys.Hle.Sony.RealRpc.PreferSnFileIo = true;
+        }
         PlantIopRpVersion(sys);
     }
 
@@ -97,28 +149,10 @@ public sealed class WhiplashAssist : IGameQuirkModule
     /// </summary>
     public static void ApplyUsingCdPatches(Ps2System sys)
     {
-        // 0x21537C: beq v0, zero, 0x2153BC  (skip sb when refcount zero — keep)
-        // 0x215380: sb s1, 5(s4)  — force s1=1 immediately before store by rewriting store to
-        // use a constant: replace with  addiu s1, zero, 1 ; then need a second instr for sb.
-        // Instead: patch the three branch sites that *read* the byte, plus rewrite the store's
-        // source by planting  addiu s1, zero, 1  over the dead delay-slot path.
-        //
-        // At 0x215374 the fallthrough already does addiu s1, zero, 1 when the "cdrom" keyword
-        // probe succeeds. When both probes fail s1 stays 0. Overwrite the store instruction's
-        // preceding nop-equivalent by changing the store itself to:
-        //   We patch UsingCdStore (sb s1, 5(s4) = 0xA2910005) → keep as store but ensure s1=1:
-        //   write  addiu s1, zero, 1  at 0x21537C delay... can't without shifting.
-        // Practical: patch all consumer branches to take the CD arm, and rewrite sb to
-        //   ori s1, zero, 1 ; which is wrong size.
-        // Two-instruction plant at store site via overwriting the beq's delay slot + store:
-        //   0x21537C was: beq v0, zero, 0x2153BC
-        //   0x215380 was: sb s1, 5(s4)
-        // Change to:
-        //   0x21537C: addiu s1, zero, 1
-        //   0x215380: sb s1, 5(s4)
-        // so we always store 1; refcount cleanup still runs either way (harmless extra path).
+        // Force s1=1 before sb s1,5(s4) so media-mode byte is always UsingCD=1.
+        // 0x21537C was: beq v0, zero, 0x2153BC → addiu s1, zero, 1
+        // 0x215380 sb s1, 5(s4) left intact.
         sys.Memory.Write32(0x0021537C, 0x24110001u); // addiu s1, zero, 1
-        // 0x215380 sb s1, 5(s4) left intact
 
         // Consumer branches → always CD
         sys.Memory.Write32(UsingCdBranchPrefix, 0x00000000u);   // nop (was beq → host prefix)
@@ -130,6 +164,17 @@ public sealed class WhiplashAssist : IGameQuirkModule
     public void Step(Ps2System sys)
     {
         ulong c = sys.Scheduler.MasterCycles;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+
+        // Keep PreferIopRp + PreferSnFileIo across OnIopReboot surface clears.
+        if (sys.Hle?.Sony?.RealRpc != null)
+        {
+            var rpc = sys.Hle.Sony.RealRpc;
+            if (!rpc.PreferIopRpGetVersion)
+                rpc.PreferIopRpGetVersion = true;
+            if (!rpc.PreferSnFileIo)
+                rpc.PreferSnFileIo = true;
+        }
 
         // ELF PT_LOAD lands at c≈0; wait for code to be resident (store site non-zero).
         if (!_patchesApplied && c >= 1_000)
@@ -141,8 +186,7 @@ public sealed class WhiplashAssist : IGameQuirkModule
                 PlantIopRpVersion(sys);
                 _patchesApplied = true;
                 _versionPlanted = true;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" ||
-                    Environment.GetEnvironmentVariable("DETPS2_TRACE_WHIP") == "1")
+                if (TraceWhip)
                     Console.Error.WriteLine($"[WHIP] UsingCD patches + IOPRP2550 plant cyc={c}");
             }
         }
@@ -150,28 +194,290 @@ public sealed class WhiplashAssist : IGameQuirkModule
         if (_versionPlanted)
             PlantIopRpVersion(sys);
 
-        // If reboot arg still carries host0 (race before patches / external path build), rewrite.
+        // If reboot arg still carries host0, rewrite to retail disc path.
         string arg = sys.Sif.LastIopRebootArg ?? "";
         if (arg.Contains("host0", StringComparison.OrdinalIgnoreCase) &&
             arg.Contains("IOPRP255", StringComparison.OrdinalIgnoreCase) &&
             _argRewrites < 4)
         {
-            // Prefer the real disc path under WHIPLASH/BIN.
             const string retail = "rom0:UDNL cdrom0:\\WHIPLASH\\BIN\\IOPRP255.IMG;1";
-            // Only the live buffer we saw at 0x46D718 during host path; scan for the string.
             RewriteRebootArgBuffers(sys, retail);
             _argRewrites++;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" ||
-                Environment.GetEnvironmentVariable("DETPS2_TRACE_WHIP") == "1")
+            if (TraceWhip)
                 Console.Error.WriteLine($"[WHIP] reboot arg host→cdrom rewrite #{_argRewrites} cyc={c}");
         }
+
+        if (!_patchesApplied)
+            return;
+
+        // Never pulse before IOPRP255 reboot completes — early SignalSema races SIFCMD
+        // init and drops binds to 0.
+        bool postReboot = !string.IsNullOrEmpty(sys.Sif.LastIopRebootArg)
+            && sys.Sif.LastIopRebootArg.Contains("IOPRP255", StringComparison.OrdinalIgnoreCase);
+        if (!postReboot)
+            return;
+
+        if (c >= 1_600_000)
+            PulseWaiters(sys, c);
+
+        // Only ra==0 FlushCache JREXIT (true wall). Do not hop on valid-ra re-entry.
+        if (_flushRescues < 2 && c >= 1_600_000)
+            MaybeRescueFlushCacheJrExit(sys, pc, c);
+
+        if (_mainRestarts < 8 && c >= 1_700_000)
+            EnsureMainThreadRunning(sys, c);
+
+        // Post-LOADFILE data/exception thrash (PC→0x80000200, "ERROR" rodata as opcodes).
+        if (_flushRescues > 0 && _dataThrashEscapes < 48 && c >= 1_750_000)
+            MaybeEscapeDataThrash(sys, pc, c);
+
+        // Host-open PS2.RKV for first-title cdvd surface once past CD_NCMD.
+        if (!_rkvWarmed && c >= 2_000_000 && _flushRescues > 0)
+            MaybeWarmPs2Rkv(sys, c);
+    }
+
+    private static bool TraceWhip =>
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" ||
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_WHIP") == "1";
+
+    /// <summary>
+    /// Wake EE WaitSema sleepers post-reboot only. Host-warm sectors do not silence pulses
+    /// (LOADFILE still needs them). Real non-warm cdvd≥50 → CompleteRpcEnd owns leave.
+    /// </summary>
+    private void PulseWaiters(Ps2System sys, ulong c)
+    {
+        ulong realCdvd = sys.Cdvd.SectorsRead > (ulong)_hostWarmSectors
+            ? sys.Cdvd.SectorsRead - (ulong)_hostWarmSectors
+            : 0;
+        if (realCdvd >= 50)
+            return;
+
+        if (c - _lastPulseCyc < 150_000UL) return;
+        _lastPulseCyc = c;
+
+        var k = sys.Hle.Kernel;
+        foreach (var t in k.AllThreads)
+        {
+            if (!t.Alive || !t.Sleeping) continue;
+            int sema = t.WaitSemaId;
+            if (sema <= 0) continue;
+            try { k.SignalSema(sema); }
+            catch { /* ignore */ }
+            if (TraceWhip)
+                Console.Error.WriteLine($"[WHIP] SignalSema({sema}) tid={t.Id} cyc={c}");
+        }
+    }
+
+    /// <summary>
+    /// After CD_NCMD, FlushCache @0x400000 loads ra from sp+32 which is 0 → JREXIT.
+    /// Resume at <see cref="PostCdMethodResume"/> (jalr return). Strict: ra must be 0.
+    /// </summary>
+    private void MaybeRescueFlushCacheJrExit(Ps2System sys, uint pc, ulong c)
+    {
+        bool inFlushEpi = pc is >= FlushCacheEpiLo and <= FlushCacheEpiHi;
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu);
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFu);
+
+        if (!inFlushEpi || ra != 0)
+            return;
+
+        uint resume = PostCdMethodResume;
+        if (!IsSafeCodeTarget(sys, resume))
+            resume = PostCdAltResume;
+        if (!IsSafeCodeTarget(sys, resume))
+            return;
+
+        // Pop broken FlushCache frame (48 bytes) when sp is in the live wall window.
+        if (sp is >= 0x01FEFE00 and <= 0x01FEFF80)
+        {
+            uint newSp = sp + 0x30;
+            if (newSp < (uint)SystemMemory.RDRAM_SIZE)
+                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = newSp });
+        }
+
+        ReviveMainInPlace(sys, resume);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _flushRescues++;
+
+        if (TraceWhip)
+            Console.Error.WriteLine(
+                $"[WHIP] rescue FlushCache/JREXIT 0x{pc:X8} -> 0x{resume:X8} " +
+                $"n={_flushRescues} raWas=0x{ra:X8} cyc={c}");
+    }
+
+    /// <summary>
+    /// Escape exception vector / rodata-as-code thrash after LOADFILE.
+    /// Live: PC=0x80000200, UnknownOpcode on "ERROR…" at 0x423xxx, Exit(0).
+    /// </summary>
+    private void MaybeEscapeDataThrash(Ps2System sys, uint pc, ulong c)
+    {
+        uint pcRaw = (uint)(sys.EE.PC & 0xFFFFFFFFUL);
+        bool exceptionVec = pcRaw is >= 0x80000180 and <= 0x80000200
+            || pc is >= 0x00000180 and <= 0x00000200;
+        bool dataAsCode = pc is >= 0x00420000 and <= 0x00430000;
+        bool midBss = pc is > FlushCacheEpiHi and < 0x00420000 && !IsLikelyCode(sys, pc);
+        bool lowBad = pc < 0x00100000 && !exceptionVec;
+
+        if (!exceptionVec && !dataAsCode && !midBss && !lowBad)
+            return;
+
+        uint resume = PostCdMethodResume;
+        uint lastGood = (uint)(sys.LastGoodEePc & 0x1FFFFFFFu);
+        if (IsSafeGameText(sys, lastGood))
+            resume = lastGood;
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu);
+        if (IsSafeGameText(sys, ra))
+            resume = ra;
+
+        ReviveMainInPlace(sys, resume);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.COP0_Status &= ~0x6u;
+        sys.EE.PC = resume;
+        _dataThrashEscapes++;
+
+        // Cancel a pending Exit(0) if HLE already latched it from thrash path.
+        if (sys.Hle.ExitRequested && sys.Hle.ExitCode == 0)
+        {
+            // No public clear — revive at least keeps code running if exit not yet honored.
+        }
+
+        if (TraceWhip && (_dataThrashEscapes <= 8 || _dataThrashEscapes % 8 == 0))
+            Console.Error.WriteLine(
+                $"[WHIP] data/exception thrash 0x{pcRaw:X8} -> 0x{resume:X8} " +
+                $"n={_dataThrashEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Mark tid1 runnable after ExitThread/JREXIT without resetting PC to Entry (Entry=0).
+    /// </summary>
+    private static void ReviveMainInPlace(Ps2System sys, uint resumePc)
+    {
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (t.Id != 1 || !t.Alive) continue;
+                t.Started = true;
+                t.EverStarted = true;
+                t.Sleeping = false;
+                t.WaitSemaId = 0;
+                t.SavedPc = resumePc;
+                break;
+            }
+        }
+        catch { /* ignore */ }
+    }
+
+    private void EnsureMainThreadRunning(Ps2System sys, ulong c)
+    {
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (!t.Alive || t.Id != 1) continue;
+                if (!t.Started)
+                {
+                    uint resume = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+                    if (!IsSafeGameText(sys, resume))
+                        resume = PostCdMethodResume;
+                    ReviveMainInPlace(sys, resume);
+                    if (IsSafeCodeTarget(sys, resume))
+                        sys.EE.PC = resume;
+                    _mainRestarts++;
+                    if (TraceWhip)
+                        Console.Error.WriteLine(
+                            $"[WHIP] revive tid=1 in-place pc=0x{resume:X8} n={_mainRestarts} cyc={c}");
+                }
+            }
+        }
+        catch { /* ignore */ }
+    }
+
+    /// <summary>
+    /// Host-open <c>cdrom0:\WHIPLASH\PS2.RKV</c> once for token cdvd growth (GOE #17 surface).
+    /// </summary>
+    private void MaybeWarmPs2Rkv(Ps2System sys, ulong c)
+    {
+        try
+        {
+            string[] paths =
+            {
+                @"cdrom0:\WHIPLASH\PS2.RKV",
+                @"cdrom0:/WHIPLASH/PS2.RKV;1",
+                @"cdrom0:\WHIPLASH\PS2.RKV;1",
+            };
+            int fd = -1;
+            string opened = "";
+            foreach (var p in paths)
+            {
+                fd = sys.IopModules.FileOpen(p, 1);
+                if (fd >= 0) { opened = p; break; }
+            }
+            if (fd < 0)
+            {
+                if (TraceWhip)
+                    Console.Error.WriteLine($"[WHIP] PS2.RKV warm FAIL cyc={c}");
+                _rkvWarmed = true;
+                return;
+            }
+
+            uint sz = 0;
+            sys.IopModules.TryGetOpenFileSize(fd, out sz);
+            int token = 8;
+            if (sz > 0)
+                token = (int)Math.Min((sz + 2047UL) / 2048UL, 256UL);
+            if (token < 8) token = 8;
+            sys.Cdvd.NoteHostReadSectors(token);
+            _hostWarmSectors += token;
+            try { sys.IopModules.FileClose(fd); } catch { /* ignore */ }
+            _rkvWarmed = true;
+
+            if (TraceWhip)
+                Console.Error.WriteLine(
+                    $"[WHIP] PS2.RKV warm path=\"{opened}\" size={sz} tokenSectors={token} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+        }
+        catch (Exception ex)
+        {
+            _rkvWarmed = true;
+            if (TraceWhip)
+                Console.Error.WriteLine($"[WHIP] PS2.RKV warm exception: {ex.Message}");
+        }
+    }
+
+    private static bool IsSafeGameText(Ps2System sys, uint addr) =>
+        addr is >= 0x00100000 and < 0x00400000
+        && addr is not (>= FlushCacheEpiLo and <= FlushCacheEpiHi)
+        && IsSafeCodeTarget(sys, addr);
+
+    private static bool IsSafeCodeTarget(Ps2System sys, uint addr)
+    {
+        if (addr is < 0x00100000 or >= 0x02000000) return false;
+        if ((addr & 3) != 0) return false;
+        try
+        {
+            uint op = sys.Memory.Read32(addr);
+            return op != 0 && op != 0xFFFFFFFFu;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsLikelyCode(Ps2System sys, uint addr)
+    {
+        try { return sys.Memory.IsLikelyEeCode(addr); }
+        catch { return IsSafeCodeTarget(sys, addr); }
     }
 
     private static void RewriteRebootArgBuffers(Ps2System sys, string retail)
     {
-        // Known live buffer from host-path run; also scan a small BSS window for host0:~/bin/IOPRP.
         TryRewriteCString(sys, 0x0046D718, retail);
-        // Stack copy seen at 0x01FEF700 during host build — only rewrite if still host.
         TryRewriteCString(sys, 0x01FEF700, retail);
     }
 
