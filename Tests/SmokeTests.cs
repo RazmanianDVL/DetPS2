@@ -714,6 +714,33 @@ public static class SmokeTests
 
     public static int Main(string[] args)
     {
+        // Optional: run a single public static void smoke by name, e.g. Irx_ExecutesMinimal
+        if (args is { Length: > 0 } && !string.IsNullOrWhiteSpace(args[0]) && !args[0].StartsWith('-'))
+        {
+            string name = args[0];
+            var mi = typeof(SmokeTests).GetMethod(name, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (mi == null || mi.ReturnType != typeof(void) || mi.GetParameters().Length != 0)
+            {
+                Console.Error.WriteLine($"Unknown smoke method: {name}");
+                return 2;
+            }
+            Console.WriteLine($"=== DetPS2 Smoke (single: {name}) ===\n");
+            try
+            {
+                mi.Invoke(null, null);
+                Console.WriteLine("\n=== ALL SMOKES PASSED ===");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                var inner = ex is System.Reflection.TargetInvocationException tie && tie.InnerException != null
+                    ? tie.InnerException : ex;
+                Console.WriteLine($"\n=== SMOKE FAILED: {inner.Message} ===");
+                Console.WriteLine(inner.StackTrace);
+                return 1;
+            }
+        }
+
         Console.WriteLine("=== DetPS2 Smoke Tests (Phase 56 Completeness / 53-56) ===\n");
         try
         {
@@ -806,6 +833,7 @@ public static class SmokeTests
             RealSifRpc_McservFormatSonyPs2AndPages();
             BiosHle_IopVblankEventFlag();
             BiosBootHost_IopBtConfContracts();
+            BiosBootHost_IopBtConfParseAndLiteralBoot();
             BiosRomdirGate_PortDocsForRequiredModules();
             BiosExtendedRomdir_SecrClearSpuLibSdUdnl();
             BiosUdnl_IopRpImageApplyAndSecrMgPath();
@@ -821,6 +849,8 @@ public static class SmokeTests
             Sio2_PadmanConfigSequenceHelper();
             Sio2_MemcardProbeAndCtrlStat();
             Sio2_DualShockConfigFsmAndActiveLow();
+            Sio2_IopPhysSend3AndIstat();
+            Sio2_Send3PortAndTransferIrqHook();
             RealSifRpc_SysmemAllocFreeLoadContracts();
             Intc_VBlankStartStickyForPollers();
             BiosHle_IopVblankRegisterContracts();
@@ -839,6 +869,7 @@ public static class SmokeTests
             RealSifRpc_CdScmdTrayErrorStatus();
             RealSifRpc_CdvdNcmdSeekSyncDiskReadyAndStream();
             Cdvd_MechaconDiskReadyAfterMount();
+            Cdvd_MmioReadyAndDiskReady_IopBus();
             LibSd_InitSetParamKeyOnContracts();
             RealSifRpc_FileIoOpenReadLseekCloseAndDir();
             RealSifRpc_PadmanCloseEndAndPortMax();
@@ -2907,6 +2938,112 @@ public static class SmokeTests
         if (!map.Contains("SIFCMD") || !map.Contains("FILEIO") || !map.Contains("SYSMEM"))
             throw new Exception("service map incomplete");
         Console.WriteLine($"[Smoke] BiosBootHost_IopBtConfContracts OK (svcs={sys.BiosBoot.ServicesInstalled}, required={required})");
+    }
+
+    /// <summary>
+    /// WP-15: ParseIopBtConfText / ExtractIopBtConfNames ordered list vs known SCPH70008 @800
+    /// order; BootIopBtConfLiteral LoadIrx for extractable synthetic ELFs (no HLE invent).
+    /// </summary>
+    public static void BiosBootHost_IopBtConfParseAndLiteralBoot()
+    {
+        // --- pure text parser ---
+        string confText = "@800\n" + string.Join("\n", BiosBootHost.Scph70008IopBtConfOrder) + "\n";
+        var fromText = BiosBootHost.ParseIopBtConfText(confText);
+        if (fromText.Count != BiosBootHost.Scph70008IopBtConfOrder.Length)
+            throw new Exception($"ParseIopBtConfText count {fromText.Count} != {BiosBootHost.Scph70008IopBtConfOrder.Length}");
+        for (int i = 0; i < fromText.Count; i++)
+        {
+            if (!string.Equals(fromText[i], BiosBootHost.Scph70008IopBtConfOrder[i], StringComparison.Ordinal))
+                throw new Exception($"order[{i}] got {fromText[i]} expected {BiosBootHost.Scph70008IopBtConfOrder[i]}");
+        }
+
+        // --- synthetic ROMDIR BIOS: IOPBTCONF text + two real minimal IRX ELFs ---
+        // Layout mirrors Romdrv_Rom0ContentServingThroughFileIo: naive cumulative sizes with
+        // small zero pad before each ELF (FindRealOffset searches forward from naive).
+        byte[] sysmemElf = IrxLoader.BuildMinimalIrx("SYSMEM");
+        byte[] loadcoreElf = IrxLoader.BuildMinimalIrx("LOADCORE");
+        byte[] confBytes = Encoding.ASCII.GetBytes(confText);
+        var confBuf = new byte[Math.Max(256, confBytes.Length + 1)];
+        Array.Copy(confBytes, confBuf, confBytes.Length);
+
+        var table = new List<byte>();
+        void AddEntry(string name, uint size)
+        {
+            var nameBytes = new byte[10];
+            Encoding.ASCII.GetBytes(name).CopyTo(nameBytes, 0);
+            table.AddRange(nameBytes);
+            table.AddRange(BitConverter.GetBytes((ushort)0));
+            table.AddRange(BitConverter.GetBytes(size));
+        }
+        AddEntry("RESET", 16);
+        AddEntry("ROMDIR", 16);
+        AddEntry("IOPBTCONF", (uint)confBuf.Length);
+        AddEntry("SYSMEM", (uint)sysmemElf.Length);
+        AddEntry("LOADCORE", (uint)loadcoreElf.Length);
+
+        var data = new List<byte>();
+        data.AddRange(new byte[16]); // RESET
+        data.AddRange(new byte[16]); // ROMDIR
+        data.AddRange(confBuf);      // IOPBTCONF text at naive offset
+        data.AddRange(new byte[8]);  // pad before SYSMEM ELF
+        data.AddRange(sysmemElf);
+        data.AddRange(new byte[8]);  // pad before LOADCORE ELF
+        data.AddRange(loadcoreElf);
+
+        byte[] bios = new byte[data.Count + table.Count];
+        data.CopyTo(bios);
+        table.CopyTo(bios, data.Count);
+
+        var extracted = BiosBootHost.ExtractIopBtConfNames(bios);
+        if (extracted.Count != BiosBootHost.Scph70008IopBtConfOrder.Length)
+            throw new Exception($"ExtractIopBtConfNames count {extracted.Count}");
+        for (int i = 0; i < extracted.Count; i++)
+            if (!string.Equals(extracted[i], BiosBootHost.Scph70008IopBtConfOrder[i], StringComparison.Ordinal))
+                throw new Exception($"extract order[{i}] {extracted[i]}");
+
+        var inv = BiosBootHost.InventoryIopBtConfElfs(bios, extracted);
+        int extractable = inv.Count(r => r.ElfExtractable);
+        if (extractable < 2)
+            throw new Exception($"expected ≥2 extractable ELFs, got {extractable}");
+
+        // Bind caches IopBtConfNames
+        var sys = new Ps2System();
+        sys.BiosBoot.BindBios(null, bios);
+        if (sys.BiosBoot.IopBtConfNames.Count != extracted.Count)
+            throw new Exception("BindBios did not cache IOPBTCONF names");
+
+        // Literal boot: LoadIrx extractable ELFs; with LITERAL_IRX=1 attempt StartModule
+        string? prevLit = Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX");
+        try
+        {
+            Environment.SetEnvironmentVariable("DETPS2_LITERAL_IRX", "1");
+            var boot = sys.BiosBoot.BootIopBtConfLiteral(sys);
+            if (boot.Order.Count != BiosBootHost.Scph70008IopBtConfOrder.Length)
+                throw new Exception($"literal order {boot.Order.Count}");
+            if (boot.ElfsExtractable < 2)
+                throw new Exception($"literal extractable {boot.ElfsExtractable}");
+            if (boot.ElfsLoaded < 2)
+                throw new Exception($"literal loaded {boot.ElfsLoaded}");
+            if (boot.NameOnlyRegistered < 20)
+                throw new Exception($"expected many name-only registrations, got {boot.NameOnlyRegistered}");
+            if (!sys.IopModules.IsModuleLoaded("SYSMEM") || !sys.IopModules.IsModuleLoaded("FILEIO"))
+                throw new Exception("SYSMEM/FILEIO not in module table after literal boot");
+            if (!sys.IopModules.TryGetModule("SYSMEM", out int sid) ||
+                !sys.IopModules.TryGetIrx(sid, out var sirx) || !sirx.HasImage)
+                throw new Exception("SYSMEM should have real image after LoadIrx");
+            if (boot.ModulesStarted < 2)
+                throw new Exception($"LITERAL_IRX=1 should start loaded modules, got {boot.ModulesStarted}");
+            if (sys.BiosBoot.LastLiteralBoot == null)
+                throw new Exception("LastLiteralBoot not set");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DETPS2_LITERAL_IRX", prevLit);
+        }
+
+        Console.WriteLine(
+            $"[Smoke] BiosBootHost_IopBtConfParseAndLiteralBoot OK " +
+            $"(order={BiosBootHost.Scph70008IopBtConfOrder.Length} extractable={extractable})");
     }
 
     /// <summary>
@@ -6426,6 +6563,72 @@ public static class SmokeTests
     }
 
     /// <summary>
+    /// WP-18: IOP CDVD MMIO window (0x1F402000 / KSEG1 0xBF402000) exposes Ready for CDVDMAN
+    /// DiskReady polls; NCMD Seek completes; unknown offsets return 0xFF and are counted.
+    /// </summary>
+    public static void Cdvd_MmioReadyAndDiskReady_IopBus()
+    {
+        var sys = new Ps2System();
+        var img = new byte[Cdvd.SectorSize * 4];
+        sys.Cdvd.MountImage(img, "MMIO");
+
+        // Direct device surface
+        byte ready = sys.Cdvd.ComposeReady();
+        if ((ready & 0xc0) != 0x40)
+            throw new Exception($"ComposeReady idle 0x{ready:X2}");
+        if ((ready & Cdvd.ReadyStickyBits) != Cdvd.ReadyStickyBits)
+            throw new Exception($"missing sticky bits 0x{ready:X2}");
+        if (sys.Cdvd.DiskReady() != Cdvd.ReadyComplete)
+            throw new Exception("HLE DiskReady after mount");
+
+        // IOP bus physical + KSEG1 alias
+        byte rPhys = sys.Memory.IopRead8(Cdvd.PhysBase + 0x05);
+        byte rKseg = sys.Memory.IopRead8(0xBF402005);
+        if (rPhys != ready || rKseg != ready)
+            throw new Exception($"IopRead Ready phys=0x{rPhys:X2} kseg=0x{rKseg:X2} want 0x{ready:X2}");
+
+        byte status = sys.Memory.IopRead8(Cdvd.PhysBase + 0x0A);
+        if (status != Cdvd.StatSpin)
+            throw new Exception($"STATUS 0x{status:X2}");
+        byte dtype = sys.Memory.IopRead8(Cdvd.PhysBase + 0x0F);
+        if (dtype != (byte)sys.Cdvd.DiscType)
+            throw new Exception($"TYPE 0x{dtype:X2}");
+
+        // NCMD Seek LSN=7: params then command
+        uint lsn = 7;
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x05, (byte)lsn);
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x05, (byte)(lsn >> 8));
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x05, (byte)(lsn >> 16));
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x05, (byte)(lsn >> 24));
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x04, 0x05); // CdSeek
+        if (sys.Cdvd.LastSector != 7)
+            throw new Exception($"Seek LSN {sys.Cdvd.LastSector}");
+        if ((sys.Memory.IopRead8(Cdvd.PhysBase + 0x05) & 0xc0) != 0x40)
+            throw new Exception("Ready after Seek");
+        if ((sys.Memory.IopRead8(Cdvd.PhysBase + 0x08) & 1) == 0)
+            throw new Exception("INTR_STAT missing command-complete");
+        // W1C ack
+        sys.Memory.IopWrite8(Cdvd.PhysBase + 0x08, 0x01);
+        if ((sys.Memory.IopRead8(Cdvd.PhysBase + 0x08) & 1) != 0)
+            throw new Exception("INTR_STAT not cleared");
+
+        // Unknown register: not silent 0
+        ulong unkBefore = sys.Cdvd.UnknownMmioAccesses;
+        byte unk = sys.Memory.IopRead8(Cdvd.PhysBase + 0x1E);
+        if (unk != 0xFF)
+            throw new Exception($"unknown read expected 0xFF got 0x{unk:X2}");
+        if (sys.Cdvd.UnknownMmioAccesses <= unkBefore)
+            throw new Exception("unknown access not counted");
+
+        // Sector path still deterministic after MMIO
+        if (!sys.Cdvd.ReadSector(1))
+            throw new Exception("ReadSector after MMIO");
+
+        Console.WriteLine(
+            $"[Smoke] Cdvd_MmioReadyAndDiskReady_IopBus OK (ready=0x{ready:X2} ncmd={sys.Cdvd.MmioCommands})");
+    }
+
+    /// <summary>
     /// Phase 7: LIBSD export table + sceSdInit / SetParam / SetAddr / SetSwitch(KON) host path
     /// (ps2sdk libsd exports.tab + libsd-common.h). Key-on must reach Spu2 voice playing.
     /// </summary>
@@ -7847,6 +8050,92 @@ public static class SmokeTests
         if (poll.Length < 9) throw new Exception("analog poll needs sticks");
 
         Console.WriteLine("[Smoke] Sio2_PadmanConfigSequenceHelper OK");
+    }
+
+
+    /// <summary>
+    /// WP-21: real IOP SIO2 map (0x1F808200) — SEND3 descriptor, DATA_IN/OUT, CTRL start,
+    /// CMD_STAT connected, iStat transfer-complete bit. Path PADMAN/SIO2MAN IRX will use.
+    /// </summary>
+    public static void Sio2_IopPhysSend3AndIstat()
+    {
+        var sys = new Ps2System();
+        sys.Pad.Press(PadInput.Button.Start | PadInput.Button.Cross);
+        sys.Pad.AnalogMode = true;
+
+        if (!Sio2.IsIopAddress(Sio2.IopPhysBase))
+            throw new Exception("IopPhysBase not recognized");
+        if (!Sio2.IsIopAddress(0xBF808200))
+            throw new Exception("KSEG1 SIO2 alias not recognized");
+        if (!Sio2.TryGetIopOffset(0xBF808268, out uint ctrlOff) || ctrlOff != 0x68)
+            throw new Exception($"CTRL offset 0x{ctrlOff:X}");
+
+        // SEND3[0] must not collide with DATA on the real map (compact +0x00 is DATA).
+        sys.Sio2.WriteRegister(Sio2.IopPhysBase + 0x00, Sio2.EncodeSend3(0, 9));
+        uint s0 = sys.Sio2.ReadRegister(Sio2.IopPhysBase + 0x00);
+        if (s0 != Sio2.EncodeSend3(0, 9))
+            throw new Exception($"SEND3[0] 0x{s0:X}");
+
+        byte[] poll = sys.Sio2.TransactIop(0, new byte[] { 0x01, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        if (poll.Length < 5) throw new Exception($"iop poll len {poll.Length}");
+        if (poll[1] != Sio2.ModeDualShock2 && poll[1] != Sio2.ModeAnalog)
+            throw new Exception($"iop poll mode 0x{poll[1]:X2}");
+        if (poll[2] != 0x5A) throw new Exception("iop poll 5A");
+        ushort btns = (ushort)(poll[3] | (poll[4] << 8));
+        ushort expected = Sio2.ActiveLowButtons(sys.Pad);
+        if (btns != expected)
+            throw new Exception($"iop active-low 0x{btns:X4} want 0x{expected:X4}");
+        if (!sys.Sio2.LastTransferConnected) throw new Exception("not connected");
+        if (!sys.Sio2.TransferIrqPending) throw new Exception("iStat bit0 not set");
+        uint ist = sys.Sio2.ReadRegister(Sio2.IopPhysBase + 0x80);
+        if ((ist & 1) == 0) throw new Exception("iStat MMIO");
+        sys.Sio2.WriteRegister(Sio2.IopPhysBase + 0x80, 1); // ack
+        if (sys.Sio2.TransferIrqPending) throw new Exception("iStat not cleared");
+
+        uint cs = sys.Sio2.ReadRegister(Sio2.IopPhysBase + 0x6C);
+        if ((cs & Sio2.CmdStatNoDevicesMissing) == 0)
+            throw new Exception($"CMD_STAT 0x{cs:X}");
+
+        Console.WriteLine("[Smoke] Sio2_IopPhysSend3AndIstat OK");
+    }
+
+
+    /// <summary>
+    /// WP-21: SEND3 selects port; OnTransferComplete fires once per acked transfer (IRQ 17 hook).
+    /// </summary>
+    public static void Sio2_Send3PortAndTransferIrqHook()
+    {
+        var sys = new Ps2System();
+        // Dual pads: primary + multitap[1] for port 1 without MultitapEnabled aggregate
+        sys.Multitap[1].Press(PadInput.Button.Circle);
+        sys.Sio2.Attach(sys.Pad, sys.MemCard);
+        sys.Sio2.AttachMultitap(sys.Multitap.Ports);
+
+        int irqCount = 0;
+        sys.Sio2.OnTransferComplete = () => irqCount++;
+
+        // Port 0 poll via SEND3
+        sys.Sio2.ClearTransferIrq();
+        sys.Pad.Press(PadInput.Button.Start);
+        byte[] p0 = sys.Sio2.TransactIop(0, new byte[] { 0x01, 0x42, 0x00, 0x00, 0x00 });
+        if (p0.Length < 5) throw new Exception("p0 len");
+        if (irqCount != 1) throw new Exception($"irq count {irqCount} after p0");
+
+        // Port 1 via SEND3 without clearing iStat first: callback must not double-fire
+        byte[] p1 = sys.Sio2.TransactIop(1, new byte[] { 0x01, 0x42, 0x00, 0x00, 0x00 });
+        // TransactIop clears IRQ first, so callback fires again
+        if (irqCount != 2) throw new Exception($"irq count {irqCount} after p1 clear");
+        if (p1.Length < 5) throw new Exception("p1 len");
+        ushort p1btns = (ushort)(p1[3] | (p1[4] << 8));
+        ushort want = (ushort)(~(uint)PadInput.Button.Circle & 0xFFFF);
+        if (p1btns != want)
+            throw new Exception($"port1 btns 0x{p1btns:X4} want 0x{want:X4} (SEND3 port select)");
+
+        // Documented IRQ line constant for T1 handoff
+        if (Sio2.IopTransferIrqLine != 17)
+            throw new Exception("IRQ line constant");
+
+        Console.WriteLine("[Smoke] Sio2_Send3PortAndTransferIrqHook OK");
     }
 
 

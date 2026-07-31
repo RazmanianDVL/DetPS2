@@ -109,7 +109,21 @@ public sealed class BiosBootHost
     public const uint SifCmdRpcCall = RealSifRpc.CidRpcCall; // 0x8000000A
     public const uint SifCmdRpcRdata = RealSifRpc.CidRpcRdata; // 0x8000000C
 
+    /// <summary>
+    /// Canonical SCPH70008 <c>IOPBTCONF</c> <c>@800</c> module order (docs/BIOS_DISSECTION.md §2).
+    /// Used by unit tests and as the no-image fallback sequence for commercial fast-path names
+    /// that appear in the retail text blob (not the full extended contract table).
+    /// </summary>
+    public static readonly string[] Scph70008IopBtConfOrder =
+    {
+        "SYSMEM", "LOADCORE", "EXCEPMAN", "INTRMANP", "INTRMANI", "SSBUSC", "DMACMAN",
+        "TIMEMANP", "TIMEMANI", "SYSCLIB", "HEAPLIB", "EECONF", "THREADMAN", "VBLANK",
+        "IOMAN", "MODLOAD", "ROMDRV", "STDIO", "SIFMAN", "IGREETING", "SIFCMD", "REBOOT",
+        "LOADFILE", "CDVDMAN", "CDVDFSV", "SIFINIT", "FILEIO",
+    };
+
     private readonly List<string> _romdirNames = new();
+    private readonly List<string> _iopBtConfNames = new();
     private readonly HashSet<string> _registered = new(StringComparer.OrdinalIgnoreCase);
     private byte[]? _biosImage;
     private string? _biosPath;
@@ -117,12 +131,17 @@ public sealed class BiosBootHost
     private bool _igreetingDone;
     private bool _stdioReady;
     private ulong _iopRebootHandoffs;
+    private LiteralIopBtConfBootResult? _lastLiteralBoot;
 
     public bool Started => _started;
     public string? BiosPath => _biosPath;
     public int RomdirModuleCount => _romdirNames.Count;
     public IReadOnlyList<string> RomdirNames => _romdirNames;
+    /// <summary>Ordered module names from bound BIOS <c>IOPBTCONF</c> (empty if unbound / missing).</summary>
+    public IReadOnlyList<string> IopBtConfNames => _iopBtConfNames;
     public ulong ServicesInstalled { get; private set; }
+    /// <summary>Result of the last <see cref="BootIopBtConfLiteral"/> call (null if never run).</summary>
+    public LiteralIopBtConfBootResult? LastLiteralBoot => _lastLiteralBoot;
 
     /// <summary>IGREETING.IRX init stub ran (early IOP banner). Idempotent once per bring-up.</summary>
     public bool IgreetingDone => _igreetingDone;
@@ -136,6 +155,7 @@ public sealed class BiosBootHost
     public void Reset()
     {
         _romdirNames.Clear();
+        _iopBtConfNames.Clear();
         _registered.Clear();
         _biosImage = null;
         _biosPath = null;
@@ -144,9 +164,10 @@ public sealed class BiosBootHost
         _igreetingDone = false;
         _stdioReady = false;
         _iopRebootHandoffs = 0;
+        _lastLiteralBoot = null;
     }
 
-    /// <summary>Parse ROMDIR from a BIOS image path (or already-loaded bytes).</summary>
+    /// <summary>Parse ROMDIR + IOPBTCONF from a BIOS image path (or already-loaded bytes).</summary>
     public void BindBios(string? path, byte[]? image = null)
     {
         Reset();
@@ -164,6 +185,9 @@ public sealed class BiosBootHost
             if (!string.IsNullOrWhiteSpace(e.Name) && e.Name != "-")
                 _romdirNames.Add(e.Name);
         }
+
+        // Ordered IOPBTCONF list for WP-15 / literal boot (unit-testable via ParseIopBtConfText).
+        _iopBtConfNames.AddRange(ExtractIopBtConfNames(_biosImage));
     }
 
     /// <summary>
@@ -392,37 +416,264 @@ public sealed class BiosBootHost
     }
 
     /// <summary>
-    /// Parse IOPBTCONF module name list from BIOS image (ROMDIR entry "IOPBTCONF").
-    /// Lines like "SYSMEM" / "@800" — skips directives starting with '@'.
+    /// True when <c>DETPS2_LITERAL_IRX=1</c> (default target after WP-08; currently opt-in until
+    /// orchestrator flips default). Empty/unset is treated as disabled for bisect safety.
+    /// </summary>
+    public static bool IsLiteralIrxEnabled()
+    {
+        string? v = Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX");
+        return string.Equals(v, "1", StringComparison.Ordinal) ||
+               string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(v, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Pure IOPBTCONF text parser — unit-testable without a BIOS image.
+    /// Lines like "SYSMEM" / "@800": skips empty lines and directives starting with '@'.
+    /// Module names are at most 16 printable ASCII characters (ROMDIR name width).
+    /// </summary>
+    public static List<string> ParseIopBtConfText(string text)
+    {
+        var names = new List<string>();
+        if (string.IsNullOrEmpty(text)) return names;
+        foreach (string raw in text.Split(new[] { '\r', '\n', '\0' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string line = raw.Trim();
+            if (line.Length == 0 || line[0] == '@') continue;
+            bool ok = true;
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (c < 0x20 || c >= 0x7F) { ok = false; break; }
+            }
+            if (ok && line.Length <= 16)
+                names.Add(line);
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// Parse IOPBTCONF module name list from a BIOS image (ROMDIR entry "IOPBTCONF").
+    /// Uses <see cref="RomdirExtractor.ExtractModuleContent"/> so text payloads stay at the
+    /// naive offset (not stolen by a later entry's ELF magic).
     /// </summary>
     public static List<string> ExtractIopBtConfNames(byte[] bios)
     {
-        var names = new List<string>();
-        foreach (var e in RomdirExtractor.ParseRomdir(bios))
+        if (bios == null || bios.Length == 0) return new List<string>();
+        byte[]? content = RomdirExtractor.ExtractModuleContent(bios, "IOPBTCONF");
+        if (content == null || content.Length == 0) return new List<string>();
+        return ParseIopBtConfText(Encoding.ASCII.GetString(content));
+    }
+
+    /// <summary>
+    /// Ordered IOPBTCONF names from the bound BIOS image, or the empty list if unbound.
+    /// Prefer this over re-parsing when <see cref="BindBios"/> already ran.
+    /// </summary>
+    public IReadOnlyList<string> GetBoundIopBtConfNames() => _iopBtConfNames;
+
+    /// <summary>
+    /// For each name in <paramref name="btconfOrder"/>, report whether a real ELF can be
+    /// extracted from <paramref name="bios"/> via <see cref="RomdirExtractor.ExtractModule"/>.
+    /// Does not load into IOP RAM — inventory helper for WP-15/WP-16.
+    /// </summary>
+    public static List<(string Name, bool ElfExtractable, int ByteLength)> InventoryIopBtConfElfs(
+        byte[] bios, IReadOnlyList<string> btconfOrder)
+    {
+        var rows = new List<(string Name, bool ElfExtractable, int ByteLength)>(btconfOrder.Count);
+        foreach (string name in btconfOrder)
         {
-            if (!string.Equals(e.Name, "IOPBTCONF", StringComparison.OrdinalIgnoreCase))
-                continue;
-            int start = (int)e.NaiveOffset;
-            int len = (int)Math.Min(e.Size, (uint)(bios.Length - start));
-            if (start < 0 || len <= 0) break;
-            string text = Encoding.ASCII.GetString(bios, start, len);
-            foreach (string raw in text.Split(new[] { '\r', '\n', '\0' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string line = raw.Trim();
-                if (line.Length == 0 || line[0] == '@') continue;
-                // printable module names only
-                bool ok = true;
-                for (int i = 0; i < line.Length; i++)
-                {
-                    char c = line[i];
-                    if (c < 0x20 || c >= 0x7F) { ok = false; break; }
-                }
-                if (ok && line.Length <= 16)
-                    names.Add(line);
-            }
-            break;
+            byte[]? mod = RomdirExtractor.ExtractModule(bios, name);
+            bool elf = mod != null && mod.Length >= 52 &&
+                       mod[0] == 0x7F && mod[1] == (byte)'E' &&
+                       mod[2] == (byte)'L' && mod[3] == (byte)'F';
+            rows.Add((name, elf, mod?.Length ?? 0));
         }
-        return names;
+        return rows;
+    }
+
+    /// <summary>
+    /// WP-15/WP-16 prep: walk IOPBTCONF order and <b>LoadIrx</b> every extractable ELF from the
+    /// bound BIOS (real extract+load — no invented HLE plants). Name-only when no ELF exists.
+    /// <para>
+    /// When <see cref="IsLiteralIrxEnabled"/> is true, attempts module start after load.
+    /// <see cref="IopModuleHost.LoadIrx"/> already HLE-marks Started; real R3000 <c>_start</c>
+    /// execution is TODO for T1/T2 (<c>IopModuleHost</c> / IOP step API) — see stub below.
+    /// </para>
+    /// Does <b>not</b> replace <see cref="StartCommercialIop"/> HLE surface; callers may invoke
+    /// this after bind for literal IRX bring-up experiments.
+    /// </summary>
+    public LiteralIopBtConfBootResult BootIopBtConfLiteral(Ps2System sys)
+    {
+        var result = new LiteralIopBtConfBootResult();
+        if (sys == null)
+        {
+            _lastLiteralBoot = result;
+            return result;
+        }
+
+        List<string> order;
+        if (_iopBtConfNames.Count > 0)
+            order = new List<string>(_iopBtConfNames);
+        else if (_biosImage != null && _biosImage.Length > 0)
+            order = ExtractIopBtConfNames(_biosImage);
+        else
+            order = new List<string>(Scph70008IopBtConfOrder);
+
+        result.Order.AddRange(order);
+        result.LiteralIrxEnv = IsLiteralIrxEnabled();
+        sys.IopModules.BindRomBios(_biosImage);
+
+        foreach (string name in order)
+        {
+            result.ModulesSeen++;
+            if (_biosImage == null || _biosImage.Length == 0)
+            {
+                Register(sys, name);
+                result.NameOnlyRegistered++;
+                result.Steps.Add(new LiteralIopBtConfStep
+                {
+                    Name = name, Action = "register-no-bios", Loaded = false, Started = false
+                });
+                continue;
+            }
+
+            byte[]? mod = null;
+            try { mod = RomdirExtractor.ExtractModule(_biosImage, name); }
+            catch { mod = null; }
+
+            bool isElf = mod != null && mod.Length >= 52 &&
+                         mod[0] == 0x7F && mod[1] == (byte)'E' &&
+                         mod[2] == (byte)'L' && mod[3] == (byte)'F';
+
+            if (!isElf)
+            {
+                // Prefer real extract+load; text/meta entries (or missing IRX) stay name-only.
+                Register(sys, name);
+                result.NameOnlyRegistered++;
+                result.Steps.Add(new LiteralIopBtConfStep
+                {
+                    Name = name, Action = "register-name-only", Loaded = false, Started = false,
+                    Bytes = mod?.Length ?? 0
+                });
+                continue;
+            }
+
+            result.ElfsExtractable++;
+            try
+            {
+                var lr = sys.IopModules.LoadIrx(mod!, sys.Memory, name);
+                if (!lr.Success)
+                {
+                    Register(sys, name);
+                    result.LoadFailures++;
+                    result.NameOnlyRegistered++;
+                    result.Steps.Add(new LiteralIopBtConfStep
+                    {
+                        Name = name, Action = "load-failed:" + lr.Message,
+                        Loaded = false, Started = false, Bytes = mod!.Length
+                    });
+                    continue;
+                }
+
+                result.ElfsLoaded++;
+                ServicesInstalled++;
+                bool started = false;
+                string startNote = "load-only";
+
+                if (result.LiteralIrxEnv)
+                {
+                    // LoadIrx already calls IopModuleHost.StartModule (HLE mark Started /
+                    // MODULE_RESIDENT_END). Real R3000 _start execution is not wired yet:
+                    //
+                    // TODO(WP-16 / T1+T2): call into IopModuleHost (or sibling) to set IOP PC
+                    // to lr.Entry, gp=lr.Gp, and run until module returns — see plan WP-08/14.
+                    // Prefer IopModuleHost over inventing HLE plants here.
+                    if (sys.IopModules.TryGetModule(name, out int mid) &&
+                        sys.IopModules.TryGetIrx(mid, out var irx) &&
+                        irx.HasImage)
+                    {
+                        int rc = sys.IopModules.StartModule(mid, out _);
+                        started = rc == mid && irx.State == IopModuleState.Started;
+                        startNote = started
+                            ? "start-hle-mark (TODO real R3000 _start via IopModuleHost)"
+                            : "start-failed rc=" + rc;
+                        if (started) result.ModulesStarted++;
+                    }
+                    else
+                    {
+                        startNote = "start-skipped (no module table entry)";
+                    }
+                }
+                else
+                {
+                    startNote = "load-ok (DETPS2_LITERAL_IRX!=1; start deferred)";
+                }
+
+                result.Steps.Add(new LiteralIopBtConfStep
+                {
+                    Name = name,
+                    Action = startNote,
+                    Loaded = true,
+                    Started = started,
+                    Bytes = mod!.Length,
+                    Entry = lr.Entry,
+                    LoadBase = lr.LoadBase,
+                });
+            }
+            catch (Exception ex)
+            {
+                Register(sys, name);
+                result.LoadFailures++;
+                result.NameOnlyRegistered++;
+                result.Steps.Add(new LiteralIopBtConfStep
+                {
+                    Name = name, Action = "load-exception:" + ex.GetType().Name,
+                    Loaded = false, Started = false, Bytes = mod?.Length ?? 0
+                });
+            }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" ||
+            Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] BootIopBtConfLiteral order={result.Order.Count} " +
+                $"elfExtractable={result.ElfsExtractable} loaded={result.ElfsLoaded} " +
+                $"started={result.ModulesStarted} nameOnly={result.NameOnlyRegistered} " +
+                $"fail={result.LoadFailures} literalEnv={result.LiteralIrxEnv}");
+
+        _lastLiteralBoot = result;
+        return result;
+    }
+
+    /// <summary>Per-module step recorded by <see cref="BootIopBtConfLiteral"/>.</summary>
+    public sealed class LiteralIopBtConfStep
+    {
+        public string Name { get; init; } = "";
+        public string Action { get; init; } = "";
+        public bool Loaded { get; init; }
+        public bool Started { get; init; }
+        public int Bytes { get; init; }
+        public uint Entry { get; init; }
+        public uint LoadBase { get; init; }
+    }
+
+    /// <summary>Aggregate result of <see cref="BootIopBtConfLiteral"/> (WP-15 inventory + WP-16 prep).</summary>
+    public sealed class LiteralIopBtConfBootResult
+    {
+        public List<string> Order { get; } = new();
+        public List<LiteralIopBtConfStep> Steps { get; } = new();
+        public int ModulesSeen { get; set; }
+        public int ElfsExtractable { get; set; }
+        public int ElfsLoaded { get; set; }
+        public int ModulesStarted { get; set; }
+        public int NameOnlyRegistered { get; set; }
+        public int LoadFailures { get; set; }
+        public bool LiteralIrxEnv { get; set; }
+
+        public override string ToString() =>
+            $"order={Order.Count} extractable={ElfsExtractable} loaded={ElfsLoaded} " +
+            $"started={ModulesStarted} nameOnly={NameOnlyRegistered} fail={LoadFailures} " +
+            $"literal={LiteralIrxEnv}";
     }
 
     private void InstallIopBtConfOrder(Ps2System sys, List<string>? names)
