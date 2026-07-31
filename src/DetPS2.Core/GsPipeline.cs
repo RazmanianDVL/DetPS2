@@ -28,6 +28,9 @@ public sealed class GsPipeline
 
     public void Reset() => FramesPresented = 0;
 
+    /// <summary>GX-040: privileged DISPFB/DISPLAY/PMODE circuit snapshot.</summary>
+    public GsDisplayCircuitInfo GetDisplayCircuitInfo() => _gs.GetDisplayCircuitInfo();
+
     public void ProcessPath3(uint address, uint qwc) => _gif.ReceivePath3Data(address, qwc);
     public void ProcessPath2(uint address, uint qwc) => _gif.ReceivePath2Data(address, qwc);
     public void ProcessPath1(uint address, uint qwc) => _gif.ReceivePath1Data(address, qwc);

@@ -5,7 +5,8 @@ Faster commercial bring-up without blind 150M runs. Soft-GS metrics do **not** r
 | Script | Purpose |
 |--------|---------|
 | **`scoreboard.ps1`** | Multi-title Soft-GS metrics + **T0–T7 / G1–G4** → `out/traces/scoreboard-*.md` + `.json` |
-| **`SCOREBOARD_SCHEMA.md`** | Claim field + tier schema (PL-001 / GX-001/002) |
+| **`SCOREBOARD_SCHEMA.md`** | Claim field + tier schema (PL-001 / GX-001/002 / PL-002 / GX-040) |
+| **`pad-scripts/`** | Example `--pad-script=` files for T2 interactive claims (PL-002) |
 | **`run-title.ps1`** | One title at diagnose/verify/claim cycle budget |
 | **`play-lookup.ps1`** | Play! GameConfig + wall→source map (`C:\Windows\Play`) |
 | **`scoreboard-fleet.json`** | Default fleet list + serials + media JSON names + tier schema pointer |
@@ -65,6 +66,9 @@ pwsh ./tools/scoreboard.ps1 -Budget verify -Titles mk-shaolin-monks,burnout-3,go
 # Schema (T0–T7, G1–G4, claim fields):
 #   tools/SCOREBOARD_SCHEMA.md
 
+# Pad-script T2 claim (PL-002) — does not invent DISPFB; only drives PadInput:
+#   dotnet exec out/seat-s10/DetPS2.Core.dll pad-inject user-media-b3.json `
+#     --cycles=20000000 --host-present --pad-script=tools/pad-scripts/example-start-cross.pad
 
 # Fixed four-title regression matrix:
 pwsh ./tools/regression-matrix.ps1 -Budget diagnose

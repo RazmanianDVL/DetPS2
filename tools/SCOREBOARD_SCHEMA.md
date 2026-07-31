@@ -24,6 +24,11 @@
 | `gifPath3` / `gifP3` | ulong | GIF Path3 transfers (DMAC GIF) |
 | `imgBytes` | long | Host→local IMAGE/BITBLT bytes |
 | `dispfbPx` | long | Pixels composited from DISPFB/FRAME local VRAM |
+| `naturalDispfbPx` | long | Subset of `dispfbPx` from software-programmed DISPFB only (GX-040; not FRAME/FBP0 fallback) |
+| `display1` / `display2` / `pmode` | string hex | Privileged CRT regs (GX-040 telemetry) |
+| `circuit` | int | Preferred PCRTC circuit 0/1/2 |
+| `naturalDispfb` | bool | Preferred circuit has non-zero DISPFB raw |
+| `padScriptEvents` / `padScriptFires` | int | PL-002 pad-script schedule / applied press+release count |
 | `expandHits` | long | Title-strip ofx expand rescues (G4/T4 demotion target) |
 | `gifCompleted` | ulong | Fully drained GIFtag packets (`Gif.PacketsCompleted`) |
 | `gifAborted` | ulong | Aborted mid-packet GIFtags (`Gif.PacketsAborted`) |
@@ -51,7 +56,7 @@ Heuristic codes emitted as strings. **`Y` / `Y?` / `NEAR?` / `N` / `?` / `WARN`*
 |------|------|---------------------|--------------------|
 | **T0** | Boot | Spine live (`cycles` advanced; not instant death) | ELF entry, no early Exit |
 | **T1** | Menu | `px>0` and any gif path; `Y?` if px≫ + gifP3 | `menuKind` YES + claim budget |
-| **T2** | Interactive | `?` until pad-inject mode (PL-002) | Pad changes sel/PC/prims |
+| **T2** | Interactive | `?` without `--pad-script`; with script: `Y?` if PC/prims/px/syscalls move after first press, else `NEAR?` / `N` | Pad changes sel/PC/prims (PL-002) |
 | **T3** | Frontend | prims≥10 **or** imgBytes>0 **or** dispfbPx>0 **or** gifP3≥20 | Richer Soft-GS charter |
 | **T4** | Natural | expandHits==0 and px>0 → `Y?` | No expand plant / assist PATH3 |
 | **T5** | Gameplay | `?` stub | Scene change post–New Game |
@@ -69,7 +74,7 @@ Heuristic codes emitted as strings. **`Y` / `Y?` / `NEAR?` / `N` / `?` / `WARN`*
 |------|------|---------------------|------|
 | **G1** | Path fidelity | any path or gifCompleted>0; WARN if aborted ≫ completed | G-GFX-1 |
 | **G2** | Texture/IMAGE | imgBytes>0 → `Y` | G-GFX-3 |
-| **G3** | DISPFB present | dispfbPx>0 → `Y` | G-GFX-5 |
+| **G3** | DISPFB present | naturalDispfbPx>0 → `Y`; residual composite dispfbPx>0 only → `Y?` | G-GFX-5 |
 | **G4** | Expand demotion | expandHits==0 and px>0 → `Y?` | G-GFX-6 |
 
 ---

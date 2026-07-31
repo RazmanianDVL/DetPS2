@@ -181,6 +181,13 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     string? dumpSoftGsPath = null;
     foreach (var a in args)
         if (a.StartsWith("--dump-softgs=")) dumpSoftGsPath = a.Substring("--dump-softgs=".Length);
+    // PL-002: optional pad-script for interactive (T2) claim runs.
+    string? padScriptPath = null;
+    foreach (var a in args)
+        if (a.StartsWith("--pad-script=")) padScriptPath = a.Substring("--pad-script=".Length);
+    PadScript blockerPadScript = PadScript.Empty;
+    if (!string.IsNullOrEmpty(padScriptPath))
+        blockerPadScript = PadScript.LoadFile(padScriptPath);
     if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
     if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
     if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;
@@ -288,18 +295,42 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             SystemMemory.WatchAddr = watchAddrArg;
         }
         ulong remaining = cycles > watchAfter ? cycles - watchAfter : 0;
-        if (driveHostPresent)
+        ulong doneCycles = cycles > remaining ? cycles - remaining : 0;
+        int padEvtIdx = 0;
+        var padPending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
+        int padFires = 0;
+        if (blockerPadScript.Events.Count > 0)
+            Console.WriteLine($"  pad-script: {blockerPadScript.Events.Count} event(s) from {blockerPadScript.Source}");
+        if (driveHostPresent || blockerPadScript.Events.Count > 0)
         {
-            const ulong slice = 1_000_000;
-            while (remaining > 0)
+            const ulong hostPeriod = 1_000_000;
+            ulong nextHost = doneCycles + hostPeriod;
+            ulong endAt = doneCycles + remaining;
+            while (doneCycles < endAt)
             {
-                ulong step = Math.Min(slice, remaining);
+                ulong nextBoundary = endAt;
+                if (driveHostPresent) nextBoundary = Math.Min(nextBoundary, nextHost);
+                if (padEvtIdx < blockerPadScript.Events.Count)
+                    nextBoundary = Math.Min(nextBoundary, blockerPadScript.Events[padEvtIdx].PressAt);
+                foreach (var p in padPending)
+                    nextBoundary = Math.Min(nextBoundary, p.releaseAt);
+                ulong step = nextBoundary > doneCycles ? nextBoundary - doneCycles : 1;
+                step = Math.Min(step, endAt - doneCycles);
                 traceSys.RunFor(step);
-                traceSys.ActiveQuirk?.OnHostPresent(traceSys);
-                // Soft-GS DISPFB residual: IMAGE may fill local VRAM without prim raster.
-                traceSys.Gs.CompositeDispfbToFramebuffer();
-                remaining -= step;
+                doneCycles += step;
+                padFires += blockerPadScript.ApplyAt(traceSys.Pad, doneCycles, ref padEvtIdx, padPending);
+                if (driveHostPresent && doneCycles >= nextHost)
+                {
+                    traceSys.ActiveQuirk?.OnHostPresent(traceSys);
+                    // Soft-GS DISPFB residual: IMAGE may fill local VRAM without prim raster.
+                    traceSys.Gs.CompositeDispfbToFramebuffer();
+                    nextHost = doneCycles + hostPeriod;
+                }
             }
+            if (!driveHostPresent)
+                traceSys.Gs.CompositeDispfbToFramebuffer();
+            if (padFires > 0)
+                Console.WriteLine($"  pad-script: applied {padFires} press/release action(s)");
         }
         else
         {
@@ -426,8 +457,11 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         }
         // GX-001 / PL-001 claim surface: always print Soft-GS + GIF path counts for scoreboard scrape.
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifPath1={traceSys.Gif.Path1Transfers} gifPath2={traceSys.Gif.Path2Transfers} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
-        Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} expandHits={traceSys.Gs.ExpandHits} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
+        Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} naturalDispfbPx={traceSys.Gs.NaturalDispfbPixels} expandHits={traceSys.Gs.ExpandHits} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
         Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
+        // GX-040: DISPFB/DISPLAY circuit snapshot (no invent — reports software-programmed regs only).
+        var circ = traceSys.Gs.GetDisplayCircuitInfo();
+        Console.WriteLine($"  softgs-circuit: {circ.SummaryLine()}");
         Console.WriteLine($"  softgs-writes: total={traceSys.Gs.RegWritesTotal} PRIM={traceSys.Gs.RegWritesPrim} XYZ2={traceSys.Gs.RegWritesXyz2} XYZ3={traceSys.Gs.RegWritesXyz3} XYZF2={traceSys.Gs.RegWritesXyzf2} FRAME={traceSys.Gs.RegWritesFrame} SCISSOR={traceSys.Gs.RegWritesScissor} TEST={traceSys.Gs.RegWritesTest} XYOFF={traceSys.Gs.RegWritesXyoffset}");
         // GX-001/GX-003: path fidelity claim lines — always present for scoreboard / G0 inventory
         Console.WriteLine($"  gif-pkts: completed={traceSys.Gif.PacketsCompleted} aborted={traceSys.Gif.PacketsAborted} spannedCalls={traceSys.Gif.PacketsSpannedCalls} inFlight={traceSys.Gif.PacketInFlight} tags={traceSys.Gif.TagsSeen} p2qws={traceSys.Gif.Path2Qws}");
@@ -584,20 +618,25 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
 {
     if (args.Length < 2 || args[1].StartsWith("--"))
     {
-        Console.Error.WriteLine("usage: detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]");
+        Console.Error.WriteLine("usage: detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path] [--pad-script=path]");
         Environment.Exit(1);
     }
     UserMediaConfig smCfg = UserMediaConfig.Load(args[1]);
     ulong smCycles = 5_000_000;
     string? smOut = null;
     string? smDumpSoftGs = null;
+    string? smPadScriptPath = null;
     bool smHostPresent = args.Contains("--host-present");
     foreach (var a in args)
     {
         if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) smCycles = c;
         else if (a.StartsWith("--out=")) smOut = a.Substring(6);
         else if (a.StartsWith("--dump-softgs=")) smDumpSoftGs = a.Substring("--dump-softgs=".Length);
+        else if (a.StartsWith("--pad-script=")) smPadScriptPath = a.Substring("--pad-script=".Length);
     }
+    PadScript smPadScript = string.IsNullOrEmpty(smPadScriptPath)
+        ? PadScript.Empty
+        : PadScript.LoadFile(smPadScriptPath);
 
     var smResults = new List<object>();
     var jsonOpts = new JsonSerializerOptions { WriteIndented = false };
@@ -626,17 +665,49 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
                      ?? smSys.ActiveQuirk?.Serial;
         }
 
-        if (smHostPresent)
+        int padFires = 0;
+        int padEvtIdx = 0;
+        var padPending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
+        // Snapshot taken at first pad press (not boot) so T2 measures reaction, not boot draw.
+        bool padSnapTaken = false;
+        long pxAtPad = 0, primsAtPad = 0;
+        ulong pcAtPad = 0, syscallsAtPad = 0;
+
+        if (smHostPresent || smPadScript.Events.Count > 0)
         {
-            const ulong slice = 1_000_000;
-            ulong remaining = smCycles;
-            while (remaining > 0)
+            const ulong hostPeriod = 1_000_000;
+            ulong done = 0;
+            ulong nextHost = hostPeriod;
+            while (done < smCycles)
             {
-                ulong step = Math.Min(slice, remaining);
+                ulong nextBoundary = smCycles;
+                if (smHostPresent) nextBoundary = Math.Min(nextBoundary, nextHost);
+                if (padEvtIdx < smPadScript.Events.Count)
+                    nextBoundary = Math.Min(nextBoundary, smPadScript.Events[padEvtIdx].PressAt);
+                foreach (var p in padPending)
+                    nextBoundary = Math.Min(nextBoundary, p.releaseAt);
+                ulong step = nextBoundary > done ? nextBoundary - done : 1;
+                step = Math.Min(step, smCycles - done);
                 smSys.RunFor(step);
-                smSys.ActiveQuirk?.OnHostPresent(smSys);
-                smSys.Gs.CompositeDispfbToFramebuffer();
-                remaining -= step;
+                done += step;
+                int beforeIdx = padEvtIdx;
+                int fired = smPadScript.ApplyAt(smSys.Pad, done, ref padEvtIdx, padPending);
+                padFires += fired;
+                if (!padSnapTaken && padEvtIdx > beforeIdx)
+                {
+                    // First press just landed — baseline for reaction.
+                    padSnapTaken = true;
+                    pxAtPad = smSys.Gs.PixelsWritten;
+                    primsAtPad = smSys.Gs.PrimitivesDrawn;
+                    pcAtPad = smSys.EE.PC;
+                    syscallsAtPad = smSys.Hle.SyscallCount;
+                }
+                if (smHostPresent && done >= nextHost)
+                {
+                    smSys.ActiveQuirk?.OnHostPresent(smSys);
+                    smSys.Gs.CompositeDispfbToFramebuffer();
+                    nextHost = done + hostPeriod;
+                }
             }
         }
         else
@@ -650,6 +721,7 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         long prims = smSys.Gs.PrimitivesDrawn;
         long imgBytes = smSys.Gs.ImageBytesWritten;
         long dispfbPx = smSys.Gs.DispfbPixelsComposited;
+        long naturalDispfbPx = smSys.Gs.NaturalDispfbPixels;
         long expandHits = smSys.Gs.ExpandHits;
         ulong gifP1 = smSys.Gif.Path1Transfers;
         ulong gifP2 = smSys.Gif.Path2Transfers;
@@ -657,13 +729,28 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         ulong gifCompleted = smSys.Gif.PacketsCompleted;
         ulong gifAborted = smSys.Gif.PacketsAborted;
         bool exitReq = smSys.Hle.ExitRequested;
+        var circ = smSys.Gs.GetDisplayCircuitInfo();
 
         // PL-001 / GX-001 tier stubs (heuristic — not formal claims). See tools/SCOREBOARD_SCHEMA.md.
         ulong gifAny = gifP1 + gifP2 + gifP3;
         string t0 = !exitReq || smSys.MasterCycles > 0 ? "Y" : "N";
         // Count all GIF paths (Path2-only titles e.g. GoW must not fall to N).
         string t1 = px > 0 && gifAny > 0 ? (px > 100_000 && gifAny >= 12 ? "Y?" : "NEAR?") : "N";
-        string t2 = "?"; // pad inject required (PL-002)
+        // PL-002: T2 measured only when pad-script ran; reaction = PC/prims/px/syscalls after first press.
+        string t2;
+        if (smPadScript.Events.Count == 0)
+            t2 = "?";
+        else if (padFires <= 0)
+            t2 = "N";
+        else if (!padSnapTaken)
+            t2 = "NEAR?";
+        else
+        {
+            bool reacted = px != pxAtPad || prims != primsAtPad
+                           || smSys.EE.PC != pcAtPad
+                           || smSys.Hle.SyscallCount != syscallsAtPad;
+            t2 = reacted ? "Y?" : "NEAR?";
+        }
         string t3 = (prims >= 10 || imgBytes > 0 || dispfbPx > 0 || gifP3 >= 20 || gifAny >= 20) ? "Y?" : "N";
         string t4 = expandHits == 0 && px > 0 ? "Y?" : (px > 0 ? "N" : "?");
         string t5 = "?"; // scene-change charter (later seasons)
@@ -673,7 +760,8 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ? (gifAborted == 0 || gifCompleted >= gifAborted ? "Y?" : "WARN")
             : "N";
         string g2 = imgBytes > 0 ? "Y" : "N";
-        string g3 = dispfbPx > 0 ? "Y" : "N";
+        // G3: natural DISPFB preferred; residual composite (FRAME/FBP0) still counts as dispfbPx for menu chrome.
+        string g3 = naturalDispfbPx > 0 ? "Y" : (dispfbPx > 0 ? "Y?" : "N");
         string g4 = expandHits == 0 && px > 0 ? "Y?" : (px > 0 ? "N" : "?");
 
         string? dumpPathWritten = null;
@@ -720,6 +808,7 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["cycles"] = smSys.MasterCycles,
             ["imgBytes"] = imgBytes,
             ["dispfbPx"] = dispfbPx,
+            ["naturalDispfbPx"] = naturalDispfbPx,
             ["expandHits"] = expandHits,
             ["gifCompleted"] = gifCompleted,
             ["gifAborted"] = gifAborted,
@@ -730,9 +819,17 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["rejAlpha"] = smSys.Gs.FragmentsRejectedAlpha,
             ["frame1"] = $"0x{smSys.Gs.Registers.FRAME_1:X16}",
             ["dispfb1"] = $"0x{smSys.Gs.Registers.DISPFB1:X16}",
+            ["dispfb2"] = $"0x{smSys.Gs.Registers.DISPFB2:X16}",
+            ["display1"] = $"0x{smSys.Gs.Registers.DISPLAY1:X16}",
+            ["display2"] = $"0x{smSys.Gs.Registers.DISPLAY2:X16}",
+            ["pmode"] = $"0x{smSys.Gs.Registers.PMODE:X16}",
+            ["circuit"] = circ.PreferredCircuit,
+            ["naturalDispfb"] = circ.HasNaturalDispfb,
             ["scissor"] = $"0x{smSys.Gs.Registers.SCISSOR_1:X16}",
             ["xyoffset"] = $"0x{smSys.Gs.Registers.XYOFFSET_1:X16}",
             ["test1"] = $"0x{smSys.Gs.Registers.TEST_1:X16}",
+            ["padScriptEvents"] = smPadScript.Events.Count,
+            ["padScriptFires"] = padFires,
             // Play tiers T0–T7 (heuristic stubs; "?" = not measured this budget)
             ["T0"] = t0,
             ["T1"] = t1,
@@ -972,31 +1069,25 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
         if (a.StartsWith("--sample-every=") && ulong.TryParse(a.AsSpan(15), out var se)) sampleEvery = se;
     bool piHostPresent = args.Contains("--host-present");
 
-    var events = new List<(ulong pressAt, ulong releaseAt, PadInput.Button button, string name)>();
+    // PL-002: --pad-script=path and/or --press=BUTTON:CYCLE[:HOLD]
+    PadScript? fileScript = null;
+    foreach (var a in args)
+    {
+        if (!a.StartsWith("--pad-script=")) continue;
+        fileScript = PadScript.LoadFile(a.Substring("--pad-script=".Length));
+    }
+    var cliEvents = new List<PadScript.Event>();
     foreach (var a in args)
     {
         if (!a.StartsWith("--press=")) continue;
-        var parts = a.Substring(8).Split(':');
-        if (parts.Length < 2)
+        if (!PadScript.TryParsePressArg(a, out var ev, out string? err))
         {
-            Console.WriteLine($"bad --press= arg (need BUTTON:CYCLE[:HOLD]): {a}");
+            Console.WriteLine($"bad --press= arg ({err}): {a}");
             continue;
         }
-        if (!Enum.TryParse<PadInput.Button>(parts[0], ignoreCase: true, out var btn))
-        {
-            Console.WriteLine($"unknown button '{parts[0]}' — valid: {string.Join(",", Enum.GetNames(typeof(PadInput.Button)))}");
-            continue;
-        }
-        if (!ulong.TryParse(parts[1], out var pressAt))
-        {
-            Console.WriteLine($"bad cycle in --press= arg: {a}");
-            continue;
-        }
-        ulong hold = 50_000;
-        if (parts.Length > 2) ulong.TryParse(parts[2], out hold);
-        events.Add((pressAt, pressAt + hold, btn, parts[0]));
+        cliEvents.Add(ev);
     }
-    events.Sort((x, y) => x.pressAt.CompareTo(y.pressAt));
+    PadScript padScript = PadScript.Merge(fileScript, cliEvents);
 
     if (!picfg.HasBios) { Console.WriteLine("No BIOS in user-media.json"); Environment.Exit(1); }
     var piTitle = picfg.Titles.FirstOrDefault(t => t.Exists);
@@ -1008,9 +1099,9 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
         ? $"ELF entry=0x{piSys.LoadElf(File.ReadAllBytes(piTitle.Path)).Entry:X8}"
         : piSys.BootDiscFile(piTitle.Path).Message;
     Console.WriteLine($"[{piTitle.Id}] {piBootMsg}");
-    Console.WriteLine(events.Count > 0
-        ? $"scheduled: {string.Join(", ", events.Select(e => $"{e.name}@{e.pressAt}-{e.releaseAt}"))}"
-        : "scheduled: (no --press= events given — plain observation run)");
+    Console.WriteLine(padScript.Events.Count > 0
+        ? $"scheduled ({padScript.Source}): {string.Join(", ", padScript.Events.Select(e => $"{e.Name}@{e.PressAt}-{e.ReleaseAt}"))}"
+        : "scheduled: (no --press= / --pad-script events — plain observation run)");
     Console.WriteLine();
     // gifPath3/dmac/sifBytes alongside px: px is unreliable once MidwayBootAssist's logo-hold
     // overlay is active (Gs.SetHostOverlay unconditionally adds a full framebuffer's worth of
@@ -1058,7 +1149,7 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
     while (done < piCycles)
     {
         ulong nextBoundary = piHostPresent ? nextHostPresent : piCycles;
-        if (eventIdx < events.Count) nextBoundary = Math.Min(nextBoundary, events[eventIdx].pressAt);
+        if (eventIdx < padScript.Events.Count) nextBoundary = Math.Min(nextBoundary, padScript.Events[eventIdx].PressAt);
         foreach (var p in pending) nextBoundary = Math.Min(nextBoundary, p.releaseAt);
         nextBoundary = Math.Min(nextBoundary, piCycles);
         ulong step = nextBoundary > done ? nextBoundary - done : 1;
@@ -1068,16 +1159,17 @@ if (args.Length > 0 && args[0].Equals("pad-inject", StringComparison.OrdinalIgno
         if (piHostPresent && done >= nextHostPresent)
         {
             piSys.ActiveQuirk?.OnHostPresent(piSys);
+            piSys.Gs.CompositeDispfbToFramebuffer();
             nextHostPresent = done + hostPresentPeriod;
         }
 
         bool fired = false;
-        while (eventIdx < events.Count && events[eventIdx].pressAt <= done)
+        while (eventIdx < padScript.Events.Count && padScript.Events[eventIdx].PressAt <= done)
         {
-            var e = events[eventIdx++];
-            piSys.Pad.Press(e.button);
-            pending.Add((e.releaseAt, e.button, e.name));
-            Console.WriteLine($"  >>> cyc={done,12} PRESS   {e.name}");
+            var e = padScript.Events[eventIdx++];
+            piSys.Pad.Press(e.Button);
+            pending.Add((e.ReleaseAt, e.Button, e.Name));
+            Console.WriteLine($"  >>> cyc={done,12} PRESS   {e.Name}");
             fired = true;
         }
         for (int i = pending.Count - 1; i >= 0; i--)
@@ -1797,8 +1889,9 @@ Console.WriteLine("  majority-catalog [out.md]");
 Console.WriteLine("  commercial-checklist");
 Console.WriteLine("  netplay-soak [frames]");
 Console.WriteLine("  netplay-cert [frames]");
-Console.WriteLine("  scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]");
-Console.WriteLine("  blocker-trace … [--dump-softgs=path]  (Soft-GS PPM when px>0; claim: px/prims/gifP1-3/imgBytes/dispfbPx/expandHits)");
+Console.WriteLine("  scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path] [--pad-script=path]");
+Console.WriteLine("  blocker-trace … [--dump-softgs=path] [--pad-script=path]  (Soft-GS PPM when px>0; claim + GX-040 circuit)");
+Console.WriteLine("  pad-inject <media> --cycles=N [--host-present] [--pad-script=path] [--press=BTN:CYC[:HOLD]]");
 Console.WriteLine("  wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]");
 Console.WriteLine("  wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]");
 Console.WriteLine("Copy user-media.example.json → user-media.json (gitignored).");
