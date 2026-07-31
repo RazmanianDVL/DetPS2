@@ -8,83 +8,96 @@
 | **ISO** | `C:/Users/xxraz/Downloads/GodofWar(USA).iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w10` |
-| **Branch** | `agent/menu-gow-w10` |
+| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w11` |
+| **Branch** | `agent/menu-gow-w11` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **Wave-10 residual:** real 0x27DBF0 hang-escape + no 989snd stomp of LoadWad streamObj; GIF DMA tag builders (0x13F5xx) allowed; **MENU NO** — Soft-GS **px=0 gifPath3=0 FRAME_1=0** (Path3MaskedByVif held; shell decode→FRAME+PRIM wall) |
+| **Status** | **Wave-11 residual:** Fedo R_SHELL disasm + shell decode consumer seed + retail 0x27D7C8 restore; **MENU NO** — Soft-GS **px=0 gifPath3=0 FRAME_1=0** (Path3MaskedByVif held) |
 | **Last updated** | 2026-07-31 |
 
 ### MENU gate
 
 **first-gs-interactive** = Soft-GS **px>0 non-black** + pad interactive surface — **not** MK MAINMENU.
 
-### Wave-10 evidence (agent/menu-gow-w10)
+### Wave-11 evidence (agent/menu-gow-w11)
+
+#### Fedo / R_SHELL layout (disasm + ISO)
+
+- `R_SHELL.WAD` TOC size **0xBAA95** @ PART1 off **0x36ED10**
+- Magic LE **`0x4665646F`** ("odeF" bytes) + version u16 `"2","1"`
+- Hashed name table of shell entities: `goSKCDiveHit`, `goSKCflasher`, `goSKFkillB`, …
+- **No** raw A+D `FRAME(0x4C)` / `PRIM` in host buffer — gzip/zlib payloads embed later
+- Retail expand required before Soft-GS can paint
+
+#### LoadWad / decode consumer (SCUS_973.99)
+
+| Addr | Role |
+|------|------|
+| `0x1BBEE8` | thin LoadWad(`"R_Shell"`) → `0x1BB7E8` |
+| `0x1BB7E8` | walks wad contexts `*0x335280` (name at **+0**, flags **+0x68** bit0) |
+| `0x21E494` | first-load SM calls LoadWad with `a0=0x2AE550` |
+| `0x27DBF0` | stream-follow: loop `jal 0x27D7C8` while cursor &lt; `*(slot+0x170)` |
+| `0x27D7C8` | per-item **handle resolver** (not Fedo inflate) |
+| `0x13F40C` | GS dirty packer writes A+D **FRAME** when dirty bit `0x1000` |
+| `0x27C4xx` | worker cmd posters need `*0x2A3310≠0` + id table `0x322748` |
 
 #### Claim 100M (SEMA_STALL_YIELD OFF) — Soft-GS
 
 ```
-@100M: PC=0x17ED70 px=0 gifPath2=1082 gifPath3=0 dmac=28 spu2Samples=32552
-       cdvdSectors=1202 (full R_SHELL+TIT1 host × pre-type2)
-       type-2: force 0x27DBF0 @40.0M → hang-escape n=1 @40.55M → complete success
-               dbf0Esc=1 shellOk=True resWas=0 (no permanent soft-ok plant)
-       R_SHELL.WAD full 0xBAA95 @0x01E00000 Fedo magic 0x4665646F OK (pre-type2)
-       TIT1E1_2.VPK @0x01D00000; LoadWad bind seed shellOk=True *obj=0x100 magic
+@100M: px=0 prims=0 gifPath2=1082 gifPath3=0 dmac=28 spu2Samples=32552
+       cdvdSectors=1202 (full R_SHELL+TIT1 host)
+       type-2: fill pin + dbf0Seen + complete @~39.85M (no permanent soft-ok plant)
+       R_SHELL Fedo OK @0x01E00000; streamObj magic=0x100; *0x2A3310=1
+       wadCtx name-leading "R_Shell" @0x335280; retail 0x27D7C8 restored post-type2
        softgs-regs: FRAME_1=0 DISPFB1=0x800005090D0 SCISSOR full XYOFFSET=0 TEST=0
-       prims=0 fragTest=0 — Path2 setup only (no XYZ kick / no FRAME write)
-       *0x310384 posts after type-2: none (cmd stays 0; no invented type-3/4)
-       989snd done-magic: refused on streamObj/Fedo (pending paints real recv only)
-       threads all Started; final PC list-walk 0x17EDxx (not mid-pack 0x26C3A4)
+       prims=0 fragTest=0 — Path2 setup only (no XYZ / no FRAME write)
        Path3MaskedByVif + high-TADR END held
 ```
 
-Wave-10 assist changes:
+Wave-11 assist changes:
 
-1. **Disasm 0x26C3A4** = stream-work mid-pack **byte-copy** (not GIF). Size gate s0&lt;513; *obj is counter starting at magic 0x100, incremented by 0x26C478.
-2. **Stop rehoming 0x13F540..0x13F6A8** as thrash — retail GIF/VIF **DMA tag builder** (QWC patch + END 0x70000000). Prior "sleep-cmd" escape killed FRAME chain finalize.
-3. **Do not RefreshLoadWadStreamTable mid pack-producer** 0x26C150..0x26C470 (was resetting *obj counter → re-entry thrash).
-4. **Refuse 989snd done-magic** on LoadWad streamObj / host Fedo/TIT1 windows (w9b regress restored).
-5. **Real 0x27DBF0 force-entry** with a1/s6 status (not 0x27E234 with s6=0 which **skips** jal 0x27DBF0) + hang-escape after 50k → post-jal 0x27E258.
-6. **No invent type-3/4**; post-type2 SignalSema wake only. Retail posters at 0x27C4xx still never re-arm *0x310384.
-7. Path3MaskedByVif **held**.
+1. **Disasm Fedo + LoadWad** — documented layout; no invented PATH3/GIF/FRAME plant.
+2. **`TrySeedShellDecodeConsumer`** — `*0x2A3310=1`, id table `0x322748`, name-leading wad contexts at `0x335280` (`"R_Shell"` at +0, flags +0x68=1), host Fedo handles re-published.
+3. **`TryRestoreRetailStreamItemResolver`** — after type-2 complete, restore original `0x27D7C8` / `0x27DCC8` (soft-ok was hang-avoid only during type-2).
+4. **Rejected force PC→LoadWad** — claim1 jumped into streamObj/TIT1 (`pc=0x01CFE008`); hang-guard data-as-code → stream poll only.
+5. Path3MaskedByVif **held**. No invent type-3/4. No StartThread re-break.
 
 Rejected:
 
-- Force-post worker type-3/4 (w7 thrash).
-- Inventing PATH3 GIF packets / fake Soft-GS pixels / FRAME plant.
+- Inventing PATH3 GIF / fake Soft-GS pixels / FRAME plant.
 - Ungating Path3MaskedByVif.
-- Permanent soft-ok 0x27DBF0 at gate plant (skips real DMA arm).
-- Painting 989snd done-magic onto streamObj 0x01CFE000.
+- Force-post worker type-3/4.
+- Permanent soft-ok of `0x27DBF0`.
+- Force PC into LoadWad with incomplete queue consumer (data-as-code).
 
 ### How far
 
 | Milestone | Result |
 |-----------|--------|
 | Disc boot + ELF | **Yes** |
-| DualInfo / MOD_LOAD IRX | **Yes** (binds=10) |
-| CDVD IRX-only 142 | **Broken** → **cdvd=1202** |
-| Worker cmd type=2 soft-success | **Yes** (force dbf0 + hang-escape) |
-| PART1.PAK / TOC FILEIO open | **Yes** (pre+post type-2) |
-| R_SHELL Fedo host extract (full) | **Yes** (`shellOk=True`) |
-| LoadWad bind seed (*obj=0x100) | **Yes** (not stomped by 989snd) |
-| Real 0x27DBF0 entry + hang-escape | **Yes** (dbf0Esc=1) |
-| GIF DMA tag builders 0x13F5xx live | **Yes** (post-type2 PC samples) |
-| Post-type-2 *0x310384 next cmd | **No** (cmd=0 forever) |
-| **gifPath3** | **No** (gifPath2=1082) |
+| DualInfo / MOD_LOAD IRX | **Yes** |
+| CDVD past IRX-only | **Yes** (cdvd=1202) |
+| Worker type-2 success | **Yes** |
+| R_SHELL Fedo host extract | **Yes** (`shellOk=True`) |
+| streamObj magic 0x100 | **Yes** |
+| `*0x2A3310` stream-ready | **Yes** (w11) |
+| Wad ctx name-leading R_Shell | **Yes** (w11) |
+| Retail 0x27D7C8 restored post-type2 | **Yes** (w11) |
+| LoadWad natural expand → FRAME | **No** |
 | Soft-GS px>0 | **No** (FRAME_1=0, prims=0) |
 | Interactive title surface | **No** |
 
 ### Wall / next
 
-1. **Shell decode → FRAME+PRIM:** Fedo R_SHELL is compressed (no raw A+D FRAME in host buffer). Hang-escape leaves follow without full DMA graph arm. Need natural consumer past 0x27D7C8 / LoadWad('R_Shell') expand path.
-2. **Post-type-2 cmd posters** at 0x27C4xx..0x27C8xx (type 3/5/6/7) require empty queue + SignalSema — queue stays 0; main list-walk residual 0x17EDxx never reaches posters.
-3. **Path2 @ gifP2=1082:** DISPFB1 + SCISSOR set; **FRAME_1=0**, **TEST=0**, **XYOFFSET=0**, **prims=0** — setup only. Soft-GS cannot paint.
-4. Path3MaskedByVif held — do not ungate as MENU shortcut.
+1. **Natural LoadWad queue consumer** past `0x1BB0F8` ring (`*0x2ACC40`) so Fedo expand runs without PC force.
+2. **Display dirty bit 0x1000** so retail packer `0x13F40C` writes FRAME after shell objects exist.
+3. **PRIM+XYZ** after FRAME — Soft-GS cannot paint without prims (truth).
+4. Path3MaskedByVif held.
 
 ### Reproduce
 
 ```powershell
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w10
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w11
 $env:DETPS2_TRACE_BIOS='1'
-dotnet exec out/game-gow-w10/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
+dotnet exec out/game-gow-w11/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
 ```
