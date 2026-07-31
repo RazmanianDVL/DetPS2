@@ -1605,10 +1605,11 @@ public sealed class EmotionEngine : ISchedulable
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x3F) }); break;
             case 0x17: // DSRAV
                 if (rd != 0) SetGpr(rd, new Gpr128 { Lo = (ulong)((long)GetGpr(rt).Lo >> (int)(GetGpr(rs).Lo & 0x3F)) }); break;
-            case 0x28: // MFSA (R5900) — shift amount register; expose as 0 until full pipeline model
-                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = 0 });
+            case 0x28: // MFSA (R5900) — SA register (set by MTSAB/MTSAH/MTSA; consumed by QFSRV)
+                if (rd != 0) SetGpr(rd, new Gpr128 { Lo = _sa });
                 break;
-            case 0x29: // MTSA — accept writes as nop for now
+            case 0x29: // MTSA — write SA from rs (full width; MTSAB/MTSAH use REGIMM encoding)
+                _sa = (uint)GetGpr(rs).Lo;
                 break;
             case 0x24: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo & GetGpr(rt).Lo }); break;
             case 0x25: if (rd != 0) SetGpr(rd, new Gpr128 { Lo = GetGpr(rs).Lo | GetGpr(rt).Lo }); break;

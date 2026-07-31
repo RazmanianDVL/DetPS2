@@ -32,8 +32,13 @@ public sealed class SystemMemory
     public bool IsLikelyEeCode(ulong addr)
     {
         uint p = (uint)(addr & 0x1FFFFFFFUL);
-        // Commercial EE .text sits in low RDRAM; high ELF image is data/BSS/strings.
-        if (p < 0x00100000u || p >= 0x00580000u) return false;
+        // Low commercial .text: ~0x00100000–0x00580000. Packed high-VA CRT0/decompress
+        // (Haven SLUS_205.17 entry 0x01000008 PT_LOAD @0x01000000) is also live code —
+        // not data/BSS — so include 0x01000000–0x01800000. Reject the mid-RDRAM hole
+        // (heaps / buffers) between those bands.
+        bool inLowText = p is >= 0x00100000u and < 0x00580000u;
+        bool inHighPackedElf = p is >= 0x01000000u and < 0x01800000u;
+        if (!inLowText && !inHighPackedElf) return false;
         if ((p & 3u) != 0) return false;
         return WordLooksLikeInsn(Read32(p)) && WordLooksLikeInsn(Read32(p + 4));
     }
@@ -56,8 +61,10 @@ public sealed class SystemMemory
         if (primary == 1) // REGIMM — only known rt sub-ops
         {
             uint rt = (op >> 16) & 0x1F;
+            // 0x00-0x03 / 0x10-0x13 branches; 0x08-0x0E traps; 0x18 MTSAB / 0x19 MTSAH.
             return rt is 0 or 1 or 2 or 3 or 8 or 9 or 10 or 11 or 12 or 14
-                or 16 or 17 or 18 or 19;
+                or 16 or 17 or 18 or 19
+                or 24 or 25;
         }
         // Common R5900 primary opcodes (SPECIAL/J/branches/ALU/COP/loads/stores/MMI).
         // Include 62/63 (LQ/SQ and LD/SD family used heavily in EE prologs: sd s0,0(sp)).
@@ -512,6 +519,27 @@ public sealed class SystemMemory
 
     public void LoadBinary(ReadOnlySpan<byte> data, ulong vaddr)
     {
+        // Fast path: contiguous RDRAM (incl. high-VA commercial ELFs @ 0x01xxxxxx after
+        // KSEG strip). Byte-loop Write8 is correct but ~2.5MiB×call for Haven-class PT_LOAD.
+        ulong paddr = TranslateAddress(vaddr);
+        if (paddr < (ulong)RDRAM_SIZE && paddr + (ulong)data.Length <= (ulong)RDRAM_SIZE
+            && !((vaddr & 0xFFFFFFFFUL) is >= SPR_BASE and < SPR_BASE + (ulong)SPR_SIZE))
+        {
+            if (ProtectKernelVectors && paddr < 0x300)
+            {
+                for (int i = 0; i < data.Length; i++)
+                {
+                    ulong a = paddr + (ulong)i;
+                    if (a < 0x300) continue;
+                    if (a >= (ulong)RDRAM_SIZE) break;
+                    _rdram[a] = data[i];
+                }
+                return;
+            }
+            data.CopyTo(_rdram.AsSpan((int)paddr, data.Length));
+            return;
+        }
+
         for (int i = 0; i < data.Length; i++)
             Write8(vaddr + (ulong)i, data[i]);
     }

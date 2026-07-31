@@ -26,16 +26,25 @@ namespace DetPS2.Core;
 /// </para>
 ///
 /// <para>
+/// <b>Haven boot geometry:</b> retail ELF is a single high-VA PT_LOAD at <c>0x01000000</c>
+/// (entry <c>0x01000008</c>, ~2.5 MiB packed). Diagnose @20M still sits in the CRT0 bit-stream
+/// decompress loop at <c>0x010003F0</c> (syscalls=0) — that is cycle budget, not a TLB/map miss:
+/// RDRAM is 32 MiB and <c>TranslateAddress</c> identity-maps kuseg. Decompress finishes ~80–85M;
+/// @100M: PC soft-float band, px=3, gifP3=2, full SYS250 (binds=12, cdvd=77).
+/// </para>
+///
+/// <para>
 /// <b>Haven residual (#21 — first FILEIO / game-data open):</b> after the IRX stack the EE
 /// burns ≥150M cycles in multi-precision soft-float at <c>0x00351xxx–0x00352xxx</c>
 /// (multi-prec body <c>0x00352660</c>, callers <c>0x00345C30</c> / <c>0x00343328</c>,
-/// outerRa live <c>0x00345Dxx</c>). INTC_STAT already sticky bit2|3 (<c>0xC</c>); Vb poll
-/// at <c>0x00331650</c> is secondary. No <c>sceSifBindRpc(FILEIO 0x80000001)</c>, no
-/// <c>DLL.DAT</c>/<c>DATA/</c> path string in RDRAM. Title-local epi/double-pop thrash
-/// escapes re-enter more soft-float and do not unlock FILEIO — next work is shared EE
-/// soft-float fidelity or a proven outer-game resume (PINE), not more stack invent.
-/// Haven-only: keep VBlankStart sticky + repair poll base if mid-function re-home.
-/// Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c> (NuFile / Traveller's Tales).
+/// outerRa live <c>0x00345Dxx</c>; libm-class poly / range-reduce on doubles — EE has no
+/// hardware double FPU). Rodata doubles at <c>0x00614640+</c> (π etc.) are live post-decompress.
+/// INTC_STAT already sticky bit2|3 (<c>0xC</c>); Vb poll at <c>0x00331650</c> is secondary.
+/// No <c>sceSifBindRpc(FILEIO 0x80000001)</c>, no <c>DLL.DAT</c>/<c>DATA/</c> path string in
+/// RDRAM. Title-local epi/double-pop thrash escapes re-enter more soft-float and do not unlock
+/// FILEIO — next work is shared EE soft-float fidelity or a proven outer-game resume (PINE),
+/// not more stack invent. Haven-only: keep VBlankStart sticky + repair poll base if mid-function
+/// re-home. Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c> (NuFile / TT).
 /// </para>
 ///
 /// <para>

@@ -881,6 +881,7 @@ public static class SmokeTests
             Ee_Mmi_PandPor();
             Ee_UnalignedLoadStore_Lwl_Lwr_Swl_Swr_Ldl_Ldr_Sdl_Sdr();
             Ee_Mtsab_Qfsrv_MatchesPlayReference();
+            Ee_MfsaMtsa_And_HighVaLikelyCode();
             BusContention_ScalesEeBudget();
             DeterministicFloat_CanonicalNaN();
             Scheduler_PerfBaseline();
@@ -1891,6 +1892,39 @@ public static class SmokeTests
             throw new Exception($"QFSRV SA=16: expected Lo=0x{expLo2:X16} Hi=0x{expHi2:X16}, got Lo=0x{r2.Lo:X16} Hi=0x{r2.Hi:X16}");
 
         Console.WriteLine("[Smoke] Ee_Mtsab_Qfsrv_MatchesPlayReference OK");
+    }
+
+    /// <summary>
+    /// SPECIAL MFSA/MTSA must share the same SA register MTSAB/MTSAH write and QFSRV reads.
+    /// Previously MFSA always returned 0 and MTSA was a nop. Also asserts IsLikelyEeCode
+    /// accepts high-VA packed ELF CRT0 (Haven PT_LOAD @ 0x01000000) for rescue re-home.
+    /// </summary>
+    public static void Ee_MfsaMtsa_And_HighVaLikelyCode()
+    {
+        static uint Special(uint rs, uint rt, uint rd, uint sa, uint func) =>
+            (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | func;
+
+        var sys = new Ps2System();
+        uint pc = 0x9100;
+        sys.EE.SetGpr(8, new EmotionEngine.Gpr128 { Lo = 0x30 }); // 48 bits
+        sys.Memory.Write32(pc, Special(8, 0, 0, 0, 0x29));     // mtsa t0
+        sys.Memory.Write32(pc + 4, Special(0, 0, 9, 0, 0x28)); // mfsa t1
+        sys.Memory.Write32(pc + 8, 0);
+        sys.EE.PC = pc;
+        sys.EE.Step(2);
+        if (sys.EE.GetGpr(9).Lo != 0x30)
+            throw new Exception($"MFSA after MTSA: expected SA=0x30, got 0x{sys.EE.GetGpr(9).Lo:X}");
+
+        sys.Memory.Write32(0x01000008, 0x3C1D01FF); // lui sp, 0x01FF
+        sys.Memory.Write32(0x0100000C, 0x27BDFFD0); // addiu sp, sp, -48
+        if (!sys.Memory.IsLikelyEeCode(0x01000008))
+            throw new Exception("IsLikelyEeCode should accept high-VA packed ELF CRT0 @ 0x01000008");
+        sys.Memory.Write32(0x00800000, 0x3C1D01FF);
+        sys.Memory.Write32(0x00800004, 0x27BDFFD0);
+        if (sys.Memory.IsLikelyEeCode(0x00800000))
+            throw new Exception("IsLikelyEeCode must reject mid-RDRAM hole @ 0x00800000");
+
+        Console.WriteLine("[Smoke] Ee_MfsaMtsa_And_HighVaLikelyCode OK");
     }
 
     public static void BusContention_ScalesEeBudget()
