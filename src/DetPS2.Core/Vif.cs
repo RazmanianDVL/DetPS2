@@ -33,6 +33,7 @@ public sealed class Vif : ISchedulable
     private Gif? _gif;
     /// <summary>Remaining QWs expected by DIRECT/DIRECTHL (PATH2 → GIF).</summary>
     private uint _directRemaining;
+    private int _path2TraceLeft = 8;
 
     public ulong CommandsProcessed { get; private set; }
     public ulong UnpackWords { get; private set; }
@@ -78,6 +79,7 @@ public sealed class Vif : ISchedulable
         _unpackDest = 0;
         _unpackVnVl = 0;
         _directRemaining = 0;
+        _path2TraceLeft = 8;
     }
 
     public int Step(ulong maxCycles)
@@ -143,8 +145,27 @@ public sealed class Vif : ISchedulable
                 break;
             case CmdDirect:
             case CmdDirectHl:
-                // IMM = number of QWs to forward to GIF PATH2 (0 means 65536)
+                // IMM = number of QWs to forward to GIF PATH2 (0 means 65536).
+                // A new DIRECT supersedes any unfinished prior DIRECT / GIF mid-packet so
+                // truncated garbage (wrong IMM or non-GIF payload) cannot sticky-swallow
+                // later real PACKED A+D setup (WAVE-11C GoW Path2 residual).
+                if (_directRemaining > 0 || (_gif?.PacketInFlight ?? false))
+                {
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1")
+                    {
+                        Console.Error.WriteLine(
+                            $"[VIF] DIRECT supersede prevRem={_directRemaining} " +
+                            $"gifInFlight={_gif?.PacketInFlight} code=0x{code:X8}");
+                    }
+                    _directRemaining = 0;
+                    _gif?.AbortIncompletePacket("new-DIRECT");
+                }
                 _directRemaining = imm == 0 ? 65536u : imm;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1")
+                {
+                    Console.Error.WriteLine(
+                        $"[VIF] DIRECT/HL imm={_directRemaining} code=0x{code:X8}");
+                }
                 break;
             default:
                 if (cmd >= 0x60 && cmd <= 0x6F)
@@ -221,18 +242,49 @@ public sealed class Vif : ISchedulable
         uint i = 0;
         while (i < wordCount)
         {
-            // DIRECT/DIRECTHL: next N QWs go to GIF PATH2 as a contiguous packet
+            // DIRECT/DIRECTHL: next N QWs go to GIF PATH2 as a contiguous packet.
+            // ps2tek: data is the *following QWs* after the DIRECT code — residual words
+            // in the same QW as the DIRECT command are padding, not GIF. Starting Path2
+            // mid-QW (e.g. after 3 command words → addr&0xF==0xC) misparses the first
+            // GIFtag (GoW residual: flg=IMAGE nloop=20586 at 0x…BE8C, FRAME never seen).
             if (_directRemaining > 0 && _gif != null)
             {
+                uint byteAddr = address + i * 4;
+                uint misalign = byteAddr & 15u;
+                if (misalign != 0)
+                {
+                    // Skip pad words to the next 16-byte boundary; do not debit DIRECT QWC.
+                    uint padWords = (16u - misalign) / 4u;
+                    uint skip = Math.Min(padWords, wordCount - i);
+                    i += skip;
+                    continue;
+                }
                 uint qws = Math.Min(_directRemaining, (wordCount - i) / 4);
                 if (qws > 0)
                 {
-                    _gif.ReceivePath2Data(address + i * 4, qws);
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1"
+                        && _path2TraceLeft > 0)
+                    {
+                        _path2TraceLeft--;
+                        uint w0 = _memory.Read32(byteAddr);
+                        uint w1 = _memory.Read32(byteAddr + 4);
+                        uint w2 = _memory.Read32(byteAddr + 8);
+                        uint w3 = _memory.Read32(byteAddr + 12);
+                        Console.Error.WriteLine(
+                            $"[VIF] Path2 feed addr=0x{byteAddr:X8} qws={qws} remDirect={_directRemaining} " +
+                            $"qw0={w0:X8}_{w1:X8}_{w2:X8}_{w3:X8}");
+                    }
+                    _gif.ReceivePath2Data(byteAddr, qws);
                     _directRemaining -= qws;
                     i += qws * 4;
+                    // DIRECT exhausted: if GIF still mid-packet the stream was truncated —
+                    // drop sticky so the next DIRECT's GIFtag is not treated as body data.
+                    if (_directRemaining == 0 && (_gif?.PacketInFlight ?? false))
+                        _gif.AbortIncompletePacket("DIRECT-end-truncated");
                     continue;
                 }
-                // Partial QW left — fall through word-by-word (shouldn't happen for aligned DMA)
+                // Partial QW left — wait for more words on next ProcessStream
+                break;
             }
 
             uint w = _memory.Read32(address + i * 4);

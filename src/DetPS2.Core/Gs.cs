@@ -76,6 +76,24 @@ public sealed class Gs : ISchedulable
     public long FragmentsRejectedBounds { get; private set; }
     /// <summary>Fragments rejected by SCISSOR_1.</summary>
     public long FragmentsRejectedScissor { get; private set; }
+    /// <summary>Total GIF/path register writes (Soft-GS truth histogram input).</summary>
+    public long RegWritesTotal { get; private set; }
+    /// <summary>Writes to PRIM (0x00), including PRE from GIFtag.</summary>
+    public long RegWritesPrim { get; private set; }
+    /// <summary>XYZ2 kick (0x05) writes.</summary>
+    public long RegWritesXyz2 { get; private set; }
+    /// <summary>XYZ3 no-kick (0x0D) writes.</summary>
+    public long RegWritesXyz3 { get; private set; }
+    /// <summary>XYZF2 kick (0x04) writes.</summary>
+    public long RegWritesXyzf2 { get; private set; }
+    /// <summary>FRAME_1 (0x4C) writes — required for commercial draw target.</summary>
+    public long RegWritesFrame { get; private set; }
+    /// <summary>SCISSOR_1 (0x40) writes.</summary>
+    public long RegWritesScissor { get; private set; }
+    /// <summary>TEST_1 (0x47) writes (ATE/AFAIL/ZTE).</summary>
+    public long RegWritesTest { get; private set; }
+    /// <summary>XYOFFSET_1 (0x18) writes.</summary>
+    public long RegWritesXyoffset { get; private set; }
     private bool _localMemHasImage;
 
     public struct Vertex
@@ -113,6 +131,8 @@ public sealed class Gs : ISchedulable
         DispfbPixelsComposited = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
+        RegWritesTotal = RegWritesPrim = RegWritesXyz2 = RegWritesXyz3 = RegWritesXyzf2 = 0;
+        RegWritesFrame = RegWritesScissor = RegWritesTest = RegWritesXyoffset = 0;
         _lastCompositeImageBytes = 0;
         _localMemHasImage = false;
         _currentPrim = 0;
@@ -243,6 +263,18 @@ public sealed class Gs : ISchedulable
     public void WriteGsRegister(uint reg, ulong value)
     {
         reg &= 0x7F;
+        RegWritesTotal++;
+        switch (reg)
+        {
+            case 0x00: RegWritesPrim++; break;
+            case 0x04: RegWritesXyzf2++; break;
+            case 0x05: RegWritesXyz2++; break;
+            case 0x0D: RegWritesXyz3++; break;
+            case 0x18: RegWritesXyoffset++; break;
+            case 0x40: RegWritesScissor++; break;
+            case 0x47: RegWritesTest++; break;
+            case 0x4C: RegWritesFrame++; break;
+        }
         Registers.WriteRegister64(reg, value);
         OnRegisterWrite(reg, value);
     }
