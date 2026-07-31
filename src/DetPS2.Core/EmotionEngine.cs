@@ -1626,6 +1626,23 @@ public sealed class EmotionEngine : ISchedulable
             static bool LooksLikeShiftedByte(ulong x) => x != 0 && (x & 0x00FFFFFFUL) == 0;
             if (LooksLikeShiftedByte(a) || LooksLikeShiftedByte(b))
                 return;
+            // NULL-terminated list walks: `lw rs, off(base); bne rs, zero, loop` (also
+            // `bne zero, rs`). Next-node pointers in RDRAM have |ptr-0| >> 50k, so the
+            // dist snap forced ptr→0 after the first node — Midway type registry install
+            // (0x1AB810) returned -1 for every id after the head (live Dec SLUS_208.81
+            // type 0x510 / 0x1F factory @ ~188M). Refuse only when the prior instruction
+            // is a load into the compared register — pure countdown loops use addiu -1,
+            // not lw, so Midway software delays still snap.
+            if (rt == 0 || rs == 0)
+            {
+                uint ptrReg = rt == 0 ? rs : rt;
+                uint prev = _memory.Read32((uint)(PC - 4));
+                uint prevOp = prev >> 26;
+                uint prevRt = (prev >> 16) & 0x1F;
+                // lw=0x23, lwu=0x27, ld=0x37
+                if ((prevOp is 0x23 or 0x27 or 0x37) && prevRt == ptrReg)
+                    return;
+            }
             // memcpy/memset unaligned tails commonly do:
             //   addiu a2, a2, -1; lbu; sb; bne a2, -1, loop
             // with the sentinel held as 0xFFFFFFFFFFFFFFFF. |len - (-1)| is always

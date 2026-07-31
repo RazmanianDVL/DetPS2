@@ -55,7 +55,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     //   → CRT Exit(0) @ ~188M BEFORE any EE CallRpc member .ssf open.
     // Soft-success fail-tails so main can leave CRT Exit and reach game loop @0x1237F0
     // without force-completing DA wait status=4. TITLE_LOCAL Dec only.
-    // Root poison: type id 0x510 factory 0x1D5270→0x1AB810 returns -1 @0x1D97D4.
+    //
+    // Root cause of type 0x510 / 0x1F factory -1 (FIXED in EmotionEngine SHARED):
+    //   0x1AB810 list walk `lw v1,48(v1); bne v1,zero,loop` was snapped by
+    //   MaybeFastForwardCountdown (ptr |dist|>>50k → force v1=0) so install
+    //   never saw nodes past the head. Post-fix live: 0x1D5270→0x1AB810 for
+    //   id 0x510 returns v0=0x60 node=0x1FB3E60 (was -1). Plants below remain
+    //   as belt-and-suspenders for residual gate tails.
     private const uint DecSysInitBandLo = 0x001D8120;
     private const uint DecSysInitBandHi = 0x001D8290;
 
