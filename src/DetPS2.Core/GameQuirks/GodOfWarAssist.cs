@@ -102,6 +102,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// <summary>Empty-SIF soft-return to SIF-cmd poll caller 0x2948xx count (wave-3).</summary>
     private int _emptySifPollLoops;
     private int _sifPollCallerEscapes;
+    /// <summary>Wave-4: explicit SwitchTo worker after SignalSema (pending cmd / dead main).</summary>
+    private int _workerYields;
+    private ulong _lastWorkerYieldCyc;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -226,11 +229,21 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _alignZeroEscapes = 0;
         _emptySifPollLoops = 0;
         _sifPollCallerEscapes = 0;
+        _workerYields = 0;
+        _lastWorkerYieldCyc = 0;
+        _postWorkerCopyEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
         _heapDefaultsPlanted = false;
         _arenaBump = HeapArenaBase;
     }
+
+    /// <summary>Worker thread entry (CreateThread lastCreatedThread.entry live tip).</summary>
+    public const uint WorkerThreadEntry = 0x0027CBD0;
+    /// <summary>Worker post-WaitSema body (load cmd type) — only valid on the worker thread.</summary>
+    public const uint WorkerPostWait = 0x0027CC08;
+    /// <summary>Worker cmd type word at <c>*(0x310380+4)</c> (s1+0x380+4 with s1=0x310000).</summary>
+    public const uint WorkerCmdTypePtr = 0x00310384;
 
     public void OnDiscMounted(Ps2System sys)
     {
@@ -384,6 +397,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // it). Wave-2: also force-leave CRT0/BSS re-entry after IRX progress — AdEL rescue
         // to 0x00100008 then spin at 0x00100140 froze claim metrics (gifPath3 path lost).
         // Gate on cdvd progress so early boot CRT0 is not skipped (RPC 81 vs 153).
+        // Wave-4: after CDVD prefer SwitchTo worker over PC-stomp 0x27CC08.
         uint pcPhysEarly = pc & 0x1FFFFFFFu;
         bool crt0Reentry = pcPhysEarly is >= 0x00100000 and <= 0x00100200
             && (sys.Cdvd.SectorsRead > 0 || c >= 40_000_000);
@@ -393,23 +407,30 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             || crt0Reentry;
         if (c >= 35_000_000 && sys.Gs.PixelsWritten == 0 && dataPc)
         {
-            uint resume = PickSafeResume(sys,
-                sys.Cdvd.SectorsRead > 0 ? 0x0027CC08u : 0x0026C0ECu);
-            sys.Memory.Write32(0x002A1338, 0);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            if (sys.Cdvd.SectorsRead > 0 && TryYieldToPendingWorker(sys, pc, c))
             {
-                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
-            });
-            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
-            if (crt0Reentry)
-                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-            sys.EE.PC = resume;
-            sys.EE.COP0_Status &= ~0x6u;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (c % 5_000_000) < 50_000)
-                Console.Error.WriteLine(
-                    $"[GOW] early data-PC rescue pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
-            pc = resume;
+                pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+            }
+            else
+            {
+                uint resume = PickSafeResume(sys,
+                    sys.Cdvd.SectorsRead > 0 ? 0x00185FACu : 0x0026C0ECu);
+                sys.Memory.Write32(0x002A1338, 0);
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                {
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+                });
+                sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
+                if (crt0Reentry)
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (c % 5_000_000) < 50_000)
+                    Console.Error.WriteLine(
+                        $"[GOW] early data-PC rescue pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+                pc = resume;
+            }
         }
 
         // Table-index walk 0x155AB0: zero/poison step → infinite t4 < limit at 0x155B84.
@@ -418,26 +439,30 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeTableIndexWalk(sys, pc, c);
 
         // Wave-2 residual after table-index leave: PC=0x156324 thrash for 40M–100M (claim100c:
-        // dmac=93 binds=10 gifPath3=0, no more GOW escape logs). Soft-return via $ra / worker.
+        // dmac=93 binds=10 gifPath3=0, no more GOW escape logs). Soft-return via $ra / worker yield.
         if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && pc is >= 0x00155BA0 and <= 0x00156400)
         {
-            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            uint resume = PickSafeResume(sys, 0x0027CC08);
-            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
-                && ra is not (>= 0x00155AB0 and <= 0x00156400)
-                && ra is not (>= 0x00100000 and <= 0x00100200))
-                resume = ra;
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            if (!TryYieldToPendingWorker(sys, pc, c))
             {
-                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
-            });
-            sys.EE.PC = resume;
-            sys.EE.COP0_Status &= ~0x6u;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (c % 5_000_000) < 50_000)
-                Console.Error.WriteLine(
-                    $"[GOW] escape post-table residual pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint resume = PickSafeResume(sys, 0x00185FAC);
+                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                    && ra is not (>= 0x00155AB0 and <= 0x00156400)
+                    && ra is not (>= 0x00100000 and <= 0x00100200)
+                    && ra is not (>= 0x0027CC00 and <= 0x0027CE90))
+                    resume = ra;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                {
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+                });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (c % 5_000_000) < 50_000)
+                    Console.Error.WriteLine(
+                        $"[GOW] escape post-table residual pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+            }
         }
 
         // Byte-sum loop 0x1390F8 with huge length after table-index leave.
@@ -663,8 +688,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 uint resume = ra;
                 if (!sys.Memory.IsLikelyEeCode(resume) || resume is < 0x00100000 or >= 0x00280000
                     || resume is (>= 0x0013DC00 and <= 0x0013E200)
-                    || resume is (>= 0x0015F2C0 and <= 0x0015FB00))
-                    resume = PickSafeResume(sys, 0x0027CC08);
+                    || resume is (>= 0x0015F2C0 and <= 0x0015FB00)
+                    || resume is (>= 0x0027CC00 and <= 0x0027CE90))
+                    resume = PickSafeResume(sys, 0x00185FAC);
                 // Return a small in-RDRAM block instead of NULL — callers often store without
                 // null-check and then OOB-fault (live object-init s0=0).
                 uint block = AllocArenaBlock(sys, 0x100);
@@ -699,6 +725,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Sibling list-compare walk at 0x2847xx (profiler hot after stubs).
         if (c >= 38_000_000 && pc is >= 0x00284780 and <= 0x002848B0)
             TryEscapeListCompareWalk(sys, pc, c);
+
+        // Wave-4: pending worker cmd @ *0x310384 (live type=2 @45M) while worker sleeps on
+        // WaitSema(32). SignalSema alone leaves Sleeping=false but EE stays on zombie main
+        // (Started=false Entry=0) or empty-SIF poll — soft-return PC-stomp to 0x27CC08 on the
+        // wrong thread poisons SP (sp=0xFFFFFF20) and freezes gifPath3. SwitchTo the real
+        // worker thread so the jump-table dispatch runs with s1/s3/s4 + stack.
+        if (c >= 38_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && sys.Gif.Path3Transfers == 0)
+            TryYieldToPendingWorker(sys, pc, c);
+
+        // Wave-4 post-worker residual (claim100c PC=0x26BF78): byte-copy
+        // while (a1 < s1) *0x305640+a1 = *(a3+a1). Huge s1 burns 10M+ cycles after cmd
+        // type=2 cleared *0x310384 to 0xFFFFFFFF. Also 0x26BFB0 infinite hang on size>512.
+        if (c >= 50_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x0026BF50 and <= 0x0026BFC8)
+            TryEscapePostWorkerCopy(sys, pc, c);
 
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
         // re-escape empty/corrupt list walks, wake peers, and inject pad so world/UI path
@@ -1220,15 +1262,146 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             return lg;
 
         // Prefer stream poll entry (0x26C0E0) after CDVD — post-FreezeCache re-entry without
-        // full s1/s2 frame re-faults. Worker dispatch 0x27CC08 is a solid alternate.
+        // full s1/s2 frame re-faults. Wave-4: do NOT return worker mid-body 0x27CC08 here —
+        // that PC is only valid after SwitchTo the worker thread (TryYieldToPendingWorker).
         if (sys.Cdvd.SectorsRead > 0 && sys.Memory.IsLikelyEeCode(0x0026C0E0UL))
             return 0x0026C0E0;
-        if (sys.Memory.IsLikelyEeCode(0x0027CC08UL))
-            return 0x0027CC08;
         // 0x185FAC is post-FreezeCache continue (real code at boot); prefer over CRT0.
         if (sys.Memory.IsLikelyEeCode(0x00185FACUL))
             return 0x00185FAC;
         return 0x0026C0E0;
+    }
+
+    private int _postWorkerCopyEscapes;
+
+    /// <summary>
+    /// Wave-4: after worker clears cmd queue (*0x310384=0xFFFFFFFF), EE lands in a
+    /// memcpy-like loop at 0x26BF60 (s1 length) or hangs at 0x26BFB0 when size≥513.
+    /// Soft-complete so stream/989snd/PATH3 path can continue.
+    /// </summary>
+    private void TryEscapePostWorkerCopy(Ps2System sys, uint pc, ulong c)
+    {
+        if (_postWorkerCopyEscapes >= 256) return;
+
+        // Infinite hang: jal printf then spin at 0x26BFB0.
+        if (pc is >= 0x0026BFB0 and <= 0x0026BFC8)
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            uint resume = 0x0026C0EC;
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x0026BF50 and <= 0x0026C200))
+                resume = ra;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+            _postWorkerCopyEscapes++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _postWorkerCopyEscapes <= 16)
+                Console.Error.WriteLine(
+                    $"[GOW] escape post-worker hang pc=0x{pc:X8} -> 0x{resume:X8} " +
+                    $"n={_postWorkerCopyEscapes} cyc={c}");
+            return;
+        }
+
+        // Byte-copy loop 0x26BF60..0x26BF80: a1 cursor, s1 length.
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint s1 = (uint)sys.EE.GetGpr(17).Lo;
+        bool huge = s1 > 0x4000u; // >16 KiB pure EE byte walk after IRX
+        bool mid = pc is >= 0x0026BF60 and <= 0x0026BF80;
+        if (!mid && !huge) return;
+        if (!huge && mid && a1 < s1 && s1 <= 0x4000u && a1 + 64 < s1)
+        {
+            // Accelerate medium copies: jump near end.
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = s1 });
+            sys.EE.PC = 0x0026BF84; // fall through to 0x26C008 path
+            sys.EE.COP0_Status &= ~0x6u;
+            _postWorkerCopyEscapes++;
+            return;
+        }
+        if (!huge && !mid) return;
+
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = s1 == 0 ? a1 : s1 }); // a1 = end
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = 0x0026BF84;
+        sys.EE.COP0_Status &= ~0x6u;
+        _postWorkerCopyEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _postWorkerCopyEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[GOW] escape post-worker copy pc=0x{pc:X8} a1=0x{a1:X8} s1=0x{s1:X8} " +
+                $"-> 0x26BF84 n={_postWorkerCopyEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Wave-4: run the 0x27CBD0 worker on its own thread when a command is queued.
+    /// Live residual (agent/menu-gow-w3 claim100): <c>*0x310384 == 2</c> (valid cmd after
+    /// <c>type-2</c> index 0 → jal 0x2803C0) while worker Sleeps WaitSema(32) and current
+    /// EE is zombie main (Started=false) or empty-SIF poll. Soft-return to <c>0x27CC08</c>
+    /// on the wrong thread poisons SP and never takes the jump table. SignalSema only clears
+    /// Sleeping — must <see cref="KernelState.RestoreContext"/> the worker.
+    /// </summary>
+    private bool TryYieldToPendingWorker(Ps2System sys, uint pc, ulong c)
+    {
+        var k = sys.Hle?.Kernel;
+        if (k == null) return false;
+        if (_workerYields >= 128) return false;
+
+        uint cmdType = sys.Memory.Read32(WorkerCmdTypePtr);
+        // Worker: v0 = *type; v0 -= 2; if (v0 >= 99) idle. Valid service: type in [2, 100].
+        bool cmdPending = cmdType is >= 2 and <= 100;
+
+        KernelState.Thread? worker = null;
+        foreach (var t in k.AllThreads)
+        {
+            if (t.Alive && t.Entry == WorkerThreadEntry)
+            {
+                worker = t;
+                break;
+            }
+        }
+        if (worker == null) return false;
+
+        // Already on worker body/handlers: never force a context switch.
+        if (k.CurrentThreadId == worker.Id)
+        {
+            if (worker.Sleeping && worker.WaitSemaId is > 0 and <= 256)
+            {
+                try { k.SignalSema(worker.WaitSemaId); } catch { /* ignore */ }
+            }
+            return false;
+        }
+
+        // Mid-dispatch on any tid: leave it alone (rewinding via RestoreContext kills progress).
+        if (pc is >= 0x0027CBD0 and <= 0x00282000)
+            return false;
+
+        if (!cmdPending || !worker.Started || !worker.Sleeping)
+            return false;
+        if (worker.WaitSemaId is < 1 or > 256)
+            return false;
+        if (c - _lastWorkerYieldCyc < 500_000UL)
+            return false;
+
+        try
+        {
+            int sid = worker.WaitSemaId;
+            k.SignalSema(sid);
+            // Cooperative yield only — RestoreContext rewinds SavedPc to WaitSema and
+            // re-enters with partial s1/s3/s4 (cmd stuck at type=2 forever). Let the next
+            // WaitSema/SwitchToNext on the current thread hand off naturally.
+            bool yielded = k.TryYieldToOtherRunnable(sys.EE);
+            _workerYields++;
+            _lastWorkerYieldCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _workerYields <= 32)
+                Console.Error.WriteLine(
+                    $"[GOW] signal-worker tid={worker.Id} cmd={cmdType} sema={sid} " +
+                    $"yielded={yielded} fromPc=0x{pc:X8} toPc=0x{(uint)sys.EE.PC:X8} " +
+                    $"n={_workerYields} cyc={c}");
+            return yielded;
+        }
+        catch { /* ignore */ }
+        return false;
     }
 
     /// <summary>
@@ -1243,6 +1416,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _lastWorldKickCyc = c;
         if (_worldKickPulses >= 768) return;
         _worldKickPulses++;
+
+        // Wave-4: prefer real worker SwitchTo before empty-SIF soft-return thrash.
+        if (sys.Gs.PixelsWritten == 0 && sys.Gif.Path3Transfers == 0)
+            TryYieldToPendingWorker(sys, pc, c);
 
         AdvanceSoftTick(sys, minTarget: 0);
         sys.Memory.Write32(SoftSpinFlagPtr, 0);
@@ -1395,23 +1572,23 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (badBand && sys.Gs.PixelsWritten == 0
             && (!crt0Band || sys.Cdvd.SectorsRead > 0 || c >= 40_000_000))
         {
-            // Prefer worker dispatch (gifPath3 residual path @0x27CC) after IRX.
-            uint resume = PickSafeResume(sys,
-                sys.Cdvd.SectorsRead > 0 && sys.Memory.IsLikelyEeCode(0x0027CC08UL)
-                    ? 0x0027CC08u
-                    : 0x0026C0ECu);
-            sys.Memory.Write32(0x002A1338, 0); // stream ready
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            // Wave-4: SwitchTo real worker after IRX; never PC-stomp 0x27CC08 on wrong thread.
+            if (!(sys.Cdvd.SectorsRead > 0 && TryYieldToPendingWorker(sys, pc, c)))
             {
-                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
-            });
-            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-            sys.EE.PC = resume;
-            sys.EE.COP0_Status &= ~0x6u;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (_worldKickPulses % 8) == 0)
-                Console.Error.WriteLine(
-                    $"[GOW] rescue bad band pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+                uint resume = PickSafeResume(sys, 0x0026C0ECu);
+                sys.Memory.Write32(0x002A1338, 0); // stream ready
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                {
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+                });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_worldKickPulses % 8) == 0)
+                    Console.Error.WriteLine(
+                        $"[GOW] rescue bad band pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
+            }
         }
 
         // After CDVD + many kicks still px=0: keep stream ready + IRQ credits.
@@ -1739,25 +1916,27 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"[GOW] escape 0x21FFxx thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
-        // Wave-3: SIF-cmd poll caller 0x2948xx re-WaitSema forever after empty-sif soft-return
-        // (claim100e: PC=0x293C68 ra=0x294810 left=True arms=0). Leave toward worker 0x27CC08
-        // (historical first gifPath3 residual @0x27CC18) once poll loops are proven empty.
+        // Wave-3/4: SIF-cmd poll caller 0x2948xx re-WaitSema forever after empty-sif soft-return.
+        // Wave-4: do NOT PC-stomp to 0x27CC08 on this thread — SwitchTo the real worker instead.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && sys.Gif.Path3Transfers == 0
             && _emptySifPollLoops >= 4
             && pc is >= 0x00294800 and <= 0x00294900
             && (_worldKickPulses % 2) == 0)
         {
-            uint resume = PickSafeResume(sys, 0x0027CC08);
             TryArmPendingStreamJob(sys, c);
             sys.Memory.Write32(0x002A1338, 0);
             sys.Memory.Write32(0x0029C7D0, 0);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 3UL });
-            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-            sys.EE.PC = resume;
-            sys.EE.COP0_Status &= ~0x6u;
             _sifPollCallerEscapes++;
-            if (k != null)
+            if (TryYieldToPendingWorker(sys, pc, c))
+            {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _sifPollCallerEscapes <= 32)
+                    Console.Error.WriteLine(
+                        $"[GOW] escape SIF-poll via worker yield loops={_emptySifPollLoops} " +
+                        $"n={_sifPollCallerEscapes} cyc={c}");
+            }
+            else if (k != null)
             {
                 foreach (var t in k.AllThreads)
                 {
@@ -1769,12 +1948,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     else if (t.WaitSemaId == 0 && !t.WaitVblank)
                         try { k.WakeupThread(t.Id); } catch { /* ignore */ }
                 }
+                try { k.TryYieldToOtherRunnable(sys.EE); } catch { /* ignore */ }
             }
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && _sifPollCallerEscapes <= 32)
-                Console.Error.WriteLine(
-                    $"[GOW] escape SIF-poll caller pc=0x{pc:X8} -> 0x{resume:X8} " +
-                    $"loops={_emptySifPollLoops} n={_sifPollCallerEscapes} cyc={c}");
         }
 
         // After CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (empty SIF-cmd poll +
@@ -1826,11 +2001,35 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             // Soft-return from WaitSema leaf via $ra so poll body can take the empty-queue path.
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
             bool left = false;
-            // Wave-3: after empty-SIF poll loops, reject 0x2948xx re-entry — force worker.
+            // Wave-4: $ra in worker body is ONLY valid when current thread IS the worker.
+            // Soft-returning 0x27CC08 onto SIF-poll / zombie-main poisons SP and freezes PATH3.
+            bool currentIsWorker = false;
+            if (k != null)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (t.Id == k.CurrentThreadId && t.Entry == WorkerThreadEntry)
+                    {
+                        currentIsWorker = true;
+                        break;
+                    }
+                }
+            }
+            bool raIsWorkerBody = ra is >= 0x0027CC00 and <= 0x0027CE90;
+            // Wave-3: after empty-SIF poll loops, reject 0x2948xx re-entry — force worker yield.
             bool rejectPollCaller = _emptySifPollLoops >= 4
                 && sys.Gif.Path3Transfers == 0
                 && ra is >= 0x00294800 and <= 0x00294900;
-            if (!rejectPollCaller
+            if (rejectPollCaller || (raIsWorkerBody && !currentIsWorker))
+            {
+                if (TryYieldToPendingWorker(sys, pc, c))
+                {
+                    left = true;
+                    _emptySifPollLoops++;
+                }
+            }
+            if (!left
+                && !(raIsWorkerBody && !currentIsWorker)
                 && sys.Memory.IsLikelyEeCode(ra)
                 && (ra is (>= 0x0027CC00 and <= 0x0027CD00)
                     or (>= 0x00294800 and <= 0x00294900)
@@ -1854,23 +2053,26 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     left = true;
                     if (ra is >= 0x00294800 and <= 0x00294900)
                         _emptySifPollLoops++;
-                    else if (ra is >= 0x0027CC00 and <= 0x0027CE90)
+                    else if (raIsWorkerBody && currentIsWorker)
                         _emptySifPollLoops = 0;
                 }
             }
-            // Null / poison $ra residual (live 0x299328): try stack slot then worker /
-            // post-FreezeCache. Prefer 0x27CC08 over bare 0x185FAC after IRX — live wave-2
-            // null-ra → 0x185FAC → AdEL 0x06207265 → CRT0 death (gifPath3 lost).
-            // Wave-3: also take this path when poll-caller soft-return is exhausted.
+            // Null / poison $ra residual (live 0x299328): stack slot then worker SwitchTo /
+            // post-FreezeCache. Wave-4: prefer TryYieldToPendingWorker over PC-stomp 0x27CC08.
             if (!left && (rejectPollCaller
                           || ((ra == 0 || !sys.Memory.IsLikelyEeCode(ra)
                                || ra is (>= 0x00299300 and <= 0x00299480)
                                || ra is (>= 0x00293C00 and <= 0x00293C80))
                               && (_worldKickPulses % 8) == 0)))
             {
-                uint resume = 0;
-                if (!rejectPollCaller)
+                if (TryYieldToPendingWorker(sys, pc, c))
                 {
+                    left = true;
+                    _emptySifPollLoops++;
+                }
+                else
+                {
+                    uint resume = 0;
                     uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
                     if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16u)
                     {
@@ -1879,29 +2081,29 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                             && stacked is not (>= 0x00299300 and <= 0x00299480)
                             && stacked is not (>= 0x00293C00 and <= 0x00293C80)
                             && stacked is not (>= 0x00294800 and <= 0x00294900)
+                            && stacked is not (>= 0x0027CC00 and <= 0x0027CE90) // never stomp worker
                             && stacked is not (>= 0x0026C0E0 and <= 0x0026C600)
                             && stacked is not (>= 0x00100000 and <= 0x00100200))
                             resume = stacked;
                     }
+                    if (resume == 0)
+                        resume = PickSafeResume(sys, 0x00185FAC); // not worker mid-body
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                    {
+                        Lo = resume == 0x00185FAC ? 0x00330000UL : 3UL
+                    });
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                    sys.EE.PC = resume;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    left = true;
                 }
-                if (resume == 0)
-                    resume = PickSafeResume(sys, 0x0027CC08);
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
-                {
-                    Lo = resume == 0x00185FAC ? 0x00330000UL : 3UL
-                });
-                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-                sys.EE.PC = resume;
-                sys.EE.COP0_Status &= ~0x6u;
-                left = true;
-                if (rejectPollCaller)
-                    _emptySifPollLoops++;
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
                     $"[GOW] SHARED empty-sifrpc wake pc=0x{pc:X8} ra=0x{ra:X8} left={left} " +
-                    $"rejectPoll={rejectPollCaller} loops={_emptySifPollLoops} " +
+                    $"rejectPoll={rejectPollCaller} curWorker={currentIsWorker} " +
+                    $"loops={_emptySifPollLoops} yields={_workerYields} " +
                     $"arms={_streamArmPulses} n={_worldKickPulses} cyc={c}");
         }
 
