@@ -246,6 +246,41 @@ public static class SmokeTests
     }
 
     /// <summary>
+    /// GX-002 / S10: DumpSoftGsIfDrawn writes PPM only when px&gt;0; ExpandHits metric is readable.
+    /// </summary>
+    public static void GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric()
+    {
+        var sys = new Ps2System();
+        var pipe = new GsPipeline(sys.Gs, sys.Gif, sys.Pcrtc);
+        string dir = Path.Combine(Path.GetTempPath(), "detps2-softgs-smoke");
+        Directory.CreateDirectory(dir);
+        string ppm = Path.Combine(dir, "softgs-smoke.ppm");
+        if (File.Exists(ppm)) File.Delete(ppm);
+
+        if (pipe.DumpSoftGsIfDrawn(ppm))
+            throw new Exception("DumpSoftGsIfDrawn must skip when px=0");
+        if (File.Exists(ppm))
+            throw new Exception("no PPM file expected for px=0");
+
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.DrawQuad(0, 0, 32, 32, 0xFF00FF00);
+        if (sys.Gs.PixelsWritten <= 0)
+            throw new Exception("expected px after DrawQuad");
+        // ExpandHits is a counter (may be 0 for normal quads) — must be queryable for scoreboard.
+        long hits = sys.Gs.ExpandHits;
+        if (hits < 0) throw new Exception("ExpandHits must be non-negative");
+
+        if (!pipe.DumpSoftGsIfDrawn(ppm))
+            throw new Exception("DumpSoftGsIfDrawn must write when px>0");
+        if (!File.Exists(ppm) || new FileInfo(ppm).Length < 32)
+            throw new Exception("PPM missing or empty after dump");
+        if (!sys.Pcrtc.DumpSoftGsIfDrawn(Path.Combine(dir, "softgs-pcrtc.ppm")))
+            throw new Exception("Pcrtc.DumpSoftGsIfDrawn failed with px>0");
+
+        Console.WriteLine($"[Smoke] GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric OK (px={sys.Gs.PixelsWritten} expandHits={hits})");
+    }
+
+    /// <summary>
     /// Wave-5: sparse prim paint must not block DISPFB/FBP0 IMAGE merge composite
     /// (B3 early AFAIL prims left logo IMAGE invisible on Soft-GS).
     /// </summary>
@@ -949,6 +984,7 @@ public static class SmokeTests
             Gs_DepthTest_RejectsFar();
             Gs_Modulate80_AlphaTestPasses();
             Gs_Xyz2_Kicks_Xyz3_DoesNot();
+            GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric();
             Gs_MergeComposite_AfterSparsePrims();
             Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();

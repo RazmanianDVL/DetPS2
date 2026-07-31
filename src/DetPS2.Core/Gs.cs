@@ -72,6 +72,11 @@ public sealed class Gs : ISchedulable
     public long ImageBytesWritten { get; private set; }
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
+    /// <summary>
+    /// Soft-GS title-strip expand rescues (ofx/thin-sprite → full FB). Metric for G4/T4 demotion
+    /// (PL-003 / GX-004 refine legal conditions; S10 surfaces the counter for claims).
+    /// </summary>
+    public long ExpandHits { get; private set; }
     /// <summary>Fragments rejected for FB bounds (before scissor).</summary>
     public long FragmentsRejectedBounds { get; private set; }
     /// <summary>Fragments rejected by SCISSOR_1.</summary>
@@ -135,6 +140,7 @@ public sealed class Gs : ISchedulable
         _trxPartial = 0;
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
+        ExpandHits = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
         RegWritesTotal = RegWritesPrim = RegWritesXyz2 = RegWritesXyz3 = RegWritesXyzf2 = 0;

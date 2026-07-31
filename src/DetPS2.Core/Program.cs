@@ -16,8 +16,8 @@ using DetPS2.Core;
 //   detps2 netplay-soak [frames]
 //   detps2 netplay-cert [frames]
 //   detps2 elf-info [user-media.json]
-//   detps2 blocker-trace [user-media.json] [cycles] [--dump=ADDR:LEN] [--trace-window=N]
-//   detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]
+//   detps2 blocker-trace [user-media.json] [cycles] [--dump=ADDR:LEN] [--trace-window=N] [--dump-softgs=path]
+//   detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]
 //   detps2 wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]
 //   detps2 wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]
 //   detps2 disasm <user-media.json> <cycles> <addr>:<len> [titleIndex]
@@ -177,6 +177,10 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     // never even finished — a test-harness gap, not evidence of unreachability. Opt-in (not
     // default) to keep this tool's existing plain-RunFor telemetry comparable to prior runs.
     bool driveHostPresent = args.Contains("--host-present");
+    // GX-002: optional Soft-GS PPM dump when px>0 (claim artifact; never plants pixels).
+    string? dumpSoftGsPath = null;
+    foreach (var a in args)
+        if (a.StartsWith("--dump-softgs=")) dumpSoftGsPath = a.Substring("--dump-softgs=".Length);
     if (args.Contains("--no-assist")) Ps2System.DisableMidwayAssist = true;
     if (args.Contains("--no-force-sif")) Ps2System.DisableForceSifInit = true;
     if (args.Contains("--no-unstick-waits")) Ps2System.DisableUnstickSifWaits = true;
@@ -420,6 +424,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 }
             }
         }
+        // GX-001 / PL-001 claim surface: always print Soft-GS + GIF path counts for scoreboard scrape.
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifPath1={traceSys.Gif.Path1Transfers} gifPath2={traceSys.Gif.Path2Transfers} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
         Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} expandHits={traceSys.Gs.ExpandHits} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
         Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
@@ -428,6 +433,8 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         Console.WriteLine($"  gif-pkts: completed={traceSys.Gif.PacketsCompleted} aborted={traceSys.Gif.PacketsAborted} spannedCalls={traceSys.Gif.PacketsSpannedCalls} inFlight={traceSys.Gif.PacketInFlight} tags={traceSys.Gif.TagsSeen} p2qws={traceSys.Gif.Path2Qws}");
         Console.WriteLine($"  gif-path: p1={traceSys.Gif.Path1Transfers} p1qws={traceSys.Gif.Path1Qws} p2={traceSys.Gif.Path2Transfers} p2qws={traceSys.Gif.Path2Qws} p3={traceSys.Gif.Path3Transfers} p3qws={traceSys.Gif.Path3Qws} m3p={traceSys.Gif.Path3MaskedByVif} heldP3n={traceSys.Gif.HeldPath3Entries} heldP3qwc={traceSys.Gif.HeldPath3Qwc} heldSubmits={traceSys.Gif.Path3HeldSubmits} mskPath3={traceSys.Vif.MskPath3Count}");
         Console.WriteLine($"  gif-tags: packed={traceSys.Gif.TagsCompletedPacked} reglist={traceSys.Gif.TagsCompletedReglist} image={traceSys.Gif.TagsCompletedImage} disable={traceSys.Gif.TagsCompletedDisable} abortNewDir={traceSys.Gif.AbortNewDirect} abortTrunc={traceSys.Gif.AbortDirectTruncate} abortOther={traceSys.Gif.AbortOther} lastAbort={traceSys.Gif.LastAbortReason}");
+        // Compact claim line for scrapers (PL-001 / GX-001).
+        Console.WriteLine($"  claim: px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifP1={traceSys.Gif.Path1Transfers} gifP2={traceSys.Gif.Path2Transfers} gifP3={traceSys.Gif.Path3Transfers} imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} expandHits={traceSys.Gs.ExpandHits} gifCompleted={traceSys.Gif.PacketsCompleted} gifAborted={traceSys.Gif.PacketsAborted}");
         if (traceSys.Gif.PacketInFlight || traceSys.Gif.TagsSeen > 0)
             Console.WriteLine($"  gif-last: flg={traceSys.Gif.LastTagFlg} nloop={traceSys.Gif.LastTagNloop} nreg={traceSys.Gif.LastTagNreg} regs=0x{traceSys.Gif.LastTagRegs:X16} inflightFlg={traceSys.Gif.PacketFlg} progress={traceSys.Gif.PacketProgress}/{traceSys.Gif.PacketNloop}");
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1" && traceSys.Gif.TraceRingCount > 0)
@@ -442,6 +449,21 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 Console.WriteLine(
                     $"    [{ri}] {kn} path={e.Path} flg={e.Flg} flags=0x{e.Flags:X2} addr=0x{e.Addr:X8} " +
                     $"qwc/nloop={e.QwcOrNloop} completed={e.Completed} aborted={e.Aborted}");
+            }
+        }
+        // GX-002: Soft-GS PPM when drawn.
+        if (!string.IsNullOrEmpty(dumpSoftGsPath))
+        {
+            if (traceSys.Gs.PixelsWritten > 0)
+            {
+                string? d = Path.GetDirectoryName(dumpSoftGsPath);
+                if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
+                traceSys.Gs.SaveFramebufferAsPPM(dumpSoftGsPath);
+                Console.WriteLine($"  dump-softgs: wrote {dumpSoftGsPath} (px={traceSys.Gs.PixelsWritten})");
+            }
+            else
+            {
+                Console.WriteLine($"  dump-softgs: skipped (px=0) path={dumpSoftGsPath}");
             }
         }
         Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
@@ -553,25 +575,28 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     Environment.Exit(0);
 }
 
-// detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]
+// detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]
 //   Soft-GS scoreboard metrics only (no GPU present). Boots each title like blocker-trace,
 //   runs N cycles (optional 1M-slice OnHostPresent), prints one JSON object per title with
 //   the fields scoreboard.ps1 / run-title.ps1 already scrape from blocker-trace text.
+//   Schema: tools/SCOREBOARD_SCHEMA.md (T0–T7 + G1–G4 heuristics).
 if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length < 2 || args[1].StartsWith("--"))
     {
-        Console.Error.WriteLine("usage: detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]");
+        Console.Error.WriteLine("usage: detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]");
         Environment.Exit(1);
     }
     UserMediaConfig smCfg = UserMediaConfig.Load(args[1]);
     ulong smCycles = 5_000_000;
     string? smOut = null;
+    string? smDumpSoftGs = null;
     bool smHostPresent = args.Contains("--host-present");
     foreach (var a in args)
     {
         if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) smCycles = c;
         else if (a.StartsWith("--out=")) smOut = a.Substring(6);
+        else if (a.StartsWith("--dump-softgs=")) smDumpSoftGs = a.Substring("--dump-softgs=".Length);
     }
 
     var smResults = new List<object>();
@@ -621,27 +646,83 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         // Headless Soft-GS DISPFB residual (IMAGE/local may hold logo without prim px).
         smSys.Gs.CompositeDispfbToFramebuffer();
 
+        long px = smSys.Gs.PixelsWritten;
+        long prims = smSys.Gs.PrimitivesDrawn;
+        long imgBytes = smSys.Gs.ImageBytesWritten;
+        long dispfbPx = smSys.Gs.DispfbPixelsComposited;
+        long expandHits = smSys.Gs.ExpandHits;
+        ulong gifP1 = smSys.Gif.Path1Transfers;
+        ulong gifP2 = smSys.Gif.Path2Transfers;
+        ulong gifP3 = smSys.Gif.Path3Transfers;
+        ulong gifCompleted = smSys.Gif.PacketsCompleted;
+        ulong gifAborted = smSys.Gif.PacketsAborted;
+        bool exitReq = smSys.Hle.ExitRequested;
+
+        // PL-001 / GX-001 tier stubs (heuristic — not formal claims). See tools/SCOREBOARD_SCHEMA.md.
+        ulong gifAny = gifP1 + gifP2 + gifP3;
+        string t0 = !exitReq || smSys.MasterCycles > 0 ? "Y" : "N";
+        // Count all GIF paths (Path2-only titles e.g. GoW must not fall to N).
+        string t1 = px > 0 && gifAny > 0 ? (px > 100_000 && gifAny >= 12 ? "Y?" : "NEAR?") : "N";
+        string t2 = "?"; // pad inject required (PL-002)
+        string t3 = (prims >= 10 || imgBytes > 0 || dispfbPx > 0 || gifP3 >= 20 || gifAny >= 20) ? "Y?" : "N";
+        string t4 = expandHits == 0 && px > 0 ? "Y?" : (px > 0 ? "N" : "?");
+        string t5 = "?"; // scene-change charter (later seasons)
+        string t6 = "?";
+        string t7 = "?"; // IRX FILEIO/PAD flags (later seasons)
+        string g1 = gifCompleted > 0 || gifAny > 0
+            ? (gifAborted == 0 || gifCompleted >= gifAborted ? "Y?" : "WARN")
+            : "N";
+        string g2 = imgBytes > 0 ? "Y" : "N";
+        string g3 = dispfbPx > 0 ? "Y" : "N";
+        string g4 = expandHits == 0 && px > 0 ? "Y?" : (px > 0 ? "N" : "?");
+
+        string? dumpPathWritten = null;
+        if (!string.IsNullOrEmpty(smDumpSoftGs) && px > 0)
+        {
+            // Per-title path when multi-title media: inject id before extension.
+            string dumpPath = smDumpSoftGs;
+            if (smCfg.Titles.Count > 1)
+            {
+                string? ext = Path.GetExtension(smDumpSoftGs);
+                string stem = Path.Combine(
+                    Path.GetDirectoryName(smDumpSoftGs) ?? ".",
+                    Path.GetFileNameWithoutExtension(smDumpSoftGs) + $"-{title.Id}");
+                dumpPath = stem + (string.IsNullOrEmpty(ext) ? ".ppm" : ext);
+            }
+            string? d = Path.GetDirectoryName(dumpPath);
+            if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
+            smSys.Gs.SaveFramebufferAsPPM(dumpPath);
+            dumpPathWritten = dumpPath;
+        }
+
         var rpc = smSys.Hle.Sony?.RealRpc;
         var metrics = new Dictionary<string, object?>
         {
             ["id"] = title.Id,
             ["serial"] = serial ?? "",
             ["pc"] = $"0x{smSys.EE.PC:X8}",
-            ["px"] = smSys.Gs.PixelsWritten,
-            ["prims"] = smSys.Gs.PrimitivesDrawn,
-            ["gifPath3"] = smSys.Gif.Path3Transfers,
+            ["px"] = px,
+            ["prims"] = prims,
+            ["gifPath1"] = gifP1,
+            ["gifPath2"] = gifP2,
+            ["gifPath3"] = gifP3,
+            ["gifP1"] = gifP1,
+            ["gifP2"] = gifP2,
+            ["gifP3"] = gifP3,
             ["dmac"] = smSys.Dmac.TransfersCompleted,
             ["cdvdSectors"] = smSys.Cdvd.SectorsRead,
             ["syscalls"] = smSys.Hle.SyscallCount,
             ["sifBytes"] = smSys.Sif.BytesTransferred,
             ["binds"] = rpc?.Binds ?? 0UL,
             ["calls"] = rpc?.Calls ?? 0UL,
-            ["exitRequested"] = smSys.Hle.ExitRequested,
+            ["exitRequested"] = exitReq,
             ["exitCode"] = smSys.Hle.ExitCode,
             ["cycles"] = smSys.MasterCycles,
-            ["imgBytes"] = smSys.Gs.ImageBytesWritten,
-            ["dispfbPx"] = smSys.Gs.DispfbPixelsComposited,
-            ["expandHits"] = smSys.Gs.ExpandHits,
+            ["imgBytes"] = imgBytes,
+            ["dispfbPx"] = dispfbPx,
+            ["expandHits"] = expandHits,
+            ["gifCompleted"] = gifCompleted,
+            ["gifAborted"] = gifAborted,
             ["fragTest"] = smSys.Gs.FragmentsTested,
             ["rejBounds"] = smSys.Gs.FragmentsRejectedBounds,
             ["rejScissor"] = smSys.Gs.FragmentsRejectedScissor,
@@ -652,6 +733,21 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["scissor"] = $"0x{smSys.Gs.Registers.SCISSOR_1:X16}",
             ["xyoffset"] = $"0x{smSys.Gs.Registers.XYOFFSET_1:X16}",
             ["test1"] = $"0x{smSys.Gs.Registers.TEST_1:X16}",
+            // Play tiers T0–T7 (heuristic stubs; "?" = not measured this budget)
+            ["T0"] = t0,
+            ["T1"] = t1,
+            ["T2"] = t2,
+            ["T3"] = t3,
+            ["T4"] = t4,
+            ["T5"] = t5,
+            ["T6"] = t6,
+            ["T7"] = t7,
+            // GFX columns G1–G4
+            ["G1"] = g1,
+            ["G2"] = g2,
+            ["G3"] = g3,
+            ["G4"] = g4,
+            ["dumpSoftGs"] = dumpPathWritten,
         };
         smResults.Add(metrics);
         Console.WriteLine(JsonSerializer.Serialize(metrics, jsonOpts));
@@ -1701,7 +1797,8 @@ Console.WriteLine("  majority-catalog [out.md]");
 Console.WriteLine("  commercial-checklist");
 Console.WriteLine("  netplay-soak [frames]");
 Console.WriteLine("  netplay-cert [frames]");
-Console.WriteLine("  scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]");
+Console.WriteLine("  scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json] [--dump-softgs=path]");
+Console.WriteLine("  blocker-trace … [--dump-softgs=path]  (Soft-GS PPM when px>0; claim: px/prims/gifP1-3/imgBytes/dispfbPx/expandHits)");
 Console.WriteLine("  wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]");
 Console.WriteLine("  wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]");
 Console.WriteLine("Copy user-media.example.json → user-media.json (gitignored).");
