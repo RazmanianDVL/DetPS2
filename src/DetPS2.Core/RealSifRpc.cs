@@ -846,9 +846,9 @@ public sealed class RealSifRpc
             uint endParam = mem.Read32(cdPtr + 32);
             if (endFunc != 0)
             {
-                // Fast path: common "*(int*)end_param = 1" done-flag (end_param may be 0).
-                if (endParam != 0 && endParam < SystemMemory.RDRAM_SIZE - 4)
-                    mem.Write32(endParam, 1);
+                // Do NOT unconditionally write *end_param=1. Simple done-flag
+                // end_functions still plant 1 via TryHleSimpleEndFunction.
+                // CDVDFSV-style treat end_param as transfer descriptor (Vexx CdRead).
                 _pendingEndFuncs.Enqueue((endFunc, endParam));
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine($"[RPC] end_function=0x{endFunc:X8} end_param=0x{endParam:X8}");

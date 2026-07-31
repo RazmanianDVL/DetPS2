@@ -177,20 +177,24 @@ public sealed class SonyKernelHle
         ee.PC = func;
         ee.HleRedirectPc = null;
 
+        // Nested end_function must not be no-op'd by WaitingVblank (Vexx CdSync).
+        bool savedWaitingVblank = _kernel.WaitingVblank;
+        _kernel.WaitingVblank = false;
+
         _inRpcEndFuncInvoke = true;
         try
         {
-            for (int i = 0; i < 512; i++)
+            for (int i = 0; i < 2048; i++)
             {
                 uint pc = (uint)(ee.PC & 0x1FFFFFFF);
                 if (pc == (SentinelRa & 0x1FFFFFFF) || pc == 0) break;
-                // One instruction; Step may take exceptions — cap total.
                 ee.Step(1);
             }
         }
         finally
         {
             _inRpcEndFuncInvoke = false;
+            _kernel.WaitingVblank = savedWaitingVblank;
             ee.PC = savedPc;
             ee.SetGpr(4, savedA0);
             ee.SetGpr(31, savedRa);
@@ -394,6 +398,9 @@ public sealed class SonyKernelHle
         ee.PC = callback;
         ee.HleRedirectPc = null;
 
+        bool savedWaitingVblank = _kernel.WaitingVblank;
+        _kernel.WaitingVblank = false;
+
         // Re-use the RPC end-function reentrancy guard so nested Step cannot re-drain.
         bool prev = _inRpcEndFuncInvoke;
         _inRpcEndFuncInvoke = true;
@@ -408,6 +415,7 @@ public sealed class SonyKernelHle
         }
         finally
         {
+            _kernel.WaitingVblank = savedWaitingVblank;
             _inRpcEndFuncInvoke = prev;
             ee.PC = savedPc;
             ee.SetGpr(4, savedA0);
@@ -1449,7 +1457,10 @@ public sealed class SonyKernelHle
         0x20 or 0x21 or 0x22 or 0x23 or 0x24 or 0x25 => true, // threads create/start/exit
         0x2B or 0x2F or 0x32 or 0x33 or 0x34 => true, // rotate/id/sleep/wakeup(+i)
         0x3C or 0x3D or 0x3E => true, // SetupThread/Heap
-        0x40 or 0x41 or 0x42 or 0x44 or 0x45 => true, // semas
+        // Semas: include iSignalSema (0x43) for SetAlarm callbacks (Vexx CdSync).
+        0x40 or 0x41 or 0x42 or 0x43 or 0x44 or 0x45 or 0x46 => true,
+        // EE soft alarms — must HLE even if title SetSyscall-hooks them.
+        0x18 or 0x19 or 0x1E or 0x1F or 0xFC or 0xFD or 0xFE or 0xFF => true,
         0x64 => true, // FlushCache
         0x74 => true, // SetSyscall itself
         0x76 or 0x77 or 0x79 or 0x7A => true, // SIF dma/reg (need ready bits)
