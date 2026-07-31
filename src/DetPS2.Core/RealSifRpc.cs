@@ -4878,16 +4878,47 @@ public sealed class RealSifRpc
             // 4 KiB live EE stream table. Painting GOE status over that table wiped slots.
             if (LooksLikeWhipStreamTableSetup(mem, argBuf, sendSize, recvSize))
             {
+                uint w0 = argBuf != 0 && sendSize >= 4 ? mem.Read32(argBuf) : 0;
+                uint w1 = argBuf != 0 && sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
+                uint w2 = argBuf != 0 && sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+                // Paint ready markers into the EE stream table without wiping floats/pointers
+                // the client already wrote. Bulk (w1=slotCount): mark each slot. Per-slot:
+                // mark index w2. Stride 16 B (4096/256) covers the full 0xFF ring seen live.
+                if (recvBuf != 0 && recvSize >= 16)
+                {
+                    const uint Stride = 16;
+                    if (w1 is >= 8 and <= 256)
+                    {
+                        uint n = Math.Min(w1, recvSize / Stride);
+                        for (uint i = 0; i < n; i++)
+                        {
+                            uint baseOff = recvBuf + i * Stride;
+                            // word0 ready/status=1 if zero; leave non-zero client state intact
+                            if (mem.Read32(baseOff) == 0)
+                                mem.Write32(baseOff, 1);
+                        }
+                    }
+                    else if (w1 == 0)
+                    {
+                        uint idx = w2;
+                        if (idx < recvSize / Stride)
+                        {
+                            uint baseOff = recvBuf + idx * Stride;
+                            if (mem.Read32(baseOff) == 0)
+                                mem.Write32(baseOff, 1);
+                        }
+                    }
+                }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 {
-                    uint w0 = argBuf != 0 && sendSize >= 4 ? mem.Read32(argBuf) : 0;
-                    uint w1 = argBuf != 0 && sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
-                    uint w2 = argBuf != 0 && sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
                     Console.Error.WriteLine(
                         $"[IOPFILE] stream-table setup sid=0x{sid:X} w0=0x{w0:X} w1=0x{w1:X} w2=0x{w2:X} " +
-                        $"recv=0x{recvBuf:X8}/{recvSize} (recv preserved)");
+                        $"recv=0x{recvBuf:X8}/{recvSize} (ready-mark)");
                 }
                 EnsureGoeArchiveMounted(iopModules, cdvd);
+                // After first bulk, warm title surface members for later Open/Start.
+                if (w1 is >= 8 and <= 256)
+                    WarmWhipTitleSurface(iopModules, cdvd);
                 return 1;
             }
 
