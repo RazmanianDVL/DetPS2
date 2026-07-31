@@ -7,9 +7,11 @@ namespace DetPS2.Core;
 /// Vexx (USA) SLUS_203.83 — IOPRP252 + null-path basename + CRT/string heap plant +
 /// SearchFile 0x128 path-layout (+0x24) + freelist bump escape + STREE0 re-plant.
 ///
-/// Wave-1 residual: GAME.TXT SearchFile+CdRead (cdvd=4). Wave-2: STREE0.TRE path sits at
-/// +0x24 while stale GAME.TXT leaf/lsn remain at +0x20/+0 — re-plant STREE0; freelist thrash
-/// only after pad/GAME.TXT; stack integrity when PC lands in path ASCII. See issue #19.
+/// Wave-1 residual: GAME.TXT SearchFile+CdRead (cdvd=4). Wave-2: STREE0.TRE SearchFile ok
+/// (lsn/size ~1GB). Wave-3: hang was null CD I/O vtable @0x3BD3A8 (install never ran) →
+/// STREE open fails → hash-map walk thrash @0x1DD2E0 with table=null. Plant game default
+/// open/read stubs (partial TRE stream, not full 1GB map); expand freelist/bump for TOC
+/// (~4.6MB header, not full TRE); escape null-table walk. Soft-GS residual. See issue #19.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -33,7 +35,10 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint ReallocStub = 0x00090160;
     public const uint BumpCursorCell = 0x00090180;
     public const uint BumpArenaBase = 0x01800000;
-    public const uint BumpArenaEnd = 0x01C00000;
+    /// <summary>8 MiB bump — STREE0 TOC/partial map (~4.6MB) must fit; never full 1GB TRE.</summary>
+    public const uint BumpArenaEnd = 0x02000000;
+    /// <summary>Freelist host-bump cap (partial TRE header / stream tables, not full map).</summary>
+    public const uint FreelistMaxBump = 0x00800000;
     public const uint PathNormalizeLoop = 0x00372ABC;
     public const uint PathNormalizeAfterLoop = 0x00372B04;
     public const uint EmptyStringSentinel = 0x003C4C58;
@@ -42,23 +47,44 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint FreelistSuccessStore = 0x001CE280;
     public const uint SearchFileArgBuf = 0x1C1F4000;
     public const uint SearchFilePacket = 0x003F7B00;
-    /// <summary>Do not freelist-bump until pad/IOPRP stack is past early CRT init.</summary>
+
+    /// <summary>
+    /// CD file-backend vtable the game install writes at 0x3BD3A8.. (open/read/…).
+    /// Live residual: never written → open returns 0 → STREE stream map stays empty.
+    /// Defaults match the install fallbacks (0x1D0CE0 open, 0x1D0CA0 read, …).
+    /// </summary>
+    public const uint CdIoVtableBase = 0x003BD3A8;
+    public const uint CdIoDefaultOpen = 0x001D0CE0;
+    public const uint CdIoDefaultClose = 0x001D0C40;
+    public const uint CdIoDefaultRead = 0x001D0CA0;
+    public const uint CdIoDefaultWrite = 0x001D0CB0;
+    public const uint CdIoDefaultStub0 = 0x001D0CC0;
+    public const uint CdIoDefaultSeek = 0x001D0E60;
+    public const uint CdIoDefaultTell = 0x001D0CD0;
+    public const uint CdIoDefaultSize = 0x001D0ED0;
+    public const uint CdIoDefaultMisc = 0x001D0F40;
+
+    /// <summary>Hash-map lookup thrash when stream table at s5+8 is null (PC 0x1DD2E0).</summary>
+    public const uint StreamMapLookupLo = 0x001DD2C0;
+    public const uint StreamMapLookupHi = 0x001DD370;
+    public const uint StreamMapLookupFail = 0x001DD370;
+
     /// <summary>Allow freelist bump after CRT plant settles (not during whip-era thrash).</summary>
     public const ulong FreelistEscapeMinCycles = 1_000_000UL;
 
-    private bool _pathPatched, _mallocPlanted;
+    private bool _pathPatched, _mallocPlanted, _cdIoPlanted;
     private int _versionReplants, _nullPathEscapes, _pathNormEscapes, _mallocReplants;
     private int _hookReplants, _freelistEscapes, _searchPathFixes, _searchPlants;
-    private int _stackRescues;
+    private int _stackRescues, _cdIoReplants, _streamMapEscapes;
     private Iso9660.Volume? _isoVol;
     private string? _isoVolPath;
 
     public void Reset()
     {
-        _pathPatched = _mallocPlanted = false;
+        _pathPatched = _mallocPlanted = _cdIoPlanted = false;
         _versionReplants = _nullPathEscapes = _pathNormEscapes = _mallocReplants = 0;
         _hookReplants = _freelistEscapes = _searchPathFixes = _searchPlants = 0;
-        _stackRescues = 0;
+        _stackRescues = _cdIoReplants = _streamMapEscapes = 0;
         try { _isoVol?.Disc?.Dispose(); } catch { }
         _isoVol = null; _isoVolPath = null;
     }
@@ -71,8 +97,9 @@ public sealed class VexxAssist : IGameQuirkModule
         PlantIopRpVersion(sys);
         PlantCrtMallocTable(sys);
         PlantStringHeapHook(sys);
+        PlantCdIoVtable(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
-            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 + CRT/string heap plant ready");
+            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 + CRT/string heap + CD I/O vtable ready");
     }
 
     public void OnHostPresent(Ps2System sys) => _ = sys;
@@ -98,6 +125,13 @@ public sealed class VexxAssist : IGameQuirkModule
         {
             PatchNullPathBasename(sys);
             _pathPatched = true;
+        }
+
+        // Keep CD I/O vtable alive — open/read defaults enable partial TRE stream.
+        if (!_cdIoPlanted || sys.Memory.Read32(CdIoVtableBase) == 0)
+        {
+            PlantCdIoVtable(sys);
+            _cdIoReplants++;
         }
 
         if (sys.Scheduler.MasterCycles >= 3_000_000UL)
@@ -142,6 +176,7 @@ public sealed class VexxAssist : IGameQuirkModule
         }
 
         // Early freelist escape (pre-pad) corrupts CRT and open-bus thrash (binds=0).
+        // Wave-3: allow up to FreelistMaxBump for STREE TOC / stream tables (not full 1GB).
         if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles
             && pc is >= FreelistWalkLo and <= FreelistWalkHi)
         {
@@ -149,7 +184,7 @@ public sealed class VexxAssist : IGameQuirkModule
             uint size = (uint)sys.EE.GetGpr(16).Lo;
             if (walks > 64)
             {
-                if (size > 0 && size < 0x00100000u)
+                if (size > 0 && size < FreelistMaxBump)
                 {
                     uint mem = HostBumpAlloc(sys, size + 64);
                     if (mem != 0)
@@ -165,17 +200,76 @@ public sealed class VexxAssist : IGameQuirkModule
                 }
                 else
                 {
+                    // Reject absurd sizes (full TRE ~1GB) — partial stream only.
                     sys.EE.SetGpr(20, new EmotionEngine.Gpr128 { Lo = 0 });
                     sys.EE.SetGpr(21, new EmotionEngine.Gpr128 { Lo = 0 });
                     sys.EE.PC = FreelistSuccessStore;
                     _freelistEscapes++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _freelistEscapes <= 16)
+                        Console.Error.WriteLine(
+                            $"[VEXX] freelist reject huge size=0x{size:X} (partial TRE only) cyc={sys.Scheduler.MasterCycles}");
                 }
             }
         }
 
+        // Null stream-table hash walk (s5+8==0) spins forever after failed STREE open.
+        if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles
+            && pc is >= StreamMapLookupLo and <= StreamMapLookupHi)
+            MaybeEscapeNullStreamMap(sys, pc);
+
         // Stack death residual: PC lands in path ASCII (STREE0.TRE / GAME.TXT) as code.
         if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles && LooksLikePathAsciiPc(sys, pc))
             MaybeRescueStackDeath(sys, pc);
+    }
+
+    /// <summary>
+    /// Install game-default CD file backends (partial stream open/read). Same pointers the
+    /// retail install writes when caller args are null.
+    /// </summary>
+    public void PlantCdIoVtable(Ps2System sys)
+    {
+        // Slot layout (8-byte stride): +0 open, +8 close, +16 read, +24 write, +32 stub0,
+        // +40 seek, +48 tell, +56 size, +64 misc — matches default-install order.
+        sys.Memory.Write32(CdIoVtableBase + 0x00, CdIoDefaultOpen);
+        sys.Memory.Write32(CdIoVtableBase + 0x08, CdIoDefaultClose);
+        sys.Memory.Write32(CdIoVtableBase + 0x10, CdIoDefaultRead);
+        sys.Memory.Write32(CdIoVtableBase + 0x18, CdIoDefaultWrite);
+        sys.Memory.Write32(CdIoVtableBase + 0x20, CdIoDefaultStub0);
+        sys.Memory.Write32(CdIoVtableBase + 0x28, CdIoDefaultSeek);
+        sys.Memory.Write32(CdIoVtableBase + 0x30, CdIoDefaultTell);
+        sys.Memory.Write32(CdIoVtableBase + 0x38, CdIoDefaultSize);
+        sys.Memory.Write32(CdIoVtableBase + 0x40, CdIoDefaultMisc);
+        _cdIoPlanted = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+            Console.Error.WriteLine(
+                $"[VEXX] CD I/O vtable @0x{CdIoVtableBase:X} open=0x{CdIoDefaultOpen:X} read=0x{CdIoDefaultRead:X}");
+    }
+
+    /// <summary>
+    /// When hash-map lookup runs with a null table pointer, return miss (v0=0) instead of
+    /// infinite chain walk / AdEL thrash.
+    /// </summary>
+    private void MaybeEscapeNullStreamMap(Ps2System sys, uint pc)
+    {
+        uint s5 = (uint)(sys.EE.GetGpr(21).Lo & 0x1FFFFFFFu); // s5
+        uint table = 0;
+        if (s5 >= 0x1000 && s5 + 0x20 < SystemMemory.RDRAM_SIZE)
+            table = sys.Memory.Read32(s5 + 8);
+        bool tableBad = table == 0
+            || table >= SystemMemory.RDRAM_SIZE
+            || (table & 3) != 0;
+        // Also bail if a3 is a non-canonical / high garbage pointer mid-walk.
+        uint a3 = (uint)sys.EE.GetGpr(7).Lo;
+        bool a3Bad = a3 >= SystemMemory.RDRAM_SIZE || (a3 & 0x80000000u) != 0;
+        if (!tableBad && !a3Bad) return;
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0 = miss
+        sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 }); // s0 = not-found
+        sys.EE.PC = StreamMapLookupFail;
+        _streamMapEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _streamMapEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[VEXX] null-stream-map escape #{_streamMapEscapes} pc=0x{pc:X} s5=0x{s5:X} table=0x{table:X} a3=0x{a3:X} cyc={sys.Scheduler.MasterCycles}");
     }
 
     private void MaybeRescueStackDeath(Ps2System sys, uint pc)
