@@ -71,14 +71,24 @@ BIOS table only covers **fno &lt; 6** (`FUN_000004c4`). Later fnos (6–10, 0xFF
 | SEARCH_BY_NAME | OK | name@+8 |
 | SEARCH_BY_ADDRESS | OK | match `LoadedIrx.LoadBase` window |
 | MOD_STOP / UNLOAD | Partial | stop soft-0; unload drops registry (no IOP RAM reclaim) |
-| GET_VERSION | OK | `0x00020000` placeholder |
-| MG_* encrypted | Partial | same path as plain (no MagicGate decode) |
+| GET_VERSION | OK | `0x00020000` placeholder (or IOPRP ASCII when PreferIopRp) |
+| MG_* plain ELF | OK | Shares plain path loader; SECRMAN classify passthrough (Phase 3) |
+| MG_* encrypted | Partial | Non-ELF disc bytes → clear fail (`LfErrNotIrx` / epc=0); **no MagicGate decode** |
+| IOPRP/DNAS `.IMG` | OK | ROMDIR-in-IMG parse + IOPBTCONF + LoadIrx (Phase 3) |
 | Module `_start` / modres | Gap | HLE does not execute IOP module start; **modres always 0** |
 | Literal LOADFILE ELF loader | Gap | EE load uses `ElfLoader`, not decomp `FUN_000010dc` transliteration |
 | XLOADFILE extended surface | Gap | only ps2sdk-documented fnos |
 | ROMDIR `rom0:` file bytes via LOADFILE | Gap | presence via `RegisterModule` / BiosBootHost, not raw ROM content |
 
-## Scope for THIS agent — **DONE 2026-07-30**
+## Phase 3 (AGENT-U) — **DONE 2026-07-30**
+
+1. `LF_F_MG_MOD_LOAD` / `LF_F_MG_ELF_LOAD` share plain path load. ✅  
+2. When disc bytes present: `IopExtendedBiosHost.ClassifySecrBoot` — plain ELF OK; non-ELF → clear reject. ✅  
+3. IOPRP/DNAS image MOD_LOAD → `ApplyIopRpImageBytes`. ✅  
+4. Smoke: `BiosUdnl_IopRpImageApplyAndSecrMgPath`. ✅  
+5. **No fake MagicGate secrets.** ✅  
+
+## Scope for Phase 0 agent — **DONE 2026-07-30**
 
 1. Full fno constants + error codes from decomp/ps2sdk. ✅  
 2. Deepen `HandleLoadFile`: correct arg/reply shapes for MOD/ELF/SET/GET/BUF/SEARCH/UNLOAD/VERSION. ✅  
@@ -90,5 +100,5 @@ BIOS table only covers **fno &lt; 6** (`FUN_000004c4`). Later fnos (6–10, 0xFF
 
 - Per-game MidwayBootAssist / title PCs.  
 - Real IOP execution of loaded IRX `_start` (modres from live start).  
-- MagicGate decrypt path for MG_MOD/MG_ELF.  
+- MagicGate decrypt path for MG_MOD/MG_ELF (residual — honest fail only).  
 - Full ROMDIR byte serving for `rom0:` path loads.

@@ -100,7 +100,7 @@ Direction: `DMAC_TO_MEM=0`, `DMAC_FROM_MEM=1`.
 | FinishIopServices plant | No | `_start` DPCR defaults not applied |
 | SaveState | N/A | No IOP DMAC state |
 
-## Landed this agent (2026-07-30)
+## Landed (waves + Phase 2 deepen)
 
 1. **`IopDmacManHost`** — contract HLE of exports 4–35 + `_start` / deinit defaults.  
 2. **Channel state** (MADR/BCR/CHCR/TADR/49A) for ch 0–12; DPCR/DPCR2/DPCR3/DICR*/BF801578/57C.  
@@ -109,8 +109,11 @@ Direction: `DMAC_TO_MEM=0`, `DMAC_FROM_MEM=1`.
 5. **`EnableDmaChannel` / `DisableDmaChannel` / `SetDmaPriority`** update DPCR bitfields exactly as ps2sdk.  
 6. **`BiosBootHost.FinishIopServices`** calls `IopDmacMan.Start()` after INTRMAN plant (IOPBTCONF-after-SSBUSC).  
 7. **`Ps2System.IopDmacMan`** property + `Reset()` wiring.  
-8. **Smoke** `BiosHle_IopDmacManContracts` (boot plant, SetSlice, SIF0/1 setup, enable/priority, OTC reject, Start complete).  
-9. **Zero game hacks** / no Midway / no title PCs; EE `Dmac` / `Sif` left intact.
+8. **Phase 2 (AGENT-I):** `RequestChannel` / `ReleaseChannel` lifecycle; DICR/DICR2 IE→IF on complete; `SetChannelInterruptEnable` / `IsChannelInterruptPending` / `AcknowledgeChannelInterrupt`; `IsTransferActive`.  
+9. **Smoke** `BiosHle_IopDmacManContracts` (boot plant, SetSlice, SIF0/1, enable/priority, OTC reject, Start complete, Request/Release, DICR IF, Deinit).  
+10. **Zero game hacks** / no Midway / no title PCs; EE `Dmac` / `Sif` left intact.
+
+**Gate:** DMACMAN → **OK** (contract HLE + smokes; residual = no physical MMIO / no async cycle complete / no Ghidra dump).
 
 ### Intentional HLE divergences
 
@@ -119,10 +122,10 @@ Direction: `DMAC_TO_MEM=0`, `DMAC_FROM_MEM=1`.
 | No physical `0xBF8010xx` MMIO | Project has no IOP DMAC hardware model; SIFMAN remains abstract (`Sif.cs`) per §6.3 |
 | StartDMA completes immediately | Without IOP IRQ/MMIO, leaving TR set forever hangs any CHCR poller |
 | No real byte copy on Start | EE↔IOP bytes already moved by `Sif` / RPC paths; dmacman HLE is enable/setup contract for import tables |
-| No DICR-driven IOP IRQ raise | INTRMAN DMA line exists as bookkeeping; full DMA-complete IRQ chain needs IOP INTC MMIO |
+| DICR IF latched but no INTRMAN irq-3 pulse | Bookkeeping only until IOP INTC MMIO; consumers can poll IF bits |
 | Ghidra retail not reconciled | No `DMACMAN.bin`/`_ALL.txt` in-tree; ps2sdk is SCE 1.3.4 recreation of the same ABI |
 
-## Remaining gaps for full ROMDIR DMACMAN completeness
+## Remaining gaps (non-blocking)
 
 Ordered by contract value:
 
@@ -134,11 +137,12 @@ Ordered by contract value:
 6. **SaveState** for DPCR + per-channel regs if commercial mid-transfer resume ever needs IOP DMA.  
 7. **Real R3000 execution of DMACMAN.IRX** — retires this host when IOP BIOS modules run.
 
-## Acceptance for this slice
+## Acceptance
 
 - `IopDmacMan.Started` after `StartCommercialIop`.  
 - SetSliceDMA valid ch → 1; OTC / out-of-range → 0.  
 - StartDMA leaves CHCR.TR clear; `CompleteCount` increments.  
 - Enable SIF0 sets DPCR2 bit `0x800`; SetDMAPriority updates field.  
-- EE `Dmac` / `Sif` smokes still green; no commercial title hacks.  
-- Remaining ROMDIR DMACMAN work listed above.
+- Request/Release lifecycle clears regs + enable bit.  
+- DICR IE → IF on complete; Acknowledge clears IF.  
+- EE `Dmac` / `Sif` smokes still green; no commercial title hacks.

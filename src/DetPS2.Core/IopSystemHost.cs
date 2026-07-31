@@ -116,6 +116,12 @@ public sealed class IopSystemHost
         public uint Counter;
         public uint TimeupFlags;
         public uint OverflowFlags;
+        /// <summary>timrman SetTimerHandler callback (opaque IOP ptr; not R3000-executed).</summary>
+        public uint CompareCallback;
+        public uint CompareCallbackArg;
+        /// <summary>timrman SetOverflowHandler callback.</summary>
+        public uint OverflowCallback;
+        public uint OverflowCallbackArg;
     }
 
     private sealed class AlarmEntry
@@ -139,6 +145,8 @@ public sealed class IopSystemHost
     private readonly IntrHandler?[] _handlers = new IntrHandler[MaxIrq + 1];
     private readonly bool[] _enabled = new bool[MaxIrq + 1];
     private readonly bool[] _dispatchEnabled = new bool[MaxIrq + 1]; // DisableDispatchIntr soft mask
+    /// <summary>Pending (raised, not yet acknowledged) IRQ lines — HLE bookkeeping for query/status.</summary>
+    private readonly bool[] _pending = new bool[MaxIrq + 1];
     /// <summary>IOMAN device slots (null = free). Classic IOMAN = 16; HLE allows 32.</summary>
     private readonly IomanDeviceEntry?[] _deviceSlots = new IomanDeviceEntry[MaxIomanDevices];
     private readonly Dictionary<string, int> _devices = new(StringComparer.OrdinalIgnoreCase);
@@ -150,6 +158,7 @@ public sealed class IopSystemHost
     private ulong _alarmAccepts;
     private ulong _alarmFires;
     private ulong _hardTimerAllocs;
+    private ulong _hardTimerCompareHits;
     private ulong _intrRegisters;
     private ulong _intrReleases;
     private ulong _intrEnables;
@@ -197,6 +206,8 @@ public sealed class IopSystemHost
     public ulong Alarms => _alarmAccepts;
     public ulong AlarmFires => _alarmFires;
     public ulong HardTimerAllocs => _hardTimerAllocs;
+    /// <summary>How many times a hard-timer counter crossed its compare value (SetTimerHandler path).</summary>
+    public ulong HardTimerCompareHits => _hardTimerCompareHits;
     public int HardTimerCount => _hardTimers.Length;
     public int HardTimersInUse
     {
@@ -228,6 +239,7 @@ public sealed class IopSystemHost
     {
         Array.Clear(_handlers);
         Array.Clear(_enabled);
+        Array.Clear(_pending);
         for (int i = 0; i < _dispatchEnabled.Length; i++)
             _dispatchEnabled[i] = true;
         Array.Clear(_deviceSlots);
@@ -239,6 +251,7 @@ public sealed class IopSystemHost
         _alarmAccepts = 0;
         _alarmFires = 0;
         _hardTimerAllocs = 0;
+        _hardTimerCompareHits = 0;
         _intrRegisters = _intrReleases = 0;
         _intrEnables = _intrDisables = 0;
         _intrAcks = _intrRaises = 0;
@@ -514,10 +527,12 @@ public sealed class IopSystemHost
     /// <summary>
     /// INTRMAN RegisterIntrHandler(irq, mode, handler, arg) — one handler per IRQ.
     /// Returns KE_FOUND_HANDLER if a handler is already installed (real INTRMAN does not stack).
+    /// Rejects interrupt context (KE_ILLEGAL_CONTEXT) to match retail thread-only register path.
     /// </summary>
     public int RegisterIntrHandler(int irq, int mode, uint callback, uint arg)
     {
         _intrRegisters++;
+        if (_intrContext) return ResultIllegalContext;
         if (!IsValidIrq(irq)) return ResultIllegalIntrCode;
         if (callback == 0) return ResultIllegalIntrCode;
         if (_handlers[irq] != null) return ResultFoundHandler;
@@ -529,7 +544,6 @@ public sealed class IopSystemHost
             Arg = arg
         };
         _handlerCount++;
-        _ = mode;
         return ResultOk;
     }
 
@@ -541,12 +555,14 @@ public sealed class IopSystemHost
     public int ReleaseIntrHandler(int irq, uint callback = 0)
     {
         _intrReleases++;
+        if (_intrContext) return ResultIllegalContext;
         if (!IsValidIrq(irq)) return ResultIllegalIntrCode;
         var h = _handlers[irq];
         if (h == null) return ResultNotFoundHandler;
         if (callback != 0 && h.Callback != callback) return ResultNotFoundHandler;
         _handlers[irq] = null;
         _enabled[irq] = false;
+        _pending[irq] = false;
         _handlerCount--;
         return ResultOk;
     }
@@ -578,7 +594,11 @@ public sealed class IopSystemHost
     public int TryDisableIntr(int irq, out int previousIrq)
     {
         previousIrq = irq;
-        return DisableIntr(irq);
+        int rc = DisableIntr(irq);
+        // Real DisableIntr writes the irq number into *res on success so callers can re-enable.
+        if (rc != ResultOk)
+            previousIrq = -1;
+        return rc;
     }
 
     public bool IsIntrEnabled(int irq) =>
@@ -589,6 +609,38 @@ public sealed class IopSystemHost
 
     public uint GetIntrHandler(int irq) =>
         IsValidIrq(irq) && _handlers[irq] != null ? _handlers[irq]!.Callback : 0;
+
+    /// <summary>Query registered handler mode (0 if none).</summary>
+    public int GetIntrHandlerMode(int irq) =>
+        IsValidIrq(irq) && _handlers[irq] != null ? _handlers[irq]!.Mode : 0;
+
+    /// <summary>Query registered handler arg (0 if none).</summary>
+    public uint GetIntrHandlerArg(int irq) =>
+        IsValidIrq(irq) && _handlers[irq] != null ? _handlers[irq]!.Arg : 0;
+
+    /// <summary>True when RaiseIntr marked the line pending and AcknowledgeIntr has not cleared it.</summary>
+    public bool IsIntrPending(int irq) =>
+        IsValidIrq(irq) && _pending[irq];
+
+    /// <summary>True when soft dispatch mask allows the line (EnableDispatchIntr default).</summary>
+    public bool IsDispatchEnabled(int irq) =>
+        IsValidIrq(irq) && _dispatchEnabled[irq];
+
+    /// <summary>
+    /// Full query status for an IRQ line — packs handler presence, enable, pending, and dispatch
+    /// into a bitfield used by smokes / diagnostics (not a retail export).
+    /// Bit0=has handler, bit1=enabled, bit2=pending, bit3=dispatch enabled.
+    /// </summary>
+    public int QueryIntrStatus(int irq)
+    {
+        if (!IsValidIrq(irq)) return ResultIllegalIntrCode;
+        int s = 0;
+        if (_handlers[irq] != null) s |= 1;
+        if (_enabled[irq]) s |= 2;
+        if (_pending[irq]) s |= 4;
+        if (_dispatchEnabled[irq]) s |= 8;
+        return s;
+    }
 
     /// <summary>Software dispatch mask (DECI2 DisableDispatchIntr / EnableDispatchIntr).</summary>
     public void DisableDispatchIntr(int irq)
@@ -602,9 +654,9 @@ public sealed class IopSystemHost
     }
 
     /// <summary>
-    /// Raise an IOP IRQ line for HLE bookkeeping. Counts as a raise when the line is enabled,
-    /// CPU interrupts are on, dispatch is enabled, and a handler is registered. Does not execute
-    /// R3000 code.
+    /// Raise an IOP IRQ line for HLE bookkeeping. Marks pending and counts a raise when the
+    /// line is enabled, CPU interrupts are on, dispatch is enabled, and a handler is registered.
+    /// Does not execute R3000 code.
     /// </summary>
     public int RaiseIntr(int irq)
     {
@@ -612,28 +664,39 @@ public sealed class IopSystemHost
         if (!_enabled[irq] || !_dispatchEnabled[irq] || !CpuInterruptsEnabled)
             return ResultIntrDisable;
         if (_handlers[irq] == null) return ResultNotFoundHandler;
+        _pending[irq] = true;
         _intrRaises++;
         return ResultOk;
     }
 
-    /// <summary>Acknowledge (clear pending bookkeeping) for an IOP IRQ after handler "ran".</summary>
+    /// <summary>
+    /// Acknowledge (clear pending bookkeeping) for an IOP IRQ after handler "ran".
+    /// Always succeeds for a valid irq (real ICR clear is unconditional).
+    /// </summary>
     public int AcknowledgeIntr(int irq)
     {
         if (!IsValidIrq(irq)) return ResultIllegalIntrCode;
+        _pending[irq] = false;
         _intrAcks++;
         return ResultOk;
     }
 
     /// <summary>
     /// Pulse IOP VBLANK + EVBLANK lines if enabled (called from EE PCRTC edge via BiosHle).
-    /// Real VBLANK.IRX handlers own these IRQs after _start.
+    /// Real VBLANK.IRX handlers own these IRQs after _start. Marks pending on each raised line.
     /// </summary>
     public void OnVblankIrqPulse()
     {
         if (_enabled[IrqVblank] && _handlers[IrqVblank] != null && _dispatchEnabled[IrqVblank] && CpuInterruptsEnabled)
+        {
+            _pending[IrqVblank] = true;
             _intrRaises++;
+        }
         if (_enabled[IrqEvblank] && _handlers[IrqEvblank] != null && _dispatchEnabled[IrqEvblank] && CpuInterruptsEnabled)
+        {
+            _pending[IrqEvblank] = true;
             _intrRaises++;
+        }
     }
 
     /// <summary>CpuDisableIntr — force IE off (deprecated API, still exported).</summary>
@@ -719,11 +782,52 @@ public sealed class IopSystemHost
         _systemClock += step;
 
         // Advance allocated hard-timer counters (free-running HLE; no MMIO).
+        // When a started timer with SetTimerHandler crosses Compare, mark time-up and
+        // bookkeeping-RaiseIntr on the timer's IRQ line (if registered+enabled).
         foreach (var t in _hardTimers)
         {
             if (t.Users == 0 || t.Mode == 0) continue;
             uint mask = t.WidthBits == 16 ? 0xFFFFu : 0xFFFFFFFFu;
-            t.Counter = (t.Counter + (uint)Math.Min(step, mask)) & mask;
+            uint prev = t.Counter;
+            uint delta = (uint)Math.Min(step, mask);
+            t.Counter = (t.Counter + delta) & mask;
+
+            // Compare-match: prev < compare <= new (or wrap past compare).
+            if (t.CompareCallback != 0 && t.Compare != 0)
+            {
+                bool hit;
+                if (prev <= t.Counter)
+                    hit = prev < t.Compare && t.Counter >= t.Compare;
+                else
+                    // wrapped
+                    hit = prev < t.Compare || t.Counter >= t.Compare;
+                if (hit)
+                {
+                    t.TimeupFlags |= 1;
+                    _hardTimerCompareHits++;
+                    // Wire to INTRMAN: RaiseIntr on timer IRQ if a handler owns the line.
+                    int irq = t.Irq;
+                    if (IsValidIrq(irq) && _enabled[irq] && _handlers[irq] != null &&
+                        _dispatchEnabled[irq] && CpuInterruptsEnabled)
+                    {
+                        _pending[irq] = true;
+                        _intrRaises++;
+                    }
+                }
+            }
+
+            // Overflow: counter wrapped (prev > new after add without compare hit requirement).
+            if (t.OverflowCallback != 0 && prev > t.Counter && delta > 0)
+            {
+                t.OverflowFlags |= 1;
+                int irq = t.Irq;
+                if (IsValidIrq(irq) && _enabled[irq] && _handlers[irq] != null &&
+                    _dispatchEnabled[irq] && CpuInterruptsEnabled)
+                {
+                    _pending[irq] = true;
+                    _intrRaises++;
+                }
+            }
         }
 
         // Fire due alarms (callback not R3000-executed — count only).
@@ -877,6 +981,10 @@ public sealed class IopSystemHost
             t.Counter = 0;
             t.Compare = 0;
             t.HasIrqHandler = false;
+            t.CompareCallback = 0;
+            t.CompareCallbackArg = 0;
+            t.OverflowCallback = 0;
+            t.OverflowCallbackArg = 0;
             _hardTimerAllocs++;
             return EncodeTimid(t.Index, t.CountAddr);
         }
@@ -918,6 +1026,10 @@ public sealed class IopSystemHost
             t.HasIrqHandler = false;
             t.Counter = 0;
             t.Compare = 0;
+            t.CompareCallback = 0;
+            t.CompareCallbackArg = 0;
+            t.OverflowCallback = 0;
+            t.OverflowCallbackArg = 0;
         }
         return ResultOk;
     }
@@ -1016,11 +1128,64 @@ public sealed class IopSystemHost
         return ResultOk;
     }
 
+    /// <summary>
+    /// timrman SetTimerHandler(timid, compare, cb, arg) — program compare + compare-match
+    /// callback. On Tick, when the free-running counter crosses <paramref name="compare"/>,
+    /// HLE counts a hit and bookkeeping-raises the timer's INTRMAN IRQ if a handler is
+    /// registered+enabled for that line. Callback is not R3000-executed.
+    /// </summary>
+    public int SetTimerHandler(int timid, uint compare, uint callback, uint arg)
+    {
+        if (_intrContext) return ResultIllegalContext;
+        if (!TryGetHardTimer(timid, out var t)) return ResultIllegalTimerId;
+        if (t!.Users == 0) return ResultTimerNotInUse;
+        uint mask = t.WidthBits == 16 ? 0xFFFFu : 0xFFFFFFFFu;
+        t.Compare = compare & mask;
+        t.CompareCallback = callback;
+        t.CompareCallbackArg = arg;
+        t.HasIrqHandler = callback != 0;
+        t.TimeupFlags = 0;
+        return ResultOk;
+    }
+
+    /// <summary>
+    /// timrman SetOverflowHandler(timid, cb, arg) — fire on counter wrap. Same INTRMAN
+    /// bookkeeping raise path as <see cref="SetTimerHandler"/>.
+    /// </summary>
+    public int SetOverflowHandler(int timid, uint callback, uint arg)
+    {
+        if (_intrContext) return ResultIllegalContext;
+        if (!TryGetHardTimer(timid, out var t)) return ResultIllegalTimerId;
+        if (t!.Users == 0) return ResultTimerNotInUse;
+        t.OverflowCallback = callback;
+        t.OverflowCallbackArg = arg;
+        t.HasIrqHandler = t.HasIrqHandler || callback != 0;
+        t.OverflowFlags = 0;
+        return ResultOk;
+    }
+
+    /// <summary>Read latched time-up flag (compare match since last clear / SetTimerHandler).</summary>
+    public uint GetTimerTimeupFlags(int timid)
+    {
+        if (!TryGetHardTimer(timid, out var t) || t!.Users == 0) return 0;
+        return t.TimeupFlags;
+    }
+
+    /// <summary>Clear latched time-up flag after handler service.</summary>
+    public void ClearTimerTimeupFlags(int timid)
+    {
+        if (!TryGetHardTimer(timid, out var t) || t == null) return;
+        t.TimeupFlags = 0;
+    }
+
     private bool TryGetHardTimer(int timid, out HardTimer? timer)
     {
         timer = null;
         int idx = DecodeTimerIndex(timid);
         if (idx < 0 || idx >= _hardTimers.Length) return false;
+        // timid low bits must match the slot's count address encoding.
+        int expected = EncodeTimid(idx, _hardTimers[idx].CountAddr);
+        if (timid != expected) return false;
         timer = _hardTimers[idx];
         return true;
     }

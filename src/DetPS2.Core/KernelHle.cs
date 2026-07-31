@@ -5,11 +5,23 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Extended kernel HLE state (Phase 14): threads, semaphores, event flags, VSync wait.
+/// Extended kernel HLE state (Phase 14 + THREADMAN Phase 1): threads, semaphores, event flags,
+/// message boxes, variable/fixed pools, delay, priority ready selection, VSync wait.
 /// Integrated into <see cref="BiosHle"/>.
 /// </summary>
 public sealed class KernelState
 {
+    /// <summary>THREADMAN DeleteSema/DeleteMbx/DeleteVpl/DeleteFpl waiter return (FUN_00003164).</summary>
+    public const int KeWaitDelete = unchecked((int)0xfffffe57);
+    /// <summary>THREADMAN ReleaseWaitThread waiter return.</summary>
+    public const int KeReleaseWait = unchecked((int)0xfffffe5e);
+    /// <summary>THREADMAN PollMbx empty (FUN_00003de4).</summary>
+    public const int KeMboxNomsg = unchecked((int)0xfffffe58);
+    /// <summary>Generic missing/unknown object (approx. KE_UNKNOWN_MBOX family).</summary>
+    public const int KeUnknownObject = unchecked((int)0xfffffe66);
+    /// <summary>AllocateVpl/Fpl would block (poll path).</summary>
+    public const int KeNoMemory = -400;
+
     public sealed class Thread
     {
         public int Id;
@@ -45,6 +57,26 @@ public sealed class KernelState
         public uint WaitEfLastBits;
         /// <summary>True after SetEventFlag released this waiter until the result_ptr is written.</summary>
         public bool WaitEfNeedsResultWrite;
+        /// <summary>EE/IOP thread priority. Lower value = higher priority (μITRON / ps2sdk).</summary>
+        public int Priority = 64;
+        /// <summary>Create-time priority (ee_thread_t.initial_priority / ReferThreadStatus).</summary>
+        public int InitialPriority = 64;
+        /// <summary>When set, next restore writes this into $v0 (DeleteSema/ReleaseWait waiter ABI).</summary>
+        public bool HasWaitReturn;
+        public int WaitReturnCode;
+        /// <summary>0 = not waiting on a message box (ReceiveMbx).</summary>
+        public int WaitMbxId;
+        /// <summary>Message pointer delivered by SendMbx to a ReceiveMbx waiter.</summary>
+        public uint MbxReceivedMsg;
+        /// <summary>0 = not waiting on AllocateVpl.</summary>
+        public int WaitVplId;
+        public int WaitVplSize;
+        public uint VplAllocatedPtr;
+        /// <summary>0 = not waiting on AllocateFpl.</summary>
+        public int WaitFplId;
+        public uint FplAllocatedPtr;
+        /// <summary>&gt;0 ⇒ DelayThread park; decremented by <see cref="TickDelays"/> / OnVblank.</summary>
+        public int DelayRemainingUs;
         public uint Entry;
         public uint Gp;
         public uint Stack;
@@ -87,13 +119,57 @@ public sealed class KernelState
         public uint Bits;
     }
 
+    /// <summary>THREADMAN message box (thmsgbx / magic 0x7f04).</summary>
+    public sealed class Mbx
+    {
+        public int Id;
+        public uint Attr;
+        public uint Option;
+        public readonly Queue<uint> Messages = new();
+    }
+
+    /// <summary>THREADMAN variable pool (thvpool / magic 0x7f05) — host-tracked freelist.</summary>
+    public sealed class Vpl
+    {
+        public int Id;
+        public uint Attr;
+        public uint Option;
+        public int PoolSize;
+        public int FreeBytes;
+        /// <summary>Synthetic base address for pointers returned by AllocateVpl.</summary>
+        public uint BasePtr;
+        public readonly List<(uint Ptr, int Size)> FreeBlocks = new();
+        public readonly List<(uint Ptr, int Size)> UsedBlocks = new();
+    }
+
+    /// <summary>THREADMAN fixed pool (thfpool / magic 0x7f06) — fixed-size block freelist.</summary>
+    public sealed class Fpl
+    {
+        public int Id;
+        public uint Attr;
+        public uint Option;
+        public int BlockSize;
+        public int BlockCount;
+        public uint BasePtr;
+        public readonly Queue<uint> FreeBlocks = new();
+        public readonly HashSet<uint> UsedBlocks = new();
+    }
+
     private readonly List<Thread> _threads = new();
     private readonly Dictionary<int, Sema> _semas = new();
     private readonly Dictionary<int, EventFlag> _flags = new();
+    private readonly Dictionary<int, Mbx> _mbxs = new();
+    private readonly Dictionary<int, Vpl> _vpls = new();
+    private readonly Dictionary<int, Fpl> _fpls = new();
     private int _nextTid = 1;
     private int _nextSema = 1;
     private int _nextEf = 1;
+    private int _nextMbx = 1;
+    private int _nextVpl = 1;
+    private int _nextFpl = 1;
     private int _currentTid = 1;
+    /// <summary>Bump allocator for synthetic Vpl/Fpl pointer cookies (not real RDRAM).</summary>
+    private uint _nextPoolCookie = 0x0E000000;
 
     public bool WaitingVblank { get; private set; }
     public ulong VblankWaits { get; private set; }
@@ -125,15 +201,22 @@ public sealed class KernelState
         _threads.Clear();
         _semas.Clear();
         _flags.Clear();
+        _mbxs.Clear();
+        _vpls.Clear();
+        _fpls.Clear();
         _nextTid = 1;
         _nextSema = 1;
         _nextEf = 1;
+        _nextMbx = 1;
+        _nextVpl = 1;
+        _nextFpl = 1;
+        _nextPoolCookie = 0x0E000000;
         _currentTid = 1;
         WaitingVblank = false;
         VblankWaits = 0;
         _cyclesSinceLastPreempt = 0;
-        // Main thread — already running
-        _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0 });
+        // Main thread — already running; priority 1 (high) matches typical EE idle/main setup
+        _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0, Priority = 1, InitialPriority = 1 });
         LogThreadEvent("MainReset", 1, 0, 0);
     }
 
@@ -192,6 +275,19 @@ public sealed class KernelState
                 foreach (var v in t.SavedGprFull) w.Write(v);
             }
             else w.Write(0);
+            // Phase-1 THREADMAN extensions (appended so older fields keep fixed offsets)
+            w.Write(t.Priority);
+            w.Write(t.InitialPriority);
+            w.Write(t.HasWaitReturn);
+            w.Write(t.WaitReturnCode);
+            w.Write(t.WaitMbxId);
+            w.Write(t.MbxReceivedMsg);
+            w.Write(t.WaitVplId);
+            w.Write(t.WaitVplSize);
+            w.Write(t.VplAllocatedPtr);
+            w.Write(t.WaitFplId);
+            w.Write(t.FplAllocatedPtr);
+            w.Write(t.DelayRemainingUs);
         }
 
         w.Write(_semas.Count);
@@ -209,6 +305,54 @@ public sealed class KernelState
             w.Write(kv.Value.Id);
             w.Write(kv.Value.Bits);
         }
+
+        w.Write(_nextMbx);
+        w.Write(_nextVpl);
+        w.Write(_nextFpl);
+        w.Write(_nextPoolCookie);
+
+        w.Write(_mbxs.Count);
+        foreach (var kv in _mbxs)
+        {
+            var m = kv.Value;
+            w.Write(m.Id);
+            w.Write(m.Attr);
+            w.Write(m.Option);
+            w.Write(m.Messages.Count);
+            foreach (var msg in m.Messages) w.Write(msg);
+        }
+
+        w.Write(_vpls.Count);
+        foreach (var kv in _vpls)
+        {
+            var v = kv.Value;
+            w.Write(v.Id);
+            w.Write(v.Attr);
+            w.Write(v.Option);
+            w.Write(v.PoolSize);
+            w.Write(v.FreeBytes);
+            w.Write(v.BasePtr);
+            w.Write(v.FreeBlocks.Count);
+            foreach (var b in v.FreeBlocks) { w.Write(b.Ptr); w.Write(b.Size); }
+            w.Write(v.UsedBlocks.Count);
+            foreach (var b in v.UsedBlocks) { w.Write(b.Ptr); w.Write(b.Size); }
+        }
+
+        w.Write(_fpls.Count);
+        foreach (var kv in _fpls)
+        {
+            var f = kv.Value;
+            w.Write(f.Id);
+            w.Write(f.Attr);
+            w.Write(f.Option);
+            w.Write(f.BlockSize);
+            w.Write(f.BlockCount);
+            w.Write(f.BasePtr);
+            w.Write(f.FreeBlocks.Count);
+            foreach (var p in f.FreeBlocks) w.Write(p);
+            w.Write(f.UsedBlocks.Count);
+            foreach (var p in f.UsedBlocks) w.Write(p);
+        }
     }
 
     public void ReadState(BinaryReader r)
@@ -216,6 +360,9 @@ public sealed class KernelState
         _threads.Clear();
         _semas.Clear();
         _flags.Clear();
+        _mbxs.Clear();
+        _vpls.Clear();
+        _fpls.Clear();
 
         _nextTid = r.ReadInt32();
         _nextSema = r.ReadInt32();
@@ -265,6 +412,18 @@ public sealed class KernelState
                 t.SavedGprFull = new ulong[fullLen];
                 for (int j = 0; j < fullLen; j++) t.SavedGprFull[j] = r.ReadUInt64();
             }
+            t.Priority = r.ReadInt32();
+            t.InitialPriority = r.ReadInt32();
+            t.HasWaitReturn = r.ReadBoolean();
+            t.WaitReturnCode = r.ReadInt32();
+            t.WaitMbxId = r.ReadInt32();
+            t.MbxReceivedMsg = r.ReadUInt32();
+            t.WaitVplId = r.ReadInt32();
+            t.WaitVplSize = r.ReadInt32();
+            t.VplAllocatedPtr = r.ReadUInt32();
+            t.WaitFplId = r.ReadInt32();
+            t.FplAllocatedPtr = r.ReadUInt32();
+            t.DelayRemainingUs = r.ReadInt32();
             _threads.Add(t);
         }
 
@@ -287,11 +446,69 @@ public sealed class KernelState
             var f = new EventFlag { Id = r.ReadInt32(), Bits = r.ReadUInt32() };
             _flags[f.Id] = f;
         }
+
+        _nextMbx = r.ReadInt32();
+        _nextVpl = r.ReadInt32();
+        _nextFpl = r.ReadInt32();
+        _nextPoolCookie = r.ReadUInt32();
+
+        int mbxCount = r.ReadInt32();
+        for (int i = 0; i < mbxCount; i++)
+        {
+            var m = new Mbx
+            {
+                Id = r.ReadInt32(),
+                Attr = r.ReadUInt32(),
+                Option = r.ReadUInt32()
+            };
+            int nMsg = r.ReadInt32();
+            for (int j = 0; j < nMsg; j++) m.Messages.Enqueue(r.ReadUInt32());
+            _mbxs[m.Id] = m;
+        }
+
+        int vplCount = r.ReadInt32();
+        for (int i = 0; i < vplCount; i++)
+        {
+            var v = new Vpl
+            {
+                Id = r.ReadInt32(),
+                Attr = r.ReadUInt32(),
+                Option = r.ReadUInt32(),
+                PoolSize = r.ReadInt32(),
+                FreeBytes = r.ReadInt32(),
+                BasePtr = r.ReadUInt32()
+            };
+            int nFree = r.ReadInt32();
+            for (int j = 0; j < nFree; j++) v.FreeBlocks.Add((r.ReadUInt32(), r.ReadInt32()));
+            int nUsed = r.ReadInt32();
+            for (int j = 0; j < nUsed; j++) v.UsedBlocks.Add((r.ReadUInt32(), r.ReadInt32()));
+            _vpls[v.Id] = v;
+        }
+
+        int fplCount = r.ReadInt32();
+        for (int i = 0; i < fplCount; i++)
+        {
+            var f = new Fpl
+            {
+                Id = r.ReadInt32(),
+                Attr = r.ReadUInt32(),
+                Option = r.ReadUInt32(),
+                BlockSize = r.ReadInt32(),
+                BlockCount = r.ReadInt32(),
+                BasePtr = r.ReadUInt32()
+            };
+            int nFree = r.ReadInt32();
+            for (int j = 0; j < nFree; j++) f.FreeBlocks.Enqueue(r.ReadUInt32());
+            int nUsed = r.ReadInt32();
+            for (int j = 0; j < nUsed; j++) f.UsedBlocks.Add(r.ReadUInt32());
+            _fpls[f.Id] = f;
+        }
     }
 
-    public int CreateThread(uint entry, uint gp, uint stack, uint stackSize = 0)
+    public int CreateThread(uint entry, uint gp, uint stack, uint stackSize = 0, int priority = 64)
     {
         int id = ++_nextTid;
+        int prio = priority < 1 ? 1 : (priority > 127 ? 127 : priority);
         _threads.Add(new Thread
         {
             Id = id,
@@ -304,10 +521,23 @@ public sealed class KernelState
             StackSize = stackSize,
             SavedPc = entry,
             SavedSp = stack,
-            SavedGp = gp
+            SavedGp = gp,
+            Priority = prio,
+            InitialPriority = prio
         });
-        LogThreadEvent("Create", id, entry, stack, $"gp=0x{gp:X8} stackSize=0x{stackSize:X}");
+        LogThreadEvent("Create", id, entry, stack, $"gp=0x{gp:X8} stackSize=0x{stackSize:X} prio={prio}");
         return id;
+    }
+
+    /// <summary>ps2sdk ChangeThreadPriority — lower value runs first. Returns previous priority.</summary>
+    public int ChangeThreadPriority(int id, int priority)
+    {
+        var t = FindThread(id == 0 ? _currentTid : id);
+        if (t == null || !t.Alive) return -1;
+        int old = t.Priority;
+        int prio = priority < 1 ? 1 : (priority > 127 ? 127 : priority);
+        t.Priority = prio;
+        return old;
     }
 
     public int DeleteThread(int id)
@@ -508,31 +738,91 @@ public sealed class KernelState
         return 0;
     }
 
-    /// <summary>Find next runnable thread id, or current if none.</summary>
+    /// <summary>True if thread is eligible for the ready set (Alive, started/main, not parked).</summary>
+    private static bool IsRunnable(Thread t)
+    {
+        if (!t.Alive || t.Sleeping || t.WaitVblank || t.SuspendCount > 0) return false;
+        // Primordial main (id 1) is runnable even when Started was never set via StartThread.
+        if (t.Id == 1) return true;
+        return t.Started;
+    }
+
+    /// <summary>
+    /// When true, <see cref="FindNextRunnable"/> uses circular RR (ignores Priority).
+    /// Midway SM (SLUS_210.87) needs this: G0 priority band + preempt reordered ADX pump
+    /// vs main → Exit@12.4M / no WAD. Default false preserves THREADMAN priority smokes.
+    /// Env <c>DETPS2_RR_SCHED=1</c> forces RR; <c>DETPS2_PRIO_SCHED=1</c> forces priority.
+    /// </summary>
+    public bool PreferRoundRobinSched { get; set; }
+
+    /// <summary>
+    /// Find next runnable thread id, or <paramref name="afterId"/> if none.
+    /// Default: priority-aware (THREADMAN readyq / μITRON: lower Priority runs first).
+    /// Circular RR when <see cref="PreferRoundRobinSched"/> or <c>DETPS2_RR_SCHED=1</c>.
+    /// </summary>
     public int FindNextRunnable(int afterId)
     {
         int idx = 0;
         for (int i = 0; i < _threads.Count; i++)
             if (_threads[i].Id == afterId) { idx = i; break; }
-        // i < Count (not <=): must NOT wrap around to re-check afterId itself. With <=, the last
-        // iteration lands back on (idx + Count) % Count == idx, i.e. the calling thread — which
-        // trivially satisfies its own Alive/Started/!Sleeping check (it's the one currently
-        // running), so it got returned as "the next runnable thread" before ever reaching the
-        // main-thread special case below. SwitchToNext then sees next==afterId and concludes
-        // "nobody else runnable," permanently starving thread 1 (whose Started flag is never set,
-        // since it's the primordial thread and never goes through StartThread) any time the
-        // current thread happened to satisfy its own criteria — confirmed live (2026-07-27):
-        // thread 2's own dispatch loop never yielded back to thread 1 once it stopped needing to
-        // genuinely block, even though thread 1 was Alive and !Sleeping the whole time.
+
+        bool forcePrio = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_PRIO_SCHED"), "1",
+            StringComparison.Ordinal);
+        bool forceRr = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_RR_SCHED"), "1",
+            StringComparison.Ordinal);
+        bool prioSched = forcePrio || (!forceRr && !PreferRoundRobinSched);
+
+        if (prioSched)
+        {
+            // Best priority among OTHER runnable threads (exclude afterId for selection).
+            int bestPrio = int.MaxValue;
+            bool found = false;
+            for (int i = 0; i < _threads.Count; i++)
+            {
+                var t = _threads[i];
+                if (t.Id == afterId) continue;
+                if (!IsRunnable(t)) continue;
+                if (t.Priority < bestPrio)
+                {
+                    bestPrio = t.Priority;
+                    found = true;
+                }
+            }
+            if (!found)
+            {
+                var mainP = FindThread(1);
+                if (mainP != null && mainP.Id != afterId && mainP.Alive && !mainP.Sleeping
+                    && mainP.SuspendCount == 0)
+                    return 1;
+                return afterId;
+            }
+
+            for (int i = 1; i < _threads.Count; i++)
+            {
+                var t = _threads[(idx + i) % _threads.Count];
+                if (t.Id == afterId) continue;
+                if (IsRunnable(t) && t.Priority == bestPrio)
+                    return t.Id;
+            }
+            return afterId;
+        }
+
+        // Default commercial RR (pre-G0): ignore Priority field; circular after afterId.
+        // i < Count (not <=): must NOT wrap onto afterId itself (see historical thrash note).
         for (int i = 1; i < _threads.Count; i++)
         {
             var t = _threads[(idx + i) % _threads.Count];
-            if (t.Alive && t.Started && !t.Sleeping && !t.WaitVblank)
+            if (t.Id == afterId) continue;
+            // Match pre-G0: Alive+Started+!Sleeping+!WaitVblank. Also respect Suspend nest.
+            if (t.Alive && t.Started && !t.Sleeping && !t.WaitVblank && t.SuspendCount == 0)
                 return t.Id;
         }
         // Also allow main thread (id 1) even if Started flag never set
         var main = FindThread(1);
-        if (main != null && main.Alive && !main.Sleeping)
+        if (main != null && main.Id != afterId && main.Alive && !main.Sleeping
+            && main.SuspendCount == 0)
             return 1;
         return afterId;
     }
@@ -617,6 +907,8 @@ public sealed class KernelState
             for (int i = 1; i < 32; i++)
                 ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
             // Snapshot consumed — next leave must SaveFullContext again if preempted.
+            // Apply waiter return ($v0) before clearing HasFullSave so DeleteSema/ReleaseWait codes stick.
+            ApplyWaitReturnIfAny(ee, t);
             t.HasFullSave = false;
             t.Sleeping = false;
             t.Started = true;
@@ -657,8 +949,29 @@ public sealed class KernelState
         }
         t.Sleeping = false;
         t.Started = true;
+        ApplyWaitReturnIfAny(ee, t);
         LogThreadEvent("SwitchTo", id, pc, t.SavedSp, fromSyscall ? "fromSyscall" : "cooperative");
         return true;
+    }
+
+    /// <summary>Patch $v0 when DeleteSema/ReleaseWait/etc. set a waiter return code.</summary>
+    private static void ApplyWaitReturnIfAny(EmotionEngine ee, Thread t)
+    {
+        if (!t.HasWaitReturn) return;
+        ulong v = unchecked((ulong)(long)t.WaitReturnCode);
+        ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v });
+        if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
+            t.SavedGprFull[2] = v;
+        t.HasWaitReturn = false;
+    }
+
+    /// <summary>Record waiter return code and optionally patch a full save's $v0 before resume.</summary>
+    private static void SetWaitReturn(Thread t, int code)
+    {
+        t.HasWaitReturn = true;
+        t.WaitReturnCode = code;
+        if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
+            t.SavedGprFull[2] = unchecked((ulong)(long)code);
     }
 
     /// <summary>
@@ -824,6 +1137,7 @@ public sealed class KernelState
         ee.PC = t.SavedPc;
         for (int i = 1; i < 32; i++) // skip $zero
             ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
+        ApplyWaitReturnIfAny(ee, t);
         // Don't clear SuspendThread park on preempt-in
         if (t.SuspendCount == 0)
             t.Sleeping = false;
@@ -843,6 +1157,14 @@ public sealed class KernelState
     /// </summary>
     public void MaybePreempt(EmotionEngine ee)
     {
+        // Force preemption stays ON by default (busy-loops like Midway ADX lock-wait at
+        // 0x4145xx never call WaitSema — without timeslice SM freezes sifBytes~2k).
+        // Pair with RR FindNextRunnable (DETPS2_PRIO_SCHED off) — priority+preempt combo
+        // caused Exit@12.4M on SLUS_210.87. DETPS2_NO_PREEMPT=1 disables for A/B.
+        if (string.Equals(Environment.GetEnvironmentVariable("DETPS2_NO_PREEMPT"), "1",
+                StringComparison.Ordinal))
+            return;
+
         _cyclesSinceLastPreempt++;
         if (_cyclesSinceLastPreempt < _preemptQuantum) return;
         _cyclesSinceLastPreempt = 0;
@@ -892,6 +1214,8 @@ public sealed class KernelState
                     t.Sleeping = false;
             }
         }
+        // ~1/60s ≈ 16667 µs — DelayThread alarm path (FUN_00002444) via VBlank ticks.
+        TickDelays(16667);
     }
 
     public int CreateSema(int init, int max)
@@ -923,9 +1247,8 @@ public sealed class KernelState
 
     /// <summary>
     /// BIOS THREADMAN DeleteSema (FUN_00003164): remove the object and wake every waiter.
-    /// Real IOP writes waiter return <c>0xfffffe57</c>; EE HLE clears the wait and leaves
-    /// Suspend nest intact (do not make a Suspend-parked peer runnable just because its
-    /// WaitSema was torn down).
+    /// Real IOP writes waiter return <c>0xfffffe57</c> (KeWaitDelete); EE HLE stores that on
+    /// the thread for $v0 patch on restore, and leaves Suspend nest intact.
     /// </summary>
     public int DeleteSema(int id)
     {
@@ -933,9 +1256,44 @@ public sealed class KernelState
         foreach (var t in _threads)
         {
             if (t.Alive && t.Sleeping && t.WaitSemaId == id)
+            {
+                SetWaitReturn(t, KeWaitDelete);
                 ClearSemaWait(t);
+            }
         }
         return 0;
+    }
+
+    /// <summary>
+    /// BIOS THREADMAN / EE ReleaseWaitThread (syscall 0x2D): force-release any wait
+    /// (Sleep / WaitSema / ReceiveMbx / Delay / event flag / pool) with return
+    /// <see cref="KeReleaseWait"/> (<c>0xfffffe5e</c>).
+    /// </summary>
+    public int ReleaseWaitThread(int id)
+    {
+        var t = FindThread(id == 0 ? _currentTid : id);
+        if (t == null || !t.Alive) return -1;
+        bool waiting = t.Sleeping || t.WaitVblank || t.WaitSemaId != 0 || t.WaitEfId != 0
+            || t.WaitMbxId != 0 || t.WaitVplId != 0 || t.WaitFplId != 0 || t.DelayRemainingUs > 0;
+        if (!waiting) return -1;
+        SetWaitReturn(t, KeReleaseWait);
+        ClearAllWaits(t);
+        return 0;
+    }
+
+    /// <summary>Clear every cooperative wait reason (not Suspend nest).</summary>
+    private void ClearAllWaits(Thread t)
+    {
+        t.WaitSemaId = 0;
+        t.WaitEfId = 0;
+        t.WaitMbxId = 0;
+        t.WaitVplId = 0;
+        t.WaitVplSize = 0;
+        t.WaitFplId = 0;
+        t.DelayRemainingUs = 0;
+        t.WaitVblank = false;
+        if (t.SuspendCount == 0)
+            t.Sleeping = false;
     }
 
     /// <summary>Non-mutating existence check — unlike WaitSemaBlocking, does not consume a count.</summary>
@@ -1137,6 +1495,451 @@ public sealed class KernelState
         t.WaitEfPattern = pattern;
         t.WaitEfMode = mode;
         t.WaitEfResultAddr = resultAddr;
+    }
+
+    // -------------------------------------------------------------------------
+    // Message boxes (THREADMAN thmsgbx / FUN_000037c0…03fa4 — magic 0x7f04)
+    // EE has no CreateMbx syscall (ps2sdk kernel.h); public KernelState API for IOP HLE /
+    // host tests. Opaque message values are uint pointers (guest message packet addresses).
+    // -------------------------------------------------------------------------
+
+    public bool LastReceiveMbxBlocked { get; private set; }
+
+    public int CreateMbx(uint attr = 0, uint option = 0)
+    {
+        int id = _nextMbx++;
+        _mbxs[id] = new Mbx { Id = id, Attr = attr, Option = option };
+        return id;
+    }
+
+    public int DeleteMbx(int id)
+    {
+        if (!_mbxs.Remove(id)) return -1;
+        foreach (var t in _threads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitMbxId == id)
+            {
+                SetWaitReturn(t, KeWaitDelete);
+                t.WaitMbxId = 0;
+                if (t.SuspendCount == 0) t.Sleeping = false;
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// SendMbx (FUN_00003a84): if a ReceiveMbx waiter exists, deliver to one and wake;
+    /// else enqueue the message pointer.
+    /// </summary>
+    public int SendMbx(int id, uint msgPtr)
+    {
+        if (!_mbxs.TryGetValue(id, out var m)) return KeUnknownObject;
+        foreach (var t in _threads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitMbxId == id)
+            {
+                t.MbxReceivedMsg = msgPtr;
+                t.WaitMbxId = 0;
+                if (t.SuspendCount == 0) t.Sleeping = false;
+                return 0;
+            }
+        }
+        m.Messages.Enqueue(msgPtr);
+        return 0;
+    }
+
+    /// <summary>
+    /// ReceiveMbx (FUN_00003c40): dequeue or park. Returns 0 and sets <paramref name="msg"/>;
+    /// on block returns −1 with <see cref="LastReceiveMbxBlocked"/> true (caller yields).
+    /// </summary>
+    public int ReceiveMbx(int id, out uint msg)
+    {
+        msg = 0;
+        LastReceiveMbxBlocked = false;
+        if (!_mbxs.TryGetValue(id, out var m)) return KeUnknownObject;
+        if (m.Messages.Count > 0)
+        {
+            msg = m.Messages.Dequeue();
+            return 0;
+        }
+        var t = FindThread(_currentTid);
+        if (t == null) return -1;
+        t.Sleeping = true;
+        t.WaitMbxId = id;
+        t.MbxReceivedMsg = 0;
+        LastReceiveMbxBlocked = true;
+        return -1;
+    }
+
+    /// <summary>PollMbx (FUN_00003de4): non-blocking; <see cref="KeMboxNomsg"/> when empty.</summary>
+    public int PollMbx(int id, out uint msg)
+    {
+        msg = 0;
+        if (!_mbxs.TryGetValue(id, out var m)) return KeUnknownObject;
+        if (m.Messages.Count == 0) return KeMboxNomsg;
+        msg = m.Messages.Dequeue();
+        return 0;
+    }
+
+    /// <summary>Take message delivered to a woken ReceiveMbx waiter (after SendMbx rendezvous).</summary>
+    public uint TakeMbxReceivedMsg(int threadId = 0)
+    {
+        var t = FindThread(threadId == 0 ? _currentTid : threadId);
+        if (t == null) return 0;
+        uint m = t.MbxReceivedMsg;
+        t.MbxReceivedMsg = 0;
+        return m;
+    }
+
+    public int ReferMbx(int id, out uint attr, out uint option, out int numMessages, out int numWaiters)
+    {
+        attr = option = 0;
+        numMessages = numWaiters = 0;
+        if (!_mbxs.TryGetValue(id, out var m)) return KeUnknownObject;
+        attr = m.Attr;
+        option = m.Option;
+        numMessages = m.Messages.Count;
+        foreach (var t in _threads)
+            if (t.Alive && t.Sleeping && t.WaitMbxId == id) numWaiters++;
+        return 0;
+    }
+
+    public bool MbxExists(int id) => _mbxs.ContainsKey(id);
+
+    // -------------------------------------------------------------------------
+    // Variable pools (THREADMAN thvpool / FUN_00004020…047b0 — magic 0x7f05)
+    // Host freelist with synthetic pointer cookies (not mapped RDRAM).
+    // -------------------------------------------------------------------------
+
+    public bool LastAllocateVplBlocked { get; private set; }
+
+    public int CreateVpl(int size, uint attr = 0, uint option = 0)
+    {
+        if (size <= 0) return -1;
+        int id = _nextVpl++;
+        uint basePtr = _nextPoolCookie;
+        // Reserve a cookie region large enough for the pool (align 16)
+        uint span = (uint)((size + 15) & ~15);
+        _nextPoolCookie = basePtr + span + 0x1000;
+        var v = new Vpl
+        {
+            Id = id,
+            Attr = attr,
+            Option = option,
+            PoolSize = size,
+            FreeBytes = size,
+            BasePtr = basePtr
+        };
+        v.FreeBlocks.Add((basePtr, size));
+        _vpls[id] = v;
+        return id;
+    }
+
+    public int DeleteVpl(int id)
+    {
+        if (!_vpls.Remove(id)) return -1;
+        foreach (var t in _threads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitVplId == id)
+            {
+                SetWaitReturn(t, KeWaitDelete);
+                t.WaitVplId = 0;
+                t.WaitVplSize = 0;
+                if (t.SuspendCount == 0) t.Sleeping = false;
+            }
+        }
+        return 0;
+    }
+
+    private static int TryAllocVpl(Vpl v, int size, out uint ptr)
+    {
+        ptr = 0;
+        if (size <= 0 || size > v.PoolSize) return -1;
+        for (int i = 0; i < v.FreeBlocks.Count; i++)
+        {
+            var (fp, fs) = v.FreeBlocks[i];
+            if (fs < size) continue;
+            ptr = fp;
+            v.FreeBlocks.RemoveAt(i);
+            int rem = fs - size;
+            if (rem > 0)
+                v.FreeBlocks.Insert(i, (fp + (uint)size, rem));
+            v.UsedBlocks.Add((ptr, size));
+            v.FreeBytes -= size;
+            return 0;
+        }
+        return KeNoMemory;
+    }
+
+    /// <summary>AllocateVpl (FUN_00004258): park when no free block (blocking).</summary>
+    public int AllocateVpl(int id, int size, out uint ptr)
+    {
+        ptr = 0;
+        LastAllocateVplBlocked = false;
+        if (!_vpls.TryGetValue(id, out var v)) return KeUnknownObject;
+        int r = TryAllocVpl(v, size, out ptr);
+        if (r == 0) return 0;
+        if (r == -1) return -1; // size invalid
+        var t = FindThread(_currentTid);
+        if (t == null) return KeNoMemory;
+        t.Sleeping = true;
+        t.WaitVplId = id;
+        t.WaitVplSize = size;
+        t.VplAllocatedPtr = 0;
+        LastAllocateVplBlocked = true;
+        return -1;
+    }
+
+    /// <summary>Non-blocking AllocateVpl (FUN_0000440c / poll path).</summary>
+    public int PollAllocateVpl(int id, int size, out uint ptr)
+    {
+        ptr = 0;
+        if (!_vpls.TryGetValue(id, out var v)) return KeUnknownObject;
+        int r = TryAllocVpl(v, size, out ptr);
+        return r == 0 ? 0 : (r == -1 ? -1 : KeNoMemory);
+    }
+
+    public int FreeVpl(int id, uint ptr)
+    {
+        if (!_vpls.TryGetValue(id, out var v)) return KeUnknownObject;
+        int idx = -1;
+        int size = 0;
+        for (int i = 0; i < v.UsedBlocks.Count; i++)
+        {
+            if (v.UsedBlocks[i].Ptr == ptr)
+            {
+                idx = i;
+                size = v.UsedBlocks[i].Size;
+                break;
+            }
+        }
+        if (idx < 0) return -1;
+        v.UsedBlocks.RemoveAt(idx);
+        // Coalesce into free list (simple insert + adjacent merge)
+        v.FreeBlocks.Add((ptr, size));
+        v.FreeBytes += size;
+        CoalesceFree(v);
+
+        // Wake one AllocateVpl waiter if a block can now satisfy them
+        foreach (var t in _threads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitVplId != id) continue;
+            if (TryAllocVpl(v, t.WaitVplSize, out uint wptr) != 0) continue;
+            t.VplAllocatedPtr = wptr;
+            t.WaitVplId = 0;
+            t.WaitVplSize = 0;
+            if (t.SuspendCount == 0) t.Sleeping = false;
+            break;
+        }
+        return 0;
+    }
+
+    private static void CoalesceFree(Vpl v)
+    {
+        if (v.FreeBlocks.Count < 2) return;
+        v.FreeBlocks.Sort((a, b) => a.Ptr.CompareTo(b.Ptr));
+        var merged = new List<(uint Ptr, int Size)>();
+        var cur = v.FreeBlocks[0];
+        for (int i = 1; i < v.FreeBlocks.Count; i++)
+        {
+            var n = v.FreeBlocks[i];
+            if (cur.Ptr + (uint)cur.Size == n.Ptr)
+                cur = (cur.Ptr, cur.Size + n.Size);
+            else
+            {
+                merged.Add(cur);
+                cur = n;
+            }
+        }
+        merged.Add(cur);
+        v.FreeBlocks.Clear();
+        v.FreeBlocks.AddRange(merged);
+    }
+
+    public uint TakeVplAllocatedPtr(int threadId = 0)
+    {
+        var t = FindThread(threadId == 0 ? _currentTid : threadId);
+        if (t == null) return 0;
+        uint p = t.VplAllocatedPtr;
+        t.VplAllocatedPtr = 0;
+        return p;
+    }
+
+    public int ReferVpl(int id, out uint attr, out uint option, out int poolSize, out int freeSize, out int numWaiters)
+    {
+        attr = option = 0;
+        poolSize = freeSize = numWaiters = 0;
+        if (!_vpls.TryGetValue(id, out var v)) return KeUnknownObject;
+        attr = v.Attr;
+        option = v.Option;
+        poolSize = v.PoolSize;
+        freeSize = v.FreeBytes;
+        foreach (var t in _threads)
+            if (t.Alive && t.Sleeping && t.WaitVplId == id) numWaiters++;
+        return 0;
+    }
+
+    public bool VplExists(int id) => _vpls.ContainsKey(id);
+
+    // -------------------------------------------------------------------------
+    // Fixed pools (THREADMAN thfpool / FUN_00004830… — magic 0x7f06)
+    // -------------------------------------------------------------------------
+
+    public bool LastAllocateFplBlocked { get; private set; }
+
+    public int CreateFpl(int blockSize, int blockCount, uint attr = 0, uint option = 0)
+    {
+        if (blockSize <= 0 || blockCount <= 0) return -1;
+        int aligned = (blockSize + 3) & ~3;
+        int id = _nextFpl++;
+        uint basePtr = _nextPoolCookie;
+        uint span = (uint)(aligned * blockCount);
+        _nextPoolCookie = basePtr + span + 0x1000;
+        var f = new Fpl
+        {
+            Id = id,
+            Attr = attr,
+            Option = option,
+            BlockSize = aligned,
+            BlockCount = blockCount,
+            BasePtr = basePtr
+        };
+        for (int i = 0; i < blockCount; i++)
+            f.FreeBlocks.Enqueue(basePtr + (uint)(i * aligned));
+        _fpls[id] = f;
+        return id;
+    }
+
+    public int DeleteFpl(int id)
+    {
+        if (!_fpls.Remove(id)) return -1;
+        foreach (var t in _threads)
+        {
+            if (t.Alive && t.Sleeping && t.WaitFplId == id)
+            {
+                SetWaitReturn(t, KeWaitDelete);
+                t.WaitFplId = 0;
+                if (t.SuspendCount == 0) t.Sleeping = false;
+            }
+        }
+        return 0;
+    }
+
+    public int AllocateFpl(int id, out uint ptr)
+    {
+        ptr = 0;
+        LastAllocateFplBlocked = false;
+        if (!_fpls.TryGetValue(id, out var f)) return KeUnknownObject;
+        if (f.FreeBlocks.Count > 0)
+        {
+            ptr = f.FreeBlocks.Dequeue();
+            f.UsedBlocks.Add(ptr);
+            return 0;
+        }
+        var t = FindThread(_currentTid);
+        if (t == null) return KeNoMemory;
+        t.Sleeping = true;
+        t.WaitFplId = id;
+        t.FplAllocatedPtr = 0;
+        LastAllocateFplBlocked = true;
+        return -1;
+    }
+
+    public int PollAllocateFpl(int id, out uint ptr)
+    {
+        ptr = 0;
+        if (!_fpls.TryGetValue(id, out var f)) return KeUnknownObject;
+        if (f.FreeBlocks.Count == 0) return KeNoMemory;
+        ptr = f.FreeBlocks.Dequeue();
+        f.UsedBlocks.Add(ptr);
+        return 0;
+    }
+
+    public int FreeFpl(int id, uint ptr)
+    {
+        if (!_fpls.TryGetValue(id, out var f)) return KeUnknownObject;
+        if (!f.UsedBlocks.Remove(ptr)) return -1;
+        // Prefer waking a waiter over returning to free list first
+        foreach (var t in _threads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitFplId != id) continue;
+            t.FplAllocatedPtr = ptr;
+            t.WaitFplId = 0;
+            f.UsedBlocks.Add(ptr);
+            if (t.SuspendCount == 0) t.Sleeping = false;
+            return 0;
+        }
+        f.FreeBlocks.Enqueue(ptr);
+        return 0;
+    }
+
+    public uint TakeFplAllocatedPtr(int threadId = 0)
+    {
+        var t = FindThread(threadId == 0 ? _currentTid : threadId);
+        if (t == null) return 0;
+        uint p = t.FplAllocatedPtr;
+        t.FplAllocatedPtr = 0;
+        return p;
+    }
+
+    public int ReferFpl(int id, out uint attr, out uint option, out int blockSize, out int freeBlocks, out int numWaiters)
+    {
+        attr = option = 0;
+        blockSize = freeBlocks = numWaiters = 0;
+        if (!_fpls.TryGetValue(id, out var f)) return KeUnknownObject;
+        attr = f.Attr;
+        option = f.Option;
+        blockSize = f.BlockSize;
+        freeBlocks = f.FreeBlocks.Count;
+        foreach (var t in _threads)
+            if (t.Alive && t.Sleeping && t.WaitFplId == id) numWaiters++;
+        return 0;
+    }
+
+    public bool FplExists(int id) => _fpls.ContainsKey(id);
+
+    // -------------------------------------------------------------------------
+    // DelayThread (THREADMAN FUN_00002444) — alarm-style park; not an EE syscall.
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Park current thread for approximately <paramref name="usec"/> microseconds.
+    /// Released by <see cref="TickDelays"/> (also called from <see cref="OnVblank"/> with ~16667 µs).
+    /// </summary>
+    public int DelayThread(int usec)
+    {
+        var t = FindThread(_currentTid);
+        if (t == null) return -1;
+        if (usec <= 0) return 0;
+        t.Sleeping = true;
+        t.DelayRemainingUs = usec;
+        // Pure delay: not a WaitSema/Mbx park
+        t.WaitSemaId = 0;
+        return 0;
+    }
+
+    /// <summary>
+    /// Advance DelayThread parks by <paramref name="usec"/> microseconds.
+    /// Called from <see cref="OnVblank"/> (~16667 µs/frame). Returns woken count.
+    /// </summary>
+    public int TickDelays(int usec)
+    {
+        if (usec <= 0) return 0;
+        int woken = 0;
+        foreach (var t in _threads)
+        {
+            if (!t.Alive || t.DelayRemainingUs <= 0) continue;
+            t.DelayRemainingUs -= usec;
+            if (t.DelayRemainingUs > 0) continue;
+            t.DelayRemainingUs = 0;
+            if (t.SuspendCount == 0 && t.WaitSemaId == 0 && t.WaitEfId == 0
+                && t.WaitMbxId == 0 && t.WaitVplId == 0 && t.WaitFplId == 0)
+            {
+                t.Sleeping = false;
+                woken++;
+            }
+        }
+        return woken;
     }
 
     private Thread? FindThread(int id)

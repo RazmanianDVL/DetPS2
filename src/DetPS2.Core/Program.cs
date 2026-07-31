@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using DetPS2.Core;
 
 // Headless CLI
@@ -16,6 +17,9 @@ using DetPS2.Core;
 //   detps2 netplay-cert [frames]
 //   detps2 elf-info [user-media.json]
 //   detps2 blocker-trace [user-media.json] [cycles] [--dump=ADDR:LEN] [--trace-window=N]
+//   detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]
+//   detps2 wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]
+//   detps2 wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]
 //   detps2 disasm <user-media.json> <cycles> <addr>:<len> [titleIndex]
 //   detps2 pad-inject [user-media.json] --cycles=N [--press=BUTTON:CYCLE[:HOLD]]... [--sample-every=N] [--host-present]
 //   detps2 long-run <user-media.json> --hours=N [--log=PATH] [--checkpoint-seconds=S]
@@ -519,6 +523,284 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 Console.WriteLine($"    pc=0x{kv.Key:X8} hits={kv.Value} op=0x{word:X8}  {EeDisassembler.Disassemble((uint)kv.Key, word)}");
             }
         }
+    }
+    Environment.Exit(0);
+}
+
+// detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]
+//   Soft-GS scoreboard metrics only (no GPU present). Boots each title like blocker-trace,
+//   runs N cycles (optional 1M-slice OnHostPresent), prints one JSON object per title with
+//   the fields scoreboard.ps1 / run-title.ps1 already scrape from blocker-trace text.
+if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2 || args[1].StartsWith("--"))
+    {
+        Console.Error.WriteLine("usage: detps2 scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]");
+        Environment.Exit(1);
+    }
+    UserMediaConfig smCfg = UserMediaConfig.Load(args[1]);
+    ulong smCycles = 5_000_000;
+    string? smOut = null;
+    bool smHostPresent = args.Contains("--host-present");
+    foreach (var a in args)
+    {
+        if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) smCycles = c;
+        else if (a.StartsWith("--out=")) smOut = a.Substring(6);
+    }
+
+    var smResults = new List<object>();
+    var jsonOpts = new JsonSerializerOptions { WriteIndented = false };
+
+    foreach (var title in smCfg.Titles)
+    {
+        if (!title.Exists)
+        {
+            Console.Error.WriteLine($"[{title.Id}] missing: {title.Path}");
+            continue;
+        }
+
+        var smSys = new Ps2System();
+        smSys.Telemetry.Reset();
+        smSys.LoadBios(smCfg.BiosPath);
+
+        string? serial = null;
+        if ((title.Kind ?? "iso").ToLowerInvariant() == "elf")
+        {
+            smSys.LoadElf(File.ReadAllBytes(title.Path));
+        }
+        else
+        {
+            var boot = smSys.BootDiscFile(title.Path);
+            serial = MediaVerify.ExtractSerial(null, boot.BootPath)
+                     ?? smSys.ActiveQuirk?.Serial;
+        }
+
+        if (smHostPresent)
+        {
+            const ulong slice = 1_000_000;
+            ulong remaining = smCycles;
+            while (remaining > 0)
+            {
+                ulong step = Math.Min(slice, remaining);
+                smSys.RunFor(step);
+                smSys.ActiveQuirk?.OnHostPresent(smSys);
+                remaining -= step;
+            }
+        }
+        else
+        {
+            smSys.RunFor(smCycles);
+        }
+
+        var rpc = smSys.Hle.Sony?.RealRpc;
+        var metrics = new Dictionary<string, object?>
+        {
+            ["id"] = title.Id,
+            ["serial"] = serial ?? "",
+            ["pc"] = $"0x{smSys.EE.PC:X8}",
+            ["px"] = smSys.Gs.PixelsWritten,
+            ["gifPath3"] = smSys.Gif.Path3Transfers,
+            ["dmac"] = smSys.Dmac.TransfersCompleted,
+            ["cdvdSectors"] = smSys.Cdvd.SectorsRead,
+            ["syscalls"] = smSys.Hle.SyscallCount,
+            ["sifBytes"] = smSys.Sif.BytesTransferred,
+            ["binds"] = rpc?.Binds ?? 0UL,
+            ["calls"] = rpc?.Calls ?? 0UL,
+            ["exitRequested"] = smSys.Hle.ExitRequested,
+            ["exitCode"] = smSys.Hle.ExitCode,
+            ["cycles"] = smSys.MasterCycles,
+        };
+        smResults.Add(metrics);
+        Console.WriteLine(JsonSerializer.Serialize(metrics, jsonOpts));
+    }
+
+    if (!string.IsNullOrEmpty(smOut))
+    {
+        string? dir = Path.GetDirectoryName(smOut);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        // Array when multi-title; still valid JSON for a single title.
+        string body = smResults.Count == 1
+            ? JsonSerializer.Serialize(smResults[0], new JsonSerializerOptions { WriteIndented = true })
+            : JsonSerializer.Serialize(smResults, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(smOut, body);
+        Console.Error.WriteLine($"Wrote {smOut}");
+    }
+    Environment.Exit(smResults.Count > 0 ? 0 : 1);
+}
+
+// detps2 wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]
+//   Boot first existing title, run N cycles (optional host-present slices), write compressed
+//   SaveState to --out. Soft-GS only; no frame present required.
+if (args.Length > 0 && args[0].Equals("wall-save", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2 || args[1].StartsWith("--"))
+    {
+        Console.Error.WriteLine("usage: detps2 wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]");
+        Environment.Exit(1);
+    }
+    UserMediaConfig wsCfg = UserMediaConfig.Load(args[1]);
+    ulong wsCycles = 0;
+    string? wsOut = null;
+    bool wsHostPresent = args.Contains("--host-present");
+    foreach (var a in args)
+    {
+        if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) wsCycles = c;
+        else if (a.StartsWith("--out=")) wsOut = a.Substring(6);
+    }
+    if (wsCycles == 0 || string.IsNullOrEmpty(wsOut))
+    {
+        Console.Error.WriteLine("usage: detps2 wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]");
+        Environment.Exit(1);
+    }
+
+    var wsTitle = wsCfg.Titles.FirstOrDefault(t => t.Exists);
+    if (wsTitle == null)
+    {
+        Console.Error.WriteLine("No existing title in user-media.json");
+        Environment.Exit(1);
+    }
+
+    var wsSys = new Ps2System();
+    wsSys.LoadBios(wsCfg.BiosPath);
+    string wsBootMsg = (wsTitle.Kind ?? "iso").ToLowerInvariant() == "elf"
+        ? $"ELF entry=0x{wsSys.LoadElf(File.ReadAllBytes(wsTitle.Path)).Entry:X8}"
+        : wsSys.BootDiscFile(wsTitle.Path).Message;
+    Console.Error.WriteLine($"[{wsTitle.Id}] {wsBootMsg}");
+
+    if (wsHostPresent)
+    {
+        const ulong slice = 1_000_000;
+        ulong remaining = wsCycles;
+        while (remaining > 0)
+        {
+            ulong step = Math.Min(slice, remaining);
+            wsSys.RunFor(step);
+            wsSys.ActiveQuirk?.OnHostPresent(wsSys);
+            remaining -= step;
+        }
+    }
+    else
+    {
+        wsSys.RunFor(wsCycles);
+    }
+
+    byte[] state = wsSys.SaveState(compress: true);
+    string? wsDir = Path.GetDirectoryName(wsOut);
+    if (!string.IsNullOrEmpty(wsDir))
+        Directory.CreateDirectory(wsDir);
+    File.WriteAllBytes(wsOut, state);
+    Console.Error.WriteLine($"wall-save: wrote {state.Length:N0} bytes → {wsOut} (cyc={wsSys.MasterCycles} PC=0x{wsSys.EE.PC:X8})");
+    Environment.Exit(0);
+}
+
+// detps2 wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]
+//   Load bios+iso (first existing title), LoadState from --in, run additional N cycles, print
+//   scoreboard-metrics-style JSON summary (and optional --out-metrics file).
+if (args.Length > 0 && args[0].Equals("wall-load", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2 || args[1].StartsWith("--"))
+    {
+        Console.Error.WriteLine("usage: detps2 wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]");
+        Environment.Exit(1);
+    }
+    UserMediaConfig wlCfg = UserMediaConfig.Load(args[1]);
+    ulong wlCycles = 0;
+    string? wlIn = null;
+    string? wlOutMetrics = null;
+    bool wlHostPresent = args.Contains("--host-present");
+    foreach (var a in args)
+    {
+        if (a.StartsWith("--cycles=") && ulong.TryParse(a.AsSpan(9), out var c)) wlCycles = c;
+        else if (a.StartsWith("--in=")) wlIn = a.Substring(5);
+        else if (a.StartsWith("--out-metrics=")) wlOutMetrics = a.Substring(14);
+    }
+    if (wlCycles == 0 || string.IsNullOrEmpty(wlIn))
+    {
+        Console.Error.WriteLine("usage: detps2 wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]");
+        Environment.Exit(1);
+    }
+    if (!File.Exists(wlIn))
+    {
+        Console.Error.WriteLine($"state file not found: {wlIn}");
+        Environment.Exit(1);
+    }
+
+    var wlTitle = wlCfg.Titles.FirstOrDefault(t => t.Exists);
+    if (wlTitle == null)
+    {
+        Console.Error.WriteLine("No existing title in user-media.json");
+        Environment.Exit(1);
+    }
+
+    var wlSys = new Ps2System();
+    wlSys.LoadBios(wlCfg.BiosPath);
+    string? wlSerial = null;
+    if ((wlTitle.Kind ?? "iso").ToLowerInvariant() == "elf")
+    {
+        wlSys.LoadElf(File.ReadAllBytes(wlTitle.Path));
+    }
+    else
+    {
+        var wlBoot = wlSys.BootDiscFile(wlTitle.Path);
+        wlSerial = MediaVerify.ExtractSerial(null, wlBoot.BootPath)
+                   ?? wlSys.ActiveQuirk?.Serial;
+        Console.Error.WriteLine($"[{wlTitle.Id}] {wlBoot.Message}");
+    }
+
+    byte[] wlState = File.ReadAllBytes(wlIn);
+    if (!wlSys.LoadState(wlState))
+    {
+        Console.Error.WriteLine($"LoadState failed for {wlIn}");
+        Environment.Exit(1);
+    }
+    Console.Error.WriteLine($"wall-load: restored cyc={wlSys.MasterCycles} PC=0x{wlSys.EE.PC:X8}");
+
+    if (wlHostPresent)
+    {
+        const ulong slice = 1_000_000;
+        ulong remaining = wlCycles;
+        while (remaining > 0)
+        {
+            ulong step = Math.Min(slice, remaining);
+            wlSys.RunFor(step);
+            wlSys.ActiveQuirk?.OnHostPresent(wlSys);
+            remaining -= step;
+        }
+    }
+    else
+    {
+        wlSys.RunFor(wlCycles);
+    }
+
+    var wlRpc = wlSys.Hle.Sony?.RealRpc;
+    var wlMetrics = new Dictionary<string, object?>
+    {
+        ["id"] = wlTitle.Id,
+        ["serial"] = wlSerial ?? "",
+        ["pc"] = $"0x{wlSys.EE.PC:X8}",
+        ["px"] = wlSys.Gs.PixelsWritten,
+        ["gifPath3"] = wlSys.Gif.Path3Transfers,
+        ["dmac"] = wlSys.Dmac.TransfersCompleted,
+        ["cdvdSectors"] = wlSys.Cdvd.SectorsRead,
+        ["syscalls"] = wlSys.Hle.SyscallCount,
+        ["sifBytes"] = wlSys.Sif.BytesTransferred,
+        ["binds"] = wlRpc?.Binds ?? 0UL,
+        ["calls"] = wlRpc?.Calls ?? 0UL,
+        ["exitRequested"] = wlSys.Hle.ExitRequested,
+        ["exitCode"] = wlSys.Hle.ExitCode,
+        ["cycles"] = wlSys.MasterCycles,
+    };
+    string wlJson = JsonSerializer.Serialize(wlMetrics, new JsonSerializerOptions { WriteIndented = false });
+    Console.WriteLine(wlJson);
+    if (!string.IsNullOrEmpty(wlOutMetrics))
+    {
+        string? mdir = Path.GetDirectoryName(wlOutMetrics);
+        if (!string.IsNullOrEmpty(mdir))
+            Directory.CreateDirectory(mdir);
+        File.WriteAllText(wlOutMetrics,
+            JsonSerializer.Serialize(wlMetrics, new JsonSerializerOptions { WriteIndented = true }));
+        Console.Error.WriteLine($"Wrote {wlOutMetrics}");
     }
     Environment.Exit(0);
 }
@@ -1376,4 +1658,7 @@ Console.WriteLine("  majority-catalog [out.md]");
 Console.WriteLine("  commercial-checklist");
 Console.WriteLine("  netplay-soak [frames]");
 Console.WriteLine("  netplay-cert [frames]");
+Console.WriteLine("  scoreboard-metrics <user-media.json> --cycles=N [--host-present] [--out=path.json]");
+Console.WriteLine("  wall-save <user-media.json> --cycles=N --out=path.dps2z [--host-present]");
+Console.WriteLine("  wall-load <user-media.json> --in=path.dps2z --cycles=N [--host-present] [--out-metrics=path.json]");
 Console.WriteLine("Copy user-media.example.json → user-media.json (gitignored).");

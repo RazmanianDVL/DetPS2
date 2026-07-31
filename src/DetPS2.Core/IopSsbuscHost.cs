@@ -281,6 +281,36 @@ public sealed class IopSsbuscHost
         return true;
     }
 
+    /// <summary>
+    /// True when every wired delay device is window-ready (post <see cref="ApplyBiosDefaults"/>).
+    /// Commercial bring-up contract for CDVD/SPU/SPU2/BOOTROM/DEV9 consumers.
+    /// </summary>
+    public bool AllWindowsReady
+    {
+        get
+        {
+            if (!_configured) return false;
+            for (int i = 0; i < DeviceCount; i++)
+            {
+                if (DelayRegAddr[i] == 0) continue;
+                if (!IsWindowReady(i)) return false;
+            }
+            return true;
+        }
+    }
+
+    /// <summary>Count of wired devices currently window-ready.</summary>
+    public int ReadyWindowCount
+    {
+        get
+        {
+            int n = 0;
+            for (int i = 0; i < DeviceCount; i++)
+                if (IsWindowReady(i)) n++;
+            return n;
+        }
+    }
+
     /// <summary>Decode range field (bits 20:16) from delay: 2^n bytes.</summary>
     public static int DecodeRangeBytes(uint delay)
     {

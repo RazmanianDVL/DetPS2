@@ -68,6 +68,10 @@ public sealed class Ps2System
     public IopSsbuscHost IopSsbusc { get; } = new();
     public IopSysclibHeaplibHost IopSysclibHeaplib { get; } = new();
     public IopDmacManHost IopDmacMan { get; } = new();
+    /// <summary>SECRMAN / CLEARSPU / LIBSD / UDNL / X* + THREADMAN thmsgbx/vpl/fpl export HLE.</summary>
+    public IopExtendedBiosHost IopExtendedBios { get; } = new();
+    /// <summary>LIBSD functional core (sceSdInit / SetParam / key-on) — installed via IopExtendedBios.</summary>
+    public IopLibSdHost IopLibSd { get; } = new();
 
     /// <summary>
     /// BIOS EXCEPMAN.IRX HLE — real per-exception-code, priority-ordered handler registration
@@ -436,21 +440,41 @@ public sealed class Ps2System
                 // so GodOfWarAssist soft escapes fire before 50k-cycle windows burn out.
                 bool gowHot = ActiveQuirk is GodOfWarAssist && pcPhys is
                     (>= 0x0015F2C0UL and <= 0x0015FA80UL)
+                    or (>= 0x001312C0UL and <= 0x001312F0UL)  // link-search thrash
+                    or (>= 0x00293C00UL and <= 0x00293C80UL)  // WaitSema empty SIF poll
+                    or (>= 0x00294800UL and <= 0x002948A0UL)  // SIF-cmd poll caller (loops WaitSema)
+                    or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
+                    or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
+                    or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
                     or (>= 0x00183880UL and <= 0x001838D0UL)
-                    or (>= 0x0017A320UL and <= 0x0017A360UL)
+                    or (>= 0x0017A1D0UL and <= 0x0017A298UL)  // soft-tick wait leaf (*0x29C7D4)
+                    or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait
                     or (>= 0x00233AD0UL and <= 0x00233B44UL)
                     or (>= 0x00284780UL and <= 0x002848B0UL)
                     or (>= 0x0021FF00UL and <= 0x00220600UL)
                     or (>= 0x0013DED0UL and <= 0x0013DEF8UL)
+                    or (>= 0x0013E1C0UL and <= 0x0013E1F4UL)  // global free-search circular
                     or (>= 0x80000180UL and <= 0x80000200UL);
-                ulong slice = (criHot || gowHot) ? sliceCri : sliceDefault;
+                // Burnout 3 post-TXD GIF flush thrash.
+                bool b3Hot = ActiveQuirk is Burnout3Assist && pcPhys is
+                    (>= 0x0021A4F0UL and <= 0x0021A5E8UL)
+                    or (>= 0x001F3080UL and <= 0x001F3500UL)
+                    or (>= 0x00218700UL and <= 0x00218790UL);
+                // Dec post-MSL factory/sys-init fail gates (one-instruction v0 checks) —
+                // MidwayFamilyAssist soft-success needs tight slices or the window is missed.
+                bool mkFamHot = ActiveQuirk is MidwayFamilyAssist
+                    && MidwayFamilyAssist.IsDecSysInitHotPc(pcPhys);
+                ulong slice = (criHot || gowHot || b3Hot || mkFamHot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never
                 // reached). One-shot kick of only thread 2 left ADX (entry 0x4147F8) and every
                 // later worker permanently unstarted — traced 2026-07-29 at 120M cycles:
                 // threads 3–6 Alive/!Started while main spun SetVSyncFlag at 0x463960.
                 // Re-arm per thread so each new CreateThread gets its own grace then Start.
-                if (!DisableMidwayAssist && ActiveQuirk is MidwayBootAssist)
+                // MidwayFamilyAssist (DA/Dec/Arm): same CreateThread→DORMANT pattern for
+                // MWFILE reverse-RPC / post-MSL workers while main thrash-sleeps.
+                if (!DisableMidwayAssist
+                    && ActiveQuirk is MidwayBootAssist or MidwayFamilyAssist)
                     KickAllDormantCommercialWorkers();
 
                 ulong n = left > slice ? slice : left;
@@ -894,6 +918,8 @@ public sealed class Ps2System
         IopSsbusc.Reset();
         IopSysclibHeaplib.Reset();
         IopDmacMan.Reset();
+        IopExtendedBios.Reset();
+        IopLibSd.Reset();
         IopExcepMan.Reset();
         // Re-bind after IopSystem.Reset so FILEIO ENODEV/AddDrv still route to the live host.
         IopModules.BindIopSystem(IopSystem);

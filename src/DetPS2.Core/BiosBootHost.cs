@@ -81,7 +81,23 @@ public sealed class BiosBootHost
         new() { RomdirName = "SIO2MAN", Role = "SIO2 bus transfer/ctrl (no EE RPC; PADMAN/MCSERV import)", RpcSid = 0, RequiredForCommercialFastPath = true },
         new() { RomdirName = "MCMAN", Role = "memory card", RpcSid = RealSifRpc.SidMcServ, RequiredForCommercialFastPath = false },
         new() { RomdirName = "MCSERV", Role = "MC service", RpcSid = RealSifRpc.SidMcServ, RequiredForCommercialFastPath = false },
-        new() { RomdirName = "LIBSD", Role = "sound driver lib", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "LIBSD", Role = "sound driver lib (IopExtendedBiosHost export stubs)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        // --- Extended ROMDIR services (SCPH70008 full table; HLE via IopExtendedBiosHost) ---
+        new() { RomdirName = "ADDDRV", Role = "rom0: add driver helper", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "SECRMAN", Role = "MagicGate SECRMAN — Secr*BootFile passthrough (no MG crypto)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "CLEARSPU", Role = "SPU2 soft clear on cold/post-UDNL (IopExtendedBiosHost)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "UDNL", Role = "IOPRP/DNAS image handoff after SifIopReset (version + module register)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "RMRESET", Role = "remote/reset helper", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XMTAPMAN", Role = "multitap manager (X path)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XPADMAN", Role = "PADMAN X alias", RpcSid = RealSifRpc.SidPadOld1, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XSIO2MAN", Role = "SIO2MAN X alias", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XMCMAN", Role = "MCMAN X alias", RpcSid = RealSifRpc.SidMcServ, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XMCSERV", Role = "MCSERV X alias", RpcSid = RealSifRpc.SidMcServ, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XSIFCMD", Role = "SIFCMD X alias", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XCDVDMAN", Role = "CDVDMAN X alias", RpcSid = RealSifRpc.SidCdBase, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XCDVDFSV", Role = "CDVDFSV X alias", RpcSid = RealSifRpc.SidCdScmd, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XDEV9", Role = "DEV9 / HDD path (optional)", RpcSid = 0, RequiredForCommercialFastPath = false },
+        new() { RomdirName = "XDEV9SERV", Role = "DEV9 service (optional)", RpcSid = 0, RequiredForCommercialFastPath = false },
     };
 
     /// <summary>
@@ -250,6 +266,11 @@ public sealed class BiosBootHost
         sys.IopSsbusc.ApplyBiosDefaults();
         sys.IopEeconf.ApplyBiosInit();
 
+        // Extended ROMDIR services: SECRMAN/CLEARSPU/LIBSD/UDNL/ADDDRV/X* + THREADMAN thmsgbx/vpl/fpl exports.
+        // Ground-truthed against SCPH70008 ROMDIR (101 entries) + Ghidra IRX decomp.
+        sys.IopExtendedBios.Install(sys);
+        sys.IopExtendedBios.ApplyClearSpu(sys);
+
         // Opaque non-zero "handler" cookies — not R3000-executed; mark IRQ 0/11 owned by VBLANK.
         sys.IopSystem.RegisterIntrHandler(IopSystemHost.IrqVblank, 1, 0x56424C4Bu /* "VBLK" */, 0);
         sys.IopSystem.RegisterIntrHandler(IopSystemHost.IrqEvblank, 1, 0x5642454Eu /* "VBEN" */, 0);
@@ -288,13 +309,22 @@ public sealed class BiosBootHost
         // Re-present LOADFILE/FILEIO-visible module names after IOPRP-style reboot.
         // Real UDNL would re-load the image; HLE keeps soft registrations live.
         ReRegisterPostRebootModules(sys);
+        // Functional UDNL handoff: version tag + CLEARSPU + common IOPRP module names.
+        // RealRpc.OnIopReboot still runs from SonyKernelHle.OnIopRebootCompleted (after this).
+        // Titles still plant EE RAM version cells when they bypass LOADFILE GetVersion.
+        // DETPS2_UDNL_SKIP_HANDOFF=1: leave pre-G0 reboot surface (name re-reg only) — A/B for
+        // commercial titles that Exit early when full UDNL image path runs.
+        if (!string.Equals(Environment.GetEnvironmentVariable("DETPS2_UDNL_SKIP_HANDOFF"), "1",
+                StringComparison.Ordinal))
+            sys.IopExtendedBios.ApplyUdnlHandoff(sys, sys.Sif.LastIopRebootArg);
         host._iopRebootHandoffs++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1" ||
             Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[REBOOT] handoff gen={sys.Sif.IopRebootGeneration} " +
                 $"arg=\"{sys.Sif.LastIopRebootArg}\" devices={sys.IopSystem.DeviceCount} " +
-                $"stdio={host._stdioReady} igreeting={host._igreetingDone}");
+                $"stdio={host._stdioReady} igreeting={host._igreetingDone} " +
+                $"udnlVer=\"{sys.IopExtendedBios.LastUdnlVersion}\"");
     }
 
     /// <summary>
@@ -308,8 +338,10 @@ public sealed class BiosBootHost
                  {
                      "LOADFILE", "FILEIO", "MODLOAD", "SIO2MAN", "PADMAN", "MCMAN", "MCSERV",
                      "LIBSD", "SDRDRV", "IOPFILE", "IOPMEM", "IOPSND", "CDVDMAN", "CDVDFSV",
+                     "SECRMAN", "CLEARSPU", "UDNL", "ADDDRV", "XMTAPMAN", "XPADMAN", "XSIO2MAN",
                      // Common retail IOPRP image tags (also re-registered from RESET_CMD arg).
-                     "IOPRP214", "IOPRP234", "IOPRP243", "IOPRP250", "IOPRP280", "IOPRP300"
+                     "IOPRP214", "IOPRP234", "IOPRP243", "IOPRP250", "IOPRP252", "IOPRP255",
+                     "IOPRP280", "IOPRP300", "DNAS280"
                  })
             sys.IopModules.RegisterModule(n);
 

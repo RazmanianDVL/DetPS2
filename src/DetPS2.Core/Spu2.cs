@@ -533,4 +533,89 @@ public sealed class Spu2 : ISchedulable
 
     public bool IsVoicePlaying(int voice) =>
         (uint)voice < VoiceCount && _voices[voice].Playing;
+
+    // ---- LIBSD-facing host hooks (IopLibSdHost) ---------------------------------
+
+    /// <summary>Key-on a voice bitmask (voices <paramref name="start"/>..+15). LIBSD <c>sceSdSetSwitch(KON)</c>.</summary>
+    public void HostKeyOnMask(uint mask, int start = 0)
+    {
+        Enabled = true;
+        KeyOnMask(mask, start);
+    }
+
+    /// <summary>Key-off a voice bitmask. LIBSD <c>sceSdSetSwitch(KOFF)</c>.</summary>
+    public void HostKeyOffMask(uint mask, int start = 0) => KeyOffMask(mask, start);
+
+    /// <summary>Set sample-start address in SPU RAM for a voice (LIBSD <c>sceSdSetAddr(SSA)</c>).</summary>
+    public void HostSetVoiceSsa(int voice, uint ssa)
+    {
+        if ((uint)voice >= VoiceCount) return;
+        _voiceSsa[voice] = ssa;
+    }
+
+    public uint HostGetVoiceSsa(int voice) =>
+        (uint)voice < VoiceCount ? _voiceSsa[voice] : 0;
+
+    /// <summary>Direct voice param poke used by LIBSD <c>sceSdSetParam</c> without full MMIO.</summary>
+    public void HostSetVoiceParam(int voice, int paramKind, int value)
+    {
+        if ((uint)voice >= VoiceCount) return;
+        var v = _voices[voice];
+        switch (paramKind)
+        {
+            case 0: // VOLL
+                v.VolumeL = SignExtend16((uint)value);
+                break;
+            case 1: // VOLR
+                v.VolumeR = SignExtend16((uint)value);
+                break;
+            case 2: // PITCH
+                v.Pitch = value & 0x3FFF;
+                break;
+            case 3: // ADSR1
+                ApplyAdsr1(v, (uint)value);
+                break;
+            case 4: // ADSR2
+                ApplyAdsr2(v, (uint)value);
+                break;
+        }
+    }
+
+    public int HostGetVoiceParam(int voice, int paramKind)
+    {
+        if ((uint)voice >= VoiceCount) return 0;
+        var v = _voices[voice];
+        return paramKind switch
+        {
+            0 => v.VolumeL & 0xFFFF,
+            1 => v.VolumeR & 0xFFFF,
+            2 => v.Pitch & 0x3FFF,
+            5 => v.Envelope & 0x7FFF, // ENVX
+            _ => 0
+        };
+    }
+
+    /// <summary>Upload bytes into SPU RAM at <paramref name="addr"/> (LIBSD VoiceTrans WRITE).</summary>
+    public int HostWriteSpuRam(uint addr, ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty) return 0;
+        int written = 0;
+        for (int i = 0; i < data.Length && addr + (uint)i < (uint)_spuRam.Length; i++)
+        {
+            _spuRam[addr + (uint)i] = data[i];
+            written++;
+        }
+        return written;
+    }
+
+    public int HostReadSpuRam(uint addr, Span<byte> dest)
+    {
+        int n = 0;
+        for (int i = 0; i < dest.Length && addr + (uint)i < (uint)_spuRam.Length; i++)
+        {
+            dest[i] = _spuRam[addr + (uint)i];
+            n++;
+        }
+        return n;
+    }
 }

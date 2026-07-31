@@ -2,10 +2,12 @@
 
 **Authority:** Ghidra decomp of BIOS `rom0:MCSERV` (`tools/bios-decomp/MCSERV_ALL.txt`,
 string `"PsIImcserv 1.30"`) + ps2sdk `ee/rpc/memorycard/src/libmc.c` (`mcRpcCmd[MC_TYPE_MC]`)
-+ `common/include/libmc-common.h` (`mcDescParam_t`, `mcEndParam_t`, result codes).
-**Not authority:** commercial title PCs, per-game save hacks, full MCMAN FAT rewrite.
++ `common/include/libmc-common.h` (`mcDescParam_t`, `mcEndParam_t`, result codes)
++ Ghidra decomp of BIOS `rom0:MCMAN` (`tools/bios-decomp/MCMAN_ALL.txt`, `"PsIImcman 130"`,
+`"1.1.0.0"` superblock) + Ross Ridge PS2 MCFS (mymc) for on-disk layout.
+**Not authority:** commercial title PCs, per-game save hacks, full ECC/wear-leveling port.
 
-**Related:** `docs/BIOS_DISSECTION.md` §6.7 (fno range bug) / §6.8 (MCMAN scoped out).
+**Related:** `docs/BIOS_DISSECTION.md` §6.7 (fno range bug) / §6.8 (MCMAN dual-format).
 
 ---
 
@@ -97,62 +99,120 @@ falls back to MCSERV correctly.
 | `sceMcResNoFormat` | −2 | |
 | `sceMcResNoEntry` | −4 | missing file |
 | `sceMcResDeniedPermit` | −5 | bad fd / unhandled RPC |
+| `sceMcTypePS1` | 1 | getInfo type |
 | `sceMcTypePS2` | 2 | getInfo type |
 
 ---
 
-## 2. Current DetPS2 surface (this port)
+## 2. MCMAN dual-format FAT (Phase 4)
+
+### 2.1 Real MCMAN dual-type probe (`FUN_000005ac`)
+
+Per-port state is a `0x180`-byte stride. Card type byte `DAT_0001ee80`:
+
+| Type | Meaning | Probe path |
+|------|---------|------------|
+| `0` | unknown / absent | fallback |
+| `1` | **PS1** format | `FUN_0000714c` succeeds |
+| `2` | **PS2** MCFS | `FUN_00002374` superblock path |
+| `3` | intermediate | `FUN_00007380` branch |
+
+PS2 format writes superblock version literal **`"1.1.0.0"`** (`FUN_00002e10` / format path).
+Page size field often `0x200` or derived; cluster I/O uses `0x2000 / page_len` sector loops.
+
+### 2.2 DetPS2 `MemoryCard` layouts
+
+| `McImageKind` | Magic / detect | `CardType` | Free units | Notes |
+|---------------|----------------|------------|------------|-------|
+| `DetPs2Native` | `"DETPS2MC"` | PS2 (2) | remaining pages | Default HLE save path; Desktop UX |
+| `SonyPs2` | `"Sony PS2 Memory Card Format "` | PS2 (2) | FAT free clusters | Superblock + IFC + FAT + root dir |
+| `SonyPs1` | `"MC"` @0 | PS1 (1) | free frames/slots | Classic 128 KB / 128-byte frames |
+
+**Sony PS2 MCFS (subset of mymc layout):**
+
+| Off | Field | HLE value |
+|-----|-------|-----------|
+| `0x00` | magic[28] | `Sony PS2 Memory Card Format ` |
+| `0x1C` | version[12] | `1.1.0.0` |
+| `0x28` | page_len | 512 |
+| `0x2A` | pages_per_cluster | 2 |
+| `0x2C` | pages_per_block | 16 |
+| `0x30` | clusters_per_card | size-derived |
+| `0x34` | alloc_offset | after IFC+FAT |
+| `0x38` | alloc_end | allocatable span |
+| `0x3C` | rootdir_cluster | 0 |
+| `0x50` | ifc_list[0] | cluster 8 |
+| `0x150` | card_type | 2 |
+| `0x151` | card_flags | `0x52` |
+
+FAT entries: MSB set = used; low 31 bits = next relative cluster; `0xFFFFFFFF` = end.
+Directory entries: 512 B, mode/length/cluster/name — enough for named save I/O and free-count.
+
+**PS1:** header `"MC"`, directory frames 1–15, data from frame 16; usage `0xA0` free / `0x51` first.
+
+### 2.3 MCSERV integration
+
+| RPC | Dual-format behavior |
+|-----|----------------------|
+| `0x77` FORMAT | `MemoryCard.FormatSonyPs2()` — real superblock for MCMAN probes |
+| `0x78` GET_INFO | `CardType` + `FreeUnits` from FAT/blocks |
+| `0x7D` ERASE_BLOCK | zeros erase-block (16 pages PS2 / frame PS1) |
+| `0x7E`/`0x7F` pages | raw page I/O on active image |
+| open/read/write/delete | path through format-aware `WriteFile`/`ReadFile` |
+
+---
+
+## 3. Current DetPS2 surface (this port)
 
 | Piece | Location | Status |
 |-------|----------|--------|
 | sid `0x80000400` bind | `RealSifRpc.SidMcServ` | OK |
-| fno **0x70–0x80** full map | `HandleMcServ` | **Mapped** (this agent) |
-| `mcDescParam_t` / name layouts | `HandleMcServ` helpers | **Corrected** (was size@+8/buf@+4) |
-| OPEN/CLOSE/SEEK/READ/WRITE/FLUSH | fd table + `MemoryCard` | Lightweight HLE |
-| GET_INFO endParam type/free | writes `param` | OK |
+| fno **0x70–0x80** full map | `HandleMcServ` | **Mapped** |
+| `mcDescParam_t` / name layouts | `HandleMcServ` helpers | **Corrected** |
+| OPEN/CLOSE/SEEK/READ/WRITE/FLUSH | fd table + `MemoryCard` | Dual-format HLE |
+| GET_INFO endParam type/free | writes `param` from `CardType`/`FreeUnits` | OK |
 | GET_DIR list | `MemoryCard.FileNames` → table | Flat names only |
-| FORMAT / DELETE / UNFORMAT | `MemoryCard` | OK |
-| CH_DIR / SET_INFO | success stubs (+ cwd string) | Partial |
-| ERASE_BLOCK | success stub | No real erase semantics |
-| READ_PAGE / WRITE_PAGE | `MemoryCard.ReadPage/WritePage` | DetPS2 image pages, not Sony FAT |
+| FORMAT / DELETE / UNFORMAT | Sony PS2 format path | OK |
+| CH_DIR / SET_INFO | success (+ cwd string); SET_INFO accept | Partial |
+| ERASE_BLOCK | real zero of erase block | OK (no wear map) |
+| READ_PAGE / WRITE_PAGE | `MemoryCard.ReadPage/WritePage` | OK |
 | Unknown fno / bad flush fd | `−5` | libmc probe-safe |
-| Full MCMAN FAT / ECC / dual PS1 | — | **Scoped out** (§6.8) |
-| XMCSERV / sid `0x80000480` | — | Not implemented |
-
-Backend is DetPS2’s own `MemoryCard` image (directory table after superblock), **not** a
-byte-exact port of MCMAN’s 512-byte cluster FAT. Sufficient for titles that only need
-RPC success + named save I/O through libmc; not for titles that dig into raw Sony pages.
+| Dual-format FAT (PS1/PS2) | `MemoryCard` + MCSERV | **OK** (Phase 4) |
+| ECC spare / wear-leveling | — | **Residual** |
+| XMCSERV / sid `0x80000480` | partial `0xFE`/`0x01` | Not full table |
 
 ---
 
-## 3. Gaps remaining (out of this slice)
+## 4. Gaps remaining (residual)
 
-1. **Full MCMAN filesystem** — cluster chains, `"1.1.0.0"` superblock, ECC, PS1 dual format
-   (`MCMAN_ALL.txt` 151 functions). Revisit if a title stalls on real card layout, not RPC.
-2. **XMCMAN/XMCSERV** — fno table `0xFE`/`0x01`…; getEnt/rename/chgPriority; DEV9 xfrom sid.
-3. **Card change detection** — getInfo sync −1/−2 when media swapped (no hotplug model yet).
+1. **ECC spare area** — real cards store 12 B ECC per 528 B page; HLE uses 512 B data pages only.
+2. **XMCMAN/XMCSERV** — full fno table `0xFE`/`0x01`…; getEnt/rename/chgPriority; DEV9 xfrom sid.
+3. **Card change detection** — getInfo sync −1 when media swapped (no hotplug model yet).
 4. **GET_DIR** — wildcards beyond simple `*`/prefix/suffix; subdirectory trees; dates.
-5. **SET_INFO** — create/modify timestamps + attr bits not persisted on HLE entries.
+5. **SET_INFO** — create/modify timestamps + attr bits not persisted on all image kinds.
 6. **READ/WRITE alignment DMA** — real MCSERV SIF-DMAs head/tail fixup into `mcEndParam_t`;
-   HLE writes aligned buffer only (libmc fixup becomes no-op when size1/size2=0).
-7. **ERASE_BLOCK** real semantics (block erase before write-page).
-8. **Multitap MC slots** — port/slot accepted but single `MemoryCard` instance.
-9. **SIO2 low-level path** — separate from MCSERV RPC; `Sio2.EmitMemcard` remains stub-level.
+   HLE writes aligned buffer only (libmc fixup is no-op when size1/size2=0).
+7. **Multitap MC slots** — port/slot accepted but single `MemoryCard` instance.
+8. **SIO2 low-level path** — separate from MCSERV RPC; `Sio2.EmitMemcard` remains stub-level.
+9. **Full MCMAN C transliteration** — 151 functions; not required once dual-format I/O + RPC are green.
 
 ---
 
-## 4. Smokes
+## 5. Smokes
 
 | Test | Checks |
 |------|--------|
 | `RealSifRpc_McservRealFunctionNumbers` | bind; open/write/seek/read/flush/close; getInfo type=2; flush fd=−1 → −5; fno 0x06 → −5; getDir ≥1 |
+| `MemoryCard_DualFormatFat_Ps1Ps2` | Sony PS2 superblock+FAT free drop/rise; PS1 128KB round-trip; DetPS2 native |
+| `RealSifRpc_McservFormatSonyPs2AndPages` | FORMAT→Sony magic page0; getInfo free; write via FAT; ERASE_BLOCK |
+| `MemCardManager_ExportImport` | DetPS2 native host save/load |
 
 Run: `dotnet run --project Tests` (or filter via smoke runner).
 
 ---
 
-## 5. Non-goals
+## 6. Non-goals
 
 - No MidwayBootAssist / game PC patches.
-- No commit/push/merge from this worktree.
-- No wholesale MCMAN C→C# transliteration.
+- No commit/push/merge from this worktree (local commits OK per campaign).
+- No wholesale MCMAN C→C# transliteration of all 151 functions.

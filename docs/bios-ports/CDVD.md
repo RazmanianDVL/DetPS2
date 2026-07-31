@@ -97,7 +97,14 @@ BIND + CALL already go through `CompleteRpcEnd` (SignalSema + pkt free + RPC_END
 4. `BIOS_DISSECTION.md` §6.1 updated.
 5. Full smoke suite green. **Zero game hacks.**
 
-## 8. Remaining ROMDIR campaign gaps (not this slice)
+## 7b. Phase 6 residual close (AGENT-CS, 2026-07-30)
+
+1. Save/restore `LastError` / `DriveState` / stream bank state with drive save-state.
+2. Mount paths (`MountIso` / `MountImage` / `MountDisc`) call `SetMountedReady()` — tray closed, `ErNO`, `StatSpin`, mechacon `0x40` so `DiskReady` → SCECdComplete immediately after media insert.
+3. Contracts hold for commercial DiskReady / tray / error / Seek-Stop-Stream paths (smokes above + `Cdvd_MechaconDiskReadyAfterMount`).
+4. **Gate: CDVDMAN PARTIAL → OK** (mechacon stand-in is intentional NONPORT-of-binary, not a contract gap).
+
+## 8. Remaining residuals (do **not** block CDVDMAN OK)
 
 - Literal CDVDMAN binary port (mechacon register poke layer) — CDVDFSV imports remain stubs; `Cdvd.cs` is the functional stand-in.
 - Real NVM / iLink / console ID secrets.

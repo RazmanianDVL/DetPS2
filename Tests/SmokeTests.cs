@@ -802,9 +802,13 @@ public static class SmokeTests
             RealSifRpc_CdScmdRealReplyStructure();
             RealSifRpc_CdNcmdReadReturnsRealByteCount();
             RealSifRpc_McservRealFunctionNumbers();
+            MemoryCard_DualFormatFat_Ps1Ps2();
+            RealSifRpc_McservFormatSonyPs2AndPages();
             BiosHle_IopVblankEventFlag();
             BiosBootHost_IopBtConfContracts();
             BiosRomdirGate_PortDocsForRequiredModules();
+            BiosExtendedRomdir_SecrClearSpuLibSdUdnl();
+            BiosUdnl_IopRpImageApplyAndSecrMgPath();
             BiosHle_RebootStdioIgreetingIomanContracts();
             Eeconf_InitContracts();
             Ssbusc_BusWindowContracts();
@@ -826,9 +830,16 @@ public static class SmokeTests
             RealSifRpc_LoadFileModuleElfSetGetSearch();
             KernelHle_ThreadmanSleepWakeupCount();
             KernelHle_ThreadmanSemaWakeAndReferStatus();
+            KernelHle_ThreadmanMbxVplFpl();
+            KernelHle_ThreadmanPriorityAndDelay();
+            KernelHle_ThreadmanReleaseWaitAndDeleteSemaCodes();
+            SonyKernelHle_SetAlarmReleaseAndFire();
+            SonyKernelHle_Rfu059AndIEnableIntc();
             RealSifRpc_CdSiblingSidsInitSearchDiskReady();
             RealSifRpc_CdScmdTrayErrorStatus();
             RealSifRpc_CdvdNcmdSeekSyncDiskReadyAndStream();
+            Cdvd_MechaconDiskReadyAfterMount();
+            LibSd_InitSetParamKeyOnContracts();
             RealSifRpc_FileIoOpenReadLseekCloseAndDir();
             RealSifRpc_PadmanCloseEndAndPortMax();
             RealSifRpc_PadmanNewSidInitAndActiveLowButtons();
@@ -2606,6 +2617,182 @@ public static class SmokeTests
     }
 
     /// <summary>
+    /// Phase 4 MCMAN dual-format FAT: Sony PS2 superblock ("1.1.0.0") + IFC/FAT free units,
+    /// PS1 classic 128KB layout, DetPS2 native still round-trips. Authority: MCMAN_ALL.txt
+    /// FUN_000005ac type 1/2, mymc MCFS, libmc sceMcTypePS1/PS2.
+    /// </summary>
+    public static void MemoryCard_DualFormatFat_Ps1Ps2()
+    {
+        // --- Sony PS2 MCFS ---
+        var ps2 = MemoryCard.Create(McImageKind.SonyPs2, pages: 512);
+        if (ps2.Kind != McImageKind.SonyPs2) throw new Exception($"kind {ps2.Kind}");
+        if (ps2.CardType != McCardType.Ps2) throw new Exception("type PS2");
+        if (!ps2.Formatted) throw new Exception("formatted");
+        byte[] rawSb = ps2.ToRawBytes();
+        string magic = System.Text.Encoding.ASCII.GetString(rawSb, 0, 28);
+        if (!magic.StartsWith("Sony PS2 Memory Card Format"))
+            throw new Exception($"bad PS2 magic '{magic}'");
+        string ver = System.Text.Encoding.ASCII.GetString(rawSb, 0x1C, 7);
+        if (ver != "1.1.0.0") throw new Exception($"version {ver}");
+        if (rawSb[0x150] != 2) throw new Exception("card_type byte");
+
+        int free0 = ps2.FreeUnits;
+        if (free0 < 1) throw new Exception($"free0={free0}");
+        byte[] payload = new byte[1500];
+        for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i ^ 0xA5);
+        if (!ps2.WriteFile("BASLUS-20001SAVE", payload))
+            throw new Exception("PS2 WriteFile failed");
+        if (ps2.FileCount != 1) throw new Exception("PS2 file count");
+        byte[]? back = ps2.ReadFile("BASLUS-20001SAVE");
+        if (back == null || back.Length != 1500 || back[3] != (3 ^ 0xA5))
+            throw new Exception("PS2 ReadFile mismatch");
+        int free1 = ps2.FreeUnits;
+        if (free1 >= free0) throw new Exception($"free should drop after write: {free0}->{free1}");
+        if (!ps2.DeleteFile("BASLUS-20001SAVE")) throw new Exception("PS2 delete");
+        if (ps2.FreeUnits <= free1) throw new Exception("free should rise after delete");
+
+        // Round-trip host image
+        string pathPs2 = Path.Combine(Path.GetTempPath(), "detps2_mc_ps2_" + Guid.NewGuid().ToString("N") + ".ps2");
+        try
+        {
+            ps2.WriteFile("KEEP.BIN", new byte[] { 9, 8, 7 });
+            MemCardManager.SaveToFile(ps2, pathPs2);
+            var loaded = MemCardManager.LoadFromFile(pathPs2);
+            if (loaded.Kind != McImageKind.SonyPs2) throw new Exception($"reload kind {loaded.Kind}");
+            if (loaded.CardType != McCardType.Ps2) throw new Exception("reload type");
+            byte[]? k = loaded.ReadFile("KEEP.BIN");
+            if (k == null || k.Length != 3 || k[0] != 9) throw new Exception("PS2 reload content");
+        }
+        finally { try { File.Delete(pathPs2); } catch { /* ignore */ } }
+
+        // EraseBlock zeros a 16-page block
+        if (!ps2.EraseBlock(0)) throw new Exception("erase block 0");
+
+        // --- PS1 classic ---
+        var ps1 = MemoryCard.Create(McImageKind.SonyPs1);
+        if (ps1.Kind != McImageKind.SonyPs1) throw new Exception("PS1 kind");
+        if (ps1.CardType != McCardType.Ps1) throw new Exception("PS1 type");
+        if (ps1.SizeBytes != MemoryCard.Ps1CardBytes) throw new Exception("PS1 size");
+        byte[] rawPs1 = ps1.ToRawBytes();
+        if (rawPs1[0] != (byte)'M' || rawPs1[1] != (byte)'C') throw new Exception("PS1 magic");
+        byte[] p1data = new byte[256];
+        for (int i = 0; i < p1data.Length; i++) p1data[i] = (byte)i;
+        if (!ps1.WriteFile("BASLUS-00001", p1data)) throw new Exception("PS1 write");
+        byte[]? p1r = ps1.ReadFile("BASLUS-00001");
+        if (p1r == null || p1r.Length != 256 || p1r[100] != 100) throw new Exception("PS1 read");
+        if (ps1.FreeUnits < 1) throw new Exception("PS1 free");
+        string pathPs1 = Path.Combine(Path.GetTempPath(), "detps2_mc_ps1_" + Guid.NewGuid().ToString("N") + ".mcr");
+        try
+        {
+            MemCardManager.SaveToFile(ps1, pathPs1);
+            var loaded1 = MemCardManager.LoadFromFile(pathPs1);
+            if (loaded1.Kind != McImageKind.SonyPs1) throw new Exception($"PS1 reload kind {loaded1.Kind}");
+            if (loaded1.CardType != McCardType.Ps1) throw new Exception("PS1 reload type");
+            if (loaded1.ReadFile("BASLUS-00001") is not { Length: 256 }) throw new Exception("PS1 reload data");
+        }
+        finally { try { File.Delete(pathPs1); } catch { /* ignore */ } }
+
+        // --- DetPS2 native still works ---
+        var det = new MemoryCard();
+        if (det.Kind != McImageKind.DetPs2Native) throw new Exception("det kind");
+        if (det.CardType != McCardType.Ps2) throw new Exception("det presents as PS2");
+        det.WriteFile("NATIVE", new byte[] { 1, 2 });
+        if (det.ReadFile("NATIVE") is not { Length: 2 }) throw new Exception("det native");
+
+        Console.WriteLine($"[Smoke] MemoryCard_DualFormatFat_Ps1Ps2 OK (ps2Free={free0}, ps1Free={ps1.FreeUnits})");
+    }
+
+    /// <summary>
+    /// MCSERV FORMAT (0x77) yields Sony PS2 dual-format superblock; READ_PAGE sees magic;
+    /// subsequent open/write/read on formatted card works through FAT-backed MemoryCard.
+    /// </summary>
+    public static void RealSifRpc_McservFormatSonyPs2AndPages()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+
+        const uint cd = 0x0000EC00;
+        const uint bindPkt = 0x0000ED00;
+        int sema = k.CreateSema(0, 1);
+        mem.Write32(cd + 8, (uint)sema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1);
+        mem.Write32(bindPkt + 28, cd);
+        mem.Write32(bindPkt + 32, RealSifRpc.SidMcServ);
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+            throw new Exception("bind");
+        uint argBuf = mem.Read32(cd + 20);
+        const uint recvBuf = 0x0000EE00;
+        const uint callPkt = 0x0000EF00;
+
+        // FORMAT 0x77
+        for (int i = 0; i < 48; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 4, 0);
+        mem.Write32(argBuf + 8, 0);
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x77, argBuf, recvBuf);
+        if (mem.Read32(recvBuf) != 0) throw new Exception($"format result {mem.Read32(recvBuf)}");
+        if (sys.MemCard.Kind != McImageKind.SonyPs2)
+            throw new Exception($"after format kind={sys.MemCard.Kind}");
+
+        // READ_PAGE 0: must contain Sony magic
+        const uint pageBuf = 0x0000F800;
+        for (int i = 0; i < 512; i++) mem.Write8(pageBuf + (uint)i, 0);
+        for (int i = 0; i < 48; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 0, 0); // page
+        mem.Write32(argBuf + 24, pageBuf);
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x7E, argBuf, recvBuf);
+        if (mem.Read32(recvBuf) != 0) throw new Exception("readpage");
+        char c0 = (char)mem.Read8(pageBuf);
+        char c1 = (char)mem.Read8(pageBuf + 1);
+        if (c0 != 'S' || c1 != 'o') throw new Exception($"page0 magic {c0}{c1}");
+
+        // GET_INFO type=2 free>0
+        const uint endParam = 0x0000F400;
+        for (int i = 0; i < 192; i++) mem.Write8(endParam + (uint)i, 0);
+        for (int i = 0; i < 48; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 12, 1);
+        mem.Write32(argBuf + 16, 1);
+        mem.Write32(argBuf + 20, 1);
+        mem.Write32(argBuf + 28, endParam);
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x78, argBuf, recvBuf);
+        if (mem.Read32(recvBuf) != 0) throw new Exception("getinfo");
+        if (mem.Read32(endParam) != 2) throw new Exception($"type {mem.Read32(endParam)}");
+        if (mem.Read32(endParam + 4) == 0) throw new Exception("free");
+
+        // Open/write/read on Sony-formatted card via MCSERV
+        for (int i = 0; i < 64; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 8, 0x0202);
+        WriteAscii(mem, argBuf + 20, "SAVE.DAT");
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x71, argBuf, recvBuf);
+        int fd = (int)mem.Read32(recvBuf);
+        if (fd < 0) throw new Exception($"open {fd}");
+        const uint dataBuf = 0x0000F000;
+        for (int i = 0; i < 64; i++) mem.Write8(dataBuf + (uint)i, (byte)(i + 1));
+        for (int i = 0; i < 48; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 0, (uint)fd);
+        mem.Write32(argBuf + 12, 64);
+        mem.Write32(argBuf + 24, dataBuf);
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x74, argBuf, recvBuf);
+        if (mem.Read32(recvBuf) != 64) throw new Exception("write");
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x7A, argBuf, recvBuf); // flush
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x72, argBuf, recvBuf); // close
+        byte[]? saved = sys.MemCard.ReadFile("SAVE.DAT");
+        if (saved == null || saved.Length != 64 || saved[0] != 1)
+            throw new Exception("FAT-backed save missing after MCSERV write");
+
+        // ERASE_BLOCK 0x7D succeeds
+        for (int i = 0; i < 48; i++) mem.Write8(argBuf + (uint)i, 0);
+        mem.Write32(argBuf + 16, 2); // block index
+        McservCall(rpc, mem, k, sys, callPkt, cd, 0x7D, argBuf, recvBuf);
+        if ((int)mem.Read32(recvBuf) != 0) throw new Exception($"erase {(int)mem.Read32(recvBuf)}");
+
+        Console.WriteLine("[Smoke] RealSifRpc_McservFormatSonyPs2AndPages OK");
+    }
+
+    /// <summary>
     /// BIOS VBLANK.IRX HLE: Register/dispatch callback lists + real event-flag residual bits
     /// (decomp FUN_00000164/374/4b4/4fc; EF_START=1, EF_END=4). After a full start+end pulse the
     /// residual is END only (base-end clear keeps bit 4); START is visible mid-pulse.
@@ -2805,6 +2992,223 @@ public static class SmokeTests
         Console.WriteLine($"[Smoke] BiosRomdirGate_PortDocsForRequiredModules OK (checked={checkedN}, ports={portsDir})");
     }
 
+    /// <summary>
+    /// Extended ROMDIR services (SECRMAN/CLEARSPU/LIBSD/UDNL/X*) + export tables + UDNL handoff.
+    /// Ground-truthed against SCPH70008 full ROMDIR (101 entries) and Ghidra IRX decomp.
+    /// </summary>
+    public static void BiosExtendedRomdir_SecrClearSpuLibSdUdnl()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        if (!sys.IopExtendedBios.Installed)
+            throw new Exception("IopExtendedBios not installed");
+        if (sys.IopExtendedBios.ClearSpuRuns < 1)
+            throw new Exception("CLEARSPU did not soft-reset at commercial IOP start");
+        foreach (var n in new[] { "SECRMAN", "CLEARSPU", "UDNL", "ADDDRV", "LIBSD", "XPADMAN", "XSIO2MAN", "XMTAPMAN" })
+        {
+            if (!sys.IopModules.IsModuleLoaded(n))
+                throw new Exception($"missing extended ROMDIR module {n}");
+        }
+        if (sys.IopModules.LookupExportLibrary("secrman") == null)
+            throw new Exception("secrman export table missing");
+        if (sys.IopModules.LookupExportLibrary("libsd") == null)
+            throw new Exception("libsd export table missing");
+        if (!sys.IopLibSd.Installed)
+            throw new Exception("IopLibSdHost not installed");
+        if (sys.IopLibSd.Exports.Count < IopLibSdHost.ExportCount)
+            throw new Exception($"libsd host exports {sys.IopLibSd.Exports.Count}");
+        if (sys.IopModules.LookupExportLibrary("thmsgbx") == null)
+            throw new Exception("thmsgbx export table missing");
+        if (sys.IopModules.LookupExportLibrary("thvpool") == null)
+            throw new Exception("thvpool export table missing");
+        if (sys.IopModules.LookupExportLibrary("thfpool") == null)
+            throw new Exception("thfpool export table missing");
+
+        // UDNL handoff after simulated SifIopReset with IOPRP300 image arg.
+        sys.Sif.MarkIopRebootPending("rom0:UDNL cdrom0:\\IOPRP300.IMG;1", 0);
+        if (!sys.Sif.TryCompletePendingIopReboot())
+            throw new Exception("reboot did not complete");
+        BiosBootHost.ApplyPostIopRebootContracts(sys);
+        if (sys.IopExtendedBios.UdnlApplies < 1)
+            throw new Exception("UDNL handoff did not run");
+        if (sys.IopExtendedBios.LastUdnlVersion != "3000")
+            throw new Exception($"expected UDNL ver 3000 got \"{sys.IopExtendedBios.LastUdnlVersion}\"");
+        if (sys.IopExtendedBios.SecrDiskBootFilePassthrough() != 0)
+            throw new Exception("SECRMAN passthrough failed");
+        Console.WriteLine(
+            $"[Smoke] BiosExtendedRomdir_SecrClearSpuLibSdUdnl OK " +
+            $"(clearspu={sys.IopExtendedBios.ClearSpuRuns} udnl={sys.IopExtendedBios.UdnlApplies} " +
+            $"ver={sys.IopExtendedBios.LastUdnlVersion})");
+    }
+
+    /// <summary>
+    /// Phase 3: synthetic IOPRP ROMDIR-in-IMG + IOPBTCONF register + LoadIrx for ELF modules;
+    /// SECRMAN plain ELF passthrough vs encrypted reject; LOADFILE MG_MOD_LOAD shares plain path.
+    /// </summary>
+    public static void BiosUdnl_IopRpImageApplyAndSecrMgPath()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+        var host = sys.IopExtendedBios;
+
+        // --- synthetic IOPRP container ---
+        byte[] modElf = IrxLoader.BuildMinimalIrx("SYNTHMOD");
+        byte[] padElf = IrxLoader.BuildMinimalIrx("SYNTHPAD");
+        byte[] image = IopExtendedBiosHost.BuildSyntheticIopRpImage(
+            btconfModules: new[] { "SYNTHMOD", "SYNTHPAD", "NAMEONLY" },
+            elfModules: new Dictionary<string, byte[]>
+            {
+                ["SYNTHMOD"] = modElf,
+                ["SYNTHPAD"] = padElf,
+            });
+
+        if (!IopExtendedBiosHost.TryParseIopRpContainer(image, out var ents) || ents.Count < 5)
+            throw new Exception($"synthetic IOPRP parse failed entries={ents?.Count ?? 0}");
+        var conf = IopExtendedBiosHost.ExtractIopBtConfNamesFromImage(image, ents);
+        if (conf.Count < 3 || !conf.Contains("SYNTHMOD") || !conf.Contains("NAMEONLY"))
+            throw new Exception($"IOPBTCONF parse got [{string.Join(",", conf)}]");
+
+        int reg = host.ApplyIopRpImage(sys, image, "IOPRP234.IMG");
+        if (reg < 3)
+            throw new Exception($"expected ≥3 modules registered, got {reg}");
+        if (host.LastIopRpElfsLoaded < 2)
+            throw new Exception($"expected ≥2 ELFs loaded, got {host.LastIopRpElfsLoaded}");
+        if (!sys.IopModules.IsModuleLoaded("SYNTHMOD") || !sys.IopModules.IsModuleLoaded("NAMEONLY"))
+            throw new Exception("SYNTHMOD/NAMEONLY not registered from image IOPBTCONF");
+        if (!sys.IopModules.IsModuleLoaded("IOPRP234"))
+            throw new Exception("image tag IOPRP234 not registered");
+        if (host.IopRpImagesApplied < 1)
+            throw new Exception("IopRpImagesApplied not bumped");
+
+        // UDNL handoff with disc-backed image path
+        byte[] iso = Iso9660.Build("DETPS2", "BOOT2 = cdrom0:\\BOOT.ELF;1\n",
+            new Dictionary<string, byte[]>
+            {
+                ["BOOT.ELF"] = new byte[] { 0x7F, (byte)'E', (byte)'L', (byte)'F', 0, 0, 0, 0 },
+                ["IOPRP234.IMG"] = image,
+                ["PLAIN.IRX"] = IrxLoader.BuildMinimalIrx("PLAINMG"),
+                // Non-ELF body — MagicGate-encrypted class without secrets
+                ["ENCRYPTED.IRX"] = new byte[]
+                {
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+                },
+            });
+        string tmp = Path.Combine(Path.GetTempPath(), "detps2-udnl-ioprp-test.iso");
+        File.WriteAllBytes(tmp, iso);
+        try
+        {
+            sys.IopModules.BindDisc(tmp);
+            sys.Cdvd.MountIso(tmp);
+
+            sys.Sif.MarkIopRebootPending("rom0:UDNL cdrom0:\\IOPRP234.IMG;1", 0);
+            if (!sys.Sif.TryCompletePendingIopReboot())
+                throw new Exception("reboot did not complete");
+            BiosBootHost.ApplyPostIopRebootContracts(sys);
+            if (host.LastUdnlVersion != "2340")
+                throw new Exception($"UDNL ver expected 2340 got \"{host.LastUdnlVersion}\"");
+            if (host.IopRpImagesApplied < 2)
+                throw new Exception("UDNL disc image apply did not bump IopRpImagesApplied");
+            if (!sys.IopModules.IsModuleLoaded("SYNTHMOD"))
+                throw new Exception("SYNTHMOD missing after UDNL disc apply");
+
+            // --- SECRMAN plain vs encrypted ---
+            byte[] plain = IrxLoader.BuildMinimalIrx("SECRPLAIN");
+            if (host.SecrDiskBootFile(plain) != IopExtendedBiosHost.SecrOk)
+                throw new Exception("SecrDiskBootFile plain ELF must succeed");
+            if (host.SecrCardBootFile(plain) != IopExtendedBiosHost.SecrOk)
+                throw new Exception("SecrCardBootFile plain ELF must succeed");
+            byte[] enc = new byte[64];
+            for (int i = 0; i < enc.Length; i++) enc[i] = (byte)(0xA0 + (i & 0xF));
+            if (host.SecrDiskBootFile(enc) != IopExtendedBiosHost.SecrErrCannotDecrypt)
+                throw new Exception("SecrDiskBootFile encrypted must fail clear");
+            if (host.SecrEncryptedRejects < 1)
+                throw new Exception("SecrEncryptedRejects not counted");
+            if (IopExtendedBiosHost.ClassifySecrBoot(null) != IopExtendedBiosHost.SecrErrNoFile)
+                throw new Exception("null SecrBoot must be NoFile");
+
+            // --- LOADFILE MG_MOD_LOAD via RPC ---
+            const uint cd = 0x0000F400;
+            const uint bindPkt = 0x0000F500;
+            int sema = k.CreateSema(0, 1);
+            mem.Write32(cd + 8, (uint)sema);
+            mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+            mem.Write32(bindPkt + 16, 1);
+            mem.Write32(bindPkt + 28, cd);
+            mem.Write32(bindPkt + 32, RealSifRpc.SidLoadFile);
+            if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+                throw new Exception("LOADFILE bind failed");
+
+            uint argBuf = mem.Read32(cd + 20);
+            const uint recvBuf = 0x0000F600;
+            const uint callPkt = 0x0000F700;
+
+            void CallLf(uint fno, uint sendSize, uint recvSize)
+            {
+                mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+                mem.Write32(callPkt + 16, 1);
+                mem.Write32(callPkt + 28, cd);
+                mem.Write32(callPkt + 32, fno);
+                mem.Write32(callPkt + 36, sendSize);
+                mem.Write32(callPkt + 40, recvBuf);
+                mem.Write32(callPkt + 44, recvSize);
+                if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+                    throw new Exception($"LOADFILE fno={fno} call failed");
+            }
+
+            void WritePathAt(uint offset, string path)
+            {
+                for (int i = 0; i < path.Length; i++)
+                    mem.Write8(argBuf + offset + (uint)i, (byte)path[i]);
+                mem.Write8(argBuf + offset + (uint)path.Length, 0);
+            }
+
+            // MG_MOD_LOAD (fno=4) plain IRX → success (shares plain path)
+            mem.Write32(argBuf + 0, 0);
+            mem.Write32(argBuf + 4, 0);
+            WritePathAt(8, "cdrom0:PLAIN.IRX");
+            CallLf(4, 520, 8);
+            int mgMid = (int)mem.Read32(recvBuf);
+            if (mgMid < 1)
+                throw new Exception($"MG_MOD_LOAD plain mid={mgMid}");
+            if (!sys.IopModules.IsModuleLoaded("PLAIN") && !sys.IopModules.IsModuleLoaded("PLAINMG"))
+                throw new Exception("PLAIN module not registered after MG_MOD_LOAD");
+
+            // MG_MOD_LOAD encrypted non-ELF → clear fail (-201)
+            mem.Write32(argBuf + 0, 0);
+            mem.Write32(argBuf + 4, 0);
+            WritePathAt(8, "cdrom0:ENCRYPTED.IRX");
+            CallLf(4, 520, 8);
+            int encRc = (int)mem.Read32(recvBuf);
+            if (encRc != RealSifRpc.LfErrNotIrx)
+                throw new Exception($"MG_MOD_LOAD encrypted expected {RealSifRpc.LfErrNotIrx} got {encRc}");
+
+            // MOD_LOAD of IOPRP image applies container
+            mem.Write32(argBuf + 0, 0);
+            mem.Write32(argBuf + 4, 0);
+            WritePathAt(8, "cdrom0:IOPRP234.IMG");
+            CallLf(0, 520, 8);
+            int imgMid = (int)mem.Read32(recvBuf);
+            if (imgMid < 1)
+                throw new Exception($"MOD_LOAD IOPRP234.IMG mid={imgMid}");
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { /* ignore */ }
+        }
+
+        Console.WriteLine(
+            $"[Smoke] BiosUdnl_IopRpImageApplyAndSecrMgPath OK " +
+            $"(reg={reg} elfs={host.LastIopRpElfsLoaded} imgs={host.IopRpImagesApplied} " +
+            $"secrOk={host.SecrBootPassthroughs} secrRej={host.SecrEncryptedRejects})");
+    }
+
     public static void BiosHle_FileIoGetstatAndCdvdSectors()
     {
         var sys = new Ps2System();
@@ -2870,9 +3274,52 @@ public static class SmokeTests
         var sys = new Ps2System();
         sys.BiosBoot.StartCommercialIop(sys);
         if (!sys.IopSystem.HasDevice("cdrom0")) throw new Exception("cdrom0 device");
-        if (sys.IopSystem.RegisterIntrHandler(2, 0, 0x800, 0) != 0)
+        if (sys.IopSystem.RegisterIntrHandler(2, 0, 0x800, 0xAA) != 0)
             throw new Exception("register intr");
+        // Duplicate → KE_FOUND_HANDLER
+        if (sys.IopSystem.RegisterIntrHandler(2, 0, 0x801, 0) != IopSystemHost.ResultFoundHandler)
+            throw new Exception("dup handler");
+        // Illegal irq
+        if (sys.IopSystem.RegisterIntrHandler(0x40, 0, 0x800, 0) != IopSystemHost.ResultIllegalIntrCode)
+            throw new Exception("illegal irq");
+        // Query mode/arg
+        if (sys.IopSystem.GetIntrHandler(2) != 0x800) throw new Exception("handler cb");
+        if (sys.IopSystem.GetIntrHandlerMode(2) != 0) throw new Exception("handler mode");
+        if (sys.IopSystem.GetIntrHandlerArg(2) != 0xAA) throw new Exception("handler arg");
         if (sys.IopSystem.EnableIntr(2) != 0) throw new Exception("enable intr");
+        if (!sys.IopSystem.IsIntrEnabled(2)) throw new Exception("enabled query");
+        // Raise → pending → ack clear
+        if (sys.IopSystem.RaiseIntr(2) != 0) throw new Exception("raise");
+        if (!sys.IopSystem.IsIntrPending(2)) throw new Exception("pending after raise");
+        int st = sys.IopSystem.QueryIntrStatus(2);
+        if ((st & 0x7) != 0x7) throw new Exception($"status bits 0x{st:X}"); // handler|en|pend
+        if (sys.IopSystem.AcknowledgeIntr(2) != 0) throw new Exception("ack");
+        if (sys.IopSystem.IsIntrPending(2)) throw new Exception("pending after ack");
+        // Disable soft-dispatch masks raises
+        sys.IopSystem.DisableDispatchIntr(2);
+        if (sys.IopSystem.RaiseIntr(2) != IopSystemHost.ResultIntrDisable)
+            throw new Exception("dispatch mask");
+        sys.IopSystem.EnableDispatchIntr(2);
+        // CpuSuspend nest
+        sys.IopSystem.CpuSuspendIntr(out int prev);
+        if (sys.IopSystem.CpuInterruptsEnabled) throw new Exception("suspend");
+        if (sys.IopSystem.RaiseIntr(2) != IopSystemHost.ResultIntrDisable)
+            throw new Exception("raise while suspended");
+        sys.IopSystem.CpuResumeIntr(prev);
+        // Release + re-register context reject
+        if (sys.IopSystem.ReleaseIntrHandler(2) != 0) throw new Exception("release");
+        if (sys.IopSystem.HasIntrHandler(2)) throw new Exception("released");
+        sys.IopSystem.InterruptContext = true;
+        if (sys.IopSystem.RegisterIntrHandler(2, 0, 0x800, 0) != IopSystemHost.ResultIllegalContext)
+            throw new Exception("register in irq ctx");
+        sys.IopSystem.InterruptContext = false;
+        // Boot-planted VBLANK IRQs 0/11 remain
+        if (!sys.IopSystem.HasIntrHandler(IopSystemHost.IrqVblank) ||
+            !sys.IopSystem.HasIntrHandler(IopSystemHost.IrqEvblank))
+            throw new Exception("boot VBLANK IRQs");
+        if (!sys.IopSystem.IsIntrEnabled(IopSystemHost.IrqVblank))
+            throw new Exception("boot VBLANK enable");
+
         ulong t0 = sys.IopSystem.SystemClock;
         sys.Hle.OnVblank();
         if (sys.IopSystem.SystemClock <= t0) throw new Exception("timeman tick");
@@ -2886,7 +3333,9 @@ public static class SmokeTests
         // TIMEMANI table is 6 hard timers after commercial bring-up.
         if (sys.IopSystem.HardTimerCount != 6)
             throw new Exception($"hard timers {sys.IopSystem.HardTimerCount}");
-        Console.WriteLine($"[Smoke] BiosHle_IopSystemIntrAndTime OK (clk={sys.IopSystem.SystemClock})");
+        Console.WriteLine(
+            $"[Smoke] BiosHle_IopSystemIntrAndTime OK (clk={sys.IopSystem.SystemClock} " +
+            $"raises={sys.IopSystem.IntrRaises} acks={sys.IopSystem.IntrAcknowledges})");
     }
 
     /// <summary>Real BIOS EXCEPMAN.IRX handler registration (Ghidra-decompiled
@@ -5931,6 +6380,128 @@ public static class SmokeTests
         Console.WriteLine("[Smoke] RealSifRpc_CdSiblingSidsInitSearchDiskReady OK");
     }
 
+    /// <summary>
+    /// Phase 6: CDVDMAN mechacon stand-in — after mount, DiskReady=Complete, tray closed,
+    /// LastError=ErNO, DriveState=StatSpin; open tray → NotReady + ErOPENS; close restores.
+    /// </summary>
+    public static void Cdvd_MechaconDiskReadyAfterMount()
+    {
+        var sys = new Ps2System();
+        // Synthetic disc image
+        var img = new byte[Cdvd.SectorSize * 4];
+        sys.Cdvd.MountImage(img, "MECH");
+        if (sys.Cdvd.DiskReady() != Cdvd.ReadyComplete)
+            throw new Exception($"DiskReady after mount={sys.Cdvd.DiskReady()}");
+        if (sys.Cdvd.LastError != Cdvd.ErNO)
+            throw new Exception($"LastError={sys.Cdvd.LastError}");
+        if (sys.Cdvd.DriveState != Cdvd.StatSpin)
+            throw new Exception($"DriveState={sys.Cdvd.DriveState}");
+        if ((sys.Cdvd.MechaconStatus & 0xc0) != 0x40)
+            throw new Exception($"MechaconStatus=0x{sys.Cdvd.MechaconStatus:X}");
+
+        if (sys.Cdvd.TrayRequest(Cdvd.TrayReqOpen) != 1)
+            throw new Exception("TrayReqOpen");
+        if (sys.Cdvd.DiskReady() != Cdvd.ReadyNotReady)
+            throw new Exception("tray open should NotReady");
+        if (sys.Cdvd.LastError != Cdvd.ErOPENS)
+            throw new Exception("ErOPENS expected");
+        if (sys.Cdvd.DriveState != Cdvd.StatShellOpen)
+            throw new Exception("StatShellOpen expected");
+
+        if (sys.Cdvd.TrayRequest(Cdvd.TrayReqClose) != 1)
+            throw new Exception("TrayReqClose");
+        if (sys.Cdvd.DiskReady() != Cdvd.ReadyComplete)
+            throw new Exception("DiskReady after close");
+        if (sys.Cdvd.SeekTo(3) != 1 || sys.Cdvd.LastSector != 3)
+            throw new Exception("SeekTo");
+        if (sys.Cdvd.Stop() != 1 || sys.Cdvd.DriveState != Cdvd.StatStop)
+            throw new Exception("Stop");
+        // Stop completes inside RPC; DiskReady stays Complete (mechacon 0x40).
+        if (sys.Cdvd.DiskReady() != Cdvd.ReadyComplete)
+            throw new Exception("DiskReady after stop");
+        if (sys.Cdvd.Standby() != 1 || sys.Cdvd.DriveState != Cdvd.StatSpin)
+            throw new Exception("Standby");
+
+        Console.WriteLine("[Smoke] Cdvd_MechaconDiskReadyAfterMount OK");
+    }
+
+    /// <summary>
+    /// Phase 7: LIBSD export table + sceSdInit / SetParam / SetAddr / SetSwitch(KON) host path
+    /// (ps2sdk libsd exports.tab + libsd-common.h). Key-on must reach Spu2 voice playing.
+    /// </summary>
+    public static void LibSd_InitSetParamKeyOnContracts()
+    {
+        var sys = new Ps2System();
+        sys.BiosBoot.StartCommercialIop(sys);
+        var sd = sys.IopLibSd;
+        if (!sd.Installed)
+            throw new Exception("IopLibSd not installed via commercial IOP");
+        var lib = sys.IopModules.LookupExportLibrary(IopLibSdHost.LibName);
+        if (lib == null) throw new Exception("libsd export missing");
+        if (lib.Exports == null || lib.Exports.Length < IopLibSdHost.ExportCount)
+            throw new Exception($"libsd export count {lib.Exports?.Length}");
+        // Ordinals 4=Init, 5=SetParam, 7=SetSwitch must be non-null plant addresses
+        if (lib.Exports[IopLibSdHost.OrdInit] == 0)
+            throw new Exception("sceSdInit export null");
+        if (lib.Exports[IopLibSdHost.OrdSetParam] == 0)
+            throw new Exception("sceSdSetParam export null");
+        if (lib.Exports[IopLibSdHost.OrdSetSwitch] == 0)
+            throw new Exception("sceSdSetSwitch export null");
+
+        if (sd.SdInit(0) != 0) throw new Exception("SdInit");
+        if (!sd.Initialized) throw new Exception("not Initialized");
+        if (sd.InitCalls < 1) throw new Exception("InitCalls");
+
+        // Set pitch + volume on voice 0 core 0
+        ushort pitchEntry = IopLibSdHost.MakeVoiceEntry(0, 0, IopLibSdHost.VParamPitch);
+        sd.SdSetParam(pitchEntry, 0x1000);
+        if (sd.SdGetParam(pitchEntry) != 0x1000)
+            throw new Exception($"pitch get {sd.SdGetParam(pitchEntry)}");
+        sd.SdSetParam(IopLibSdHost.MakeVoiceEntry(0, 0, IopLibSdHost.VParamVoll), 0x3FFF);
+        sd.SdSetParam(IopLibSdHost.MakeVoiceEntry(0, 0, IopLibSdHost.VParamVolr), 0x3FFF);
+
+        // SSA + synthetic ADPCM block in SPU RAM so key-on has data
+        uint ssa = 0x1000;
+        sd.SdSetAddr(IopLibSdHost.MakeAddrEntry(0, 0, IopLibSdHost.VAddrSsa), ssa);
+        if (sd.SdGetAddr(IopLibSdHost.MakeAddrEntry(0, 0, IopLibSdHost.VAddrSsa)) != ssa)
+            throw new Exception("SSA get");
+        // One silent ADPCM block with loop-end flag so decode terminates
+        var block = new byte[16];
+        block[1] = 1; // loop end
+        sys.Memory.Write8(0x00100000, block[0]); // VoiceTrans source
+        for (int i = 0; i < 16; i++)
+            sys.Memory.Write8(0x00100000 + (uint)i, block[i]);
+        int transferred = sd.SdVoiceTrans(sys.Memory, 0, (ushort)IopLibSdHost.TransWrite,
+            0x00100000, ssa, 16);
+        if (transferred != 16) throw new Exception($"VoiceTrans {transferred}");
+        if (sd.SdVoiceTransStatus(0, 0) != 1) throw new Exception("VoiceTransStatus");
+
+        // Key-on voice 0
+        sd.SdSetSwitch(IopLibSdHost.MakeSwitchEntry(0, IopLibSdHost.SwitchKon), 1u);
+        if (sd.KeyOnOps < 1) throw new Exception("KeyOnOps");
+        if (!sys.Spu2.IsVoicePlaying(0))
+            throw new Exception("voice 0 not playing after KON");
+
+        // Key-off → release (still may play until envelope ends; HostKeyOff sets release)
+        sd.SdSetSwitch(IopLibSdHost.MakeSwitchEntry(0, IopLibSdHost.SwitchKoff), 1u);
+        if (sd.KeyOffOps < 1) throw new Exception("KeyOffOps");
+
+        // Note2Pitch unity at center
+        ushort p = sd.SdNote2Pitch(60, 0, 60, 0);
+        if (p != 0x1000) throw new Exception($"Note2Pitch unity {p}");
+        ushort octave = sd.SdNote2Pitch(60, 0, 72, 0);
+        if (octave < 0x1F00 || octave > 0x2100)
+            throw new Exception($"Note2Pitch +12 {octave}");
+
+        if (sd.SdQuit() != 0) throw new Exception("SdQuit");
+        if (sd.Initialized) throw new Exception("still Initialized after quit");
+
+        Console.WriteLine(
+            $"[Smoke] LibSd_InitSetParamKeyOnContracts OK " +
+            $"(init={sd.InitCalls} keyon={sd.KeyOnOps} setparam={sd.SetParamOps} " +
+            $"vtrans={sd.VoiceTransOps})");
+    }
+
 
     /// <summary>
     /// THREADMAN contracts from tools/bios-decomp/THREADMAN_ALL.txt + BIOS_DISSECTION §4:
@@ -6064,6 +6635,324 @@ public static class SmokeTests
         if (t.Sleeping) throw new Exception("WaitSema release should run (no Suspend)");
 
         Console.WriteLine("[Smoke] KernelHle_ThreadmanSleepWakeupCount OK");
+    }
+
+    /// <summary>
+    /// THREADMAN message boxes + variable/fixed pools (decomp thmsgbx/thvpool/thfpool):
+    /// Create/Delete/Send/Receive/Poll/Refer Mbx; Create/Allocate/Free/Refer Vpl and Fpl;
+    /// Receive parks when empty; Poll is non-blocking (KeMboxNomsg).
+    /// Host KernelState API — EE has no CreateMbx/Vpl/Fpl syscalls (ps2sdk kernel.h).
+    /// </summary>
+    public static void KernelHle_ThreadmanMbxVplFpl()
+    {
+        var sys = new Ps2System();
+        var k = sys.Hle.Kernel;
+
+        // --- Mbx ---
+        int mbx = k.CreateMbx(attr: 0, option: 0xBEEF);
+        if (mbx < 1) throw new Exception("CreateMbx");
+        if (k.PollMbx(mbx, out _) != KernelState.KeMboxNomsg)
+            throw new Exception("Poll empty → KeMboxNomsg");
+        if (k.SendMbx(mbx, 0x1000u) != 0) throw new Exception("SendMbx queue");
+        if (k.SendMbx(mbx, 0x2000u) != 0) throw new Exception("SendMbx queue2");
+        if (k.ReceiveMbx(mbx, out uint m1) != 0 || m1 != 0x1000u) throw new Exception("Receive FIFO");
+        if (k.PollMbx(mbx, out uint m2) != 0 || m2 != 0x2000u) throw new Exception("Poll remaining");
+        if (k.ReferMbx(mbx, out _, out uint opt, out int nMsg, out int nWait) != 0)
+            throw new Exception("ReferMbx");
+        if (opt != 0xBEEF || nMsg != 0 || nWait != 0) throw new Exception("Refer empty status");
+
+        // Park on empty Receive, deliver via Send
+        if (k.ReceiveMbx(mbx, out _) >= 0 || !k.LastReceiveMbxBlocked)
+            throw new Exception("Receive should park");
+        var self = k.GetThread(k.CurrentThreadId)!;
+        if (!self.Sleeping || self.WaitMbxId != mbx) throw new Exception("Receive park state");
+        if (k.ReferMbx(mbx, out _, out _, out _, out nWait) != 0 || nWait != 1)
+            throw new Exception("Refer waiter count");
+        if (k.SendMbx(mbx, 0xABCDU) != 0) throw new Exception("Send to waiter");
+        if (self.Sleeping || self.WaitMbxId != 0) throw new Exception("Send must wake Receive");
+        if (k.TakeMbxReceivedMsg() != 0xABCDU) throw new Exception("delivered msg");
+
+        // DeleteMbx wakes waiters with KeWaitDelete
+        k.ReceiveMbx(mbx, out _);
+        if (!k.LastReceiveMbxBlocked) throw new Exception("re-park");
+        if (k.DeleteMbx(mbx) != 0) throw new Exception("DeleteMbx");
+        if (self.WaitMbxId != 0) throw new Exception("Delete cleared WaitMbxId");
+        if (!self.HasWaitReturn || self.WaitReturnCode != KernelState.KeWaitDelete)
+            throw new Exception($"Delete waiter code 0x{self.WaitReturnCode:X8}");
+
+        // --- Vpl ---
+        int vpl = k.CreateVpl(0x1000);
+        if (vpl < 1) throw new Exception("CreateVpl");
+        if (k.AllocateVpl(vpl, 0x100, out uint p1) != 0 || p1 == 0) throw new Exception("AllocVpl");
+        if (k.AllocateVpl(vpl, 0x100, out uint p2) != 0 || p2 == p1) throw new Exception("AllocVpl2");
+        if (k.FreeVpl(vpl, p1) != 0) throw new Exception("FreeVpl");
+        if (k.ReferVpl(vpl, out _, out _, out int psz, out int free, out _) != 0)
+            throw new Exception("ReferVpl");
+        if (psz != 0x1000 || free < 0x100) throw new Exception($"Refer free={free}");
+        // Exhaust then park
+        while (k.PollAllocateVpl(vpl, 0x100, out _) == 0) { /* drain */ }
+        if (k.AllocateVpl(vpl, 0x100, out _) >= 0 || !k.LastAllocateVplBlocked)
+            throw new Exception("AllocVpl should park when empty");
+        // Free should wake (we freed p2 earlier? p2 still held — free p2)
+        // Actually drained free list; free the used blocks we still hold
+        // p2 may still be used; free it to create space
+        k.FreeVpl(vpl, p2);
+        // Waiter may still be blocked if free space was fragmented — FreeVpl tries alloc for waiter
+        // After drain, Free of any used block should wake if size fits
+        // Ensure: create fresh vpl for wake test
+        if (k.DeleteVpl(vpl) != 0) throw new Exception("DeleteVpl");
+
+        int vpl2 = k.CreateVpl(0x40);
+        // Take entire pool
+        if (k.AllocateVpl(vpl2, 0x40, out uint whole) != 0) throw new Exception("take all");
+        k.AllocateVpl(vpl2, 0x10, out _);
+        if (!k.LastAllocateVplBlocked) throw new Exception("park for free");
+        if (k.FreeVpl(vpl2, whole) != 0) throw new Exception("free whole");
+        if (self.WaitVplId != 0) throw new Exception("Free must wake Alloc waiter");
+        if (k.TakeVplAllocatedPtr() == 0) throw new Exception("woken alloc ptr");
+        k.DeleteVpl(vpl2);
+
+        // --- Fpl ---
+        int fpl = k.CreateFpl(blockSize: 32, blockCount: 2);
+        if (fpl < 1) throw new Exception("CreateFpl");
+        if (k.AllocateFpl(fpl, out uint b1) != 0 || b1 == 0) throw new Exception("AllocFpl1");
+        if (k.AllocateFpl(fpl, out uint b2) != 0 || b2 == b1) throw new Exception("AllocFpl2");
+        if (k.PollAllocateFpl(fpl, out _) != KernelState.KeNoMemory)
+            throw new Exception("Poll empty Fpl");
+        k.AllocateFpl(fpl, out _);
+        if (!k.LastAllocateFplBlocked) throw new Exception("AllocFpl park");
+        if (k.FreeFpl(fpl, b1) != 0) throw new Exception("FreeFpl wake");
+        if (self.WaitFplId != 0) throw new Exception("Free must wake Fpl waiter");
+        if (k.TakeFplAllocatedPtr() != b1) throw new Exception("Fpl delivered block");
+        if (k.ReferFpl(fpl, out _, out _, out int bs, out int freeN, out int fw) != 0)
+            throw new Exception("ReferFpl");
+        if (bs != 32 || freeN != 0 || fw != 0) throw new Exception($"ReferFpl bs={bs} free={freeN} w={fw}");
+        if (k.DeleteFpl(fpl) != 0) throw new Exception("DeleteFpl");
+
+        Console.WriteLine("[Smoke] KernelHle_ThreadmanMbxVplFpl OK");
+    }
+
+    /// <summary>
+    /// Priority-aware FindNextRunnable (lower priority value runs first) + DelayThread
+    /// alarm path (FUN_00002444) via TickDelays / OnVblank.
+    /// </summary>
+    public static void KernelHle_ThreadmanPriorityAndDelay()
+    {
+        var sys = new Ps2System();
+        var k = sys.Hle.Kernel;
+
+        // Main is prio 1. Create two workers: high prio 2 and low prio 80.
+        int high = k.CreateThread(0x00100000, 0, 0x01F00000, 0x1000, priority: 2);
+        int low = k.CreateThread(0x00100100, 0, 0x01E00000, 0x1000, priority: 80);
+        k.StartThread(high);
+        k.StartThread(low);
+
+        // From main (prio 1), next runnable among others should be high (2) not low (80)
+        int next = k.FindNextRunnable(k.CurrentThreadId);
+        if (next != high) throw new Exception($"expected high-prio worker, got {next}");
+
+        // Raise low above high → next becomes low
+        if (k.ChangeThreadPriority(low, 1) != 80) throw new Exception("ChangeThreadPriority old");
+        next = k.FindNextRunnable(k.CurrentThreadId);
+        // Main is current; both low (prio 1) and high (prio 2) runnable — pick lowest prio value among others
+        // low now has prio 1 same as main but main is afterId-excluded; low and high: low wins
+        if (next != low) throw new Exception($"after reprio expected low, got {next}");
+
+        // Sony ChangeThreadPriority syscall
+        sys.Hle.EnableSonyKernel();
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x29 });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = (ulong)high });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 3 });
+        sys.Hle.HandleSyscall(sys.EE);
+        var ht = k.GetThread(high)!;
+        if (ht.Priority != 3) throw new Exception($"syscall prio={ht.Priority}");
+
+        // DelayThread
+        var self = k.GetThread(k.CurrentThreadId)!;
+        if (k.DelayThread(50000) != 0) throw new Exception("DelayThread");
+        if (!self.Sleeping || self.DelayRemainingUs != 50000) throw new Exception("delay park");
+        if (k.TickDelays(10000) != 0) throw new Exception("partial tick must not wake");
+        if (self.DelayRemainingUs != 40000) throw new Exception("delay remaining");
+        if (k.TickDelays(40000) != 1) throw new Exception("full tick wakes");
+        if (self.Sleeping || self.DelayRemainingUs != 0) throw new Exception("delay done");
+
+        // OnVblank advances ~16667 µs
+        k.DelayThread(20000);
+        k.OnVblank();
+        if (self.DelayRemainingUs != 20000 - 16667) throw new Exception("OnVblank delay tick");
+        k.OnVblank();
+        if (self.Sleeping || self.DelayRemainingUs != 0) throw new Exception("second vblank finishes delay");
+
+        Console.WriteLine("[Smoke] KernelHle_ThreadmanPriorityAndDelay OK");
+    }
+
+    /// <summary>
+    /// DeleteSema / ReleaseWaitThread waiter return codes (0xfffffe57 / 0xfffffe5e).
+    /// </summary>
+    public static void KernelHle_ThreadmanReleaseWaitAndDeleteSemaCodes()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var k = sys.Hle.Kernel;
+        var self = k.GetThread(k.CurrentThreadId)!;
+
+        int sid = k.CreateSema(0, 1);
+        k.WaitSemaBlocking(sid);
+        if (!k.LastWaitSemaBlocked) throw new Exception("park");
+        if (k.DeleteSema(sid) != 0) throw new Exception("DeleteSema");
+        if (self.WaitSemaId != 0) throw new Exception("cleared WaitSemaId");
+        if (!self.HasWaitReturn || self.WaitReturnCode != KernelState.KeWaitDelete)
+            throw new Exception($"Delete code 0x{self.WaitReturnCode:X8}");
+
+        // ReleaseWaitThread on Sleep
+        self.HasWaitReturn = false;
+        k.SleepThread();
+        if (!self.Sleeping) throw new Exception("sleep");
+        // Sony syscall 0x2D
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x2D });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = (ulong)k.CurrentThreadId });
+        sys.Hle.HandleSyscall(sys.EE);
+        if ((int)sys.EE.GetGpr(2).Lo != 0) throw new Exception("ReleaseWait v0");
+        if (self.Sleeping) throw new Exception("ReleaseWait must unpark");
+        if (!self.HasWaitReturn || self.WaitReturnCode != KernelState.KeReleaseWait)
+            throw new Exception($"Release code 0x{self.WaitReturnCode:X8}");
+
+        // ReleaseWait on non-waiting thread → error
+        if (k.ReleaseWaitThread(k.CurrentThreadId) >= 0)
+            throw new Exception("ReleaseWait on non-waiter must fail");
+
+        Console.WriteLine("[Smoke] KernelHle_ThreadmanReleaseWaitAndDeleteSemaCodes OK");
+    }
+
+    /// <summary>
+    /// Phase 5 EE SetAlarm/ReleaseAlarm (ps2sdk 0x18/0x19 / 0xFC/0xFE): allocate id, release
+    /// returns remaining H-SYNC, fire callback via TickEeAlarms after budget elapses.
+    /// Callback writes common word = alarm id (mini EE run).
+    /// </summary>
+    public static void SonyKernelHle_SetAlarmReleaseAndFire()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var sony = sys.Hle.Sony ?? throw new Exception("no Sony HLE");
+        var mem = sys.Memory;
+
+        // Callback body at 0x00120000:
+        //   sw a0, 0(a2)   ; *common = alarm_id  (base=a2=6, rt=a0=4)
+        //   jr ra
+        //   nop
+        const uint cb = 0x00120000;
+        const uint common = 0x00120100;
+        mem.Write32(cb + 0, 0xACC40000u); // sw a0, 0(a2)
+        mem.Write32(cb + 4, 0x03E00008u); // jr ra
+        mem.Write32(cb + 8, 0x00000000u); // nop
+        mem.Write32(common, 0);
+
+        // Public SetAlarm (0xFC): time=100 H-SYNC, cb, common
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0xFC });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 100 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = cb });
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = common });
+        if (!sys.Hle.HandleSyscall(sys.EE)) throw new Exception("SetAlarm not handled");
+        int id1 = (int)sys.EE.GetGpr(2).Lo;
+        if (id1 <= 0) throw new Exception($"SetAlarm id={id1}");
+        if (sony.ActiveAlarmCount != 1) throw new Exception("active count after set");
+
+        // Internal _SetAlarm 0x18 also works
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x18 });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 500 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = cb });
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = common + 4 });
+        mem.Write32(common + 4, 0);
+        sys.Hle.HandleSyscall(sys.EE);
+        int id2 = (int)sys.EE.GetGpr(2).Lo;
+        if (id2 <= 0 || id2 == id1) throw new Exception($"SetAlarm2 id={id2}");
+        if (sony.ActiveAlarmCount != 2) throw new Exception("two alarms");
+
+        // Release id2 via 0xFE — remaining should be > 0 and near 500
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0xFE });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = (ulong)id2 });
+        sys.Hle.HandleSyscall(sys.EE);
+        int rem = (int)sys.EE.GetGpr(2).Lo;
+        if (rem <= 0 || rem > 500) throw new Exception($"Release remaining={rem}");
+        if (sony.ActiveAlarmCount != 1) throw new Exception("one left after release");
+
+        // Missing id → -1
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x19 });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = (ulong)id2 });
+        sys.Hle.HandleSyscall(sys.EE);
+        if ((int)sys.EE.GetGpr(2).Lo >= 0) throw new Exception("double release must fail");
+
+        // Fire id1: Tick 100 H-SYNC (exact budget)
+        sony.TickEeAlarms(100);
+        if (sony.ActiveAlarmCount != 0) throw new Exception("should have fired");
+        uint written = mem.Read32(common);
+        if (written != (uint)id1)
+            throw new Exception($"callback wrote 0x{written:X}, expected id={id1}");
+
+        // Zero-time SetAlarm still arms (clamped to 1) and fires on next tick
+        mem.Write32(common, 0);
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0xFC });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = cb });
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = common });
+        sys.Hle.HandleSyscall(sys.EE);
+        int id3 = (int)sys.EE.GetGpr(2).Lo;
+        if (id3 <= 0) throw new Exception("zero-time SetAlarm");
+        sony.TickEeAlarms(1);
+        if (mem.Read32(common) != (uint)id3) throw new Exception("zero-time fire");
+
+        // VBlank path also advances (one field = 262 H-SYNC)
+        mem.Write32(common, 0);
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0xFC });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 200 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = cb });
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = common });
+        sys.Hle.HandleSyscall(sys.EE);
+        int id4 = (int)sys.EE.GetGpr(2).Lo;
+        sony.OnVblankTick(); // -262 ⇒ fire
+        if (mem.Read32(common) != (uint)id4) throw new Exception("VBlank fire");
+
+        Console.WriteLine("[Smoke] SonyKernelHle_SetAlarmReleaseAndFire OK");
+    }
+
+    /// <summary>
+    /// Phase 5: RFU059 (0x3B) is not JoinThread; iEnableIntc abs(-0x1A)=0x1A arms INTC_MASK.
+    /// EndOfHeap returns HeapTop; GetMemorySize returns RDRAM.
+    /// </summary>
+    public static void SonyKernelHle_Rfu059AndIEnableIntc()
+    {
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+
+        // RFU059
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x3B });
+        if (!sys.Hle.HandleSyscall(sys.EE)) throw new Exception("RFU059 not handled");
+        if ((int)sys.EE.GetGpr(2).Lo != 0) throw new Exception("RFU059 v0");
+
+        // iEnableIntc as negative v1 (BiosHle abs → 0x1A)
+        uint maskBefore = sys.Intc.Mask;
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)(int)(-0x1A)) });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 2 }); // VBlankStart
+        if (!sys.Hle.HandleSyscall(sys.EE)) throw new Exception("iEnableIntc not handled");
+        if ((int)sys.EE.GetGpr(2).Lo != 1) throw new Exception("iEnableIntc result");
+        if ((sys.Intc.Mask & (1u << 2)) == 0) throw new Exception("VBlankStart mask bit");
+        if (sys.Intc.Mask == maskBefore && (maskBefore & (1u << 2)) == 0)
+            throw new Exception("mask unchanged");
+
+        // EndOfHeap / GetMemorySize
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x3E });
+        sys.Hle.HandleSyscall(sys.EE);
+        if (sys.EE.GetGpr(2).Lo != 0x01FFF000u) throw new Exception("EndOfHeap");
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x7F });
+        sys.Hle.HandleSyscall(sys.EE);
+        if (sys.EE.GetGpr(2).Lo != (ulong)SystemMemory.RDRAM_SIZE)
+            throw new Exception("GetMemorySize");
+
+        // DisableDispatchThread intentional no-op
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0x27 });
+        if (!sys.Hle.HandleSyscall(sys.EE)) throw new Exception("DisableDispatch not handled");
+
+        Console.WriteLine("[Smoke] SonyKernelHle_Rfu059AndIEnableIntc OK");
     }
 
 
@@ -7120,6 +8009,24 @@ public static class SmokeTests
         if (t.StartHardTimer(timid) != 0) throw new Exception("start");
         t.SetTimerCompare(timid, 0x100);
         if (t.GetTimerCompare(timid) != 0x100) throw new Exception("compare");
+
+        // SetTimerHandler + compare-match → INTRMAN RaiseIntr bookkeeping
+        // RTC2 irq = 6; plant handler + enable then advance counter past compare.
+        if (t.RegisterIntrHandler(6, 0, 0xC0FFEEu, 0) != 0) throw new Exception("timer irq handler");
+        if (t.EnableIntr(6) != 0) throw new Exception("timer irq enable");
+        if (t.SetTimerHandler(timid, 0x50, 0xDEADBEEFu, 0x11) != 0)
+            throw new Exception("SetTimerHandler");
+        t.SetTimerCounter(timid, 0x40);
+        ulong hits0 = t.HardTimerCompareHits;
+        ulong raises0 = t.IntrRaises;
+        t.Tick(0x20, rawTicks: true); // counter 0x40 → 0x60 crosses 0x50
+        if (t.HardTimerCompareHits <= hits0) throw new Exception("compare hit");
+        if (t.GetTimerTimeupFlags(timid) == 0) throw new Exception("timeup flag");
+        if (t.IntrRaises <= raises0) throw new Exception("timer irq raise");
+        if (!t.IsIntrPending(6)) throw new Exception("timer irq pending");
+        t.AcknowledgeIntr(6);
+        t.ClearTimerTimeupFlags(timid);
+
         if (t.StopHardTimer(timid) != 0) throw new Exception("stop");
         if (t.FreeHardTimer(timid) != 0) throw new Exception("free");
 
@@ -7251,12 +8158,46 @@ private static void WriteAscii(SystemMemory mem, uint addr, string s)
             throw new Exception("SIO2 RequestAndStart");
         if (!d.IsChannelEnabled(IopDmacManHost.ChSio2In)) throw new Exception("SIO2 enabled");
 
+        // Channel lifecycle: Request → Start → Release
+        if (d.RequestChannel(IopDmacManHost.ChCdvd, 0x5000, 16, 1, IopDmacManHost.DmacFromMem) != 1)
+            throw new Exception("RequestChannel");
+        if (d.GetMadr(IopDmacManHost.ChCdvd) != 0x5000) throw new Exception("req MADR");
+        if (!d.IsChannelEnabled(IopDmacManHost.ChCdvd)) throw new Exception("req enable");
+        d.StartDma(IopDmacManHost.ChCdvd);
+        if (d.IsTransferActive(IopDmacManHost.ChCdvd)) throw new Exception("sync complete leaves TR clear");
+        if (d.ReleaseChannel(IopDmacManHost.ChCdvd) != 1) throw new Exception("ReleaseChannel");
+        if (d.GetMadr(IopDmacManHost.ChCdvd) != 0) throw new Exception("released MADR");
+        if (d.IsChannelEnabled(IopDmacManHost.ChCdvd)) throw new Exception("released enable");
+
+        // DICR IE → IF on complete (ch 3 CDVD)
+        d.SetDicr(0);
+        d.SetChannelInterruptEnable(IopDmacManHost.ChCdvd, true);
+        if (d.SetSliceDma(IopDmacManHost.ChCdvd, 0x6000, 4, 1, IopDmacManHost.DmacToMem) != 1)
+            throw new Exception("slice for dicr");
+        ulong dicr0 = d.DicrIrqCount;
+        d.StartDma(IopDmacManHost.ChCdvd);
+        if (d.DicrIrqCount <= dicr0) throw new Exception("DICR IF latch");
+        if (!d.IsChannelInterruptPending(IopDmacManHost.ChCdvd))
+            throw new Exception("channel IF pending");
+        d.AcknowledgeChannelInterrupt(IopDmacManHost.ChCdvd);
+        if (d.IsChannelInterruptPending(IopDmacManHost.ChCdvd))
+            throw new Exception("IF cleared");
+
+        // Chained SPU + deinit
+        if (d.SetDmaChainedSpuSif0(IopDmacManHost.ChSpu, 0x10, 0x7000) != 1)
+            throw new Exception("chained SPU");
+        if (d.GetChcr(IopDmacManHost.ChSpu) != 0x601) throw new Exception("SPU CHCR");
+        d.Deinit();
+        if (d.Started) throw new Exception("deinit clears started");
+        if (d.MasterEnable != 0) throw new Exception("deinit master");
+
         // EE Dmac untouched by IOP path
         if (sys.Dmac.TransfersCompleted != 0)
             throw new Exception("EE Dmac should not run from IopDmacMan");
 
         Console.WriteLine(
-            $"[Smoke] BiosHle_IopDmacManContracts OK (starts={d.StartCount} complete={d.CompleteCount} en={d.EnableCount})");
+            $"[Smoke] BiosHle_IopDmacManContracts OK (starts={d.StartCount} complete={d.CompleteCount} " +
+            $"en={d.EnableCount} rel={d.ReleaseCount} dicrIrq={d.DicrIrqCount})");
     }
 
 
@@ -7474,18 +8415,25 @@ private static void WriteAscii(SystemMemory mem, uint addr, string s)
         int range = IopSsbuscHost.DecodeRangeBytes(0x00130000); // n=0x13 → 2^19
         if (range != (1 << 0x13)) throw new Exception($"range {range}");
 
+        // All wired windows ready after defaults
+        if (!s.AllWindowsReady) throw new Exception("AllWindowsReady");
+        if (s.ReadyWindowCount != s.WiredDelayDevices)
+            throw new Exception($"ready {s.ReadyWindowCount} vs wired {s.WiredDelayDevices}");
+
         // Boot path plants SSBUSC
         var sys = new Ps2System();
         sys.BiosBoot.StartCommercialIop(sys);
         if (!sys.IopSsbusc.Configured) throw new Exception("boot SSBUSC not configured");
         if (!sys.IopSsbusc.IsWindowReady(IopSsbuscHost.DevCdvd))
             throw new Exception("boot CDVD window");
+        if (!sys.IopSsbusc.AllWindowsReady)
+            throw new Exception("boot AllWindowsReady");
         if (!sys.IopModules.IsModuleLoaded("SSBUSC"))
             throw new Exception("SSBUSC name not registered");
 
         Console.WriteLine(
             $"[Smoke] Ssbusc_BusWindowContracts OK (wired={sys.IopSsbusc.WiredDelayDevices}, " +
-            $"applies={sys.IopSsbusc.ApplyDefaultsCount})");
+            $"ready={sys.IopSsbusc.ReadyWindowCount}, applies={sys.IopSsbusc.ApplyDefaultsCount})");
     }
 
 
@@ -7517,10 +8465,22 @@ private static void WriteAscii(SystemMemory mem, uint addr, string s)
         if (e.Ps1ClearCount <= clears) throw new Exception("re-clear");
         if (e.InitCount < 2) throw new Exception("init count");
 
+        // Dirty then ApplyBiosInit must zero-fill again
+        e.DirtyPs1ConfigBlock(0x5A);
+        if (e.IsPs1ConfigAllZero) throw new Exception("dirty should not be zero");
+        if (e.ReadPs1Config(0) != 0x5A) throw new Exception("dirty byte");
+        e.ApplyBiosInit();
+        if (!e.IsPs1ConfigAllZero) throw new Exception("re-init must zero PS1 block");
+        if (!e.Ps1ConfigBlockCleared) throw new Exception("cleared flag after dirty-init");
+
         // Custom MAC bind
         e.SetMac(new byte[] { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
         mac = e.GetMacCopy();
         if (mac[0] != 0xAA || mac[5] != 0xFF) throw new Exception("custom MAC");
+
+        // SPEED caps set
+        e.SetSpeedCaps(IopEeconfHost.SpeedCapPresent | IopEeconfHost.SpeedCapHdd);
+        if ((e.SpeedCaps & IopEeconfHost.SpeedCapHdd) == 0) throw new Exception("HDD cap");
 
         // Boot path
         var sys = new Ps2System();

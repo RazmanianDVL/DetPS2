@@ -47,6 +47,23 @@ public sealed class SonyKernelHle
     private uint _vsyncFlagOdd;
     private uint _vsyncFlagEven;
     private uint _vsyncCount;
+    /// <summary>EE kernel soft alarms (syscalls 0x18/0x19 / 0xFC/0xFE). Time unit is H-SYNC
+    /// ticks per ps2sdk <c>kernel.h</c>. Fired from <see cref="OnVblankTick"/> by subtracting
+    /// an approximate lines-per-frame budget (real BIOS uses INTC Timer3 / H-SYNC).</summary>
+    private sealed class EeAlarm
+    {
+        public int Id;
+        public int RemainingHsync;
+        public int InitialTime;
+        public uint Callback;
+        public uint Common;
+        public bool Active;
+    }
+    private const int MaxEeAlarms = 64;
+    /// <summary>Approx NTSC visible+blanking lines per VBlank field used to advance alarms.</summary>
+    private const int HsyncPerVblank = 262;
+    private readonly EeAlarm?[] _alarms = new EeAlarm?[MaxEeAlarms];
+    private int _nextAlarmId = 1;
     private const uint StubBase = 0x00081000;
     // Top of usable RDRAM for heap purposes — leaves room below the top-of-RAM stack
     // region real hardware reserves. Shared by SetupHeap (0x3D) and EndOfHeap (0x3E)
@@ -220,7 +237,8 @@ public sealed class SonyKernelHle
         return false;
     }
 
-    /// <summary>Called from VBlank path — fulfills sceSetVSyncFlag pointers.</summary>
+    /// <summary>Called from VBlank path — fulfills sceSetVSyncFlag pointers and advances
+    /// EE soft alarms (H-SYNC budget per field).</summary>
     public void OnVblankTick()
     {
         _vsyncCount++;
@@ -232,11 +250,137 @@ public sealed class SonyKernelHle
             _system.Memory.Write32(_vsyncFlagOdd, odd);
         if (_vsyncFlagEven != 0 && _vsyncFlagEven < SystemMemory.RDRAM_SIZE - 4)
             _system.Memory.Write32(_vsyncFlagEven, even);
-        // Also poke common Midway/global VSync poll words if SetVSyncFlag was never called
-        // but software still samples a fixed address (observed thrash at high 0x73 counts).
-        if (_vsyncFlagOdd == 0 && _vsyncFlagEven == 0)
+
+        TickEeAlarms(HsyncPerVblank);
+    }
+
+    /// <summary>Test / save-state helper: advance alarm timers by <paramref name="hsyncTicks"/>
+    /// H-SYNC units without a full PCRTC VBlank (fires due callbacks immediately).</summary>
+    public void TickEeAlarms(int hsyncTicks)
+    {
+        if (hsyncTicks <= 0) return;
+        // Collect firings first so a callback that SetAlarm/ReleaseAlarm mid-fire is safe.
+        Span<int> fireSlots = stackalloc int[MaxEeAlarms];
+        int fireCount = 0;
+        for (int i = 0; i < MaxEeAlarms; i++)
         {
-            // no plant — only write registered pointers
+            var a = _alarms[i];
+            if (a == null || !a.Active) continue;
+            a.RemainingHsync -= hsyncTicks;
+            if (a.RemainingHsync <= 0)
+                fireSlots[fireCount++] = i;
+        }
+        for (int f = 0; f < fireCount; f++)
+        {
+            int slot = fireSlots[f];
+            var a = _alarms[slot];
+            if (a == null || !a.Active) continue;
+            a.Active = false;
+            _alarms[slot] = null;
+            InvokeAlarmCallback(a.Id, (uint)a.InitialTime, a.Callback, a.Common);
+        }
+    }
+
+    /// <summary>Number of currently armed EE soft alarms (diagnostics / smokes).</summary>
+    public int ActiveAlarmCount
+    {
+        get
+        {
+            int n = 0;
+            for (int i = 0; i < MaxEeAlarms; i++)
+                if (_alarms[i] is { Active: true }) n++;
+            return n;
+        }
+    }
+
+    /// <summary>ps2sdk SetAlarm(u16 time, cb, common) — returns alarm id, or negative on full.</summary>
+    private int SetEeAlarm(uint timeHsync, uint callback, uint common)
+    {
+        // time is u16 on hardware; zero means "as soon as possible" (next tick).
+        int time = (int)(timeHsync & 0xFFFF);
+        if (time == 0) time = 1;
+        if (callback == 0) return -1;
+
+        for (int i = 0; i < MaxEeAlarms; i++)
+        {
+            if (_alarms[i] != null) continue;
+            int id = _nextAlarmId++;
+            if (_nextAlarmId <= 0) _nextAlarmId = 1;
+            _alarms[i] = new EeAlarm
+            {
+                Id = id,
+                RemainingHsync = time,
+                InitialTime = time,
+                Callback = callback,
+                Common = common,
+                Active = true
+            };
+            return id;
+        }
+        return -1; // table full (MAX_ALARMS = 64)
+    }
+
+    /// <summary>ps2sdk ReleaseAlarm(id) — returns remaining H-SYNC ticks, or negative if missing.</summary>
+    private int ReleaseEeAlarm(int alarmId)
+    {
+        if (alarmId <= 0) return -1;
+        for (int i = 0; i < MaxEeAlarms; i++)
+        {
+            var a = _alarms[i];
+            if (a == null || !a.Active || a.Id != alarmId) continue;
+            int rem = a.RemainingHsync > 0 ? a.RemainingHsync : 0;
+            a.Active = false;
+            _alarms[i] = null;
+            return rem;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Invoke <c>void cb(s32 id, u16 time, void *common)</c> briefly. Same save/restore
+    /// pattern as RPC end_function invoke; callback must return (jr ra) within a few hundred
+    /// instructions. Failures are swallowed — alarms must not crash the whole EE.
+    /// </summary>
+    private void InvokeAlarmCallback(int alarmId, uint time, uint callback, uint common)
+    {
+        if (callback < 0x1000 || callback >= SystemMemory.RDRAM_SIZE) return;
+        var ee = _system.EE;
+        if (ee == null) return;
+
+        ulong savedPc = ee.PC;
+        var savedA0 = ee.GetGpr(4);
+        var savedA1 = ee.GetGpr(5);
+        var savedA2 = ee.GetGpr(6);
+        var savedRa = ee.GetGpr(31);
+        const uint SentinelRa = 0xFFFFFFFC;
+
+        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = unchecked((uint)alarmId) });
+        ee.SetGpr(5, new EmotionEngine.Gpr128 { Lo = time });
+        ee.SetGpr(6, new EmotionEngine.Gpr128 { Lo = common });
+        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = SentinelRa });
+        ee.PC = callback;
+        ee.HleRedirectPc = null;
+
+        // Re-use the RPC end-function reentrancy guard so nested Step cannot re-drain.
+        bool prev = _inRpcEndFuncInvoke;
+        _inRpcEndFuncInvoke = true;
+        try
+        {
+            for (int i = 0; i < 512; i++)
+            {
+                uint pc = (uint)(ee.PC & 0x1FFFFFFF);
+                if (pc == (SentinelRa & 0x1FFFFFFF) || pc == 0) break;
+                ee.Step(1);
+            }
+        }
+        finally
+        {
+            _inRpcEndFuncInvoke = prev;
+            ee.PC = savedPc;
+            ee.SetGpr(4, savedA0);
+            ee.SetGpr(5, savedA1);
+            ee.SetGpr(6, savedA2);
+            ee.SetGpr(31, savedRa);
         }
     }
 
@@ -396,6 +540,11 @@ public sealed class SonyKernelHle
         _gsImr = 0xFF00;
         _stubsInstalled = false;
         _stubSlots = 0;
+        _vsyncFlagOdd = 0;
+        _vsyncFlagEven = 0;
+        _vsyncCount = 0;
+        Array.Clear(_alarms);
+        _nextAlarmId = 1;
         Handled = Unknown = 0;
         SifDmaCalls = SifGetRegCalls = 0;
         _recentSyscallIdx = 0;
@@ -551,8 +700,8 @@ public sealed class SonyKernelHle
 
         switch (num)
         {
-            case 0x00: // RFU000 FullReset
-            case 0x01: // ResetEE
+            case 0x00: // RFU000_FullReset — soft accept (no full machine rebuild mid-title)
+            case 0x01: // ResetEE(init_bitfield) — accept; peripherals already live under HLE
                 result = 0;
                 break;
             case 0x02: // SetGsCrt(interlace, mode, ffmd)
@@ -561,18 +710,18 @@ public sealed class SonyKernelHle
                 _system.Gs.WritePrivileged64(0x12000000, 1); // PMODE EN1
                 result = 0;
                 break;
-            case 0x03:
+            case 0x03: // (unused / RFU) — intentional no-op
                 result = 0;
                 break;
-            case 0x04: // Exit
+            case 0x04: // Exit / KExit
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1")
                     Console.Error.WriteLine($"[EXIT-SYSCALL] code={a0} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} tid={_kernel.CurrentThreadId} cyc={_system.MasterCycles}");
                 _system.Hle.RequestExit((int)a0);
                 result = 0;
                 break;
-            case 0x05:
-            case 0x08:
-            case 0x09:
+            case 0x05: // ResumeIntrDispatch (ps2sdk arbitrary name) — intentional no-op
+            case 0x08: // ResumeT3IntrDispatch (alarm update path) — intentional no-op under soft alarms
+            case 0x09: // RFU009 — intentional no-op
                 result = 0;
                 break;
             case 0x06: // LoadExecPS2 — not fully supported
@@ -581,9 +730,11 @@ public sealed class SonyKernelHle
                 break;
 
             // ---- INTC / DMAC enable ----
-            case 0x0A: // AddSbusIntcHandler
+            case 0x0A: // AddSbusIntcHandler — no SBUS guest; accept id
             case 0x0B: // RemoveSbusIntcHandler
             case 0x0C: // Interrupt2Iop
+                result = 0;
+                break;
             case 0x0D: // SetVTLBRefillHandler(cause, handler) — return previous (or BIOS default)
                 result = SetExceptionVectorHandler(_vTlbRefillHandlers, (int)a0, a1);
                 break;
@@ -641,6 +792,7 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x14: // EnableIntc(cause) — OR the cause bit into INTC_MASK
+            case 0x1A: // iEnableIntc after abs(-0x1a) — same mask OR
                 if (a0 < 15)
                 {
                     uint bit = 1u << (int)a0;
@@ -650,11 +802,13 @@ public sealed class SonyKernelHle
                 result = 1;
                 break;
             case 0x15: // DisableIntc(cause)
+            case 0x1B: // iDisableIntc after abs(-0x1b)
                 if (a0 < 15)
                     _system.Intc.SetMask(_system.Intc.Mask & ~(1u << (int)a0));
                 result = 1;
                 break;
             case 0x16: // EnableDmac(channel) — arm D_STAT mask + INTC DmaController
+            case 0x1C: // iEnableDmac after abs(-0x1c)
                 if (a0 < 10)
                 {
                     _system.Dmac.EnableChannelIrq((int)a0);
@@ -672,15 +826,24 @@ public sealed class SonyKernelHle
                 result = 1;
                 break;
             case 0x17: // DisableDmac(channel)
+            case 0x1D: // iDisableDmac after abs(-0x1d)
                 if (a0 < 10)
                     _system.Dmac.DisableChannelIrq((int)a0);
                 result = 1;
                 break;
-            case 0x18: // SetAlarm
-            case 0x19: // ReleaseAlarm
-            case 0xFC:
-            case 0xFE:
-                result = 0;
+            // ---- Alarms (ps2sdk: time in H-SYNC ticks; public nums 0xFC/0xFE, internal 0x18/0x19;
+            // i* after abs: 0x1E/0x1F internal, 0xFD/0xFF public) ----
+            case 0x18: // _SetAlarm(time, cb, common)
+            case 0x1E: // _iSetAlarm
+            case 0xFC: // SetAlarm
+            case 0xFD: // iSetAlarm
+                result = SetEeAlarm(a0, a1, a2);
+                break;
+            case 0x19: // _ReleaseAlarm(id)
+            case 0x1F: // _iReleaseAlarm
+            case 0xFE: // ReleaseAlarm
+            case 0xFF: // iReleaseAlarm
+                result = ReleaseEeAlarm((int)a0);
                 break;
 
             // ---- Threads (Sony) ----
@@ -704,21 +867,31 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x25: // TerminateThread
+            case 0x26: // iTerminateThread after abs(-0x26)
                 result = _kernel.DeleteThread((int)a0);
                 break;
-            case 0x27: // DisableDispatchThread
-            case 0x28: // EnableDispatchThread
+            case 0x27: // DisableDispatchThread — not supported on retail EE (ps2sdk comment)
+            case 0x28: // EnableDispatchThread — intentional no-op
                 result = 0;
                 break;
-            case 0x29: // ChangeThreadPriority
-                result = 0;
+            case 0x29: // ChangeThreadPriority(tid, priority) — lower value = higher priority
+            case 0x2A: // iChangeThreadPriority after abs(-0x2a)
+                {
+                    int oldPrio = _kernel.ChangeThreadPriority((int)a0, (int)a1);
+                    result = oldPrio;
+                    // Self-priority change may need a yield so a higher-prio peer runs first.
+                    if (oldPrio >= 0 && ((int)a0 == 0 || (int)a0 == _kernel.CurrentThreadId))
+                        _kernel.SwitchToNext(ee);
+                }
                 break;
             case 0x2B: // RotateThreadReadyQueue
+            case 0x2C: // iRotateThreadReadyQueue after abs(-0x2c)
                 _kernel.SwitchToNext(ee);
                 result = 0;
                 break;
-            case 0x2D: // ReleaseWaitThread
-                result = _kernel.WakeupThread((int)a0);
+            case 0x2D: // ReleaseWaitThread — THREADMAN KeReleaseWait (0xfffffe5e) on waiter
+            case 0x2E: // iReleaseWaitThread after abs(-0x2e)
+                result = _kernel.ReleaseWaitThread((int)a0);
                 break;
             case 0x2F: // GetThreadId
                 result = _kernel.CurrentThreadId;
@@ -750,6 +923,7 @@ public sealed class SonyKernelHle
                 result = _kernel.WakeupThread((int)a0);
                 break;
             case 0x35: // CancelWakeupThread — THREADMAN FUN_000022dc: return+clear wakeup count
+            case 0x36: // iCancelWakeupThread after abs(-0x36)
                 result = _kernel.CancelWakeupThread((int)a0);
                 break;
             case 0x37: // SuspendThread(tid) — was a no-op stub; ADX thrash path
@@ -831,7 +1005,8 @@ public sealed class SonyKernelHle
             case 0x3A: // iResumeThread
                 result = _kernel.ResumeThread((int)a0 == 0 ? _kernel.CurrentThreadId : (int)a0);
                 break;
-            case 0x3B: // JoinThread
+            case 0x3B: // RFU059 (ps2sdk) — not JoinThread; EE has no JoinThread syscall.
+                       // Retail returns a u8 status; HLE returns 0 (idle/no residual).
                 result = 0;
                 break;
             case 0x3C: // SetupThread
@@ -965,7 +1140,8 @@ public sealed class SonyKernelHle
             case 0x50: // CreateEventFlag
                 result = _kernel.CreateEventFlag(a0);
                 break;
-            case 0x51:
+            case 0x51: // DeleteEventFlag — object delete not exposed on KernelState (residual);
+                       // return success so callers that Create+Delete without Wait do not panic.
                 result = 0;
                 break;
             case 0x52: // SetEventFlag
@@ -1029,9 +1205,12 @@ public sealed class SonyKernelHle
                     }
                 }
                 break;
-            case 0x57: // PollEventFlag
+            case 0x57: // PollEventFlag (DetPS2 live ABI; ps2sdk 0x57 = GetTLBEntry — see EE_KERNEL_SYSCALLS.md)
             case 0x58: // iPollEventFlag
                 result = (long)_kernel.PollEventFlag((int)a0);
+                break;
+            case 0x59: // ExpandScratchPad (ps2sdk) — no TLB/scratch remap; success 0
+                result = 0;
                 break;
 
             // ---- Cache / COP0 / KSeg ----
@@ -1047,10 +1226,10 @@ public sealed class SonyKernelHle
             case 0x5B: // GetEntryAddress
                 result = AllocStub();
                 break;
-            case 0x5C: // EnableIntcHandler
-            case 0x5D: // DisableIntcHandler
-            case 0x5E:
-            case 0x5F:
+            case 0x5C: // EnableIntcHandler — handlers always "enabled" once registered
+            case 0x5D: // DisableIntcHandler — intentional no-op (chain kept)
+            case 0x5E: // EnableDmacHandler
+            case 0x5F: // DisableDmacHandler
                 result = 0;
                 break;
             case 0x60: // KSeg0
@@ -1059,21 +1238,25 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x63: // GetCop0
+            case 0x67: // iGetCop0 after abs(-0x67)
                 result = (long)ee.ReadCop0Public((int)a0);
                 break;
             case 0x64: // FlushCache
             case 0x66: // CpuConfig
+            case 0x68: // iFlushCache after abs(-0x68)
+            case 0x69: // RFU105 — intentional no-op
+            case 0x6A: // iCpuConfig after abs(-0x6a)
                 result = 0;
                 break;
 
-            // ---- SIF ----
+            // ---- SIF / timers / OSD ----
             case 0x6B: // SifStopDma
                 result = 0;
                 break;
-            case 0x6C: // SetCPUTimerHandler
-            case 0x6D: // SetCPUTimer
-            case 0x6E:
-            case 0x6F:
+            case 0x6C: // SetCPUTimerHandler — COP0 Compare timer not wired; accept registration
+            case 0x6D: // SetCPUTimer — intentional no-op (no EE hard-timer fire path yet)
+            case 0x6E: // SetOsdConfigParam2
+            case 0x6F: // GetOsdConfigParam2
                 result = 0;
                 break;
             case 0x70: // GsGetIMR
@@ -1084,7 +1267,9 @@ public sealed class SonyKernelHle
                 _system.Gs.WritePrivileged64(0x12001010, a0);
                 result = 0;
                 break;
-            case 0x72: // SetPgifHandler
+            case 0x72: // SetPgifHandler — PGIF path unused under HLE; intentional no-op
+                result = 0;
+                break;
             case 0x73: // SetVSyncFlag(u32* oddField, u32* evenField) — ps2sdk sceSetVSyncFlag
                 // Stores EE RAM pointers; kernel writes field counters on each VBlank.
                 // Flat no-op left MK calling this ~500k times / 200M with no progress.
@@ -1631,10 +1816,19 @@ public sealed class SonyKernelHle
             _system.Memory.Write32(statusAddr + 8, t.Stack);
             _system.Memory.Write32(statusAddr + 12, t.StackSize);
             _system.Memory.Write32(statusAddr + 16, t.Gp);
-            _system.Memory.Write32(statusAddr + 20, 0);
-            _system.Memory.Write32(statusAddr + 24, 0);
-            _system.Memory.Write32(statusAddr + 28, 0);
-            _system.Memory.Write32(statusAddr + 32, 0);
+            _system.Memory.Write32(statusAddr + 20, (uint)t.InitialPriority);
+            _system.Memory.Write32(statusAddr + 24, (uint)t.Priority);
+            _system.Memory.Write32(statusAddr + 28, 0); // attr
+            _system.Memory.Write32(statusAddr + 32, 0); // option
+            // ee_thread_status_t: waitType@0x24, waitId@0x28, wakeupCount@0x2C
+            uint waitType = 0, waitId = 0;
+            if (t.WaitSemaId != 0) { waitType = 2; waitId = (uint)t.WaitSemaId; }
+            else if (t.WaitMbxId != 0) { waitType = 5; waitId = (uint)t.WaitMbxId; }
+            else if (t.DelayRemainingUs > 0) { waitType = 2; /* DELAY */ }
+            else if (t.Sleeping || t.WaitVblank) { waitType = 1; /* SLEEP */ }
+            _system.Memory.Write32(statusAddr + 36, waitType);
+            _system.Memory.Write32(statusAddr + 40, waitId);
+            _system.Memory.Write32(statusAddr + 44, (uint)t.WakeupCount);
         }
         return 0;
     }
@@ -1644,12 +1838,15 @@ public sealed class SonyKernelHle
         // ps2sdk ee_thread_t:
         // +0 status, +4 func, +8 stack, +C stack_size, +10 gp, +14 initial_priority
         uint func = 0, stack = 0, stackSize = 0, gp = 0;
+        int priority = 64;
         if (addr != 0)
         {
             func = _system.Memory.Read32(addr + 0x04);
             stack = _system.Memory.Read32(addr + 0x08);
             stackSize = _system.Memory.Read32(addr + 0x0C);
             gp = _system.Memory.Read32(addr + 0x10);
+            priority = (int)_system.Memory.Read32(addr + 0x14);
+            if (priority <= 0 || priority > 127) priority = 64;
             // Sanity: func must look like EE code in RDRAM
             if (func < 0x100000 || (func & 0x1FFFFFFFu) >= SystemMemory.RDRAM_SIZE)
             {
@@ -1661,6 +1858,8 @@ public sealed class SonyKernelHle
                     stack = _system.Memory.Read32(addr + 0x10);
                     stackSize = _system.Memory.Read32(addr + 0x14);
                     gp = _system.Memory.Read32(addr + 0x18);
+                    priority = (int)_system.Memory.Read32(addr + 0x1C);
+                    if (priority <= 0 || priority > 127) priority = 64;
                 }
             }
         }
@@ -1673,7 +1872,7 @@ public sealed class SonyKernelHle
             sp = stack & ~0xFu;
         LastCreatedThreadEntry = func;
         LastCreatedThreadStack = sp;
-        return _kernel.CreateThread(func, gp, sp, stackSize);
+        return _kernel.CreateThread(func, gp, sp, stackSize, priority);
     }
 
     private int CreateSemaFromStruct(uint addr)

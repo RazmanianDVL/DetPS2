@@ -2,6 +2,9 @@
 
 **Policy (user mandate, 2026-07-30):** For **every current and future title**, when DetPS2 hits a wall or behavior is unclear, agents **must** consult the [Play!](https://github.com/jpd002/Play-) HLE source (and PCSX2+PINE for live LLE). **Do not guess** boot flow, RPC shapes, FILEIO layouts, or menu type.
 
+**Agent entrypoint:** `pwsh ./tools/play-lookup.ps1 -Serial <serial> -Wall <FILEIO|SIF|PAD|…>`  
+**Full SOP (budgets, scoreboard, GPU notes):** **`docs/AGENT_SOP.md`**.
+
 Play! is another **HLE** PS2 emulator (C++). We do **not** port the whole engine. We **re-host contracts** into DetPS2 C# (`RealSifRpc`, kernel, CDVD, quirks) the same way we already re-host BIOS ABI.
 
 ## Location (this machine)

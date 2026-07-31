@@ -81,3 +81,38 @@ $env:DETPS2_TRACE_RPC='1'
 dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
 # expect: HandleLgDev fno=0xC, force CallRpc→lgDev epilogue n=1, calls≥500, unknownBindSids=0
 ```
+
+## Wave-7 (2026-07-30 post-G0)
+
+| Field | Value |
+|-------|-------|
+| STG / full TXD | YES (deliver) fno=5 n=1146112; FRONTEND open |
+| cdvd | 2425 (deliver 80M) |
+| gifP3 / dmac / calls | 656 / 831 / 602 |
+| px / MENU | 0 / No |
+| Wall | post-TXD MMIO probe 0x21A5xx / PC 0x1F308C |
+| Assist | e90eaef post-TXD MMIO leave |
+| Residual | #20 presentation px>0; tip residual-STG flaky after SM RR |
+
+## Wave-8 (2026-07-30 presentation thrash)
+
+| Field | Value |
+|-------|-------|
+| Wall disasm | GIF flush `0x21A4F0` bulk lq/sq MMIO src; submit `0x1F3080` / final `0x1F308C` |
+| Assist | Collapse absurd gp ring; leave epilogue `0x21A5D8` / `0x218774`; `b3Hot` tight slices; force≥22M; delay entry/leaf stubs n≥24 |
+| Deliver 100M | STG+TXD+FRONTEND cdvd=2425 gifP3=656 **px=0** PC=0x1F308C |
+| Tip 100M | residual n=2–3 cdvd=**425** (residual-STG still flaky vs deliver) |
+| MENU / px | **No / 0** |
+| Next | tip residual→STG restore → FRONTEND DMA → sane GIF flush → px>0 |
+
+## Wave-9 (2026-07-30 presentation PATH3 / FRONTEND plant)
+
+| Field | Value |
+|-------|-------|
+| Play! | `play-lookup SLUS_210.50 TITLE` → no GameConfig; FILEIO handlers OK |
+| Diagnose 20M | residual force@~18.6M pristine FC00; PC `0x293A30`; cdvd=425 IRX; px=0 |
+| Claim 100M quiet | STG+Global + **FRONTEND plant** cdvd=**6584** gifP3=**436** dmac=423 binds=13 PC=`0x10BE68` **px=0** |
+| Assist | sticky PATH3 `SetMskPath3(false)` when M3P+px=0; host-plant FRONTEND.TXD 2MiB @`0xA00000`; post-TXD high WaitSema pulse; flip-wait bypass delayed to ≥95M; dead flip-watermark `$ra` rescue only |
+| Rejected | VBlank poll sticky stub @25.9M → UnknownOpcode `0x4E3BD0` + STG loss; generic CallRpc soft-complete → DBC thrash abort |
+| MENU / px | **No / 0** — PATH3 unmask fires; prims still 0 (IMAGE/hold or no real PRIM path) |
+| Next | natural FRONTEND fno=5 dest bind (SHARED GTFS) + sane prim submit; no invented Soft-GS clear |

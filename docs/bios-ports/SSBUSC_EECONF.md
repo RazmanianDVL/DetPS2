@@ -144,18 +144,21 @@ No EE SIF RPC sid. No public export table in ps2sdk (BIOS-private).
 
 ---
 
-## 3. Landed in this agent pass
+## 3. Landed (waves + Phase 2 deepen)
 
 1. **`IopSsbuscHost`** — 13-device tables, Set/Get Delay/Base, common-delay fields, `ApplyBiosDefaults`, `IsWindowReady`.
 2. **`IopEeconfHost`** — `ApplyBiosInit`, PS1 block clear, MAC/SPEED/ROM version, `ContractsReady`.
 3. **`Ps2System`** — `IopSsbusc` / `IopEeconf` properties + Reset.
 4. **`BiosBootHost.FinishIopServices`** — plants both after INTRMAN/TIMEMAN.
-5. **Docs** — this file; `ROMDIR_GATE.md` SSBUSC/EECONF → PARTIAL.
-6. **Smokes** — `Ssbusc_BusWindowContracts`, `Eeconf_InitContracts`; boot path asserts windows ready.
+5. **Phase 2 (AGENT-I):** `AllWindowsReady` / `ReadyWindowCount`; EECONF `DirtyPs1ConfigBlock` / `IsPs1ConfigAllZero` for re-clear proof.
+6. **Docs** — this file; `ROMDIR_GATE.md` SSBUSC/EECONF → **OK**.
+7. **Smokes** — `Ssbusc_BusWindowContracts`, `Eeconf_InitContracts` (deepened); boot path asserts windows ready.
+
+**Gate:** SSBUSC → **OK**; EECONF → **OK** (optional required flag remains false in boot table; contracts still complete).
 
 ---
 
-## 4. Remaining gaps (orchestrator / later)
+## 4. Remaining gaps (non-blocking)
 
 | Gap | Notes |
 |-----|-------|
@@ -164,7 +167,6 @@ No EE SIF RPC sid. No public export table in ps2sdk (BIOS-private).
 | **IOP SSBUS MMIO** | Map `0xBF8010xx` so R3000 IRX can poke real regs if IOP exec lands |
 | **DEV9 / SPEED HLE** | Consumers of SpeedCaps still thin; HDD path optional |
 | **EE SBUS 0x1000F100** | Keep as MmioBus ready stubs; do not conflate with SSBUSC |
-| **DMACMAN** | Adjacent wave-4 OPEN — separate agent |
 | **Re-init on SifIopReset** | Today FinishIopServices runs at StartCommercialIop; wire EECONF/SSBUSC re-plant on deferred reboot if titles re-query |
 
 ---

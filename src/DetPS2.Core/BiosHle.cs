@@ -127,6 +127,8 @@ public sealed class BiosHle
         _system.IopSystem?.Tick(1);
         // PADMAN: refresh open-port DMA buffers (padGetState is EE-side, not RPC).
         _sony?.RealRpc.TickPadDma(_system.Memory, _system.Pad);
+        // FILEIO-2200: Play! delays READ replies one frame (SotC thread reschedule).
+        _sony?.RealRpc.ProcessPendingFileIoReplies(_system.Memory, _kernel);
     }
 
     public bool HandleSyscall(EmotionEngine ee)
