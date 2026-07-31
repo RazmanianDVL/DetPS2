@@ -96,11 +96,34 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _globalFreeEscapes;
     private int _tickWaitEscapes;
     private int _flagSpinHardReturns;
+    private int _tableIndexEscapes;
+    private int _byteSumEscapes;
+    private int _alignZeroEscapes;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
     /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
     private uint _arenaBump;
+
+    /// <summary>
+    /// Table-index walk at <c>0x155AB0</c>: <c>t4</c> cursor vs <c>*0x30498C</c> limit, step
+    /// <c>lh t3,0x40(t2)</c>. Live residual (2026-07-30 tip): zero/poison step keeps
+    /// <c>t4 &lt; limit</c> forever at <c>0x155B84</c> (~27M samples) → freelist/BST delayed
+    /// to 70M+, dmac/RPC freeze (binds 10 / calls ~40 at 45M).
+    /// </summary>
+    public const uint TableIndexWalkPcLo = 0x00155AB0;
+    public const uint TableIndexWalkPcHi = 0x00155B90;
+    public const uint TableIndexWalkReturn = 0x00155B94; // jr ra
+    public const uint TableIndexCursorPtr = 0x00304988;
+    public const uint TableIndexLimitPtr = 0x0030498C;
+
+    /// <summary>
+    /// Byte-sum / hash loop at <c>0x1390F8</c>: <c>while (t4 &lt; a0) s2 += *(base+t4++)</c>.
+    /// After table-index leave, residual lands here with huge <c>a0</c> (multi-M samples @100M).
+    /// </summary>
+    public const uint ByteSumLoopPcLo = 0x001390F0;
+    public const uint ByteSumLoopPcHi = 0x00139110;
+    public const uint ByteSumLoopExit = 0x00139114;
 
     /// <summary>Retail IOPRP image on disc (ISO strings: IOPRP300.IMG;1).</summary>
     public const string UdnlIopRp300Arg = "rom0:UDNL cdrom0:\\IOPRP300.IMG;1";
@@ -195,6 +218,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _globalFreeEscapes = 0;
         _tickWaitEscapes = 0;
         _flagSpinHardReturns = 0;
+        _tableIndexEscapes = 0;
+        _byteSumEscapes = 0;
+        _alignZeroEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
         _heapDefaultsPlanted = false;
@@ -368,6 +394,34 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 Console.Error.WriteLine(
                     $"[GOW] early data-PC rescue pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
             pc = resume;
+        }
+
+        // Table-index walk 0x155AB0: zero/poison step → infinite t4 < limit at 0x155B84.
+        // Burns 30M+ cycles before freelist/BST (live 45M PC=0x155B84, dmac=2). Escape early.
+        if (c >= 12_000_000 && pc is >= TableIndexWalkPcLo and <= TableIndexWalkPcHi)
+            TryEscapeTableIndexWalk(sys, pc, c);
+
+        // Byte-sum loop 0x1390F8 with huge length after table-index leave.
+        if (c >= 12_000_000 && pc is >= ByteSumLoopPcLo and <= ByteSumLoopPcHi)
+            TryEscapeByteSumLoop(sys, pc, c);
+
+        // Align-zero loop 0x23E7C0: while (a0&0xF) *a0=0 with poison a0 / no advance
+        // (live 50M–100M PC=0x23E7D4, metrics frozen; ra often exception / 0x13FExx).
+        if (c >= 30_000_000 && pc is >= 0x0023E7C0 and <= 0x0023E7F0)
+            TryEscapeAlignZeroLoop(sys, pc, c);
+        // Residual after bad align leave: thrash at 0x13FExx UnknownOpcode.
+        if (c >= 35_000_000 && pc is >= 0x0013FE00 and <= 0x00140000
+            && sys.Gs.PixelsWritten == 0)
+        {
+            uint resume = 0x00185FAC;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (c % 5_000_000) < 50_000)
+                Console.Error.WriteLine(
+                    $"[GOW] escape 0x13FExx residual pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
         }
 
         // BST search walk guard — see class doc. Only after the dict pool exists (~3.5M).
@@ -704,6 +758,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     {
         uint a1 = (uint)sys.EE.GetGpr(5).Lo;
         uint t0 = (uint)sys.EE.GetGpr(8).Lo;
+        // Soft-float lives in this band (0x2847xx mantissa/compare). Small integer a1/t0
+        // (live a1=0/1) are IEEE paths — never treat as list cursors (force-exit storms
+        // after freelist hard-return; dmac/gif regress).
+        bool pointerLike = a1 >= 0x00100000u || (a1 & 0x40000000u) != 0;
+        if (!pointerLike)
+            return;
         bool bad = IsBadCursor(a1) || (t0 != 0 && IsBadCursor(t0));
         // Even with "valid" phys (0x401Axxxx → 0x001Axxxx), empty/corrupt rings re-enter.
         if (!bad && pc is >= 0x002847D0 and <= 0x00284820
@@ -731,6 +791,192 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 $"-> 0x{resume:X8} n={_listCmpEscapes} cyc={c}");
     }
 
+
+    /// <summary>
+    /// Table-index walk <c>0x155AB0</c> (disasm 2026-07-30):
+    /// <c>t4 = *0x304988; limit = *0x30498C; while (t4 &lt; limit) { t2=table[t4];
+    /// t3=lh(t2+0x40); …; t4 += t3; }</c>. Poison table entry → t3=0 → t4 never reaches
+    /// limit → forever at <c>0x155B84</c>. Force epilogue (jr ra @ 0x155B94).
+    /// </summary>
+    private void TryEscapeTableIndexWalk(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc >= TableIndexWalkReturn)
+            return;
+        if (_tableIndexEscapes >= 4096)
+            return;
+
+        uint t4 = (uint)sys.EE.GetGpr(12).Lo; // t4
+        uint limitMem = sys.Memory.Read32(TableIndexLimitPtr);
+        uint cursorMem = sys.Memory.Read32(TableIndexCursorPtr);
+        // Also read live t2 step when mid-body.
+        uint t2 = (uint)sys.EE.GetGpr(10).Lo;
+        uint t2Phys = t2 & 0x1FFFFFFFu;
+        int step = 0;
+        bool stepKnown = false;
+        if (t2Phys is >= 0x00100000u and < (uint)SystemMemory.RDRAM_SIZE - 0x44u && (t2Phys & 1) == 0)
+        {
+            step = (short)ReadHu(sys, t2Phys + 0x40);
+            stepKnown = true;
+        }
+
+        // Stuck when: zero step, negative step looping under limit, or still mid-band after hits.
+        bool stuck = (stepKnown && step == 0)
+            || (stepKnown && step < 0 && t4 < 0x100000u)
+            || (pc is >= 0x00155B84 and <= 0x00155B8C)
+            || _tableIndexEscapes > 0;
+
+        // First visit mid-compare with healthy positive step and small remaining — let run once.
+        if (!stuck)
+        {
+            uint lim = limitMem != 0 ? limitMem : t4 + 1u;
+            if (stepKnown && step > 0 && t4 < lim && (lim - t4) <= (uint)(step * 8))
+                return; // short healthy walk
+            if (!stepKnown && _tableIndexEscapes == 0 && pc is < 0x00155B00)
+                return;
+            stuck = true;
+        }
+
+        if (!stuck) return;
+
+        // Publish cursor = limit so re-entry takes the natural empty path at 0x155AD0.
+        uint limPub = limitMem;
+        if (limPub == 0 || limPub < cursorMem)
+            limPub = cursorMem != 0 ? cursorMem : 1u;
+        sys.Memory.Write32(TableIndexCursorPtr, limPub);
+        // Force t4 >= limit for the slt at 0x155B88.
+        sys.EE.SetGpr(12, new EmotionEngine.Gpr128 { Lo = limPub }); // t4
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0 = done
+        sys.EE.PC = TableIndexWalkReturn;
+        sys.EE.COP0_Status &= ~0x6u;
+        _tableIndexEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _tableIndexEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape table-index walk pc=0x{pc:X8} t4=0x{t4:X8} lim=0x{limitMem:X8} " +
+                $"step={step} t2=0x{t2:X8} -> 0x{TableIndexWalkReturn:X8} n={_tableIndexEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Byte-sum loop <c>0x1390F8</c>: <c>while (t4 &lt; a0) { s2 += *(t3+t4); t4++; }</c>.
+    /// Huge <c>a0</c> (length) burns multi-M cycles after table-index leave. Snap t4=a0 and
+    /// exit to <c>0x139114</c>.
+    /// </summary>
+    private void TryEscapeByteSumLoop(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc >= ByteSumLoopExit)
+            return;
+        if (_byteSumEscapes >= 2048)
+            return;
+
+        uint t4 = (uint)sys.EE.GetGpr(12).Lo;
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo; // length (from t2 at entry)
+        // Also accept length still in t2 when mid-setup.
+        uint t2 = (uint)sys.EE.GetGpr(10).Lo;
+        uint len = a0;
+        if (len == 0 || len > 0x01000000u)
+            len = t2;
+        // Only force when length is large or we re-entered.
+        bool huge = len > 0x4000u; // >16 KiB pure EE byte walk
+        bool midLoop = pc is >= 0x001390F8 and <= 0x0013910C;
+        if (!huge && !midLoop && _byteSumEscapes == 0)
+            return;
+        if (!huge && midLoop && _byteSumEscapes == 0 && len <= 0x4000u && t4 < len)
+        {
+            // Small honest sums — let them finish unless already thrashing.
+            if (len > 0x200u && t4 < 16)
+            {
+                // Accelerate: jump t4 near end.
+                sys.EE.SetGpr(12, new EmotionEngine.Gpr128 { Lo = len });
+                sys.EE.PC = ByteSumLoopExit;
+                sys.EE.COP0_Status &= ~0x6u;
+                _byteSumEscapes++;
+                return;
+            }
+            return;
+        }
+
+        uint end = len == 0 ? t4 : len;
+        sys.EE.SetGpr(12, new EmotionEngine.Gpr128 { Lo = end }); // t4 = end
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = end }); // a0 coherent
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = ByteSumLoopExit;
+        sys.EE.COP0_Status &= ~0x6u;
+        _byteSumEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _byteSumEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape byte-sum loop pc=0x{pc:X8} t4=0x{t4:X8} len=0x{len:X8} " +
+                $"-> 0x{ByteSumLoopExit:X8} n={_byteSumEscapes} cyc={c}");
+    }
+
+    /// <summary>
+    /// Align-to-16 zero pad at <c>0x23E7C0</c>: <c>andi v0,a0,0xF; bnel v0,0,loop; sw zero,0(a0)</c>.
+    /// Live residual (2026-07-30): <c>a0=2</c> (not RDRAM) and the increment slot is zeroed
+    /// code → forever at <c>0x23E7D4</c>, metrics frozen 50M≡100M, <c>ra=0x80000200</c>.
+    /// Return via epilogue / PickSafeResume; do not run the store.
+    /// </summary>
+    private void TryEscapeAlignZeroLoop(Ps2System sys, uint pc, ulong c)
+    {
+        if (pc >= 0x0023E7EC) // jr ra
+            return;
+        if (_alignZeroEscapes >= 512)
+            return;
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint a0Phys = a0 & 0x1FFFFFFFu;
+        bool bad = a0 == 0
+            || a0Phys < 0x00100000u
+            || a0Phys >= (uint)SystemMemory.RDRAM_SIZE
+            || (a0Phys & 3u) != 0 && a0Phys < 0x00100000u;
+        // Even with "valid" phys: if mid-bnel thrash for long, force.
+        if (!bad && pc is >= 0x0023E7D0 and <= 0x0023E7D8)
+            bad = _alignZeroEscapes > 0 || (a0 & 0xF) != 0 && a0Phys < 0x00100000u;
+        // a0=2 live: andi keeps v0!=0 forever with no addiu in the delay chain.
+        if (!bad && a0 < 0x00100000u)
+            bad = true;
+        if (!bad && (a0 & 0xF) == 0)
+            return; // natural fall-through to store-tag / jr ra
+
+        if (!bad && _alignZeroEscapes == 0 && pc is < 0x0023E7D0)
+            return;
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        // Prefer live $ra when it is real .text. Never re-home to 0x26C0E0 (Exit risk),
+        // exception vector, or the 0x13FExx nop/unknown band (live align leave → 0x13FEE0
+        // UnknownOpcode storm, 4.8M telemetry hits @100M). Fallback: post-FreezeCache.
+        static bool IsBadAlignResume(uint p) =>
+            p is < 0x00100000 or >= 0x002C0000
+            or (>= 0x0023E7C0 and <= 0x0023E7F0)
+            or (>= 0x0026C0E0 and <= 0x0026C600)
+            or (>= 0x0013FE00 and <= 0x00140000)
+            or (>= 0x00185F90 and <= 0x00186120)
+            or (>= 0x80000000 and <= 0x80020000)
+            || p == 0;
+        uint resume;
+        if (sys.Memory.IsLikelyEeCode(ra) && !IsBadAlignResume(ra))
+            resume = ra;
+        else
+            resume = 0x00185FAC;
+
+        // Publish a harmless aligned arena pointer so any caller that re-uses a0 is not a0=2.
+        uint block = AllocArenaBlock(sys, 0x40);
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = block }); // a0
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+        {
+            Lo = resume == 0x00185FAC ? 0x00330000UL : 0UL
+        });
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = block + 8 }); // v1 as post-loop
+        if (resume == 0x00185FAC)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _alignZeroEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _alignZeroEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape align-zero loop pc=0x{pc:X8} a0=0x{a0:X8} -> 0x{resume:X8} " +
+                $"block=0x{block:X8} n={_alignZeroEscapes} cyc={c}");
+    }
 
     /// <summary>
     /// Bump software tick *0x29C7D4 so wait leaf 0x17A1D0 can exit.
@@ -912,6 +1158,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
             or (>= 0x0017A320 and <= 0x0017A360)  // software delay + flag poll
+            or (>= 0x00155AB0 and <= 0x00155B90)  // table-index zero-step thrash
+            or (>= 0x001390F0 and <= 0x00139110)  // huge byte-sum loop
+            or (>= 0x0023E7C0 and <= 0x0023E7F0)  // align-zero poison a0 thrash
+            or (>= 0x0013FE00 and <= 0x00140000)  // post-align UnknownOpcode storm
             or (>= 0x00100000 and <= 0x00100200)  // CRT0 / BSS-clear re-entry (wipes heap)
             || p == 0x00100008u;
 
@@ -1047,6 +1297,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeListCompareWalk(sys, pc, c);
         if (pc is >= GlobalFreeSearchPcLo and <= GlobalFreeSearchPcHi)
             TryEscapeGlobalFreeSearch(sys, pc, c);
+        if (pc is >= TableIndexWalkPcLo and <= TableIndexWalkPcHi)
+            TryEscapeTableIndexWalk(sys, pc, c);
+        if (pc is >= ByteSumLoopPcLo and <= ByteSumLoopPcHi)
+            TryEscapeByteSumLoop(sys, pc, c);
+        if (pc is >= 0x0023E7C0 and <= 0x0023E7F0)
+            TryEscapeAlignZeroLoop(sys, pc, c);
 
         // Live final PC band 0x170BBx — list tag walk (sb flags @ node+0x18). With empty/
         // corrupt a1 (often zeroed then movn'd) the loop at 0x170BB0..BF8 never hits the
@@ -1447,10 +1703,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Wave-5: paint 989snd done-magic + residual SignalSema. When still stuck mid-leaf,
         // soft-return via live $ra (SIF poll caller is 0x294810 / worker 0x27CC08) — do NOT
         // snap to 0x26C0E0 mid-frame (live w5c data PC / UnknownSyscall 0x2A1364).
+        // Live tip residual: PC=0x299328 with $ra=0 after align-zero leave — empty wake
+        // alone cannot progress; force leave via stack $ra / post-FreezeCache.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && _worldKickPulses >= 8 && (_worldKickPulses % 4) == 0
             && (pc is >= 0x00293C00 and <= 0x00293C80
-                || pc is >= 0x00299300 and <= 0x00299400
+                || pc is >= 0x00299300 and <= 0x00299480
                 || pc is >= 0x00289A00 and <= 0x00289B00))
         {
             TryArmPendingStreamJob(sys, c);
@@ -1488,25 +1746,62 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
             // Soft-return from WaitSema leaf via $ra so poll body can take the empty-queue path.
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            bool left = false;
             if (sys.Memory.IsLikelyEeCode(ra) && ra is (>= 0x0027CC00 and <= 0x0027CD00)
                     or (>= 0x00294800 and <= 0x00294900)
                     or (>= 0x00297600 and <= 0x00297700)
-                    or (>= 0x00297300 and <= 0x00297400))
+                    or (>= 0x00297300 and <= 0x00297400)
+                    or (>= 0x00100000 and < 0x00280000))
             {
                 // WaitSema success convention: v0 = sema id (libcdvd / sifrpc check v0==id).
                 // Only accept plausible THREADMAN ids — live a0=0x20000000 is poison.
-                uint a0 = (uint)sys.EE.GetGpr(4).Lo;
-                uint sema = a0 is >= 1 and <= 256 ? a0 : 3u;
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = sema });
-                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = sema }); // keep a0 coherent
-                sys.EE.PC = ra;
+                // Broader $ra accept (any .text) for 0x2993xx residual with null-ra recovery.
+                if (ra is not (>= 0x00293C00 and <= 0x00293C80)
+                    && ra is not (>= 0x00299300 and <= 0x00299480)
+                    && ra is not (>= 0x0026C0E0 and <= 0x0026C600))
+                {
+                    uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+                    uint sema = a0 is >= 1 and <= 256 ? a0 : 3u;
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = sema });
+                    sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = sema }); // keep a0 coherent
+                    sys.EE.PC = ra;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    left = true;
+                }
+            }
+            // Null / poison $ra residual (live 0x299328): try stack slot then FreezeCache.
+            if (!left && (ra == 0 || !sys.Memory.IsLikelyEeCode(ra)
+                          || ra is (>= 0x00299300 and <= 0x00299480)
+                          || ra is (>= 0x00293C00 and <= 0x00293C80))
+                && (_worldKickPulses % 8) == 0)
+            {
+                uint resume = 0;
+                uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16u)
+                {
+                    uint stacked = sys.Memory.Read32(sp) & 0x1FFFFFFFu;
+                    if (sys.Memory.IsLikelyEeCode(stacked) && stacked is >= 0x00100000 and < 0x002C0000
+                        && stacked is not (>= 0x00299300 and <= 0x00299480)
+                        && stacked is not (>= 0x00293C00 and <= 0x00293C80)
+                        && stacked is not (>= 0x0026C0E0 and <= 0x0026C600))
+                        resume = stacked;
+                }
+                if (resume == 0)
+                    resume = 0x00185FAC;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+                {
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 3UL
+                });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
+                left = true;
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
-                    $"[GOW] SHARED empty-sifrpc wake pc=0x{pc:X8} ra=0x{ra:X8} arms={_streamArmPulses} " +
-                    $"n={_worldKickPulses} cyc={c}");
+                    $"[GOW] SHARED empty-sifrpc wake pc=0x{pc:X8} ra=0x{ra:X8} left={left} " +
+                    $"arms={_streamArmPulses} n={_worldKickPulses} cyc={c}");
         }
 
         if (_padInjectPulses < 8192)
@@ -2238,7 +2533,38 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // Prefer known epilogues; for pre-walk residual 0x2393xx return a real arena block
         // via $ra when available (header poison → OOB lists).
+        // After several synthetic-header hits, hard-return via $ra with a carved block —
+        // epi 0x239744 re-enters the same s0=header thrash for multi-M cycles (live 35–37M).
+        bool headerThrash = s0 == HeapDefaultNodeBase || s0 == HeapDefaultNodeBase + 0x80u
+            || s0 == 0;
         uint epi;
+        // Header thrash: only hard-return via a clearly good live $ra (caller).
+        // Never invent 0x185FAC / 0x26C0EC here — that jumped into synthetic BST nodes as
+        // code (UnknownOpcode key=0xF24E524F @ 0x01FD8120) and killed gifPath3.
+        if (headerThrash && _free2Escapes >= 12)
+        {
+            uint block = AllocArenaBlock(sys);
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x00239300 and <= 0x00239810)
+                && ra is not (>= 0x0023A900 and <= 0x0023AA30)
+                && ra is not (>= 0x0026C0E0 and <= 0x0026C600)
+                && ra is not (>= 0x0023E7C0 and <= 0x0023E7F0)
+                && ra is not (>= 0x00185F90 and <= 0x00186120))
+            {
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = block });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = block });
+                sys.EE.PC = ra;
+                sys.EE.COP0_Status &= ~0x6u;
+                _free2Escapes++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _free2Escapes <= 32)
+                    Console.Error.WriteLine(
+                        $"[GOW] hard-return freelist thrash pc=0x{pc:X8} s0=0x{s0:X8} block=0x{block:X8} " +
+                        $"-> 0x{ra:X8} n={_free2Escapes} cyc={c}");
+                return;
+            }
+            // Fall through to soft epi when $ra is not a clean caller.
+        }
         if (pc >= 0x002397A0)
             epi = 0x002397FCu;
         else if (pc >= 0x002396F0)
