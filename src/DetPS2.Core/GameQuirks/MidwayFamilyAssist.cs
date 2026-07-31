@@ -316,14 +316,40 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 catch { /* ignore */ }
             }
         }
-        if (woke == 0) return;
-        _decPostMslKicks++;
-        try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _decPostMslKicks <= 16)
+        if (woke > 0)
+        {
+            _decPostMslKicks++;
+            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _decPostMslKicks <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] Dec post-MSL enqueue kick woke={woke} n={_decPostMslKicks} " +
+                    $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+        }
+
+        // After repeated kicks head still stuck: main never reaches process@0x1B5D78
+        // (idle callback null). Type 0x41 handler (0x1B6228) only sets flags + head+=8 —
+        // apply the same RDRAM side-effects so idle can leave the busy-wait and workers
+        // can enqueue asset opens. Live cmd @head: type=0x41 ptr=0x617AC0.
+        if (!pending || _decPostMslKicks < 2) return;
+        uint headNow = sys.Memory.Read32(DecIdleQueueHead);
+        uint tailNow = sys.Memory.Read32(DecIdleQueueTail);
+        if (headNow == tailNow) return;
+        if (headNow < 0x00100000 || headNow + 8 > 0x02000000) return;
+        uint cmd = sys.Memory.Read32(headNow);
+        if ((cmd & 0xFF) != 0x41) return;
+        uint arg = sys.Memory.Read32(headNow + 4);
+        // Match 0x1B6228: flags @gp-25040/-25036 = 1; slot @gp-25044 = arg; head += 8.
+        sys.Memory.Write8(DecGp - 25040, 1);
+        sys.Memory.Write8(DecGp - 25036, 1);
+        sys.Memory.Write32(DecGp - 25044, arg);
+        sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+        // Clear sticky idle flag so s1 can fall to DI path when queue empties.
+        sys.Memory.Write8(DecGp - 25032, 0);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[MKFAM] Dec post-MSL enqueue kick woke={woke} n={_decPostMslKicks} " +
-                $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                $"[MKFAM] Dec idle type-0x41 consume head=0x{headNow:X8}->0x{headNow + 8:X8} " +
+                $"arg=0x{arg:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
