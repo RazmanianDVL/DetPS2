@@ -186,3 +186,16 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | MENU | **logo-frontend Soft-GS YES** (px=25594); not claiming pad-interactive main menu |
 | Next | natural DISPFB; more prims/tex sample; optional pad-driven menu advance |
 
+## Wave-6 (2026-07-31) — agent/menu-b3-w6 tip re-claim + packet-ring leave
+
+| Field | Value |
+|-------|-------|
+| Tip base | main `6dabb99` (W5 merge composite + DA XYZ2/3 kick + whip/bo2/dec) |
+| Soft-GS synergy | DA XYZ2/3 map + W5 merge composite → full Path2 prim paint (was sparse AFAIL only) |
+| Assist W6 | GIF packet-build band `0x2198xx` absurd-ring leave (MMIO/VU cursor); FRONTEND plant **4 MiB**; denser pad Start/Cross/Circle/D-pad after chrome (cap 2048) |
+| Claim 100M | **STG+TXD+FRONTEND** cdvd=**6584** gifP2=**14526** gifP3=**491** dmac=424 prims=**1506** **px=24407048** dispfbPx=**2273160** imgBytes=2694848 fragTest=**22133888** rejAlpha=**0** PC=`0x253FA0` binds=13 calls=226 |
+| softgs-regs | FRAME_1=`0xA0046` DISPFB1=0 SCISSOR full XYOFFSET=`0x72006C00` TEST=`0x5140B` |
+| Heuristic | **LIKELY-NEAR** (px≫100k gifP3≥12); logo-frontend Soft-GS chrome **YES** |
+| MENU | **logo-frontend MENU YES** (scoreboard menuKind bar: non-black Soft-GS after FRONTEND/logo spine) |
+| Residual | DISPFB still unset (FRAME+FBP0 composite); PC mid presentation draw `0x253FA0` — pad-interactive main-menu advance not proven beyond logo chrome |
+

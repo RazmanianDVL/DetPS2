@@ -9,7 +9,7 @@
 | Title | Serial | Menu? | Key tip metric | Wall |
 |-------|--------|-------|----------------|------|
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | gifP3=11 FAE8 | selection/second chrome; C1C0 never binds |
-| **Burnout 3** | SLUS_210.50 | **No** | gifP3=436 cdvd=6584 | presentation px=0 |
+| **Burnout 3** | SLUS_210.50 | **YES** (logo-frontend) | px=24.4M dispfbPx=2.27M cdvd=6584 gifP2=14526 | wave-6 Soft-GS logo chrome; pad main-menu advance residual |
 | **Blood Omen 2** | SLUS_200.24 | **No** | px=3 cdvd=2135 stream=2.4MB LIST+ENGLISH PC=0x2CD884 | WAVE-5 low-ELF thrash fix; Soft-GS menu not drawn |
 | **God of War** | SCUS_973.99 | **No*** | **gifP3=1** first | FILEIO/LoadWad; px=0 |
 | **MK Deception** | SLUS_208.81 | **No** | cdvd 287→399 | no member .ssf CallRpc |
@@ -20,7 +20,7 @@
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
-> **No MENU YES.**
+> **Burnout 3 logo-frontend MENU YES** (wave-6 Soft-GS). Other titles still open.
 
 ## 9-title wave commits (`32b4e62..f807ab1`)
 

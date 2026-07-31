@@ -424,14 +424,20 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         // Pad inject once disc assets stream — menu probes need non-zero buttons.
         // Wave-5: raise cap after Soft-GS logo chrome so front-end pad path keeps live.
-        int padCap = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 ? 1024 : 256;
+        // Wave-6: after rich chrome (px>10k), keep pulsing through full budget with
+        // Start/Cross/Circle/D-pad edges so logo→menu advance can be observed.
+        int padCap = sys.Gs.PixelsWritten > 10_000 && sys.Cdvd.SectorsRead >= 2000 ? 2048
+            : sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 ? 1024 : 256;
         if (sys.Cdvd.SectorsRead > 0 && _padInjectPulses < padCap)
         {
             _padInjectPulses++;
-            int phase = _padInjectPulses % 8;
+            int phase = _padInjectPulses % 10;
             uint buttons = 0;
             if (phase is 2 or 3) buttons = (uint)PadInput.Button.Start;
             else if (phase is 5 or 6) buttons = (uint)PadInput.Button.Cross;
+            else if (phase == 7) buttons = (uint)PadInput.Button.Circle;
+            else if (phase == 8) buttons = (uint)PadInput.Button.Down;
+            else if (phase == 9) buttons = (uint)PadInput.Button.Up;
             if (sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 && phase is 0 or 1)
                 buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
             try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
@@ -962,16 +968,22 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // After LGDEV cleared, hold START longer so title front-end sees a press edge.
         if (_lgDevEscapes >= 3 && (_menuKickPulses % 4) < 2)
             buttons = (uint)PadInput.Button.Start;
+        // Wave-6: after Soft-GS logo chrome, cycle Start/Cross/Circle/D-pad so the
+        // Criterion front-end can leave static logo into interactive chrome when pad is read.
         bool logoChromeLive = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000;
         if (logoChromeLive)
         {
-            int p2 = _menuKickPulses % 4;
+            int p2 = _menuKickPulses % 8;
             buttons = p2 switch
             {
                 0 => (uint)PadInput.Button.Start,
                 1 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
                 2 => (uint)PadInput.Button.Cross,
-                _ => (uint)PadInput.Button.Start
+                3 => (uint)PadInput.Button.Circle,
+                4 => (uint)PadInput.Button.Down,
+                5 => (uint)PadInput.Button.Up,
+                6 => (uint)(PadInput.Button.Start | PadInput.Button.Circle),
+                _ => (uint)PadInput.Button.Cross
             };
         }
         try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
@@ -1052,11 +1064,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         // Wave-8: GIF path-flush 0x21A4F0 bulk lq/sq with MMIO src (UnknownMmioRead) /
         // submit 0x1F308C. Collapse absurd gp ring; leave flush epilogue (not 0x1F2520).
+        // Wave-6: also cover packet-build 0x2198xx (sq into gp-23960 ring) when cursor
+        // lands in EE MMIO / VU mem (live 50M UnknownMmioWrite 0x1000xxxx / 0x1100xxxx).
         // Do not permanent-stub flush entry — sane flushes needed for Soft-GS px>0.
         bool inGifFlush = pc is >= 0x0021A4F0 and <= 0x0021A5E4;
         bool inGifSubmit = pc is >= 0x001F3080 and <= 0x001F3500;
         bool inFlushCaller = pc is >= 0x00218700 and <= 0x00218790;
-        bool mmioProbe = (inGifFlush || inGifSubmit || inFlushCaller)
+        bool inGifPacketBuild = pc is >= 0x00219800 and <= 0x00219A20;
+        bool mmioProbe = (inGifFlush || inGifSubmit || inFlushCaller || inGifPacketBuild)
                          && sys.Cdvd.SectorsRead >= 2000;
         if (mmioProbe)
         {
@@ -1070,6 +1085,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 || (endPhys > startPhys && endPhys - startPhys > 0x00080000u)
                 || startPhys < 0x00100000u
                 || startPhys >= (uint)SystemMemory.RDRAM_SIZE;
+            // Packet-build writes sq @ a3 / v1 from ring cursor — treat EE MMIO/VU as absurd.
+            if (!absurd && inGifPacketBuild)
+            {
+                uint a3p = (uint)(sys.EE.GetGpr(7).Lo & 0x1FFFFFFFu);
+                uint v1p = (uint)(sys.EE.GetGpr(3).Lo & 0x1FFFFFFFu);
+                if (a3p is >= 0x10000000u and < 0x12000000u
+                    || v1p is >= 0x10000000u and < 0x12000000u
+                    || endPhys is >= 0x10000000u and < 0x12000000u)
+                    absurd = true;
+            }
             if (!absurd && inGifFlush)
             {
                 uint t7 = (uint)(sys.EE.GetGpr(15).Lo & 0xFFFFFFFFUL);
@@ -1093,16 +1118,18 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.Memory.Write32(endCell, safe); // empty range → s0≈0 after (end-start+8)>>4
             sys.Memory.Write32(dstCell, safe);
 
-            // Prefer flush epilogue (ld ra / jr) so callers see a clean return; only use
-            // raw $ra when it is outside the flush/submit thrash band.
-            uint resume = inGifFlush ? 0x0021A5D8u
+            // Prefer flush/packet epilogue so callers see a clean return; only use
+            // raw $ra when it is outside the flush/submit/packet thrash band.
+            uint resume = inGifPacketBuild ? 0x00219A04u
+                : inGifFlush ? 0x0021A5D8u
                 : inGifSubmit ? 0x00218774u
                 : 0x00218774u;
             if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
                 && ra is not (>= 0x0021A4F0 and <= 0x0021A5E8)
                 && ra is not (>= 0x001F3080 and <= 0x001F3500)
                 && ra is not (>= 0x001F24E0 and <= 0x001F2520)
-                && ra is not (>= 0x00218700 and <= 0x00218790))
+                && ra is not (>= 0x00218700 and <= 0x00218790)
+                && ra is not (>= 0x00219800 and <= 0x00219A20))
                 resume = ra;
             // Sticky thrash at submit final (0x1F308C): after many leaves, bypass submit
             // entry to caller so FRONTEND draw path can continue past empty rings.
@@ -1130,8 +1157,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
             }
             try
             {
-                sys.Pad.SetButtons((_postTxdEscapes % 4) < 2
-                    ? (uint)PadInput.Button.Start : (uint)PadInput.Button.Cross);
+                int p = _postTxdEscapes % 6;
+                uint btn = p switch
+                {
+                    0 or 1 => (uint)PadInput.Button.Start,
+                    2 => (uint)PadInput.Button.Cross,
+                    3 => (uint)PadInput.Button.Circle,
+                    4 => (uint)PadInput.Button.Down,
+                    _ => (uint)(PadInput.Button.Start | PadInput.Button.Cross)
+                };
+                sys.Pad.SetButtons(btn);
             }
             catch { }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -1625,7 +1660,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
     /// <summary>
     /// After STG + Global.txd (cdvd>=2000), host-plant a capped FRONTEND.TXD slice so
-    /// presentation/logo walks can see real TXD payload (first 2 MiB = dir + early mips).
+    /// presentation/logo walks can see real TXD payload. Wave-6: 4 MiB (was 2) so more
+    /// early mips/UI pages bind under Soft-GS without claiming a full 8+ MiB plant.
     /// </summary>
     private void MaybePlantFrontendTxd(Ps2System sys)
     {
@@ -1642,11 +1678,21 @@ public sealed class Burnout3Assist : IGameQuirkModule
                          ?? Iso9660.ReadFile(vol, "Data/FRONTEND.TXD");
             if (fe == null || fe.Length == 0) return;
 
-            const int maxPlant = 2 * 1024 * 1024;
+            // Wave-6: 4 MiB — dir + more early mips than wave-9's 2 MiB plant.
+            // Stay below STAGEHED scratch (0x01900000) and EE stack (~0x01FF0000).
+            const int maxPlant = 4 * 1024 * 1024;
             int n = Math.Min(fe.Length, maxPlant);
             uint dest = FrontendScratch;
-            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
+            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE
+                || dest + (uint)n >= StageHedScratch)
                 dest = 0x00C00000;
+            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE
+                || dest + (uint)n >= StageHedScratch)
+            {
+                // Fall back to 2 MiB if 4 MiB collides with stage scratch.
+                n = Math.Min(fe.Length, 2 * 1024 * 1024);
+                dest = FrontendScratch;
+            }
             if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
                 return;
 
