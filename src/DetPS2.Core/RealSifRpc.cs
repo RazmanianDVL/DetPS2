@@ -4298,6 +4298,8 @@ public sealed class RealSifRpc
         _havenDllBoundBytes = TryBindHavenDllDat(mem, iopModules, cdvd, trace);
 
         // Secondary roots: open/stat only (large/stream; not mapped wholesale).
+        // Wave-6: also warm DATA\BIN system packs the EE asks for after NUSOUND (SYSTEM.RW3
+        // ~195 KiB; CUBE/MKSPACE under DATA\BIN\ as well as root aliases).
         string[] warm =
         {
             @"cdrom0:\MKSPACE.DAT",
@@ -4306,6 +4308,10 @@ public sealed class RealSifRpc
             @"cdrom0:\CUBE.BIN;1",
             @"cdrom0:\DATA\CUBE.BIN;1",
             @"cdrom0:\DATA\MKSPACE.DAT;1",
+            @"cdrom0:\DATA\BIN\CUBE.BIN;1",
+            @"cdrom0:\DATA\BIN\MKSPACE.DAT;1",
+            @"cdrom0:\DATA\BIN\SYSTEM.RW3;1",
+            @"cdrom0:\DATA\BIN\SYSTEM.RW3",
         };
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string p in warm)

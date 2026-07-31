@@ -222,6 +222,14 @@ public sealed class EmotionEngine : ISchedulable
     /// this wait for real.</summary>
     public void RequestSemaStall() => _pendingSemaStall = true;
 
+    /// <summary>
+    /// Clear JREXIT / implicit-exit stall after a title assist revives the thread in place
+    /// (Haven post-NUSOUND CallRpc epilogue, Whiplash FlushCache). Without this,
+    /// <see cref="_pendingThreadStall"/> burns cycles in SwitchToNext while PC is already
+    /// restored and the only runnable thread is current (next==current → stall never clears).
+    /// </summary>
+    public void ClearPendingThreadStall() => _pendingThreadStall = false;
+
     /// <summary>When true, pending IRQs vector through EnterException.</summary>
     public bool TakeExceptions
     {

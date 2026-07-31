@@ -1009,13 +1009,41 @@ public sealed class KernelState
     }
 
     /// <summary>Start thread and optionally switch to it immediately (first-run boost).</summary>
+    /// <remarks>
+    /// When <paramref name="switchNow"/> is set from a SYSCALL stub (typical
+    /// <c>li v1,N; syscall; jr ra; nop</c> cluster), resume the caller at <c>$ra</c>
+    /// (the instruction after the <c>jal</c> into the stub) rather than at the stub's
+    /// post-syscall <c>jr ra</c>.
+    ///
+    /// Haven SLUS_205.17 live (WAVE-5): StartThread switchNow → worker WaitSema yield
+    /// restored main at stub <c>PC+4</c> (<c>0x329B08 jr ra</c>) but execution continued
+    /// at <c>0x329B0C</c> (delay-slot nop) and fell through into the next trampoline
+    /// (<c>ExitThread</c> @ <c>0x329B10</c>). Main <c>Started=false</c>, residual
+    /// WaitSema@0x32BCD0 with Soft-GS logo-only. Resuming at <c>$ra</c> skips the entire
+    /// stub epilogue so an off-by-one cannot walk into ExitThread.
+    /// </remarks>
     public int StartAndMaybeSwitch(EmotionEngine ee, int id, bool switchNow, ulong arg = 0, bool fromSyscall = true)
     {
         int r = StartThread(id, arg);
         if (r < 0) return r;
         if (switchNow)
         {
-            SaveCurrentContext(ee, fromSyscall);
+            ulong ra = ee.GetGpr(31).Lo & 0x1FFFFFFFu;
+            // Prefer caller return when $ra looks like EE .text (not null / low vector).
+            bool raResume = fromSyscall
+                && ra >= 0x00080000u && ra < 0x02000000u && (ra & 3u) == 0;
+            if (raResume)
+            {
+                // Cooperative save (no PC+4), then pin SavedPc to $ra.
+                SaveCurrentContext(ee, fromSyscall: false);
+                var cur = FindThread(_currentTid);
+                if (cur != null)
+                    cur.SavedPc = ra;
+            }
+            else
+            {
+                SaveCurrentContext(ee, fromSyscall);
+            }
             RestoreContext(ee, id, fromSyscall);
         }
         return 0;
