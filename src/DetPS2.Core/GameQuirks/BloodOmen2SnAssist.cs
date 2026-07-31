@@ -73,6 +73,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _streamedCodeBg2 = false;
         _streamedMainmenuBg2 = false;
         _mainLayerForces = 0;
+        _postEnglishDrawKicks = 0;
+        _sawListTxt = false;
+        _sawEnglishDir = false;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -538,9 +541,16 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private const uint FinishedCodeBigFilePc = 0x001B57AC;
 
     /// <summary>
-    /// WAVE-4: "Creating main layer" — post-code surface that must run for mainmenu-bg2 draw.
+    /// WAVE-4/5: "Creating main layer" — true function entry (addiu sp,-32). WAVE-4 used
+    /// <c>0x1B5AC4</c> (mid-prologue after stack alloc). Soft-GS residual needs correct frame.
     /// </summary>
-    private const uint CreatingMainLayerPc = 0x001B5AC4;
+    private const uint CreatingMainLayerPc = 0x001B5AC0;
+
+    /// <summary>
+    /// WAVE-5: EI helper w4 residual parks at after short-circuit 0x48A980 re-entry
+    /// (<c>*0x4AC108 != 0</c> → j EI). Real code, but dead-ra loops here with px=3.
+    /// </summary>
+    private const uint EiHelperPc = 0x0048CF50;
 
     /// <summary>
     /// WAVE-4: StartBigFile wrapper called from Starting-code path (not 0x346DE0 epilogue).
@@ -697,9 +707,13 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         bool inFmtScan = pc is >= 0x00483000 and < 0x00484448
             || pc is >= 0x00486EC0 and <= 0x00486EF8;
         bool inFmtFrame = pc is > 0x00482F68 and < 0x00484448 || inFmtScan;
-        bool dataThrash = pc is < 0x00120000
-            || (pc is >= 0x00500000 and < 0x02000000)
-            || (pc is >= 0x00800000 and < 0x02000000);
+        // WAVE-5: boot ELF PT_LOAD code lives at 0x100000..~0x4A477C including low C++ lib
+        // (list splice @0x100F48, path helpers @0x10CFD8, MMI epilogues @0x101A10). w4 treated
+        // all PC<0x120000 as thrash and yanked mid-helper — killed LIST/ENGLISH Soft-GS path.
+        // IsLikelyEeCode rejects valid MMI (lq/sq) so do NOT use it as thrash gate here.
+        // Format thrash is handled via inFmtFrame; high heaps / below-image are thrash.
+        bool dataThrash = (pc is < 0x00100000)
+            || (pc is >= 0x004A0000 and < 0x02000000);
         if (!inFmtFrame && !dataThrash) return;
 
         if (inFmtFrame)
@@ -1100,20 +1114,24 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// WAVE-4: after CODE+MAINMENU stream into EE, force "Creating main layer" once so
+    /// WAVE-4/5: after CODE+MAINMENU stream into EE, force "Creating main layer" once so
     /// LIST.TXT/ENGLISH.DIR natural FILEIO can run. Do NOT re-yank once post-stream asset
     /// I/O advances (live w4b: re-kick looped LIST.TXT open forever, px stuck 3).
+    /// WAVE-5: true entry prologue; do not yank real low-ELF helpers; post-ENGLISH Soft-GS
+    /// residual advances mainmenu-bg2 draw instead of short-circuit 0x48A980 → EI park.
     /// </summary>
     private void MaybeKickCreatingMainLayer(Ps2System sys, ulong c)
     {
         if (!_streamedCodeBg2 || !_streamedMainmenuBg2) return;
         if (sys.Gs.PixelsWritten >= 500_000) return;
 
+        RefreshListEnglishSignals(sys);
+
         // After first kick: only rescue hard data thrash — never interrupt LIST.TXT spine.
         if (_mainLayerForces >= 1)
         {
             // Soft-GS residual composite while EE processes entity list / English dir.
-            if (_mainLayerForces <= 8 && c - _lastTitleSmCyc >= 2_000_000)
+            if (_mainLayerForces <= 12 && c - _lastTitleSmCyc >= 1_500_000)
             {
                 try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
                 ArmGifPath3(sys);
@@ -1121,26 +1139,33 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 _mainLayerForces++; // count residual pulses without PC yank
                 _lastTitleSmCyc = c;
             }
+
+            // WAVE-5: after LIST+ENGLISH full reads, drive post-ENGLISH Soft-GS residual.
+            if (_sawListTxt && _sawEnglishDir && sys.Gs.PixelsWritten < 50_000)
+                MaybeKickPostEnglishMenuDraw(sys, c);
+
             uint pcNow = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             // Live w4c: after ENGLISH.DIR full read, EE executes path strings in asset
             // buffers (LIST @0xA4EA90 / ENGLISH @0xA62140) → UnknownOpcode storm.
-            // Also high data / exception / trampoline.
+            // WAVE-5: do NOT treat real low-ELF (0x10xxxx helpers) as hard thrash.
             bool assetAsCode = pcNow is >= 0x00A00000 and < 0x02000000;
             bool hardThrash = assetAsCode
                 || pcNow is >= 0x004A0000 and < 0x00A00000
                 || pcNow < 0x00100000
                 || pcNow == UseBigfileReturnTrampoline;
-            if (hardThrash && _mainLayerForces < 16 && c - _lastTitleSmCyc >= 500_000)
+            if (hardThrash && _mainLayerForces < 24 && c - _lastTitleSmCyc >= 500_000)
             {
-                // Prefer post-layer continue over re-entering Creating main layer cold.
-                uint cont = 0x001B5B3C;
+                // Prefer Finished-code continue over short-circuit 0x48A980 (already-init →
+                // EI park @0x48CF50, w4 residual). Never cold-enter mid-Creating.
+                uint cont = _sawEnglishDir ? FinishedCodeBigFilePc : 0x001B5B3C;
                 if (!IsSafeCodeTarget(sys, cont))
-                    cont = 0x0048A980;
+                    cont = FinishedCodeBigFilePc;
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
                 sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = cont });
                 sys.EE.PC = cont;
                 sys.EE.COP0_Status &= ~0x6u;
                 ArmGifPath3(sys);
+                try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
                 _mainLayerForces++;
                 _titleSmEscapes++;
                 _lastTitleSmCyc = c;
@@ -1148,7 +1173,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                     && (_mainLayerForces <= 12 || _mainLayerForces % 4 == 0))
                     Console.Error.WriteLine(
                         $"[BO2] rescue asset-as-code thrash pc=0x{pcNow:X8} -> 0x{cont:X8} " +
-                        $"n={_mainLayerForces} px={sys.Gs.PixelsWritten} cyc={c}");
+                        $"n={_mainLayerForces} list={_sawListTxt} eng={_sawEnglishDir} " +
+                        $"px={sys.Gs.PixelsWritten} cyc={c}");
             }
             return;
         }
@@ -1169,6 +1195,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp });
         }
 
+        // WAVE-5: true entry @0x1B5AC0 (stack alloc). $ra = next function after Creating.
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
         sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x001B5B3C });
         sys.EE.PC = CreatingMainLayerPc;
@@ -1185,8 +1212,106 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[BO2] kick Creating main layer from pc=0x{pc:X8} planted={menuPlanted} " +
-                $"n=1 px={sys.Gs.PixelsWritten} " +
+                $"entry=0x{CreatingMainLayerPc:X8} n=1 px={sys.Gs.PixelsWritten} " +
                 $"streamed={sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0} cyc={c}");
+    }
+
+    private bool _sawListTxt;
+    private bool _sawEnglishDir;
+    private int _postEnglishDrawKicks;
+
+    /// <summary>
+    /// WAVE-5: poll RealSifRpc LIST.TXT / ENGLISH.DIR full-read counters (honest FILEIO).
+    /// </summary>
+    private void RefreshListEnglishSignals(Ps2System sys)
+    {
+        var rpc = sys.Hle.Sony?.RealRpc;
+        if (rpc == null) return;
+        if (rpc.Bo2ListTxtBytesRead > 0) _sawListTxt = true;
+        if (rpc.Bo2EnglishDirBytesRead > 0) _sawEnglishDir = true;
+    }
+
+    /// <summary>
+    /// WAVE-5 residual: after LIST.TXT + ENGLISH.DIR full FILEIO, Soft-GS still logo-class
+    /// (px=3). w4 parked at EI helper (0x48CF50) via short-circuit 0x48A980 re-entry.
+    /// Unstick that park, arm PATH3, composite DISPFB, and nudge past dead-ra EI loops so
+    /// MAINMENU surface can issue GIF prims. Never invent pixels.
+    /// </summary>
+    private void MaybeKickPostEnglishMenuDraw(Ps2System sys, ulong c)
+    {
+        if (_postEnglishDrawKicks >= 48) return;
+        if (c - _lastTitleSmCyc < 200_000) return;
+        if (sys.Gs.PixelsWritten >= 50_000) return;
+        if (!_sawListTxt || !_sawEnglishDir) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+
+        // Soft-GS pulse every visit (IMAGE/DISPFB residual while EE draws).
+        try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
+        ArmGifPath3(sys);
+        EnsureMainThreadRunning(sys);
+        try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+        catch { /* ignore */ }
+
+        // Real low-ELF / main .text progress — leave alone (LIST/ENGLISH helpers live here).
+        if (pc is >= 0x00100000 and < 0x004A0000
+            && pc is not (>= EiHelperPc and <= EiHelperPc + 0x20)
+            && pc is not (>= 0x0048A980 and <= 0x0048A9C0)
+            && pc is not (>= 0x00488800 and <= 0x00488920)
+            && !IsExecutingDataOrNopSled(sys, pc))
+        {
+            if (_postEnglishDrawKicks < 8 || _postEnglishDrawKicks % 8 == 0)
+            {
+                _postEnglishDrawKicks++;
+                _lastTitleSmCyc = c;
+            }
+            return;
+        }
+
+        // Stuck at EI helper / short-circuit post-flush / WaitSema / data — force continue.
+        // Clear already-init gate so a cold re-entry of 0x48A980 can run body past EI
+        // (w4: *0x4AC108!=0 → j EI; return forever).
+        if (pc is (>= EiHelperPc and <= EiHelperPc + 0x20)
+            || pc is (>= 0x0048A980 and <= 0x0048A9C0)
+            || IsExecutingDataOrNopSled(sys, pc)
+            || pc is >= 0x00A00000
+            || pc is >= 0x004A0000 and < 0x00A00000)
+        {
+            try
+            {
+                // *0x4AC108 is the "post-flush init done" flag (disasm 0x48A99C).
+                if (sys.Memory.Read32(0x004AC108) != 0)
+                    sys.Memory.Write32(0x004AC108, 0);
+            }
+            catch { /* ignore */ }
+
+            // After clearing 0x4AC108, re-enter post-flush init body so it can run past EI
+            // and issue more setup/draw. Alternate with Finished-code spine.
+            uint cont = (_postEnglishDrawKicks & 1) == 0
+                ? 0x0048A980u
+                : FinishedCodeBigFilePc;
+            if (!IsSafeCodeTarget(sys, cont) && cont != 0x0048A980)
+                cont = 0x0048A980;
+
+            ulong sp = sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL;
+            if (sp < 0x00100000 || sp >= (ulong)SystemMemory.RDRAM_SIZE - 0x100)
+                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FE8000 });
+
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = cont });
+            sys.EE.PC = cont;
+            sys.EE.COP0_Status &= ~0x6u;
+            _postEnglishDrawKicks++;
+            _menuDrawKicks++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_postEnglishDrawKicks <= 12 || _postEnglishDrawKicks % 4 == 0))
+                Console.Error.WriteLine(
+                    $"[BO2] post-ENGLISH menu-draw kick pc=0x{pc:X8} -> 0x{cont:X8} " +
+                    $"n={_postEnglishDrawKicks} listB={sys.Hle.Sony?.RealRpc.Bo2ListTxtBytesRead ?? 0} " +
+                    $"engB={sys.Hle.Sony?.RealRpc.Bo2EnglishDirBytesRead ?? 0} " +
+                    $"px={sys.Gs.PixelsWritten} gifP3={sys.Gif?.Path3Transfers ?? 0} cyc={c}");
+        }
     }
 
     /// <summary>
@@ -1581,21 +1706,25 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // High-image goefile tables / anything past ELF .text (memsz ~0x4A477C).
         if (pc is >= 0x004A0000 and < 0x02000000)
             return true;
-        // Sea of nops (dead after bad mid-function jump) — sample 4 words.
-        if (pc is >= 0x00100000 and < 0x00200000)
+        // WAVE-5: trust entire boot ELF PT_LOAD (0x100000..~0x4A477C) including low C++
+        // lib with MMI (lq/sq). IsLikelyEeCode rejects MMI and falsely flagged 0x10xxxx
+        // as data — post-ENGLISH kicks then yanked mid-helper (w5 live 0x1019D8).
+        // Only a pure NOP sled in low mem is thrash.
+        if (pc is >= 0x00100000 and < 0x004A0000)
         {
-            int nops = 0;
-            for (uint i = 0; i < 4; i++)
-                if (sys.Memory.Read32(pc + i * 4) == 0) nops++;
-            if (nops >= 3) return true;
+            if (pc is < 0x00200000)
+            {
+                int nops = 0;
+                for (uint i = 0; i < 4; i++)
+                    if (sys.Memory.Read32(pc + i * 4) == 0) nops++;
+                if (nops >= 3) return true;
+            }
+            return false;
         }
         // 0x479E04 is a real bit-pack utility (ori v0,v0,0xFFFF) — never a menu-draw
         // entry, but natural calls must run to completion. Do NOT treat as data thrash
         // (live agent-fix30: post-Bind sid=0x29 lands here legitimately; rescuing to
         // 0x48AF30 cold-corrupted RPC frames).
-        // Trust resident .text inside the boot ELF window.
-        if (pc is >= 0x00120000 and < 0x004A0000)
-            return false;
         return !sys.Memory.IsLikelyEeCode(pc) && pc is >= 0x00100000 and < 0x02000000;
     }
 
