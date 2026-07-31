@@ -8,11 +8,11 @@
 | **BIOS** | SCPH70008 / native BIOS HLE |
 | **ROMDIR gate** | **CLOSED** |
 | **Seat** | **S5 BO2** — worktree `detps2-seat-s5` |
-| **Branch** | `agent/seat-s5/s1-g1` |
+| **Branch** | `agent/seat-s5/s2-g2` |
 | **Owned** | `BloodOmen2SnAssist.cs`, this doc |
 | **Forbidden** | invent pixels; fake warm CODE/MAINMENU sector credit |
 | **Date** | 2026-07-31 |
-| **Status** | **S1/PL-015:** MENU YES hold + title-FB pad inject (opens=2, ForceRefreshPad); gifP2↑ concurrent with pad; selection/press-start state advance **not proven** (prims=1 residual) |
+| **Status** | **S2/PL-027 PARTIAL:** MENU YES hold + CODE+MAINMENU+**MAINSKY** stream (3024132); post-RUMBLE residual live; **imgBytes=0 prims=1** residual (UI ETP Open / multi-prim IMAGE not yet) |
 
 ---
 
@@ -146,8 +146,12 @@ Disc PS2.RKV / GOE
         │     └─ Soft-GS titleStrip EXPAND → px=286720 prims=1   [LIVE MENU YES]
         │           residual: expandHits demote (G-GFX-6 / S9)
         │
-        ├─ [MISSING] GIF IMAGE / BITBLT tex upload (imgBytes=0)
-        │     └─ TEX0 sample multi-prim chrome (G-GFX-3/4)
+        ├─ MAINSKY.BG2 Open+stream → EE @0xD80000              [LIVE S2 stream]
+        │     residual: package register + mainmenusky.etp Open
+        │
+        ├─ [MISSING] MAINMENU UI ETP Open (wall/fire/sky)
+        │     └─ GIF IMAGE / BITBLT tex upload (imgBytes=0)
+        │           └─ TEX0 sample multi-prim chrome (G-GFX-3/4)
         │
         ├─ [MISSING] DISPFB1 natural present (dispfbPx=0)          [S10]
         │
@@ -225,6 +229,63 @@ MENU? YES | T2 PARTIAL (pad-inject live; state advance residual)
 | Forbidden | Invent pixels; plant PATH3 chrome; fake DISPFB composite-only as FRONTEND |
 | Exit test | claim @100M: imgBytes&gt;0 **and** MENU hold; expandHits documented (not sole px source preferred) |
 
+#### S2 PL-027 claim (seat-s5 / `out/seat-s5`, SEMA_OFF, host-present)
+
+**Assist delta (this WP):**
+
+1. **MAINSKY.BG2 force-stream** — real disc `RESOURCES\LEVELS\UI\MAINSKY.BG2` (598640 B) → EE `@0xD80000` after CODE+MAINMENU. Pack holds MainMenuSky / `skies_scroll` textures (companion to MAINMENU UI). **streamedTotal=3024132** (was 2425492). Honest sector credit via `ForceBo2GameBg2Stream`; no invent pixels.
+2. **Post-RUMBLE residual** — soft-leave InMap a1==0 after pack≥5 → post-display; data-thrash resume prefers display spine (not entity-printf `0x2AD9E0` death); freelist band widen; cap post-Finished re-kick after RUMBLE storm (pack≥8) so residual does not reopen whole-CODE helper ETPs forever.
+3. **Freelist heat soft-stub** after RUMBLE storm (`0x2BBD2C` / `0x2BBD44` / `0x2BB900`) — cycle budget for residual without inventing menu pixels.
+4. **Hold stream** CODE+MAINMENU (+MAINSKY); MENU title-surface Soft-GS held.
+
+**Disc graph (UI packs — ISO truth):**
+
+| Pack | Size | Contents (symlist) |
+|------|------|--------------------|
+| MAINMENU.BG2 | 1511408 | `mainmenuwall/fire/reflectedsky` ETP + `ui/main_menu/*` textures |
+| MAINSKY.BG2 | 598640 | `mainmenusky.etp` + `ui/main_menu/skies_scroll` |
+
+**100M claim metrics (SEMA_OFF):**
+
+| Metric | Value |
+|--------|-------|
+| PC final | freelist residual band (variance) |
+| px / prims | **286720 / 1** (MENU hold ofx expand; **not** multi-prim yet) |
+| gifP1 / gifP2 / gifP3 | 0 / **54** / 2 |
+| expandHits | **1** |
+| imgBytes / dispfbPx | **0 / 0** |
+| gif-tags image | **0** |
+| cdvd | ~7243 (MAINSKY open + helper pack; RUMBLE reopen residual) |
+| Stream | CODE+MAINMENU+**MAINSKY** **3024132** |
+| Pack members opened | KAIN + GAMEKEEPER + RUMBLEDATABASE (n≈10); **no** `mainmenuwall/fire/sky` ETP Open yet |
+| **MENU?** | **YES** title-surface Soft-GS |
+| **T3 FRONTEND / imgBytes?** | **NO** — ofx strip sole px; IMAGE path not live |
+
+```
+[BO2] force-game CODE+MAINMENU+MAINSKY streamedTotal=3024132 streamSky=True
+[BO2] PL-027 leave InMap / frontend residual / freelist soft-stub after RUMBLE
+softgs: px=286720 prims=1 expandHits=1 gifP2=54 imgBytes=0
+MENU? YES | PL-027 PARTIAL (stream+residual; multi-prim IMAGE residual)
+```
+
+**Claim line (S2 PL-027):**  
+`BO2 SLUS_200.24 S5 PL-027 | MENU YES title-surface | stream CODE+MAINMENU+MAINSKY 3024132 | px=286720 prims=1 gifP2=54 expandHits=1 imgBytes=0 ofx=0x8000 | PARTIAL (no UI ETP Open / no IMAGE tags) | residual mainmenuwall.etp Open + multi-prim + pack-member slice for helper ETPs`
+
+**Wall analysis (PL-027 residual):**
+
+1. **Stream advanced:** MAINSKY real bytes in EE; CODE+MAINMENU hold.
+2. **Path2 still setup-only:** gifCompleted↑ to 11 packed tags; XYZ2=0; image tags=0.
+3. **Helper ETP served as whole CODE.BG2** (`gamekeeper`/`rumbledatabase` off=0 size=914084) — pack-index root-symbol mapping; parsers thrash / reopen. Handoff RealSifRpc / nested goefile slice fidelity.
+4. **MAINMENU UI ETPs never Open** — factory never reaches `assets/etypes/ui/mainmenuwall.etp` etc. after RUMBLE freelist heat.
+5. **Forbidden held:** no invent pixels; no fake warm sector credit; SEMA_OFF.
+
+**Next (after this push):**
+
+1. Nested goefile / pack-member slice for helper ETPs (not whole CODE) — RPC seat handoff  
+2. Natural Open of MAINMENU UI ETPs + MAINSKY registration (stream≠register residual)  
+3. Soft-GS multi-prim once IMAGE/TEX path sees real UI assets (G-GFX-3/4)  
+4. G-GFX-6 expand demotion when retail multi-prim fills FB  
+
 ### Handoffs / freezes
 
 | Freeze | Rule |
@@ -235,13 +296,13 @@ MENU? YES | T2 PARTIAL (pad-inject live; state advance residual)
 | No invent pixels | Expand reuses prim color/UV only |
 | Gs/Gif ownership | Title seat does not edit Gs/Gif without S8/S9 merge train |
 
-### Next WP queue (after S1 merge)
+### Next WP queue (after S2 merge)
 
-1. **PL-015 residual** — map pad consumer / selection cell (PCSX2+PINE) once menu poll is live  
-2. **PL-027** — multi-prim IMAGE (with S8/S9/S10)  
-3. Demote list soft-stubs when natural walk exits freelist  
+1. **PL-027 residual** — MAINMENU UI ETP Open (`mainmenuwall/fire/sky`) + imgBytes&gt;0  
+2. Pack-member nested slice for GAMEKEEPER/RUMBLE (not whole CODE) — RPC handoff  
+3. **PL-015 residual** — map pad consumer / selection cell once menu poll is live  
 4. G-GFX-6 expand demotion when retail multi-prim fills FB without titleStrip  
-5. Soft-leave late asset-as-code thrash (`0x00EFxxxx` / `0x00EEExxxx` post-RUMBLE) without inventing pixels
+5. Demote list / freelist soft-stubs when natural walk exits heat  
 
 ## Commands
 
@@ -251,7 +312,7 @@ dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s5
 $env:DETPS2_TRACE_BIOS='1'; $env:DETPS2_TRACE_RPC='1'
 dotnet exec out/seat-s5/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=20000000 --host-present
 dotnet exec out/seat-s5/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=100000000 --host-present
-# expect: stream CODE+MAINMENU; Creating; LIST+ENGLISH; dual list-stub; GAMEKEEPER;
-#         title-FB pad inject opens=2; Soft-GS px=286720 prims=1 gifP2≈54 ofx=0x8000;
-#         MENU? YES (title-surface); T2 PARTIAL until sel-idx/prims>1
+# expect: stream CODE+MAINMENU+MAINSKY streamedTotal=3024132; Creating; LIST+ENGLISH;
+#         dual list-stub; GAMEKEEPER+RUMBLE; PL-027 residual; Soft-GS px=286720 prims=1
+#         gifP2≈54 ofx=0x8000 imgBytes=0; MENU? YES (title-surface); PL-027 PARTIAL
 ```
