@@ -466,11 +466,15 @@ public sealed class Ps2System
                     or (>= 0x0013DED0UL and <= 0x0013DEF8UL)
                     or (>= 0x0013E1C0UL and <= 0x0013E1F4UL)  // global free-search circular
                     or (>= 0x80000180UL and <= 0x80020000UL);
-                // Burnout 3 post-TXD GIF flush thrash.
+                // Burnout 3: post-TXD GIF flush thrash + residual-STG WaitSema/SIF bands.
                 bool b3Hot = ActiveQuirk is Burnout3Assist && pcPhys is
                     (>= 0x0021A4F0UL and <= 0x0021A5E8UL)
                     or (>= 0x001F3080UL and <= 0x001F3500UL)
-                    or (>= 0x00218700UL and <= 0x00218790UL);
+                    or (>= 0x00218700UL and <= 0x00218790UL)
+                    or (>= 0x00293A00UL and <= 0x00294200UL)
+                    or (>= 0x00123E00UL and <= 0x00124080UL)
+                    or (>= 0x002AF800UL and <= 0x002AF994UL)
+                    or (>= 0x002B34C0UL and <= 0x002B35D0UL);
                 // Dec post-MSL factory/sys-init fail gates (one-instruction v0 checks) —
                 // MidwayFamilyAssist soft-success needs tight slices or the window is missed.
                 bool mkFamHot = ActiveQuirk is MidwayFamilyAssist

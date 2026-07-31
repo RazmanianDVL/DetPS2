@@ -128,3 +128,19 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | Branch claim 50-100M | often cdvd=609 (STAGEHED plant only) when residual-STG flaky |
 | MENU / px | No / 0 — not claiming logo-frontend |
 | Next | stabilize residual-STG under IRX always-on; prims to px; pad after Soft-GS non-black |
+
+## Wave-2 (2026-07-31) — agent/menu-b3-w2 residual-STG + Soft-GS
+
+| Field | Value |
+|-------|-------|
+| Tip base | `3748553` |
+| Claim 100M | **STG+TXD+FRONTEND** cdvd=**6584** gifP3=**885** dmac=742 prims=**2593** binds=13 calls=342 PC=`0x242AA8` **px=0** |
+| STAGEHED plant | cdvd=**2425** @28M (was flaky plant-only 609) |
+| FRONTEND plant | 2MiB @40M cdvd=6584 |
+| Residual | tip CallRpc complete path (n=2–3 @FC10); force@pristine; PreferIopRp OFF |
+| Soft-GS | DISPFB FBP=0 fallback when IMAGE present; broader XYZ 0x8000; PATH3 unmask live |
+| Assist | VBlank heavy leave gated until cdvd>=600; b3Hot residual SIF/boot bands (no WaitSema leaf) |
+| Rejected | residual jump to parent without CallRpc unwind (sp drop); thrash leave to 0x2AF914 (UnknownSpecial); WaitSema in b3Hot (cdvd=0) |
+| MENU / px | **No / 0** — not claiming logo-frontend; prims>0 but Soft-GS still black |
+| Next | prims to px (FRAME/DISPFB/scissor/IMAGE present); pad after non-black Soft-GS |
+

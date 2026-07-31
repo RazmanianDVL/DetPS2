@@ -141,6 +141,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _frontendPlanted = false;
         _frontendEeAddr = 0;
         _frontendSize = 0;
+        _residualBootLeaves = 0;
+        _lastResidualBootLeaveCyc = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -218,6 +220,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // CallRpc runs on main. Gating solely on FullyDone left residual monopolizing EE.
         if (sys.MasterCycles >= 22_000_000 && sys.Cdvd.SectorsRead > 0)
             MaybeKickPostGtfsMenu(sys);
+
+        // Wave-2: after force FullyDone, tip residual often parks in WaitSema/SIF poll
+        // bands (0x293xxx / 0x123Exx) with IRX-only cdvd - never reaches STG bind.
+        // Wave-2 thrash leave disabled: early snap to 0x2AF914 caused UnknownSpecial @0x480xxx.
+        // Residual CallRpc->parent + VBlank gate + Soft-GS DISPFB remain the path to STG.
+        // if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && _lgDevEscapes >= 2
+        //     && sys.Cdvd.SectorsRead is >= 400 and < 2000)
+        //     MaybeLeaveResidualBootThrash(sys);
 
         // Direct flip-leave once LGDEV is done — do not depend solely on menu-kick cadence
         // (live menu14 stuck at 0x1F24E0 with re-arm only, never leave).
@@ -386,8 +396,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 1 }); // v1 = non-zero
                 // Prefer natural fall-through (0x2371A0) so s1-indexed store runs;
                 // after heavy thrash / when parked at prologue, epilogue return.
-                bool heavy = _sleepWakeups >= 8 || _menuKickPulses >= 16 || _vblankExits >= 4
-                    || pc is >= 0x00237120 and <= 0x00237170;
+                bool allowHeavy = sys.Cdvd.SectorsRead >= 600 || _menuKickPulses >= 48;
+                bool heavy = allowHeavy && (_sleepWakeups >= 8 || _menuKickPulses >= 16
+                    || _vblankExits >= 4 || pc is >= 0x00237120 and <= 0x00237170);
                 if (heavy)
                 {
                     // Clamp s1 into 0..3 so success path writes a valid slot, then epilogue.
@@ -1697,6 +1708,103 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 $"[B3] escape table walk pc=0x{pc:X8} a0={a0} a2={a2} absurd={absurd} " +
                 $"-> 0x{(uint)sys.EE.PC:X8} n={_tableWalkEscapes} gifP3={sys.Gif.Path3Transfers} " +
                 $"cyc={sys.MasterCycles}");
+    }
+
+
+    private int _residualBootLeaves;
+    private ulong _lastResidualBootLeaveCyc;
+
+    /// <summary>
+    /// Wave-2 residual-STG: after LGDEV force, tip parks in SIF WaitSema (0x293Axx) /
+    /// stream poll (0x123Exx). Leave toward post-LGDEV success so STG can bind.
+    /// </summary>
+    private void MaybeLeaveResidualBootThrash(Ps2System sys)
+    {
+        if (_residualBootLeaves >= 128) return;
+        if (sys.MasterCycles - _lastResidualBootLeaveCyc < 40_000) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        bool sifWaitBand = pc is >= 0x00293A00 and <= 0x00294200
+            || ra is >= 0x00293A00 and <= 0x00294200;
+        bool streamPoll = pc is >= 0x00123E00 and <= 0x00124000;
+        bool postLgDev = pc is >= 0x002AF800 and <= 0x002AF994
+            || ra is >= 0x002AF800 and <= 0x002AF994;
+        bool bootWait = pc is >= 0x002B34C0 and <= 0x002B35D0;
+        bool waitSemaBoot = pc is >= 0x0010BE60 and <= 0x0010BE70
+            && (postLgDev || sifWaitBand || ra is >= 0x002B34C0 and <= 0x002B35D0
+                || ra is >= 0x00123E00 and <= 0x00124000);
+        bool badPc = pc is >= 0x004E0000 and < 0x02000000
+            || pc is >= 0x80000180 and <= 0x80000200;
+
+        if (!sifWaitBand && !streamPoll && !waitSemaBoot && !postLgDev && !bootWait && !badPc)
+            return;
+
+        _lastResidualBootLeaveCyc = sys.MasterCycles;
+        _residualBootLeaves++;
+
+        uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
+        if (gp is < 0x00400000 or >= 0x01000000) gp = 0x004E8670;
+        uint f23104 = unchecked((uint)((int)gp - 23104));
+        uint f23028 = unchecked((uint)((int)gp + BootWaitFlagGpOff));
+        if (f23104 is >= 0x00400000 and < 0x01000000)
+            sys.Memory.Write32(f23104, 1);
+        if (f23028 is >= 0x00400000 and < 0x01000000)
+            sys.Memory.Write32(f23028, 1);
+        sys.Memory.Write32(BootWaitFlagDefault, 1);
+        uint f27128 = unchecked((uint)((int)gp - 27128));
+        if (f27128 is >= 0x00400000 and < 0x01000000
+            && sys.Memory.Read32(f27128) == 0xFFFFFFFFu)
+            sys.Memory.Write32(f27128, 1);
+
+        const uint postLgDevSuccess = 0x002AF914u;
+        const uint bootWaitContinue = 0x002B34E8u;
+        uint resume = sys.Cdvd.SectorsRead < 600 ? postLgDevSuccess : bootWaitContinue;
+        if (bootWait) resume = bootWaitContinue;
+        if (postLgDev) resume = postLgDevSuccess;
+        if (badPc) resume = bootWaitContinue;
+
+        uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
+        if (s0w >= 600 || s0w == 0 || (s0w & 3) != 0
+            || s0w is >= 0x01000000 or < 0x00400000)
+            sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~(1u << 1);
+
+        var k = sys.Hle?.Kernel;
+        if (k != null)
+        {
+            foreach (var th in k.AllThreads)
+            {
+                if (!th.Alive || !th.Sleeping) continue;
+                if (th.WaitSemaId >= 32)
+                {
+                    try { k.SignalSema(th.WaitSemaId); } catch { /* ignore */ }
+                }
+                if (th.Id == 1 && sys.Cdvd.SectorsRead < 600)
+                {
+                    th.SavedPc = postLgDevSuccess;
+                    if (th.HasFullSave && th.SavedGprFull != null && th.SavedGprFull.Length > 2)
+                    {
+                        th.SavedGprFull[2] = 1;
+                        if (th.SavedGprFull.Length > 16) th.SavedGprFull[16] = 1;
+                    }
+                    th.WaitSemaId = 0;
+                    th.Sleeping = false;
+                    th.WaitVblank = false;
+                }
+                else if (th.WaitSemaId == 0 && !th.WaitVblank)
+                    k.WakeupThread(th.Id);
+            }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_residualBootLeaves <= 16 || _residualBootLeaves % 16 == 0))
+            Console.Error.WriteLine(
+                $"[B3] residual boot thrash leave pc=0x{pc:X8} ra=0x{ra:X8} -> 0x{resume:X8} " +
+                $"n={_residualBootLeaves} cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

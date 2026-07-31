@@ -381,15 +381,36 @@ public sealed class Gs : ISchedulable
         // Homebrew path: large raw without retail centering → map 0..4096 → FB.
         if (ofx == 0 && ofy == 0)
         {
-            if (xRaw >= 0x6000 || yRaw >= 0x6000)
+            int sxRaw = unchecked((short)(ushort)xRaw);
+            int syRaw = unchecked((short)(ushort)yRaw);
+            if (xRaw >= 0x6000 || yRaw >= 0x6000 || sxRaw < -16 || syRaw < -16)
             {
-                x = (xRaw - 0x8000) >> 4;
-                y = (yRaw - 0x8000) >> 4;
+                if (xRaw >= 0x4000 || yRaw >= 0x4000)
+                {
+                    x = (xRaw - 0x8000) >> 4;
+                    y = (yRaw - 0x8000) >> 4;
+                }
+                else
+                {
+                    x = sxRaw >> 4;
+                    y = syRaw >> 4;
+                }
             }
             else if (xRaw > FB_WIDTH * 16 || yRaw > FB_HEIGHT * 16)
             {
                 x = (xRaw * FB_WIDTH) / 4096;
                 y = (yRaw * FB_HEIGHT) / 4096;
+            }
+        }
+        else if ((ofx == 0 && ofy != 0) || (ofy == 0 && ofx != 0))
+        {
+            if (x < -64 || y < -64 || x >= FB_WIDTH + 64 || y >= FB_HEIGHT + 64)
+            {
+                if (xRaw >= 0x4000 || yRaw >= 0x4000)
+                {
+                    x = (xRaw - 0x8000) >> 4;
+                    y = (yRaw - 0x8000) >> 4;
+                }
             }
         }
 
@@ -1330,13 +1351,25 @@ public sealed class Gs : ISchedulable
         ulong fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1
             : Registers.DISPFB2 != 0 ? Registers.DISPFB2
             : Registers.FRAME_1;
-        if (fb == 0) return 0;
+        bool syntheticFb = false;
+        if (fb == 0)
+        {
+            if (ImageBytesWritten <= 0) return 0;
+            fromDispfb = false;
+            syntheticFb = true;
+        }
 
         int fbp;
         int fbw;
         int psm;
         int dbx = 0, dby = 0;
-        if (fromDispfb)
+        if (syntheticFb)
+        {
+            fbp = 0;
+            fbw = FB_WIDTH;
+            psm = 0x00;
+        }
+        else if (fromDispfb)
         {
             fbp = (int)(fb & 0x1FF);
             fbw = (int)((fb >> 9) & 0x3F) * 64;
