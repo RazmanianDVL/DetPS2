@@ -5,11 +5,11 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Vexx (USA) SLUS_203.83 — IOPRP252 + null-path basename + CRT/string heap plant +
-/// SearchFile 0x128 path-layout (+0x24) + freelist bump escape + STREE0 re-plant.
+/// SearchFile path-layout slide (+0x24→+0x20) + freelist bump escape.
 ///
-/// Wave-1 residual: GAME.TXT SearchFile+CdRead (cdvd=4). Wave-2: STREE0.TRE path sits at
-/// +0x24 while stale GAME.TXT leaf/lsn remain at +0x20/+0 — re-plant STREE0; freelist thrash
-/// only after pad/GAME.TXT; stack integrity when PC lands in path ASCII. See issue #19.
+/// Post-pad wall: string alloc via *0x00444998 half-init pool → body 0xF path thrash;
+/// dlmalloc bins zero → freelist walk thrash; sceCdlFILE 0x128 layout path at +0x24
+/// while HLE reads +0x20 → empty SearchFile. See issue #19.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -42,13 +42,10 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint FreelistSuccessStore = 0x001CE280;
     public const uint SearchFileArgBuf = 0x1C1F4000;
     public const uint SearchFilePacket = 0x003F7B00;
-    /// <summary>Do not freelist-bump until pad/IOPRP stack is past early CRT init.</summary>
-    public const ulong FreelistEscapeMinCycles = 3_500_000UL;
 
     private bool _pathPatched, _mallocPlanted;
     private int _versionReplants, _nullPathEscapes, _pathNormEscapes, _mallocReplants;
     private int _hookReplants, _freelistEscapes, _searchPathFixes, _searchPlants;
-    private int _stackRescues;
     private Iso9660.Volume? _isoVol;
     private string? _isoVolPath;
 
@@ -57,7 +54,6 @@ public sealed class VexxAssist : IGameQuirkModule
         _pathPatched = _mallocPlanted = false;
         _versionReplants = _nullPathEscapes = _pathNormEscapes = _mallocReplants = 0;
         _hookReplants = _freelistEscapes = _searchPathFixes = _searchPlants = 0;
-        _stackRescues = 0;
         try { _isoVol?.Disc?.Dispose(); } catch { }
         _isoVol = null; _isoVolPath = null;
     }
@@ -140,9 +136,7 @@ public sealed class VexxAssist : IGameQuirkModule
             }
         }
 
-        // Early freelist escape (pre-pad) corrupts CRT and open-bus thrash (binds=0).
-        if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles
-            && pc is >= FreelistWalkLo and <= FreelistWalkHi)
+        if (pc is >= FreelistWalkLo and <= FreelistWalkHi)
         {
             long walks = (long)sys.EE.GetGpr(22).Lo;
             uint size = (uint)sys.EE.GetGpr(16).Lo;
@@ -171,64 +165,6 @@ public sealed class VexxAssist : IGameQuirkModule
                 }
             }
         }
-
-        // Stack death residual: PC lands in path ASCII (STREE0.TRE / GAME.TXT) as code.
-        if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles && LooksLikePathAsciiPc(sys, pc))
-            MaybeRescueStackDeath(sys, pc);
-    }
-
-    private void MaybeRescueStackDeath(Ps2System sys, uint pc)
-    {
-        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFu);
-        uint resume = 0;
-        if (sp is >= 0x00100000 and < SystemMemory.RDRAM_SIZE)
-        {
-            for (uint off = 0; off <= 0x80; off += 4)
-            {
-                uint cand = sys.Memory.Read32(sp + off);
-                if ((cand & 3) == 0 && sys.Memory.IsLikelyEeCode(cand)
-                    && (cand & 0x1FFFFFFFu) is >= 0x00100000 and < 0x00400000)
-                {
-                    resume = cand & 0x1FFFFFFFu;
-                    break;
-                }
-            }
-        }
-        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu);
-        if (resume == 0 && (ra & 3) == 0 && sys.Memory.IsLikelyEeCode(ra)
-            && ra is >= 0x00100000 and < 0x00400000)
-            resume = ra;
-        if (resume == 0 && sys.Memory.IsLikelyEeCode(0x0011C200u))
-            resume = 0x0011C200u;
-        if (resume == 0) return;
-
-        sys.EE.PC = resume;
-        _stackRescues++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _stackRescues <= 16)
-            Console.Error.WriteLine(
-                $"[VEXX] stack-death rescue #{_stackRescues} from=0x{pc:X} -> 0x{resume:X} cyc={sys.Scheduler.MasterCycles}");
-    }
-
-    private static bool LooksLikePathAsciiPc(Ps2System sys, uint pc)
-    {
-        if (pc < 0x00300000 || pc + 4 >= SystemMemory.RDRAM_SIZE) return false;
-        if (sys.Memory.IsLikelyEeCode(pc)) return false;
-        int printable = 0;
-        for (int i = 0; i < 4; i++)
-        {
-            byte b = sys.Memory.Read8(pc + (uint)i);
-            if (b is >= 0x20 and <= 0x7E) printable++;
-        }
-        if (printable < 3) return false;
-        for (int i = 0; i < 12; i++)
-        {
-            byte b = sys.Memory.Read8(pc + (uint)i);
-            if (b is (byte)'.' or (byte)'\\' or (byte)'/' or (byte)';') return true;
-        }
-        uint w = sys.Memory.Read32(pc);
-        // "STRE" "GAME" "e0.t" fragments from STREE0.TRE
-        if (w is 0x45525453u or 0x454D4147u or 0x742E3065u) return true;
-        return printable >= 4;
     }
 
     public static void PlantIopRpVersion(Ps2System sys)
@@ -297,6 +233,7 @@ public sealed class VexxAssist : IGameQuirkModule
     public static bool MaybeFixSearchFilePathLayout(Ps2System sys, uint buf)
     {
         if (buf + 0x120 >= SystemMemory.RDRAM_SIZE) return false;
+        if (sys.Memory.Read8(buf + 0x20) != 0) return false;
         byte at24 = sys.Memory.Read8(buf + 0x24);
         if (at24 is not ((byte)'\\' or (byte)'/' or (>= (byte)'A' and <= (byte)'Z')
             or (>= (byte)'a' and <= (byte)'z') or (byte)'$'))
@@ -310,27 +247,14 @@ public sealed class VexxAssist : IGameQuirkModule
             tmp[len] = b;
             if (b == 0) { len++; break; }
         }
-        if (len <= 1) return false;
-
-        // Slide when +0x20 empty OR stale (different leaf than +0x24) — STREE0 after GAME.TXT.
-        string path24 = Encoding.ASCII.GetString(tmp, 0, Math.Max(0, len - 1));
-        string path20 = ReadCStringStatic(sys, buf + 0x20, 128);
-        string leaf24 = NormalizeSearchLeaf(path24);
-        string leaf20 = NormalizeSearchLeaf(path20);
-        bool needSlide = path20.Length == 0 || (leaf24.Length > 0 && leaf24 != leaf20);
-        if (!needSlide) return false;
-
         for (int i = 0; i < len; i++)
             sys.Memory.Write8(buf + 0x20 + (uint)i, tmp[i]);
-        // New path: clear stale lsn/size so plant / HLE rewrite for STREE0 etc.
-        if (leaf24.Length > 0 && leaf24 != leaf20)
-        {
-            sys.Memory.Write32(buf + 0, 0);
-            sys.Memory.Write32(buf + 4, 0);
-        }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
-            Console.Error.WriteLine($"[VEXX] SearchFile path slide @0x{buf:X} → \"{path24}\"");
+        {
+            string s = Encoding.ASCII.GetString(tmp, 0, Math.Max(0, len - 1));
+            Console.Error.WriteLine($"[VEXX] SearchFile path slide @0x{buf:X} → \"{s}\"");
+        }
         return true;
     }
 
@@ -338,23 +262,19 @@ public sealed class VexxAssist : IGameQuirkModule
     {
         string? isoPath = sys.Cdvd.MountedPath;
         if (string.IsNullOrEmpty(isoPath) || buf + 0x30 >= SystemMemory.RDRAM_SIZE) return false;
+        if (sys.Memory.Read32(buf) != 0) return false;
 
         string name = ReadCString(sys, buf + 0x20, 128);
         if (name.Length == 0) name = ReadCString(sys, buf + 0x24, 128);
         if (name.Length == 0) return false;
 
-        name = NormalizeSearchLeaf(name);
+        int colon = name.IndexOf(':');
+        if (colon >= 0) name = name[(colon + 1)..];
+        name = name.TrimStart('\\', '/');
+        int semi = name.IndexOf(';');
+        if (semi >= 0) name = name[..semi];
         if (name.Length == 0 || name.Length > 64) return false;
         if (name.Contains('\\') || name.Contains('/') || name.StartsWith('$')) return false;
-
-        // Re-plant when lsn empty OR planted leaf at +8 mismatches requested path (STREE0).
-        string plantedLeaf = ReadCString(sys, buf + 8, 16);
-        uint curLsn = sys.Memory.Read32(buf);
-        if (curLsn != 0 && string.Equals(plantedLeaf, name, StringComparison.OrdinalIgnoreCase))
-            return false;
-        if (curLsn != 0 && plantedLeaf.Length > 0
-            && name.StartsWith(plantedLeaf, StringComparison.OrdinalIgnoreCase))
-            return false;
 
         if (_isoVol == null || _isoVolPath != isoPath)
         {
@@ -382,30 +302,6 @@ public sealed class VexxAssist : IGameQuirkModule
             return true;
         }
         catch { return false; }
-    }
-
-    private static string NormalizeSearchLeaf(string name)
-    {
-        if (string.IsNullOrEmpty(name)) return "";
-        int colon = name.IndexOf(':');
-        if (colon >= 0) name = name[(colon + 1)..];
-        name = name.TrimStart('\\', '/');
-        int semi = name.IndexOf(';');
-        if (semi >= 0) name = name[..semi];
-        return name.Trim();
-    }
-
-    private static string ReadCStringStatic(Ps2System sys, uint addr, int max)
-    {
-        var sb = new StringBuilder(max);
-        for (int i = 0; i < max; i++)
-        {
-            byte b = sys.Memory.Read8(addr + (uint)i);
-            if (b == 0) break;
-            if (b is < 32 or >= 127) break;
-            sb.Append((char)b);
-        }
-        return sb.ToString();
     }
 
     private static bool VersionCellsOk(Ps2System sys) =>
