@@ -72,8 +72,10 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _useBigfileSavedGpr = null;
         _droveCodeBg2 = false;
         _droveMainmenuBg2 = false;
+        _droveMainskyBg2 = false;
         _streamedCodeBg2 = false;
         _streamedMainmenuBg2 = false;
+        _streamedMainskyBg2 = false;
         _mainLayerForces = 0;
         _postEnglishDrawKicks = 0;
         _sawListTxt = false;
@@ -81,6 +83,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _listWalkStubbed = false;
         _entityParseLeaves = 0;
         _displaySpineKicks = 0;
+        _frontendResiduals = 0;
+        _postRumbleLeaves = 0;
+        _freelistStubbed = false;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -697,9 +702,12 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// <summary>
     /// EE plant destinations past PRECODE load @0xA242A0 (172028 B). CODE ~914 KiB,
     /// MAINMENU ~1.5 MiB — high RDRAM so factory/goefile parsers can see real bytes.
+    /// PL-027: MAINSKY ~599 KiB sits after MAINMENU end (~0xD70FF0) and before LIST.TXT
+    /// plant @0xEE8AB0 / ENGLISH.DIR @0xEFC160.
     /// </summary>
     private const uint CodeBg2EeDest = 0x00B00000;
     private const uint MainmenuBg2EeDest = 0x00C00000;
+    private const uint MainskyBg2EeDest = 0x00D80000;
 
     /// <summary>
     /// Unstick post-KAIN format thrash toward CODE/MAINMENU Open.
@@ -896,26 +904,35 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             resume2 = 0;
         if (resume2 is >= 0x004804E8 and <= 0x00480538)
             resume2 = 0;
+        // PL-027: reject entity-printf neighborhood cold resumes (claim death 0x2AD9E0).
+        if (resume2 is >= 0x002AD8E0 and <= 0x002ADB80)
+            resume2 = 0;
+        long streamedNow = sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0;
+        bool titleSparse = streamedNow > 1_000_000 && sys.Gs.PrimitivesDrawn <= 8;
         if (resume2 == 0 || resume2 == pc || !IsSafeCodeTarget(sys, resume2)
-            || !IsColdSafeResume(sys, resume2))
-            resume2 = 0x0048A980;
+            || (!IsColdSafeResume(sys, resume2)
+                && resume2 is not (PostDisplaySetupPc or PostFinishedCodeContinuePc)))
+            resume2 = titleSparse ? PostDisplaySetupPc : 0x0048A980u;
         uint spNow = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-        if (spNow < 0x00100000u || spNow >= (uint)SystemMemory.RDRAM_SIZE)
-            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
-        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume2 });
+        if (spNow < 0x00100000u || spNow >= (uint)SystemMemory.RDRAM_SIZE
+            || pc is >= 0x01E00000 and <= 0x01FFFFFF)
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FE8000 });
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = titleSparse ? 1UL : 0UL });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
         sys.EE.PC = resume2;
         sys.EE.COP0_Status &= ~0x6u;
         ArmGifPath3(sys);
         EnsureMainThreadRunning(sys);
         _goeTokenEscapes++;
         _titleSmEscapes++;
+        if (titleSparse) _frontendResiduals++;
         _lastTitleSmCyc = c;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
             Console.Error.WriteLine(
                 $"[BO2] rescue data thrash 0x{pc:X8} -> 0x{resume2:X8} " +
-                $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+                $"n={_goeTokenEscapes} streamed={streamedNow} titleSparse={titleSparse} " +
+                $"cdvd={sys.Cdvd.SectorsRead} cyc={c}");
     }
 
     /// <summary>
@@ -1161,15 +1178,26 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// </summary>
     private bool _droveCodeBg2;
     private bool _droveMainmenuBg2;
+    private bool _droveMainskyBg2;
     private bool _streamedCodeBg2;
     private bool _streamedMainmenuBg2;
+    private bool _streamedMainskyBg2;
     private int _mainLayerForces;
+    private int _frontendResiduals;
+    private int _postRumbleLeaves;
+    private bool _freelistStubbed;
+
+    /// <summary>
+    /// PL-027: disc path for UI sky pack (companion to MAINMENU.BG2 under LEVELS/UI).
+    /// Real bytes; no invent pixels. Streamed after CODE+MAINMENU hold.
+    /// </summary>
+    private const string MainskyDiscToken = @"RESOURCES\LEVELS\UI\MAINSKY.BG2";
 
     private void MaybeDriveGameBg2Open(Ps2System sys, ulong c)
     {
         var rpc = sys.Hle.Sony?.RealRpc;
         if (rpc == null) return;
-        if (_streamedCodeBg2 && _streamedMainmenuBg2) return;
+        if (_streamedCodeBg2 && _streamedMainmenuBg2 && _streamedMainskyBg2) return;
         // WAVE-6: stream after InMap leave OR bit-pack residual (pack open alone stalls).
         if (_inMapEscapes == 0 && _codeOpenNudges == 0 && !IsInBitPackHeat(sys)
             && !_useBigfileForced)
@@ -1191,16 +1219,24 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         var iop = sys.IopModules;
         if (iop == null) return;
 
-        // CODE first (usebigfile Starting code), then MAINMENU for menu surface.
-        string[] tokens = _streamedCodeBg2
-            ? new[] { "MAINMENU" }
-            : new[] { "CODE", "MAINMENU" };
+        // CODE first (usebigfile Starting code), then MAINMENU surface, then MAINSKY (PL-027).
+        // MAINSKY holds MainMenuSky / skies_scroll textures for multi-prim chrome.
+        string[] tokens;
+        if (!_streamedCodeBg2)
+            tokens = new[] { "CODE", "MAINMENU", MainskyDiscToken };
+        else if (!_streamedMainmenuBg2)
+            tokens = new[] { "MAINMENU", MainskyDiscToken };
+        else
+            tokens = new[] { MainskyDiscToken };
         foreach (string token in tokens)
         {
             if (token == "CODE" && _streamedCodeBg2) continue;
             if (token == "MAINMENU" && _streamedMainmenuBg2) continue;
+            if (token == MainskyDiscToken && _streamedMainskyBg2) continue;
 
-            uint dest = token == "MAINMENU" ? MainmenuBg2EeDest : CodeBg2EeDest;
+            uint dest = token == "MAINMENU" ? MainmenuBg2EeDest
+                : token == MainskyDiscToken ? MainskyBg2EeDest
+                : CodeBg2EeDest;
             int n = rpc.ForceBo2GameBg2Stream(sys.Memory, iop, sys.Cdvd, token, dest);
             if (n <= 0)
             {
@@ -1220,20 +1256,28 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 _droveMainmenuBg2 = true;
                 if (n > 0) _streamedMainmenuBg2 = true;
             }
+            if (token == MainskyDiscToken)
+            {
+                _droveMainskyBg2 = true;
+                if (n > 0) _streamedMainskyBg2 = true;
+            }
             _codeOpenNudges++;
             ArmGifPath3(sys);
             EnsureMainThreadRunning(sys);
             uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             // After CODE stream → Finished-code; after MAINMENU → Creating main layer.
+            // MAINSKY stream holds PC (no yank) so post-ENGLISH UI path can consume it.
             uint cont = _streamedMainmenuBg2 ? CreatingMainLayerPc
                 : _streamedCodeBg2 ? FinishedCodeBigFilePc
                 : StartingCodeBigFilePc;
-            if (pc < 0x00120000 || pc >= 0x004A0000
-                || (pc >= 0x00488800 && pc <= 0x00489200)
-                || (pc >= 0x004BE000 && pc <= 0x004C0000)
-                || (pc >= 0x00441F00 && pc <= 0x00442080)
-                || pc == UseBigfileReturnTrampoline
-                || _streamedMainmenuBg2)
+            bool yankPc = token != MainskyDiscToken
+                && (pc < 0x00120000 || pc >= 0x004A0000
+                    || (pc >= 0x00488800 && pc <= 0x00489200)
+                    || (pc >= 0x004BE000 && pc <= 0x004C0000)
+                    || (pc >= 0x00441F00 && pc <= 0x00442080)
+                    || pc == UseBigfileReturnTrampoline
+                    || _streamedMainmenuBg2);
+            if (yankPc)
             {
                 if (IsSafeCodeTarget(sys, cont)
                     || cont is CreatingMainLayerPc or FinishedCodeBigFilePc or StartingCodeBigFilePc)
@@ -1249,7 +1293,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                     $"[BO2] drive-game BG2 token={token} n={n} gameOpens={rpc.Bo2GameBg2Opens} " +
                     $"streamed={rpc.Bo2GameBg2StreamedBytes} dest=0x{dest:X8} " +
                     $"cdvd={sys.Cdvd.SectorsRead} droveCode={_droveCodeBg2} droveMenu={_droveMainmenuBg2} " +
-                    $"streamCode={_streamedCodeBg2} streamMenu={_streamedMainmenuBg2} cyc={c}");
+                    $"droveSky={_droveMainskyBg2} streamCode={_streamedCodeBg2} streamMenu={_streamedMainmenuBg2} " +
+                    $"streamSky={_streamedMainskyBg2} cyc={c}");
             if (_streamedCodeBg2 && _streamedMainmenuBg2)
             {
                 EnsureMainThreadRunning(sys);
@@ -1281,6 +1326,10 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (!IsPreMainmenuSurface(sys) && sys.Gs.PixelsWritten >= 500_000) return;
 
         RefreshListEnglishSignals(sys);
+
+        // PL-027: finish MAINSKY stream even after Creating kick (one pack/slice).
+        if (!_streamedMainskyBg2 && c - _lastTitleSmCyc >= 50_000)
+            MaybeDriveGameBg2Open(sys, c);
 
         // After first kick: only rescue hard data thrash — never interrupt LIST.TXT spine.
         if (_mainLayerForces >= 1)
@@ -1476,6 +1525,25 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         long gif2 = (long)(sys.Gif?.Path2Transfers ?? 0UL);
         long prims0 = sys.Gs.PrimitivesDrawn;
 
+        // PL-027: after RUMBLE pack storm, soft-stub freelist heat (live mid-body 0x2BBD2C)
+        // so residual does not spin freelist→0x48A980 forever with prims=1.
+        int packNow = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
+        if (!_freelistStubbed && packNow >= 8 && prims0 <= 8)
+        {
+            // Mid-body heat site (claim PC=0x2BBD2C) + nearby epilogue — jr ra; v0=1.
+            foreach (uint site in new uint[] { 0x002BBD2C, 0x002BBD44, 0x002BB900 })
+            {
+                uint head = sys.Memory.Read32(site);
+                if (head == 0 || head == 0x03E00008u) continue;
+                sys.Memory.Write32(site, 0x03E00008u); // jr ra
+                sys.Memory.Write32(site + 4, 0x24020001u); // addiu v0, zero, 1
+            }
+            _freelistStubbed = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    "[BO2] PL-027 soft-stub freelist heat @ 0x2BBD2C/0x2BBD44/0x2BB900 after RUMBLE");
+        }
+
         // Soft-GS pulse every visit (IMAGE/DISPFB residual while EE draws).
         try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
         ArmGifPath3(sys);
@@ -1625,6 +1693,92 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
+        // PL-027: post-GAMEKEEPER/RUMBLE frontend residual — title FB held (ofx expand)
+        // but prims=1 imgBytes=0. Soft-leave LIST/ENGLISH-as-code thrash (0xEExxxx/0xEFxxxx)
+        // and stack parks. Cap display-spine re-entry after RUMBLE storm (pack≥8) — further
+        // post-Finished kicks reopen whole-CODE helper ETPs forever (claim pack n=20).
+        // Never invent pixels / fake sector credit.
+        int packOpens = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
+        long img0 = sys.Gs.ImageBytesWritten;
+        bool rumbleStorm = packOpens >= 8;
+        bool needFrontend = logoClass && _listWalkStubbed && _streamedMainmenuBg2
+            && (packOpens >= 3 || gif2 >= 20)
+            && (prims0 <= 1 || img0 == 0)
+            && _frontendResiduals < 48
+            && c - _lastTitleSmCyc >= 200_000;
+        if (needFrontend)
+        {
+            // Asset-as-code: LIST @0xEE8AB0 / ENGLISH @0xEFC160 / MAINSKY plant @0xD80000
+            // / CODE+MAINMENU plants — executing these as .text is post-RUMBLE death.
+            bool assetAsCode = pc is >= 0x00A00000 and < 0x02000000
+                || pc is >= 0x004A0000 and < 0x00A00000
+                || pc < 0x00100000;
+            bool stackThrash = pc is >= 0x01E00000 and <= 0x01FFFFFF;
+            // Freelist / heap-walk (expanded past S0 0x2BB968 variance).
+            bool freelist = pc is >= 0x002BB000 and <= 0x002BC200;
+            // Helper ETP re-load band (RUMBLE/GAMEKEEPER storm @0x2CBxxx after pack≥7).
+            bool helperReload = packOpens >= 7 && pc is >= 0x002CB000 and <= 0x002CC800;
+            // Post-ETP InMap a1==0 helper after RUMBLE (pack≥5) — leave without inventing.
+            bool lateInMap = packOpens >= 5
+                && pc is >= 0x002B9E00 and <= 0x002B9F98
+                && _postRumbleLeaves < 16;
+            // Low-ELF vector insert residual after gif plateau.
+            bool vectorInsert = pc is >= 0x00101900 and <= 0x00101A80 && gif2 >= 40
+                && !rumbleStorm;
+
+            if (assetAsCode || stackThrash || freelist || helperReload || lateInMap || vectorInsert)
+            {
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint cont;
+                bool raUsable = IsSafeCodeTarget(sys, ra) && ra != pc
+                    && ra is not (>= 0x00A00000)
+                    && ra is not (>= 0x002B9E00 and <= 0x002B9F98)
+                    && ra is not (>= 0x002BB000 and <= 0x002BC200)
+                    && ra is not (>= 0x002CB000 and <= 0x002CC800)
+                    && ra is not (>= PostFinishedCodeContinuePc and <= PostDisplaySetupPc + 0x40)
+                    && IsColdSafeResume(sys, ra);
+                if (raUsable)
+                    cont = ra;
+                else if (rumbleStorm)
+                    // Storm: soft-return via $ra if any code; else post-flush idle — do NOT
+                    // re-enter post-Finished (reopens RUMBLEDATABASE whole CODE.BG2).
+                    cont = IsSafeCodeTarget(sys, ra) && ra != pc
+                           && ra is < 0x004A0000 && ra is >= 0x00200000
+                        ? ra
+                        : 0x0048A980u;
+                else
+                    // Early residual only: alternate display spine for Path2 climb.
+                    cont = (_frontendResiduals % 3 == 0)
+                        ? PostFinishedCodeContinuePc
+                        : PostDisplaySetupPc;
+
+                ulong spF = sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL;
+                if (spF < 0x00100000 || spF >= (ulong)SystemMemory.RDRAM_SIZE - 0x100
+                    || stackThrash)
+                    sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FE8000 });
+
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                if (!rumbleStorm)
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
+                sys.EE.PC = cont;
+                sys.EE.COP0_Status &= ~0x6u;
+                ArmGifPath3(sys);
+                try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
+                _frontendResiduals++;
+                if (packOpens >= 5) _postRumbleLeaves++;
+                _postEnglishDrawKicks++;
+                _menuDrawKicks++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_frontendResiduals <= 16 || _frontendResiduals % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] PL-027 frontend residual 0x{pc:X8} -> 0x{cont:X8} " +
+                        $"n={_frontendResiduals} pack={packOpens} sky={_streamedMainskyBg2} " +
+                        $"storm={rumbleStorm} px={px0} prims={prims0} gifP2={gif2} img={img0} cyc={c}");
+                return;
+            }
+        }
+
         // WAVE-7b / PL-015: post-GAMEKEEPER memcpy heat — free residual so entity ETP
         // parse can finish. Live claim1: 0x4802F0 after GAMEKEEPER.ETP.
         // PL-015 fix: do NOT leave 0x4814xx solely on PC — S0 claim rem=0x01FExxxx was a
@@ -1667,32 +1821,43 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // WAVE-7b / PL-015: freelist / heap-walk thrash after GAMEKEEPER.
-        // S0 variance final PC=0x2BB968 (below old 0x2BBD00 band). Expand leave window so
-        // drawable / MainMenu path can run under title-surface Soft-GS + pad inject.
+        // WAVE-7b / PL-015 / PL-027: freelist / heap-walk thrash after GAMEKEEPER.
+        // S0 variance final PC=0x2BB968; PL-027 widens to 0x2BB000..0x2BC200 so drawable /
+        // MainMenu UI path can run under title-surface Soft-GS + pad inject.
         if (_listWalkStubbed && logoClass
-            && pc is >= 0x002BB900 and <= 0x002BBD80
-            && c - _lastTitleSmCyc >= 250_000)
+            && pc is >= 0x002BB000 and <= 0x002BC200
+            && c - _lastTitleSmCyc >= 200_000)
         {
+            int packN = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            uint cont = IsSafeCodeTarget(sys, ra) && ra != pc
-                && ra is not (>= 0x002BB900 and <= 0x002BBD80)
-                ? ra : PostDisplaySetupPc;
-            // Skip to epilogue store path when mid-body (sw t0,0(a1) @0x2BBD4C).
-            if (pc is >= 0x002BBD20 and <= 0x002BBD48
+            // After RUMBLE storm do not re-enter post-Finished (helper ETP reopen).
+            uint cont;
+            if (packN >= 8)
+                cont = 0x0048A980u; // post-flush idle — wait natural FILEIO
+            else if (ra is (>= 0x002CB000 and <= 0x002CC800)
+                || !(IsSafeCodeTarget(sys, ra) && ra != pc
+                     && ra is not (>= 0x002BB000 and <= 0x002BC200)))
+                cont = PostDisplaySetupPc;
+            else
+                cont = ra;
+            // Skip to epilogue store path when mid-body (sw t0,0(a1) @0x2BBD4C) early only.
+            if (packN < 7 && pc is >= 0x002BBD20 and <= 0x002BBD48
                 && IsSafeCodeTarget(sys, 0x002BBD4C))
                 cont = 0x002BBD4C;
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            if (packN < 8)
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
             sys.EE.PC = cont;
             sys.EE.COP0_Status &= ~0x6u;
             _postEnglishDrawKicks++;
+            _frontendResiduals++;
             _menuDrawKicks++;
             _lastTitleSmCyc = c;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_postEnglishDrawKicks <= 24 || _postEnglishDrawKicks % 8 == 0))
                 Console.Error.WriteLine(
                     $"[BO2] post-ENGLISH leave freelist-walk 0x{pc:X8} -> 0x{cont:X8} " +
-                    $"n={_postEnglishDrawKicks} px={px0} prims={prims0} gifP2={gif2} cyc={c}");
+                    $"n={_postEnglishDrawKicks} pack={packN} px={px0} prims={prims0} gifP2={gif2} cyc={c}");
             return;
         }
 
@@ -1839,6 +2004,12 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        long streamed = sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0;
+        int packOpens = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
+        // PL-027: after GAMEKEEPER/RUMBLE (pack≥5) with title FB, InMap a1==0 loops
+        // into stack thrash — soft-leave to post-display UI spine instead of ra=0x2B9E28.
+        bool postRumbleTitle = streamed > 1_000_000 && packOpens >= 5
+            && sys.Gs.PrimitivesDrawn <= 8;
 
         if (inInMapCaller)
         {
@@ -1847,18 +2018,22 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 : (uint)(sys.EE.GetGpr(3).Lo & 0x1FFFFFFFUL);
             if (target != 0 && IsSafeCodeTarget(sys, target) && target is < 0x004A0000)
                 return;
-            uint cont = pc <= 0x002B9E14 ? 0x002B9E14u : 0x002B9E38u;
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            uint cont = postRumbleTitle ? PostDisplaySetupPc
+                : (pc <= 0x002B9E14 ? 0x002B9E14u : 0x002B9E38u);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = postRumbleTitle ? 1UL : 0UL });
+            if (postRumbleTitle)
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
             sys.EE.PC = cont;
             sys.EE.COP0_Status &= ~0x6u;
             _inMapEscapes++;
+            if (postRumbleTitle) { _postRumbleLeaves++; _frontendResiduals++; }
             _titleSmEscapes++;
             _lastTitleSmCyc = c;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_inMapEscapes <= 12 || _inMapEscapes % 8 == 0))
                 Console.Error.WriteLine(
                     $"[BO2] skip InMap bad jalr pc=0x{pc:X8} tgt=0x{target:X8} -> 0x{cont:X8} " +
-                    $"n={_inMapEscapes} cyc={c}");
+                    $"n={_inMapEscapes} postRumble={postRumbleTitle} cyc={c}");
             return;
         }
 
@@ -1868,6 +2043,25 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         uint slot = 0;
         if (s1 is >= 0x00500000 and < 0x00600000)
             slot = s1 + 0x78A8u;
+
+        if (postRumbleTitle && _inMapEscapes >= 1)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = slot != 0 ? slot : 1UL });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
+            sys.EE.PC = PostDisplaySetupPc;
+            sys.EE.COP0_Status &= ~0x6u;
+            ArmGifPath3(sys);
+            _inMapEscapes++;
+            _postRumbleLeaves++;
+            _frontendResiduals++;
+            _titleSmEscapes++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] PL-027 leave InMap helper 0x{pc:X8} -> post-display " +
+                    $"n={_inMapEscapes} pack={packOpens} cyc={c}");
+            return;
+        }
 
         if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x50u)
         {
@@ -2224,8 +2418,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (addr is >= 0x00482E00 and <= 0x00486F00) return false;
         // Format-wrapper (soft-stubbed post-KAIN) — no cold re-entry.
         if (addr is >= 0x004804E8 and <= 0x00480538) return false;
-        // Entity printf glue (soft-stubbed).
-        if (addr is >= 0x002AD8E0 and <= 0x002AD940) return false;
+        // Entity printf glue (soft-stubbed) + PL-027 neighborhood — live claim resumed
+        // thrash to 0x2AD9E0 and re-died without MAINMENU UI draw.
+        if (addr is >= 0x002AD8E0 and <= 0x002ADB80) return false;
         // InMap / destination helpers (live park 0x2B9F34 a1==0 + caller 0x2B9E28).
         // Cold re-entry mid-frame rescue-loops forever after permanent format stubs were removed.
         if (addr is >= 0x002B9DB0 and <= 0x002B9F98) return false;
@@ -2234,6 +2429,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
     private static uint PickSafeResume(Ps2System sys, uint pc)
     {
+        // PL-027: after CODE+MAINMENU stream with sparse Soft-GS, prefer display spine
+        // over post-flush 0x48A980 / entity-printf neighborhood (claim death @0x2AD9E0).
+        long streamed = sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0;
+        long prims = sys.Gs.PrimitivesDrawn;
+        bool titleSurfaceSparse = streamed > 1_000_000
+            && prims <= 8
+            && sys.Gs.PixelsWritten >= 50_000;
+
         // 1) Live $ra when cold-safe.
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
         if (IsColdSafeResume(sys, ra) && ra != pc)
@@ -2259,10 +2462,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 return lg;
         }
 
-        // 4) Cold-resume only into self-contained prologues.
-        foreach (uint cand in new uint[] { 0x0048A980, 0x002D71E4 })
+        // 4) Cold-resume prologues — title surface prefers post-display UI spine (PL-027).
+        uint[] cold = titleSurfaceSparse
+            ? new uint[] { PostDisplaySetupPc, PostFinishedCodeContinuePc, 0x0048A980 }
+            : new uint[] { 0x0048A980, 0x002D71E4 };
+        foreach (uint cand in cold)
         {
-            if (IsColdSafeResume(sys, cand) && cand != pc)
+            if ((IsColdSafeResume(sys, cand) || cand is PostDisplaySetupPc or PostFinishedCodeContinuePc)
+                && cand != pc)
                 return cand;
         }
         return 0;
