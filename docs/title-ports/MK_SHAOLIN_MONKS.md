@@ -9,14 +9,51 @@
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
-| Agent date | 2026-07-31 |
+| Agent date | 2026-07-31 (wave-2) |
 | ROMDIR gate | **CLOSED** |
 | IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
 | Wave-14 tip | SifRpc MSFLAG plant removed; WAD + gifP3=11 restored |
 
 ---
 
-## Result this session (wave-14 / WAD restore + spine)
+## Result this session (wave-2 / resource bind path)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR?** — not claimed. Soft-GS gifP3 plateau 8-9; slot0 still empty |
+| Real resource bind path | **Landed** TITLE_LOCAL force-call `FUN_0026F918` then `FUN_0026FBF0` (BFC0→C1C0 chain) |
+| Kick outcome | Force fires when gifP3>=8 @70M+; `*0x678458` stays 0 after kick (43B670 fails without real resource name args) |
+| Synthetic type5 | **Not used** (wave-12 reject held) |
+| PresentEeSifHandshake in StartLoadedModule | **Not re-added** (MSFLAG once at Sif.Reset) |
+| Selection index | Still unproven under D-pad |
+
+### Soft-GS scoreboard
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Before (tip 3748553 / wave-14)** | `0x43FAB4` | 573440 | 2 | **11** | 88 | FAE8 NEAR?; empty slots |
+| **After (agent/menu-sm-w2)** | FAE8 / lock bands | 573440–860160 | 2–3 | **8–9** | 12–16 | force kick returns empty handle; no MENU claim |
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`: `MaybeForceResourceSlotBind` / `MaybeResumeAfterForcedResourceBind` — real EE force-call of `FUN_0026F918` (slot alloc via `FUN_0043B670` into stream pool `0x55E25C`) then `FUN_0026FBF0` (sole BFC0→C1C0 caller). Trampoline `0x01FE0030`. Prep handle at `0x678458` mirrors `FUN_0026FD80` zero+flags only.
+- **SHARED**: none. Sif MSFLAG remains once at `Sif.Reset` only.
+- **Rejected again**: synthetic type5 slot plants; force `26FD80` poll loop; PresentEeSifHandshake in StartLoadedModule.
+
+### Residual wall
+
+1. `FUN_0026F918` returns without `*0x678458=slot` when a1/a2 resource name args are zero — need real load request from `FUN_0032EA08` args or PCSX2+PINE live handle dump.
+2. gifP3 8–9 on this wave (below wave-14 11 plateau) — second chrome still blocked.
+3. Selection index unproven.
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: no SLUS_210.87 entry
+- PINE: **N this wave** (ELF XREF of sole bind chain sufficient to land force path; kick fail is missing resource IDs, not unknown XREF)
+
+---
+
+## Result prior session (wave-14 / WAD restore + spine)
 
 | Goal | Status |
 |------|--------|
