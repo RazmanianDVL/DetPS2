@@ -1147,6 +1147,7 @@ public static class SmokeTests
             Vif_Direct_MidQw_PadsBeforePath2();
             Vif_Direct_Supersede_AbortsStickyGarbage();
             Gif_Path2_QwSliced_PackedSprite_WritesPixels();
+            Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -5196,6 +5197,41 @@ public static class SmokeTests
             $"[Smoke] Gif_Path2_QwSliced_PackedSprite_WritesPixels OK " +
             $"(px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
             $"FRAME=0x{sys.Gs.Registers.FRAME_1:X} spanned={sys.Gif.PacketsSpannedCalls})");
+    }
+
+    /// <summary>
+    /// WAVE-12B Soft-GS: GoW Path2 SPRITE corners (0,0)+(512,0) with ofx/ofy=0 collapse to a
+    /// 512×1 strip (px≈512 per prim → claim residual px=1026 for two sprites). Expand
+    /// full-width thin strips to Soft-GS title FB (640×448) so first-gs title-surface MENU
+    /// chrome scales without inventing PATH3. Color still from the real prim.
+    /// </summary>
+    public static void Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        // Match GoW live Path2: ofx=0 at kick, SPRITE, raw X 0→0x2000 (512px), both Y=0.
+        sys.Gs.WriteGsRegister(0x18, 0); // XYOFFSET_1 = 0
+        sys.Gs.WriteGsRegister(0x4C, 0x0000000000080000UL); // FRAME_1 like claim
+        sys.Gs.WriteGsRegister(0x00, 0x06); // PRIM sprite
+        sys.Gs.WriteGsRegister(0x01, 0x00000000FF8080FFUL); // RGBAQ
+        static ulong XyzRaw(int x12_4, int y12_4) =>
+            ((ulong)(uint)(x12_4 & 0xFFFF)) | ((ulong)(uint)(y12_4 & 0xFFFF) << 16);
+        sys.Gs.WriteGsRegister(0x05, XyzRaw(0x0000, 0x0000));
+        sys.Gs.WriteGsRegister(0x05, XyzRaw(0x2000, 0x0000));
+
+        long px = sys.Gs.PixelsWritten;
+        long prims = sys.Gs.PrimitivesDrawn;
+        // Without expand: 512×1 = 512. Title surface: ≥ 640×448/2 (half FB floor).
+        const long titleFloor = 640L * 448L / 2;
+        if (prims < 1)
+            throw new Exception("expected one SPRITE prim");
+        if (px < titleFloor)
+            throw new Exception(
+                $"ofx=0 Y=0 Path2 strip did not expand to title surface: px={px} prims={prims} " +
+                $"(want ≥{titleFloor}; residual class was px=512 without expand)");
+        Console.WriteLine(
+            $"[Smoke] Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface OK " +
+            $"(px={px} prims={prims} titleFloor={titleFloor})");
     }
 
     public static void Timer_GateAndClockSelect()
