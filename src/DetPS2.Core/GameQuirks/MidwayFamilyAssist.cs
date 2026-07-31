@@ -48,6 +48,29 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     // Scratch status word used when wait is entered with s0==null (no job object).
     private const uint WaitReadyScratch = 0x0007FF00;
 
+    // DA MFL CallRpc client (live open @0x22C9F0): strcpy path → 0x546EC0, recv @0x5470C0,
+    // client cd @0x54F200. HLE HandleCall uses _cdToArgBuf[client] (soft-bind ~0x1C1F7800),
+    // NOT the EE send pointer — so open fno=24 sees path="" unless we bridge.
+    // Ground-truthed 2026-07-30: open FAIL path="" then fno=0x15 result=0; post-wait
+    // thrash @0x1B39xx / px=0 / cdvd=259. DA-only bridge — do not touch Dec paths.
+    private const uint MflClientDa = 0x0054F200;
+    private const uint MflEeSendDa = 0x00546EC0; // open strcpy dest / info handle store
+    private const uint MflEeRecvDa = 0x005470C0; // CallRpc recv (handle / -2)
+    private const uint MflReadyDa = 0x0040ACE4;  // gp-24716 ready flag
+    // Scannable (no leading '\') so RealSifRpc.ScanSendBufferForPath accepts it.
+    private const string DaGameartMemberPath = @"ps2dvd\artps2\gameart.ssf";
+    // Permanent path scratch for open CallRpc send retarget (outside ELF / stream plant).
+    private const uint DaMflPathScratch = 0x0007F100;
+    // open@0x22C9F0: lui a3,0x54 / addiu a3,0x6EC0 → send=0x546EC0. Retarget to scratch
+    // so SifSetDma → HLE argBuf carries a scannable path (empty strcpy dest wiped plants).
+    private const uint DaOpenA3Lui = 0x0022CA54;
+    private const uint DaOpenA3Addiu = 0x0022CA60;
+    private const uint DaOpenA3LuiOrig = 0x3C070054u;   // lui a3, 0x54
+    private const uint DaOpenA3AddiuOrig = 0x24E76EC0u; // addiu a3, a3, 0x6EC0
+    // lui a3, 8; addiu a3, a3, -0xF00 → 0x0007F100
+    private const uint DaOpenA3LuiPlant = 0x3C070008u;
+    private const uint DaOpenA3AddiuPlant = 0x24E7F100u;
+
     // Dec SLUS_208.81 post-MSL main abort (live 2026-07-30, 200M host-present):
     //   main@0x1235B0 → 0x127900 → 0x126CE0 → 0x1D8120 → jal 0x1D9620
     //   0x1D9620 (type/factory register for ids 0x509/0x50E/0x510/0x1F) returns 0
@@ -75,6 +98,11 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _mslRingSeeds;
     private int _decSysInitEscapes;
     private bool _decSysInitPlanted;
+    private int _mflArgBridges;
+    private int _mflPathPlants;
+    private int _postWaitKicks;
+    private int _pathSrcRewrites;
+    private bool _openSendRetargetPlanted;
 
     public MidwayFamilyAssist(string serial, string displayName)
     {
@@ -98,11 +126,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _mslFilePumps = 0;
         _decSysInitEscapes = 0;
         _decSysInitPlanted = false;
+        _mflArgBridges = 0;
+        _mflPathPlants = 0;
+        _postWaitKicks = 0;
+        _pathSrcRewrites = 0;
+        _openSendRetargetPlanted = false;
     }
 
     /// <summary>True when this assist is bound to Deception (SLUS_208.81).</summary>
     public bool IsDeception =>
         _serial.Equals("SLUS_208.81", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this assist is bound to Deadly Alliance (SLUS_204.23).</summary>
+    public bool IsDeadlyAlliance =>
+        _serial.Equals("SLUS_204.23", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Dec sys-init fail band that aborts main→Exit after MSL. Exposed so
@@ -134,6 +171,15 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // RealSifRpc so gameart.ssf can reach status==4 without planting *s0=4 (Exit).
         // Restored after accidental drop in 8313945 (Arm PE freelist multi-band refactor).
         TryPumpMslFiles(sys);
+        // DA-only: bridge EE MFL send/recv into soft-bind client argBuf so CallRpc open/info
+        // see path/handle (HLE reads client arg, not EE a3 send). Unblocks gameart member open.
+        if (IsDeadlyAlliance)
+        {
+            TryRewriteDaLeadingBackslashPaths(sys);
+            TryPlantDaOpenSendRetarget(sys);
+            TryBridgeDaMflCallRpcArg(sys);
+            TryKickDaPostWait(sys);
+        }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
         // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
         if (sys.Memory.Read32(0x0040B44C) != 0)
@@ -143,6 +189,285 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // before member .ssf CallRpc (see DecSysInit* constants).
         if (IsDeception)
             TryEscapeDecSysInitFail(sys);
+    }
+
+    /// <summary>
+    /// DA only: one-shot retarget of mfl open CallRpc send pointer (a3) from 0x546EC0 to
+    /// <see cref="DaMflPathScratch"/> where we keep a permanent scannable gameart path.
+    /// Live: EE strcpy to 0x546EC0 is often empty/garbage by DMA time so HLE open sees
+    /// path=""; pointing send at our scratch makes SifSetDma→argBuf carry a real member.
+    /// Instruction match guards the plant (DA ELF only). Does not alter info/close.
+    /// </summary>
+    private void TryPlantDaOpenSendRetarget(Ps2System sys)
+    {
+        if (_openSendRetargetPlanted) return;
+        // Code resident after PT_LOAD; wait for MSL so we don't fight early IRX load.
+        if (sys.MasterCycles < 2_000_000) return;
+        if (sys.Memory.Read32(DaOpenA3Lui) != DaOpenA3LuiOrig) return;
+        if (sys.Memory.Read32(DaOpenA3Addiu) != DaOpenA3AddiuOrig) return;
+
+        // Permanent path at scratch (also re-asserted by bridge).
+        WriteCStringIfChanged(sys.Memory, DaMflPathScratch, DaGameartMemberPath);
+        sys.Memory.Write32(DaOpenA3Lui, DaOpenA3LuiPlant);
+        sys.Memory.Write32(DaOpenA3Addiu, DaOpenA3AddiuPlant);
+        _openSendRetargetPlanted = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] DA open send retarget a3->0x{DaMflPathScratch:X8} " +
+                $"\"{DaGameartMemberPath}\" cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// DA only: rewrite TOC/name-table paths that start with <c>\ps2dvd</c> so
+    /// <c>ScanSendBufferForPath</c> (first-byte whitelist, no <c>\</c>) can find them when
+    /// EE strcpy → CallRpc DMA copies the string into the HLE arg buffer.
+    /// Live strings @0x1FCC6C0 (<c>\ps2dvd\artps2\gameart.ssf</c>). One-shot per site.
+    /// </summary>
+    private void TryRewriteDaLeadingBackslashPaths(Ps2System sys)
+    {
+        if (_pathSrcRewrites != 0) return;
+        if (sys.Memory.Read32(MflReadyDa) == 0 && sys.MasterCycles < 2_500_000) return;
+
+        // Known live sites + short scan of the path-hash string pool if present.
+        Span<uint> sites = stackalloc uint[]
+        {
+            0x01FCC6C0u,
+            0x01FCC6DCu,
+            0x003F77F8u, // "gameart.sec" leaf — no leading \, skip if not backslash
+            0x003F7818u,
+        };
+        int n = 0;
+        foreach (uint site in sites)
+        {
+            if (site + 8 >= SystemMemory.RDRAM_SIZE) continue;
+            if (sys.Memory.Read8(site) != (byte)'\\') continue;
+            // Only rewrite \ps2dvd\... / \PS2DVD\... family (TOC member names).
+            byte b1 = sys.Memory.Read8(site + 1);
+            if (b1 is not ((byte)'p' or (byte)'P')) continue;
+            // Shift left one byte until NUL.
+            for (uint i = 0; i < 120; i++)
+            {
+                byte b = sys.Memory.Read8(site + 1 + i);
+                sys.Memory.Write8(site + i, b);
+                if (b == 0) break;
+            }
+            n++;
+        }
+        if (n == 0) return;
+        _pathSrcRewrites = n;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] DA path src rewrite leading-\\ sites={n} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// DA only: keep MFL soft-bind client argBuf coherent with EE open/info buffers.
+    /// <list type="bullet">
+    /// <item>Handle bridge — when EE send/recv holds a small MFL handle, copy to argBuf so
+    /// fno 21/22 (info/close) see it (same soft-bind arg mismatch as open).</item>
+    /// <item>Path bridge — when EE send @0x546EC0 holds a member path, normalize leading
+    /// <c>\</c> (ScanSendBufferForPath whitelist) and copy to argBuf for fno=24 open.</item>
+    /// <item>Fallback plant — plant scannable path into BOTH EE send and client argBuf so
+    /// either HLE-arg or DMA-from-send path resolves gameart after MKDA ring-complete.</item>
+    /// </list>
+    /// Does not force wait status=4. Dec/Arm untouched.
+    /// </summary>
+    private void TryBridgeDaMflCallRpcArg(Ps2System sys)
+    {
+        // MFL ready flag must be live (set by soft-bind / seed).
+        if (sys.Memory.Read32(MflReadyDa) == 0) return;
+
+        uint argBuf = sys.Memory.Read32(MflClientDa + 20);
+        if (!IsWritableEeOrIop(argBuf)) return;
+
+        uint send0 = sys.Memory.Read32(MflEeSendDa);
+        uint recv0 = sys.Memory.Read32(MflEeRecvDa);
+
+        // 1) Handle bridge (info/close): small positive MFL handle in EE send or recv.
+        //    Reject 0xFFFFFFFE (-2 open fail) and huge pointers.
+        if (IsMflHandle(send0))
+        {
+            if (sys.Memory.Read32(argBuf) != send0)
+            {
+                sys.Memory.Write32(argBuf, send0);
+                _mflArgBridges++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _mflArgBridges <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] DA MFL handle bridge send->arg h={send0} arg=0x{argBuf:X8} " +
+                        $"n={_mflArgBridges} cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+        if (IsMflHandle(recv0))
+        {
+            if (sys.Memory.Read32(argBuf) != recv0)
+            {
+                sys.Memory.Write32(argBuf, recv0);
+                _mflArgBridges++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _mflArgBridges <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] DA MFL handle bridge recv->arg h={recv0} arg=0x{argBuf:X8} " +
+                        $"n={_mflArgBridges} cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+
+        // 2) Path bridge from EE open strcpy dest — normalize + copy to argBuf.
+        //    Also rewrite in-place at EE send if it still has a leading '\'.
+        if (TryReadPathLike(sys.Memory, MflEeSendDa, out string eePath))
+        {
+            string norm = NormalizeDaMemberPath(eePath);
+            if (!string.Equals(eePath, norm, StringComparison.Ordinal))
+                WriteCStringIfChanged(sys.Memory, MflEeSendDa, norm);
+            if (WriteCStringIfChanged(sys.Memory, argBuf, norm))
+            {
+                _mflPathPlants++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _mflPathPlants <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] DA MFL path bridge \"{norm}\" -> arg=0x{argBuf:X8} " +
+                        $"n={_mflPathPlants} cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+
+        // 3) Fallback plant into BOTH EE send and client argBuf when neither is a path/handle.
+        //    EE CallRpc may DMA send→arg; HLE may read arg directly — cover both.
+        uint a0 = sys.Memory.Read32(argBuf);
+        if (IsMflHandle(a0)) return;
+        if (TryReadPathLike(sys.Memory, argBuf, out _))
+        {
+            // argBuf already has path — also ensure EE send has it for DMA path.
+            if (!TryReadPathLike(sys.Memory, MflEeSendDa, out _))
+                WriteCStringIfChanged(sys.Memory, MflEeSendDa, DaGameartMemberPath);
+            return;
+        }
+
+        bool wroteArg = WriteCStringIfChanged(sys.Memory, argBuf, DaGameartMemberPath);
+        bool wroteSend = WriteCStringIfChanged(sys.Memory, MflEeSendDa, DaGameartMemberPath);
+        bool wroteScratch = WriteCStringIfChanged(sys.Memory, DaMflPathScratch, DaGameartMemberPath);
+        if (!wroteArg && !wroteSend && !wroteScratch) return;
+        _mflPathPlants++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _mflPathPlants <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA MFL path plant \"{DaGameartMemberPath}\" arg=0x{argBuf:X8} " +
+                $"send=0x{MflEeSendDa:X8} scratch=0x{DaMflPathScratch:X8} " +
+                $"n={_mflPathPlants} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// DA only: after wait-ready (PC past 0x2F55B0) with live gameart host, wake pure
+    /// SleepThread workers and signal non-RPC-looking WaitSema parks so post-wait asset
+    /// consumers can run. Never SignalSema on high RPC ids; never force *s0=4.
+    /// </summary>
+    private void TryKickDaPostWait(Ps2System sys)
+    {
+        // Host stream must be live (status plant done).
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        // Only after wait band / once past early boot.
+        uint pc = (uint)sys.EE.PC;
+        bool pastWait = pc < WaitReadyPcLo || pc > WaitReadyPcHi;
+        if (!pastWait && _waitReadyEscapes == 0) return;
+        if (sys.MasterCycles < 4_000_000) return;
+        // Throttle: every ~256 Step hits after first escape, cap total kicks.
+        if (_postWaitKicks >= 64) return;
+        if ((_mslFilePumps & 255) != 0) return;
+
+        var k = sys.Hle?.Kernel;
+        if (k == null) return;
+        int woke = 0;
+        foreach (var t in k.AllThreads)
+        {
+            if (!t.Alive || t.Id < 1) continue;
+            // Start any DORMANT worker (KickAllDormant skips id&lt;2; main may also re-Create).
+            if (!t.Started && t.Id >= 2)
+            {
+                try
+                {
+                    k.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false);
+                    woke++;
+                }
+                catch { /* ignore */ }
+                continue;
+            }
+            if (!t.Sleeping) continue;
+            // Pure SleepThread — WakeupThread only.
+            if (t.WaitSemaId == 0 && !t.WaitVblank)
+            {
+                try { k.WakeupThread(t.Id); woke++; }
+                catch { /* ignore */ }
+                continue;
+            }
+            // Low-id WaitSema (not RPC packet pool) — soft signal once.
+            if (t.WaitSemaId is > 0 and < 16)
+            {
+                try { k.SignalSema(t.WaitSemaId); woke++; }
+                catch { /* ignore */ }
+            }
+        }
+        if (woke == 0) return;
+        _postWaitKicks++;
+        try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _postWaitKicks <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA post-wait kick woke={woke} n={_postWaitKicks} " +
+                $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+    }
+
+    private static bool IsMflHandle(uint v) => v is >= 1 and <= 0x100;
+
+    private static bool IsWritableEeOrIop(uint addr) =>
+        addr != 0
+        && (addr < SystemMemory.RDRAM_SIZE
+            || (addr >= 0x1C000000u && addr < 0x1C000000u + 0x00200000u));
+
+    private static string NormalizeDaMemberPath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return DaGameartMemberPath;
+        // Drop leading separators so ScanSendBufferForPath first-byte whitelist matches.
+        path = path.TrimStart('\\', '/');
+        return path;
+    }
+
+    private static bool TryReadPathLike(SystemMemory mem, uint addr, out string path)
+    {
+        path = "";
+        if (addr == 0) return false;
+        var sb = new System.Text.StringBuilder(96);
+        for (uint i = 0; i < 96; i++)
+        {
+            byte b;
+            try { b = mem.Read8(addr + i); }
+            catch { return false; }
+            if (b == 0) break;
+            if (b < 0x20 || b > 0x7E) return false;
+            sb.Append((char)b);
+        }
+        path = sb.ToString();
+        if (path.Length < 4) return false;
+        // Path-ish: extension, separator, or known Midway member leaf.
+        if (path.IndexOf('.') < 0 && path.IndexOf('\\') < 0 && path.IndexOf('/') < 0
+            && path.IndexOf(':') < 0)
+            return false;
+        return true;
+    }
+
+    private static bool WriteCStringIfChanged(SystemMemory mem, uint addr, string s)
+    {
+        if (string.IsNullOrEmpty(s) || addr == 0) return false;
+        // Skip write if already matches.
+        if (TryReadPathLike(mem, addr, out string cur)
+            && string.Equals(cur, s, StringComparison.OrdinalIgnoreCase))
+            return false;
+        for (int i = 0; i < s.Length; i++)
+            mem.Write8(addr + (uint)i, (byte)s[i]);
+        mem.Write8(addr + (uint)s.Length, 0);
+        return true;
     }
 
     /// <summary>
