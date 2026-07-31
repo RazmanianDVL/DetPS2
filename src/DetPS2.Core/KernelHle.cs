@@ -1010,17 +1010,21 @@ public sealed class KernelState
 
     /// <summary>Start thread and optionally switch to it immediately (first-run boost).</summary>
     /// <remarks>
-    /// When <paramref name="switchNow"/> is set from a SYSCALL stub (typical
-    /// <c>li v1,N; syscall; jr ra; nop</c> cluster), resume the caller at <c>$ra</c>
-    /// (the instruction after the <c>jal</c> into the stub) rather than at the stub's
-    /// post-syscall <c>jr ra</c>.
+    /// Classic resume is stub <c>PC+4</c> (<c>jr ra</c>) so the caller epilogue after the
+    /// <c>jal</c> into the SCE kernel stub runs normally.
     ///
-    /// Haven SLUS_205.17 live (WAVE-5): StartThread switchNow → worker WaitSema yield
-    /// restored main at stub <c>PC+4</c> (<c>0x329B08 jr ra</c>) but execution continued
-    /// at <c>0x329B0C</c> (delay-slot nop) and fell through into the next trampoline
-    /// (<c>ExitThread</c> @ <c>0x329B10</c>). Main <c>Started=false</c>, residual
-    /// WaitSema@0x32BCD0 with Soft-GS logo-only. Resuming at <c>$ra</c> skips the entire
-    /// stub epilogue so an off-by-one cannot walk into ExitThread.
+    /// Haven SLUS_205.17 WAVE-5 residual: StartThread switchNow → worker WaitSema yield
+    /// restored main at stub <c>jr ra</c> but an HleRedirect / PC+4 interaction continued at
+    /// the delay-slot nop and fell through into the next packed trampoline
+    /// (<c>ExitThread</c>). A broad "always resume at <c>$ra</c>" plant fixed Haven but
+    /// <b>broke God of War</b> at the first StartThread (tid2 @0x2947C8, ~274k cycles):
+    /// main SavedPc pinned to the jal return, stack/ra epilogue desynced, <c>Started=false</c>,
+    /// forever WaitSema thrash, cdvd=0 / gifP2=0 (wave-7 had cdvd=555 gifP2=962).
+    ///
+    /// WAVE-8b (GoW): keep classic <c>fromSyscall</c> PC+4 always. Haven's ExitThread
+    /// fall-through is covered by restoring full SP/s-regs in
+    /// <c>SonyKernelHle.InvokeRpcEndFunction</c> and title-side stall clear — not by
+    /// rewriting every StartThread resume PC.
     /// </remarks>
     public int StartAndMaybeSwitch(EmotionEngine ee, int id, bool switchNow, ulong arg = 0, bool fromSyscall = true)
     {
@@ -1028,22 +1032,7 @@ public sealed class KernelState
         if (r < 0) return r;
         if (switchNow)
         {
-            ulong ra = ee.GetGpr(31).Lo & 0x1FFFFFFFu;
-            // Prefer caller return when $ra looks like EE .text (not null / low vector).
-            bool raResume = fromSyscall
-                && ra >= 0x00080000u && ra < 0x02000000u && (ra & 3u) == 0;
-            if (raResume)
-            {
-                // Cooperative save (no PC+4), then pin SavedPc to $ra.
-                SaveCurrentContext(ee, fromSyscall: false);
-                var cur = FindThread(_currentTid);
-                if (cur != null)
-                    cur.SavedPc = ra;
-            }
-            else
-            {
-                SaveCurrentContext(ee, fromSyscall);
-            }
+            SaveCurrentContext(ee, fromSyscall);
             RestoreContext(ee, id, fromSyscall);
         }
         return 0;
