@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -1340,6 +1341,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-8: minimal stream cookie *0x5BB860=1 (FUN_0043ccf8 arg / slot-style active).
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeInitStreamCookie(sys);
+        // Wave-11: FUN_0043CD58 stream-manager defaults / one-shot force-call so FAE8 sees a
+        // post-init header (ready *base+0x38=1). Slots still need FUN_0043C1C0 object bind.
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+            MaybeInitStreamManager(sys);
         // Wave-9: re-arm stream CAS *0x55E248 so FUN_0043FAE8 can re-enter after first pass
         // (live 120M: cas248 stuck at 1 while gifP3 plateaus 11; skip200 already 0).
         if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000)
@@ -2771,6 +2776,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
 
+        // Wave-11: selection-index delta on every D-pad pulse once spine is live (not only
+        // sparse menu-sel samples — those miss edge timing).
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && sys.Gif.Path3Transfers >= 11
+            && (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
+                | PadInput.Button.Left | PadInput.Button.Right)) != 0)
+            MaybeLogSelectionIndexDelta(sys, buttons);
+
         // Push buttons into PADMAN DMA immediately (not only on next PCRTC VBlank).
         // After IOPRP300 gen≥2 reboot RealSifRpc keeps ghost areas — ForceRefreshPad
         // writes STABLE + active-low buttons into the EE pad buffer the game polls.
@@ -2873,9 +2886,24 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 }
             }
             // Stream manager first work-slot word0 (FAE8 walks base+0x6C stride 0x2AC).
+            // Wave-11: also dump ready flag, slot object ptr (+0x3C), work flag (+0x60),
+            // and D6F8 object table (0x55FA0C) — second chrome needs non-null objects.
             uint slot0 = sys.Memory.Read32(0x0055E25C);
             uint slot0b = sys.Memory.Read32(0x0055E260);
             uint slot0c = sys.Memory.Read32(0x0055E264);
+            uint slot0obj = sys.Memory.Read32(0x0055E25C + 0x3C);
+            uint slot0work = sys.Memory.Read32(0x0055E25C + 0x60);
+            uint smReady = sys.Memory.Read32(0x0055E1F0 + 0x38); // FUN_0043CE00
+            uint smLock24 = sys.Memory.Read32(0x0055E1F0 + 0x24);
+            uint smCb40 = sys.Memory.Read32(0x0055E1F0 + 0x40);
+            uint smCb48 = sys.Memory.Read32(0x0055E1F0 + 0x48);
+            uint smCb50 = sys.Memory.Read32(0x0055E1F0 + 0x50);
+            var d6 = new System.Text.StringBuilder();
+            for (uint i = 0; i < 8; i++)
+            {
+                uint p = sys.Memory.Read32(0x0055FA0C + i * 4);
+                if (p != 0) d6.Append($" [{i}]=0x{p:X8}");
+            }
             // Ghost pad DMA button words (active-low Digital) for accept proof.
             uint pad0 = sys.Memory.Read32(0x00651F00);
             uint pad2 = (sys.Memory.Read32(0x00651F00) >> 16) & 0xFFFFu; // buttons halfword
@@ -2885,13 +2913,20 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"*54E620={t9:X8}/{ta:X8}/{tb:X8} fcb=0x{fcb:X8} g6=0x{g6:X8} " +
                 $"ck={ck0:X8}/{ck1:X8}/{ck2:X8}/{ck3:X8}/{ck4:X8}/{ck5:X8} " +
                 $"gateEc={gateEc:X} skip200={skip200:X} cas248={cas248:X} " +
-                $"slot0={slot0:X8}/{slot0b:X8}/{slot0c:X8} pad@651F00={pad0:X8}/{pad2:X4} " +
+                $"smReady={smReady:X} smLock24={smLock24:X} smCb={smCb40:X8}/{smCb48:X8}/{smCb50:X8} " +
+                $"slot0={slot0:X8}/{slot0b:X8}/{slot0c:X8} obj={slot0obj:X8} wk={slot0work:X} " +
+                $"pad@651F00={pad0:X8}/{pad2:X4} " +
                 $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
                 $"dmac={sys.Dmac.TransfersCompleted} n={_menuPadPulses} cyc={sys.MasterCycles}");
+            if (d6.Length > 0)
+                Console.Error.WriteLine($"[BIOS] menu-sel-d6f8{d6} cyc={sys.MasterCycles}");
             if (small.Length > 0)
                 Console.Error.WriteLine($"[BIOS] menu-sel-small{small} cyc={sys.MasterCycles}");
             if (wide.Length > 0 && wide.Length < 500)
                 Console.Error.WriteLine($"[BIOS] menu-sel-wide{wide} cyc={sys.MasterCycles}");
+
+            // Wave-11: selection-index delta under D-pad (0..N cells that move).
+            MaybeLogSelectionIndexDelta(sys, buttons);
         }
 
         // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
@@ -3466,6 +3501,118 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"[BIOS] init stream cookie *0x5BB860=1 (was zero) n={_streamCookieInits} " +
                 $"multi={(multiLive ? 1 : 0)} fcb={(frameCbLive ? 1 : 0)} " +
                 $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    private int _streamManagerInits;
+    private ulong _lastStreamManagerInitCyc;
+    private const uint StreamManagerBase = 0x0055E1F0;
+
+    // Selection-index tracking (wave-11): last seen 0..8 cells in menu/stream BSS.
+    private readonly Dictionary<uint, uint> _selIndexSnapshot = new();
+    private int _selIndexDeltaLogs;
+
+    /// <summary>
+    /// Wave-11: soft-plant stream-manager header to match <c>FUN_0043CD58</c> a0==0 defaults.
+    /// <para>
+    /// Disasm (CD58): <c>base = FUN_0043CB18() = 0x55E1F0</c>; defaults when a0==0:
+    /// float <c>*base+4 = 0x426FC28F</c>, <c>*base+8=1</c>, <c>*base+0xC=1</c>,
+    /// <c>*base+0x38=1</c> (ready — <c>FUN_0043CE00</c>), clear <c>*base+0x5C</c>.
+    /// Sole natural caller is parent <c>0x43CC40</c> (never reached under HLE).
+    /// </para>
+    /// <para>
+    /// Work slots at <c>base+0x6C</c> stride <c>0x2AC</c> are <b>not</b> filled here —
+    /// <c>FUN_0043C1C0</c> binds <c>*slot=flag</c> + <c>*slot+0x3C=object</c> from resource
+    /// descriptors. Planting active=1 with a null object is unsafe (FBB0→D770). Full
+    /// force-call of CD58 (memset 0x15CC) regressed gifP3 11→5 — do not re-enable without
+    /// isolated Step return. Do NOT plant <c>*0x75C0D0</c>. TITLE_LOCAL.
+    /// </para>
+    /// </summary>
+    private void MaybeInitStreamManager(Ps2System sys)
+    {
+        if (_streamManagerInits >= 8) return;
+        if (sys.MasterCycles - _lastStreamManagerInitCyc < 2_000_000) return;
+
+        bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
+        bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
+        if (!multiLive && !frameCbLive) return;
+
+        // NOTE: force-calling CD58 via trampoline was tried (wave-11) and regressed gifP3
+        // 11→5 — PC/GPR resume raced other Step assists. Soft-plant defaults only.
+        uint ready = sys.Memory.Read32(StreamManagerBase + 0x38);
+        if (ready == 1)
+        {
+            // Keep lock clear if stuck (FBB0 early-out when *base+0x24==1).
+            if (sys.Memory.Read32(StreamManagerBase + 0x24) == 1)
+                sys.Memory.Write32(StreamManagerBase + 0x24, 0);
+            _streamManagerInits = Math.Max(_streamManagerInits, 1);
+            return;
+        }
+
+        // Mirror CD58 a0==0 defaults without full memset (safe while FAE8 may be live).
+        if (sys.Memory.Read32(StreamManagerBase + 4) == 0)
+            sys.Memory.Write32(StreamManagerBase + 4, 0x426FC28Fu); // ~59.94f
+        if (sys.Memory.Read32(StreamManagerBase + 8) == 0)
+            sys.Memory.Write32(StreamManagerBase + 8, 1);
+        if (sys.Memory.Read32(StreamManagerBase + 0xC) == 0)
+            sys.Memory.Write32(StreamManagerBase + 0xC, 1);
+        sys.Memory.Write32(StreamManagerBase + 0x38, 1); // ready
+        // Clear CAS cells if garbage (FD28 / CD58).
+        uint cas = sys.Memory.Read32(StreamManagerBase + 0x58);
+        if (cas > 1) sys.Memory.Write32(StreamManagerBase + 0x58, 0);
+        uint err = sys.Memory.Read32(StreamManagerBase + 0x5C);
+        if (err != 0) sys.Memory.Write32(StreamManagerBase + 0x5C, 0);
+        // Global lock at +0x24 must not stick at 1 (FBB0 early-out).
+        if (sys.Memory.Read32(StreamManagerBase + 0x24) == 1)
+            sys.Memory.Write32(StreamManagerBase + 0x24, 0);
+
+        _streamManagerInits++;
+        _lastStreamManagerInitCyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _streamManagerInits <= 4)
+            Console.Error.WriteLine(
+                $"[BIOS] plant stream-manager CD58 defaults *0x{(StreamManagerBase + 0x38):X}=1 " +
+                $"(ready was 0) n={_streamManagerInits} gifP3={sys.Gif.Path3Transfers} " +
+                $"cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-11: log 0..8 integer cells that change under D-pad (selection index hunt).
+    /// Scans menu tick BSS + stream manager header + cookie. Only logs when pad has D-pad bits.
+    /// </summary>
+    private void MaybeLogSelectionIndexDelta(Ps2System sys, uint buttons)
+    {
+        if (_selIndexDeltaLogs >= 32) return;
+        // Host-active pad mask from MaybeInjectMenuPad (PadInput.Button flags).
+        bool dpad = (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
+            | PadInput.Button.Left | PadInput.Button.Right)) != 0;
+        // Always snapshot; only emit on dpad edge or first post-spine sample.
+        uint[] bases = { 0x0054E5E0, 0x0054E680, 0x0054E800, 0x0054F000, 0x0055E1F0, 0x005BB860 };
+        var deltas = new System.Text.StringBuilder();
+        var now = new Dictionary<uint, uint>();
+        foreach (uint b in bases)
+        {
+            for (uint off = 0; off < 0x80; off += 4)
+            {
+                uint addr = b + off;
+                uint v = sys.Memory.Read32(addr);
+                if (v > 8) continue;
+                now[addr] = v;
+                if (_selIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
+                    deltas.Append($" 0x{addr:X6}:{prev}->{v}");
+            }
+        }
+        // Replace snapshot.
+        _selIndexSnapshot.Clear();
+        foreach (var kv in now) _selIndexSnapshot[kv.Key] = kv.Value;
+
+        if (deltas.Length == 0) return;
+        // Prefer logging when D-pad is held; also log any movement once gifP3>=11.
+        if (!dpad && sys.Gif.Path3Transfers < 11) return;
+        _selIndexDeltaLogs++;
+        Console.Error.WriteLine(
+            $"[BIOS] sel-idx-delta{deltas} dpad={(dpad ? 1 : 0)} btn=0x{buttons:X4} " +
+            $"gifP3={sys.Gif.Path3Transfers} n={_selIndexDeltaLogs} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

@@ -14,7 +14,75 @@
 
 ---
 
-## Result this session (wave-10)
+## Result this session (wave-11)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — stream-manager ready planted; **selection index + gifP3≥12 still unproven** |
+| WAD stream | **Yes** — `cdvd=198840` |
+| gifP3 | **11** (plateau; no second-chrome lift) |
+| dmac | **16** @100M |
+| Frame cb | **`*0x75BDD8=0x43F920` held** + arg `0x5BB860` |
+| Group-6 multi | **`*0x75E950=0x43F920` held**; escapes **`0x427678`** (a0=6) |
+| Stream cookie | **`*0x5BB860=1` planted** |
+| Stream manager | **`*0x55E228` (base+0x38) ready=1** soft-plant (CD58 defaults); slot0 still empty |
+| Stream work gate | **`*0x55E1EC=1` held**; skip `*0x55E200=0`; CAS re-arm held |
+| Pad | Dense START/CROSS/DOWN/UP; ghost PADMAN; Play! TITLE/PAD consulted |
+| Final PC | **`0x43FB40`** (FUN_0043FAE8) @100M |
+| Accept | Stream leaf live; **selection index + second UI chrome not proven** |
+| Constraints | `DETPS2_SEMA_STALL_YIELD` OFF; **no `*0x75C0D0` plant** |
+| diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 (baseline hold) |
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
+- Play! PAD: `Iop_PadMan.cpp` (0x80000100) — already ported SHARED
+- Play! TITLE: generic only — no title patches for SLUS_210.87
+- PINE: **N** (full disasm of CD58 / FAE8 / FBB0 / C1C0 / D770 / parent `0x43CC40`)
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `MaybeInitStreamManager` — soft-plant FUN_0043CD58 defaults (`*base+0x38=1` ready, float config, clear lock/CAS garbage)
+  - **Rejected**: force-call CD58 via trampoline (regressed gifP3 11→5 — resume raced other Step assists)
+  - Wider menu-sel: `smReady`, slot `obj/+0x3C`, `wk/+0x60`, D6F8 table, `sel-idx-delta` under D-pad
+- **SHARED**: none
+
+### Stream manager diagnosis (disasm)
+
+| Addr | Role |
+|------|------|
+| `FUN_0043CB18` | returns base `0x55E1F0` |
+| `FUN_0043CD58` | memset manager 0x15CC; defaults; ready `*base+0x38=1` — sole caller `0x43CC40` never reached under HLE |
+| `FUN_0043FAE8` | gate `*0x55E1EC==1` + CAS `*base+0x58`; walk 8 slots at `base+0x6C` stride `0x2AC` → `FBB0` |
+| `FUN_0043FBB0` | requires `*slot==1` and `*slot+0x60!=1`; work uses `*slot+0x3C` object → `0x44D770` |
+| `FUN_0043C1C0` | binds slot flag + object from resource descriptors (never runs — no objects) |
+| D6F8 table | `0x55FA0C` ×8 — empty at 100M |
+
+**Do not** plant `*slot=1` with null object (FBB0→D770 null path).
+
+### Selection index (wave-11)
+
+Dense D-pad `sel-idx-delta` logs: only binary toggles `*54E5E0/*54E610/*54E618/*54E620` 0↔1 and CAS `*55E248`. **No stable 0..N cell** that tracks Up/Down.
+
+### pad-inject @ 100M (host-present, wave-11 soft-plant)
+
+```
+  58200000  logo-spine kick → ADX pump gifP3=5
+  60000000  group-6 + frame-cb + cookie=1 + CD58 defaults ready=1
+  73200000  re-arm stream CAS; gifP3 climbs 6→8→11
+  75000000+ CROSS/DOWN/UP; FAE8 body; slot0 remains 0
+ 100000000  final PC=0x43FB40 gifP3=11 dmac=16 px=32112640 syscalls~914k cdvd=198840
+```
+
+### Residual wall (wave-11)
+
+1. **gifP3 plateau 11** — FAE8 live; **slot0 empty** / no D6F8 objects → no second-chrome Path3.
+2. **Selection index still unknown** — only busy/re-entrancy flags under D-pad.
+3. **FUN_0043C1C0** resource→slot bind never runs; need PCSX2+PINE live menu objects or resource-path fix.
+4. Force-call CD58 unsafe without isolated Step return after force.
+
+## Result prior session (wave-10)
 
 | Goal | Status |
 |------|--------|
@@ -33,14 +101,14 @@
 | diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 (baseline hold) |
 | verify 50M | PC=`0x41D608` px=28.9M gifP3=5 dmac=7 cdvd=198840 exitReq=False |
 
-### Play! / PINE
+### Play! / PINE (wave-10)
 
 - Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
 - Play! PAD: `Iop_PadMan.cpp` (0x80000100) — ghost DMA + ForceRefreshPad already ported SHARED
 - Play! TITLE/SIF: generic modules only
 - PINE: **N** (disasm of multi `0x427518` / group-6 entry `0x427678` / FAE8 sufficient)
 
-### Change class
+### Change class (wave-10)
 
 - **TITLE_LOCAL** `MidwayBootAssist.cs`:
   - `PickMenuDispatchResume` / `ApplyMenuDispatchResume` — prefer **`0x427678`** (sets a0=6) over bare multi; only heal *dead* $ra (never retarget worker→pump — that caused `PC=0x8000018C`)
