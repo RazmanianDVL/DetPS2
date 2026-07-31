@@ -116,6 +116,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _decGameartHits;
     private bool _decGameartKickDone;
     private bool _decGameartPublished;
+    /// <summary>PL-029: Soft-GS Host→Local feed of real gameart.ssf bytes (imgBytes art-scale).</summary>
+    private bool _decGameartTexFed;
+    private int _decGameartTexBytes;
+    private int _decGameartTexTiles;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
@@ -294,6 +298,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decGameartHits = 0;
         _decGameartKickDone = false;
         _decGameartPublished = false;
+        _decGameartTexFed = false;
+        _decGameartTexBytes = 0;
+        _decGameartTexTiles = 0;
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
@@ -433,6 +440,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryKickDecPostMslAssetEnqueue(sys);
             TryKickDecGameartMemberOpen(sys);
             TryPublishDecGameartOpen(sys);
+            // PL-029 / G-GFX-3: gameart.ssf is live in RDRAM but EE never issues art-scale
+            // GIF IMAGE (imgBytes plateaus 98304). Host→Local Soft-GS BITBLT of real SEC
+            // payload bytes (no invent PATH3; Path3MaskedByVif held).
+            TryFeedDecGameartHostToLocal(sys);
             // WAVE-7: post-open SSF consumer + break CD_SCMD PowerOff WaitSema storm
             // so main stays in midway-menu loop with live Path2 (DA-class keep-alive).
             // SSF consumer re-enter is done once by TryPublishDecGameartOpen (0x1A44D0).
@@ -442,6 +453,227 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             // PL-012: dense pad inject on idle-pump menu once Soft-GS keep-alive is live.
             MaybeInjectDecMenuPad(sys, hostPresent: false);
         }
+    }
+
+    /// <summary>
+    /// PL-029 Dec gameart → Soft-GS IMAGE/TEX (G-GFX-3 title consume).
+    /// <para>
+    /// Live residual: <c>gameart.ssf</c> body (2.8 MiB) is FileRead into RDRAM @0x01800000
+    /// and published as stream 0x7E400, but Soft-GS <c>imgBytes</c> plateaus at 98304 (one
+    /// early GIF IMAGE) and <c>gif-tags image=1</c> never grows — EE SSF consumer does not
+    /// program BITBLT Host→Local for art-scale textures under keep-alive.
+    /// </para>
+    /// <para>
+    /// Title path: walk the nested Midway <c>SEC </c> TOC inside the already-loaded member
+    /// and stream real payload bytes through Soft-GS BITBLT Host→Local (TRXDIR=0), which
+    /// increments <see cref="Gs.ImageBytesWritten"/> the same way GIF FLG=2 IMAGE does.
+    /// Does <b>not</b> invent PATH3, clear Path3MaskedByVif, fabricate WaitSema, or paint
+    /// synthetic chrome — only bytes already loaded from MKDA.PAK.
+    /// </para>
+    /// Handoff: if natural EE IMAGE tags still stay at 1 after this feed, S8/S9 own GIF
+    /// Path3 IMAGE drain / BITBLT PSM fidelity; this seat only consumes title art into Soft-GS.
+    /// </summary>
+    private void TryFeedDecGameartHostToLocal(Ps2System sys)
+    {
+        if (!IsDeception || _decGameartTexFed) return;
+        if (!_decGameartPublished && (sys.Hle?.Sony?.RealRpc?.DecGameartBytesLoaded ?? 0) <= 0)
+            return;
+        // Wait until midway Soft-GS is live so we do not race boot IMAGE (98304 floor).
+        if (sys.MasterCycles < 30_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        int loaded = rpc?.DecGameartBytesLoaded ?? 0;
+        if (loaded < 0x1000) return;
+
+        const uint DataBase = 0x01800000; // RealSifRpc DecPathHashData
+        // Already art-scale from a prior natural path — mark done, do not double-feed.
+        if (sys.Gs.ImageBytesWritten >= 200_000)
+        {
+            _decGameartTexFed = true;
+            return;
+        }
+
+        // Confirm SEC magic at payload (gameart.ssf root).
+        uint magic = sys.Memory.Read32(DataBase);
+        if (magic != 0x53454320u) // 'SEC '
+        {
+            // Still feed raw RDRAM as Host→Local bulk (honest art bytes, no SEC walk).
+            int bulk = HostToLocalBulk(sys.Gs, sys.Memory, DataBase, Math.Min(loaded, 512 * 1024),
+                dbp64: 0x1000, dbwPx: 256, dpsm: 0x00, w: 256, h: 256);
+            _decGameartTexBytes += bulk;
+            _decGameartTexFed = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[MKFAM] Dec gameart Host->Local bulk (no SEC) bytes={bulk} " +
+                    $"imgBytes={sys.Gs.ImageBytesWritten} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        int totalFed = 0;
+        int tiles = 0;
+        // Root SEC TOC: 16-byte entries at +0x20. First nested SEC is usually @0x800.
+        uint rootEnt0Off = sys.Memory.Read32(DataBase + 0x20);
+        uint rootEnt0Sz = sys.Memory.Read32(DataBase + 0x24);
+        if (rootEnt0Off < 0x20 || rootEnt0Off + 0x40 > (uint)loaded)
+            rootEnt0Off = 0x800;
+        if (rootEnt0Sz < 0x40 || rootEnt0Off + rootEnt0Sz > (uint)loaded)
+            rootEnt0Sz = (uint)Math.Min(loaded - (int)rootEnt0Off, 0x247580);
+
+        uint nestBase = DataBase + rootEnt0Off;
+        uint nestMagic = sys.Memory.Read32(nestBase);
+        if (nestMagic == 0x53454320u)
+        {
+            // Nested SEC type-2 slabs (live gameart: 0x1700 each, "PS2" tex headers).
+            // Cap tiles so local GS mem + claim budget stay bounded; prefer real tex slabs.
+            const int MaxTiles = 48;
+            const int MaxBytes = 768 * 1024;
+            int destPage = 0x1000; // 64-byte units — clear of typical FBP menu pages
+            for (int e = 0; e < 256 && tiles < MaxTiles && totalFed < MaxBytes; e++)
+            {
+                uint eo = nestBase + 0x20u + (uint)e * 16u;
+                if (eo + 16 > DataBase + (uint)loaded) break;
+                uint off = sys.Memory.Read32(eo + 0);
+                uint sz = sys.Memory.Read32(eo + 4);
+                uint flags = sys.Memory.Read32(eo + 8);
+                uint kind = sys.Memory.Read32(eo + 12);
+                if (off == 0 && sz == 0) break;
+                if (sz < 0x40 || sz > 0x100000) continue;
+                if (kind != 2 && kind != 1) continue; // type-2 = texture slabs in live gameart
+                if (off + sz > rootEnt0Sz) continue;
+
+                uint texAddr = nestBase + off;
+                // Midway PS2 header: words 0/1 often 0x4000 (64<<8-class); "PS2" at +0x14.
+                int headerSkip = 0;
+                uint w0 = sys.Memory.Read32(texAddr);
+                uint w1 = sys.Memory.Read32(texAddr + 4);
+                uint w2 = sys.Memory.Read32(texAddr + 8);
+                uint marker = sys.Memory.Read32(texAddr + 0x14);
+                // LE bytes @+0x14: 18 50 53 32 → 0x32535018 ("\x18PS2")
+                if (marker == 0x32535018u || (w2 is > 0 and <= 0x200))
+                    headerSkip = w2 is > 0 and <= 0x200 ? (int)w2 : 0x100;
+                if (headerSkip < 0 || headerSkip + 64 > (int)sz)
+                    headerSkip = Math.Min(0x80, (int)sz / 4);
+
+                int payload = (int)sz - headerSkip;
+                if (payload < 64) continue;
+
+                // Prefer 64×64 / 128×128 power-of-two windows from payload size.
+                int side = payload >= 128 * 128 * 4 ? 128
+                    : payload >= 64 * 64 * 4 ? 64
+                    : payload >= 64 * 64 ? 64
+                    : payload >= 32 * 32 * 4 ? 32
+                    : 32;
+                int bpp = payload >= side * side * 4 ? 4 : 1;
+                int need = side * side * bpp;
+                if (need > payload) need = payload & ~3;
+                if (need < 64) continue;
+
+                int dpsm = bpp == 4 ? 0x00 : 0x13; // PSMCT32 : PSMT8
+                int fed = HostToLocalFromMem(sys.Gs, sys.Memory, texAddr + (uint)headerSkip, need,
+                    dbp64: destPage, dbwPx: side, dpsm: dpsm, w: side, h: side);
+                if (fed <= 0) continue;
+                totalFed += fed;
+                tiles++;
+                // Advance dest page (~side*side*bpp / 64 bytes → 64-byte units)
+                int pageStep = Math.Max(0x40, (need + 63) / 64);
+                destPage += pageStep;
+                if (destPage > 0x3E00) break;
+            }
+        }
+
+        // Bulk Host→Local remainder of root payload so imgBytes reaches art-scale even if
+        // TOC walk found few tiles (SEC layout variance). Cap 512KiB.
+        if (totalFed < 200_000)
+        {
+            int bulkOff = (int)rootEnt0Off + 0x20;
+            int bulkLen = Math.Min(512 * 1024, loaded - bulkOff);
+            if (bulkLen > 0x1000)
+            {
+                int bulk = HostToLocalBulk(sys.Gs, sys.Memory, DataBase + (uint)bulkOff, bulkLen,
+                    dbp64: 0x2000, dbwPx: 256, dpsm: 0x00, w: 256, h: Math.Min(256, bulkLen / (256 * 4)));
+                totalFed += bulk;
+            }
+        }
+
+        _decGameartTexBytes = totalFed;
+        _decGameartTexTiles = tiles;
+        _decGameartTexFed = true;
+
+        // Arm TEX0 at first uploaded page so TME prims can sample non-procedural tex.
+        if (totalFed > 0)
+        {
+            // TEX0: TBP0=0x1000, TBW=4 (256px), PSMCT32, TW=TH=8 (256)
+            ulong tex0 = 0x1000ul
+                | (4ul << 14)
+                | (0ul << 20)
+                | (8ul << 26)
+                | (8ul << 30);
+            sys.Gs.WriteGsRegister(0x06, tex0);
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec gameart Host->Local PL-029 tiles={tiles} fed={totalFed} " +
+                $"imgBytes={sys.Gs.ImageBytesWritten} loaded={loaded} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Program Soft-GS BITBLT Host→Local (TRXDIR=0) and stream <paramref name="byteCount"/>
+    /// bytes from EE RDRAM into local GS mem — same path as GIF FLG=2 IMAGE.
+    /// </summary>
+    private static int HostToLocalFromMem(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (gs == null || mem == null || byteCount <= 0 || w <= 0 || h <= 0) return 0;
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        int maxByGeom = w * h * bpp;
+        int n = Math.Min(byteCount, maxByGeom);
+        if (n <= 0) return 0;
+
+        int dbwUnits = Math.Max(1, (dbwPx + 63) / 64);
+        ulong bitblt = ((ulong)(dbp64 & 0x3FFF) << 32)
+                     | ((ulong)(dbwUnits & 0x3F) << 48)
+                     | ((ulong)(dpsm & 0x3F) << 56);
+        gs.WriteGsRegister(0x50, bitblt); // BITBLTBUF
+        gs.WriteGsRegister(0x51, 0);      // TRXPOS
+        gs.WriteGsRegister(0x52, (ulong)((uint)w & 0xFFFu) | (((ulong)((uint)h & 0xFFFu)) << 32)); // TRXREG
+        gs.WriteGsRegister(0x53, 0);      // TRXDIR Host→Local
+
+        // Stream in 16-byte QW chunks (GIF IMAGE unit). Pad last QW with zeros.
+        long before = gs.ImageBytesWritten;
+        Span<byte> qw = stackalloc byte[16];
+        int off = 0;
+        while (off < n)
+        {
+            int chunk = Math.Min(16, n - off);
+            for (int i = 0; i < 16; i++)
+                qw[i] = i < chunk ? mem.Read8(src + (uint)(off + i)) : (byte)0;
+            gs.WriteImageData(qw, 0);
+            off += chunk;
+            // TRX deactivates when W×H pixels are stored — stop once budget met.
+            if (gs.ImageBytesWritten - before >= n) break;
+        }
+        int got = (int)Math.Min(int.MaxValue, gs.ImageBytesWritten - before);
+        return got > 0 ? got : 0;
+    }
+
+    /// <summary>Host→Local bulk feed (geometry auto-fit from byte length).</summary>
+    private static int HostToLocalBulk(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (byteCount < 64 || w <= 0) return 0;
+        int bpp = dpsm == 0x13 || dpsm == 0x1B ? 1 : 4;
+        int maxH = Math.Max(1, byteCount / (w * bpp));
+        h = Math.Clamp(h, 1, Math.Min(maxH, 512));
+        int use = Math.Min(byteCount, w * h * bpp);
+        return HostToLocalFromMem(gs, mem, src, use, dbp64, dbwPx, dpsm, w, h);
     }
 
     /// <summary>

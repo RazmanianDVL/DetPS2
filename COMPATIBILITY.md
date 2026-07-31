@@ -34,7 +34,7 @@ This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships enginee
 | God of War (`SCUS_973.99`) | Retail | **MENU YES** | Soft-GS first-gs (Path2 sticky + ofx expand). Residual: Fedo shell decode, IRX-only stream class. |
 | Haven: Call of the King (`SLUS_205.17`) | Retail | **MENU YES** | Soft-GS title-surface + NUSOUND. Residual: IMAGE chrome. |
 | Mortal Kombat: Deadly Alliance (`SLUS_204.23`) | Retail | **MENU YES** | Soft-GS midway-menu keep-alive. Residual: fail-tail plants / richer chrome. |
-| Mortal Kombat: Deception (`SLUS_208.81`) | Retail | **MENU YES** + **INTERACTIVE** (assist sel-idx) | Soft-GS midway-menu (p2qws≈5988). PL-012 pad inject moves `*0x5DC000` 0..4. Residual: natural accept + gameart GIF IMAGE (G-GFX-3). See `docs/title-ports/MK_DECEPTION.md`. |
+| Mortal Kombat: Deception (`SLUS_208.81`) | Retail | **MENU YES** + **INTERACTIVE** (assist sel-idx) | Soft-GS midway-menu (p2qws≈5988). PL-012 pad + **PL-029** Host→Local gameart SEC tiles **imgBytes=557056**. Residual: natural EE IMAGE + AnimMenu accept. See `docs/title-ports/MK_DECEPTION.md`. |
 | Whiplash (`SLUS_206.84`) | Retail | **MENU YES** | Soft-GS title-surface. Residual: full texture path; WHIP WaitSema fabricate. |
 | Other commercial game ISOs | Retail | **Untested / free-ride** | Next free-ride target e.g. SotC — post-menu plan P7. |
 

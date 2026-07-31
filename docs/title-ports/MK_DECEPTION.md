@@ -11,14 +11,14 @@
 | **Assist** | `MidwayFamilyAssist` **REGION DEC** (`IsDeception`) |
 | **Seat** | **S2 MIDWAY-DEC** |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s2` |
-| **Branch** | `agent/seat-s2/s1-g1` |
+| **Branch** | `agent/seat-s2/s2-g2` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **MENU YES** hold · **P1 INTERACTIVE** (assist-stable sel-idx under D-pad) — PL-012 |
+| **Status** | **MENU YES** hold · **P1 INTERACTIVE** (assist-stable sel-idx) · **G-GFX-3 partial** Host→Local imgBytes↑ — PL-012 + **PL-029** |
 | **Last updated** | 2026-07-31 |
 
 ---
 
-## S0 charter (PL-005) + S1 pad (PL-012)
+## S0 charter (PL-005) + S1 pad (PL-012) + S2 IMAGE (PL-029)
 
 **Gates this seat feeds:**
 
@@ -26,7 +26,7 @@
 |------|------|-------------|
 | **P0** | MENU floor | **HOLD** — midway-menu Soft-GS |
 | **P1** | INTERACTIVE | **HOLD (assist-stable)** — pad inject moves sel-idx `*0x5DC000` 0..4 under D-pad; Soft-GS Δ after pad; natural AnimMenu accept residual |
-| **G-GFX-3** | IMAGE path | **WALL** — `gameart.ssf` body live (2.8 MiB), Soft-GS `imgBytes` plateau **98304** (not art-scale) |
+| **G-GFX-3** | IMAGE path | **PARTIAL** — `gameart.ssf` body live (2.8 MiB); Soft-GS Host→Local feed **imgBytes=557056** (tiles=48 fed=458752); natural GIF `image=` still 1 |
 
 **Freezes held:** Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF** · no invent PATH3 · **Path3MaskedByVif** held · no DA-only thrash · no SM `MidwayBootAssist` · no global WaitSema fabricate.
 
@@ -46,9 +46,9 @@
 | Midway Path2 paint | **YES** — p2qws=**5988** Soft-GS px multi-M |
 | PowerOff/WaitSema storm kill | **YES** — park idle @`0x1B6A68` keep-alive |
 | **MENU YES** (midway-menu) | **YES** — Soft-GS keep-alive, `exitRequested=False` |
-| gifPath3 growth / natural IMAGE chrome | **No** — gifP3=**6** stuck; imgBytes plateaus |
+| gifPath3 growth / natural IMAGE chrome | **No** — gifP3=**6** stuck; natural `gif-tags image=1` |
 | **Pad INTERACTIVE (P1 / PL-012)** | **HOLD** — assist-stable sel-idx + pad inject @ idle-pump |
-| Full gameart TEX sample (G-GFX-3) | **Open** — GX-037 / PL-029 consume |
+| Full gameart TEX sample (G-GFX-3 / PL-029) | **PARTIAL** — Host→Local **imgBytes=557056** (SEC tiles); natural EE IMAGE residual |
 
 ---
 
@@ -68,29 +68,32 @@
       phase: heap-tree cycle band (pre idle-kick / pre gameart)
 ```
 
-### Claim 100M — PL-012 pad inject (SEMA_OFF host-present)
+### Claim 100M — PL-012 + PL-029 Host→Local (SEMA_OFF host-present)
 
 ```
-@100M: PC=0x001B6BF0 px=22006272 prims=1444 gifPath1=0 gifPath2=145 gifPath3=6 dmac=153
+@100M: PC=0x001B6BF0 px=22126909 prims=1445 gifPath1=0 gifPath2=145 gifPath3=6 dmac=153
        sifBytes=3567920 syscalls=25390 cdvdSectors=4535 spu2Samples=31928
-       softgs: imgBytes=98304 dispfbPx=32768 expandHits=0 fragTest=21973504 rejScissor=640
-       softgs-regs: FRAME_1=0xA005B DISPFB1=0 SCISSOR=0x7FFF00007FFF0000
-                    XYOFFSET=0x72006C00 TEST=0x3101A
-       softgs-writes: total=5177 PRIM=75 XYZ2=2886 FRAME=148 SCISSOR=76 TEST=78 XYOFF=148
-       gif-pkts: completed=151 aborted=0 tags=151 p2qws=5988
+       softgs: imgBytes=557056 dispfbPx=153405 expandHits=0 fragTest=21973504 rejScissor=640
+       softgs-regs: FRAME_1=0xA005B DISPFB1=0 SCISSOR=0x01BF0000027F0000
+                    XYOFFSET=0x72006C00 TEST=0x5101B
+       softgs-writes: total=6025 PRIM=75 XYZ2=2886 FRAME=220 SCISSOR=148 TEST=152 XYOFF=220
+       gif-pkts: completed=225 aborted=0 tags=225 p2qws=5988
+       gif-tags: packed=224 reglist=0 image=1  (natural EE IMAGE still 1)
        RealSifRpc: binds=17 calls=2937
        gameart.ssf: open OK size=2836480 loaded=2836480 data=0x01800000 hdr=0x0061E5A0
+       PL-029: Host->Local tiles=48 fed=458752 imgBytes 98304→557056 @~30M
        keep-alive: idle-pump 0x1B6A68 / PC@end 0x1B6BF0 exitRequested=False
        pad: inject n≥1280 sel plants=512 *0x5DC000 tracks 0..4 under D-pad
             sel-idx-delta logs (e.g. 0x5DC000:3->4 dpad=1 btn=0x0020)
             post-pad Soft-GS Δprims≈1320 Δpx≈19.5M Δp2≈132 (from pad baseline @32M)
 MENU? YES (midway-menu Soft-GS keep-alive)
 INTERACTIVE? YES (assist-stable sel-idx under D-pad + Soft-GS growth after pad)
+G-GFX-3? PARTIAL (Host→Local art-scale imgBytes; natural GIF IMAGE residual)
 ```
 
 > **Note on gifPath2 vs p2qws:** batch-aware `Path2Transfers` may read **145** while **p2qws=5988** matches historical wave-7 gifP2≈5988 (same Path2 QW volume). Prefer **p2qws** for Path2 work comparisons.
 
-**Historical wave-7 baseline (agent/menu-dec-w7):** px≈822k gifP2≈5988 gifP3=6 imgBytes=0 — same gifP3 plateau and Path2 QW class; tip Soft-GS now reports more prims/px and a small early IMAGE footprint (`imgBytes=98304`).
+**Historical:** wave-7 imgBytes=0 · PL-012 tip imgBytes=98304 · **PL-029 imgBytes=557056** (Host→Local SEC tiles from real gameart.ssf).
 
 ---
 
@@ -109,18 +112,19 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
         ├─ Path1 / VU1 XgKick: 0
         │
         └─ gameart.ssf stream @0x01800000 (2.8 MiB member)
-                  └─ residual: no art-scale GIF IMAGE / TEX sample into Soft-GS
-                     (imgBytes plateaus 98304; DISPFB1=0)
+                  ├─ PL-029: title Host→Local BITBLT of nested SEC type-2 tiles
+                  │         → Soft-GS imgBytes=557056 (fed=458752 @~30M)
+                  └─ residual: natural EE GIF IMAGE tags still image=1; TME sample path
 ```
 
 | Path / class | At MENU | Evidence | Residual |
 |--------------|---------|----------|----------|
 | **Path1** | none | gifPath1=0 | post-menu 3D |
-| **Path2** | **primary** | p2qws=5988, prims=1444, XYZ2=2886 | keep-alive force-process assist |
+| **Path2** | **primary** | p2qws=5988, prims=1445, XYZ2=2886 | keep-alive force-process assist |
 | **Path3** | early only | gifPath3=**6** | **do not invent**; mask held |
-| **IMAGE (flg)** | early footprint | imgBytes=**98304** both 20M+100M | **G-GFX-3 wall** — not gameart-scale |
-| **DISPFB** | unset | DISPFB1=0, dispfbPx=32768 | S10 / G-GFX-5 |
-| **gameart.ssf** | **loaded** | MWFILE + path-hash + publish | consumer TEX bind residual |
+| **IMAGE (flg)** | early + Host→Local | natural image=1; **imgBytes=557056** | natural EE IMAGE residual (S8/S9) |
+| **DISPFB** | unset | DISPFB1=0, dispfbPx=153405 | S10 / G-GFX-5 |
+| **gameart.ssf** | **loaded + fed** | MWFILE + path-hash + Host→Local SEC tiles | EE SSF consumer / TME bind residual |
 | **Pad / sel-idx** | **assist plant** | `*0x5DC000` 0..4 under D-pad | natural AnimMenu accept residual |
 
 ### gameart.ssf state machine (live claim)
@@ -129,9 +133,10 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 2. ~28.1M: MWFILE open `\ps2dvd\art\gameart.ssf` size=2836480 (pak-member force-dec).  
 3. MSL-MFL path-hash plant: entries=8 loaded=2836480 data=`0x01800000`.  
 4. MKFAM table-open kick `0x1B6A8C→0x267090` + publish stream=`0x0007E400`.  
-5. ~32M: **PL-012 pad inject** starts (Start/Cross/D-pad + ForceRefreshPad).  
-6. ~35M: PowerOff/WaitSema storm → keep-alive park `0x1B6A68`.  
-7. Through 100M: Path2 continues via force-process; sel-idx plant tracks D-pad; **no** gifP3 climb; **imgBytes** unchanged from 20M.
+5. ~30M: **PL-029** Host→Local walk nested `SEC ` type-2 slabs → imgBytes **557056**.  
+6. ~32M: **PL-012 pad inject** starts (Start/Cross/D-pad + ForceRefreshPad).  
+7. ~35M: PowerOff/WaitSema storm → keep-alive park `0x1B6A68`.  
+8. Through 100M: Path2 continues via force-process; sel-idx plant tracks D-pad; **no** gifP3 climb; imgBytes holds art-scale.
 
 ---
 
@@ -147,11 +152,10 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 - **Residual:** natural game menu accept / AnimMenuGUI row cell (not assist plant); idle thrash still dominates PC.  
 - Same honesty class as SM wave-7 assist-stable sel-idx (not free-ride natural UI).
 
-### 2. IMAGE wall (G-GFX-3 / GX-037) — S8/S9 + S2 consume (PL-029)
+### 2. IMAGE wall (G-GFX-3 / GX-037) — PL-029 **PARTIAL** + S8/S9 handoff
 
-- Soft-GS residual: **gameart GIF IMAGE textures**.  
-- Body is in RDRAM; Soft-GS does **not** show art-scale `imgBytes` growth.  
-- Report to GFX triad: Path2-only Midway menu; need Host↔Local / Local↔Local BITBLT fidelity for SSF tex upload, **no** assist PATH3 plant.  
+- **Done (title path):** after publish, `TryFeedDecGameartHostToLocal` programs Soft-GS BITBLT Host→Local (TRXDIR=0) from real nested SEC type-2 payloads in RDRAM — **imgBytes 98304→557056** (tiles=48, fed=458752). Real MKDA.PAK bytes only; no synthetic chrome; no invent PATH3.  
+- **Residual for GFX triad (S8/S9):** natural EE GIF `image=` tag count still **1**; Path2-only Midway menu never programs BITBLT itself under keep-alive. Local↔Local / richer PSM + TME-modulated prims still open.  
 - **Path3MaskedByVif** remains frozen until natural unmask.
 
 ### 3. Held residuals (not this wave)
@@ -171,7 +175,8 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 - gameart table-open kick + path-hash + stream publish.  
 - PowerOff/WaitSema storm break → midway-menu keep-alive.  
 - **PL-012:** dense pad inject on idle-pump + assist-stable sel-idx plant (`0x5DC000`) + ForceRefreshPad.  
-- **Not used:** invent PATH3; DA wait-ready / MFL path plants; SM CRI/WAD; global WaitSema fabricate; idle queue control-word stomps.
+- **PL-029:** Host→Local Soft-GS BITBLT of nested `gameart.ssf` SEC tiles (imgBytes art-scale).  
+- **Not used:** invent PATH3; Path3MaskedByVif remove; DA wait-ready / MFL path plants; SM CRI/WAD; global WaitSema fabricate; idle queue control-word stomps.
 
 ---
 
@@ -197,9 +202,10 @@ Look for stderr: `[MKFAM] Dec pad inject`, `Dec menu-sel-index=`, `Dec sel-idx-d
 ## Claim line (copy for scoreboard / #12)
 
 ```
-Dec S2 PL-012 @100M SEMA_OFF host-present: MENU YES + INTERACTIVE (assist-stable sel-idx)
-  PC=0x1B6BF0 px=22006272 prims=1444 gifP2=145 p2qws=5988 gifP3=6 dmac=153
-  imgBytes=98304 dispfbPx=32768 cdvd=4535 gameart.ssf=2836480@0x01800000 exitReq=False
-  pad: inject n≥1280 *0x5DC000 sel 0..4 under D-pad (sel-idx-delta) Δprims≈1320 after pad
-  residual: natural AnimMenu accept + IMAGE wall (G-GFX-3 gameart TEX) — no invent PATH3
+Dec S2 PL-029 @100M SEMA_OFF host-present: MENU YES + INTERACTIVE + G-GFX-3 PARTIAL
+  PC=0x1B6BF0 px=22126909 prims=1445 gifP2=145 p2qws=5988 gifP3=6 dmac=153
+  imgBytes=557056 (was 98304) dispfbPx=153405 cdvd=4535 gameart.ssf=2836480@0x01800000
+  PL-029 Host->Local tiles=48 fed=458752 exitReq=False
+  pad: inject n≥1280 *0x5DC000 sel 0..4 under D-pad Δprims≈1320 after pad
+  residual: natural EE GIF image=1 + AnimMenu accept — no invent PATH3; mask held
 ```
