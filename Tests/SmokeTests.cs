@@ -212,11 +212,37 @@ public static class SmokeTests
         sys.Gs.WriteGsRegister(0x00, (1UL << 4) | 6); // sprite + TME
         sys.Gs.WriteGsRegister(0x01, 0x80808080UL);
         long before = sys.Gs.PixelsWritten;
-        sys.Gs.WriteGsRegister(0x04, (ulong)(20 * 16) | ((ulong)(20 * 16) << 16));
-        sys.Gs.WriteGsRegister(0x04, (ulong)(60 * 16) | ((ulong)(50 * 16) << 16) | (0x1000UL << 32));
+        // Sony GS: 0x05 = XYZ2 (kick). 0x04 is XYZF2 (also kicks) — use real XYZ2 address.
+        sys.Gs.WriteGsRegister(0x05, (ulong)(20 * 16) | ((ulong)(20 * 16) << 16));
+        sys.Gs.WriteGsRegister(0x05, (ulong)(60 * 16) | ((ulong)(50 * 16) << 16) | (0x1000UL << 32));
         if (sys.Gs.PixelsWritten <= before)
             throw new Exception($"Modulate80 ATE failed px={sys.Gs.PixelsWritten} rejA={sys.Gs.FragmentsRejectedAlpha} fragT={sys.Gs.FragmentsTested}");
         Console.WriteLine($"[Smoke] Gs_Modulate80_AlphaTestPasses OK (px={sys.Gs.PixelsWritten})");
+    }
+
+    /// <summary>
+    /// Sony/Play! GS map: 0x05 XYZ2 kicks, 0x0D XYZ3 does not. Swapped map left commercial
+    /// Midway (DA) SPRITE XYZ2 with kick=False / prims=0.
+    /// </summary>
+    public static void Gs_Xyz2_Kicks_Xyz3_DoesNot()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.WriteGsRegister(0x00, 6); // sprite
+        sys.Gs.WriteGsRegister(0x01, 0xFFFFFFFFUL);
+        long p0 = sys.Gs.PixelsWritten;
+        long prim0 = sys.Gs.PrimitivesDrawn;
+        // XYZ3 (0x0D) pair — must not assemble
+        sys.Gs.WriteGsRegister(0x0D, (ulong)(10 * 16) | ((ulong)(10 * 16) << 16));
+        sys.Gs.WriteGsRegister(0x0D, (ulong)(40 * 16) | ((ulong)(40 * 16) << 16));
+        if (sys.Gs.PrimitivesDrawn != prim0 || sys.Gs.PixelsWritten != p0)
+            throw new Exception($"XYZ3 must not kick prims={sys.Gs.PrimitivesDrawn} px={sys.Gs.PixelsWritten}");
+        // XYZ2 (0x05) pair — must kick
+        sys.Gs.WriteGsRegister(0x05, (ulong)(10 * 16) | ((ulong)(10 * 16) << 16));
+        sys.Gs.WriteGsRegister(0x05, (ulong)(40 * 16) | ((ulong)(40 * 16) << 16));
+        if (sys.Gs.PrimitivesDrawn <= prim0 || sys.Gs.PixelsWritten <= p0)
+            throw new Exception($"XYZ2 must kick prims={sys.Gs.PrimitivesDrawn} px={sys.Gs.PixelsWritten}");
+        Console.WriteLine($"[Smoke] Gs_Xyz2_Kicks_Xyz3_DoesNot OK (px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn})");
     }
 
     /// <summary>ZTE=0 must not soft-depth-reject overdraw.</summary>
@@ -829,7 +855,7 @@ public static class SmokeTests
         ulong xyz = (ulong)(uint)((x << 4) & 0xFFFF)
                   | ((ulong)(uint)((y << 4) & 0xFFFF) << 16)
                   | ((ulong)(z & 0xFFFFFF) << 32);
-        WriteAd(mem, ref addr, 0x04, xyz);
+        WriteAd(mem, ref addr, 0x05, xyz); // GS_REG_XYZ2
     }
 
     private static void Write64(SystemMemory mem, uint addr, ulong value)
@@ -885,6 +911,7 @@ public static class SmokeTests
             Gs_Sprite_FillsRect();
             Gs_DepthTest_RejectsFar();
             Gs_Modulate80_AlphaTestPasses();
+            Gs_Xyz2_Kicks_Xyz3_DoesNot();
             Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();
             Gs_TextureSample_NonUniform();
