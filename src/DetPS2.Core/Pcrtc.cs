@@ -42,6 +42,8 @@ public sealed class Pcrtc : ISchedulable
 
     public void Present(string filename = "detps2_frame.ppm")
     {
+        // GX-041: bind natural DISPFB (or residual FRAME/FBP0) before dump.
+        _gs.CompositeDispfbToFramebuffer();
         _gs.SaveFramebufferAsPPM(filename);
         FrameCount++;
     }
@@ -52,6 +54,7 @@ public sealed class Pcrtc : ISchedulable
     /// </summary>
     public bool DumpSoftGsIfDrawn(string filename)
     {
+        _gs.CompositeDispfbToFramebuffer();
         if (_gs.PixelsWritten <= 0) return false;
         string? dir = Path.GetDirectoryName(filename);
         if (!string.IsNullOrEmpty(dir))
@@ -63,6 +66,8 @@ public sealed class Pcrtc : ISchedulable
 
     public void PresentFrame()
     {
+        // Host/vblank present path: composite DISPFB circuit before raising VBlank (GX-041).
+        _gs.CompositeDispfbToFramebuffer();
         FrameCount++;
         RaiseVblank();
     }

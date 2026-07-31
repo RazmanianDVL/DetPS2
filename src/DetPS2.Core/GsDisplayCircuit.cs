@@ -129,6 +129,21 @@ public readonly struct DisplayRect
 }
 
 /// <summary>
+/// Where Soft-GS last sourced composite pixels (GX-041 telemetry).
+/// Natural = software-programmed DISPFB; Frame = FRAME_1 residual; SyntheticFbp0 = FBP page0 IMAGE fallback.
+/// </summary>
+public enum GsCompositeSource : byte
+{
+    None = 0,
+    /// <summary>DISPFB1/2 programmed by software (GX-041 natural path).</summary>
+    NaturalDispfb = 1,
+    /// <summary>FRAME_1 draw target residual (B3-class when DISPFB stays 0).</summary>
+    Frame = 2,
+    /// <summary>FBP=0 IMAGE page residual when FRAME is high-page / unset.</summary>
+    SyntheticFbp0 = 3,
+}
+
+/// <summary>
 /// Snapshot of PMODE-selected read circuits + decoded DISPFB/DISPLAY for telemetry / present.
 /// </summary>
 public sealed class GsDisplayCircuitInfo
@@ -147,7 +162,8 @@ public sealed class GsDisplayCircuitInfo
 
     /// <summary>
     /// Preferred single circuit for Soft-GS present (Play! dual-circuit collapse rules simplified):
-    /// EN1 only → 1; EN2 only → 2; both → pick non-zero DISPFB raw (prefer 1); none → 0.
+    /// EN1 only → 1; EN2 only → 2; both → pick non-zero DISPFB raw (prefer 1);
+    /// EN=0 but DISPFB written → pick that circuit (titles often program DISPFB before EN).
     /// </summary>
     public int PreferredCircuit
     {
@@ -163,6 +179,9 @@ public sealed class GsDisplayCircuitInfo
                 if (RegistersRawDispfb1 == 0 && RegistersRawDispfb2 != 0) return 2;
                 return 1; // both non-zero or both zero — report circuit 1
             }
+            // PMODE EN=0: still bind a circuit when software wrote DISPFB (GX-041 natural).
+            if (RegistersRawDispfb1 != 0) return 1;
+            if (RegistersRawDispfb2 != 0) return 2;
             return 0;
         }
     }
@@ -177,8 +196,14 @@ public sealed class GsDisplayCircuitInfo
     public ulong PreferredDispfbRaw => PreferredCircuit == 2 ? RegistersRawDispfb2 : RegistersRawDispfb1;
     public ulong PreferredDisplayRaw => PreferredCircuit == 2 ? RegistersRawDisplay2 : RegistersRawDisplay1;
 
-    /// <summary>True when the preferred circuit has a non-zero DISPFB programmed by software.</summary>
-    public bool HasNaturalDispfb => PreferredCircuit != 0 && PreferredDispfbRaw != 0;
+    /// <summary>
+    /// True when software programmed any DISPFB raw (GX-041). Independent of PMODE EN —
+    /// retail often writes DISPFB before enabling the circuit. Never invented/planted.
+    /// </summary>
+    public bool HasNaturalDispfb => RegistersRawDispfb1 != 0 || RegistersRawDispfb2 != 0;
+
+    /// <summary>True when preferred circuit is enabled in PMODE and carries non-zero DISPFB.</summary>
+    public bool HasEnabledNaturalDispfb => CircuitMode != 0 && PreferredDispfbRaw != 0;
 
     public static GsDisplayCircuitInfo FromRegisters(GsRegisters regs)
     {
@@ -202,7 +227,9 @@ public sealed class GsDisplayCircuitInfo
         var d = PreferredDispfb;
         var r = PreferredDisplay.GetOutputRect();
         return $"pmode=0x{Pmode:X} circ={PreferredCircuit} naturalDispfb={(HasNaturalDispfb ? 1 : 0)} " +
-               $"dispfb1=0x{RegistersRawDispfb1:X} display1=0x{RegistersRawDisplay1:X} " +
+               $"enNatural={(HasEnabledNaturalDispfb ? 1 : 0)} " +
+               $"dispfb1=0x{RegistersRawDispfb1:X} dispfb2=0x{RegistersRawDispfb2:X} " +
+               $"display1=0x{RegistersRawDisplay1:X} " +
                $"out={r.Width}x{r.Height}+{r.OffsetX},{r.OffsetY} {d}";
     }
 }
