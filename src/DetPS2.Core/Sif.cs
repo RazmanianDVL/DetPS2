@@ -205,6 +205,9 @@ public sealed class Sif : ISchedulable
         LastIopRebootArgLen = 0;
         // BIOS handoff: SIFMAN SIFINIT + SIFCMD CMDINIT + EESYNC BOOTEND already complete.
         SmFlag = SifStatIopBootReady;
+        // EE→IOP MSFLAG SIFINIT once at reset so sequential SIFMAN _start can leave GetMsFlag
+        // without planting before every SIF* StartLoadedModule (that regressed SM WAD).
+        PresentEeSifHandshake();
         _cmdQueue.Clear();
         _rpcPacketAddrs.Clear();
         _realRpcQueue.Clear();

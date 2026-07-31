@@ -1393,7 +1393,7 @@ public sealed class Gs : ISchedulable
                     int r = (p16 & 0x1F) << 3;
                     int g = ((p16 >> 5) & 0x1F) << 3;
                     int b = ((p16 >> 10) & 0x1F) << 3;
-                    pixel = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
+                    pixel = 0xFF000000u | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
                 }
 
                 if ((pixel & 0x00FFFFFF) == 0) continue;
