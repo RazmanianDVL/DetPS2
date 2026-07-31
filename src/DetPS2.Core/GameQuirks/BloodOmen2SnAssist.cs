@@ -448,12 +448,18 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
     /// <summary>
     /// Unstick post-KAIN format thrash.
-    /// Entry <c>0x482F60</c> is a 720-byte frame (<c>addiu sp,-720</c> … epilogue
-    /// <c>0x48444C</c> <c>ld ra,704(sp)</c>). Body contains the '%' scan loop at
-    /// <c>0x483040</c> (live thrash when PRECODE was served as KAIN.IMP). Soft-stub the
-    /// leaf after asset I/O so callers (<c>jal 0x482F60</c> @ <c>0x482F40</c>) get a clean
-    /// v0=0 without corrupting $sp. If already mid-frame: manually unwind the 0x2D0 frame
-    /// from a valid $sp (never jump to epilogue with $sp==0 — that zeroed $ra/$sp live).
+    ///
+    /// Entry <c>0x482F60</c> is a 720-byte frame (epilogue <c>0x484448</c>).
+    /// Live thrash root (2026-07-30): after FILEIO pack-open of KAIN.IMP serves whole
+    /// PRECODE.BG2 goefile @0xA242A0, format is called with a2 in goefile string tables
+    /// (0x5378A8) — '%' scan @0x483040 burns tens of M cycles.
+    /// Soft-stub the leaf after asset I/O (jr ra; v0=0). Mid-frame residual: unwind the
+    /// 0x2D0 frame from a valid . Never interrupt real epilogue 0x484448..0x484478.
+    ///
+    /// Residual (#17/#8): thrash cleared; game still never FILEIO/IOPFILE Opens CODE.BG2
+    /// or MAINMENU.BG2 into the EE factory (host warm + sector-credit note only). px=3
+    /// logo-class. Next: proper goefile member extract for .IMP, or ground-truth the
+    /// post-entity usebigfile → "Starting code big file" gate (rodata @0x4BEDB8).
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
@@ -476,13 +482,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (c - _lastTitleSmCyc < 80_000) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
 
-        // Soft-stubbed leaf is two words (jr ra; v0=0). Let it return naturally —
-        // treating PC@entry as "inFmtFrame" re-unwound $sp and parked on exception vectors
-        // (live: rescue 0x482F60 → 0x2B9E28 → vector storm → host exit -1).
+        // Soft-stubbed leaf is two words — let it return naturally.
         if (_fmtScanStubbed && pc is >= 0x00482F60 and <= 0x00482F68)
             return;
+        // Real epilogue — never interrupt mid-restore.
+        if (pc is >= 0x00484448 and <= 0x00484478)
+            return;
 
-        bool inFmtFrame = pc is > 0x00482F68 and <= 0x00484474;
+        bool inFmtFrame = pc is > 0x00482F68 and < 0x00484448;
         bool dataThrash = pc is < 0x00120000
             || (pc is >= 0x00500000 and < 0x02000000)
             || (pc is >= 0x00800000 and < 0x02000000);
@@ -523,13 +530,11 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // Data thrash / bad SP: prefer $ra / stack / last-good; re-start tid1 if dead.
         uint resume2 = PickSafeResume(sys, pc);
         if (resume2 is >= 0x00482F60 and <= 0x00484474)
             resume2 = 0;
         if (resume2 == 0 || resume2 == pc || !IsSafeCodeTarget(sys, resume2))
             resume2 = 0x0048A980;
-        // If $sp was zeroed, give the EE a sane stack near the RPC worker BSS.
         uint spNow = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         if (spNow < 0x00100000u || spNow >= (uint)SystemMemory.RDRAM_SIZE)
             sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
