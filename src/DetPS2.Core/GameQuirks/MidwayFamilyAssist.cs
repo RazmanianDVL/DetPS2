@@ -109,6 +109,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _displayCmdCompletes;
     private int _decPostMslKicks;
     private int _decPostMslHits;
+    private int _decProcessForces;
+    private int _decFlagClears;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
@@ -137,17 +139,27 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DecPostInitListHi = 0x003B9E84;
     private const uint DecPostInitListExit = 0x003B9EE0; // post-outer done
 
-    // Dec post-MSL main idle (live 50M host-present, wave-3):
+    // Dec post-MSL main idle (live 50M host-present, wave-3/4):
     //   0x1B6980 -> idle @0x1B6A68: head/tail @ gp-25048/-25052 (gp=0x5DCB70).
-    //   Callback @ gp-25116 is NULL; when head!=tail (type 0x41 pending) main busy-waits
-    //   with s1=1 and never reaches process@0x1B5D78. Workers sleep after MSL DADA
-    //   gameart warm, so no EE .ssf CallRpc.
+    //   Callback @ gp-25116 is NULL (cleared @0x1B8658); when head!=tail main busy-waits
+    //   with s1=1. Real process is wrapper@0x1B5D10 (a0=-1) → 0x1B5D78 — only called from
+    //   pump@0x1B7000 / enqueue@0x1B6FD4 when flags gp-25032 and gp-25036 are CLEAR.
+    //   Type 0x41 sets gp-25036=1 (mode lock) so subsequent type 0x01 GIF chains never run
+    //   while main is trapped in idle. Soft-skipping 0x01 skips real PATH3 — do not.
+    //   Wave-4: clear sticky 25036 + force process wrapper so GIF/VIF cmds execute.
     private const uint DecGp = 0x005DCB70;
     private const uint DecIdleQueueHead = DecGp - 25048; // 0x5D6998
     private const uint DecIdleQueueTail = DecGp - 25052; // 0x5D6994
     private const uint DecIdleCallback = DecGp - 25116;  // 0x5D6954
+    private const uint DecIdleFlag25032 = DecGp - 25032; // 0x5D69A8 — busy-wait / DMA inflight
+    private const uint DecIdleFlag25036 = DecGp - 25036; // 0x5D69A4 — mode lock (blocks process)
+    private const uint DecIdleFlag25040 = DecGp - 25040; // 0x5D69A0 — companion mode flag
+    private const uint DecIdleSlot25044 = DecGp - 25044; // 0x5D699C — type 0x40/41 arg
+    private const uint DecIdleCount25064 = DecGp - 25064; // 0x5D6988 — pending op counter
     private const uint DecIdlePcLo = 0x001B6A40;
     private const uint DecIdlePcHi = 0x001B6B20;
+    /// <summary>Dec process wrapper entry (a0=-1 → drain @0x1B5D78 when flags clear).</summary>
+    private const uint DecProcessWrapper = 0x001B5D10;
     private bool _openSendRetargetPlanted;
 
     public MidwayFamilyAssist(string serial, string displayName)
@@ -183,6 +195,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _displayCmdCompletes = 0;
         _decPostMslKicks = 0;
         _decPostMslHits = 0;
+        _decProcessForces = 0;
+        _decFlagClears = 0;
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
@@ -256,21 +270,28 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
     /// <summary>
     /// Deception only: post-MSL asset-enqueue unstick at main idle <c>0x1B6A68</c>.
-    /// Live 50M: MSL DADA warms <c>gameart.ssf</c> (2.8 MiB) but EE never CallRpc-opens it;
-    /// idle callback is null while head!=tail (cmd type 0x41) and workers sleep
-    /// (WaitSema 3 / SleepThread / WaitSema 69). Wake pure sleepers + high-id SN waiters
-    /// so the enqueue/process path can run. Does not plant wait status=4. Does not invent
-    /// Soft-GS pixels. Does not SignalSema(3) (SIF-cmd poll).
+    /// Live 50M/100M: MSL DADA warms <c>gameart.ssf</c> but EE never CallRpc-opens it;
+    /// idle callback null; workers sleep (WaitSema 3 / SleepThread / WaitSema 69).
+    /// Wave-3: kick workers + soft-drain simple types. Residual: soft-drain of type 0x41
+    /// left gp-25036 sticky so pump never calls process@0x1B5D10; soft-skip of type 0x01
+    /// skipped real GIF DMA (px=0). Wave-4: clear sticky mode lock + force process wrapper
+    /// (a0=-1) so type 0x01/0x21 PATH3 runs; soft-drain only simple types and never leave
+    /// 25036 set. No wait status=4. No invented Soft-GS pixels. No SignalSema(3).
     /// </summary>
     private void TryKickDecPostMslAssetEnqueue(Ps2System sys)
     {
         if (sys.MasterCycles < 20_000_000) return;
-        if (_decPostMslKicks >= 48) return;
+        if (_decPostMslKicks >= 64 && _decProcessForces >= 64) return;
 
         uint pc = (uint)sys.EE.PC;
         bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
         bool inDiTail = pc is >= 0x001B6AA8 and <= 0x001B6AE8;
-        if (!inIdle && !inDiTail)
+        // Also act when pump would call process but is blocked (0x1B7000 band).
+        bool inPump = pc is >= 0x001B7000 and <= 0x001B70E8;
+        // Post-idle wait @0x1B8288: while (flag25032 || flag25036) spin — type 0x01
+        // leaves 25032=1 after one process(a0=1) complete (needs two).
+        bool inFlagSpin = pc is >= 0x001B8280 and <= 0x001B82B8;
+        if (!inIdle && !inDiTail && !inPump && !inFlagSpin)
         {
             _decPostMslHits = 0;
             return;
@@ -282,63 +303,161 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             && head >= 0x00100000 && head < 0x02000000
             && tail >= 0x00100000 && tail < 0x02000000;
         bool emptyStuck = !pending && sys.Memory.Read32(DecIdleCallback) == 0;
+        byte flag36 = sys.Memory.Read8(DecIdleFlag25036);
+        byte flag32 = sys.Memory.Read8(DecIdleFlag25032);
 
-        if (!pending && !emptyStuck)
+        // Empty queue but sticky flag25032 keeps s1=1 forever (idle never leaves).
+        // Type 0x01 increments 25032 by 2; real DMA IRQ should call process(a0=1) twice.
+        bool flagStuck = !pending && flag32 != 0;
+        if (!pending && !emptyStuck && !flagStuck)
         {
             _decPostMslHits = 0;
             return;
         }
 
         _decPostMslHits++;
-        if (_decPostMslKicks == 0 && _decPostMslHits < 64) return;
-        if (_decPostMslKicks > 0 && (_decPostMslHits & 255) != 0) return;
+        if (_decPostMslKicks == 0 && _decProcessForces == 0 && _decPostMslHits < 64) return;
+        // Throttle after first action (every 64 Step hits in band).
+        if ((_decPostMslKicks > 0 || _decProcessForces > 0) && (_decPostMslHits & 63) != 0)
+            return;
 
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        bool dmaIdle = !sys.Dmac.IsActive(Dmac.Channel.GIF)
+            && !sys.Dmac.IsActive(Dmac.Channel.VIF1)
+            && !sys.Dmac.IsActive(Dmac.Channel.VIF0);
+
+        // 1) Wake pure sleepers + high-id SN waiters so producers can refill / complete.
         var k = sys.Hle?.Kernel;
-        if (k == null) return;
-        int woke = 0;
-        foreach (var th in k.AllThreads)
+        if (k != null && _decPostMslKicks < 64)
         {
-            if (!th.Alive || th.Id < 2) continue;
-            if (!th.Started)
+            int woke = 0;
+            foreach (var th in k.AllThreads)
+            {
+                if (!th.Alive || th.Id < 2) continue;
+                if (!th.Started)
+                {
+                    try
+                    {
+                        k.StartAndMaybeSwitch(sys.EE, th.Id, switchNow: false, arg: 0, fromSyscall: false);
+                        woke++;
+                    }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                if (!th.Sleeping) continue;
+                if (th.WaitSemaId == 0 && !th.WaitVblank)
+                {
+                    try { k.WakeupThread(th.Id); woke++; }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                // High-id SN client waiters — not SIF-cmd poll (3).
+                if (th.WaitSemaId is >= 32 and < 0x10000)
+                {
+                    try { k.SignalSema(th.WaitSemaId); woke++; }
+                    catch { /* ignore */ }
+                }
+            }
+            if (woke > 0)
+            {
+                _decPostMslKicks++;
+                try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+                if (trace && _decPostMslKicks <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] Dec post-MSL enqueue kick woke={woke} n={_decPostMslKicks} " +
+                        $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+            }
+        }
+
+        // 2) Wave-4: sticky gp-25036 from type 0x41 blocks pump→process and process re-entry.
+        //    Sticky gp-25032 after type 0x01 keeps idle s1=1 with empty queue.
+        //    Credit GIF/VIF IRQ so real completion (process a0=1) can run; then clear residual.
+        if (flag36 != 0 || flag32 != 0)
+        {
+            sys.Memory.Write8(DecIdleFlag25036, 0);
+            sys.Memory.Write8(DecIdleFlag25040, 0);
+            if (flag32 != 0 && dmaIdle)
             {
                 try
                 {
-                    k.StartAndMaybeSwitch(sys.EE, th.Id, switchNow: false, arg: 0, fromSyscall: false);
-                    woke++;
+                    // Type 0x01 bumped 25032 by 2 — two completion signals.
+                    sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
+                    sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 2);
+                    sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+                    sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 1);
                 }
                 catch { /* ignore */ }
-                continue;
+                // Honest residual: if IRQ path still leaves 25032, clear so idle can exit.
+                sys.Memory.Write8(DecIdleFlag25032, 0);
             }
-            if (!th.Sleeping) continue;
-            if (th.WaitSemaId == 0 && !th.WaitVblank)
-            {
-                try { k.WakeupThread(th.Id); woke++; }
-                catch { /* ignore */ }
-                continue;
-            }
-            // High-id SN client waiters — not SIF-cmd poll (3).
-            if (th.WaitSemaId is >= 32 and < 0x10000)
-            {
-                try { k.SignalSema(th.WaitSemaId); woke++; }
-                catch { /* ignore */ }
-            }
-        }
-        if (woke > 0)
-        {
-            _decPostMslKicks++;
-            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && _decPostMslKicks <= 16)
+            _decFlagClears++;
+            if (trace && _decFlagClears <= 24)
                 Console.Error.WriteLine(
-                    $"[MKFAM] Dec post-MSL enqueue kick woke={woke} n={_decPostMslKicks} " +
-                    $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                    $"[MKFAM] Dec idle flag clear n={_decFlagClears} was36={flag36} was32={flag32} " +
+                    $"dmaIdle={dmaIdle} head=0x{head:X8} tail=0x{tail:X8} cyc={sys.MasterCycles}");
         }
 
-        // After repeated kicks head still stuck: main never reaches process@0x1B5D78
-        // (idle callback null / non-draining). Drain simple process types with the same
-        // RDRAM side-effects as 0x1B5D78 handlers so the queue can advance and asset
-        // enqueue can run. Live residual: 0x41 then 0x01+0x40 chains.
-        if (!pending || _decPostMslKicks < 2) return;
+        if (!pending)
+        {
+            // Empty queue: residual flag25032 (type 0x01 +2 needs two process(a0=1)
+            // completes). Post-idle spin @0x1B8288 only reads the flag — clear when DMA idle.
+            byte now32 = sys.Memory.Read8(DecIdleFlag25032);
+            byte now36 = sys.Memory.Read8(DecIdleFlag25036);
+            if ((now32 != 0 || now36 != 0) && dmaIdle)
+            {
+                if (inFlagSpin || flagStuck)
+                {
+                    sys.Memory.Write8(DecIdleFlag25032, 0);
+                    sys.Memory.Write8(DecIdleFlag25036, 0);
+                    _decFlagClears++;
+                    if (trace && _decFlagClears <= 32)
+                        Console.Error.WriteLine(
+                            $"[MKFAM] Dec post-idle flag drain n={_decFlagClears} " +
+                            $"was32={now32} was36={now36} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                    return;
+                }
+                // Idle empty+flag: one honest complete entry then residual clear next tick.
+                if (inIdle && _decProcessForces < 96 && now32 != 0)
+                {
+                    sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = pc });
+                    sys.EE.PC = DecProcessWrapper;
+                    _decProcessForces++;
+                    if (trace && _decProcessForces <= 32)
+                        Console.Error.WriteLine(
+                            $"[MKFAM] Dec force process-complete n={_decProcessForces} " +
+                            $"pc=0x{pc:X8} flag32={now32} cyc={sys.MasterCycles}");
+                }
+            }
+            return;
+        }
+
+        // 3) Force process wrapper (a0=-1): same entry pump@0x1B70AC uses. Wrapper
+        //    falls through to 0x1B5D78 when head!=tail and flags clear; runs type 0x01
+        //    GIF CHCR setup honestly. Resume idle so s1 can re-evaluate.
+        if (_decProcessForces < 96
+            && (_decPostMslKicks >= 1 || _decFlagClears >= 1)
+            && inIdle)
+        {
+            uint resume = pc is >= DecIdlePcLo and <= DecIdlePcHi ? pc : 0x001B6A68u;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFUL }); // a0 = -1
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });      // ra
+            sys.EE.PC = DecProcessWrapper;
+            _decProcessForces++;
+            if (trace && _decProcessForces <= 32)
+            {
+                uint cmd0 = head + 4 <= 0x02000000 ? sys.Memory.Read32(head) : 0;
+                Console.Error.WriteLine(
+                    $"[MKFAM] Dec force process n={_decProcessForces} pc=0x{pc:X8}→0x{DecProcessWrapper:X8} " +
+                    $"cmd=0x{cmd0:X8} head=0x{head:X8} tail=0x{tail:X8} cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+
+        // 4) Fallback: soft-drain ONLY simple types (0x40/0x41/0x7F). Never soft-skip
+        //    type 0x01/0x21 (GIF/VIF) — that was the wave-3 residual (px=0).
+        //    After 0x41 side-effects, clear 25036 so process can run next cycle.
+        if (_decProcessForces < 2) return;
         int drained = 0;
         for (int n = 0; n < 8; n++)
         {
@@ -351,45 +470,41 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             uint arg = sys.Memory.Read32(headNow + 4);
             if (typ == 0x41)
             {
-                // 0x1B6228: flags 25040/25036=1; slot 25044=arg; head+=8
-                sys.Memory.Write8(DecGp - 25040, 1);
-                sys.Memory.Write8(DecGp - 25036, 1);
-                sys.Memory.Write32(DecGp - 25044, arg);
+                // 0x1B6228: slot + flags + count--; then CLEAR 25036 (wave-4) so process continues.
+                sys.Memory.Write8(DecIdleFlag25040, 1);
+                sys.Memory.Write32(DecIdleSlot25044, arg);
+                byte cnt = sys.Memory.Read8(DecIdleCount25064);
+                if (cnt > 0) sys.Memory.Write8(DecIdleCount25064, (byte)(cnt - 1));
                 sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+                sys.Memory.Write8(DecIdleFlag25036, 0); // do not leave process blocked
             }
             else if (typ == 0x40)
             {
-                // 0x1B6200: flag 25036=1, 25040=0; slot 25044=arg; head+=8
-                sys.Memory.Write8(DecGp - 25036, 1);
-                sys.Memory.Write8(DecGp - 25040, 0);
-                sys.Memory.Write32(DecGp - 25044, arg);
+                sys.Memory.Write8(DecIdleFlag25040, 0);
+                sys.Memory.Write32(DecIdleSlot25044, arg);
+                byte cnt = sys.Memory.Read8(DecIdleCount25064);
+                if (cnt > 0) sys.Memory.Write8(DecIdleCount25064, (byte)(cnt - 1));
                 sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+                sys.Memory.Write8(DecIdleFlag25036, 0);
             }
             else if (typ == 0x7F)
             {
-                // 0x1B61A8: head = arg (absolute)
                 if (arg >= 0x00100000 && arg < 0x02000000)
                     sys.Memory.Write32(DecIdleQueueHead, arg);
                 else
                     break;
             }
-            else if (typ is 0x01 or 0x02 or 0x21 or 0x42 or 0x43 or 0x4F)
-            {
-                // Complex types (display/VIF/callback). Soft-advance head so the idle
-                // busy-wait cannot pin forever; real PATH3/VIF work remains for later.
-                sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
-            }
             else
+            {
+                // Complex types — leave for force-process next tick.
                 break;
+            }
             drained++;
         }
         if (drained == 0) return;
-        // Clear sticky idle flag so s1 can fall to DI path when queue empties.
-        sys.Memory.Write8(DecGp - 25032, 0);
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _decPostMslKicks <= 24)
+        if (trace && _decProcessForces <= 24)
             Console.Error.WriteLine(
-                $"[MKFAM] Dec idle queue drain n={drained} kicks={_decPostMslKicks} " +
+                $"[MKFAM] Dec idle simple-drain n={drained} forces={_decProcessForces} " +
                 $"head=0x{sys.Memory.Read32(DecIdleQueueHead):X8} " +
                 $"tail=0x{sys.Memory.Read32(DecIdleQueueTail):X8} cyc={sys.MasterCycles}");
     }
