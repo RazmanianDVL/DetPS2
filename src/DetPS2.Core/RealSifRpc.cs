@@ -1971,6 +1971,18 @@ public sealed class RealSifRpc
         uint w1 = sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
         mode = (int)w0;
 
+        // WHIP_SN_OPEN: SN ProDG { seq, eeReply*, 4, mode@+0xC, path@+0x14 }.
+        if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 16)
+        {
+            mode = (int)mem.Read32(argBuf + 12);
+            string snPath = ReadCString(mem, argBuf + 0x14, 256);
+            if (LooksLikeFsPath(snPath))
+            {
+                path = snPath;
+                return;
+            }
+        }
+
         // 1) Canonical inline name @+4.
         if (sendSize >= 8)
         {
