@@ -4807,8 +4807,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         // Minimal object fields set by 44E768 before deeper ctors + wave-6 type contract.
         mem.Write32(obj + 0x44, 1);
-        mem.Write32(obj + 0x48, 1); // type 1 (resource) — required by 442A0/44F490/D7C8
-        mem.Write32(obj + 0x4C, 0);
+        // Type 2 (not 5): jump table 0x5AD538→44D860 does real work (44DA10/44DAC0).
+        // Type 1 is a near-nop adjust; type 5 early-outs the 1..4 range check.
+        mem.Write32(obj + 0x48, 2);
+        mem.Write32(obj + 0x4C, 2); // subtype for 44D920/44D950
         mem.Write32(obj + 0x50, 0);
         mem.Write32(obj + 0x54, 0);
         mem.Write32(obj + 0x58, 0);
@@ -4845,8 +4847,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (mem.Read32(obj + 0x44) == 0)
             mem.Write32(obj + 0x44, 1);
         uint ty = mem.Read32(obj + 0x48);
+        // Prefer type 2 (draw work) over type 1 (near-nop). Never type 5.
         if (ty == 0 || ty > 4)
-            mem.Write32(obj + 0x48, 1);
+            mem.Write32(obj + 0x48, 2);
+        if (mem.Read32(obj + 0x4C) == 0)
+            mem.Write32(obj + 0x4C, 2);
         // 44F630 sticky: first-set +0x58=1 succeeds when zero.
         if (mem.Read32(obj + 0x58) == 0)
             mem.Write32(obj + 0x58, 0);
@@ -4990,7 +4995,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // D7C8 clears +0x44 on entry; restore so type path can run again.
         sys.Memory.Write32(obj + 0x44, 1);
         if (sys.Memory.Read32(obj + 0x48) == 0 || sys.Memory.Read32(obj + 0x48) > 4)
-            sys.Memory.Write32(obj + 0x48, 1);
+            sys.Memory.Write32(obj + 0x48, 2);
+        if (sys.Memory.Read32(obj + 0x4C) == 0)
+            sys.Memory.Write32(obj + 0x4C, 2);
         sys.Memory.Write32(Slot + 0x3C, obj);
         sys.Memory.Write32(Slot, 1);
         sys.Memory.Write32(Slot + 0x38, 1);
