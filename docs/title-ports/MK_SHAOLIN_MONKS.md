@@ -14,7 +14,55 @@
 
 ---
 
-## Result this session (wave-11)
+## Result this session (wave-12)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — no claim; selection index + second chrome still unproven |
+| Stream slot objects | **Blocked** — synthetic slot0 plant **REJECTED** (EE exception death) |
+| C1C0 bind path | **Never runs** under HLE (pcbreak 0 hits @100M) |
+| gifP3 | **11** (plateau held; no second-chrome lift) |
+| dmac | **16** @100M |
+| Selection index | Still unproven — multi busy `0x54E608+i*4` is re-entrancy only |
+| diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 (baseline hold) |
+| claim-class 100M | PC=`0x43FB40` px=32.1M gifP3=11 dmac=16 syscalls~914k cdvd=198840 |
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
+- Play! TITLE: generic only
+- Play! PAD: `Iop_PadMan.cpp` — already SHARED
+- PINE: **N** (disasm + pcbreak sufficient for reject)
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - Wider `sel-idx-delta` bases (`0x54E608` multi busy, `0x75E7A0`, 0..16 cap)
+  - Documented **REJECTED** `MaybePlantStreamSlotObjects` (type5 stub + D6F8[0])
+  - **Not called** from Step — residual only as comment + empty stub for next agent
+- **SHARED**: none
+
+### Stream slot diagnosis (wave-12 evidence)
+
+| Fact | Evidence |
+|------|----------|
+| Sole C1C0 caller | `jal 0x43C1C0` only at `0x43C0D4` inside `FUN_0043BFC0` |
+| Sole BFC0 caller | `0x26FC34` inside `FUN_0026FBF0` (resource post-load bind) |
+| `FUN_0026FBF0` / `0x26FD80` / C1C0 | **0 pcbreak hits** through 100M pad-inject |
+| FAE8 still walks | Live PC samples `0x43FB40` / `0x43FBB0` / `0x44D744` (empty FBB0 + D6F8) |
+| Slot plant type5 | Plant @74.1M → PC `0x8000018x` by 80M; final `0xAB47` — **regresses** healthy FAE8 |
+| D770 object contract | `442A0`: +0x48≠0 valid; `D7C8`: type must be **1..4** to continue (type5 early-out still unsafe in practice with partial slot) |
+
+**Do not** re-enable synthetic slot plants without PCSX2 live object dump or a working `26FBF0` path.
+
+### Residual wall (wave-12)
+
+1. **gifP3 plateau 11** — FAE8 live; empty slots / empty D6F8 → no second-chrome Path3.
+2. **Selection index unknown** — D-pad only toggles multi re-entrancy + CAS cells.
+3. **FUN_0043C1C0 never binds** — resource post-load (`26FBF0`) never reached; force status at `0x678458+0x48` unblocks wait but does not run bind.
+4. Next: PCSX2+PINE dump of live menu stream slots **or** force/reach `FUN_0026FBF0` with a real manager pointer at `*0x678458`.
+
+## Result prior session (wave-11)
 
 | Goal | Status |
 |------|--------|
