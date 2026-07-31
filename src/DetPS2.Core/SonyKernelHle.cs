@@ -1124,14 +1124,26 @@ public sealed class SonyKernelHle
                         }
                         else
                         {
-                            // WHIP_SEMA_FIX_V2: non-RPC soft-signal (Whiplash SN seq + SIF worker).
-                            // No yield-without-wake; VBlank park only when ThreadCount < 2.
-                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
-                            if (_kernel.ThreadCount < 2)
-                                _kernel.WaitSemaVblank();
-                            _kernel.SignalSema((int)a0);
-                            _kernel.WakeupThread(_kernel.CurrentThreadId);
+                            // Hybrid (wave-2 Dec): WHIP always-fabricate starved Midway SIF-cmd
+                            // poll (WaitSema(3) @0x10BE24) → CreateSema/WaitSema thrash ~120k @20M.
+                            // Low-id mutexes (1..16): TryYield first (pre-whip). High-id SN client
+                            // semas (>16): keep multi-thread soft-signal (WHIP_SEMA_FIX_V2).
+                            bool snClientSema = a0 > 16;
+                            if (!snClientSema && _kernel.TryYieldToOtherRunnable(ee))
+                            {
+                                // Yielded — leave wait; result still returns sema id below.
+                            }
+                            else
+                            {
+                                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                                    Console.Error.WriteLine(
+                                        $"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} " +
+                                        $"(sn={snClientSema} thr={_kernel.ThreadCount})");
+                                if (_kernel.ThreadCount < 2)
+                                    _kernel.WaitSemaVblank();
+                                _kernel.SignalSema((int)a0);
+                                _kernel.WakeupThread(_kernel.CurrentThreadId);
+                            }
                         }
                         // On block (and on later wake): return the sema id as the success token
                         // so SN ProDG `WaitSema(id) == id` checks pass. Same rationale as SignalSema.

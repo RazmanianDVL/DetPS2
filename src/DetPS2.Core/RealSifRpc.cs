@@ -139,7 +139,12 @@ public sealed class RealSifRpc
     // through we haven't individually mapped. Same toolchain as SNDF_Driver ("MW MIPS C
     // Compiler" per both modules' .comment sections) — 0 for success is that toolchain's
     // convention here too, confirmed independently for SNDF's fno=0x1300 handler.
+    //
+    // SCE SDRDRV 2.0.0 (Whiplash BIN/SDRDRV.IRX, "SDR driver version 2.0.0 (C)SCEI") also
+    // registers 0x80000701 plus sibling 0x80000704 (live bind after LIBSD/SDRDRV/IOPSND).
     public const uint SidSdReg = 0x80000701;
+    /// <summary>SCE SDRDRV secondary RPC (Whiplash / LIBSD stack). Soft 0-for-success.</summary>
+    public const uint SidSdReg2 = 0x80000704;
     // EE iopheap RPC fnos (ps2sdk ee/kernel/src/iopheap.c + iopheap-common.h).
     // IOP-side backend is SYSMEM AllocSysMemory/FreeSysMemory (sysmem.h / SYSMEM.bin
     // export table sysmem v1.1). Not the same as SIFCMD CID 0x80000003 (RESET_CMD).
@@ -329,6 +334,15 @@ public sealed class RealSifRpc
     private const uint FioFormat = 14;
     private const uint FioAddDrv = 15; // FIO_F_ADDDRV — EE rarely uses; IOP AddDrv is primary
     private const uint FioDelDrv = 16; // FIO_F_DELDRV
+    // Play! CFileIoHandler2200 COMMANDID — Midway posts DEVCTL after DEV9 even when
+    // PreferSnFileIo keeps classic open/read (command header + GENERICREPLY ABI).
+    private const uint FioChdir = 18;
+    private const uint FioSync = 19;
+    private const uint FioMount = 20;
+    private const uint FioUmount = 21;
+    private const uint FioSeek64 = 22;
+    private const uint FioDevctl = 23; // COMMANDID_DEVCTL
+    private const uint FioIoctl2 = 26; // COMMANDID_IOCTL2
     /// <summary>Some retail clients probe FILEIO with fno=0xFF like LOADFILE GetVersion.</summary>
     private const uint FioGetVersion = 0xFF;
 
@@ -1654,13 +1668,34 @@ public sealed class RealSifRpc
                 string name = argBuf != 0 ? ReadCString(mem, argBuf, 64) : "";
                 return iopModules.DelDrv(name);
             }
+            case FioDevctl:
+                // Play! COMMANDID_DEVCTL=23. Live Dec (PreferSnFileIo): after DEV9.IRX load the
+                // EE issues 2200-shaped DEVCTL (send≈0x81C, device "dev9…") and WaitSema on the
+                // command header sema. Soft-success without GENERICREPLY + ISignalSema left Dec
+                // spinning at PC 0x10BE28 (cdvd stuck ~187), never reaching MSL/gameart.
+                return HandleFio2200Extended(mem, kernel, argBuf, sendSize, FioDevctl);
+            case FioIoctl2:
+                return HandleFio2200Extended(mem, kernel, argBuf, sendSize, FioIoctl2);
+            case FioChdir:
+            case FioSync:
+            case FioMount:
+            case FioUmount:
+            case FioSeek64:
+                if (LooksLikeFio2200CommandHeader(mem, argBuf, sendSize))
+                    return HandleFio2200Extended(mem, kernel, argBuf, sendSize, fno);
+                if (recvBuf != 0 && recvSize >= 4)
+                    mem.Write32(recvBuf, 0);
+                return 0;
             default:
                 // Real FILEIO logs "sce_fileio: unrecognized code %x". Live Burnout 3 calls
                 // fno=23 after GTFS/LGDEV (result was -22 EINVAL → IOP reboot thrash). Soft-
                 // success high/extended XFILEIO-style fnos so boot can open game assets;
                 // keep classic 0..16 as failure when truly unmapped above.
+                // Prefer 2200 GENERICREPLY when the packet carries COMMANDHEADER (Dec/B3).
                 if (fno is >= 17 and <= 64)
                 {
+                    if (LooksLikeFio2200CommandHeader(mem, argBuf, sendSize))
+                        return HandleFio2200Extended(mem, kernel, argBuf, sendSize, fno);
                     if (recvBuf != 0 && recvSize >= 4)
                         mem.Write32(recvBuf, 0);
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -1670,6 +1705,97 @@ public sealed class RealSifRpc
                 }
                 return IopModuleHost.IoManErrnoInvalid;
         }
+    }
+
+    /// <summary>
+    /// True when arg looks like Play! FILEIO-2200 <c>COMMANDHEADER</c>: low sema id, EE
+    /// resultPtr, small resultSize. PreferSnFileIo disarms global 2200 for open/read but Midway
+    /// still posts DEVCTL/IOCTL2 with this header after loading DEV9.
+    /// </summary>
+    private static bool LooksLikeFio2200CommandHeader(SystemMemory mem, uint argBuf, uint sendSize)
+    {
+        if (argBuf == 0 || sendSize < 16) return false;
+        uint sema = mem.Read32(argBuf);
+        uint resultPtr = mem.Read32(argBuf + 4);
+        uint resultSize = mem.Read32(argBuf + 8);
+        if (sema == 0 || sema >= 0x10000) return false;
+        if (resultSize is 0 or > 0x1000) return false;
+        return IsEeRamPointer(resultPtr);
+    }
+
+    /// <summary>
+    /// Play! extended FILEIO (DEVCTL/IOCTL2/…): post GENERICREPLY to command resultPtr,
+    /// signal command semaphore once, return 1 as CallRpc result. Soft-success for
+    /// <c>dev9:</c>/<c>hdd0:</c>/<c>cdrom0:</c> probes (no real network stack).
+    /// </summary>
+    private int HandleFio2200Extended(SystemMemory mem, KernelState kernel,
+        uint argBuf, uint sendSize, uint commandId)
+    {
+        uint sema = 0;
+        uint resultPtr = 0;
+        string device = "";
+        if (argBuf != 0 && sendSize >= 12)
+        {
+            sema = mem.Read32(argBuf);
+            resultPtr = mem.Read32(argBuf + 4) & 0x1FFFFFFFu;
+            if (sendSize >= 16)
+                device = ReadCString(mem, argBuf + 12, 64);
+        }
+
+        // Soft device-ready: Dec polls DEVCTL("dev9x:", 0x4402) forever when result=0.
+        uint devResult = 0;
+        if (commandId == FioDevctl)
+        {
+            string d = device.TrimEnd(':').ToLowerInvariant();
+            if (d is "dev9x" or "dev9" or "hdd0" or "cdrom0" or "cdfs" or "rom" or "rom0")
+                devResult = 1;
+        }
+
+        uint primary = resultPtr != 0 && resultPtr + 32 <= (uint)SystemMemory.RDRAM_SIZE
+            ? resultPtr
+            : _fio2200ResultPtr0;
+        if (primary != 0)
+        {
+            if (_fio2200ResultPtr0 == 0)
+                _fio2200ResultPtr0 = primary;
+            WriteFio2200GenericReplyBody(mem, primary, sema, commandId, devResult);
+            if (_fio2200ResultPtr0 != 0 && _fio2200ResultPtr0 != primary
+                && _fio2200ResultPtr0 + 32 <= (uint)SystemMemory.RDRAM_SIZE)
+                WriteFio2200GenericReplyBody(mem, _fio2200ResultPtr0, sema, commandId, devResult);
+        }
+        if (sema != 0 && sema < 0x10000)
+            kernel.ISignalSema((int)sema);
+
+        if (commandId == FioDevctl && argBuf != 0 && sendSize >= 0x81C)
+        {
+            uint outPtr = mem.Read32(argBuf + 0x814) & 0x1FFFFFFFu;
+            uint outSize = mem.Read32(argBuf + 0x818);
+            if (outPtr != 0 && outSize >= 4 && outPtr + 4 <= (uint)SystemMemory.RDRAM_SIZE)
+                mem.Write32(outPtr, devResult);
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[FILEIO] {(commandId == FioDevctl ? "DEVCTL" : $"fno={commandId}")} " +
+                $"device=\"{device}\" sema=0x{sema:X} resultPtr=0x{resultPtr:X8} result={devResult}");
+
+        // Play! InvokeDevctl returns 1 (RPC ok); real DevCtl result is in GENERICREPLY.
+        return 1;
+    }
+
+    /// <summary>Write Play! GENERICREPLY body only (caller signals command sema once).</summary>
+    private static void WriteFio2200GenericReplyBody(SystemMemory mem,
+        uint replyDest, uint semaId, uint commandId, uint result)
+    {
+        if (replyDest == 0 || replyDest + 32 > (uint)SystemMemory.RDRAM_SIZE) return;
+        mem.Write32(replyDest + 0, semaId);
+        mem.Write32(replyDest + 4, commandId);
+        mem.Write32(replyDest + 8, 0);
+        mem.Write32(replyDest + 12, 0);
+        mem.Write32(replyDest + 16, result);
+        mem.Write32(replyDest + 20, 0);
+        mem.Write32(replyDest + 24, 0);
+        mem.Write32(replyDest + 28, 0);
     }
 
     private static uint ResolvePathArg(SystemMemory mem, uint argBuf, uint sendSize)
