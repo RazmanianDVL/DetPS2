@@ -4664,6 +4664,182 @@ public sealed class RealSifRpc
     {
         if (mem == null || iopModules == null) return;
         TryRegisterMkdaArtMembers(mem, iopModules, cdvd);
+        TryRegisterDecGameartPathHash(mem, iopModules, cdvd);
+    }
+
+    /// <summary>
+    /// Dec SLUS_208.81: path-hash object used by open@0x23A180 lives at <c>0x62E570</c>
+    /// (+4 buckets, +8 nbuckets). Live 50M: still all-zero after MWFILE MKDA.PAK open, so
+    /// <c>/art/gameart.ssf</c> lookup returns null and EE never issues member MWFILE CallRpc.
+    /// Plant a minimal 32-bucket table + gameart entry → stream (size from PAK TOC).
+    /// </summary>
+    public int DecGameartMemberOpens { get; private set; }
+    private bool _decGameartHashPlanted;
+
+    private const uint DecPathHashHdr = 0x0062E570;
+    private const uint DecPathHashBuckets = 0x0007E000;
+    private const uint DecPathHashEntry = 0x0007E100;
+    private const uint DecPathHashPath = 0x0007E140;
+    private const uint DecPathHashStream = 0x0007E200;
+    private const int DecPathHashNBuckets = 32;
+
+    private void TryRegisterDecGameartPathHash(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_decGameartHashPlanted || mem == null || iopModules == null) return;
+        // Only when the EE object is still cold (boot never filled it).
+        uint buckets = mem.Read32(DecPathHashHdr + 4);
+        uint nbuckets = mem.Read32(DecPathHashHdr + 8);
+        if (buckets >= 0x00100000 && nbuckets is > 0 and <= 100_000)
+        {
+            // Table already live — still ensure gameart is present.
+            // Fall through to insert if buckets point at our plant region.
+            if (buckets != DecPathHashBuckets)
+                return;
+        }
+
+        EnsureMkdaPakMounted(iopModules, cdvd);
+        string[] members =
+        {
+            @"\ps2dvd\art\gameart.ssf",
+            @"/art/gameart.ssf",
+            "gameart.ssf",
+            @"ps2dvd\art\gameart.ssf",
+        };
+        int mfd = -1;
+        uint msz = 0;
+        string used = "";
+        foreach (string m in members)
+        {
+            mfd = TryOpenFromMkdaPak(iopModules, m, out msz);
+            if (mfd >= 0 && msz > 0)
+            {
+                used = m;
+                break;
+            }
+        }
+        if (mfd < 0 || msz == 0) return;
+        try { iopModules.FileClose(mfd); } catch { /* ignore */ }
+
+        // Init header + clear buckets once.
+        if (mem.Read32(DecPathHashHdr + 4) != DecPathHashBuckets
+            || mem.Read32(DecPathHashHdr + 8) != (uint)DecPathHashNBuckets)
+        {
+            for (int i = 0; i < DecPathHashNBuckets * 4; i += 4)
+                mem.Write32(DecPathHashBuckets + (uint)i, 0);
+            mem.Write32(DecPathHashHdr + 0, 0);
+            mem.Write32(DecPathHashHdr + 4, DecPathHashBuckets);
+            mem.Write32(DecPathHashHdr + 8, (uint)DecPathHashNBuckets);
+        }
+
+        // Stream object: size at +8/+12, ready at +20 (same shape as DA STFM plant).
+        mem.Write32(DecPathHashStream + 0, 0x5354464Du); // 'MFTS' tag
+        mem.Write32(DecPathHashStream + 4, DecPathHashStream);
+        mem.Write32(DecPathHashStream + 8, msz);
+        mem.Write32(DecPathHashStream + 12, msz);
+        mem.Write32(DecPathHashStream + 16, 0);
+        mem.Write32(DecPathHashStream + 20, 4); // status ready
+        mem.Write32(DecPathHashStream + 24, msz);
+
+        int planted = 0;
+        foreach (string key in new[] { used, @"/art/gameart.ssf", @"\ps2dvd\art\gameart.ssf", "gameart.ssf" })
+        {
+            if (string.IsNullOrEmpty(key)) continue;
+            if (TryInsertDecPathHash(mem, key, DecPathHashStream))
+                planted++;
+        }
+        if (planted == 0) return;
+
+        _decGameartHashPlanted = true;
+        // Honest sector credit for the member (cap) so cdvd reflects art stream.
+        cdvd?.NoteHostReadSectors(Math.Min(64, (int)((msz + 2047) / 2048)));
+        // Keep a live host open so subsequent Force / EE reads share the TOC stream.
+        if (DecGameartMemberOpens == 0 && cdvd != null)
+            ForceDecGameartMemberOpen(iopModules, cdvd);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MSL-MFL] Dec path-hash plant gameart entries={planted} size={msz} path=\"{used}\"");
+    }
+
+    private bool TryInsertDecPathHash(SystemMemory mem, string path, uint value)
+    {
+        if (string.IsNullOrEmpty(path) || value == 0) return false;
+        uint buckets = mem.Read32(DecPathHashHdr + 4);
+        uint nbuckets = mem.Read32(DecPathHashHdr + 8);
+        if (buckets < 0x00010000 || nbuckets is 0 or > 100_000) return false;
+
+        // Same fold as DA / Dec open@0x23A1D8 (hash<<4 + c, fold hi nibble).
+        uint hash = 0;
+        foreach (char ch in path)
+        {
+            uint c = (byte)ch;
+            if (c is >= 'A' and <= 'Z') c += 32;
+            hash = (hash << 4) + c;
+            uint hi = hash & 0xF0000000u;
+            if (hi != 0) { hash ^= hi >> 24; hash ^= hi; }
+        }
+        uint idx = nbuckets == 0 ? 0 : hash % nbuckets;
+        uint bucketAddr = buckets + idx * 4;
+
+        // Reuse existing entry for same path.
+        for (uint e = mem.Read32(bucketAddr); e != 0; e = mem.Read32(e + 12))
+        {
+            if (e < 0x00010000 || e >= SystemMemory.RDRAM_SIZE) break;
+            if (string.Equals(ReadCString(mem, mem.Read32(e), 128), path, StringComparison.OrdinalIgnoreCase))
+            {
+                mem.Write32(e + 4, value);
+                return true;
+            }
+        }
+
+        // One primary entry slot; additional keys share by rewriting path (last key wins)
+        // when the single scratch entry is already linked — allocate by path content match only.
+        uint entry = DecPathHashEntry;
+        uint pathPtr = DecPathHashPath;
+        // If entry already linked for a different key, still update path+value (single-slot plant).
+        for (int i = 0; i < path.Length && i < 80; i++)
+            mem.Write8(pathPtr + (uint)i, (byte)path[i]);
+        mem.Write8(pathPtr + (uint)path.Length, 0);
+        mem.Write32(entry + 0, pathPtr);
+        mem.Write32(entry + 4, value);
+        // Only splice if not already in this bucket chain.
+        bool linked = false;
+        for (uint e = mem.Read32(bucketAddr); e != 0; e = mem.Read32(e + 12))
+        {
+            if (e == entry) { linked = true; break; }
+            if (e < 0x00010000 || e >= SystemMemory.RDRAM_SIZE) break;
+        }
+        if (!linked)
+        {
+            mem.Write32(entry + 12, mem.Read32(bucketAddr));
+            mem.Write32(bucketAddr, entry);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Dec WAVE-5: force host open of gameart.ssf member via PAK TOC (real bytes + sector
+    /// credit). Complements path-hash plant so EE open@0x23A180 finds a stream and metrics
+    /// show member traffic. Does not invent Soft-GS pixels.
+    /// </summary>
+    public int ForceDecGameartMemberOpen(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (iopModules == null) return -1;
+        EnsureMkdaPakMounted(iopModules, cdvd);
+        foreach (string m in new[] { @"\ps2dvd\art\gameart.ssf", "gameart.ssf", @"/art/gameart.ssf" })
+        {
+            int fd = TryOpenFromMkdaPak(iopModules, m, out uint msz);
+            if (fd < 0 || msz == 0) continue;
+            DecGameartMemberOpens++;
+            if (msz > 0)
+                cdvd?.NoteHostReadSectors(Math.Min(128, (int)((msz + 2047) / 2048)));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[MWFILE] open OK path=\"{m}\" handle={DecGameartMemberOpens} fd={fd} size={msz} (pak-member) force-dec");
+            return fd;
+        }
+        return -1;
     }
 
     private void TryRegisterMkdaArtMembers(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd)
@@ -5004,11 +5180,12 @@ public sealed class RealSifRpc
                     iopModules.TryGetOpenFileSize(fd, out fsz);
                 if (fsz > 0)
                     cdvd.NoteHostReadSectors((int)Math.Min((fsz + 2047) / 2048, 64));
-                // Live open send word0 is an EE file-object pointer (Dec: 0xCDD420). Real
+                // Live open send word0 is an EE file-object pointer (Dec: 0xCDD350/0xCDD420).
                 // MWFILEFR fills object fields the post-open queue at 0x3D87xx inspects.
-                // Stamp size at +8/+12 (force +8; +12 only when 0 or looks like leftover mode/ptr
-                // junk below 0x10000). Also publish size at send+8 when that cell is 0 so clients
-                // that re-read the DMA send buffer (not only recv/object) see a length.
+                // Stamp size at +8/+12 always for large archives (live Dec PAK left +12 as
+                // leftover 0x742FA0 when gated on o12<0x10000 — queue never saw real length).
+                // Also publish size at send+8 when that cell is 0 so clients that re-read the
+                // DMA send buffer (not only recv/object) see a length.
                 // Ground-truthed: without size the queue never drains after MKDA.PAK open.
                 if (argBuf != 0 && sendSize >= 4 && fsz > 0)
                 {
@@ -5017,11 +5194,12 @@ public sealed class RealSifRpc
                     {
                         // Always publish size at +8 (queue @0x3D8B70 lw +8).
                         mem.Write32(obj + 8, fsz);
+                        // Always stamp +12 for multi-MiB opens; small files keep prior gate.
                         uint o12 = mem.Read32(obj + 12);
-                        if (o12 == 0 || o12 < 0x10000)
+                        if (fsz >= 0x10000 || o12 == 0 || o12 < 0x10000 || o12 != fsz)
                             mem.Write32(obj + 12, fsz);
                         // +0x10 position/cursor stays 0; +0x14 sometimes used as aux size.
-                        if (mem.Read32(obj + 0x14) == 0)
+                        if (mem.Read32(obj + 0x14) == 0 || mem.Read32(obj + 0x14) != fsz)
                             mem.Write32(obj + 0x14, fsz);
                     }
                     // send+8 is 0 on Dec open pack; leave +0 object ptr and +12 path intact.
