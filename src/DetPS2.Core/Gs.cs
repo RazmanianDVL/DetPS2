@@ -695,8 +695,14 @@ public sealed class Gs : ISchedulable
         // menuKind title-surface is MENU-class chrome — color/UV still from the prim.
         // WAVE-7: also expand partial-height logo bands (BO2 ofx=0x8000 ~112-row clear
         // → full title FB) so post-stream Path2 sprites paint MENU-class chrome.
-        bool titleStrip = ofxR == 0x8000 && ofyR == 0x8000
-            && w >= FB_WIDTH / 2 && h < FB_HEIGHT / 2;
+        // WAVE-12B GoW Path2: two SPRITEs kick with ofx/ofy still 0 and both Y=0
+        // (corners (0,0)+(512,0) → 512×1) → px=1026 residual. XYOFFSET is armed only
+        // after later A+D packets. Treat ofx=0 / retail-center ofx band the same as
+        // ofx=0x8000 for full-width thin strips (no invent PATH3; color/UV from prim).
+        bool retailOfs = (ofxR == 0 && ofyR == 0)
+            || (ofxR == 0x8000 && ofyR == 0x8000)
+            || (ofxR is >= 0x6000 and <= 0x9000 && ofyR is >= 0x6000 and <= 0x9000);
+        bool titleStrip = retailOfs && w >= FB_WIDTH / 2 && h < FB_HEIGHT / 2;
         if (x0 > x1 || y0 > y1)
         {
             // Commercial rescue: sprite fully off Soft-GS FB after XYOFFSET — clamp onto

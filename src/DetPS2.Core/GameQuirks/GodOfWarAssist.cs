@@ -975,7 +975,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Wave-11: after type-2, restore retail 0x27D7C8 + seed shell decode consumer state
         // (stream-ready *0x2A3310, wad contexts, Fedo bind) and once-enter LoadWad('R_Shell')
         // so natural expand can arm FRAME(0x4C)+PRIM. No PATH3 invent / no pixel plant.
-        if (c >= 40_000_000 && _type2Completed && sys.Gs.PixelsWritten == 0)
+        // WAVE-12B: early Path2 already paints title strips (px>0) — still seed/refresh shell
+        // so Fedo consumers can grow PRIM/XYZ past boot Soft-GS.
+        if (c >= 40_000_000 && _type2Completed)
         {
             // Hang-guard data-as-code (host Fedo/TIT1/streamObj / high-VA poison) after
             // LoadWad attempts — claim1 saw pc=0x01CFE008 / 0x2032xxxx thrash.
@@ -1066,8 +1068,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             TryEscapeObjectDispatch(sys, pc, c);
 
         // Wave-7: after type-2 soft-complete, kick stream/TOC so FILEIO leaves IRX-only.
-        if (c >= 40_000_000 && _type2Completed && sys.Gs.PixelsWritten == 0
-            && sys.Gif.Path3Transfers == 0)
+        // WAVE-12B: early Path2 title sprites already paint Soft-GS (px>0) before shell
+        // decode — keep stream/TOC kick live so Fedo consumers can still issue more PRIM/XYZ.
+        if (c >= 40_000_000 && _type2Completed && sys.Gif.Path3Transfers == 0)
             TryPostType2StreamKick(sys, pc, c);
 
         // Sibling list-compare walk at 0x2847xx (profiler hot after stubs).
@@ -1092,8 +1095,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Wave-8/9b: residual thrash after type-2 (MMI / sleep-cmd 0x13F5 / stack-PC /
         // flip-lock spin) → stream-poll continue so main can post next *0x310384 cmds.
         // Do NOT invent type-3/4. Do NOT jump mid flip-kick (0x140A04→0x1838A4 spin).
-        if (c >= 40_000_000 && _type2Completed && sys.Cdvd.SectorsRead > 400
-            && sys.Gs.PixelsWritten == 0
+        // WAVE-12B: live claim parks at 0x13F5F8 with cdvd=142 (IRX-only) after early
+        // Path2 title paint — old gate cdvd>400 && px==0 never fired. Allow after type-2
+        // + any CDVD, and keep escaping after first Soft-GS so shell can grow PRIM/XYZ.
+        if (c >= 40_000_000 && _type2Completed && sys.Cdvd.SectorsRead > 0
             && (pc is >= 0x00289A00 and <= 0x00289C00
                 || pc is >= 0x0013F5E0 and <= 0x0013F620
                 || pc is >= 0x00300000 and <= 0x00320000
@@ -1106,7 +1111,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(0x002A1338, 0);
             RepairCurrentSpIfPoison(sys);
             if (_loadWadSeeded)
+            {
                 RefreshLoadWadStreamTable(sys);
+                TrySeedShellDecodeConsumer(sys, c);
+            }
             if (pc is >= 0x001415E8 and <= 0x00141614)
             {
                 sys.EE.PC = 0x00141618;
@@ -1131,7 +1139,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (c % 5_000_000UL) < 50_000UL)
                 Console.Error.WriteLine(
-                    $"[GOW] escape residual thrash pc=0x{pc:X8} -> 0x{sys.EE.PC:X8} cyc={c}");
+                    $"[GOW] escape residual thrash pc=0x{pc:X8} -> 0x{sys.EE.PC:X8} " +
+                    $"px={sys.Gs.PixelsWritten} cyc={c}");
         }
 
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
