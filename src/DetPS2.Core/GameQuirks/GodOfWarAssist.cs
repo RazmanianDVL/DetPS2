@@ -99,6 +99,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _tableIndexEscapes;
     private int _byteSumEscapes;
     private int _alignZeroEscapes;
+    /// <summary>Empty-SIF soft-return to SIF-cmd poll caller 0x2948xx count (wave-3).</summary>
+    private int _emptySifPollLoops;
+    private int _sifPollCallerEscapes;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -221,6 +224,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _tableIndexEscapes = 0;
         _byteSumEscapes = 0;
         _alignZeroEscapes = 0;
+        _emptySifPollLoops = 0;
+        _sifPollCallerEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
         _heapDefaultsPlanted = false;
@@ -1734,6 +1739,44 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"[GOW] escape 0x21FFxx thrash -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
 
+        // Wave-3: SIF-cmd poll caller 0x2948xx re-WaitSema forever after empty-sif soft-return
+        // (claim100e: PC=0x293C68 ra=0x294810 left=True arms=0). Leave toward worker 0x27CC08
+        // (historical first gifPath3 residual @0x27CC18) once poll loops are proven empty.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && sys.Gif.Path3Transfers == 0
+            && _emptySifPollLoops >= 4
+            && pc is >= 0x00294800 and <= 0x00294900
+            && (_worldKickPulses % 2) == 0)
+        {
+            uint resume = PickSafeResume(sys, 0x0027CC08);
+            TryArmPendingStreamJob(sys, c);
+            sys.Memory.Write32(0x002A1338, 0);
+            sys.Memory.Write32(0x0029C7D0, 0);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 3UL });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+            _sifPollCallerEscapes++;
+            if (k != null)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping) continue;
+                    if (t.WaitSemaId is 3 or 0x20 || t.WaitSemaId is >= 32 and <= 256)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    else if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                }
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _sifPollCallerEscapes <= 32)
+                Console.Error.WriteLine(
+                    $"[GOW] escape SIF-poll caller pc=0x{pc:X8} -> 0x{resume:X8} " +
+                    $"loops={_emptySifPollLoops} n={_sifPollCallerEscapes} cyc={c}");
+        }
+
         // After CDVD, sifrpc WaitSema trampoline thrash at 0x293Cxx (empty SIF-cmd poll +
         // worker 0x27CCxx). SHARED QueueMaySignalSema + CompleteRpcEnd own real BIND/CALL.
         // Wave-5: paint 989snd done-magic + residual SignalSema. When still stuck mid-leaf,
@@ -1783,11 +1826,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             // Soft-return from WaitSema leaf via $ra so poll body can take the empty-queue path.
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
             bool left = false;
-            if (sys.Memory.IsLikelyEeCode(ra) && ra is (>= 0x0027CC00 and <= 0x0027CD00)
+            // Wave-3: after empty-SIF poll loops, reject 0x2948xx re-entry — force worker.
+            bool rejectPollCaller = _emptySifPollLoops >= 4
+                && sys.Gif.Path3Transfers == 0
+                && ra is >= 0x00294800 and <= 0x00294900;
+            if (!rejectPollCaller
+                && sys.Memory.IsLikelyEeCode(ra)
+                && (ra is (>= 0x0027CC00 and <= 0x0027CD00)
                     or (>= 0x00294800 and <= 0x00294900)
                     or (>= 0x00297600 and <= 0x00297700)
                     or (>= 0x00297300 and <= 0x00297400)
-                    or (>= 0x00100000 and < 0x00280000))
+                    or (>= 0x00100000 and < 0x00280000)))
             {
                 // WaitSema success convention: v0 = sema id (libcdvd / sifrpc check v0==id).
                 // Only accept plausible THREADMAN ids — live a0=0x20000000 is poison.
@@ -1803,27 +1852,37 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     sys.EE.PC = ra;
                     sys.EE.COP0_Status &= ~0x6u;
                     left = true;
+                    if (ra is >= 0x00294800 and <= 0x00294900)
+                        _emptySifPollLoops++;
+                    else if (ra is >= 0x0027CC00 and <= 0x0027CE90)
+                        _emptySifPollLoops = 0;
                 }
             }
             // Null / poison $ra residual (live 0x299328): try stack slot then worker /
             // post-FreezeCache. Prefer 0x27CC08 over bare 0x185FAC after IRX — live wave-2
             // null-ra → 0x185FAC → AdEL 0x06207265 → CRT0 death (gifPath3 lost).
-            if (!left && (ra == 0 || !sys.Memory.IsLikelyEeCode(ra)
-                          || ra is (>= 0x00299300 and <= 0x00299480)
-                          || ra is (>= 0x00293C00 and <= 0x00293C80))
-                && (_worldKickPulses % 8) == 0)
+            // Wave-3: also take this path when poll-caller soft-return is exhausted.
+            if (!left && (rejectPollCaller
+                          || ((ra == 0 || !sys.Memory.IsLikelyEeCode(ra)
+                               || ra is (>= 0x00299300 and <= 0x00299480)
+                               || ra is (>= 0x00293C00 and <= 0x00293C80))
+                              && (_worldKickPulses % 8) == 0)))
             {
                 uint resume = 0;
-                uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
-                if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16u)
+                if (!rejectPollCaller)
                 {
-                    uint stacked = sys.Memory.Read32(sp) & 0x1FFFFFFFu;
-                    if (sys.Memory.IsLikelyEeCode(stacked) && stacked is >= 0x00100000 and < 0x002C0000
-                        && stacked is not (>= 0x00299300 and <= 0x00299480)
-                        && stacked is not (>= 0x00293C00 and <= 0x00293C80)
-                        && stacked is not (>= 0x0026C0E0 and <= 0x0026C600)
-                        && stacked is not (>= 0x00100000 and <= 0x00100200))
-                        resume = stacked;
+                    uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                    if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16u)
+                    {
+                        uint stacked = sys.Memory.Read32(sp) & 0x1FFFFFFFu;
+                        if (sys.Memory.IsLikelyEeCode(stacked) && stacked is >= 0x00100000 and < 0x002C0000
+                            && stacked is not (>= 0x00299300 and <= 0x00299480)
+                            && stacked is not (>= 0x00293C00 and <= 0x00293C80)
+                            && stacked is not (>= 0x00294800 and <= 0x00294900)
+                            && stacked is not (>= 0x0026C0E0 and <= 0x0026C600)
+                            && stacked is not (>= 0x00100000 and <= 0x00100200))
+                            resume = stacked;
+                    }
                 }
                 if (resume == 0)
                     resume = PickSafeResume(sys, 0x0027CC08);
@@ -1835,11 +1894,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
                 left = true;
+                if (rejectPollCaller)
+                    _emptySifPollLoops++;
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_worldKickPulses % 16) == 0)
                 Console.Error.WriteLine(
                     $"[GOW] SHARED empty-sifrpc wake pc=0x{pc:X8} ra=0x{ra:X8} left={left} " +
+                    $"rejectPoll={rejectPollCaller} loops={_emptySifPollLoops} " +
                     $"arms={_streamArmPulses} n={_worldKickPulses} cyc={c}");
         }
 

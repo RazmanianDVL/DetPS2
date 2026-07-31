@@ -568,29 +568,41 @@ public sealed class Ps2System
         ulong resume = lastGoodPc;
 
         // Prefer a live stack return address (MK parked with sp→0x414448 code).
+        // Wave-3: reject heap-alloc mid-body (0x13DCxx) — stack scan can pick 0x13D9C8
+        // after ungated VIF/GIF drain and kill GoW MOD_LOAD (binds=0).
+        static bool IsBadNopSledResume(ulong cand)
+        {
+            uint p = (uint)(cand & 0x1FFFFFFFUL);
+            if (p == 0x00100008u) return true;
+            if (p is >= 0x0013DC00u and <= 0x0013E200u) return true;
+            if (p is >= 0x80000180u and <= 0x80000200u) return true;
+            if (p < 0x00100000u) return true;
+            return false;
+        }
+
         uint sp = (uint)(EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         if (sp is >= 0x00100000 and < 0x02000000)
         {
             for (uint off = 0; off <= 0x40; off += 4)
             {
                 uint cand = Memory.Read32(sp + off);
-                if (Memory.IsLikelyEeCode(cand))
+                if (Memory.IsLikelyEeCode(cand) && !IsBadNopSledResume(cand))
                 {
                     resume = cand;
                     break;
                 }
             }
         }
-        if (!Memory.IsLikelyEeCode(resume) || (resume & 0x1FFFFFFFUL) == 0x00100008UL)
+        if (!Memory.IsLikelyEeCode(resume) || IsBadNopSledResume(resume))
         {
             ulong ra = EE.GetGpr(31).Lo & 0x1FFFFFFFUL;
-            if (Memory.IsLikelyEeCode(ra) && ra != 0x00100008UL)
+            if (Memory.IsLikelyEeCode(ra) && !IsBadNopSledResume(ra))
                 resume = ra;
-            else if (Memory.IsLikelyEeCode(EE.COP0_EPC) && (EE.COP0_EPC & 0x1FFFFFFFUL) != 0x00100008UL)
+            else if (Memory.IsLikelyEeCode(EE.COP0_EPC) && !IsBadNopSledResume(EE.COP0_EPC))
                 resume = EE.COP0_EPC;
             else if (lastGoodPc is >= 0x00100000 and < 0x01000000
                      && Memory.IsLikelyEeCode(lastGoodPc)
-                     && (lastGoodPc & 0x1FFFFFFFUL) != 0x00100008UL)
+                     && !IsBadNopSledResume(lastGoodPc))
                 resume = lastGoodPc;
             else if (Memory.IsLikelyEeCode(0x004147F8UL))
                 resume = 0x004147F8UL; // ADX pump (MK)
@@ -600,9 +612,22 @@ public sealed class Ps2System
                 resume = 0x00170BFCUL; // GoW tag-list empty epilogue (never CRT0)
             else if (Memory.IsLikelyEeCode(0x00185FACUL))
                 resume = 0x00185FACUL; // GoW post-FreezeCache
+            else if (pcPhys is >= 0x0021FF00u and <= 0x00220600u)
+                resume = pcPhys + 0x0Cu; // skip zero sled in-place (healthy GoW 0x2200F0→FC)
             // Avoid re-CRT0 (0x100008): restarts boot and storms UnknownOpcode.
             else if (Memory.IsLikelyEeCode(0x00100008UL))
-                resume = lastGoodPc is >= 0x00100000 ? lastGoodPc : 0x00100008UL;
+                resume = lastGoodPc is >= 0x00100000 && !IsBadNopSledResume(lastGoodPc)
+                    ? lastGoodPc : 0x00100008UL;
+        }
+        if (IsBadNopSledResume(resume))
+        {
+            if (pcPhys is >= 0x0021FF00u and <= 0x00220600u)
+                resume = pcPhys + 0x0Cu;
+            else
+            {
+                _nopSledHits = 0;
+                return;
+            }
         }
 
         EE.COP0_Status &= ~0x6u; // clear EXL|ERL
