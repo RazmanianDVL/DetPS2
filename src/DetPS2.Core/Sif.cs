@@ -4,8 +4,14 @@ using System.Collections.Generic;
 namespace DetPS2.Core;
 
 /// <summary>
-/// Subsystem Interface (Phase 8 + 13 RPC).
-/// DMA SIF0/SIF1 + command queue + RPC packet queue processed in Step().
+/// Subsystem Interface (Phase 8 + 13 RPC) — <b>SIF bridge</b> for IRX-first (WP-19/T4).
+/// DMA SIF0/SIF1 + SBUS mailbox + RPC queues. See <c>docs/irx/SIF_BRIDGE.md</c>.
+/// <para>
+/// Under <c>DETPS2_LITERAL_IRX=1</c> the long-term owner of sifcmd transport is executing
+/// SIFMAN/SIFCMD on the IOP R3000; this class remains the shared DMA/mailbox engine those
+/// modules (or HLE stand-ins) drive. Paths that pure-HLE without IOP exec are marked
+/// <c>LITERAL_IRX HLE bypass</c> below — do not extend them; demote via WP-20/WP-49.
+/// </para>
 /// </summary>
 public sealed class Sif : ISchedulable
 {
@@ -13,6 +19,23 @@ public sealed class Sif : ISchedulable
     {
         IopToEe = 0,
         EeToIop = 1
+    }
+
+    /// <summary>
+    /// True unless <c>DETPS2_LITERAL_IRX=0</c> (explicit legacy HLE-first bisect).
+    /// Default / unset / any other value → literal IRX mode (WP-00).
+    /// </summary>
+    public static bool LiteralIrxMode =>
+        !string.Equals(Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX"), "0", StringComparison.Ordinal);
+
+    /// <summary>Optional log of pure-HLE SIF paths when <c>DETPS2_TRACE_SIF_HLE=1</c>.</summary>
+    public static bool TraceSifHleBypass =>
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_SIF_HLE") == "1";
+
+    private static void NoteHleBypass(string site)
+    {
+        if (!TraceSifHleBypass) return;
+        Console.Error.WriteLine($"[SIF-HLE] bypass site={site} literalIrx={LiteralIrxMode}");
     }
 
     private readonly SystemMemory _memory;
@@ -227,9 +250,17 @@ public sealed class Sif : ISchedulable
     /// <summary>
     /// Full IOPBTCONF SIF stack handoff after SIFMAN→SIFCMD→…→SIFINIT (+ EESYNC): all three
     /// SMFLAG bits set. Idempotent.
+    /// <para>
+    /// <b>LITERAL_IRX HLE bypass</b> when called without executing those IRX modules — presents
+    /// the EE-visible *effect* of a completed IOP boot. Under literal mode, prefer
+    /// <see cref="ApplySifInit"/> / <see cref="ApplyCmdInit"/> / <see cref="PostBootEnd"/>
+    /// driven by real module start (or keep this only as bisect fallback).
+    /// </para>
     /// </summary>
     public void PresentIopBootReady()
     {
+        if (LiteralIrxMode)
+            NoteHleBypass("PresentIopBootReady");
         SmFlag |= SifStatIopBootReady;
     }
 
@@ -293,9 +324,17 @@ public sealed class Sif : ISchedulable
     /// <summary>
     /// Plant EE-side SIF "queue ready" slots so <c>sceSifInitRpc</c>-style polls succeed under
     /// pure BIOS HLE (no IOP R3000 to run the real SIF0→_SifCmdIntHandler path).
+    /// <para>
+    /// <b>LITERAL_IRX HLE bypass:</b> under <see cref="LiteralIrxMode"/> this is debt until
+    /// executing SIFCMD + SIF0 DMA fills the same table. Do not add title-specific bases here;
+    /// WP-20 should shrink call sites. Trace: <c>DETPS2_TRACE_SIF_HLE=1</c>.
+    /// </para>
     /// </summary>
     public static void PlantEeSifReadySlots(SystemMemory mem, uint baseAddr = EeSifReadySlotBase, int count = EeSifReadySlotCount)
     {
+        // LITERAL_IRX HLE bypass — optional branch stub (always plants today; log when tracing).
+        if (LiteralIrxMode)
+            NoteHleBypass("PlantEeSifReadySlots");
         if (mem == null) return;
         if (count <= 0) count = EeSifReadySlotCount;
         for (uint i = 0; i < (uint)count; i++)
@@ -470,6 +509,35 @@ public sealed class Sif : ISchedulable
         _intc?.Raise(Intc.InterruptSource.Sif);
     }
 
+    /// <summary>
+    /// EE posts MSFLAG bits visible to the IOP via the shared mailbox (EE
+    /// <c>0x1000F220</c> / IOP <c>0x1D000020</c>). Used by smokes and by kernel
+    /// <c>SifSetReg(SIF_REG_MSFLAG)</c> mirroring.
+    /// </summary>
+    public void EePostMsFlag(uint value)
+    {
+        MsFlag = value;
+    }
+
+    /// <summary>
+    /// IOP → EE mailbox reply path for future executing SIFMAN (and WP-19 smokes).
+    /// Sets SMCOM, optionally ORs SMFLAG status bits, raises SIF INTC so the EE can observe
+    /// the reverse mailbox without requiring a full SIF0 DMA.
+    /// <para>
+    /// Bulk reply data still uses <see cref="Sif0IopToEe"/>. Command-packet replies use
+    /// <c>SonyKernelHle.DeliverIopSifCmdToEe</c> (HLE) until SIFCMD IRX owns that path.
+    /// </para>
+    /// </summary>
+    public void IopPostMailboxReply(uint smCom, uint smFlagOrBits = 0)
+    {
+        SmCom = smCom;
+        if (smFlagOrBits != 0)
+            SmFlag |= smFlagOrBits;
+        SmFlag |= 1; // "message pending" style bit (matches WriteSmCom)
+        Status |= 0x4; // transfer/reply visible
+        _intc?.Raise(Intc.InterruptSource.Sif);
+    }
+
     public uint GetStatus() => Status;
 
     public uint ReadRegister(uint address)
@@ -491,32 +559,49 @@ public sealed class Sif : ISchedulable
         switch (address & 0xFF)
         {
             case 0x00:
+                // EE→IOP MSCOM (also used if EE MMIO posts a command word).
                 SendCommand(value);
                 break;
             case 0x10:
+                // IOP→EE SMCOM reply (IOP window WriteRegister / WriteSmCom).
                 WriteSmCom(value);
                 break;
             case 0x20:
+                // EE→IOP MSFLAG — must be readable by IOP IopRead32(0x1D000020).
                 MsFlag = value;
                 break;
             case 0x30:
+                // IOP→EE SMFLAG raw write (SIFMAN posts SIFINIT etc.). EE path uses W1C
+                // via SifSetReg, not this full assign.
                 SmFlag = value;
                 break;
             case 0x40:
                 Status = value;
                 break;
             case 0x60:
-                // Write packet address to submit RPC via MMIO
+                // Write packet address to submit simplified RPC via MMIO
                 SubmitRpc(value);
                 break;
         }
     }
 
-    /// <summary>Process pending RPC packets (deterministic, no host I/O).</summary>
+    /// <summary>
+    /// Process pending <b>simplified</b> Phase-13 RPC packets (deterministic, no host I/O).
+    /// <para>
+    /// <b>LITERAL_IRX HLE bypass:</b> dispatches <see cref="SifRpcPacket"/> through
+    /// <c>IopModuleHost.Dispatch</c> — does <b>not</b> execute SIFMAN/SIFCMD/service IRX.
+    /// Retail BIND/CALL use <see cref="SubmitRealRpc"/> + <c>RealSifRpc</c> (also HLE services).
+    /// Under <see cref="LiteralIrxMode"/> keep this for homebrew/bisect only; WP-20 routes
+    /// sifcmd through live IOP. Optional stub: log via <c>DETPS2_TRACE_SIF_HLE=1</c>.
+    /// </para>
+    /// </summary>
     public int Step(ulong maxCycles)
     {
         if (_modules == null || _pad == null || _cdvd == null)
             return 0;
+
+        if (_rpcPacketAddrs.Count > 0 && LiteralIrxMode)
+            NoteHleBypass("Sif.Step pure-HLE SifRpcPacket→IopModuleHost");
 
         int n = 0;
         while (_rpcPacketAddrs.Count > 0 && n < 16)
@@ -526,13 +611,12 @@ public sealed class Sif : ISchedulable
             var done = _modules.Dispatch(pkt, _memory, _pad, _cdvd);
             done.Write(_memory, addr);
             LastRpcResult = done.Result;
-            SmCom = done.Result;
-            SmFlag |= 4;
+            // Reply path: result visible on SMCOM + SMFLAG for EE pollers.
+            IopPostMailboxReply(done.Result, 4);
             Status |= 0x10; // RPC complete
             Status &= ~0x8u;
             RpcProcessed++;
             n++;
-            _intc?.Raise(Intc.InterruptSource.Sif);
         }
 
         return n > 0 ? n : 0;

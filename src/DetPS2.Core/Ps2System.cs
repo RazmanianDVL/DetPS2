@@ -408,6 +408,10 @@ public sealed class Ps2System
             // can finish ISO open/read without missing the PC window across a long slice.
             const ulong sliceDefault = 50_000;
             const ulong sliceCri = 2_000;
+            // WP-11: under DETPS2_LITERAL_IRX=1, arm IOP PC at last LoadIrx entry so scheduler
+            // quanta actually execute module text (was load-only historically).
+            if (IopModuleHost.IsLiteralIrxEnabled && IopModules.HasPendingLiteralEntry)
+                IopModules.TryArmPendingLiteralEntry(Iop);
             while (left > 0)
             {
                 ulong pcPhys = EE.PC & 0x1FFFFFFFUL;
