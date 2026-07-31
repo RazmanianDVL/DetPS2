@@ -114,6 +114,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _decGameartKicks;
     private int _decGameartHits;
     private bool _decGameartKickDone;
+    private bool _decGameartPublished;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
@@ -234,6 +235,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decGameartKicks = 0;
         _decGameartHits = 0;
         _decGameartKickDone = false;
+        _decGameartPublished = false;
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
@@ -321,6 +323,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryEscapeDecPostInitListWalk(sys);
             TryKickDecPostMslAssetEnqueue(sys);
             TryKickDecGameartMemberOpen(sys);
+            TryPublishDecGameartOpen(sys);
         }
     }
 
@@ -341,7 +344,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// </summary>
     private void TryKickDecGameartMemberOpen(Ps2System sys)
     {
-        if (_decGameartKickDone && _decGameartKicks >= 2) return;
+        if (_decGameartKickDone && _decGameartKicks >= 6) return;
         if (sys.MasterCycles < 28_000_000) return;
 
         // Registry must be live (post MKDA.PAK mount / TOC register).
@@ -366,40 +369,45 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // Always plant path-hash + force host member open once registry is live (even if
         // path scratch already has "gameart" from a prior partial open).
         if (rpc != null && iop != null && cdvd != null
-            && (rpc.DecGameartMemberOpens == 0 || sys.Memory.Read32(0x0062E574) == 0))
+            && (rpc.DecGameartMemberOpens == 0 || sys.Memory.Read32(0x0061E5A4) == 0))
         {
             rpc.TryEnsureMkdaArtPathHash(sys.Memory, iop, cdvd);
             if (rpc.DecGameartMemberOpens == 0)
                 rpc.ForceDecGameartMemberOpen(iop, cdvd);
         }
 
-        // Path already names gameart and member open landed — stop PC kicks.
-        if (PathScratchMentionsGameart(sys.Memory) && (rpc?.DecGameartMemberOpens ?? 0) > 0)
+        // WAVE-6: open result lives at gp-24036 (0x5D69AC). Path-hash multi-entry must
+        // make open@0x21D810 return the planted stream; stop only when that cell is non-null
+        // (or host open live after several kicks).
+        const uint DecOpenResultSlot = 0x005D6D8C; // gp(0x5DCB70)-24036 (sw v0 after open)
+        uint openResult = sys.Memory.Read32(DecOpenResultSlot);
+        bool streamLive = openResult >= 0x00010000 && openResult < 0x02000000;
+        if (streamLive && (rpc?.DecGameartMemberOpens ?? 0) > 0)
         {
             _decGameartKickDone = true;
             return;
         }
+        // Soft success: path-hash plant + host open without EE store still needs re-kick.
+        if (_decGameartKickDone && _decGameartKicks >= 6) return;
 
-        if (_decGameartKickDone) return;
-
-        // Throttle: first kick after ~32 hits in band; second after more hits if still no path.
+        // Throttle: first kick after ~32 hits; then every 128 hits up to 6 kicks.
         _decGameartHits++;
         if (_decGameartKicks == 0 && (_decGameartHits & 31) != 0) return;
-        if (_decGameartKicks >= 1 && (_decGameartHits & 255) != 0) return;
+        if (_decGameartKicks >= 1 && (_decGameartHits & 127) != 0) return;
+        if (_decGameartKicks >= 6) { _decGameartKickDone = true; return; }
 
         // Clear sticky idle locks so post-return pump can run after open returns.
         sys.Memory.Write8(DecIdleFlag25032, 0);
         sys.Memory.Write8(DecIdleFlag25036, 0);
         sys.Memory.Write8(DecIdleFlag25040, 0);
 
-        // Normalize path scratch to a scannable PAK member path before open re-entry.
-        WriteCStringIfChanged(sys.Memory, DecPathScratch, @"\ps2dvd\art\gameart.ssf");
+        // Normalize path scratch to EE path-builder form ("/art/gameart.ssf").
+        WriteCStringIfChanged(sys.Memory, DecPathScratch, "/art/gameart.ssf");
 
         uint resume = inIdle ? pc : 0x001B6A68u;
-        // Prefer full main load sequence (sysart table + gameart); fallback table open.
+        // Prefer full main load sequence (sysart table + gameart); alternate table open.
         uint target = DecLoadSysartGameart;
-        // Second attempt: direct table open (a0 = gameart table).
-        if (_decGameartKicks >= 1)
+        if ((_decGameartKicks & 1) == 1)
         {
             target = DecOpenFromTable;
             sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = DecGameartTable }); // a0
@@ -409,7 +417,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume }); // ra
         sys.EE.PC = target;
         _decGameartKicks++;
-        if (_decGameartKicks >= 2)
+        // Prefer load@0x1A41B0 first; then table open; alternate thereafter.
+        if (_decGameartKicks >= 6)
             _decGameartKickDone = true;
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
@@ -417,6 +426,55 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"[MKFAM] Dec gameart member open kick n={_decGameartKicks} " +
                 $"pc=0x{pc:X8}→0x{target:X8} reg=0x{reg:X8} resume=0x{resume:X8} " +
                 $"opens={rpc?.DecGameartMemberOpens ?? 0} cyc={sys.MasterCycles}");
+    }
+
+
+    /// <summary>
+    /// WAVE-6: after path-hash plant + gameart kick, if open@0x21D810 still left
+    /// gp-24036 null, publish the planted stream object so post-open consumers can run.
+    /// Stream payload was FileRead from PAK TOC into high RDRAM (honest art bytes).
+    /// </summary>
+    private void TryPublishDecGameartOpen(Ps2System sys)
+    {
+        if (_decGameartPublished) return;
+        if (_decGameartKicks == 0) return;
+        if (sys.MasterCycles < 29_000_000) return;
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null || rpc.DecGameartBytesLoaded <= 0) return;
+
+        const uint DecOpenResultSlot = 0x005D6D8C; // gp-24036
+        const uint DecOpenTableSlot = 0x005D6D88;  // gp-24040
+        const uint Stream = 0x0007E400;
+        uint cur = sys.Memory.Read32(DecOpenResultSlot);
+        if (cur >= 0x00010000 && cur < 0x02000000) return; // already live
+
+        // Confirm stream plant still tagged.
+        if (sys.Memory.Read32(Stream) != 0x5354464Du) return;
+
+        // Publish table + stream result the same way 0x2670EC/F0 would after a hit.
+        if (sys.Memory.Read32(DecOpenTableSlot) == 0)
+            sys.Memory.Write32(DecOpenTableSlot, DecGameartTable);
+        sys.Memory.Write32(DecOpenResultSlot, Stream);
+        _decGameartKickDone = true;
+        _decGameartPublished = true;
+
+        // Re-enter post-open consumer @0x1A44D0 (main@0x1A41C8) so SSF is consumed.
+        uint pc = (uint)sys.EE.PC;
+        bool idleish = (pc >= DecIdlePcLo && pc <= DecIdlePcHi)
+            || (pc >= 0x001B8280 && pc <= 0x001B82B8)
+            || (pc >= 0x001BF700 && pc <= 0x001BF800);
+        if (idleish)
+        {
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 }); // a0 matches 0x1A41C8
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0x0050AD08UL }); // a1 from 0x1A41D0
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = pc });
+            sys.EE.PC = DecLoadSysartGameart; // full load after open result live
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec publish gameart open result stream=0x{Stream:X8} " +
+                $"loaded={rpc.DecGameartBytesLoaded} reenter=0x1A41B0 cyc={sys.MasterCycles}");
     }
 
     private static bool PathScratchMentionsGameart(SystemMemory mem)
