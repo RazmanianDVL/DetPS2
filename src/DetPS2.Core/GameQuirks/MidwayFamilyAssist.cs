@@ -111,6 +111,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _decPostMslHits;
     private int _decProcessForces;
     private int _decFlagClears;
+    private int _decGameartKicks;
+    private int _decGameartHits;
+    private bool _decGameartKickDone;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
@@ -160,6 +163,19 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DecIdlePcHi = 0x001B6B20;
     /// <summary>Dec process wrapper entry (a0=-1 → drain @0x1B5D78 when flags clear).</summary>
     private const uint DecProcessWrapper = 0x001B5D10;
+
+    // Dec WAVE-5: member .ssf CallRpc residual (live 50M Soft-GS px=73, idle @0x1B6A68).
+    // Archive registry head @0x61302C is live after MWFILE MKDA.PAK open, but main's
+    // gameart load @0x1A41B0 either raced an empty registry or failed without retry.
+    // 0x1A41B0 → 0x267090(table@0x5A6E20) → 0x222790(entry) builds path @0x612C30 and
+    // issues MWFILE open for gameart.ssf. Re-enter once registry is non-null.
+    private const uint DecArchiveRegHead = 0x0061302C;
+    private const uint DecGameartTable = 0x005A6E20;   // first slot → gameart entry
+    private const uint DecGameartEntry = 0x0050AD28;   // { name@0x5A6E10 "gameart.ssf", … }
+    private const uint DecGameartName = 0x005A6E10;
+    private const uint DecPathScratch = 0x00612C30;    // strcat dest in 0x222790/0x222980
+    private const uint DecLoadSysartGameart = 0x001A41B0; // main@0x123798 call target
+    private const uint DecOpenFromTable = 0x00267090;    // table → 0x222790 open
     private bool _openSendRetargetPlanted;
 
     public MidwayFamilyAssist(string serial, string displayName)
@@ -197,6 +213,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decPostMslHits = 0;
         _decProcessForces = 0;
         _decFlagClears = 0;
+        _decGameartKicks = 0;
+        _decGameartHits = 0;
+        _decGameartKickDone = false;
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
@@ -264,7 +283,135 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryEscapeDecSysInitFail(sys);
             TryEscapeDecPostInitListWalk(sys);
             TryKickDecPostMslAssetEnqueue(sys);
+            TryKickDecGameartMemberOpen(sys);
         }
+    }
+
+    /// <summary>
+    /// Deception only (WAVE-5): re-enter main's gameart load once the MKDA archive
+    /// registry is live so EE issues MWFILE CallRpc for member <c>gameart.ssf</c>.
+    ///
+    /// Live 50M (Soft-GS px=73, heuristic GS?): MSL DADA warms the TOC member, MWFILE
+    /// opened <c>cdrom0:\MKDA.PAK</c>, registry head <c>*(0x61302C)</c> is non-null, yet
+    /// no member <c>.ssf</c> CallRpc appears (calls stay ~42). Idle parks at
+    /// <c>0x1B6A68</c> with residual type-0x41 / flag25032. Main calls
+    /// <c>0x1A41B0</c> once at <c>0x123798</c>; if that raced an empty registry the open
+    /// is never retried.
+    ///
+    /// Fix: after registry live + post-MSL idle force path has run, one-shot jump to
+    /// <c>0x1A41B0</c> (or table open <c>0x267090</c>) with <c>ra</c>=idle so MWFILE can
+    /// honestly open the member. Does not plant wait status=4 or invent Soft-GS pixels.
+    /// </summary>
+    private void TryKickDecGameartMemberOpen(Ps2System sys)
+    {
+        if (_decGameartKickDone && _decGameartKicks >= 2) return;
+        if (sys.MasterCycles < 28_000_000) return;
+
+        // Registry must be live (post MKDA.PAK mount / TOC register).
+        uint reg = sys.Memory.Read32(DecArchiveRegHead);
+        if (reg < 0x00100000 || reg >= 0x02000000) return;
+
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        var iop = sys.IopModules;
+        var cdvd = sys.Cdvd;
+
+        // Prefer idle / post-idle bands so we do not interrupt CallRpc / WaitSema frames.
+        uint pc = (uint)sys.EE.PC;
+        bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
+        bool inFlagSpin = pc is >= 0x001B8280 and <= 0x001B82B8;
+        bool inDiTail = pc is >= 0x001B6AA8 and <= 0x001B6AE8;
+        if (!inIdle && !inFlagSpin && !inDiTail) return;
+
+        // Wait until wave-4 enqueue path has acted at least once (queue/process live).
+        if (_decPostMslKicks == 0 && _decProcessForces == 0 && _decFlagClears == 0)
+            return;
+
+        // Always plant path-hash + force host member open once registry is live (even if
+        // path scratch already has "gameart" from a prior partial open).
+        if (rpc != null && iop != null && cdvd != null
+            && (rpc.DecGameartMemberOpens == 0 || sys.Memory.Read32(0x0062E574) == 0))
+        {
+            rpc.TryEnsureMkdaArtPathHash(sys.Memory, iop, cdvd);
+            if (rpc.DecGameartMemberOpens == 0)
+                rpc.ForceDecGameartMemberOpen(iop, cdvd);
+        }
+
+        // Path already names gameart and member open landed — stop PC kicks.
+        if (PathScratchMentionsGameart(sys.Memory) && (rpc?.DecGameartMemberOpens ?? 0) > 0)
+        {
+            _decGameartKickDone = true;
+            return;
+        }
+
+        if (_decGameartKickDone) return;
+
+        // Throttle: first kick after ~32 hits in band; second after more hits if still no path.
+        _decGameartHits++;
+        if (_decGameartKicks == 0 && (_decGameartHits & 31) != 0) return;
+        if (_decGameartKicks >= 1 && (_decGameartHits & 255) != 0) return;
+
+        // Clear sticky idle locks so post-return pump can run after open returns.
+        sys.Memory.Write8(DecIdleFlag25032, 0);
+        sys.Memory.Write8(DecIdleFlag25036, 0);
+        sys.Memory.Write8(DecIdleFlag25040, 0);
+
+        // Normalize path scratch to a scannable PAK member path before open re-entry.
+        WriteCStringIfChanged(sys.Memory, DecPathScratch, @"\ps2dvd\art\gameart.ssf");
+
+        uint resume = inIdle ? pc : 0x001B6A68u;
+        // Prefer full main load sequence (sysart table + gameart); fallback table open.
+        uint target = DecLoadSysartGameart;
+        // Second attempt: direct table open (a0 = gameart table).
+        if (_decGameartKicks >= 1)
+        {
+            target = DecOpenFromTable;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = DecGameartTable }); // a0
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 });                 // a1
+        }
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume }); // ra
+        sys.EE.PC = target;
+        _decGameartKicks++;
+        if (_decGameartKicks >= 2)
+            _decGameartKickDone = true;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec gameart member open kick n={_decGameartKicks} " +
+                $"pc=0x{pc:X8}→0x{target:X8} reg=0x{reg:X8} resume=0x{resume:X8} " +
+                $"opens={rpc?.DecGameartMemberOpens ?? 0} cyc={sys.MasterCycles}");
+    }
+
+    private static bool PathScratchMentionsGameart(SystemMemory mem)
+    {
+        // Path strcat dest @0x612C30 — if open started, "gameart" appears here.
+        Span<byte> buf = stackalloc byte[96];
+        for (int i = 0; i < buf.Length; i++)
+        {
+            byte b = mem.Read8(DecPathScratch + (uint)i);
+            buf[i] = b;
+            if (b == 0)
+            {
+                buf = buf[..i];
+                break;
+            }
+        }
+        if (buf.Length < 7) return false;
+        // Case-insensitive "gameart"
+        ReadOnlySpan<byte> needle = "gameart"u8;
+        for (int i = 0; i + needle.Length <= buf.Length; i++)
+        {
+            bool ok = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                byte c = buf[i + j];
+                if (c is >= (byte)'A' and <= (byte)'Z') c += 32;
+                if (c != needle[j]) { ok = false; break; }
+            }
+            if (ok) return true;
+        }
+        // Also accept entry name still only at ELF string (not sufficient alone).
+        return false;
     }
 
 
