@@ -8,46 +8,49 @@
 | **ISO** | `C:/Users/xxraz/Downloads/GodofWar(USA).iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w8` |
-| **Branch** | `agent/menu-gow-w8` |
+| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w9` |
+| **Branch** | `agent/menu-gow-w9` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **Wave-8 residual:** type-2 forced success epilogue `0x27E234` + full Fedo **R_SHELL.WAD** host load (cdvd **692**); LoadWad bind seed; still **MENU NO** — Soft-GS **px=0 gifPath3=0** (FRAME_1=0; Path3MaskedByVif held) |
+| **Status** | **Wave-9 residual:** type-2 FULL-stream + fill enter `0x27E0CC` (streamPast=True) + full Fedo **R_SHELL** LoadWad bind restored; still **MENU NO** — Soft-GS **px=0 gifPath3=0** (FRAME_1=0; Path3MaskedByVif held) |
 | **Last updated** | 2026-07-31 |
 
 ### MENU gate
 
 **first-gs-interactive** = Soft-GS **px>0 non-black** + pad interactive surface — **not** MK MAINMENU.
 
-### Wave-8 evidence (agent/menu-gow-w8)
+### Wave-9 evidence (agent/menu-gow-w9)
 
 #### Claim 100M (SEMA_STALL_YIELD OFF) — Soft-GS
 
 ```
-@100M: PC=0x28BFF0 px=0 gifPath2=1082 gifPath3=0 dmac=28 spu2Writes=512
-       cdvdSectors=692 (was 555 w7 / 142 IRX-only)
-       type-2 force epilogue 0x27E234 @38.25M → complete @38.6M (epi=True resWas=0)
+@100M: PC=0x26C3A4 (stream-work mid-pack) px=0 gifPath2=1082 gifPath3=0 dmac=28
+       cdvdSectors=692 sifBytes~22k syscalls~75k
+       type-2: plant gates @37M; WaitSema→fill 0x27E0CC @40.2M s1=slot0;
+               complete @41.7M streamPast=True epi=False resWas=0x8101006F→0
        R_SHELL.WAD full 0xBAA95 @0x01E00000 Fedo magic 0x4665646F OK
-       TIT1E1_2.VPK @0x01D00000; LoadWad bind + streamObj seeded
+       TIT1E1_2.VPK @0x01D00000; LoadWad bind + streamObj* =0x100 magic
        Path3MaskedByVif + high-TADR END held
 ```
 
-Wave-8 assist changes:
+Wave-9 assist changes (on w8b FULL-stream base; wave-8 LoadWad was lost in 8b):
 
-1. **Pre-type-2 FILEIO** open TOC+PART1 at gate plant (before soft-complete).
-2. **Force type-2 success epilogue** `0x27E234` on worker + protect from sleep-cmd rewind 2M.
-3. **0x27DBF0 soft-success stub** (`*a1=0`) so epilogue does not re-enter `0x8101002F`.
-4. **Full R_SHELL** host extract (`maxBytes=0xC0000`, TOC size `0xBAA95`) — Fedo `0x4665646F` verified.
-5. **LoadWad bind seed** — table `+0x800` payload ptrs, stream slot `*0x2A1358`, name scratch, `*0x2AC7D0` kick flag.
-6. **0x26BFB0 hang** escape from 40M (size≥0x201 assert nop-sled) → `0x26C0EC`.
-7. **Death-band** widen: soft-float `0x292Cxx`, MMI `0x289Axx`, sleep-cmd `0x13F5xx`, stack-as-PC, flip-lock spin.
-8. Path3MaskedByVif + high-TADR END **not** ungated.
+1. **Restore full R_SHELL** host extract (`maxBytes=0xC0000`, TOC size `0xBAA95`) + TIT1.
+2. **Restore `TrySeedLoadWadBind` / `TryPreType2FileIo`** — table `+0x800` payload ptrs, stream slot, name scratch, `*0x2AC7D0` flip/kick enable.
+3. **streamObj layout fix** — disasm `0x26C2C4` requires `*obj==0x100` magic (payload at +4); wrong `*obj=payload` → poison `0x2A1360` UnknownSyscall.
+4. **Do not zero `*0x2A1358` after LoadWad seed** (w5b null-skip undid bind).
+5. **No PostWait rewind** after type-2 mid-body (WaitSema leaf was force-rewinding every 200k).
+6. **Remove soft-ok** on real fill helpers `0x282208` / `0x282710` / `0x281E30` / `0x27DCC8` / `0x27DED8` (they arm stream work; soft-ok left FRAME_1=0).
+7. **WaitSema→fill plant** `SavedPc=0x27E0CC` + `s1=slot0@0x2A3318`; do not stomp fill PC when s1≠0x310000 (was IsWorkerFramePoison→PostWait).
+8. **Sticky streamPast** + complete only ≥1.5M after fill enter (claim100g same-cycle complete fixed).
+9. Path3MaskedByVif + high-TADR END **not** ungated. StartThread classic (no Haven $ra plant).
 
 Rejected:
 
-- Mid flip-kick jump `0x140A04` → `0x1838A4` spin (claim100e).
-- Force-post worker type-3/4 (w7 claim100e thrash).
+- Mid flip-kick jump `0x140A04` → `0x1838A4` spin.
+- Force-post worker type-3/4.
 - Inventing PATH3 GIF packets / fake Soft-GS pixels.
 - Ungating Path3MaskedByVif.
+- WaitSema global fabricate / SEMA_STALL_YIELD ON.
 
 ### How far
 
@@ -56,27 +59,28 @@ Rejected:
 | Disc boot + ELF | **Yes** |
 | DualInfo / MOD_LOAD IRX | **Yes** (binds=10) |
 | CDVD IRX-only 142 | **Broken** → **cdvd=692** |
-| Worker cmd type=2 soft-success | **Yes** (forced epi, resWas=0) |
+| Worker cmd type=2 soft-success | **Yes** (streamPast=True @41.7M) |
 | PART1.PAK / TOC FILEIO open | **Yes** (pre+post type-2) |
 | R_SHELL Fedo host extract (full) | **Yes** (`shellOk=True`) |
-| LoadWad bind seed | **Yes** (host state only) |
-| SPU2 activity | **Yes** (spu2Writes=512) |
+| LoadWad bind seed | **Yes** (0x100 magic + table +0x800) |
+| Type-2 fill enter 0x27E0CC | **Yes** (planted; sticky streamPast) |
+| Stream-work path 0x26Cxxx | **Yes** (final PC mid-pack) |
 | **gifPath3** | **No** (gifPath2=1082) |
 | Soft-GS px>0 | **No** (FRAME_1=0) |
 | Interactive title surface | **No** |
 
 ### Wall / next
 
-1. Host Fedo R_SHELL / TIT1 bytes land but game **decode → GIF PRIM** path never runs (stream graph still empty after soft type-2).
-2. Forced epi + `0x27DBF0` stub publish res=0; natural type-2 body still does not build draw graph / FRAME.
-3. Need natural **LoadWad('R_Shell')** / title VPK decode that issues PATH2/PATH3 with FRAME+PRIM — keep Path3MaskedByVif.
+1. Worker queue still empty after type-2 (`*0x310384=0`) — nothing enqueues type-3+/shell draw cmd.
+2. Fill helpers now run natural but do not arm FRAME/PATH3 (slot/graph still incomplete for decode→PRIM).
+3. Stream-work `0x26C3xx` packs bytes but never issues GIF; keep Path3MaskedByVif.
 4. Soft-GS px>0 non-black then pad.
 
 ### Reproduce
 
 ```powershell
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w8
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w9
 $env:DETPS2_TRACE_BIOS='1'
-dotnet exec out/game-gow-w8/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
+dotnet exec out/game-gow-w9/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
 ```
