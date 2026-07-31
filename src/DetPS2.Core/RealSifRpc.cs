@@ -5511,11 +5511,34 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// Last EE work buffer from <c>sceDbcSetWorkAddr</c> (B3 libpad2). Only set when
-    /// arg word0 is a high-RDRAM 64-aligned pointer outside Criterion gp boot cells.
+    /// Last EE work buffer from <c>sceDbcSetWorkAddr</c> / DS2O create (B3 libpad2).
+    /// Captured from create/poll arg words that look like EE RDRAM pad areas.
     /// </summary>
     private uint _dbcWorkAddr;
     private uint _dbcPadFrame;
+    private int _dbcWorkCaptures;
+    private int _dbcPadPaints;
+    private bool _dbcCreateSeen;
+
+    /// <summary>Diagnostics: last captured DBC work buffer (0 if none).</summary>
+    public uint DbcWorkAddr => _dbcWorkAddr;
+    /// <summary>Diagnostics: times DBC work buffer was painted with host buttons.</summary>
+    public int DbcPadPaintCount => _dbcPadPaints;
+
+    /// <summary>
+    /// Register an EE work buffer for DBC/libpad2 (B3 client-scan fallback when
+    /// SetWorkAddr arg capture missed the pointer). Rejects non-plausible addresses.
+    /// </summary>
+    public bool TryRegisterDbcWorkAddr(uint cand)
+    {
+        cand &= 0x1FFFFFFFu;
+        if (!IsPlausibleDbcWorkAddr(cand)) return false;
+        if (_dbcWorkAddr == cand) return true;
+        if (_dbcWorkAddr != 0) return false; // already have a capture
+        _dbcWorkAddr = cand;
+        _dbcWorkCaptures++;
+        return true;
+    }
 
     private int HandleDbcMan(SystemMemory mem, PadInput pad, uint fno, uint argBuf, uint recvBuf, uint recvSize)
     {
@@ -5526,11 +5549,19 @@ public sealed class RealSifRpc
         // fno low byte often encodes the op. Version/init probes use 0x63 / sid|0x63.
         // Create/open-style ops (0x01, 0x04, 0x80001301, 0x80001304) need a non-version
         // handle — returning 0x310 for those made GoW treat "create" as a weird version.
+        // Live B3: fno=0x80001363 version, 0x80001304 create, 0x80001301/02 poll thrash
+        // with fixed recvBuf@0x00679840 (client scratch — not the pad work DMA).
         uint op = fno & 0xFF;
         bool versionProbe = op is 0x63 or 0x00 || fno == 0x80001363u;
+        bool createOp = op == 0x04 || fno == 0x80001304u;
         int result = versionProbe
             ? unchecked((int)Ver310)
             : 1 + (int)(op & 0x1F);
+
+        // Capture work addr BEFORE clobbering arg words with result.
+        // Scan arg[0..5] for EE pad-area pointers (create + SetWorkAddr + poll).
+        if (!versionProbe && argBuf != 0)
+            TryCaptureDbcWorkAddr(mem, argBuf, createOp, fno);
 
         // Preserve original header layout exactly (GoW + B3 residual depend on it).
         if (recvBuf != 0)
@@ -5542,28 +5573,88 @@ public sealed class RealSifRpc
         }
         if (argBuf != 0)
         {
-            // Capture work addr BEFORE overwriting arg[0] with result (SetWorkAddr / create).
-            if (!versionProbe)
-            {
-                uint cand = mem.Read32(argBuf) & 0x1FFFFFFFu;
-                // High-RDRAM only (0x01000000+), 64-align, not Criterion gp (0x4Exxxx).
-                if (cand is >= 0x01000000 and < (uint)SystemMemory.RDRAM_SIZE - 0x100
-                    && (cand & 0x3F) == 0
-                    && cand is not (>= 0x01F00000)) // leave EE stack alone
-                    _dbcWorkAddr = cand;
-            }
             mem.Write32(argBuf, unchecked((uint)result));
             mem.Write32(argBuf + 4, versionProbe ? Ver310 : unchecked((uint)result));
         }
 
-        // PL-014 / B3: refresh a captured high-RDRAM libpad2 work buffer only.
-        // Never stomp recv payload during DBC init — writing STABLE+buttons into recv+0x10
-        // while sockets were still creating collapsed residual→STG (cdvd plant-only 609).
-        bool dataOp = !versionProbe && op is not 0x04;
+        if (createOp)
+            _dbcCreateSeen = true;
+
+        // PL-014 residual / PL-026: paint DualShock into captured work buffer on data ops.
+        // Never stomp recv payload during DBC *create* — writing STABLE+buttons into
+        // recv+0x10 while sockets were still creating collapsed residual→STG (cdvd=609).
+        // After create, poll (01/02) may keep SRData in the work buffer; also refresh
+        // a pad_data_old dual-buffer when work looks like a classic pad area.
+        // Data/poll ops (01/02 thrash on B3): keep work buffer STABLE + host buttons live.
+        bool dataOp = !versionProbe && !createOp;
         if (dataOp && _dbcWorkAddr != 0)
             WriteDbcPadWorkArea(mem, pad, _dbcWorkAddr);
+        // Create also seeds the work area once captured so EE never reads a zeroed socket.
+        else if (createOp && _dbcWorkAddr != 0)
+            WriteDbcPadWorkArea(mem, pad, _dbcWorkAddr);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            && (!versionProbe)
+            && (_dbcWorkCaptures <= 8 || (_dbcPadPaints > 0 && _dbcPadPaints % 64 == 0)
+                || (createOp && _dbcWorkCaptures <= 16)))
+        {
+            uint a0 = argBuf != 0 ? mem.Read32(argBuf) : 0;
+            uint a1 = argBuf != 0 ? mem.Read32(argBuf + 4) : 0;
+            uint a2 = argBuf != 0 ? mem.Read32(argBuf + 8) : 0;
+            uint a3 = argBuf != 0 ? mem.Read32(argBuf + 12) : 0;
+            Console.Error.WriteLine(
+                $"[RPC] HandleDbcMan fno=0x{fno:X} op=0x{op:X2} create={createOp} data={dataOp} " +
+                $"seenCreate={_dbcCreateSeen} arg=0x{argBuf:X8} recv=0x{recvBuf:X8} " +
+                $"work=0x{_dbcWorkAddr:X8} paints={_dbcPadPaints} " +
+                $"a0..3=0x{a0:X8},0x{a1:X8},0x{a2:X8},0x{a3:X8}");
+        }
 
         return result;
+    }
+
+    /// <summary>
+    /// Accept EE RDRAM candidates for libpad2/DS2O work buffers.
+    /// Allows mid-heap (0x00400000+) and high-RDRAM; rejects EE stack, low null page,
+    /// Criterion flip-queue gp cells (0x4E28xx), and non-64-aligned addresses.
+    /// </summary>
+    private static bool IsPlausibleDbcWorkAddr(uint cand)
+    {
+        if (cand < 0x00400000u) return false;
+        if (cand >= (uint)SystemMemory.RDRAM_SIZE - 0x100) return false;
+        if (cand >= 0x01F00000u) return false; // EE stack
+        if ((cand & 0x3Fu) != 0) return false; // 64-align (SIF/DMA)
+        // B3 flip residual cells (gp-based pending/out/in) — never paint as pad.
+        if (cand is >= 0x004E2800u and < 0x004E2A00u) return false;
+        // MMIO / VU / SPR mirrors.
+        if (cand is >= 0x10000000u) return false;
+        return true;
+    }
+
+    private void TryCaptureDbcWorkAddr(SystemMemory mem, uint argBuf, bool createOp, uint fno)
+    {
+        // Scan several words — create/SetWorkAddr put the EE buffer in word0 or word1;
+        // some DS2O sockets stash it deeper. Prefer first plausible pointer.
+        for (uint off = 0; off <= 20; off += 4)
+        {
+            uint cand = mem.Read32(argBuf + off) & 0x1FFFFFFFu;
+            if (!IsPlausibleDbcWorkAddr(cand)) continue;
+            // Prefer not overwriting a good capture with the same value.
+            if (_dbcWorkAddr == cand) return;
+            // On poll ops, only adopt if we have no work yet (avoid thrash-pointer noise).
+            if (!createOp && _dbcWorkAddr != 0) return;
+            uint prev = _dbcWorkAddr;
+            _dbcWorkAddr = cand;
+            _dbcWorkCaptures++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                if (_dbcWorkCaptures <= 12 || createOp)
+                    Console.Error.WriteLine(
+                        $"[RPC] DBC SetWorkAddr-class capture work=0x{cand:X8} (was 0x{prev:X8}) " +
+                        $"off=+{off} fno=0x{fno:X} create={createOp} n={_dbcWorkCaptures}");
+            }
+            return;
+        }
     }
 
     /// <summary>Standard DualShock <c>padButtonStatus</c> (active-low btns) at <paramref name="dataBase"/>.</summary>
@@ -5571,7 +5662,7 @@ public sealed class RealSifRpc
     {
         if (dataBase == 0 || dataBase >= (uint)SystemMemory.RDRAM_SIZE - 32) return;
         mem.Write8(dataBase + 0, 0x00); // ok
-        mem.Write8(dataBase + 1, 0x79); // DualShock analog mode id
+        mem.Write8(dataBase + 1, pad.AnalogMode ? (byte)0x79 : (byte)0x79); // DualShock analog
         ushort btns = (ushort)(~pad.Buttons & 0xFFFF);
         mem.Write8(dataBase + 2, (byte)(btns & 0xFF));
         mem.Write8(dataBase + 3, (byte)(btns >> 8));
@@ -5583,17 +5674,58 @@ public sealed class RealSifRpc
             mem.Write8(dataBase + o, 0x00);
     }
 
-    /// <summary>libpad2 work area: STABLE + DualShock report (high-RDRAM only).</summary>
+    /// <summary>
+    /// libpad2 / DS2O work area: <c>pad_data_old</c>-shaped STABLE + DualShock report.
+    /// Dual-buffer (+0 / +0x40) so frame pick always sees a live slot.
+    /// Safe for mid-heap BSS (0x00400000+) and high-RDRAM; never EE stack.
+    /// </summary>
     private void WriteDbcPadWorkArea(SystemMemory mem, PadInput pad, uint baseP)
     {
-        if (baseP < 0x01000000 || baseP >= (uint)SystemMemory.RDRAM_SIZE - 0x40) return;
-        if (baseP is >= 0x01F00000) return; // EE stack
+        if (!IsPlausibleDbcWorkAddr(baseP)) return;
+        if (baseP >= (uint)SystemMemory.RDRAM_SIZE - 0x80) return;
         _dbcPadFrame++;
+        _dbcPadPaints++;
+        // Slot 0
         mem.Write32(baseP + 0x00, _dbcPadFrame);
-        mem.Write8(baseP + 0x04, 6); // STABLE
-        mem.Write8(baseP + 0x05, 0);
-        mem.Write8(baseP + 0x06, 1);
+        mem.Write8(baseP + 0x04, (byte)PadStateStable);
+        mem.Write8(baseP + 0x05, (byte)PadRstatComplete);
+        mem.Write8(baseP + 0x06, 1); // ok
+        mem.Write8(baseP + 0x07, 0);
         WriteDbcPadButtonStatus(mem, pad, baseP + 0x08);
+        mem.Write32(baseP + 0x28, 32); // length
+        mem.Write8(baseP + 0x2C, 0);
+        mem.Write8(baseP + 0x2D, 2); // CTP config done
+        mem.Write8(baseP + 0x2E, 3); // model DualShock
+        mem.Write8(baseP + 0x2F, 1);
+        // Slot 1 (higher frame) — dual-buffer pick
+        uint s1 = baseP + 0x40;
+        if (s1 + 0x30 < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            mem.Write32(s1 + 0x00, _dbcPadFrame + 1);
+            mem.Write8(s1 + 0x04, (byte)PadStateStable);
+            mem.Write8(s1 + 0x05, (byte)PadRstatComplete);
+            mem.Write8(s1 + 0x06, 1);
+            mem.Write8(s1 + 0x07, 0);
+            WriteDbcPadButtonStatus(mem, pad, s1 + 0x08);
+            mem.Write32(s1 + 0x28, 32);
+            mem.Write8(s1 + 0x2D, 2);
+            mem.Write8(s1 + 0x2E, 3);
+            mem.Write8(s1 + 0x2F, 1);
+        }
+        // Bare padButtonStatus after dual-buffer (some DS2O SRData paths skip header).
+        // Do NOT write at baseP — that would clobber frame/state of slot 0.
+        uint bare = baseP + 0x80;
+        if (bare + 32 < (uint)SystemMemory.RDRAM_SIZE)
+            WriteDbcPadButtonStatus(mem, pad, bare);
+    }
+
+    /// <summary>
+    /// Force-refresh DBC/libpad2 work buffer (B3 has no PADMAN OPEN). Safe no-op if unset.
+    /// </summary>
+    public void ForceRefreshDbcPad(SystemMemory mem, PadInput pad)
+    {
+        if (_dbcWorkAddr == 0 || pad == null) return;
+        WriteDbcPadWorkArea(mem, pad, _dbcWorkAddr);
     }
 
     /// <summary>
@@ -8791,8 +8923,15 @@ public sealed class RealSifRpc
     /// <summary>Ghost pad areas retained across IOP reboot (diagnostics).</summary>
     public int GhostPadCount => _padAreasGhost.Count;
 
-    /// <summary>Force-refresh pad DMA now (menu pad inject / host present). Safe no-op when empty.</summary>
-    public void ForceRefreshPad(SystemMemory mem, PadInput pad) => TickPadDma(mem, pad);
+    /// <summary>
+    /// Force-refresh pad DMA now (menu pad inject / host present). Safe no-op when empty.
+    /// Also refreshes DBC/libpad2 work buffer (B3 DualShock path — no PADMAN OPEN).
+    /// </summary>
+    public void ForceRefreshPad(SystemMemory mem, PadInput pad)
+    {
+        TickPadDma(mem, pad);
+        ForceRefreshDbcPad(mem, pad);
+    }
 
 
 

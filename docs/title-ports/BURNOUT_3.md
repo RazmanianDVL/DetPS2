@@ -6,10 +6,10 @@
 | **Serial** | `SLUS_210.50` |
 | **ISO** | `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
-| **Worktree / seat** | `detps2-seat-s4` · branch `agent/seat-s4/s1-g1` |
+| **Worktree / seat** | `detps2-seat-s4` · branch `agent/seat-s4/s2-g2` |
 | **Agent date** | 2026-07-31 |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **logo-frontend MENU YES** Soft-GS hold; PL-014 pad edges live (libdbc/DBCMAN path); INTERACTIVE logo→menu **not claimed**; residual **natural DISPFB** + DBC SetWorkAddr button DMA |
+| **Status** | **logo-frontend MENU YES** Soft-GS hold; **PL-014 DBC work buffer wired** (`work=0x0067CCC0` paints≥1500); INTERACTIVE logo→menu **not claimed**; residual **natural DISPFB** + pad-driven scene leave |
 
 ---
 
@@ -407,5 +407,79 @@ $env:DETPS2_TRACE_BIOS = '1'
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s4 --nologo -v q
 dotnet exec out/seat-s4/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
 # expect: cdvd=6584 px≈24.4M DISPFB1=0; [B3] PL-014 logo-pad edge lines; no DETPS2_SEMA_STALL_YIELD
+```
+
+---
+
+## Seat S2-G2 (2026-07-31) — PL-014 residual + PL-026 DBC work DMA
+
+| Field | Value |
+|-------|-------|
+| Seat | **S4 BURNOUT** · branch `agent/seat-s4/s2-g2` |
+| WP | **PL-014 residual** wire DBC SetWorkAddr/DS2O so pad reaches game; **PL-026** natural DISPFB if safe |
+| Build | `out/seat-s4` Release · **SEMA_OFF** · `--host-present` · `burnout-only.json` |
+| FREEZES | Soft-GS truth · SEMA_OFF · no FFmpeg · **no invent DISPFB plant** |
+
+### Root cause (S1 residual)
+
+| Finding | Evidence |
+|---------|----------|
+| DBC create arg+4 is work buffer | TRACE_RPC create `fno=0x80001304` → capture `work=0x0067CCC0` off=+4 |
+| S1 only accepted high-RDRAM ≥0x01000000 | Mid-heap BSS `0x0067CCC0` was **rejected** → `_dbcWorkAddr` stayed 0 |
+| ForceRefreshPad was PADMAN-only | B3 has **zero** PADMAN OPEN → force-refresh was a no-op between poll RPCs |
+| Live poll thrash | `fno=0x80001301/02` on fixed `recvBuf=0x00679840` (client scratch ≠ pad DMA) |
+
+### Fixes
+
+| Change | File | Notes |
+|--------|------|-------|
+| Broader work-addr capture | `RealSifRpc.cs` | Scan arg words 0..5; accept 64-align EE RDRAM ≥0x00400000 (not stack / not flip 0x4E28xx) |
+| pad_data_old dual-buffer paint | `RealSifRpc.cs` | STABLE + active-low DualShock @ work / work+0x40; bare status @ +0x80 |
+| ForceRefreshPad → DBC too | `RealSifRpc.cs` | `ForceRefreshDbcPad` so logo edges refresh work between SIF polls |
+| Logo-pad telemetry | `Burnout3Assist.cs` | Log `dbcWork` + `paints`; client-scan fallback if capture misses |
+| Rejected | — | No DISPFB plant; no recv+0x10 paint during create (STG collapse class) |
+
+### Claim 100M (SEMA_OFF)
+
+```
+PC=0x00253F88 px=23620619 prims=4954 gifP1=0 gifP2=340 gifP3=491 dmac=424
+  sifBytes=149428 syscalls=41025 cdvdSectors=6584
+softgs: imgBytes=2694848 dispfbPx=1486728 naturalDispfbPx=1474560 expandHits=164
+  fragTest=75399048 rejDepth=53265157 rejAlpha=3
+softgs-regs: FRAME_1=0xA0046 DISPFB1=0 SCISSOR full XYOFFSET=0x72006C00 TEST=0x5140B
+softgs-writes: total=24960 PRIM=7054 XYZ2=7229 FRAME=84 SCISSOR=84
+RealSifRpc: binds=13 calls=226 unknown=0
+DBC: work=0x0067CCC0 paints≥1588 (create capture + ForceRefresh)
+PL-014 logo-pad edges: n≥704
+```
+
+**Claim line:**
+
+```
+B3 SLUS_210.50 seat-s4/s2-g2 SEMA_OFF 100M: STG+TXD+FRONTEND cdvd=6584
+  gifP1=0 gifP2=340(p2qws=14538) gifP3=491 dmac=424 prims=4954
+  px=23620619 dispfbPx=1486728 naturalDispfbPx=1474560 imgBytes=2694848 DISPFB1=0
+  binds=13 calls=226 PC=0x253F88 — logo-frontend MENU YES hold
+  PL-014: DBC work=0x0067CCC0 paints≥1588 + edge pad n≥704; T2 INTERACTIVE logo→menu NOT claimed
+  residual: pad-driven scene leave (PC/stream) + natural DISPFB; no DISPFB plant
+```
+
+**MENU:** logo-frontend Soft-GS **YES** (hold). **Not** claiming pad-interactive main menu — final PC still presentation `0x253Fxx` / flip thrash `0x1F2508`; no second stream open.
+
+### PL-026 / DISPFB note (S10 shared path)
+
+- Privileged **DISPFB1=0** still; `naturalDispfb` circuit **0** (no plant).
+- `naturalDispfbPx` / `dispfbPx` remain **merge composite** fill counts (FRAME_1 + FBP0 IMAGE), not retail PCRTC bind.
+- Prefer S10 GX-040 circuit decode; do not invent DISPFB registers.
+
+### Reproduce
+
+```powershell
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = '1'
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s4 --nologo -v q
+dotnet exec out/seat-s4/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
+# expect: cdvd=6584 DISPFB1=0; [RPC] DBC SetWorkAddr-class capture work=0x0067CCC0;
+#         [B3] PL-014 logo-pad … dbcWork=0x0067CCC0 paints=…
 ```
 
