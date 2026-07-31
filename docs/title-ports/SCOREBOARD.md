@@ -11,8 +11,8 @@
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | C1C0 bind YES gifP3=11 px=573k | second-chrome Path3 / sel-idx |
 | **Burnout 3** | SLUS_210.50 | **YES** (logo-frontend) | px=24.4M dispfbPx=2.27M cdvd=6584 gifP2=14526 | wave-6 Soft-GS logo chrome; pad main-menu advance residual |
 | **Blood Omen 2** | SLUS_200.24 | **YES** (mainmenu title-surface) | px=286720 gifP2=106 stream=2.4MB cdvd=6512 | wave-7 dual list-stub + ofx title FB |
-| **God of War** | SCUS_973.99 | **No** | worker type-2 cleared; gifP2=962 px=0 cdvd=142 | PATH3/WAD FILEIO residual |
-| **MK Deception** | SLUS_208.81 | **No** | px=822k dispfbPx=105k gameart.ssf loaded | WAVE-6 path-hash; no GIF IMAGE menu |
+| **God of War** | SCUS_973.99 | **No** | type2 soft-ok gifP2=962 px=0 cdvd=142 | PATH3/WAD FILEIO residual |
+| **MK Deception** | SLUS_208.81 | **YES** (midway-menu) | px=822k gifP2=5988 idle-pump | wave-7 PowerOff storm kill |
 | **MK Deadly Alliance** | SLUS_204.23 | **YES** (midway-menu) | px=716800 gifP2=35109 exitReq=False | wave-6 post-logo keep-alive |
 | **Vexx** | SLUS_203.83 | **YES** (title-surface) | px=581954 prims=4 cdvd=318 members=17 | wave-6 STREE0 VFS |
 | **Whiplash** | SLUS_206.84 | **YES** (title-surface) | px=286720 frontend Start full | wave-6 full title path |
