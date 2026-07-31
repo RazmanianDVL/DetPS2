@@ -571,6 +571,7 @@ public sealed class IopModuleHost
         if (m.Gp != 0)
             iop.SetGpr(28, m.Gp); // $gp
         iop.SetGpr(29, DefaultModuleStack); // $sp
+        iop.SetGpr(30, DefaultModuleStack); // $fp — many IRX use frame pointer without prolog if argc path short
         iop.SetGpr(31, ModuleReturnSentinel); // $ra
         iop.SetGpr(4, 0); // a0 argc
         iop.SetGpr(5, 0); // a1 argv
