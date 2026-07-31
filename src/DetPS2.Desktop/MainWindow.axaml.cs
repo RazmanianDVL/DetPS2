@@ -896,19 +896,11 @@ public partial class MainWindow : Window
 
             _sessionLog.WriteSystemSnapshot(_system, "post-boot");
             Log("Note: DetPS2 fast-boots the disc ELF (BIOS logo sequence is not fully LLE).");
-            Log($"Boot assist: {_system.MidwayAssist.Status} (FMV frames ready={_system.MidwayAssist.FramesReady}).");
+            Log($"Boot assist: {_system.MidwayAssist.Status}");
             Log("Audio: host output is live when SPU2 voices produce samples (no test tone).");
-            // Give async FMV preload a moment if cache was cold
+            // Boot logos / Sofdec must come from Soft-GS (IPU/CRI). Host FFmpeg decode was removed.
             if (!_system.MidwayAssist.FramesReady)
-            {
-                Log("Warming boot-movie cache (one-time ffmpeg decode)…");
-                await Task.Run(() =>
-                {
-                    for (int i = 0; i < 100 && !_system.MidwayAssist.FramesReady; i++)
-                        System.Threading.Thread.Sleep(100);
-                });
-                Log($"Boot-movie cache: {_system.MidwayAssist.Status} frames={_system.MidwayAssist.LogoFramesTotal}");
-            }
+                Log("No host FMV overlay — logos only if Soft-GS renders them (IPU/CRI).");
             if (autoRun)
             {
                 EnsureGameWindow(Path.GetFileNameWithoutExtension(path));
