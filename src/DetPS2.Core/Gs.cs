@@ -94,6 +94,12 @@ public sealed class Gs : ISchedulable
     public long RegWritesTest { get; private set; }
     /// <summary>XYOFFSET_1 (0x18) writes.</summary>
     public long RegWritesXyoffset { get; private set; }
+    /// <summary>
+    /// Soft-GS title-strip expand events (temporary MENU chrome crutch; G-GFX-6 demotes later).
+    /// Incremented once per SPRITE that matches legal ofx expand conditions and is expanded
+    /// to full Soft-GS FB. See docs/graphics/EXPAND_POLICY.md.
+    /// </summary>
+    public long ExpandHits { get; private set; }
     private bool _localMemHasImage;
 
     public struct Vertex
@@ -133,6 +139,7 @@ public sealed class Gs : ISchedulable
         FragmentsRejectedScissor = 0;
         RegWritesTotal = RegWritesPrim = RegWritesXyz2 = RegWritesXyz3 = RegWritesXyzf2 = 0;
         RegWritesFrame = RegWritesScissor = RegWritesTest = RegWritesXyoffset = 0;
+        ExpandHits = 0;
         _lastCompositeImageBytes = 0;
         _localMemHasImage = false;
         _currentPrim = 0;
@@ -690,15 +697,14 @@ public sealed class Gs : ISchedulable
         int y0 = Math.Max(0, minY);
         int y1 = Math.Min(FB_HEIGHT - 1, maxY);
         Registers.GetXyOffset(out int ofxR, out int ofyR);
-        // WAVE-5/6: retail ofx/ofy=0x8000 full-width strip collapses to h=1 (Whiplash
-        // title sprite raw Y=0 both corners). Expand to a full Soft-GS title surface so
-        // menuKind title-surface is MENU-class chrome — color/UV still from the prim.
-        // WAVE-7: also expand partial-height logo bands (BO2 ofx=0x8000 ~112-row clear
-        // → full title FB) so post-stream Path2 sprites paint MENU-class chrome.
-        // WAVE-12B GoW Path2: two SPRITEs kick with ofx/ofy still 0 and both Y=0
-        // (corners (0,0)+(512,0) → 512×1) → px=1026 residual. XYOFFSET is armed only
-        // after later A+D packets. Treat ofx=0 / retail-center ofx band the same as
-        // ofx=0x8000 for full-width thin strips (no invent PATH3; color/UV from prim).
+        // Title-strip expand (TEMPORARY Soft-GS MENU chrome; telemetry = ExpandHits).
+        // Legal ofx/ofy classes (all require full-width thin strip — see EXPAND_POLICY.md):
+        //   1) ofx=0 && ofy=0          — GoW Path2: XYOFFSET armed after first SPRITEs
+        //   2) ofx=ofy=0x8000          — Whiplash/BO2 retail center origin (2048.0 12.4)
+        //   3) retail-center band      — ofx,ofy ∈ [0x6000,0x9000] (B3-class offsets)
+        // Geometry gate: w ≥ FB_WIDTH/2 && h < FB_HEIGHT/2 (thin strip / logo band).
+        // Color/UV still from the real prim — no invent PATH3 / no planted pixels.
+        // G-GFX-6 demotes this path once retail XYOFFSET+PRIM sizes paint naturally.
         bool retailOfs = (ofxR == 0 && ofyR == 0)
             || (ofxR == 0x8000 && ofyR == 0x8000)
             || (ofxR is >= 0x6000 and <= 0x9000 && ofyR is >= 0x6000 and <= 0x9000);
@@ -711,7 +717,10 @@ public sealed class Gs : ISchedulable
             int sw = Math.Clamp(w, 1, FB_WIDTH);
             int sh = Math.Clamp(h, 1, FB_HEIGHT);
             if (titleStrip)
+            {
                 sh = FB_HEIGHT;
+                ExpandHits++;
+            }
             minX = 0; minY = 0;
             maxX = sw; maxY = sh;
             x0 = 0; y0 = 0;
@@ -721,6 +730,7 @@ public sealed class Gs : ISchedulable
         else if (titleStrip)
         {
             // Partially on-FB one-row (WAVE-6 Y=0 rescue): still expand to full title FB.
+            ExpandHits++;
             minX = 0; minY = 0;
             maxX = FB_WIDTH; maxY = FB_HEIGHT;
             x0 = 0; y0 = 0;

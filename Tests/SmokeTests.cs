@@ -5221,6 +5221,7 @@ public static class SmokeTests
 
         long px = sys.Gs.PixelsWritten;
         long prims = sys.Gs.PrimitivesDrawn;
+        long expandHits = sys.Gs.ExpandHits;
         // Without expand: 512×1 = 512. Title surface: ≥ 640×448/2 (half FB floor).
         const long titleFloor = 640L * 448L / 2;
         if (prims < 1)
@@ -5229,9 +5230,12 @@ public static class SmokeTests
             throw new Exception(
                 $"ofx=0 Y=0 Path2 strip did not expand to title surface: px={px} prims={prims} " +
                 $"(want ≥{titleFloor}; residual class was px=512 without expand)");
+        if (expandHits < 1)
+            throw new Exception(
+                $"expected ExpandHits≥1 when title-strip expand fires (got {expandHits})");
         Console.WriteLine(
             $"[Smoke] Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface OK " +
-            $"(px={px} prims={prims} titleFloor={titleFloor})");
+            $"(px={px} prims={prims} expandHits={expandHits} titleFloor={titleFloor})");
     }
 
     public static void Timer_GateAndClockSelect()

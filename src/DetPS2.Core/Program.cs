@@ -421,7 +421,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             }
         }
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifPath1={traceSys.Gif.Path1Transfers} gifPath2={traceSys.Gif.Path2Transfers} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
-        Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
+        Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} expandHits={traceSys.Gs.ExpandHits} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
         Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
         Console.WriteLine($"  softgs-writes: total={traceSys.Gs.RegWritesTotal} PRIM={traceSys.Gs.RegWritesPrim} XYZ2={traceSys.Gs.RegWritesXyz2} XYZ3={traceSys.Gs.RegWritesXyz3} XYZF2={traceSys.Gs.RegWritesXyzf2} FRAME={traceSys.Gs.RegWritesFrame} SCISSOR={traceSys.Gs.RegWritesScissor} TEST={traceSys.Gs.RegWritesTest} XYOFF={traceSys.Gs.RegWritesXyoffset}");
         Console.WriteLine($"  gif-pkts: completed={traceSys.Gif.PacketsCompleted} aborted={traceSys.Gif.PacketsAborted} spannedCalls={traceSys.Gif.PacketsSpannedCalls} inFlight={traceSys.Gif.PacketInFlight} tags={traceSys.Gif.TagsSeen} p2qws={traceSys.Gif.Path2Qws}");
@@ -624,6 +624,7 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["cycles"] = smSys.MasterCycles,
             ["imgBytes"] = smSys.Gs.ImageBytesWritten,
             ["dispfbPx"] = smSys.Gs.DispfbPixelsComposited,
+            ["expandHits"] = smSys.Gs.ExpandHits,
             ["fragTest"] = smSys.Gs.FragmentsTested,
             ["rejBounds"] = smSys.Gs.FragmentsRejectedBounds,
             ["rejScissor"] = smSys.Gs.FragmentsRejectedScissor,
