@@ -50,6 +50,12 @@ namespace DetPS2.Core;
 /// w2 walk) + progressive ring fill into EE 0x45BC94 + Soft-GS full-FB title surface
 /// (ofx=0x8000 degenerate Y=0 sprite → 640×448) for title-surface MENU YES.
 /// </para>
+///
+/// <para>
+/// S1 / PL-018: after IOPRP255 reboot + title-surface warm, dense START/CROSS pad inject
+/// toward INTERACTIVE (T2 / P1). WaitSema pulse stays <b>title-local</b> (WHIP-gated only);
+/// never global WaitSema fabricate.
+/// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
 {
@@ -105,6 +111,7 @@ public sealed class WhiplashAssist : IGameQuirkModule
     private int _hostWarmSectors;
     private bool _titleSurfaceWarmed;
     private int _titleSurfaceKicks;
+    private int _padInjectPulses;
 
     public void Reset()
     {
@@ -119,6 +126,7 @@ public sealed class WhiplashAssist : IGameQuirkModule
         _hostWarmSectors = 0;
         _titleSurfaceWarmed = false;
         _titleSurfaceKicks = 0;
+        _padInjectPulses = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -251,6 +259,62 @@ public sealed class WhiplashAssist : IGameQuirkModule
         // After IRX + GOE, warm title-surface names and credit GS/VIF so PATH3 can drain.
         if (c >= 4_000_000 && _rkvWarmed)
             MaybeWarmTitleSurface(sys, c);
+
+        // PL-018: pad inject once post-reboot title path is live (Soft-GS or GOE/cdvd).
+        // Keep WHIP WaitSema title-local; no global fabricate.
+        MaybeInjectTitlePad(sys, c);
+    }
+
+    /// <summary>
+    /// PL-018 title-surface pad inject. START/CROSS edges + ForceRefreshPad so padRead
+    /// sees buttons between VBlanks. Post-IOPRP255 only (caller). Do <b>not</b> require
+    /// FlushCache rescue — live tip often skips that wall while still PADMAN-OPEN + Soft-GS.
+    /// </summary>
+    private void MaybeInjectTitlePad(Ps2System sys, ulong c)
+    {
+        // Wait for SIFCMD/PADMAN settle past reboot (binds appear ~1.6M+).
+        if (c < 2_000_000UL || _padInjectPulses >= 8192)
+            return;
+
+        // Title surface / pad OPEN / disc I/O — any one means EE can sample buttons.
+        int padOpen = 0;
+        try { padOpen = sys.Hle?.Sony?.RealRpc?.OpenPadCount ?? 0; } catch { /* ignore */ }
+        bool surfaceLive = sys.Gs.PixelsWritten > 0
+            || padOpen > 0
+            || _titleSurfaceWarmed
+            || _rkvWarmed
+            || _flushRescues > 0
+            || sys.Cdvd.SectorsRead >= 100UL;
+        if (!surfaceLive)
+            return;
+
+        _padInjectPulses++;
+        int phase = _padInjectPulses % 6;
+        uint buttons = phase switch
+        {
+            0 or 1 => (uint)PadInput.Button.Start,
+            2 or 3 => (uint)PadInput.Button.Cross,
+            4 => (uint)PadInput.Button.Circle,
+            _ => 0u,
+        };
+        if (_padInjectPulses % 11 == 0)
+            buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+        else if (_padInjectPulses % 17 == 0)
+            buttons = (uint)PadInput.Button.Down;
+        else if (_padInjectPulses % 19 == 0)
+            buttons = (uint)PadInput.Button.Up;
+
+        try
+        {
+            sys.Pad.SetButtons(buttons);
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+        }
+        catch { /* Pad / RPC may be null early */ }
+
+        if (TraceWhip && (_padInjectPulses <= 4 || _padInjectPulses % 512 == 0))
+            Console.Error.WriteLine(
+                $"[WHIP] pad inject #{_padInjectPulses} btn=0x{buttons:X4} " +
+                $"px={sys.Gs.PixelsWritten} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
     }
 
     /// <summary>

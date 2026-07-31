@@ -29,6 +29,10 @@ namespace DetPS2.Core;
 /// (ground-truthed: CRC32 of lowercased backslash path matches entry NameCRC; dual layout
 /// A=NameCRC,DataCRC,off,sz / C=off,sz,NameCRC,DataCRC) and FileOpenVirtualStream into the
 /// STREE0 extent so fonts/textures stream → Soft-GS title-surface pixels.
+///
+/// S1 / PL-017: after STREE0 stream + Soft-GS title surface, dense START/CROSS pad inject
+/// (edge phases + ForceRefreshPad) so frontend/pad readers can advance toward INTERACTIVE
+/// (T2 / P1). No WaitSema fabricate; no invent PATH3 / plant pixels.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -118,6 +122,7 @@ public sealed class VexxAssist : IGameQuirkModule
     private int _hostMemberOpens, _hostMemberFail;
     private int _streamMapProbes, _streamMapPlants;
     private int _streamMapLookupHits;
+    private int _padInjectPulses;
     private bool _tocProbeDone;
     private Iso9660.Volume? _isoVol;
     private string? _isoVolPath;
@@ -143,6 +148,7 @@ public sealed class VexxAssist : IGameQuirkModule
         _hostMemberOpens = _hostMemberFail = 0;
         _streamMapProbes = _streamMapPlants = 0;
         _streamMapLookupHits = 0;
+        _padInjectPulses = 0;
         _tocProbeDone = false;
         _streamMapTable = _streamMapCount = _streamMapObj = 0;
         _hostFds.Clear();
@@ -309,6 +315,57 @@ public sealed class VexxAssist : IGameQuirkModule
         // Stack death residual: PC lands in path ASCII (STREE0.TRE / GAME.TXT) as code.
         if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles && LooksLikePathAsciiPc(sys, pc))
             MaybeRescueStackDeath(sys, pc);
+
+        // PL-017: pad inject after STREE0 / title path is live. Dense START/CROSS edges
+        // so Press-START / confirm readers can leave logo/title surface (T2 INTERACTIVE).
+        // Gate: real disc sectors OR Soft-GS title chrome — never pulse during pure CRT thrash.
+        MaybeInjectTitlePad(sys);
+    }
+
+    /// <summary>
+    /// PL-017 title-surface pad inject. Active-high <see cref="PadInput.Button"/> bits;
+    /// PADMAN DMA gets active-low via shared WritePadButtonData. Force-refresh open pad
+    /// areas so EE padRead sees edges between VBlanks.
+    /// </summary>
+    private void MaybeInjectTitlePad(Ps2System sys)
+    {
+        // Need STREE/TOC activity or Soft-GS surface before pad matters.
+        bool surfaceLive = sys.Gs.PixelsWritten > 0
+            || sys.Cdvd.SectorsRead >= 80UL
+            || _hostMemberOpens > 0
+            || _streamMapTable != 0;
+        if (!surfaceLive || _padInjectPulses >= 8192)
+            return;
+
+        _padInjectPulses++;
+        int phase = _padInjectPulses % 6;
+        uint buttons = phase switch
+        {
+            0 or 1 => (uint)PadInput.Button.Start,
+            2 or 3 => (uint)PadInput.Button.Cross,
+            4 => (uint)PadInput.Button.Circle,
+            _ => 0u, // release edge for edge-triggered padRead
+        };
+        // Occasional dual-press + D-pad for menus that want confirm / move selection.
+        if (_padInjectPulses % 11 == 0)
+            buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+        else if (_padInjectPulses % 17 == 0)
+            buttons = (uint)PadInput.Button.Down;
+        else if (_padInjectPulses % 19 == 0)
+            buttons = (uint)PadInput.Button.Up;
+
+        try
+        {
+            sys.Pad.SetButtons(buttons);
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+        }
+        catch { /* Pad / RPC may be null early */ }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1"
+            && (_padInjectPulses <= 4 || _padInjectPulses % 512 == 0))
+            Console.Error.WriteLine(
+                $"[VEXX] pad inject #{_padInjectPulses} btn=0x{buttons:X4} " +
+                $"px={sys.Gs.PixelsWritten} cdvd={sys.Cdvd.SectorsRead} cyc={sys.Scheduler.MasterCycles}");
     }
 
     /// <summary>
