@@ -43,7 +43,8 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint SearchFileArgBuf = 0x1C1F4000;
     public const uint SearchFilePacket = 0x003F7B00;
     /// <summary>Do not freelist-bump until pad/IOPRP stack is past early CRT init.</summary>
-    public const ulong FreelistEscapeMinCycles = 3_500_000UL;
+    /// <summary>Allow freelist bump after CRT plant settles (not during whip-era thrash).</summary>
+    public const ulong FreelistEscapeMinCycles = 1_000_000UL;
 
     private bool _pathPatched, _mallocPlanted;
     private int _versionReplants, _nullPathEscapes, _pathNormEscapes, _mallocReplants;

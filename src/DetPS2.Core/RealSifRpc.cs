@@ -6368,26 +6368,21 @@ public sealed class RealSifRpc
         // path even if sendSize is unknown (HLE Dispatch / quirks call without size).
         string at20 = ReadCString(mem, argBuf + 0x20, 256);
         string at24 = ReadCString(mem, argBuf + 0x24, 256);
-        string name;
-        if (sendSize is 0x128 or 0x12C)
-            name = at24;
-        else if (sendSize == 0x124)
-            name = at20;
+        // Candidate order: Play! size first, then path-sniff, then opposite offset fallback.
+        var candidates = new System.Collections.Generic.List<string>(3);
+        void AddCand(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return;
+            s = s.Trim();
+            if (!candidates.Contains(s)) candidates.Add(s);
+        }
+        if (sendSize is 0x128 or 0x12C) { AddCand(at24); AddCand(at20); }
+        else if (sendSize == 0x124) { AddCand(at20); AddCand(at24); }
         else if (LooksLikeCdSearchPath(at24) && (!LooksLikeCdSearchPath(at20) || at24 != at20))
-            name = at24; // Vexx 0x128 residual: stale leaf at +0x20, fresh path at +0x24
-        else
-            name = at20;
-        if (string.IsNullOrEmpty(name))
-            name = ReadCString(mem, argBuf, 256);
-        name = name.Trim();
-        if (name.Length == 0) return 0;
-
-        // Strip device / version suffix: "\\SYSTEM.CNF;1" / "cdrom0:\\FOO.ELF;1"
-        int colon = name.IndexOf(':');
-        if (colon >= 0) name = name[(colon + 1)..];
-        name = name.TrimStart('\\', '/');
-        int semi = name.IndexOf(';');
-        if (semi >= 0) name = name[..semi];
+        { AddCand(at24); AddCand(at20); }
+        else { AddCand(at20); AddCand(at24); }
+        AddCand(ReadCString(mem, argBuf, 256));
+        if (candidates.Count == 0) return 0;
 
         string? path = cdvd.MountedPath;
         if (string.IsNullOrEmpty(path))
@@ -6401,10 +6396,21 @@ public sealed class RealSifRpc
         {
             var vol = Iso9660.OpenFile(path);
             if (vol == null) return 0;
-            var entry = Iso9660.FindFile(vol, name);
-            // Also try bare leaf
-            if (entry == null)
-                entry = Iso9660.FindFile(vol, System.IO.Path.GetFileName(name));
+            Iso9660.FileEntry? entry = null;
+            string name = "";
+            foreach (string raw in candidates)
+            {
+                name = raw;
+                int colon = name.IndexOf(':');
+                if (colon >= 0) name = name[(colon + 1)..];
+                name = name.TrimStart('\\', '/');
+                int semi = name.IndexOf(';');
+                if (semi >= 0) name = name[..semi];
+                if (name.Length == 0) continue;
+                entry = Iso9660.FindFile(vol, name)
+                    ?? Iso9660.FindFile(vol, System.IO.Path.GetFileName(name));
+                if (entry != null) break;
+            }
             if (entry == null)
             {
                 // Dispose volume's disc if OpenFile created a new FileDiscImage — OpenFile
