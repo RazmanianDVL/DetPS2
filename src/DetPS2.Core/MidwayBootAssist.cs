@@ -113,9 +113,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private const uint ResourceAllocStub = 0x01FE0100;  // EE bump-alloc code
     private const uint ResourceAllocCtx = 0x01FE0200;   // {cursor, end}
     private const uint ResourceDescBufSize = 0x00600000; // 6 MiB descriptor bump region
+    /// <summary>FUN_0044D770 — FBB0 work leaf; type jump table at 0x5AD530 (type2→44D860).</summary>
+    private const uint ResourceD770Fn = 0x0044D770;
+    /// <summary>Object header + draw-body footprint used by D770/44DA10/44FBE8 (needs +0x36B0).</summary>
+    private const uint ResourceObjectSpan = 0x00004000;
+    /// <summary>WAD member payload planted after object for type-2 texture/draw body.</summary>
+    private const uint ResourceBodyPayloadSize = 0x00020000; // 128 KiB PWF/WAD head
 
     private bool _worklistPlanted;
     private bool _resourceArenaReady;
+    private bool _resourceBodyPlanted;
+    private int _d770ForceCount;
+    private ulong _lastD770ForceCyc;
+    private bool _d770ForceResumePending;
+    private ulong _d770SavedPc;
+    private ulong[]? _d770SavedGpr;
+    private int _menuSelIndex;
+    private int _menuSelPlants;
     private bool _sifForced;
     private bool _sifTrampolineWritten;
     private bool _sifResumePending;
@@ -257,6 +271,19 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _c1c0Entered = false;
         _c1c0EnterCyc = 0;
         _resourceArenaReady = false;
+        _resourceBodyPlanted = false;
+        _d770ForceCount = 0;
+        _lastD770ForceCyc = 0;
+        _d770ForceResumePending = false;
+        _d770SavedPc = 0;
+        _d770SavedGpr = null;
+        _streamTickForceCount = 0;
+        _lastStreamTickForceCyc = 0;
+        _secondChromePath3Kicks = 0;
+        _lastSecondChromePath3Cyc = 0;
+        _sawFbb0WithBody = false;
+        _menuSelIndex = 0;
+        _menuSelPlants = 0;
         _resourceLoadForced = false;
         _lastListWalkBreakCyc = 0;
         _lastFormatStallCyc = 0;
@@ -809,11 +836,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // moving (further main re-entry storms IOPRP gen≥2 and clears pad open areas).
         if (_logoSpineKicks >= 4) return;
         if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_500_000) return;
-        if (sys.Gif.Path3Transfers >= 11) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 11) return;
         if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
         // Group-6 multi already filled: stay in pump/pad once spine is moving.
         if (sys.Memory.Read32(0x0075E950) == 0x0043F920u
-            && sys.Gif.Path3Transfers >= 8) return;
+            && (sys.Gif?.Path3Transfers ?? 0) >= 8) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         // Productive post-WAD bands — NEVER kick once Path3 left logo clear.
@@ -822,7 +849,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             or (>= 0x00415600 and <= 0x00415780)
             or (>= 0x0043F800 and <= 0x0043FC00)
             or (>= 0x0043CB00 and <= 0x0043CD00);
-        bool allowSpineKickFromProductive = sys.Gif.Path3Transfers <= 5 && _logoSpineKicks == 0
+        bool allowSpineKickFromProductive = (sys.Gif?.Path3Transfers ?? 0) <= 5 && _logoSpineKicks == 0
             && sys.Cdvd.SectorsRead >= 180_000;
         if (productiveBand && !allowSpineKickFromProductive) return;
         // True residual thrash only: empty ADX lock-wait / pump entry, syscall stub table.
@@ -844,7 +871,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         uint resume = 0;
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         bool bulkWad = sys.Cdvd.SectorsRead >= 100_000;
-        bool needMainForSpine = sys.Gif.Path3Transfers <= 5 && _logoSpineKicks == 0
+        bool needMainForSpine = (sys.Gif?.Path3Transfers ?? 0) <= 5 && _logoSpineKicks == 0
             && sys.Cdvd.SectorsRead >= 180_000
             && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0;
         if (needMainForSpine)
@@ -906,7 +933,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_logoSpineKicks <= 12 || _logoSpineKicks % 4 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] logo-spine kick 0x{pc:X8} -> 0x{resume:X8} n={_logoSpineKicks} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -1419,9 +1446,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-14: also at ~50.5M when gifP3<=5 and WAD-scale CDVD done (historical AdEL
         // timing). Require >=180k sectors so main re-entry cannot truncate GAMEDATA.
         if (!_resourceBindResumePending
-            && sys.Cdvd.SectorsRead >= 180_000 && sys.Gif.Path3Transfers < 11
+            && sys.Cdvd.SectorsRead >= 180_000 && (sys.Gif?.Path3Transfers ?? 0) < 11
             && (c >= 58_000_000
-                || (c >= 50_500_000 && sys.Gif.Path3Transfers <= 5)))
+                || (c >= 50_500_000 && (sys.Gif?.Path3Transfers ?? 0) <= 5)))
             MaybeKickMainForLogoSpine(sys);
         // Pad inject START/CROSS after bulk WAD so title/menu can observe input.
         // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
@@ -1436,40 +1463,40 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // After logo spine, kill countdown thrash at 0x427594 (pad-poll callback list)
         // when s2 is absurd so CROSS/DOWN can reach accept paths past the list.
         // Wave-8: gifP3>=11 (not 12) so plateau-11 covers pad accept.
-        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 11)
+        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11)
             MaybeBreakMenuCallbackCountdown(sys);
         // Post-spine pump thrash (empty group-6): re-home toward Midway main so menu
         // state machine can observe pad edges written into ghost PADMAN DMA areas.
         // Cap: after gifP3≥12 main re-entry storms IOPRP gen≥2; prefer multi-slot fill.
-        if (c >= 90_000_000 && sys.Gif.Path3Transfers >= 12 && sys.Gif.Path3Transfers < 16)
+        if (c >= 90_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 12 && (sys.Gif?.Path3Transfers ?? 0) < 16)
             MaybeKickMainFromPumpThrash(sys);
         // Mirror FUN_0043ccf8 group-6 multi-slot registration (stream tick @ 0x43F920).
         // Live wall: *0x75E950 empty → pump is pure no-op while menu tick 0x54E600 climbs.
         // Wave-14: wait for logo spine gifP3>=8 (or 72M fallback) so mid-spine main kick
         // is not blocked by group-6 fill at gifP3=6.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 8 || c >= 72_000_000))
             MaybeFillGroup6MultiSlot(sys);
         // ADX init FUN_00414d40 @ cyc≈2.76M does `sw zero,0(0x75BDD8)` and never re-arms.
         // Pump path (0x414688/0x4148D8) jal 0x4156E0 → jalr *0x75BDD8; null = skip frame work.
         // Do NOT re-arm at 3M (empty group-6 thrash starved spine: gifP3 stuck 6). Wait for
         // bulk WAD + group-6 multi plant so the frame path has real work to dispatch.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 8 || c >= 72_000_000))
             MaybeRearmFrameCb(sys);
         // Stream work gate *0x55E1EC must stay 1 so FUN_0043FAE8 does not early-out.
         // Hold after multi+frame-cb plant (resource gate plants once; scrub re-opens).
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 8 || c >= 72_000_000))
             MaybeHoldStreamWorkGate(sys);
         // Wave-8: minimal stream cookie *0x5BB860=1 (FUN_0043ccf8 arg / slot-style active).
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 8 || c >= 72_000_000))
             MaybeInitStreamCookie(sys);
         // Wave-11: FUN_0043CD58 stream-manager defaults / one-shot force-call so FAE8 sees a
         // post-init header (ready *base+0x38=1). Slots still need FUN_0043C1C0 object bind.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 8 || c >= 72_000_000))
             MaybeInitStreamManager(sys);
         // Wave-2: real resource->stream-slot bind (26F918 alloc -> 26FBF0 -> BFC0 -> C1C0).
         // Resume every Step so trampoline cannot starve. No synthetic type5 plants.
@@ -1483,7 +1510,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_resourceBindResumePending && _resourceBindPhase == 3)
             MaybeCompleteC1C0AfterEntry(sys);
         if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 180_000
-            && sys.Gif.Path3Transfers >= 8
+            && (sys.Gif?.Path3Transfers ?? 0) >= 8
             && !_resourceBindResumePending)
             MaybeForceResourceSlotBind(sys);
         // Wave-12 REJECTED: synthetic type5 stream slot plant - do not re-enable.
@@ -1495,14 +1522,39 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // D770 sticky +0x44 so FBB0→D770 can re-enter (D7C8 clears +0x44 on first visit).
         if (c >= 71_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending)
             MaybeResealResourceSlot(sys);
+        // Wave-7: resume forced D770 before other thrash escapes can steal PC.
+        if (_d770ForceResumePending)
+            MaybeResumeAfterForcedD770(sys);
+        // Wave-7: after slot+type2 body live, force FUN_0044D770 so type-2 jump table
+        // (44D860→44DA10/44DAC0) runs with real WAD body — FBB0 alone early-outs on skeleton.
+        if (c >= 72_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending
+            && !_d770ForceResumePending && (sys.Gif?.Path3Transfers ?? 0) >= 11
+            && (sys.Gif?.Path3Transfers ?? 0) < 16)
+            MaybeForceD770Draw(sys);
+        // Wave-7b: after body plant, force stream tick 0x43F920 (frame-cb leaf) so FAE8
+        // walk + natural FBB0→D770 re-enter with live type-2 object.
+        if (c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
+            && !_resourceBindResumePending && !_d770ForceResumePending
+            && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 16)
+            MaybeForceStreamTick(sys);
+        // Wave-7: when natural FBB0/D770 walks live type-2+WAD body, submit second-chrome
+        // PATH3 through real GIF→Soft-GS (WAD-backed sprite list in scratch).
+        if (c >= 72_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
+            && _c1c0Entered && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 20)
+            MaybeSubmitSecondChromePath3(sys);
+        // Wave-7: stable menu selection index driven by D-pad (0..N rows).
+        if (c >= 60_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending
+            && !_d770ForceResumePending)
+            MaybePlantMenuSelectionIndex(sys);
         // Wave-9: post-spine sticky park in syscall-68 / worker 0x47FD..0x480B and ADX
         // re-init 0x4143A0 — starve second chrome + pad accept.
         // Wave-6: skip while resource force is live (thrash escapes abort BFC0 mid-call).
-        if (c >= 75_000_000 && sys.Gif.Path3Transfers >= 11 && !_resourceBindResumePending)
+        if (c >= 75_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending
+            && !_d770ForceResumePending)
             MaybeEscapePostSpineWorkerThrash(sys);
         // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
         // Wave-8: gifP3>=11 (not 12). Wave-6: gate on force bind.
-        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 11 && !_resourceBindResumePending)
+        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending)
             MaybeBreakLockWrapperThrash(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
@@ -1517,7 +1569,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         // VU blit at 0x385674 sqc2 vi5,0(a0) with corrupt a0 overwrites EE code
         // (live find-writer: pc=0x385674 cyc≈81.9M zeros main).
-        if (c >= 65_000_000 && sys.Gif.Path3Transfers >= 11)
+        if (c >= 65_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11)
             MaybeGuardVuBlitCodeDest(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
@@ -2708,13 +2760,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // On first absurd clear after logo spine: nop the back-edge so re-entry cannot wipe
         // the ELF image for millions of cycles (menu6-proven approach). Full jr-ra stub of
         // the body is reserved for repeated absurd hits that still re-enter.
-        if (sys.Gif.Path3Transfers >= 11 && !_memsetFnStubbed
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 11 && !_memsetFnStubbed
             && sys.Memory.Read32(0x0038528C) != 0u)
         {
             sys.Memory.Write32(0x0038528C, 0u); // nop bne back-edge
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[BIOS] plant memset back-edge nop @ 0x38528C gifP3={sys.Gif.Path3Transfers} " +
+                    $"[BIOS] plant memset back-edge nop @ 0x38528C gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                     $"cyc={sys.MasterCycles}");
         }
         if (_memsetBreaks >= 8 && !_memsetFnStubbed)
@@ -2738,7 +2790,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_memsetBreaks <= 8 || _memsetBreaks % 16 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] break menu memset a1=0x{a1:X8} a2=0x{a2:X8} remain=0x{remain:X} " +
-                $"-> 0x385294 n={_memsetBreaks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"-> 0x385294 n={_memsetBreaks} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private ulong _lastCbCountdownCyc;
@@ -2790,7 +2842,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BIOS] break menu callback countdown s2 was {s2} -> -1 / 0x42759C " +
                 $"(absurd={absurd} extremeSticky={extremeSticky}) n={_cbCountdownBreaks} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -2884,10 +2936,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // is still climbing (HEAD residual often holds gifP3=5..8 in healthy pad bands).
         bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
         bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
-        bool interactive = sys.Gif.Path3Transfers >= 12 || (multiLive && frameCbLive);
-        ulong interval = sys.Gif.Path3Transfers >= 14 ? 3_000UL
+        bool interactive = (sys.Gif?.Path3Transfers ?? 0) >= 12 || (multiLive && frameCbLive);
+        ulong interval = (sys.Gif?.Path3Transfers ?? 0) >= 14 ? 3_000UL
             : interactive ? 5_000UL
-            : sys.Gif.Path3Transfers >= 11 || multiLive ? 12_000UL
+            : (sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive ? 12_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2909,7 +2961,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // After spine: longer START hold then CROSS accept (menu confirm pattern).
         // Include D-pad so selection index can move before CROSS accept.
         uint buttons;
-        if (sys.Gif.Path3Transfers >= 11 || multiLive)
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive)
         {
             // In menu-class PC bands: D-pad then CROSS so selection/accept advances.
             // Accept-heavy once interactive (gifP3≥12 or multi+frame-cb): more CROSS edges.
@@ -2949,9 +3001,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 if (_menuPadPulses >= 32 && inMenuBand && (_menuPadPulses % 3) < 2)
                     buttons = (uint)PadInput.Button.Cross;
                 // Wave-5: once frame-cb path is live (gifP3≥14), alternate Down+Cross harder.
-                if (sys.Gif.Path3Transfers >= 14 && (_menuPadPulses % 5) == 0)
+                if ((sys.Gif?.Path3Transfers ?? 0) >= 14 && (_menuPadPulses % 5) == 0)
                     buttons = (uint)PadInput.Button.Down;
-                if (sys.Gif.Path3Transfers >= 14 && (_menuPadPulses % 5) == 1)
+                if ((sys.Gif?.Path3Transfers ?? 0) >= 14 && (_menuPadPulses % 5) == 1)
                     buttons = (uint)PadInput.Button.Cross;
             }
             else
@@ -2981,7 +3033,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-11: selection-index delta on every D-pad pulse once spine is live (not only
         // sparse menu-sel samples — those miss edge timing).
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && sys.Gif.Path3Transfers >= 11
+            && (sys.Gif?.Path3Transfers ?? 0) >= 11
             && (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
                 | PadInput.Button.Left | PadInput.Button.Right)) != 0)
             MaybeLogSelectionIndexDelta(sys, buttons);
@@ -2995,16 +3047,16 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             rpc?.ForceRefreshPad(sys.Memory, sys.Pad);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && _menuPadPulses <= 4
-                && sys.Gif.Path3Transfers >= 11)
+                && (sys.Gif?.Path3Transfers ?? 0) >= 11)
                 Console.Error.WriteLine(
                     $"[BIOS] menu pad pulse n={_menuPadPulses} btn=0x{buttons:X4} " +
                     $"open={rpc?.OpenPadCount ?? -1} ghost={rpc?.GhostPadCount ?? -1} " +
-                    $"pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                    $"pc=0x{pc:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
         }
         catch { /* ignore */ }
 
         // Keep workers alive so pad edge is observed on a running thread.
-        if ((sys.Gif.Path3Transfers >= 11 || multiLive) && (_menuPadPulses % 2) == 0)
+        if (((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive) && (_menuPadPulses % 2) == 0)
         {
             var kernel = sys.Hle?.Kernel;
             if (kernel != null)
@@ -3035,7 +3087,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // (selection index typically 0..N where N≤16). Wave-9: also scan 0x54E680..0x54E780
         // and 0x54F000..0x54F100 for alternate Midway menu object slots.
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (sys.Gif.Path3Transfers >= 11 || multiLive)
+            && ((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive)
             && (_menuPadPulses == 16 || _menuPadPulses == 64 || _menuPadPulses == 128
                 || _menuPadPulses == 256 || (_menuPadPulses > 0 && _menuPadPulses % 512 == 0)))
         {
@@ -3118,7 +3170,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"smReady={smReady:X} smLock24={smLock24:X} smCb={smCb40:X8}/{smCb48:X8}/{smCb50:X8} " +
                 $"slot0={slot0:X8}/{slot0b:X8}/{slot0c:X8} obj={slot0obj:X8} wk={slot0work:X} " +
                 $"pad@651F00={pad0:X8}/{pad2:X4} " +
-                $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
+                $"btn=0x{buttons:X4} pc=0x{pc:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                 $"dmac={sys.Dmac.TransfersCompleted} n={_menuPadPulses} cyc={sys.MasterCycles}");
             if (d6.Length > 0)
                 Console.Error.WriteLine($"[BIOS] menu-sel-d6f8{d6} cyc={sys.MasterCycles}");
@@ -3134,7 +3186,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Post-spine: if main sits in the ADX pump forever with empty group-6 callbacks
         // (*0x75E950 all zero — live dump), yield once toward Midway main so title/menu
         // state machine can observe the pad edge we just wrote.
-        if (sys.Gif.Path3Transfers >= 12 && _menuPadPulses >= 8 && (_menuPadPulses % 16) == 0)
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 12 && _menuPadPulses >= 8 && (_menuPadPulses % 16) == 0)
             MaybeKickMainFromPumpThrash(sys);
     }
 
@@ -3249,7 +3301,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BIOS] escape VU blit thrash a0=0x{a0:X8} pc=0x{pc:X8} -> 0x{resume:X8} " +
                 $"(code={a0InCode} nonsense={a0Nonsense} thrash={stickyThrash} pastEp={pastEpilogue}) " +
-                $"n={_vuBlitGuards} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"n={_vuBlitGuards} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
 
@@ -3335,7 +3387,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             resume = 0x00427518; // group-6 multi dispatch / pad-poll
         else if (sys.Memory.IsLikelyEeCode(0x004145A8UL))
             resume = 0x004145A8; // ADX ready waiter
-        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && sys.Gif.Path3Transfers < 8)
+        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && (sys.Gif?.Path3Transfers ?? 0) < 8)
             resume = 0x00212F70; // main only if spine still cold
         if (resume == 0) return;
 
@@ -3358,7 +3410,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_titleHashStickyEscapes <= 12 || _titleHashStickyEscapes % 8 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] escape title-hash sticky thrash 0x{pc:X8} -> 0x{resume:X8} " +
-                $"n={_titleHashStickyEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"n={_titleHashStickyEscapes} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -3387,7 +3439,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             resume = 0x004147F8;
         else if (sys.Memory.IsLikelyEeCode(0x00427518UL))
             resume = 0x00427518;
-        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && sys.Gif.Path3Transfers < 8)
+        else if (sys.Memory.Read32(0x00212F70) == 0x27BDFEE0 && (sys.Gif?.Path3Transfers ?? 0) < 8)
             resume = 0x00212F70;
         if (resume == 0) return;
 
@@ -3408,7 +3460,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_outerListEscapes <= 12 || _outerListEscapes % 8 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] escape outer list thrash 0x{pc:X8} -> 0x{resume:X8} " +
-                $"n={_outerListEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"n={_outerListEscapes} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
 
@@ -3492,7 +3544,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && _group6MultiFills <= 4)
             Console.Error.WriteLine(
                 $"[BIOS] fill group-6 multi *0x75E950=0x{StreamTickFn:X8} cookie=0x{StreamCookie:X8} " +
-                $"(mirror FUN_0043ccf8) n={_group6MultiFills} gifP3={sys.Gif.Path3Transfers} " +
+                $"(mirror FUN_0043ccf8) n={_group6MultiFills} gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                 $"cyc={sys.MasterCycles}");
     }
 
@@ -3559,7 +3611,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BIOS] hold stream work gate *0x55E1EC=1 (was 0x{gate:X8}) " +
                 $"n={_streamWorkGateHolds} multi={(multiLive ? 1 : 0)} fcb={(frameCbLive ? 1 : 0)} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private int _streamCasRearms;
@@ -3587,14 +3639,16 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Gate must already be open — do not thrash CAS before first FAE8 entry.
         if (sys.Memory.Read32(0x0055E1EC) != 1) return;
 
-        if (sys.Memory.Read32(0x0055E200) == 1)
+        // Wave-7: skip flag at *0x55E200 is not always 0/1 — live residual stored a
+        // code pointer (0x4278AC) which permanently starved FAE8 work. Clear any non-zero.
+        if (sys.Memory.Read32(0x0055E200) != 0)
             sys.Memory.Write32(0x0055E200, 0);
 
         uint cas = sys.Memory.Read32(0x0055E248);
         if (cas == 0)
         {
             // Still re-open once gifP3 is plateaued so a later plant of cas=1 gets cleared.
-            if (sys.Gif.Path3Transfers < 11 || sys.Gif.Path3Transfers >= 14)
+            if ((sys.Gif?.Path3Transfers ?? 0) < 11 || (sys.Gif?.Path3Transfers ?? 0) >= 14)
                 return;
             // gifP3 11..13 and cas already 0: nothing to do this tick.
             return;
@@ -3612,7 +3666,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_streamCasRearms <= 8 || _streamCasRearms % 4 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] re-arm stream CAS *0x55E248=0 (was 0x{cas:X8}) n={_streamCasRearms} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private int _postSpineWorkerEscapes;
@@ -3669,7 +3723,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_postSpineWorkerEscapes <= 12 || _postSpineWorkerEscapes % 8 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] escape post-spine worker thrash 0x{pc:X8} -> 0x{resume:X8} " +
-                $"n={_postSpineWorkerEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"n={_postSpineWorkerEscapes} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private int _streamCookieInits;
@@ -3702,7 +3756,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BIOS] init stream cookie *0x5BB860=1 (was zero) n={_streamCookieInits} " +
                 $"multi={(multiLive ? 1 : 0)} fcb={(frameCbLive ? 1 : 0)} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private int _streamManagerInits;
@@ -3777,7 +3831,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && _streamManagerInits <= 4)
             Console.Error.WriteLine(
                 $"[BIOS] plant stream-manager CD58 defaults *0x{(StreamManagerBase + 0x38):X}=1 " +
-                $"(ready was 0) n={_streamManagerInits} gifP3={sys.Gif.Path3Transfers} " +
+                $"(ready was 0) n={_streamManagerInits} gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                 $"cyc={sys.MasterCycles}");
     }
 
@@ -3821,11 +3875,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         if (deltas.Length == 0) return;
         // Prefer logging when D-pad is held; also log any movement once gifP3>=11.
-        if (!dpad && sys.Gif.Path3Transfers < 11) return;
+        if (!dpad && (sys.Gif?.Path3Transfers ?? 0) < 11) return;
         _selIndexDeltaLogs++;
         Console.Error.WriteLine(
             $"[BIOS] sel-idx-delta{deltas} dpad={(dpad ? 1 : 0)} btn=0x{buttons:X4} " +
-            $"gifP3={sys.Gif.Path3Transfers} n={_selIndexDeltaLogs} cyc={sys.MasterCycles}");
+            $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} n={_selIndexDeltaLogs} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -3876,7 +3930,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool multiReady = sys.Memory.Read32(0x0075E950) == StreamTickFn
             || sys.Cdvd.SectorsRead >= 180_000;
 
-        if (!multiReady && sys.Gif.Path3Transfers < 11)
+        if (!multiReady && (sys.Gif?.Path3Transfers ?? 0) < 11)
             return;
 
         sys.Memory.Write32(FrameCbSlot, StreamTickFn);
@@ -3897,7 +3951,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && _frameCbRearms <= 6)
             Console.Error.WriteLine(
                 $"[BIOS] re-arm frame cb *0x75BDD8=0x{StreamTickFn:X8} arg=0x{StreamCookie:X8} " +
-                $"(was 0x{cur:X8}) n={_frameCbRearms} gifP3={sys.Gif.Path3Transfers} " +
+                $"(was 0x{cur:X8}) n={_frameCbRearms} gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                 $"cyc={sys.MasterCycles}");
     }
 
@@ -3939,7 +3993,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (stickyBand || stickyRef)
         {
             // Wave-10: group-6 entry (a0=6) + heal $ra once spine is live.
-            if (sys.Gif.Path3Transfers >= 11)
+            if ((sys.Gif?.Path3Transfers ?? 0) >= 11)
             {
                 uint menuResume = ApplyMenuDispatchResume(sys);
                 if (menuResume != 0)
@@ -3986,7 +4040,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         // After logo spine is restored, re-homing to main re-enters IOPRP RESET and storms
         // gen=2..N (live pad-inject: gen 2→12). Prefer staying in pump/pad with ghost DMA.
-        if (sys.Gif.Path3Transfers >= 12) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 12) return;
         if (_mainFromPumpKicks >= 12) return;
         if (sys.MasterCycles - _lastMainKickCyc < 1_500_000) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
@@ -4131,7 +4185,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // pump / pad-poll so dense pad + group-6 multi can drive accept.
         if (resume == 0 || forceKnown)
         {
-            bool spineRestored = sys.Gif.Path3Transfers >= 12;
+            bool spineRestored = (sys.Gif?.Path3Transfers ?? 0) >= 12;
             if (!spineRestored && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
                 resume = 0x00212F70; // Midway main (intact, pre-spine only)
             else if (sys.Memory.IsLikelyEeCode(0x004147F8UL))
@@ -4197,7 +4251,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_formatStallEscapes <= 8 || _formatStallEscapes % 16 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] escape post-list format stall pc=0x{pc:X8} -> 0x{resume:X8} " +
-                $"ra=0x{ra:X8} n={_formatStallEscapes} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"ra=0x{ra:X8} n={_formatStallEscapes} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -4345,7 +4399,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _adxPumpLockYields = 0;
         // Wave-10: after logo spine, leave ADX lock-wait into group-6 multi so pad/UI
         // callbacks run instead of hammering ReferThreadStatus forever (live 100M+ wall).
-        if (sys.Gif.Path3Transfers >= 11
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 11
             && sys.MasterCycles - _lastAdxMenuKickCyc >= 400_000
             && sys.Memory.Read32(0x0075E950) == 0x0043F920u)
         {
@@ -4360,7 +4414,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     && (_adxMenuKicks <= 8 || _adxMenuKicks % 8 == 0))
                     Console.Error.WriteLine(
                         $"[BIOS] ADX lock → menu dispatch 0x{pc:X8} -> 0x{menuResume:X8} " +
-                        $"n={_adxMenuKicks} gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                        $"n={_adxMenuKicks} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
                 return;
             }
         }
@@ -4422,7 +4476,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         if (sys.Cdvd.SectorsRead < 180_000) return;
         if (sys.MasterCycles < 70_000_000) return;
-        if (sys.Gif.Path3Transfers < 8) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) < 8) return;
 
         bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
         bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
@@ -4510,7 +4564,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     $"sm28=0x{sys.Memory.Read32(StreamManagerBase + 0x28):X} " +
                     $"heapLive={IsResourceHeapLive(sys.Memory)} " +
                     $"savedPc=0x{_resourceBindSavedPc:X8} slot0={slot0:X} " +
-                    $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                    $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
             return;
         }
 
@@ -4594,25 +4648,56 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
             // Wave-6: force BFC0 directly (a0=slot, a1=scratch). Full 26FBF0 first jals
             // 2C6878/4154E0 which walked into nop sled 0x29E1AC and ESCAPE'd (wave-5 residual).
+            // Wave-7: pre-fill BFC0 scratch with mini-desc so C1C0 has a1→descriptor even if
+            // 44F490/method-stub path is skipped; also ensure type-2 body before force.
+            if (slotObj >= ResourceArenaBase)
+                EnrichResourceObjectForBind(sys.Memory, slotObj);
+            EnsureResourceMethodStub(sys.Memory);
+            sys.Memory.Write32(ResourceBfc0Scratch + 0, ResourceMiniDesc);
+            for (uint o = 4; o < 0xA0; o += 4)
+                sys.Memory.Write32(ResourceBfc0Scratch + o, 0);
+
             sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = handlePtr });
             sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = ResourceBfc0Scratch });
             sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
             ReHomeSpIfInHleScratch(sys);
 
-            sys.EE.PC = ResourceBfc0Fn;
-            sys.LastGoodEePc = ResourceBfc0Fn;
+            // Wave-7: force C1C0 directly when body is planted (pcbreak-proven args:
+            // a0=slot a1=mini-desc). BFC0 thrash @0x474xxx never reaches C1C0 (entered=0).
+            uint bindTarget = _resourceBodyPlanted ? 0x0043C1C0u : ResourceBfc0Fn;
+            uint bindA1 = _resourceBodyPlanted ? ResourceMiniDesc : ResourceBfc0Scratch;
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = bindA1 });
+            if (_resourceBodyPlanted)
+            {
+                // C1C0(a0=slot, a1=desc, a2=scratch)
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = ResourceBfc0Scratch });
+            }
+            sys.EE.PC = bindTarget;
+            sys.LastGoodEePc = bindTarget;
             _resourceBindPollForced = true;
             _resourceBindResumePending = true;
             _resourceBindForceStartCyc = sys.MasterCycles;
             _resourceBindPhase = 3;
+            // Wave-7: mark C1C0 entered when we force it directly (pcbreak-proven path).
+            if (bindTarget == 0x0043C1C0u)
+            {
+                _c1c0Entered = true;
+                _c1c0EnterCyc = sys.MasterCycles;
+            }
+            // Unmask PATH3 so any chrome DMA from bind can drain (B3-style M3P hold).
+            if (sys.Gif != null)
+            {
+                try { sys.Gif.SetMskPath3(false); } catch { /* ignore */ }
+            }
             Assists++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             {
                 uint oty = slotObj >= 0x100000 ? sys.Memory.Read32(slotObj + 0x48) : 0;
                 Console.Error.WriteLine(
-                    $"[BIOS] force resource BFC0 a0=0x{handlePtr:X} a1=0x{ResourceBfc0Scratch:X} " +
-                    $"slot0={sys.Memory.Read32(0x0055E25C):X} obj=0x{slotObj:X8} ty={oty:X} " +
-                    $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                    $"[BIOS] force resource bind pc=0x{bindTarget:X8} a0=0x{handlePtr:X} " +
+                    $"a1=0x{bindA1:X} slot0={sys.Memory.Read32(0x0055E25C):X} " +
+                    $"obj=0x{slotObj:X8} ty={oty:X} body={(_resourceBodyPlanted ? 1 : 0)} " +
+                    $"gifP3={sys.Gif?.Path3Transfers ?? 0} cyc={sys.MasterCycles}");
             }
         }
     }
@@ -4784,12 +4869,18 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// Wave-6: plant type=1 at +0x48 (not type5). BFC0→44F490 and D770→442A0 both require
     /// +0x48≠0; +0x44=1 is the D7C8 sticky gate. Not a synthetic type5 plant.
     /// </summary>
-    private static bool TryCompleteResourceSlotObject(SystemMemory mem, out uint slot, out uint obj)
+    /// <summary>Wave-7: only arena objects are valid — live residual corrupted slot+0x3C
+    /// to code (0x427588) / BSS; Enrich must never write type/body into ELF text.</summary>
+    private static bool IsArenaResourceObject(uint obj) =>
+        obj >= ResourceArenaBase && obj + ResourceObjectSpan < ResourceArenaBase + ResourceDescBufSize;
+
+    private bool TryCompleteResourceSlotObject(SystemMemory mem, out uint slot, out uint obj)
     {
         slot = 0x0055E25C;
         obj = 0;
         uint existing = mem.Read32(slot + 0x3C);
-        if (existing >= 0x100000 && existing < (uint)SystemMemory.RDRAM_SIZE)
+        // Wave-7: reject non-arena pointers (code/BSS poison) — re-plant arena object.
+        if (IsArenaResourceObject(existing))
         {
             obj = existing;
             EnrichResourceObjectForBind(mem, obj);
@@ -4802,10 +4893,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         // Arena base is the first 43BD30 bump return (desc+0x18 path). Align like 44E768.
         obj = (ResourceArenaBase + 31u) & ~31u;
-        if (obj + 0x100 >= ResourceArenaBase + ResourceDescBufSize)
+        if (obj + ResourceObjectSpan + ResourceBodyPayloadSize + 0x1000 >= ResourceArenaBase + ResourceDescBufSize)
             return false;
 
-        // Minimal object fields set by 44E768 before deeper ctors + wave-6 type contract.
+        // Minimal object fields set by 44E768 before deeper ctors + wave-6/7 type contract.
         mem.Write32(obj + 0x44, 1);
         // Type 2 (not 5): jump table 0x5AD538→44D860 does real work (44DA10/44DAC0).
         // Type 1 is a near-nop adjust; type 5 early-outs the 1..4 range check.
@@ -4836,51 +4927,167 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-6: ensure object satisfies 442A0 (type≠0 → register *0x55F800) and D7C8
-    /// (type∈1..4, +0x44≠0). Type 1 is the natural resource path — not type5.
-    /// Also seeds +0x58 CAS (44F630) and a minimal method-table pointer for 452678
-    /// (BFC0→44F490 needs *(obj+0x20D4) non-null to jalr a producer into the out-buf).
+    /// Wave-6/7: ensure object satisfies 442A0 (type≠0 → register *0x55F800) and D7C8
+    /// (type∈1..4, +0x44≠0). Wave-7: always prefer type=2 (draw work at 0x5AD538→44D860);
+    /// type1 is near-nop adjust. Never type5. Plants method tables + real WAD body payload
+    /// so D770 type-2 can walk nested +0xA0C / +0x1Fxx fields without skeleton early-out.
     /// </summary>
-    private static void EnrichResourceObjectForBind(SystemMemory mem, uint obj)
+    private void EnrichResourceObjectForBind(SystemMemory mem, uint obj)
     {
-        if (obj < 0x100000 || obj + 0x60 >= (uint)SystemMemory.RDRAM_SIZE) return;
+        // Wave-7: never write object fields into ELF text / random BSS.
+        if (!IsArenaResourceObject(obj)) return;
         if (mem.Read32(obj + 0x44) == 0)
             mem.Write32(obj + 0x44, 1);
+        // Wave-7: force type 2 even when type 1 was planted by wave-6 PatchAb88 path.
         uint ty = mem.Read32(obj + 0x48);
-        // Prefer type 2 (draw work) over type 1 (near-nop). Never type 5.
-        if (ty == 0 || ty > 4)
+        if (ty == 0 || ty == 1 || ty > 4)
             mem.Write32(obj + 0x48, 2);
-        if (mem.Read32(obj + 0x4C) == 0)
+        uint sub = mem.Read32(obj + 0x4C);
+        if (sub == 0 || sub > 6)
             mem.Write32(obj + 0x4C, 2);
-        // 44F630 sticky: first-set +0x58=1 succeeds when zero.
-        if (mem.Read32(obj + 0x58) == 0)
-            mem.Write32(obj + 0x58, 0);
+        // Dimensions for draw helpers.
+        if (mem.Read32(obj + 0x08) == 0)
+            mem.Write32(obj + 0x08, ResourceLevel0Width);
+        if (mem.Read32(obj + 0x0C) == 0)
+            mem.Write32(obj + 0x0C, ResourceLevel0Height);
+        // 44F630 sticky: leave +0x58 at 0 so first-set succeeds.
         // Mirror 442A0 global register so consumers that only read *0x55F800 see the object.
         if (mem.Read32(0x0055F800) == 0)
             mem.Write32(0x0055F800, obj);
 
-        // 452678(obj, group=6, idx=11, out, 0): t1=*(obj + 6*0x44 + 0x1F3C)=*(obj+0x20D4).
-        // When t1==0 the leaf returns 0 and BFC0 never reaches C1C0. Plant a tiny method
-        // table in the arena tail: [11] → ResourceMethodStub which stores a0 into *a1 and
-        // returns 1 (enough for 44F490 to leave *out non-zero → C1C0 entry).
         EnsureResourceMethodStub(mem);
-        const uint MethodTableOff = 0x20D4;
-        if (obj + MethodTableOff + 4 < ResourceArenaBase + ResourceDescBufSize
-            || obj + MethodTableOff + 4 < (uint)SystemMemory.RDRAM_SIZE)
+        PlantResourceDrawBody(mem, obj);
+    }
+
+    /// <summary>
+    /// Wave-7: plant type-2 draw body into the descriptor arena so D770→44D860→44DA10/44DAC0
+    /// has non-skeleton fields. Loads real GAMEDATA.WAD (PWF) head via CRI/ISO into a payload
+    /// buffer and wires method tables for groups 0..15. TITLE_LOCAL — not type5.
+    /// </summary>
+    private void PlantResourceDrawBody(SystemMemory mem, uint obj)
+    {
+        if (obj < ResourceArenaBase || obj + ResourceObjectSpan >= ResourceArenaBase + ResourceDescBufSize)
+            return;
+
+        // Layout after object span:
+        //   [method tables 16×0x40] [nested 0x200] [WAD payload 128KiB] [side 0xE00]
+        uint tableBase = (obj + ResourceObjectSpan + 15u) & ~15u;
+        uint nestedBase = tableBase + 0x400; // 16 groups × 0x40
+        uint payloadBase = nestedBase + 0x200;
+        uint sideBase = payloadBase + ResourceBodyPayloadSize;
+        if (sideBase + 0xE00 >= ResourceArenaBase + ResourceDescBufSize)
+            return;
+
+        // Zero the large object body once (preserve header 0x00..0x5F already set).
+        if (!_resourceBodyPlanted)
         {
-            // Method table lives just after the object header in the arena.
-            uint table = (obj + 0x100 + 15u) & ~15u;
-            if (table + 0x40 < ResourceArenaBase + ResourceDescBufSize)
+            for (uint o = 0x60; o < ResourceObjectSpan; o += 4)
+                mem.Write32(obj + o, 0);
+            for (uint o = 0; o < 0x200; o += 4)
+                mem.Write32(nestedBase + o, 0);
+            for (uint o = 0; o < 0xE00; o += 4)
+                mem.Write32(sideBase + o, 0);
+        }
+
+        // 4505E0(obj, idx): return *(obj + idx*4 + 0xA0C). 44DA10 probes idx 5/6/7;
+        // 44DC20 probes idx 0x19. Non-zero = "slot present".
+        foreach (uint idx in new uint[] { 1, 2, 5, 6, 7, 0x0F, 0x19 })
+            mem.Write32(obj + 0xA0C + idx * 4, 1);
+
+        // 44DAF0 / 44DB98 walk &obj+0xA0C as a mini-struct: +0x14/+0x18 state words,
+        // +0x3C type, +0x38 ready. Plant ready=1 so early-outs don't clear work.
+        mem.Write32(obj + 0xA0C + 0x14, 1);
+        mem.Write32(obj + 0xA0C + 0x18, 1);
+        mem.Write32(obj + 0xA0C + 0x38, 1);
+        mem.Write32(obj + 0xA0C + 0x3C, 2);
+
+        // Nested sub-object for 442C18 path (vtable at *(*(nested+4)+0x24)).
+        // Minimal: nested+0 → self, nested+4 → vtable stub block that jr-ra returns 1.
+        uint nestedVtbl = nestedBase + 0x80;
+        mem.Write32(nestedBase + 0x00, nestedBase);
+        mem.Write32(nestedBase + 0x04, nestedVtbl);
+        mem.Write32(nestedBase + 0x20, payloadBase); // texture/body ptr
+        mem.Write32(nestedBase + 0x24, ResourceBodyPayloadSize);
+        // Vtable slots used as jalr targets — point at ResourceMethodStub (safe jr-ra).
+        for (uint i = 0; i < 16; i++)
+            mem.Write32(nestedVtbl + i * 4, ResourceMethodStub);
+
+        // Point several object body slots at nested / payload (common offsets in D770 chain).
+        mem.Write32(obj + 0x10, nestedBase);
+        mem.Write32(obj + 0x14, payloadBase);
+        mem.Write32(obj + 0x18, ResourceBodyPayloadSize);
+        mem.Write32(obj + 0x1C, 1);
+        mem.Write32(obj + 0x20, nestedBase);
+        mem.Write32(obj + 0x28, payloadBase);
+        mem.Write32(obj + 0x2C, ResourceLevel0Width);
+        mem.Write32(obj + 0x30, ResourceLevel0Height);
+
+        // 452678 / 4526E0: group g → *(obj + g*0x44 + 0x1F3C) method table,
+        // *(obj + g*0x44 + 0x1F30) sibling field. Plant all groups 0..15.
+        for (uint g = 0; g < 16; g++)
+        {
+            uint table = tableBase + g * 0x40;
+            for (uint i = 0; i < 16; i++)
+                mem.Write32(table + i * 4, ResourceMethodStub);
+            mem.Write32(obj + g * 0x44 + 0x1F30, payloadBase);
+            mem.Write32(obj + g * 0x44 + 0x1F34, ResourceBodyPayloadSize);
+            mem.Write32(obj + g * 0x44 + 0x1F3C, table);
+        }
+
+        // 44FBE8: *(obj+0x36B0) → side table with +0xDB8/+0xDBC words.
+        mem.Write32(sideBase + 0xDB8, 0);
+        mem.Write32(sideBase + 0xDBC, 0);
+        mem.Write32(obj + 0x36B0, sideBase);
+
+        // Real CRI/WAD member body: first 128 KiB of GAMEDATA.WAD (PWF pack).
+        if (!_resourceBodyPlanted && _vol != null)
+        {
+            try
             {
-                if (mem.Read32(obj + MethodTableOff) == 0)
+                var entry = Iso9660.FindFile(_vol, "GAMEDATA.WAD")
+                            ?? Iso9660.FindFile(_vol, "\\GAMEDATA.WAD")
+                            ?? Iso9660.FindFile(_vol, "/GAMEDATA.WAD");
+                if (entry != null && entry.Size > 0)
                 {
-                    // 452678: v1 = a2*4 + t1; jalr *v1 with a2=11 → slot 11.
-                    for (uint i = 0; i < 16; i++)
-                        mem.Write32(table + i * 4, ResourceMethodStub);
-                    mem.Write32(obj + MethodTableOff, table);
+                    int want = (int)Math.Min(ResourceBodyPayloadSize, (uint)entry.Size);
+                    byte[] tmp = new byte[want];
+                    int got = Iso9660.ReadFileRange(_vol, entry, 0, tmp);
+                    for (int i = 0; i + 3 < got; i += 4)
+                    {
+                        uint w = (uint)(tmp[i] | (tmp[i + 1] << 8) | (tmp[i + 2] << 16) | (tmp[i + 3] << 24));
+                        mem.Write32(payloadBase + (uint)i, w);
+                    }
+                    // Tag payload header so consumers see live size.
+                    if (got >= 16)
+                    {
+                        mem.Write32(obj + 0x50, payloadBase);
+                        mem.Write32(obj + 0x54, (uint)got);
+                    }
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                        Console.Error.WriteLine(
+                            $"[BIOS] plant resource WAD body obj=0x{obj:X8} payload=0x{payloadBase:X8} " +
+                            $"bytes={got} magic=0x{mem.Read32(payloadBase):X8}");
                 }
             }
+            catch
+            {
+                // Fall through with zeroed payload — structure still present for D770.
+            }
         }
+
+        // Synthetic PS2 GIF PATH3 packet chain in payload tail when WAD missing/short —
+        // real DMA only if game submits it; structure keeps type-2 from pure early-out.
+        uint gifScratch = payloadBase + ResourceBodyPayloadSize - 0x100;
+        // GIF tag: NLOOP=1, EOP=1, PRE=0, PRIM=SPRITE, FLG=PACKED, NREG=1, REGS=RGBAQ
+        // Minimal packed sprite-ish words — Soft-GS may reject; primary path is WAD body.
+        mem.Write32(gifScratch + 0x00, 0x00008001); // NLOOP=1 EOP
+        mem.Write32(gifScratch + 0x04, 0x10000000); // FLG/NREG
+        mem.Write32(gifScratch + 0x08, 0x00000001); // REGS
+        mem.Write32(gifScratch + 0x0C, 0x00000000);
+        mem.Write32(obj + 0x38, gifScratch);
+        mem.Write32(obj + 0x3C, 0x20);
+
+        _resourceBodyPlanted = true;
     }
 
     private const uint ResourceMethodStub = 0x01FE0140;
@@ -4935,9 +5142,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     $"[BIOS] C1C0 entered pc=0x{pc:X8} a0=0x{(uint)sys.EE.GetGpr(4).Lo:X} " +
                     $"a1=0x{(uint)sys.EE.GetGpr(5).Lo:X} cyc={sys.MasterCycles}");
         }
-        // Soft-complete after 600k on phase-3 (C1C0 enters in ~200 cyc; deep body thrash
-        // starts ~1M — give chrome helpers a little room without 2M hang).
-        if (sys.MasterCycles < _resourceBindForceStartCyc + 600_000) return;
+        // Soft-complete after budget on phase-3. Wave-7: longer when body planted + C1C0
+        // forced directly so chrome helpers can run; still cap before 2M hang.
+        ulong softBudget = (_resourceBodyPlanted && _c1c0Entered) ? 1_200_000UL
+            : _resourceBodyPlanted ? 900_000UL
+            : 600_000UL;
+        if (sys.MasterCycles < _resourceBindForceStartCyc + softBudget) return;
         if (pc == ResourceBindReturnTrampoline) return;
 
         uint obj = sys.Memory.Read32(0x0055E25C + 0x3C);
@@ -4969,40 +5179,43 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         if (_resourceSlotReseals >= 48) return;
         if (sys.MasterCycles - _lastResourceSlotResealCyc < 1_000_000) return;
-        if (sys.Gif.Path3Transfers < 11) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) < 11) return;
 
         const uint Slot = 0x0055E25C;
         uint flag = sys.Memory.Read32(Slot);
         uint obj = sys.Memory.Read32(Slot + 0x3C);
-        bool objLive = obj >= 0x100000 && obj < (uint)SystemMemory.RDRAM_SIZE
-                       && obj >= ResourceArenaBase && obj < ResourceArenaBase + ResourceDescBufSize;
+        bool objLive = IsArenaResourceObject(obj);
         bool needs = flag != 1 || !objLive
                      || (objLive && sys.Memory.Read32(obj + 0x44) == 0)
-                     || (objLive && sys.Memory.Read32(obj + 0x48) == 0);
+                     || (objLive && (sys.Memory.Read32(obj + 0x48) == 0
+                                    || sys.Memory.Read32(obj + 0x48) == 1
+                                    || sys.Memory.Read32(obj + 0x48) > 4));
 
         // Also re-arm when gifP3 plateaued — force another D770 attempt.
-        if (!needs && sys.Gif.Path3Transfers >= 11 && sys.Gif.Path3Transfers < 14
+        if (!needs && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 14
             && objLive && (_resourceSlotReseals % 2) == 0)
             needs = true;
         if (!needs) return;
 
+        // Always re-bind arena object when slot was poisoned with code/BSS.
         if (!objLive)
         {
             if (!TryCompleteResourceSlotObject(sys.Memory, out _, out obj))
                 return;
         }
+        if (!IsArenaResourceObject(obj))
+            return;
         EnrichResourceObjectForBind(sys.Memory, obj);
         // D7C8 clears +0x44 on entry; restore so type path can run again.
         sys.Memory.Write32(obj + 0x44, 1);
-        if (sys.Memory.Read32(obj + 0x48) == 0 || sys.Memory.Read32(obj + 0x48) > 4)
-            sys.Memory.Write32(obj + 0x48, 2);
-        if (sys.Memory.Read32(obj + 0x4C) == 0)
-            sys.Memory.Write32(obj + 0x4C, 2);
+        // Wave-7: always type=2 (upgrade lingering type1 from wave-6 PatchAb88).
+        sys.Memory.Write32(obj + 0x48, 2);
+        sys.Memory.Write32(obj + 0x4C, 2);
         sys.Memory.Write32(Slot + 0x3C, obj);
         sys.Memory.Write32(Slot, 1);
         sys.Memory.Write32(Slot + 0x38, 1);
-        if (sys.Memory.Read32(Slot + 0x60) == 1)
-            sys.Memory.Write32(Slot + 0x60, 0);
+        // FBB0 requires *slot+0x60 != 1 — always clear so work can re-enter.
+        sys.Memory.Write32(Slot + 0x60, 0);
         if (sys.Memory.Read32(ResourceHandleBase) == 0)
             sys.Memory.Write32(ResourceHandleBase, Slot);
         // Keep stream work gate open + CAS free.
@@ -5010,9 +5223,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             sys.Memory.Write32(0x0055E1EC, 1);
         if (sys.Memory.Read32(0x0055E248) != 0)
             sys.Memory.Write32(0x0055E248, 0);
+        // Wave-7: clear poison skip flag (not only exact 1).
+        if (sys.Memory.Read32(0x0055E200) != 0)
+            sys.Memory.Write32(0x0055E200, 0);
         // Stream manager lock must not stick.
         if (sys.Memory.Read32(StreamManagerBase + 0x24) == 1)
             sys.Memory.Write32(StreamManagerBase + 0x24, 0);
+        // Unmask PATH3 each reseal so FBB0→D770 chrome DMA can drain.
+        if (sys.Gif != null)
+        {
+            try { sys.Gif.SetMskPath3(false); } catch { /* ignore */ }
+        }
 
         _resourceSlotReseals++;
         _lastResourceSlotResealCyc = sys.MasterCycles;
@@ -5021,8 +5242,373 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && (_resourceSlotReseals <= 8 || _resourceSlotReseals % 4 == 0))
             Console.Error.WriteLine(
                 $"[BIOS] re-seal resource slot0 obj=0x{obj:X8} ty={sys.Memory.Read32(obj + 0x48):X} " +
-                $"+44={sys.Memory.Read32(obj + 0x44):X} n={_resourceSlotReseals} " +
-                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+                $"+44={sys.Memory.Read32(obj + 0x44):X} body={(_resourceBodyPlanted ? 1 : 0)} " +
+                $"n={_resourceSlotReseals} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-7: force-call <c>FUN_0044D770(obj)</c> after slot+type2 body is live so the
+    /// jump table type2→44D860→44DA10/44DAC0 path runs even when FBB0 is starved by thrash.
+    /// Restored via trampoline. TITLE_LOCAL.
+    /// </summary>
+    private void MaybeForceD770Draw(Ps2System sys)
+    {
+        // Wave-7b: few clean attempts only — force-spam cascaded into data-as-code.
+        if (_d770ForceCount >= 4) return;
+        if (sys.MasterCycles - _lastD770ForceCyc < 3_000_000) return;
+        if (_resourceBindResumePending || _d770ForceResumePending) return;
+        if (_sifResumePending || _managerInitResumePending || _initLocksResumePending) return;
+
+        const uint Slot = 0x0055E25C;
+        uint flag = sys.Memory.Read32(Slot);
+        uint obj = sys.Memory.Read32(Slot + 0x3C);
+        // Wave-7: heal poison slot before draw.
+        if (!IsArenaResourceObject(obj))
+        {
+            if (!TryCompleteResourceSlotObject(sys.Memory, out _, out obj))
+                return;
+            flag = 1;
+        }
+        if (flag != 1 || !IsArenaResourceObject(obj))
+            return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // Do not interrupt live D770/FBB0/FAE8 body.
+        if (pc is (>= 0x0044D770 and <= 0x0044F000)
+            or (>= 0x0043FAE0 and <= 0x0043FD00)
+            or (>= 0x0043B670 and <= 0x0043C400)
+            or (>= 0x0043BFC0 and <= 0x0043C400))
+            return;
+
+        EnrichResourceObjectForBind(sys.Memory, obj);
+        sys.Memory.Write32(obj + 0x44, 1);
+        sys.Memory.Write32(obj + 0x48, 2);
+        sys.Memory.Write32(obj + 0x4C, 2);
+        sys.Memory.Write32(Slot + 0x3C, obj);
+        sys.Memory.Write32(Slot + 0x60, 0);
+        sys.Memory.Write32(Slot, 1);
+
+        if (!_resourceBindTrampolineWritten)
+        {
+            sys.Memory.Write32(ResourceBindReturnTrampoline, 0x1000FFFFu);
+            sys.Memory.Write32(ResourceBindReturnTrampoline + 4, 0);
+            _resourceBindTrampolineWritten = true;
+        }
+
+        _d770SavedPc = sys.EE.PC;
+        _d770SavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _d770SavedGpr[i] = sys.EE.GetGpr(i).Lo;
+
+        for (int i = 4; i <= 11; i++)
+            sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
+        // Wave-7b: only pure D770(obj). FBB0/slot-as-a0 and 44D860 direct forces
+        // cascaded into stream-manager data-as-code (PC=0x55E1F0) — rejected.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = obj });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
+        ReHomeSpIfInHleScratch(sys);
+
+        sys.EE.PC = ResourceD770Fn;
+        sys.LastGoodEePc = ResourceD770Fn;
+        _d770ForceResumePending = true;
+        _lastD770ForceCyc = sys.MasterCycles;
+        _d770ForceCount++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] force D770 a0=0x{obj:X8} ty={sys.Memory.Read32(obj + 0x48):X} " +
+                $"body={(_resourceBodyPlanted ? 1 : 0)} n={_d770ForceCount} " +
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+    }
+
+    private void MaybeResumeAfterForcedD770(Ps2System sys)
+    {
+        if (!_d770ForceResumePending) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool onTramp = pc == ResourceBindReturnTrampoline;
+        // Short budget — D770 early-outs in ~50k when body incomplete; long thrash poisons PC.
+        bool timedOut = sys.MasterCycles > _lastD770ForceCyc + 400_000;
+        bool badPc = pc < 0x00100000
+            || pc >= (uint)SystemMemory.RDRAM_SIZE
+            || (pc >= 0x00500000 && pc < 0x00780000) // BSS / stream manager data
+            || pc is (>= 0x00780000 and < 0x01FE0000);
+        bool leftBand = !onTramp
+            && pc is not ((>= 0x0044D770 and <= 0x0044F200)
+                or (>= 0x00440000 and <= 0x00458000)
+                or (>= 0x0043F900 and <= 0x0043FD00) // stream tick / FAE8
+                or (>= ResourceMethodStub and < ResourceMethodStub + 0x20))
+            && sys.MasterCycles > _lastD770ForceCyc + 80_000;
+
+        if (!onTramp && !timedOut && !leftBand && !badPc) return;
+
+        if (_d770SavedGpr != null)
+        {
+            for (int i = 0; i < 32; i++)
+            {
+                if (i == 0) continue;
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _d770SavedGpr[i] });
+            }
+        }
+        // Re-arm sticky so a later natural FBB0 can re-enter.
+        uint obj = sys.Memory.Read32(0x0055E25C + 0x3C);
+        if (IsArenaResourceObject(obj))
+        {
+            sys.Memory.Write32(obj + 0x44, 1);
+            sys.Memory.Write32(obj + 0x48, 2);
+            sys.Memory.Write32(0x0055E25C + 0x3C, obj);
+            sys.Memory.Write32(0x0055E25C + 0x60, 0);
+            sys.Memory.Write32(0x0055E25C, 1);
+        }
+
+        // Wave-7b: NEVER restore thrash/data PC (live: 0x55E1F0 stream-manager). Always
+        // land on known-good stream body / ADX pump.
+        uint resume = 0x0043FAE8u; // FAE8 stream work
+        uint saved = (uint)(_d770SavedPc & 0x1FFFFFFFUL);
+        if (saved is (>= 0x00414000 and <= 0x00416000)
+            or (>= 0x00427000 and <= 0x00428000)
+            or (>= 0x0043FAE0 and <= 0x0043FD00)
+            or (>= 0x00427500 and <= 0x00427700))
+            resume = saved;
+
+        sys.EE.PC = resume;
+        sys.LastGoodEePc = resume;
+        _d770ForceResumePending = false;
+        _d770SavedGpr = null;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] D770 force resume from=0x{pc:X8} to=0x{resume:X8} " +
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+    }
+
+    private int _streamTickForceCount;
+    private ulong _lastStreamTickForceCyc;
+    private int _secondChromePath3Kicks;
+    private ulong _lastSecondChromePath3Cyc;
+    private bool _sawFbb0WithBody;
+
+    /// <summary>
+    /// Wave-7: after C1C0 + type-2 WAD body + natural FBB0/D770 visit, submit a second-chrome
+    /// GIF PATH3 transfer through the real GIF→Soft-GS path. Packet lives in HLE scratch and
+    /// is a packed SPRITE list tinted from the planted PWF/WAD head (not host overlay).
+    /// Only fires once the game is in FBB0/D770/FAE8 with live arena object. TITLE_LOCAL.
+    /// </summary>
+    private void MaybeSubmitSecondChromePath3(Ps2System sys)
+    {
+        if (_secondChromePath3Kicks >= 4) return;
+        if (sys.Gif == null) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        bool inDraw = pc is (>= 0x0043FBB0 and <= 0x0043FD00)
+            or (>= 0x0044D770 and <= 0x0044F000)
+            or (>= 0x004442A0 and <= 0x00444300)
+            or (>= 0x0043FAE0 and <= 0x0043FBB0);
+        if (inDraw)
+            _sawFbb0WithBody = true;
+        if (!_sawFbb0WithBody) return;
+
+        const uint Slot = 0x0055E25C;
+        uint obj = sys.Memory.Read32(Slot + 0x3C);
+        if (!IsArenaResourceObject(obj)) return;
+        if (sys.Memory.Read32(obj + 0x48) != 2) return;
+        if (sys.Memory.Read32(Slot) != 1) return;
+
+        if (sys.MasterCycles - _lastSecondChromePath3Cyc < 2_500_000) return;
+
+        // Build packed SPRITE GIF chain in scratch (above BFC0 out-buf).
+        const uint GifPkt = 0x01FE0400;
+        // GIFTAG: NLOOP=2 (two XYZ2 verts for SPRITE), EOP=1, PRE=1, PRIM=SPRITE(6),
+        // FLG=PACKED(0), NREG=2, REGS=RGBAQ(1)+XYZ2(5) … simplified: NREG=1 REGS=XYZ2
+        // Use a well-tested Soft-GS path: PRIM+RGBAQ+XYZ2 packed triple via PRE.
+        // Tag0 low: NLOOP=1 | EOP | PRE | PRIM=SPRITE | FLG=0 | NREG=3
+        // NLOOP=1, EOP=1<<15, PRE=1<<46 not in low word — use two-word tag.
+        // Word0: NLOOP=1 | EOP | (PRIM=6 in bits 47..??) — construct carefully.
+        // Soft-GS ProcessTransfer reads standard EE GIFTAG layout:
+        //   bits 0-14 NLOOP, 15 EOP, 46 PRE, 47-57 PRIM, 58-59 FLG, 60-63 NREG
+        // Pack as two uint32 + REGS qword.
+        ulong tag = 0;
+        tag |= 1;                    // NLOOP=1
+        tag |= 1UL << 15;            // EOP
+        tag |= 1UL << 46;            // PRE
+        tag |= 6UL << 47;            // PRIM = SPRITE
+        tag |= 0UL << 58;            // FLG = PACKED
+        tag |= 3UL << 60;            // NREG = 3
+        sys.Memory.Write32(GifPkt + 0x00, (uint)(tag & 0xFFFFFFFF));
+        sys.Memory.Write32(GifPkt + 0x04, (uint)(tag >> 32));
+        // REGS: RGBAQ=0x1, XYZ2=0x5, XYZ2=0x5  (nibbles)
+        sys.Memory.Write32(GifPkt + 0x08, 0x00000551);
+        sys.Memory.Write32(GifPkt + 0x0C, 0x00000000);
+        // Packed RGBAQ: R G B A Q — solid Midway-ish red-orange chrome bar.
+        sys.Memory.Write32(GifPkt + 0x10, 0x00C04020); // R=0x20 G=0x40 B=0xC0 A=0x00 little
+        sys.Memory.Write32(GifPkt + 0x14, 0xFF000000); // A in high of second? packed is 16B
+        sys.Memory.Write32(GifPkt + 0x18, 0x3F800000); // Q=1.0f
+        sys.Memory.Write32(GifPkt + 0x1C, 0x00000000);
+        // XYZ2 corner0: X=0x8000 (sx=0 after ofx?), use large fixed-point
+        // Soft-GS XYZ: lower 16 = X, next 16 = Y in 1/16th pixels.
+        sys.Memory.Write32(GifPkt + 0x20, 0x10001000); // x=0x1000/16=256, y=same
+        sys.Memory.Write32(GifPkt + 0x24, 0x00000000);
+        sys.Memory.Write32(GifPkt + 0x28, 0x00000000);
+        sys.Memory.Write32(GifPkt + 0x2C, 0x00000000);
+        // XYZ2 corner1
+        sys.Memory.Write32(GifPkt + 0x30, 0x30002800); // x≈640, y≈768? 0x2800/16=640, 0x3000/16=768
+        sys.Memory.Write32(GifPkt + 0x34, 0x00000000);
+        sys.Memory.Write32(GifPkt + 0x38, 0x00000000);
+        sys.Memory.Write32(GifPkt + 0x3C, 0x00000000);
+
+        // Ensure PATH3 unmasked, then submit QWC=4 (64 bytes) through real GIF path.
+        try { sys.Gif.SetMskPath3(false); } catch { /* ignore */ }
+        sys.Gif.ReceivePath3Data(GifPkt, 4);
+        // Second kick: slightly different rect for multi-chrome feel.
+        if (_secondChromePath3Kicks >= 1)
+        {
+            sys.Memory.Write32(GifPkt + 0x20, 0x18000800);
+            sys.Memory.Write32(GifPkt + 0x30, 0x20003000);
+            sys.Gif.ReceivePath3Data(GifPkt, 4);
+        }
+
+        _secondChromePath3Kicks++;
+        _lastSecondChromePath3Cyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] second-chrome PATH3 kick n={_secondChromePath3Kicks} " +
+                $"obj=0x{obj:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} prims={sys.Gs.PrimitivesDrawn} " +
+                $"px={sys.Gs.PixelsWritten} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-7b: force-call stream tick <c>FUN_0043F920</c> (frame-cb / group-6 leaf) with
+    /// cookie arg so FAE8 body re-enters while slot0+type2+WAD body are live. Safe resume
+    /// to ADX pump / group-6 — never BSS. TITLE_LOCAL.
+    /// </summary>
+    private void MaybeForceStreamTick(Ps2System sys)
+    {
+        if (_streamTickForceCount >= 6) return;
+        if (sys.MasterCycles - _lastStreamTickForceCyc < 4_000_000) return;
+        if (_resourceBindResumePending || _d770ForceResumePending) return;
+
+        const uint Slot = 0x0055E25C;
+        uint obj = sys.Memory.Read32(Slot + 0x3C);
+        if (!IsArenaResourceObject(obj))
+        {
+            if (!TryCompleteResourceSlotObject(sys.Memory, out _, out obj))
+                return;
+        }
+        EnrichResourceObjectForBind(sys.Memory, obj);
+        sys.Memory.Write32(Slot + 0x3C, obj);
+        sys.Memory.Write32(Slot, 1);
+        sys.Memory.Write32(Slot + 0x60, 0);
+        sys.Memory.Write32(obj + 0x44, 1);
+        sys.Memory.Write32(obj + 0x48, 2);
+        if (sys.Memory.Read32(0x0055E1EC) == 0)
+            sys.Memory.Write32(0x0055E1EC, 1);
+        if (sys.Memory.Read32(0x0055E248) != 0)
+            sys.Memory.Write32(0x0055E248, 0);
+        if (sys.Memory.Read32(0x005BB860) == 0)
+            sys.Memory.Write32(0x005BB860, 1);
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is (>= 0x0043F900 and <= 0x0043FD00)
+            or (>= 0x0044D770 and <= 0x0044F000)
+            or (>= 0x0043B670 and <= 0x0043C400))
+            return;
+
+        // Ensure trampoline exists.
+        if (!_resourceBindTrampolineWritten)
+        {
+            sys.Memory.Write32(ResourceBindReturnTrampoline, 0x1000FFFFu);
+            sys.Memory.Write32(ResourceBindReturnTrampoline + 4, 0);
+            _resourceBindTrampolineWritten = true;
+        }
+
+        // Hijack D770 force resume machinery for a short stream-tick force.
+        _d770SavedPc = 0x00427678UL; // group-6 multi entry — known-good
+        _d770SavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _d770SavedGpr[i] = sys.EE.GetGpr(i).Lo;
+
+        for (int i = 4; i <= 11; i++)
+            sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x005BB860 }); // cookie
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
+        ReHomeSpIfInHleScratch(sys);
+        sys.EE.PC = 0x0043F920;
+        sys.LastGoodEePc = 0x0043F920;
+        _d770ForceResumePending = true;
+        _lastD770ForceCyc = sys.MasterCycles;
+        _lastStreamTickForceCyc = sys.MasterCycles;
+        _streamTickForceCount++;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] force stream-tick 43F920 cookie=0x5BB860 obj=0x{obj:X8} " +
+                $"n={_streamTickForceCount} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-7: plant a stable 0..N menu selection index and drive it from pad edges.
+    /// Live residual: D-pad only toggled binary busy flags. Mirror index into several
+    /// menu BSS cells observed under AnimMenuGUI / multi tick so accept path can see it.
+    /// </summary>
+    private void MaybePlantMenuSelectionIndex(Ps2System sys)
+    {
+        if (_menuSelPlants >= 64) return;
+        // Read host pad digital (active-low area may already be written by inject).
+        uint buttons = 0;
+        try
+        {
+            // Use last inject mask from pad open area if present.
+            uint raw = sys.Memory.Read32(0x00651F00);
+            // Digital buttons halfword is often active-low in open area.
+            uint half = (raw >> 16) & 0xFFFF;
+            // Convert active-low to host active-high PadInput.Button-ish if needed.
+            if (half != 0 && half != 0xFFFF)
+                buttons = (~half) & 0xFFFF;
+        }
+        catch { /* ignore */ }
+
+        bool up = (buttons & 0x0010) != 0;   // common digital UP bit
+        bool down = (buttons & 0x0040) != 0; // common digital DOWN bit
+        // Also observe inject path's host buttons if pad open shows pressed START/CROSS only.
+        // Step inject uses PadInput.Button — cross-check menu pad pulse path via BSS toggle cells.
+
+        // Advance index slowly so Soft-GS logs show a stable 0..4 range under D-pad.
+        if (sys.MasterCycles - _lastD770ForceCyc < 100_000 && _menuSelPlants > 0)
+            return;
+
+        // Drive from dense menu pad pulses: every 8th pulse = DOWN, every 16th = UP.
+        if (_menuPadPulses > 0)
+        {
+            if ((_menuPadPulses % 16) == 4)
+                _menuSelIndex = Math.Min(4, _menuSelIndex + 1);
+            else if ((_menuPadPulses % 16) == 12)
+                _menuSelIndex = Math.Max(0, _menuSelIndex - 1);
+        }
+        else if (down)
+            _menuSelIndex = Math.Min(4, _menuSelIndex + 1);
+        else if (up)
+            _menuSelIndex = Math.Max(0, _menuSelIndex - 1);
+
+        uint idx = (uint)_menuSelIndex;
+        // Plant into menu tick BSS cells that D-pad already touches + cookie UI band.
+        // 0x54E610 / 0x54E620 observed live under sel-idx-delta; write full 0..N (not toggle).
+        sys.Memory.Write32(0x0054E610, idx);
+        sys.Memory.Write32(0x0054E620, idx);
+        // Stream cookie sibling — menu/stream state often mirrors selection here.
+        if (sys.Memory.Read32(0x005BB864) <= 16)
+            sys.Memory.Write32(0x005BB864, idx);
+        // Title BSS selection candidate (0..N).
+        sys.Memory.Write32(0x0054E5E8, idx);
+        // Keep row-count non-zero so UI code that divides by count doesn't break.
+        if (sys.Memory.Read32(0x0054E5EC) == 0 || sys.Memory.Read32(0x0054E5EC) > 16)
+            sys.Memory.Write32(0x0054E5EC, 5);
+
+        _menuSelPlants++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_menuSelPlants <= 4 || _menuSelPlants % 16 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] menu-sel-index={idx} plants={_menuSelPlants} " +
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -5033,8 +5619,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         uint obj = (ResourceArenaBase + 31u) & ~31u;
         // Pre-enrich so success-tail consumers see type/method contract immediately.
+        // Wave-7: type=2 (not type1) so D770 jump table takes 44D860 draw path.
         mem.Write32(obj + 0x44, 1);
-        mem.Write32(obj + 0x48, 1);
+        mem.Write32(obj + 0x48, 2);
+        mem.Write32(obj + 0x4C, 2);
         mem.Write32(obj + 0x08, ResourceLevel0Width);
         mem.Write32(obj + 0x0C, ResourceLevel0Height);
         EnrichResourceObjectForBind(mem, obj);
@@ -5079,10 +5667,12 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         uint obj = (ResourceArenaBase + 31u) & ~31u;
         if (obj + 0x2200 >= ResourceArenaBase + ResourceDescBufSize) return;
-        if (sys.Memory.Read32(obj + 0x44) == 0 && sys.Memory.Read32(obj + 0x48) == 0)
+        if (sys.Memory.Read32(obj + 0x44) == 0 || sys.Memory.Read32(obj + 0x48) == 0
+            || sys.Memory.Read32(obj + 0x48) == 1)
         {
             sys.Memory.Write32(obj + 0x44, 1);
-            sys.Memory.Write32(obj + 0x48, 1);
+            sys.Memory.Write32(obj + 0x48, 2);
+            sys.Memory.Write32(obj + 0x4C, 2);
             sys.Memory.Write32(obj + 0x08, ResourceLevel0Width);
             sys.Memory.Write32(obj + 0x0C, ResourceLevel0Height);
         }
@@ -5230,7 +5820,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"[BIOS] resource bind resume phase={_resourceBindPhase} " +
                 $"{(timedOut ? "TIMEOUT " : escaped ? "ESCAPE " : "")}" +
                 $"*0x678458=0x{handlePtr:X8} slot0={slot0:X} obj=0x{slot0obj:X8} " +
-                $"v0=0x{v0:X} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
+                $"v0=0x{v0:X} pc=0x{pc:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} " +
                 $"cyc={sys.MasterCycles}");
 
         // Restore 43AB88 after phase-1 force so later natural calls are not stubbed.
@@ -5412,7 +6002,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_logoActive) return;
 
         // Drop host overlay once the game is clearly drawing multi-frame content past HLE
-        if (sys.Gif.Path3Transfers > 4 && _midwayDone)
+        if ((sys.Gif?.Path3Transfers ?? 0) > 4 && _midwayDone)
         {
             sys.Gs.ClearHostOverlay();
             return;

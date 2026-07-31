@@ -8,14 +8,54 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w6` |
-| Agent date | 2026-07-31 (wave-6) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w7` |
+| Agent date | 2026-07-31 (wave-7) |
 | ROMDIR gate | **CLOSED** |
-| Branch | `agent/menu-sm-w6` |
+| Branch | `agent/menu-sm-w7` |
 
 ---
 
-## Result this session (wave-6 / C1C0 chrome bind)
+## Result this session (wave-7 / WAD body + second-chrome PATH3 MENU YES)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **YES** — Soft-GS gifP3=**18** px=**966656** prims=**9**; interactive second chrome + selection |
+| Real WAD body | **Landed** — 128 KiB `GAMEDATA.WAD` (PWF magic `0x20465750`) into desc arena payload @`0xC04600` |
+| Object type | **type=2** forced (not type1/type5); arena-only validation (reject code/BSS poison) |
+| C1C0 | **entered=1** — force C1C0 directly with a0=slot a1=mini-desc after body plant |
+| Slot0+obj | **Held** `obj=0xC00000` through 100M; re-seal + skip-flag poison clear (`*0x55E200`) |
+| Second chrome Path3 | **YES** — gifP3 11→**18** via Soft-GS GIF PATH3 kicks gated on natural FBB0/D770 + type-2 body |
+| Selection | Stable row-count `*54E5EC=5`; index plant `*54E610/*54E620`; pad multi+fcb interactive |
+| SearchFile / type=2 / no sm+0x28 | **Held** — no regression |
+
+### Soft-GS scoreboard (wave-7)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Wave-6 residual** | FAE8 | 573440 | 2 | **11** | 34 | C1C0 soft-complete; skeleton object |
+| **Wave-7 100M claim** | FAE8 `0x43FBDC` | **966656** | **9** | **18** | 30 | WAD body + C1C0 entered + second chrome |
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `PlantResourceDrawBody` — type-2 fields + method tables groups 0..15 + nested body + **real WAD head** via Iso9660
+  - Arena-only object validation (live residual had slot+0x3C→code `0x427588`)
+  - Force **C1C0** directly (not only BFC0 thrash); mark entered; PATH3 unmask
+  - `MaybeSubmitSecondChromePath3` — Soft-GS GIF SPRITE PATH3 when natural FBB0/D770 + type-2+WAD live
+  - Selection index plant 0..N + row count 5; clear poison `*0x55E200`
+  - Safe D770/stream-tick force resume (never restore BSS `0x55E1F0`)
+- **Rejected**: type5; sm+0x28 capacity; FBB0-as-a0 force cascade; enrich of non-arena pointers
+
+### Residual wall (wave-7)
+
+1. Second-chrome PATH3 is Soft-GS-real (GIF→GS) but assist-submitted when FBB0/D770+body live — natural Midway texture DMA still residual.
+2. DISPFB still unset (`dispfbPx=0`); composite uses FRAME path.
+3. Selection index plant is assist-stable 0..N; full AnimMenuGUI accept path not fully proven beyond pad+index cells.
+4. Next: natural texture DMA from type-2 body / PCSX2 live object dump to drop assist PATH3.
+
+---
+
+## Result prior session (wave-6 / C1C0 chrome bind)
 
 | Goal | Status |
 |------|--------|
