@@ -292,11 +292,41 @@ public sealed class GsRegisters
         }
     }
 
+    /// <summary>
+    /// XYOFFSET_1 OFX/OFY as unsigned 16-bit 12.4 fixed (same unit as XYZ X/Y).
+    /// Screen pixel = (raw12_4 - of) &gt;&gt; 4. Bits: OFX[15:0], OFY[47:32] (Sony GS).
+    /// </summary>
     public void GetXyOffset(out int ofx, out int ofy)
     {
         ofx = (int)(XYOFFSET_1 & 0xFFFF);
         ofy = (int)((XYOFFSET_1 >> 32) & 0xFFFF);
     }
+
+    /// <summary>
+    /// Pure 12.4 fixed screen mapping: (raw - ofx/ofy) &gt;&gt; 4. No Soft-GS rescues.
+    /// Use for expand legality and when both OFX/OFY are programmed (non-zero).
+    /// </summary>
+    public static void MapScreenXy12_4(int xRaw, int yRaw, int ofx, int ofy, out int x, out int y)
+    {
+        x = (xRaw - ofx) >> 4;
+        y = (yRaw - ofy) >> 4;
+    }
+
+    /// <summary>
+    /// Retail-center XYOFFSET: OFX/OFY both in [0x6000,0x9000] (includes 0x8000 = 2048.0).
+    /// Demotion (G-GFX-6 / GX-043): natural PRIM size under this class should drive expandHits→0.
+    /// </summary>
+    public static bool IsRetailCenterOffset(int ofx, int ofy) =>
+        ofx is >= 0x6000 and <= 0x9000 && ofy is >= 0x6000 and <= 0x9000;
+
+    /// <summary>
+    /// Collapse-class OFX/OFY that may still need title-strip expand (MENU chrome).
+    /// ofx=ofy=0 (unprogrammed / GoW), exact 0x8000, or retail-center band.
+    /// </summary>
+    public static bool IsCollapseOffsetClass(int ofx, int ofy) =>
+        (ofx == 0 && ofy == 0)
+        || (ofx == 0x8000 && ofy == 0x8000)
+        || IsRetailCenterOffset(ofx, ofy);
 
     public int TexWidthLog2
     {

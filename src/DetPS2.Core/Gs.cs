@@ -74,9 +74,18 @@ public sealed class Gs : ISchedulable
     public long DispfbPixelsComposited { get; private set; }
     /// <summary>
     /// Soft-GS title-strip expand events (temporary MENU chrome; G-GFX-6 demotes later).
-    /// See docs/graphics/EXPAND_POLICY.md. Legal ofx: 0/0, 0x8000/0x8000, or [0x6000,0x9000] band.
+    /// Increments only when DrawSprite actually expands a legal collapsed strip.
+    /// See docs/graphics/EXPAND_POLICY.md. Collapse ofx: 0/0, 0x8000/0x8000, or [0x6000,0x9000] band.
+    /// Illegal expand killed when retail-center ofx + pure 12.4 map already on-FB with natural h.
     /// </summary>
     public long ExpandHits { get; private set; }
+
+    /// <summary>
+    /// Max natural sprite height (pixels) under retail-center XYOFFSET that still forbids expand.
+    /// Pure-mapped on-FB strips taller than this paint as-is (GX-021 illegal-expand kill).
+    /// Collapsed h=1 MENU strips (GoW/Whip) remain expandable.
+    /// </summary>
+    public const int ExpandRetailNaturalMinH = 2;
     /// <summary>Fragments rejected for FB bounds (before scissor).</summary>
     public long FragmentsRejectedBounds { get; private set; }
     /// <summary>Fragments rejected by SCISSOR_1.</summary>
@@ -428,16 +437,15 @@ public sealed class Gs : ISchedulable
         uint zRaw = (uint)((xyz >> 32) & 0xFFFFFF);
 
         Registers.GetXyOffset(out int ofx, out int ofy);
-        // Convert 12.4 to pixel: (raw - offset) / 16
-        int x = (xRaw - ofx) >> 4;
-        int y = (yRaw - ofy) >> 4;
+        // GX-021: pure 16-bit 12.4 fixed first — screen = (raw - OFX/OFY) >> 4 (Sony/Play!).
+        GsRegisters.MapScreenXy12_4(xRaw, yRaw, ofx, ofy, out int x, out int y);
 
-        // Retail GS: XYOFFSET often left 0 while verts use a 2048.0 (0x8000 in 12.4)
-        // origin so screen space is (raw - 0x8000) / 16. Without this, commercial titles
-        // kick thousands of prims with every fragment off-FB (B3: prims=2389 px=0).
-        // Homebrew path: large raw without retail centering → map 0..4096 → FB.
+        // Soft-GS rescues only when pure map is off-FB (or ofx unprogrammed). Do not invent
+        // PATH3; rescues only re-interpret XYZ when commercial packs leave ofx=0 or strip
+        // verts use raw Y near 0 under ofy=0x8000 (Whip MENU).
         if (ofx == 0 && ofy == 0)
         {
+            // Unprogrammed XYOFFSET: verts often use 2048.0 (0x8000) origin while OFX stays 0.
             int sxRaw = unchecked((short)(ushort)xRaw);
             int syRaw = unchecked((short)(ushort)yRaw);
             if (xRaw >= 0x6000 || yRaw >= 0x6000 || sxRaw < -16 || syRaw < -16)
@@ -461,6 +469,7 @@ public sealed class Gs : ISchedulable
         }
         else if ((ofx == 0 && ofy != 0) || (ofy == 0 && ofx != 0))
         {
+            // Partial program: only rescue if pure map landed far off Soft-GS FB.
             if (x < -64 || y < -64 || x >= FB_WIDTH + 64 || y >= FB_HEIGHT + 64)
             {
                 if (xRaw >= 0x4000 || yRaw >= 0x4000)
@@ -473,9 +482,9 @@ public sealed class Gs : ISchedulable
 
         // Off-FB rescue when XYOFFSET is programmed but verts still land outside Soft-GS
         // FB (B3: ofx=0x6C00 ofy=0x7200 → prims↑ rejBounds=prims fragTest=0 without this).
-        // WAVE-6: Whiplash title sprite raw Y=0 with ofy=0x8000 → y=-2048. Prefer Y=raw/16
-        // (top of FB) while keeping ofx-based X so the sprite clamp expands a full-width
-        // title surface instead of pure rejBounds.
+        // WAVE-6: Whiplash title sprite raw Y=0 with ofy=0x8000 → pure y=-2048. Prefer
+        // Y=raw/16 (top of FB) while keeping ofx-based X so the sprite clamp expands a
+        // full-width title surface instead of pure rejBounds.
         if (ofy == 0x8000 && yRaw < 0x1000 && (y < -64 || y >= FB_HEIGHT + 64))
             y = yRaw >> 4;
         if (x < -64 || y < -64 || x >= FB_WIDTH + 64 || y >= FB_HEIGHT + 64)
@@ -697,22 +706,30 @@ public sealed class Gs : ISchedulable
         int y1 = Math.Min(FB_HEIGHT - 1, maxY);
         Registers.GetXyOffset(out int ofxR, out int ofyR);
         // Title-strip expand (TEMPORARY Soft-GS MENU chrome; telemetry = ExpandHits).
-        // Legal ofx/ofy classes (all require full-width thin strip — see EXPAND_POLICY.md):
-        //   1) ofx=0 && ofy=0          — GoW Path2: XYOFFSET armed after first SPRITEs
+        // Collapse ofx/ofy classes (full-width thin strip — see EXPAND_POLICY.md):
+        //   1) ofx=0 && ofy=0          — GoW Path2: XYOFFSET often unprogrammed at kick
         //   2) ofx=ofy=0x8000          — Whiplash/BO2 retail center origin (2048.0 12.4)
         //   3) retail-center band      — ofx,ofy ∈ [0x6000,0x9000] (B3-class offsets)
         // Geometry gate: w ≥ FB_WIDTH/2 && h < FB_HEIGHT/2 (thin strip / logo band).
-        // Color/UV still from the real prim — no invent PATH3 / no planted pixels.
-        // G-GFX-6 demotes this path once retail XYOFFSET+PRIM sizes paint naturally.
-        bool retailOfs = (ofxR == 0 && ofyR == 0)
-            || (ofxR == 0x8000 && ofyR == 0x8000)
-            || (ofxR is >= 0x6000 and <= 0x9000 && ofyR is >= 0x6000 and <= 0x9000);
-        bool titleStrip = retailOfs && w >= FB_WIDTH / 2 && h < FB_HEIGHT / 2;
+        // GX-021: kill illegal expand when retail-center ofx + pure 12.4 map already places
+        // a natural-height rect on-FB (no Y-collapse). Collapsed h=1 MENU strips still expand.
+        // Color/UV from the real prim — no invent PATH3 / no planted pixels.
+        // G-GFX-6 demotes remaining expand once retail XYOFFSET+PRIM sizes hold MENU px.
+        bool collapseOfs = GsRegisters.IsCollapseOffsetClass(ofxR, ofyR);
+        bool titleStrip = collapseOfs && w >= FB_WIDTH / 2 && h < FB_HEIGHT / 2;
+        // GX-021 illegal expand: retail-center OFX/OFY + already on-FB + natural height
+        // (not a 1-row collapse). Collapsed MENU strips (h=1 after map/rescue) still expand.
+        // ofx=0 (unprogrammed) keeps expand for GoW-class Path2 chrome until G-GFX-6.
+        bool fullyOffFb = x0 > x1 || y0 > y1;
+        if (titleStrip && GsRegisters.IsRetailCenterOffset(ofxR, ofyR)
+            && !fullyOffFb && h >= ExpandRetailNaturalMinH)
+            titleStrip = false;
+
         if (x0 > x1 || y0 > y1)
         {
             // Commercial rescue: sprite fully off Soft-GS FB after XYOFFSET — clamp onto
             // FB origin. Cap to FB size so huge wrong-space rects still produce a Soft-GS
-            // surface instead of pure rejBounds.
+            // surface instead of pure rejBounds. ExpandHits only when titleStrip expands H.
             int sw = Math.Clamp(w, 1, FB_WIDTH);
             int sh = Math.Clamp(h, 1, FB_HEIGHT);
             if (titleStrip)
@@ -728,13 +745,16 @@ public sealed class Gs : ISchedulable
         }
         else if (titleStrip)
         {
-            // Partially on-FB one-row (WAVE-6 Y=0 rescue): still expand to full title FB.
-            ExpandHits++;
+            // Partially on-FB one-row (WAVE-6 Y=0 rescue / ofx=0 Y=0): expand to full title FB.
+            // ExpandHits accurate: only when we actually grow the raster rect.
+            int beforeW = w, beforeH = h;
             minX = 0; minY = 0;
             maxX = FB_WIDTH; maxY = FB_HEIGHT;
             x0 = 0; y0 = 0;
             x1 = FB_WIDTH - 1; y1 = FB_HEIGHT - 1;
             w = FB_WIDTH; h = FB_HEIGHT;
+            if (w != beforeW || h != beforeH)
+                ExpandHits++;
         }
 
         for (int y = y0; y <= y1; y++)

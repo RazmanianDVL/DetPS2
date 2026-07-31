@@ -1184,6 +1184,8 @@ public static class SmokeTests
             Vif_Direct_Supersede_AbortsStickyGarbage();
             Gif_Path2_QwSliced_PackedSprite_WritesPixels();
             Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface();
+            Gs_RetailOfx_NaturalHeight_DoesNotExpand();
+            Gs_Ofx8000_CollapsedStrip_StillExpands();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -5272,6 +5274,77 @@ public static class SmokeTests
         Console.WriteLine(
             $"[Smoke] Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface OK " +
             $"(px={px} prims={prims} expandHits={expandHits} titleFloor={titleFloor})");
+    }
+
+    /// <summary>
+    /// GX-021: retail-center XYOFFSET (0x8000) + full-width sprite with natural height must
+    /// NOT expand (illegal expand kill). ExpandHits stays 0; px ≈ natural w×h.
+    /// </summary>
+    public static void Gs_RetailOfx_NaturalHeight_DoesNotExpand()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        // OFX=OFY=0x8000 (2048.0 12.4). Verts relative to origin → on-FB 640×64 band.
+        ulong xyOff = 0x8000UL | (0x8000UL << 32);
+        sys.Gs.WriteGsRegister(0x18, xyOff);
+        sys.Gs.WriteGsRegister(0x4C, 0x0000000000080000UL);
+        sys.Gs.WriteGsRegister(0x00, 0x06);
+        sys.Gs.WriteGsRegister(0x01, 0x00000000FF00FF00UL);
+        static ulong Xyz(int px, int py) =>
+            ((ulong)(uint)((0x8000 + px * 16) & 0xFFFF))
+            | ((ulong)(uint)((0x8000 + py * 16) & 0xFFFF) << 16);
+        sys.Gs.WriteGsRegister(0x05, Xyz(0, 0));
+        sys.Gs.WriteGsRegister(0x05, Xyz(640, 64));
+
+        long expandHits = sys.Gs.ExpandHits;
+        long px = sys.Gs.PixelsWritten;
+        long prims = sys.Gs.PrimitivesDrawn;
+        if (prims < 1)
+            throw new Exception("expected SPRITE prim under retail ofx");
+        if (expandHits != 0)
+            throw new Exception(
+                $"GX-021 illegal expand: retail ofx natural h must not expand (expandHits={expandHits})");
+        // Natural band: 640×64 = 40960; must not blow to full FB (286720).
+        if (px > 640L * 128L)
+            throw new Exception($"expected natural-height band px, got px={px} (looks expanded)");
+        if (px < 640L * 32L)
+            throw new Exception($"expected natural band paint px≥{640 * 32}, got {px}");
+        Console.WriteLine(
+            $"[Smoke] Gs_RetailOfx_NaturalHeight_DoesNotExpand OK " +
+            $"(px={px} prims={prims} expandHits={expandHits})");
+    }
+
+    /// <summary>
+    /// GX-021 MENU hold: ofx=0x8000 collapsed strip (raw Y=0 → pure off-FB → Y-rescue h=1)
+    /// still expands so Whip/BO2 title surface is not demoted without proof.
+    /// </summary>
+    public static void Gs_Ofx8000_CollapsedStrip_StillExpands()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        ulong xyOff = 0x8000UL | (0x8000UL << 32);
+        sys.Gs.WriteGsRegister(0x18, xyOff);
+        sys.Gs.WriteGsRegister(0x4C, 0x0000000000100000UL); // Whip-like FRAME
+        sys.Gs.WriteGsRegister(0x00, 0x06);
+        sys.Gs.WriteGsRegister(0x01, 0x00000000FF8080FFUL);
+        // Raw corners near 0 under ofy=0x8000 → pure y=-2048; Soft-GS Y-rescue → h=1 strip.
+        static ulong XyzRaw(int x12_4, int y12_4) =>
+            ((ulong)(uint)(x12_4 & 0xFFFF)) | ((ulong)(uint)(y12_4 & 0xFFFF) << 16);
+        sys.Gs.WriteGsRegister(0x05, XyzRaw(0x0000, 0x0000));
+        sys.Gs.WriteGsRegister(0x05, XyzRaw(0x2800, 0x0000)); // 640px wide @12.4
+
+        long expandHits = sys.Gs.ExpandHits;
+        long px = sys.Gs.PixelsWritten;
+        const long titleFloor = 640L * 448L / 2;
+        if (expandHits < 1)
+            throw new Exception(
+                $"MENU hold: ofx=0x8000 collapse strip must still expand (expandHits={expandHits})");
+        if (px < titleFloor)
+            throw new Exception(
+                $"ofx=0x8000 collapse did not reach title floor: px={px} expandHits={expandHits}");
+        Console.WriteLine(
+            $"[Smoke] Gs_Ofx8000_CollapsedStrip_StillExpands OK " +
+            $"(px={px} expandHits={expandHits} titleFloor={titleFloor})");
     }
 
     public static void Timer_GateAndClockSelect()
