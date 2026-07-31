@@ -849,12 +849,17 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     if (savedRa == 0 && t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 31)
                         savedRa = (uint)(t.SavedGprFull[31] & 0x1FFFFFFFUL);
                     uint savedPc = (uint)(t.SavedPc & 0x1FFFFFFFUL);
+                    // Only re-home when saved context is clearly the post-LGDEV poll/WaitSema.
+                    // Blind re-home of pure-sleep main after N kicks corrupted residual→STG
+                    // (cdvd stuck plant-only 609 without STG bind).
                     bool postPark = (savedRa is >= 0x002AF800 and <= 0x002AF994)
                         || (savedPc is >= 0x002AF800 and <= 0x002AF994)
                         || (savedPc is >= 0x0010C0A0 and <= 0x0010C0AC && savedRa is >= 0x002AF800 and <= 0x002AF994)
                         || (savedPc is >= 0x0010BE60 and <= 0x0010BE70 && savedRa is >= 0x002AF800 and <= 0x002AF994)
-                        || (t.Id == 1 && t.WaitSemaId >= 0x40)
-                        || (t.Id == 1 && t.WaitSemaId == 0 && !t.WaitVblank && _menuKickPulses >= 16);
+                        || (t.Id == 1 && t.WaitSemaId >= 0x40
+                            && (savedRa is >= 0x002AF800 and <= 0x002AF994
+                                || savedPc is >= 0x002AF800 and <= 0x002AF994
+                                || savedPc is >= 0x0010BE60 and <= 0x0010BE70));
                     if (t.WaitSemaId >= 32)
                     {
                         try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
