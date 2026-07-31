@@ -8,11 +8,11 @@
 | **BIOS** | SCPH70008 / native BIOS HLE |
 | **ROMDIR gate** | **CLOSED** |
 | **Seat** | **S5 BO2** — worktree `detps2-seat-s5` |
-| **Branch** | `agent/seat-s5/s0-g0` |
+| **Branch** | `agent/seat-s5/s1-g1` |
 | **Owned** | `BloodOmen2SnAssist.cs`, this doc |
 | **Forbidden** | invent pixels; fake warm CODE/MAINMENU sector credit |
 | **Date** | 2026-07-31 |
-| **Status** | **S0/PL-005:** MENU YES hold (title-surface Soft-GS); residual multi-prim IMAGE + INTERACTIVE pad charter |
+| **Status** | **S1/PL-015:** MENU YES hold + title-FB pad inject (opens=2, ForceRefreshPad); gifP2↑ concurrent with pad; selection/press-start state advance **not proven** (prims=1 residual) |
 
 ---
 
@@ -166,6 +166,54 @@ Disc PS2.RKV / GOE
 | Forbidden | Global WaitSema fabricate; invent menu UI pixels |
 | Exit test | `pad-inject` claim @100M: MENU hold + T2 signal (state or Soft-GS delta) |
 
+#### S1 PL-015 claim (seat-s5 / `out/seat-s5`, SEMA_OFF, host-present)
+
+**Assist delta (this WP):**
+
+1. **`MaybeInjectInteractivePad`** — pad inject **not** buried in 50k PulseWaiters gate; 20k pre-title / **8k post-title-FB**.
+2. **Post-title pattern** — Start/Cross/Circle/D-pad + release edges + longer START hold when `streamed>1M && px≥250k` (ofx title surface).
+3. **`ForceRefreshPad` + AnalogMode** after every inject + `OnHostPresent` (PADMAN dual-buffer DMA live: OPEN port0/1 `opens=2`).
+4. **False thrash fix** — do not leave `0x4814xx` solely on PC when `a2` is stack/BSS pointer (`rem=0x01FExxxx` S0); real copy counts only.
+5. **Freelist leave band** expanded `0x2BB900..0x2BBD80` (S0 variance PC `0x2BB968`).
+
+**100M claim metrics (SEMA_OFF):**
+
+| Metric | Value |
+|--------|-------|
+| PC final | `0x00101058` (low-ELF residual; variance vs WaitSema/`0x2BB968`) |
+| px / prims | **286720 / 1** (MENU hold ofx expand) |
+| gifP1 / gifP2 / gifP3 | 0 / **54** / 2 |
+| expandHits | **1** |
+| imgBytes / dispfbPx | **0 / 0** |
+| cdvd / sifBytes / syscalls | 5086 / 49624 / 1813 |
+| Stream | CODE+MAINMENU **2425492**; LIST+ENGLISH; GAMEKEEPER+RUMBLEDATABASE |
+| Pad | **opens=2**; title-FB inject **n≈1536** @8k; btn START-heavy + dualshock AnalogMode |
+| gifP2 vs pad | gifP2 **0→54** while title-FB pad inject live (display-spine + residual; not proven pad-causal) |
+| **MENU?** | **YES** title-surface Soft-GS |
+| **T2 INTERACTIVE?** | **PARTIAL** — pad DMA live + denser inject + gifP2↑ concurrent; **no** selection-index / prims&gt;1 / press-start state proof |
+
+```
+[BO2] force-game CODE+MAINMENU streamedTotal=2425492
+[BO2] title-FB pad inject n=1..1536 btn=Start/Cross/… opens=2 px=286720
+[BO2] soft-stub dual list + GAMEKEEPER + RUMBLEDATABASE
+softgs: px=286720 prims=1 expandHits=1 gifP2=54 imgBytes=0
+MENU? YES | T2 PARTIAL (pad-inject live; state advance residual)
+```
+
+**Claim line (S1 PL-015):**  
+`BO2 SLUS_200.24 S5 PL-015 | MENU YES title-surface | pad opens=2 inject≈1536 ForceRefreshPad | px=286720 prims=1 gifP2=54 expandHits=1 imgBytes=0 ofx=0x8000 | T2 PARTIAL (gif concurrent; no sel-idx) | residual multi-prim IMAGE + menu state`
+
+**Pad graph (P1):**
+
+| Phase | Pattern | Live? | Effect |
+|-------|---------|-------|--------|
+| Pre-stream cdvd≥100 | Start/Cross 20k | Yes | Boot PADMAN OPEN |
+| Title FB streamed+px≥250k | Start/Cross/Circle/D-pad 8k + ForceRefreshPad | **Yes** n≈1536 | DMA buffers update; no proven menu state cell |
+| gifP2 climb | 0→54 during pad window | Yes | Display-spine residual (assist); not sole pad proof |
+| Press-START → menu state | selection / prims&gt;1 | **No** | Residual for deeper menu poll / IMAGE |
+
+**Forbidden held:** no invent pixels; no fake warm sector credit; SEMA_OFF; no global WaitSema fabricate.
+
 ### S2 — IMAGE multi-prim (PL-027 + G-GFX-3/4)
 
 | Item | Spec |
@@ -187,12 +235,13 @@ Disc PS2.RKV / GOE
 | No invent pixels | Expand reuses prim color/UV only |
 | Gs/Gif ownership | Title seat does not edit Gs/Gif without S8/S9 merge train |
 
-### Next WP queue (after S0 merge)
+### Next WP queue (after S1 merge)
 
-1. **PL-015** — pad past title FB (INTERACTIVE)  
+1. **PL-015 residual** — map pad consumer / selection cell (PCSX2+PINE) once menu poll is live  
 2. **PL-027** — multi-prim IMAGE (with S8/S9/S10)  
 3. Demote list soft-stubs when natural walk exits freelist  
-4. G-GFX-6 expand demotion when retail multi-prim fills FB without titleStrip
+4. G-GFX-6 expand demotion when retail multi-prim fills FB without titleStrip  
+5. Soft-leave late asset-as-code thrash (`0x00EFxxxx` / `0x00EEExxxx` post-RUMBLE) without inventing pixels
 
 ## Commands
 
@@ -203,5 +252,6 @@ $env:DETPS2_TRACE_BIOS='1'; $env:DETPS2_TRACE_RPC='1'
 dotnet exec out/seat-s5/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=20000000 --host-present
 dotnet exec out/seat-s5/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=100000000 --host-present
 # expect: stream CODE+MAINMENU; Creating; LIST+ENGLISH; dual list-stub; GAMEKEEPER;
-#         Soft-GS px=286720 prims=1 imgBytes=0 ofx=0x8000; MENU? YES (title-surface)
+#         title-FB pad inject opens=2; Soft-GS px=286720 prims=1 gifP2≈54 ofx=0x8000;
+#         MENU? YES (title-surface); T2 PARTIAL until sel-idx/prims>1
 ```

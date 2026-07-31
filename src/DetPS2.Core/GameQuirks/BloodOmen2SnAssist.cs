@@ -53,6 +53,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _lastTitleSmCyc = 0;
         _snQuietPatches = 0;
         _padInjectPulses = 0;
+        _titlePadPulses = 0;
+        _lastPadInjectCyc = 0;
         _titleSmEscapes = 0;
         _menuDrawKicks = 0;
         _cacheFlushSkips = 0;
@@ -124,7 +126,13 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         ForceSnScanSuccess(sys);
     }
 
-    public void OnHostPresent(Ps2System sys) => _ = sys;
+    public void OnHostPresent(Ps2System sys)
+    {
+        // PL-015: keep PADMAN dual-buffer DMA STABLE so EE padGetState/padRead see
+        // host inject between VBlank ticks (title-FB interactive residual).
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+    }
 
     /// <summary>
     /// Nop the cdrom short-name rewrite <c>jal 0x2DB138</c> inside path combine.
@@ -219,6 +227,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             // Post-SN-check boot parks thread 1 on WaitSema(id) with no producer yet
             // (SN ProDG / disc gate). Periodically SignalSema any waiter so SIF/CDVD progress.
             PulseWaiters(sys);
+            // PL-015: pad inject is NOT rate-gated by PulseWaiters interval — title FB
+            // consumers sample pad between thrash-residual slices.
+            MaybeInjectInteractivePad(sys);
             // If main is on the fail branch that does li v0,1 / Exit, nudge past by forcing v0.
             if (pc is >= 0x00297DA0 and <= 0x00297DC8)
             {
@@ -261,8 +272,10 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
     private ulong _lastPulseCyc;
     private ulong _lastTitleSmCyc;
+    private ulong _lastPadInjectCyc;
     private int _snQuietPatches;
     private int _padInjectPulses;
+    private int _titlePadPulses;
     private int _titleSmEscapes;
     private int _menuDrawKicks;
 
@@ -450,26 +463,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // Pad inject liberally: once disc I/O is live, pulse START/CROSS often so
-        // title/logo/menu code that waits for controller ready or "Press START" advances.
-        // Leave WaitSema park alone (PulseWaiters above); DETPS2_SEMA_STALL_YIELD stays OFF.
-        if (sys.Cdvd.SectorsRead >= 100 && _padInjectPulses < 8192)
-        {
-            _padInjectPulses++;
-            // PadInput uses active-high Press bits (see PadInput.Button).
-            // Dense duty cycle: START and CROSS on alternate pulses with short idle gaps.
-            int phase = _padInjectPulses % 5;
-            uint buttons = phase switch
-            {
-                0 or 1 => (uint)PadInput.Button.Start,
-                2 or 3 => (uint)PadInput.Button.Cross,
-                _ => 0u, // brief release so edge-triggered readers see press/release
-            };
-            // Occasional dual-press (START+CROSS) for menus that want confirm.
-            if (_padInjectPulses % 11 == 0)
-                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
-            try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
-        }
+        // Pad inject moved to MaybeInjectInteractivePad (called every planted Step) so
+        // PL-015 title-FB edges are not starved by the 50k thrash-residual interval.
 
         // Exception vector rescue (always safe post GOE). Data/NOP rescue after RKV token.
         if (sys.Cdvd.SectorsRead >= 200)
@@ -516,6 +511,85 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         int packOpens = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
         int gameBg2 = sys.Hle.Sony?.RealRpc.Bo2GameBg2Opens ?? 0;
         return packOpens > 0 || gameBg2 > 0 || sys.Cdvd.SectorsRead >= 500;
+    }
+
+    /// <summary>
+    /// PL-015: pad inject past ofx title-surface Soft-GS (INTERACTIVE residual).
+    ///
+    /// Pre-title: Start/Cross duty cycle after first disc I/O (boot pad open path).
+    /// Post-title (CODE+MAINMENU streamed + ofx FB px≥250k): denser Start/Cross/Circle/D-pad
+    /// with release edges + dualshock AnalogMode + immediate <see cref="RealSifRpc.ForceRefreshPad"/>
+    /// so PADMAN dual-buffer DMA (OPEN @0x540740/0x540880 live) sees presses without waiting
+    /// for the next VBlank tick. Never invents menu pixels / selection index plants.
+    /// </summary>
+    private void MaybeInjectInteractivePad(Ps2System sys)
+    {
+        if (sys.Cdvd.SectorsRead < 100) return;
+        if (_padInjectPulses >= 16384) return;
+
+        ulong c = sys.Scheduler.MasterCycles;
+        long streamed = sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0;
+        long px = sys.Gs.PixelsWritten;
+        // Title-surface Soft-GS (ofx=0x8000 full FB 286720) after CODE+MAINMENU stream.
+        bool titleFb = streamed > 1_000_000 && px >= 250_000;
+        // Pre-title: 20k (was buried in 50k PulseWaiters). Post-title: 8k for edge density.
+        ulong padInterval = titleFb ? 8_000UL : 20_000UL;
+        if (c - _lastPadInjectCyc < padInterval) return;
+        _lastPadInjectCyc = c;
+        _padInjectPulses++;
+
+        // PadInput uses active-high Press bits; RealSifRpc WritePadButtonData inverts to
+        // active-low padButtonStatus for DMA.
+        uint buttons;
+        if (titleFb)
+        {
+            int p = _padInjectPulses % 10;
+            buttons = p switch
+            {
+                0 or 1 => (uint)PadInput.Button.Start,
+                2 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                3 or 4 => (uint)PadInput.Button.Cross,
+                5 => (uint)PadInput.Button.Circle,
+                6 => (uint)PadInput.Button.Down,
+                7 => (uint)PadInput.Button.Up,
+                8 => (uint)(PadInput.Button.Start | PadInput.Button.Circle),
+                _ => 0u, // release so edge-triggered readers see press→release
+            };
+            // Hold START longer in a window so Press-START consumers can latch.
+            if ((_padInjectPulses % 16) < 4)
+                buttons = (uint)PadInput.Button.Start;
+            _titlePadPulses++;
+        }
+        else
+        {
+            int phase = _padInjectPulses % 5;
+            buttons = phase switch
+            {
+                0 or 1 => (uint)PadInput.Button.Start,
+                2 or 3 => (uint)PadInput.Button.Cross,
+                _ => 0u,
+            };
+            if (_padInjectPulses % 11 == 0)
+                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+        }
+
+        try
+        {
+            sys.Pad.AnalogMode = true;
+            sys.Pad.SetButtons(buttons);
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+        }
+        catch { /* Pad / RealRpc may be null early */ }
+
+        if (titleFb && Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_titlePadPulses <= 8 || _titlePadPulses % 64 == 0))
+        {
+            int opens = sys.Hle?.Sony?.RealRpc?.OpenPadCount ?? 0;
+            Console.Error.WriteLine(
+                $"[BO2] title-FB pad inject n={_titlePadPulses} btn=0x{buttons:X4} " +
+                $"opens={opens} px={px} prims={sys.Gs.PrimitivesDrawn} " +
+                $"gifP2={sys.Gif?.Path2Transfers ?? 0} cyc={c}");
+        }
     }
 
     /// <summary>
@@ -1286,7 +1360,12 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         sys.EE.COP0_Status &= ~0x6u;
         EnsureMainThreadRunning(sys);
         ArmGifPath3(sys);
-        try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+        try
+        {
+            sys.Pad.AnalogMode = true;
+            sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross));
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+        }
         catch { /* ignore */ }
         try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
 
@@ -1409,7 +1488,12 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         }
         catch { /* ignore */ }
         EnsureMainThreadRunning(sys);
-        try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
+        try
+        {
+            sys.Pad.AnalogMode = true;
+            sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross));
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+        }
         catch { /* ignore */ }
 
         // WAVE-6/7: huge byte-copy heat @0x4802E8 — positive absurd rem only (not -1).
@@ -1541,17 +1625,26 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // WAVE-7b: post-GAMEKEEPER / post-spine memcpy or format heat — free residual so
-        // entity ETP parse can finish and drawable path can submit Path2 PRIM.
-        // Live claim1 final PC=0x4802F0 after GAMEKEEPER.ETP full read 914084.
+        // WAVE-7b / PL-015: post-GAMEKEEPER memcpy heat — free residual so entity ETP
+        // parse can finish. Live claim1: 0x4802F0 after GAMEKEEPER.ETP.
+        // PL-015 fix: do NOT leave 0x4814xx solely on PC — S0 claim rem=0x01FExxxx was a
+        // stack/BSS pointer in a2, not a copy count (false thrash yanked productive frames).
         if (_listWalkStubbed && gif2 >= 20
             && (pc is >= 0x004802E0 and <= 0x00480410
                 || pc is >= 0x00481400 and <= 0x00481800)
             && c - _lastTitleSmCyc >= 200_000)
         {
             uint rem = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
-            // Leave medium/large positive copies; never abort rem=-1 sentinel mid-FILEIO.
-            if (rem is > 0x1000u and < 0x80000000u || pc is >= 0x00481400)
+            // Real copy counts only: positive, bounded. Stack/BSS pointers live ≥0x01000000
+            // (S0 claim rem=0x01FExxxx was pointer-as-rem, not thrash).
+            bool realCopy = rem > 0x1000u && rem <= 0x00100000u;
+            bool absurdCopy = rem > 0x00100000u && rem < 0x01000000u;
+            bool inMemcpyLeaf = pc is >= 0x004802E0 and <= 0x00480410;
+            bool inFmtBand = pc is >= 0x00481400 and <= 0x00481800;
+            // Memcpy leaf: medium or absurd rem. Format band: medium rem only (no ptr-as-rem).
+            bool leave = (inMemcpyLeaf && (realCopy || absurdCopy))
+                || (inFmtBand && realCopy);
+            if (leave)
             {
                 sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
@@ -1574,16 +1667,16 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             }
         }
 
-        // WAVE-7b: freelist / heap-walk thrash @0x2BBD20 after GAMEKEEPER (claim2 final).
-        // Circular or huge free-chain: lw *a3; load node; sltu bounds; bnel. Soft-leave
-        // so drawable / MainMenu path can run under title-surface Soft-GS.
+        // WAVE-7b / PL-015: freelist / heap-walk thrash after GAMEKEEPER.
+        // S0 variance final PC=0x2BB968 (below old 0x2BBD00 band). Expand leave window so
+        // drawable / MainMenu path can run under title-surface Soft-GS + pad inject.
         if (_listWalkStubbed && logoClass
-            && pc is >= 0x002BBD00 and <= 0x002BBD80
+            && pc is >= 0x002BB900 and <= 0x002BBD80
             && c - _lastTitleSmCyc >= 250_000)
         {
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
             uint cont = IsSafeCodeTarget(sys, ra) && ra != pc
-                && ra is not (>= 0x002BBD00 and <= 0x002BBD80)
+                && ra is not (>= 0x002BB900 and <= 0x002BBD80)
                 ? ra : PostDisplaySetupPc;
             // Skip to epilogue store path when mid-body (sw t0,0(a1) @0x2BBD4C).
             if (pc is >= 0x002BBD20 and <= 0x002BBD48
