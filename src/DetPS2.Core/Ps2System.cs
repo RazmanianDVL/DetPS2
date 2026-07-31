@@ -920,6 +920,7 @@ public sealed class Ps2System
         // stepped/touched, so it never accumulates real state and needs no reset here.
         ActiveQuirk?.Reset();
         ActiveQuirk = null;
+        SoftFloatBridge.Reset();
         BiosBoot.Reset();
         IopVblank.Reset();
         IopSystem.Reset();

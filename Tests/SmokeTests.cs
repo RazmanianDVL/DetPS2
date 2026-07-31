@@ -995,6 +995,7 @@ public static class SmokeTests
             // Phase 20
             Ee_MultuDivu_Dsll();
             Ee_32BitOps_SignExtendAcrossBoundary();
+            SoftFloatBridge_HostIeee_ReturnsViaRa();
             TitleCampaign_SyntheticPack();
 
             // Phase 21
@@ -4067,6 +4068,55 @@ public static class SmokeTests
         if (sys.EE.GetGpr(2).Lo != 0x110UL) throw new Exception($"DSLL 0x{sys.EE.GetGpr(2).Lo:X}");
 
         Console.WriteLine("[Smoke] Ee_MultuDivu_Dsll OK");
+    }
+
+    /// <summary>
+    /// Shared soft-double host bridge (Haven wave-2): registered entry PCs evaluate IEEE
+    /// on the host and return via $ra so multi-precision libm table fills do not burn
+    /// 100M+ interpreter cycles before FILEIO.
+    /// </summary>
+    public static void SoftFloatBridge_HostIeee_ReturnsViaRa()
+    {
+        SoftFloatBridge.Reset();
+        try
+        {
+            var sys = new Ps2System();
+            const uint entry = 0x003432F0u;
+            SoftFloatBridge.Register(entry, SoftFloatBridge.Op.DSin);
+
+            // a0 = 0.0 double bits → sin(0) = 0
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x00123450 }); // ra
+            sys.EE.PC = entry;
+            int n = sys.EE.Step(1);
+            if (n < 1) throw new Exception("Step consumed 0");
+            if (sys.EE.PC != 0x00123450UL)
+                throw new Exception($"PC after soft-sin 0x{sys.EE.PC:X}, expected return via ra");
+            if (sys.EE.GetGpr(2).Lo != 0)
+                throw new Exception($"sin(0) v0=0x{sys.EE.GetGpr(2).Lo:X}");
+
+            // F32→F64: f12 = 2.0f → v0 = 2.0 double
+            SoftFloatBridge.Register(0x00353A28u, SoftFloatBridge.Op.F32ToF64);
+            sys.EE.SetFpr(12, 2.0f);
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x00123460 });
+            sys.EE.PC = 0x00353A28;
+            sys.EE.Step(1);
+            ulong bits = sys.EE.GetGpr(2).Lo;
+            double d = BitConverter.UInt64BitsToDouble(bits);
+            if (Math.Abs(d - 2.0) > 1e-9)
+                throw new Exception($"F32ToF64 got {d}");
+            if (sys.EE.PC != 0x00123460UL)
+                throw new Exception("F32ToF64 did not return via ra");
+
+            if (SoftFloatBridge.Hits < 2)
+                throw new Exception($"expected ≥2 hits, got {SoftFloatBridge.Hits}");
+
+            Console.WriteLine($"[Smoke] SoftFloatBridge_HostIeee_ReturnsViaRa OK (hits={SoftFloatBridge.Hits})");
+        }
+        finally
+        {
+            SoftFloatBridge.Reset();
+        }
     }
 
     /// <summary>Pins the fix for a whole class of bug found in the same investigation that
