@@ -1,6 +1,8 @@
 # DetPS2Sharp — Deterministic PS2 Emulator in Pure C#
 
-**Goal**: A clean-slate PlayStation 2 emulator written entirely in modern C# (.NET 9), with **determinism as a core design principle**.
+**Goal**: A clean-slate PlayStation 2 emulator written entirely in modern C# (.NET 9), with **determinism** and **correctness over “working”** as core design principles.
+
+**Correctness doctrine**: we do **not** take host shortcuts that fake console behavior (e.g. FFmpeg boot logos, synthetic UI paint, invented I/O). Soft-GS truth and honest residuals beat a flashy wrong screen. See **[docs/CORRECTNESS.md](docs/CORRECTNESS.md)**.
 
 ## Status — **v0.1.0 Foundation** (July 2026)
 
@@ -49,6 +51,7 @@ Copy `user-media.example.json` → `user-media.json` (gitignored) for dump paths
 | [FLOAT_POLICY.md](FLOAT_POLICY.md) | Deterministic float rules |
 | [PERF_NOTES.md](PERF_NOTES.md) | Timing notes |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
+| [docs/CORRECTNESS.md](docs/CORRECTNESS.md) | **Correct over working** — no host-cheat presentation |
 
 | Layer | State |
 |-------|--------|

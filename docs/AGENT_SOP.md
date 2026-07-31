@@ -1,12 +1,14 @@
 # DetPS2 agent SOP — commercial bring-up (mandatory)
 
 **Audience:** human operators and AI subagents.  
-**Goal:** faster, less wrong HLE — not more blind 150M runs.
+**Goal:** faster, less wrong HLE — not more blind 150M runs.  
+**Doctrine:** **[CORRECTNESS.md](CORRECTNESS.md)** — we optimize for **correct**, not for “working.”
 
 ---
 
 ## 0. Non-negotiables
 
+0. **Correct over working.** No host cheats that fake PS2 video/UI/I/O (no FFmpeg logos, no synthetic branded overlays, no force-complete waits that skip real RPC). A black Soft-GS frame with honest residuals beats a pretty lie. Full list: **[CORRECTNESS.md](CORRECTNESS.md)**.  
 1. **BIOS G0 is closed.** Prefer deepening **shared** HLE over inventing title plants.  
 2. **No literal IRX execution required** for menu work (Phase L / #12 ignored unless asked).  
 3. **Do not guess** boot flow, RPC shapes, FILEIO layouts, or menu type.  

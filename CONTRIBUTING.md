@@ -11,6 +11,7 @@ top of that.
 
 ## Principles
 
+0. **Correct, not “working”** — see **[`docs/CORRECTNESS.md`](docs/CORRECTNESS.md)**. Soft-GS truth over host shortcuts (no FFmpeg/game-video host decode, no fake logos, no invented I/O success). Incomplete + honest beats complete + wrong.
 1. **Determinism first** — no host clocks in core or save paths (`FLOAT_POLICY.md`).
 2. **Single run API** — `Ps2System.RunFor` / `Scheduler.RunFor` only.
 3. **`ISchedulable` contract** — `int Step(ulong maxCycles); void Reset();`
