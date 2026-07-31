@@ -1186,6 +1186,11 @@ public sealed class RealSifRpc
             // matching pointed at code (tip main@9657852: gifP3 11→5 spine death; sm-w4
             // without this path held gifP3=11). Only copy into heap-class CdlFILE buffers:
             // refuse ELF image band and IsLikelyEeCode destinations; prefer CdlFILE sizes.
+            //
+            // WAVE-6 Vexx: EE SIF packet for SearchFile is at 0x3F7B00 (inside Vexx ELF data
+            // map, below the SM 8MiB gate) — notElf alone skipped GAME.TXT/STREE0 copy-back
+            // (cdvd→0). Allow non-code CdlFILE-sized packets in the Vexx SIF packet window
+            // when the buffer still carries a path-shaped CdlFILE (not live .text).
             if (sf != 0 && argBuf != 0 && sendSize >= 8
                 && _argBufToEeSend.TryGetValue(argBuf, out uint eeSend) && eeSend != 0)
             {
@@ -1193,25 +1198,34 @@ public sealed class RealSifRpc
                 // sceCdlFILE is typically ≥0x124; refuse tiny/unknown DMA tails.
                 bool sizeOk = sendSize is >= 0x100 and <= 0x200;
                 // Commercial ELF images load near 0x00100000..~0x00800000 (SM memsz≈0x680898).
-                // Vexx/CdlFILE live in higher BSS/heap. Never write into primary image band.
+                // Prefer high-heap CdlFILE; never write into primary image *code*.
                 bool notElfImage = ee >= 0x00800000u
                     && ee + 0x130u < (uint)SystemMemory.RDRAM_SIZE;
                 bool notCode = !mem.IsLikelyEeCode(ee) && !mem.IsLikelyEeCode(ee + 4);
-                if (sizeOk && notElfImage && notCode)
+                // Vexx (SLUS_203.83): known EE SearchFile packet @0x3F7B00 (sendSize 0x12C).
+                // After first GAME.TXT copy-back, +0/+4 hold lsn/size which IsLikelyEeCode may
+                // misread as opcodes — rely on path shape at +0x20/+0x24 for the re-use packet.
+                bool vexxCdlPacket = sizeOk
+                    && ee is >= 0x003F0000u and < 0x00400000u
+                    && ee + 0x130u < (uint)SystemMemory.RDRAM_SIZE
+                    && LooksLikeCdlFilePath(mem, ee);
+                if (sizeOk && ((notElfImage && notCode) || vexxCdlPacket))
                 {
                     uint n = Math.Min(sendSize, 0x130u);
                     for (uint i = 0; i < n; i++)
                         mem.Write8(ee + i, mem.Read8(argBuf + i));
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                        || Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
                         Console.Error.WriteLine(
-                            $"[RPC] SearchFile copy-back EE=0x{ee:X} n={n} lsn={mem.Read32(argBuf)} size={mem.Read32(argBuf + 4)}");
+                            $"[RPC] SearchFile copy-back EE=0x{ee:X} n={n} lsn={mem.Read32(argBuf)} size={mem.Read32(argBuf + 4)}"
+                            + (vexxCdlPacket ? " (vexx-packet)" : ""));
                 }
                 else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                          || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 {
                     Console.Error.WriteLine(
                         $"[RPC] SearchFile copy-back SKIP ee=0x{ee:X} sendSize=0x{sendSize:X} " +
-                        $"sizeOk={sizeOk} notElf={notElfImage} notCode={notCode}");
+                        $"sizeOk={sizeOk} notElf={notElfImage} notCode={notCode} vexxPkt={vexxCdlPacket}");
                 }
             }
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
@@ -7908,6 +7922,38 @@ public sealed class RealSifRpc
         {
             return 0;
         }
+    }
+
+    /// <summary>
+    /// True when <paramref name="ee"/> looks like an sceCdlFILE path packet (Vexx EE SIF
+    /// buffer at 0x3F7B00): path-shaped bytes at +0x20 or +0x24 (\, /, $, alnum leaf).
+    /// Used to allow SearchFile copy-back into the low image data band without SM text stomp.
+    /// </summary>
+    private static bool LooksLikeCdlFilePath(SystemMemory mem, uint ee)
+    {
+        if (ee + 0x40u >= (uint)SystemMemory.RDRAM_SIZE) return false;
+        foreach (uint off in new uint[] { 0x20, 0x24, 0x08 })
+        {
+            byte b0 = mem.Read8(ee + off);
+            if (b0 is (byte)'\\' or (byte)'/' or (byte)'$' or (byte)'.')
+                return true;
+            if (b0 is >= (byte)'A' and <= (byte)'Z'
+                or >= (byte)'a' and <= (byte)'z'
+                or >= (byte)'0' and <= (byte)'9')
+            {
+                // Need a few printable bytes to avoid random data.
+                int printable = 0;
+                for (uint i = 0; i < 12; i++)
+                {
+                    byte b = mem.Read8(ee + off + i);
+                    if (b == 0) break;
+                    if (b is >= 32 and < 127) printable++;
+                    else return false;
+                }
+                if (printable >= 4) return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>

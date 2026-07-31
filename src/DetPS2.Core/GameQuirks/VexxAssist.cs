@@ -23,6 +23,12 @@ namespace DetPS2.Core;
 /// (lui at,0x3B + lw -0x2C58), NOT the 0x3BD3A8 plant target used in waves 3–4. Correct
 /// base so host open/read runs: first u32 (entry count) → malloc(count×24) table → full
 /// index CdRead-equivalent host read → Soft-GS residual after assets bind.
+///
+/// Wave-6: residual host-open FAIL for <c>data\…</c> / fonts / frontend (paths live inside
+/// STREE0.TRE, not ISO root). Build NameCRC32→(offset,size) from the count×24 index words
+/// (ground-truthed: CRC32 of lowercased backslash path matches entry NameCRC; dual layout
+/// A=NameCRC,DataCRC,off,sz / C=off,sz,NameCRC,DataCRC) and FileOpenVirtualStream into the
+/// STREE0 extent so fonts/textures stream → Soft-GS title-surface pixels.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -109,6 +115,7 @@ public sealed class VexxAssist : IGameQuirkModule
     private int _hookReplants, _freelistEscapes, _searchPathFixes, _searchPlants;
     private int _stackRescues, _cdIoReplants, _streamMapEscapes;
     private int _hostOpens, _hostReads, _hostCloses, _hostSeeks;
+    private int _hostMemberOpens, _hostMemberFail;
     private int _streamMapProbes, _streamMapPlants;
     private int _streamMapLookupHits;
     private bool _tocProbeDone;
@@ -117,6 +124,15 @@ public sealed class VexxAssist : IGameQuirkModule
     /// <summary>Game 1-based handle → IopModules FILEIO fd (0-based).</summary>
     private readonly Dictionary<int, int> _hostFds = new();
 
+    /// <summary>STREE0 disc byte offset (LBA×2048) once resolved.</summary>
+    private long _stree0DiscByteOff;
+    private uint _stree0Size;
+    /// <summary>NameCRC32 (path) → (offset within STREE0, size, score). Built once from TOC words.</summary>
+    private Dictionary<uint, (uint Off, uint Size, int Score)>? _streeMemberByCrc;
+    private int _streeMemberIndexCount;
+    /// <summary>Minimum payload probe score to accept a NameCRC→(off,sz) candidate.</summary>
+    private const int MemberMinScore = 10;
+
     public void Reset()
     {
         _pathPatched = _mallocPlanted = _cdIoPlanted = false;
@@ -124,11 +140,16 @@ public sealed class VexxAssist : IGameQuirkModule
         _hookReplants = _freelistEscapes = _searchPathFixes = _searchPlants = 0;
         _stackRescues = _cdIoReplants = _streamMapEscapes = 0;
         _hostOpens = _hostReads = _hostCloses = _hostSeeks = 0;
+        _hostMemberOpens = _hostMemberFail = 0;
         _streamMapProbes = _streamMapPlants = 0;
         _streamMapLookupHits = 0;
         _tocProbeDone = false;
         _streamMapTable = _streamMapCount = _streamMapObj = 0;
         _hostFds.Clear();
+        _stree0DiscByteOff = 0;
+        _stree0Size = 0;
+        _streeMemberByCrc = null;
+        _streeMemberIndexCount = 0;
         try { _isoVol?.Disc?.Dispose(); } catch { }
         _isoVol = null; _isoVolPath = null;
     }
@@ -476,7 +497,7 @@ public sealed class VexxAssist : IGameQuirkModule
             return true;
         }
 
-        // Prefer cdrom0: so FileOpen hits disc path.
+        // Prefer cdrom0: so FileOpen hits disc path (STREE0.TRE / GAME.TXT / DATA\SOUND\…).
         string tryPath = path.Contains(':') ? path : "cdrom0:\\" + path;
         int fd = mods.FileOpen(tryPath, 1);
         if (fd < 0 && !tryPath.Equals(path, StringComparison.OrdinalIgnoreCase))
@@ -488,9 +509,21 @@ public sealed class VexxAssist : IGameQuirkModule
                 fd = mods.FileOpen("cdrom0:\\" + leaf, 1);
         }
 
+        // Wave-6: data\… / fonts / frontend live inside STREE0 — virtual member stream.
+        bool member = false;
+        uint memberSz = 0;
         if (fd < 0)
         {
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens < 24)
+            // Prefer full raw path for CRC (NormalizeHostCdPath may leaf-strip).
+            fd = TryOpenStreeMember(sys, mods, raw, path, out memberSz);
+            member = fd >= 0;
+        }
+
+        if (fd < 0)
+        {
+            _hostMemberFail++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1"
+                && (_hostOpens + _hostMemberFail) <= 40)
                 Console.Error.WriteLine(
                     $"[VEXX] host-open FAIL \"{raw}\" → \"{path}\" cyc={sys.Scheduler.MasterCycles}");
             ReturnHost(sys, 0);
@@ -500,15 +533,267 @@ public sealed class VexxAssist : IGameQuirkModule
         int handle = fd + 1; // retail open returns 1-based; read does a0--
         _hostFds[handle] = fd;
         _hostOpens++;
+        if (member) _hostMemberOpens++;
         // Do NOT credit full 1GB TRE at open — only actual FileRead bytes (TOC stream).
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens <= 16)
+        // Member open credits a small sector token so cdvd advances with asset binds.
+        if (member && memberSz > 0)
+            sys.Cdvd.NoteHostReadSectors((int)Math.Min((memberSz + 2047) / 2048, 64));
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens <= 32)
         {
-            mods.TryGetOpenFileSize(fd, out uint sz);
+            if (!member) mods.TryGetOpenFileSize(fd, out memberSz);
             Console.Error.WriteLine(
-                $"[VEXX] host-open #{_hostOpens} \"{raw}\" → \"{path}\" h={handle} fd={fd} size={sz} cyc={sys.Scheduler.MasterCycles}");
+                $"[VEXX] host-open #{_hostOpens}{(member ? " MEMBER" : "")} \"{raw}\" → \"{path}\" " +
+                $"h={handle} fd={fd} size={memberSz} members={_hostMemberOpens} cyc={sys.Scheduler.MasterCycles}");
         }
         ReturnHost(sys, unchecked((uint)handle));
         return true;
+    }
+
+    /// <summary>
+    /// Open a path that lives inside STREE0.TRE via NameCRC32 → (offset,size) virtual stream.
+    /// </summary>
+    private int TryOpenStreeMember(Ps2System sys, IopModuleHost mods, string raw, string path,
+        out uint size)
+    {
+        size = 0;
+        EnsureStreeMemberIndex(sys);
+        if (_streeMemberByCrc == null || _streeMemberByCrc.Count == 0 || _stree0DiscByteOff == 0)
+            return -1;
+
+        string key = NormalizeMemberPath(raw.Length > 0 ? raw : path);
+        if (key.Length == 0) return -1;
+
+        // Try full path, leaf-prefixed data\, and plain leaf under common roots.
+        var alts = new List<string>(8) { key };
+        string leaf = System.IO.Path.GetFileName(key.Replace('/', '\\'));
+        if (!string.IsNullOrEmpty(leaf) && leaf != key)
+        {
+            alts.Add(leaf);
+            if (!key.StartsWith("data\\", StringComparison.Ordinal))
+                alts.Add("data\\" + key);
+        }
+        // Uppercase path variants (some TOC NameCRCs use mixed case; we CRC lower).
+        // Already lowercased in NormalizeMemberPath.
+
+        foreach (string a in alts)
+        {
+            uint crc = Crc32Ascii(a);
+            if (!_streeMemberByCrc.TryGetValue(crc, out var ent) || ent.Size == 0)
+                continue;
+            // Reject weak matches (e.g. sound0.tre false positive → UnknownOpcode thrash).
+            if (ent.Score < MemberMinScore) continue;
+            // Nested .tre must start with a plausible entry-count header.
+            if (a.EndsWith(".tre", StringComparison.Ordinal) && ent.Score < 20)
+                continue;
+            long abs = _stree0DiscByteOff + ent.Off;
+            if (abs > uint.MaxValue) continue;
+            int vfd = mods.FileOpenVirtualStream("stree:" + a, (uint)abs, ent.Size);
+            if (vfd >= 0)
+            {
+                size = ent.Size;
+                return vfd;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Lowercase backslash path, strip device / <c>$/</c> / version suffix.</summary>
+    internal static string NormalizeMemberPath(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        string path = raw.Trim();
+        if (path.StartsWith("host0:", StringComparison.OrdinalIgnoreCase)) path = path[6..];
+        else if (path.StartsWith("host:", StringComparison.OrdinalIgnoreCase)) path = path[5..];
+        else if (path.StartsWith("cdrom0:", StringComparison.OrdinalIgnoreCase)) path = path[7..];
+        else if (path.StartsWith("cdrom:", StringComparison.OrdinalIgnoreCase)) path = path[6..];
+        path = path.TrimStart('\\', '/');
+        if (path.StartsWith("$/", StringComparison.Ordinal) || path.StartsWith("$\\", StringComparison.Ordinal))
+            path = path[2..];
+        else if (path.Length > 0 && path[0] == '$')
+            path = path[1..].TrimStart('\\', '/');
+        int semi = path.IndexOf(';');
+        if (semi >= 0) path = path[..semi];
+        path = path.Replace('/', '\\').ToLowerInvariant();
+        while (path.StartsWith(".\\")) path = path[2..];
+        return path.Trim();
+    }
+
+    private void EnsureStreeMemberIndex(Ps2System sys)
+    {
+        if (_streeMemberByCrc != null) return;
+        _streeMemberByCrc = new Dictionary<uint, (uint Off, uint Size, int Score)>(16384);
+        string? isoPath = sys.Cdvd.MountedPath;
+        if (string.IsNullOrEmpty(isoPath)) return;
+        try
+        {
+            if (_isoVol == null || _isoVolPath != isoPath)
+            {
+                try { _isoVol?.Disc?.Dispose(); } catch { }
+                _isoVol = Iso9660.OpenFile(isoPath);
+                _isoVolPath = isoPath;
+            }
+            if (_isoVol?.Disc == null) return;
+            var entry = Iso9660.FindFile(_isoVol, "STREE0.TRE");
+            if (entry == null) return;
+
+            _stree0DiscByteOff = (long)entry.ExtentLba * Iso9660.SectorSize;
+            _stree0Size = entry.Size;
+
+            var hdr = new byte[4];
+            if (_isoVol.Disc.ReadAt(_stree0DiscByteOff, hdr) < 4) return;
+            uint count = BitConverter.ToUInt32(hdr, 0);
+            if (count is 0 or > 200_000) return;
+
+            uint bytes = count * 24u;
+            var buf = new byte[bytes];
+            int n = _isoVol.Disc.ReadAt(_stree0DiscByteOff + 4, buf);
+            if (n < 24) return;
+            int words = n / 4;
+            uint tocEnd = 4 + bytes;
+
+            // Dual sliding layouts over the index word stream (not only 24-byte aligned):
+            //   A: NameCRC, DataCRC, offset, size
+            //   C: offset, size, NameCRC, DataCRC
+            // Score candidates by payload probe; keep best per NameCRC.
+            for (int i = 0; i + 3 < words; i++)
+            {
+                uint w0 = BitConverter.ToUInt32(buf, i * 4);
+                uint w1 = BitConverter.ToUInt32(buf, i * 4 + 4);
+                uint w2 = BitConverter.ToUInt32(buf, i * 4 + 8);
+                uint w3 = BitConverter.ToUInt32(buf, i * 4 + 12);
+
+                TryOfferMember(w0, w2, w3, tocEnd); // A: ncrc=w0 off=w2 sz=w3
+                TryOfferMember(w2, w0, w1, tocEnd); // C: ncrc=w2 off=w0 sz=w1
+            }
+
+            _streeMemberIndexCount = _streeMemberByCrc.Count;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+                Console.Error.WriteLine(
+                    $"[VEXX] STREE0 member-index entries={_streeMemberIndexCount} " +
+                    $"count={count} discOff=0x{_stree0DiscByteOff:X}");
+        }
+        catch
+        {
+            /* leave empty; retry not needed — null dict means built-failed */
+            _streeMemberByCrc ??= new Dictionary<uint, (uint Off, uint Size, int Score)>();
+        }
+    }
+
+    private void TryOfferMember(uint nameCrc, uint off, uint sz, uint tocEnd)
+    {
+        if (_streeMemberByCrc == null || nameCrc == 0 || sz < 8 || sz > 32u * 1024 * 1024)
+            return;
+        if (off < tocEnd || off >= _stree0Size) return;
+        if ((ulong)off + sz > _stree0Size) return;
+        if (_isoVol?.Disc == null) return;
+
+        // Payload probe for scoring (prefer real text/asset heads over random TOC noise).
+        int probeLen = (int)Math.Min(sz, 96u);
+        var probe = new byte[probeLen];
+        int got = 0;
+        try { got = _isoVol.Disc.ReadAt(_stree0DiscByteOff + off, probe); }
+        catch { return; }
+        if (got < 4) return;
+
+        int score = ScoreMemberProbe(probe.AsSpan(0, got));
+        if (score < MemberMinScore) return;
+
+        if (_streeMemberByCrc.TryGetValue(nameCrc, out var prev) && prev.Score >= score)
+            return;
+        _streeMemberByCrc[nameCrc] = (off, sz, score);
+    }
+
+    /// <summary>Heuristic payload score; below <see cref="MemberMinScore"/> = reject.</summary>
+    private static int ScoreMemberProbe(ReadOnlySpan<byte> b)
+    {
+        if (b.Length < 4) return -1;
+        int score = 0;
+        uint w0 = (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+
+        // Strong text / index markers (fontindex / history / textindex).
+        if (b[0] == (byte)';' || b[0] == (byte)'#' || (b[0] == (byte)'/' && b.Length > 1 && b[1] == (byte)'/'))
+            score += 25;
+        if (ContainsAscii(b, "This is a list") || ContainsAscii(b, "add history")
+            || ContainsAscii(b, "font files") || ContainsAscii(b, "message text"))
+            score += 35;
+        // Actor / level package heads
+        if (b[0] == (byte)'.' && ContainsAscii(b, "ACTOR")) score += 20;
+        if (b[0] == (byte)'*' && (StartsWithAscii(b, "*PARTDEF") || StartsWithAscii(b, "*EMITDEF")
+            || StartsWithAscii(b, "*LEVEL") || StartsWithAscii(b, "*DataPath")
+            || StartsWithAscii(b, "*ST") || StartsWithAscii(b, "*PR")))
+            score += 14;
+        // FILE / MESH containers (little-endian tags ELIF / HSEM)
+        if (b.Length >= 8 && (ContainsAscii(b[..Math.Min(b.Length, 48)], "ELIF")
+            || ContainsAscii(b[..Math.Min(b.Length, 48)], "HSEM")))
+            score += 22;
+        if (ContainsAscii(b[..Math.Min(b.Length, 48)], "MINA")
+            || ContainsAscii(b[..Math.Min(b.Length, 48)], "EPYT"))
+            score += 14;
+        // Memcard / save template
+        if (ContainsAscii(b, "SLUS") || ContainsAscii(b, "/BA")) score += 20;
+        // Nested TRE: first u32 count + second word TOC-ish
+        if (b.Length >= 8)
+        {
+            uint w1 = (uint)(b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24));
+            if (w0 is >= 1 and <= 200_000 && w1 is >= 0x1000 and <= 0x1000000)
+                score += 30; // strong nested-TRE
+            else if (w0 is >= 1 and <= 200_000)
+                score += 6;
+        }
+
+        // Binary texture-ish: low printable, non-zero header (tgax/bmpx)
+        int printable = 0;
+        int n = Math.Min(b.Length, 32);
+        for (int i = 0; i < n; i++)
+        {
+            byte c = b[i];
+            if (c is >= 32 and < 127 or 9 or 10 or 13) printable++;
+        }
+        score += printable / 5;
+        if (printable <= 6 && w0 != 0) score += 8; // compact binary head
+
+        // Reject pure zeros / near-empty
+        if (score < 4 && printable < 4) return -1;
+        return score;
+    }
+
+    private static bool StartsWithAscii(ReadOnlySpan<byte> b, string s)
+    {
+        if (b.Length < s.Length) return false;
+        for (int i = 0; i < s.Length; i++)
+            if (b[i] != (byte)s[i]) return false;
+        return true;
+    }
+
+    private static bool ContainsAscii(ReadOnlySpan<byte> b, string s)
+    {
+        if (b.Length < s.Length) return false;
+        for (int i = 0; i <= b.Length - s.Length; i++)
+        {
+            bool ok = true;
+            for (int j = 0; j < s.Length; j++)
+            {
+                if (b[i + j] != (byte)s[j]) { ok = false; break; }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Standard CRC-32 (ZIP/PNG), matches retail NameCRC and Python binascii.crc32.</summary>
+    internal static uint Crc32Ascii(string s)
+    {
+        uint crc = 0xFFFFFFFFu;
+        for (int i = 0; i < s.Length; i++)
+        {
+            crc ^= (byte)s[i];
+            for (int k = 0; k < 8; k++)
+            {
+                uint mask = (uint)-(int)(crc & 1);
+                crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            }
+        }
+        return ~crc;
     }
 
     private bool HostCdRead(Ps2System sys, IopModuleHost mods)
@@ -531,8 +816,7 @@ public sealed class VexxAssist : IGameQuirkModule
 
         // Reject non-RDRAM destinations (wave-5: Game.txt thrash used buf=0xFFFFFFF0).
         uint phys = buf & 0x1FFFFFFFu;
-        if (buf == 0 || phys < 0x1000u || phys >= SystemMemory.RDRAM_SIZE
-            || size == 0 || size > HostReadMaxBytes && phys + Math.Min(size, HostReadMaxBytes) > SystemMemory.RDRAM_SIZE)
+        if (buf == 0 || phys < 0x1000u || phys >= SystemMemory.RDRAM_SIZE)
         {
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads < 24)
                 Console.Error.WriteLine(
@@ -541,17 +825,39 @@ public sealed class VexxAssist : IGameQuirkModule
             return true;
         }
 
+        // Wave-6: retail often passes size=0xFFFFFFFF ("read all") for host:$ members.
+        // Clamp to file remaining + HostReadMaxBytes + RDRAM before rejecting.
+        if (size == 0)
+        {
+            ReturnHost(sys, 0);
+            return true;
+        }
         if (size > HostReadMaxBytes)
             size = HostReadMaxBytes;
-        // Cap to remaining RDRAM from phys.
+        if (mods.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+        {
+            int pos = mods.FileSeek(fd, 0, 1); // SEEK_CUR
+            if (pos >= 0 && (uint)pos < fsz)
+            {
+                uint remain = fsz - (uint)pos;
+                if (size > remain) size = remain;
+            }
+            // restore position after tell
+            if (pos >= 0) mods.FileSeek(fd, pos, 0); // SEEK_SET
+        }
         if (phys + size > SystemMemory.RDRAM_SIZE)
             size = SystemMemory.RDRAM_SIZE - phys;
+        if (size == 0)
+        {
+            ReturnHost(sys, 0);
+            return true;
+        }
 
         int n = mods.FileRead(sys.Memory, fd, phys, size);
         if (n > 0)
             sys.Cdvd.NoteHostReadSectors((n + 2047) / 2048);
         _hostReads++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads <= 24)
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads <= 32)
             Console.Error.WriteLine(
                 $"[VEXX] host-read #{_hostReads} h={handle} buf=0x{buf:X} size=0x{size:X} n={n} cdvd={sys.Cdvd.SectorsRead} cyc={sys.Scheduler.MasterCycles}");
         ReturnHost(sys, unchecked((uint)n));
@@ -622,9 +928,9 @@ public sealed class VexxAssist : IGameQuirkModule
         }
         if (!mods.TryGetOpenFileSize(fd, out uint sz))
             sz = 0;
-        // Cap absurd TRE (~1GB) so malloc(size) takes TOC headroom only. Stream open uses the
-        // first u32 entry-count for the hash table (count×24), not this size.
-        if (sz > 8u * 1024 * 1024)
+        // Cap only multi-100MB TRE roots (STREE0 ~1GB) so malloc takes TOC headroom.
+        // Wave-6 members (fonts/textures/mcf) must report real size — do not clamp them.
+        if (sz > 100u * 1024 * 1024)
             sz = 0x00492570; // STREE0 TOC byte length from header w1
         ReturnHost(sys, sz);
         return true;
