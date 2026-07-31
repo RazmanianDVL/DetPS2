@@ -1122,15 +1122,14 @@ public sealed class SonyKernelHle
                                 Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
                             ee.RequestSemaStall();
                         }
-                        else if (!_kernel.TryYieldToOtherRunnable(ee))
+                        else
                         {
-                            // Nobody else runnable and no matching SIF RPC pending: park on VBlank
-                            // instead of busy-spin. Next PCRTC VBlank wakes us so the frame loop
-                            // can progress. Preserved as-is for waits unrelated to SIF RPC.
-                            // Use TryYield (no self-wake) then fabricate only if still alone.
+                            // WHIP_SEMA_FIX_V2: non-RPC soft-signal (Whiplash SN seq + SIF worker).
+                            // No yield-without-wake; VBlank park only when ThreadCount < 2.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no matching RPC / no runnable thread)");
-                            _kernel.WaitSemaVblank();
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
+                            if (_kernel.ThreadCount < 2)
+                                _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
                         }

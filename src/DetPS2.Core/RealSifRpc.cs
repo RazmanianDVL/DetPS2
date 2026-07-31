@@ -1971,7 +1971,7 @@ public sealed class RealSifRpc
         uint w1 = sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
         mode = (int)w0;
 
-        // SN ProDG wrapper: { seq, eeReply*, 4, mode, …, path@+0x14 }.
+        // SN ProDG wrapper: { seq, eeReply*, 4, mode@+0xC, path@+0x14 }.
         // Word0 is a sequence cookie (often 0x2D…), NOT FIO open mode — Whiplash GAME.INI
         // live: seq=0x2D, mode@+0xC=1 (O_RDONLY), path@+0x14 = cdrom0:\WHIPLASH\GAME.INI;1.
         if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 16)
