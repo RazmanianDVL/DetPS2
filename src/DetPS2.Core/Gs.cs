@@ -1389,7 +1389,7 @@ public sealed class Gs : ISchedulable
                 {
                     int bi = (int)baseBytes + (sy * fbw + sx) * 2;
                     if ((uint)bi + 1u >= (uint)_localMem.Length) continue;
-                    ushort p16 = (ushort)(_localMem[bi] | (_localMem[bi + 1] << 8));
+                    ushort p16 = (ushort)(_localMem[bi] | ((uint)_localMem[bi + 1] << 8));
                     int r = (p16 & 0x1F) << 3;
                     int g = ((p16 >> 5) & 0x1F) << 3;
                     int b = ((p16 >> 10) & 0x1F) << 3;
