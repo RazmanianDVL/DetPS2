@@ -1036,6 +1036,8 @@ public static class SmokeTests
 
             // Phase 27
             Dmac_MfifoAndChainTags();
+            Dmac_ChainEndIrq_LatchesChcrTag();
+            Dmac_Vif1EndAddr0_InlineDirectPath2();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -4839,6 +4841,82 @@ public static class SmokeTests
         for (int i = 0; i < 8; i++) sys.Dmac.Step(16);
         if (sys.Dmac.TransfersCompleted < 1) throw new Exception("no complete");
         Console.WriteLine($"[Smoke] Dmac_MfifoAndChainTags OK (done={sys.Dmac.TransfersCompleted})");
+    }
+
+
+    /// <summary>
+    /// WAVE-3: VIF1 END+IRQ chain completes (STR clear). CHCR.TAG high-nibble latch is
+    /// intentionally off for DA — live IRQ success advances display head then Exit before
+    /// Soft-GS chrome. See <see cref="Dmac_Vif1EndAddr0_InlineDirectPath2"/> for Path2.
+    /// </summary>
+    public static void Dmac_ChainEndIrq_LatchesChcrTag()
+    {
+        var sys = new Ps2System();
+        sys.Dmac.WriteRegister(0x1000E000, 1); // DMAE
+        const uint vif1Base = 0x10009000u;
+        const uint tadr = 0x00004000u;
+        const uint data = 0x00005000u;
+        sys.Memory.Write32(tadr, 0xF0000001u);
+        sys.Memory.Write32(tadr + 4, data);
+        sys.Memory.Write32(tadr + 8, 0);
+        sys.Memory.Write32(tadr + 12, 0);
+        for (uint i = 0; i < 4; i++)
+            sys.Memory.Write32(data + i * 4, 0);
+
+        sys.Dmac.WriteRegister(vif1Base + 0x30, tadr);
+        sys.Dmac.WriteRegister(vif1Base + 0x20, 0);
+        sys.Dmac.WriteRegister(vif1Base + 0x00, 0x1C5u);
+
+        for (int i = 0; i < 64 && sys.Dmac.IsActive(Dmac.Channel.VIF1); i++)
+            sys.Dmac.Step(256);
+
+        if (sys.Dmac.IsActive(Dmac.Channel.VIF1))
+            throw new Exception("VIF1 chain still active after END");
+        uint chcr = sys.Dmac.ReadRegister(vif1Base + 0x00);
+        if ((chcr & 0x100u) != 0)
+            throw new Exception($"STR still set chcr=0x{chcr:X8}");
+
+        Console.WriteLine($"[Smoke] Dmac_ChainEndIrq_LatchesChcrTag OK (complete chcr=0x{chcr:X8}, TAG latch off)");
+    }
+
+
+    /// <summary>
+    /// WAVE-3 DA: END+IRQ tag with ADDR=0, QWC&gt;0, TTE DIRECT must pull payload from the
+    /// QWs following the DMAtag (not phys 0) so Path2 reaches Soft-GS.
+    /// </summary>
+    public static void Dmac_Vif1EndAddr0_InlineDirectPath2()
+    {
+        var sys = new Ps2System();
+        sys.Dmac.WriteRegister(0x1000E000, 1);
+        const uint vif1Base = 0x10009000u;
+        const uint tadr = 0x00006000u;
+        // END+IRQ QWC=2, ADDR=0 — inline 2 QWs after tag
+        sys.Memory.Write32(tadr, 0xF0000002u);
+        sys.Memory.Write32(tadr + 4, 0); // ADDR=0
+        sys.Memory.Write32(tadr + 8, 0); // TTE w2 NOP
+        sys.Memory.Write32(tadr + 12, 0x50000002u); // DIRECT IMM=2
+        // Minimal PACKED A+D GIFtag + one A+D (FRAME) — NLOOP=1 EOP NREG=1 REGS=A+D
+        uint data = tadr + 16;
+        sys.Memory.Write32(data + 0, 0x00008001u);
+        sys.Memory.Write32(data + 4, 0x10000000u);
+        sys.Memory.Write32(data + 8, 0x0000000Eu);
+        sys.Memory.Write32(data + 12, 0);
+        sys.Memory.Write32(data + 16, 0); // data
+        sys.Memory.Write32(data + 20, 0);
+        sys.Memory.Write32(data + 24, 0x4Cu); // reg FRAME
+        sys.Memory.Write32(data + 28, 0);
+
+        ulong p2before = sys.Gif.Path2Transfers;
+        sys.Dmac.WriteRegister(vif1Base + 0x30, tadr);
+        sys.Dmac.WriteRegister(vif1Base + 0x20, 0);
+        sys.Dmac.WriteRegister(vif1Base + 0x00, 0x145u); // STR|TTE|CHAIN|DIR
+        for (int i = 0; i < 64 && sys.Dmac.IsActive(Dmac.Channel.VIF1); i++)
+            sys.Dmac.Step(256);
+        if (sys.Dmac.IsActive(Dmac.Channel.VIF1))
+            throw new Exception("VIF1 still active");
+        if (sys.Gif.Path2Transfers <= p2before)
+            throw new Exception($"Path2 not delivered p2={sys.Gif.Path2Transfers} before={p2before}");
+        Console.WriteLine($"[Smoke] Dmac_Vif1EndAddr0_InlineDirectPath2 OK (path2={sys.Gif.Path2Transfers})");
     }
 
     public static void Timer_GateAndClockSelect()
