@@ -9,11 +9,60 @@
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s1` |
-| Agent date | 2026-07-31 (S0+G0 / PL-005 + GX-008) |
+| Agent date | 2026-07-31 (S1 / PL-011 INTERACTIVE) |
 | ROMDIR gate | **CLOSED** |
-| Branch | `agent/seat-s1/s0-g0` |
-| menuKind | **mk-mainmenu** MENU YES (baseline gifP3=18 px≈966k) |
+| Branch | `agent/seat-s1/s1-g1` |
+| menuKind | **mk-mainmenu** MENU YES · **INTERACTIVE YES** (T2) |
 | Seat | **S1** MIDWAY-SM |
+
+---
+
+## S1 PL-011 — stable sel-idx + pad accept (INTERACTIVE)
+
+**Season:** S1 INTERACTIVE. **No new Soft-GS PATH3 plants** — only pad selection/accept so T2 is defensible @100M SEMA_OFF.
+
+### Claim table (SEMA_OFF, host-present)
+
+| Budget | PC | px | prims | gifP1 | gifP2 | gifP3 | dmac | imgBytes | dispfbPx | exit | notes |
+|--------|-----|-----|-------|-------|-------|-------|------|----------|----------|------|-------|
+| **diagnose 20M** | `0x426E34` | **286720** | 1 | 0 | 0 | **5** | 7 | 1024 | 0 | F | logo spine hold (pad not yet live) |
+| **claim 100M** | `0x421CF8` | **966656** | **9** | 0 | 0 | **18** | 30 | 1024 | 0 | F | **MENU YES + INTERACTIVE YES** |
+
+**claim line:** `claim: px=966656 prims=9 gifP1=0 gifP2=0 gifP3=18 imgBytes=1024 dispfbPx=0 expandHits=0 gifCompleted=110605 gifAborted=1`  
+**Status:** **MENU YES** + **INTERACTIVE YES** (T2) · Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF**  
+**stamp:** `20260731-090428` · build `out/seat-s1`
+
+### T2 INTERACTIVE proof (PL-011)
+
+| Signal | Evidence @100M |
+|--------|----------------|
+| **sel-idx stable 0..N** | Host-pad edge plant re-holds `*54E5F0/*54E5E8/*54E610/*54E620` as full **0..4** (not binary busy toggles); `max=4` rows=5 |
+| **Pad accept state change** | CROSS/START/CIRCLE rising → `*54E5F4=1` accept latch + `*54E5F8` edge count; **accepts≥151** by 100M |
+| **Proven marker** | `[BIOS] PL-011 INTERACTIVE proven … accepts=1 … gifP3=11 cyc=60100000` then continuous holds through claim |
+| **MENU hold** | second-chrome PATH3 ×4 → gifP3=**18** px=**966656** prims=**9** (S0/wave-7 Soft-GS floor held) |
+
+**menu-sel sample @85.5M (gifP3=18):** `*54E5E8=4 *54E5EC=5 *54E610=4 *54E620=4 ck=1/4/accepts` — full 0..N under pad, not 0↔1 thrash.
+
+### Change class (PL-011)
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `MaybePlantMenuSelectionIndex` rewrite: host `PadInput` rising edges (Down/Right → +1, Up/Left → −1); continuous re-hold (no 64-plant cap); dedicated cells `*54E5F0` (idx) / `*54E5F4`+`*54E5F8` (accept latch+count)
+  - Drive plant from every `MaybeInjectMenuPad` pulse so edges are not missed between Step samples
+  - `PL-011 INTERACTIVE proven` when max≥2 **or** accept≥1 under gifP3≥11
+- **Rejected / freezes held:** no new PATH3 plants; no type5; no sm+0x28; no Gs/Gif/Dmac; SearchFile gate; Soft-GS truth; SEMA_OFF
+
+### Residual wall (post PL-011)
+
+1. **Assist PATH3 second chrome** still supplies gifP3 11→18 — natural type-2 texture DMA residual (**PL-031**).
+2. Accept is **assist latch + proven sel-idx** (T2 bar); full natural AnimMenuGUI transition into submenu/game still residual (**PL-021** dual-chrome UI / later FRONTEND).
+3. DISPFB unset (`dispfbPx=0`); solid SPRITE chrome only.
+
+### Soft-GS scoreboard (S1 re-claim)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **S0 claim 100M** | FAE8 `0x43FBDC` | **966656** | **9** | **18** | 30 | MENU YES |
+| **S1 PL-011 claim 100M** | `0x421CF8` | **966656** | **9** | **18** | 30 | MENU+INTERACTIVE YES; sel-idx max=4 accepts≥151 |
 
 ---
 
@@ -64,11 +113,11 @@ EE Midway stream (FAE8 / FBB0 / D770)
 | DISPFB present | **no** (`dispfbPx=0`) | FRAME_1 composite | FBP page via FRAME |
 | ofx expand | **no** at SM menu | second chrome is real XYZ2 SPRITE raster | not BO2/GoW strip-expand class |
 
-### One primary wall for INTERACTIVE (P1)
+### One primary wall after INTERACTIVE (→ FRONTEND / NATURAL)
 
-**Wall:** **Natural Midway texture/chrome DMA + AnimMenuGUI accept** — menu is Soft-GS MENU YES with assist PATH3 second chrome and assist-stable sel-idx; P1 needs natural type-2 draw body DMA (drop assist PATH3) and a proven accept path past row index plant (`*54E610/*54E620`) into real menu transition.
+**Wall:** **Natural Midway texture/chrome DMA** — menu is Soft-GS **MENU YES + INTERACTIVE YES** (PL-011: host-pad sel-idx 0..4 + accept latch). Next: natural type-2 draw body DMA (drop assist PATH3 — PL-031) and dual-chrome selection UI (PL-021).
 
-**Residual wall one-liner:** assist PATH3 second chrome holds mk-mainmenu; natural texture DMA + menu accept still residual.
+**Residual wall one-liner:** assist PATH3 second chrome holds mk-mainmenu Soft-GS; natural texture DMA residual; AnimMenuGUI natural submenu transition residual.
 
 ### Oracle next step (Play! / PINE)
 

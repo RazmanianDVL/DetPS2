@@ -27,7 +27,7 @@ This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships enginee
 | In-memory netplay lockstep | Netplay | **Pass** | `Netplay_InMemory_LockstepSync` |
 | Real PS2 BIOS dump | BIOS | **Partial** | Load path + expanded HLE; verified against a real user-supplied dump |
 | Public domain / ps2dev homebrew | Homebrew | **Partial** | Loader + HLE + more ISA; title-dependent |
-| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **MENU YES** | Soft-GS mk-mainmenu (gifP3=18 px≈966k). Residual: natural texture DMA / pad accept. See scoreboard + post-menu plan. |
+| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **MENU YES + INTERACTIVE YES** | Soft-GS mk-mainmenu (gifP3=18 px≈966k) + PL-011 sel-idx 0..4 + accept latch. Residual: natural texture DMA / AnimMenuGUI natural submenu. |
 | Vexx (`SLUS_203.83`) | Retail | **MENU YES** | Soft-GS title-surface (STREE0 VFS). Residual: richer frontend TRE members. |
 | Blood Omen 2 (`SLUS_200.24`) | Retail | **MENU YES** | Soft-GS title-surface. Residual: multi-prim IMAGE/DISPFB chrome. |
 | Burnout 3: Takedown (`SLUS_210.50`) | Retail | **MENU YES** | Soft-GS logo-frontend (px multi-M). Residual: DISPFB + pad main-menu advance. |
