@@ -7790,6 +7790,9 @@ public sealed class RealSifRpc
                 uint sectors = argBuf != 0 ? Math.Max(1u, mem.Read32(argBuf + 4)) : 1u;
                 uint bufAddr = argBuf != 0 ? mem.Read32(argBuf + 8) : 0;
                 uint ok = cdvd.ReadSectorsTo(mem, lbn, sectors, bufAddr);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[RPC] CdRead lbn={lbn} sectors={sectors} buf=0x{bufAddr:X} ok={ok} arg=0x{argBuf:X}");
                 return (int)(ok * (uint)Cdvd.SectorSize);
             }
             case NcmdGetToc:

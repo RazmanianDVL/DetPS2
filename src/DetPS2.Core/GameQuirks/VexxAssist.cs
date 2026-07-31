@@ -18,6 +18,11 @@ namespace DetPS2.Core;
 /// SearchFile (empty SIFCMD cid=0 thrash), so STREE TOC never CdReads (cdvd=0). Host-serve
 /// CD I/O open/read/seek/tell/size/close against the mounted ISO (real sector stream for
 /// TRE TOC / GAME.TXT); strip <c>$/</c> virtual root. Soft-GS residual. See issue #19.
+///
+/// Wave-5: stream-map open at 0x1DCEB0 loads the CD I/O vtable from <c>0x3AD3A8</c>
+/// (lui at,0x3B + lw -0x2C58), NOT the 0x3BD3A8 plant target used in waves 3–4. Correct
+/// base so host open/read runs: first u32 (entry count) → malloc(count×24) table → full
+/// index CdRead-equivalent host read → Soft-GS residual after assets bind.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -54,11 +59,12 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint SearchFileArgBuf = 0x1C1F4000;
 
     /// <summary>
-    /// CD file-backend vtable the game install writes at 0x3BD3A8.. (open/read/…).
-    /// Live residual: never written → open returns 0 → STREE stream map stays empty.
-    /// Defaults match the install fallbacks (0x1D0CE0 open, 0x1D0CA0 read, …).
+    /// CD file-backend vtable the stream open path loads (EE 0x1DCEFC: lui at,0x3B;
+    /// lw open=-0x2C58 → <c>0x3AD3A8</c>). Wave 3–4 wrongly planted <c>0x3BD3A8</c> (never
+    /// read) while retail defaults live here — open returned through host:+FILEIO (fail) so
+    /// STREE stream map table at obj+8 stayed null. Defaults: 0x1D0CE0 open, 0x1D0CA0 read.
     /// </summary>
-    public const uint CdIoVtableBase = 0x003BD3A8;
+    public const uint CdIoVtableBase = 0x003AD3A8;
     public const uint CdIoDefaultOpen = 0x001D0CE0;
     public const uint CdIoDefaultClose = 0x001D0C40;
     public const uint CdIoDefaultRead = 0x001D0CA0;
@@ -73,8 +79,11 @@ public sealed class VexxAssist : IGameQuirkModule
     /// Host-serve CD I/O stubs (spin until Step fulfills). Vtable points here so open/read
     /// cannot race past a single-instruction PC sample (wave-4).
     /// Layout: open, close, read, write, seek, tell, size — 0x20 bytes each (spin + nops).
+    /// Must live at ≥0x00100000 — <see cref="KernelBootstrap.RescueIfLostInLowMem"/> treats
+    /// PC below 1MiB as lost and re-homes before ActiveQuirk.Step can service the spin
+    /// (wave-5: stubs at 0x90200 never ran; stream open hung).
     /// </summary>
-    public const uint HostCdStubBase = 0x00090200;
+    public const uint HostCdStubBase = 0x00F00000;
     public const uint HostCdStubOpen = HostCdStubBase + 0x00;
     public const uint HostCdStubClose = HostCdStubBase + 0x20;
     public const uint HostCdStubRead = HostCdStubBase + 0x40;
@@ -100,6 +109,9 @@ public sealed class VexxAssist : IGameQuirkModule
     private int _hookReplants, _freelistEscapes, _searchPathFixes, _searchPlants;
     private int _stackRescues, _cdIoReplants, _streamMapEscapes;
     private int _hostOpens, _hostReads, _hostCloses, _hostSeeks;
+    private int _streamMapProbes, _streamMapPlants;
+    private int _streamMapLookupHits;
+    private bool _tocProbeDone;
     private Iso9660.Volume? _isoVol;
     private string? _isoVolPath;
     /// <summary>Game 1-based handle → IopModules FILEIO fd (0-based).</summary>
@@ -112,6 +124,10 @@ public sealed class VexxAssist : IGameQuirkModule
         _hookReplants = _freelistEscapes = _searchPathFixes = _searchPlants = 0;
         _stackRescues = _cdIoReplants = _streamMapEscapes = 0;
         _hostOpens = _hostReads = _hostCloses = _hostSeeks = 0;
+        _streamMapProbes = _streamMapPlants = 0;
+        _streamMapLookupHits = 0;
+        _tocProbeDone = false;
+        _streamMapTable = _streamMapCount = _streamMapObj = 0;
         _hostFds.Clear();
         try { _isoVol?.Disc?.Dispose(); } catch { }
         _isoVol = null; _isoVolPath = null;
@@ -125,9 +141,10 @@ public sealed class VexxAssist : IGameQuirkModule
         PlantIopRpVersion(sys);
         PlantCrtMallocTable(sys);
         PlantStringHeapHook(sys);
-        PlantCdIoVtable(sys);
+        // Host CD stubs ready; live vtable wired after STREE0 TOC CdReads (see Step).
+        PlantHostCdStubs(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
-            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 + CRT/string heap + CD I/O vtable ready");
+            Console.Error.WriteLine("[VEXX] OnDiscMounted: IOPRP252 + CRT/string heap; CD I/O stubs planted");
     }
 
     public void OnHostPresent(Ps2System sys) => _ = sys;
@@ -155,8 +172,12 @@ public sealed class VexxAssist : IGameQuirkModule
             _pathPatched = true;
         }
 
-        // Keep host-serve CD I/O vtable alive (STREE0 TOC open/read).
-        if (!_cdIoPlanted || sys.Memory.Read32(CdIoVtableBase) != HostCdStubOpen)
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+
+        // Wire live CD I/O vtable after STREE0 TOC CdReads (~89 sectors) so multi-chunk
+        // libcdvd assembly is not interrupted; then host-serve secondary .TRE opens.
+        if (sys.Cdvd.SectorsRead >= 80UL
+            && (!_cdIoPlanted || sys.Memory.Read32(CdIoVtableBase) != HostCdStubOpen))
         {
             PlantCdIoVtable(sys);
             _cdIoReplants++;
@@ -173,12 +194,8 @@ public sealed class VexxAssist : IGameQuirkModule
             if (MaybeCapTreSearchSize(sys, buf)) _searchPlants++;
         }
 
-        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
-
-        // Wave-4: host-serve CD I/O open/read/… so STREE0 TOC streams real ISO sectors
-        // (retail host: + FILEIO bind never completes after SearchFile). No cycle gate —
-        // stubs only spin when the game actually calls them.
-        if (MaybeHostCdIo(sys, pc))
+        // Wave-5: host-serve CD I/O once vtable is wired (STREE0 stream-map open/read).
+        if (_cdIoPlanted && MaybeHostCdIo(sys, pc))
             return;
 
         if ((pc is >= 0x0014619C and <= 0x001461BC) || (pc is >= 0x0014625C and <= 0x0014627C))
@@ -220,6 +237,10 @@ public sealed class VexxAssist : IGameQuirkModule
             uint size = (uint)sys.EE.GetGpr(16).Lo;
             if (walks > 64)
             {
+                // size==0 often follows a failed open; give a tiny block so callers that
+                // store through the pointer do not hard-fault, and the freelist loop exits.
+                if (size == 0)
+                    size = 16;
                 if (size > 0 && size < FreelistMaxBump)
                 {
                     uint mem = HostBumpAlloc(sys, size + 64);
@@ -236,22 +257,33 @@ public sealed class VexxAssist : IGameQuirkModule
                 }
                 else
                 {
-                    // Reject absurd sizes (full TRE ~1GB) — partial stream only.
+                    // Absurd sizes (~1GB TRE): fail alloc cleanly.
                     sys.EE.SetGpr(20, new EmotionEngine.Gpr128 { Lo = 0 });
                     sys.EE.SetGpr(21, new EmotionEngine.Gpr128 { Lo = 0 });
                     sys.EE.PC = FreelistSuccessStore;
                     _freelistEscapes++;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _freelistEscapes <= 16)
                         Console.Error.WriteLine(
-                            $"[VEXX] freelist reject huge size=0x{size:X} (partial TRE only) cyc={sys.Scheduler.MasterCycles}");
+                            $"[VEXX] freelist fail size=0x{size:X} cyc={sys.Scheduler.MasterCycles}");
                 }
             }
         }
 
-        // Null stream-table hash walk (s5+8==0) spins forever after failed STREE open.
+        // Null / planted stream-table hash walk.
         if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles
             && pc is >= StreamMapLookupLo and <= StreamMapLookupHi)
+        {
+            _streamMapLookupHits++;
             MaybeEscapeNullStreamMap(sys, pc);
+        }
+        else
+            _streamMapLookupHits = 0;
+
+        // Wave-5: after STREE TOC CdReads (cdvd≥50), probe/build stream map so asset
+        // lookups leave null-table thrash and Soft-GS can receive real prims.
+        if (!_tocProbeDone && sys.Cdvd.SectorsRead >= 50UL
+            && sys.Scheduler.MasterCycles >= 4_000_000UL)
+            MaybeFinishStreamMap(sys);
 
         // Stack death residual: PC lands in path ASCII (STREE0.TRE / GAME.TXT) as code.
         if (sys.Scheduler.MasterCycles >= FreelistEscapeMinCycles && LooksLikePathAsciiPc(sys, pc))
@@ -268,19 +300,120 @@ public sealed class VexxAssist : IGameQuirkModule
         PlantHostCdStubs(sys);
         // Slot layout (8-byte stride): +0 open, +8 close, +16 read, +24 write, +32 stub0,
         // +40 seek, +48 tell, +56 size, +64 misc — matches default-install order.
-        sys.Memory.Write32(CdIoVtableBase + 0x00, HostCdStubOpen);
-        sys.Memory.Write32(CdIoVtableBase + 0x08, HostCdStubClose);
-        sys.Memory.Write32(CdIoVtableBase + 0x10, HostCdStubRead);
-        sys.Memory.Write32(CdIoVtableBase + 0x18, HostCdStubWrite); // spin; rb path unused
-        sys.Memory.Write32(CdIoVtableBase + 0x20, CdIoDefaultStub0); // retail nop-ish
-        sys.Memory.Write32(CdIoVtableBase + 0x28, HostCdStubSeek);
-        sys.Memory.Write32(CdIoVtableBase + 0x30, HostCdStubTell);
-        sys.Memory.Write32(CdIoVtableBase + 0x38, HostCdStubSize);
-        sys.Memory.Write32(CdIoVtableBase + 0x40, CdIoDefaultMisc);
+        // Live open path (0x1DCEFC) loads 0x3AD3A8; also keep legacy 0x3BD3A8 covered.
+        foreach (uint baseAddr in new[] { CdIoVtableBase, 0x003BD3A8u })
+        {
+            sys.Memory.Write32(baseAddr + 0x00, HostCdStubOpen);
+            sys.Memory.Write32(baseAddr + 0x08, HostCdStubClose);
+            sys.Memory.Write32(baseAddr + 0x10, HostCdStubRead);
+            sys.Memory.Write32(baseAddr + 0x18, HostCdStubWrite);
+            sys.Memory.Write32(baseAddr + 0x20, CdIoDefaultStub0);
+            sys.Memory.Write32(baseAddr + 0x28, HostCdStubSeek);
+            sys.Memory.Write32(baseAddr + 0x30, HostCdStubTell);
+            sys.Memory.Write32(baseAddr + 0x38, HostCdStubSize);
+            sys.Memory.Write32(baseAddr + 0x40, CdIoDefaultMisc);
+        }
         _cdIoPlanted = true;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
             Console.Error.WriteLine(
-                $"[VEXX] CD I/O vtable @0x{CdIoVtableBase:X} host-stubs open=0x{HostCdStubOpen:X} read=0x{HostCdStubRead:X}");
+                $"[VEXX] CD I/O vtable @0x{CdIoVtableBase:X} (+legacy 0x3BD3A8) host-stubs open=0x{HostCdStubOpen:X} read=0x{HostCdStubRead:X}");
+    }
+
+    /// <summary>
+    /// Wave-5: after STREE0 TOC CdReads, host-load the hash index (u32 count + count×24)
+    /// into bump RAM. On null-stream-map lookup, plant obj+8 = table so asset paths resolve.
+    /// </summary>
+    private uint _streamMapTable;
+    private uint _streamMapCount;
+    private uint _streamMapObj;
+
+    private void MaybeFinishStreamMap(Ps2System sys)
+    {
+        _streamMapProbes++;
+        if (_streamMapTable == 0)
+            TryBuildStreamMapFromIso(sys);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _streamMapProbes <= 3)
+            Console.Error.WriteLine(
+                $"[VEXX] stream-map probe #{_streamMapProbes} cdvd={sys.Cdvd.SectorsRead} " +
+                $"table=0x{_streamMapTable:X} count={_streamMapCount} " +
+                $"hostOpen={_hostOpens} hostRead={_hostReads} mapEsc={_streamMapEscapes} " +
+                $"cyc={sys.Scheduler.MasterCycles}");
+
+        if (_streamMapTable != 0)
+            _tocProbeDone = true;
+    }
+
+    /// <summary>
+    /// STREE0 on-disk: u32 count, then count × 24-byte hash entries (stream open @ 0x1DCFE0).
+    /// </summary>
+    private void TryBuildStreamMapFromIso(Ps2System sys)
+    {
+        string? isoPath = sys.Cdvd.MountedPath;
+        if (string.IsNullOrEmpty(isoPath)) return;
+        try
+        {
+            if (_isoVol == null || _isoVolPath != isoPath)
+            {
+                try { _isoVol?.Disc?.Dispose(); } catch { }
+                _isoVol = Iso9660.OpenFile(isoPath);
+                _isoVolPath = isoPath;
+            }
+            if (_isoVol?.Disc == null) return;
+            var entry = Iso9660.FindFile(_isoVol, "STREE0.TRE");
+            if (entry == null) return;
+
+            var hdr = new byte[8];
+            int got = _isoVol.Disc.ReadAt((long)entry.ExtentLba * Iso9660.SectorSize, hdr);
+            if (got < 4) return;
+            uint count = BitConverter.ToUInt32(hdr, 0);
+            if (count is 0 or > 200_000) return;
+
+            uint bytes = count * 24u;
+            uint alloc = bytes + 32u;
+            uint table = HostBumpAlloc(sys, alloc);
+            if (table == 0) return;
+
+            // File layout: +0 count (4), +4 entries. Stream open reads count then entries.
+            var buf = new byte[bytes];
+            int n = _isoVol.Disc.ReadAt((long)entry.ExtentLba * Iso9660.SectorSize + 4, buf);
+            if (n <= 0) return;
+            for (int i = 0; i < n; i++)
+                sys.Memory.Write8(table + (uint)i, buf[i]);
+            for (int i = n; i < (int)bytes; i++)
+                sys.Memory.Write8(table + (uint)i, 0);
+
+            _streamMapTable = table;
+            _streamMapCount = count;
+            _streamMapPlants++;
+            sys.Cdvd.NoteHostReadSectors((int)((4 + bytes + 2047) / 2048));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+                Console.Error.WriteLine(
+                    $"[VEXX] stream-map BUILD table=0x{table:X} count={count} bytes={bytes} cyc={sys.Scheduler.MasterCycles}");
+        }
+        catch
+        {
+            /* keep trying next probe */
+        }
+    }
+
+    /// <summary>Plant host-built hash table into the live stream object (s5 / a0).</summary>
+    private void MaybePlantStreamMapOnObject(Ps2System sys, uint obj)
+    {
+        if (_streamMapTable == 0 || obj < 0x1000 || obj + 0x420 >= SystemMemory.RDRAM_SIZE)
+            return;
+        uint cur = sys.Memory.Read32(obj + 8);
+        if (cur == _streamMapTable) return;
+        sys.Memory.Write32(obj + 8, _streamMapTable);
+        sys.Memory.Write32(obj + 0xC, _streamMapCount);
+        // Zero bucket count used by insert path; lookups walk the flat table via hash.
+        if (sys.Memory.Read32(obj + 0x418) == 0)
+            sys.Memory.Write32(obj + 0x418, 0);
+        _streamMapObj = obj;
+        _streamMapPlants++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _streamMapPlants <= 8)
+            Console.Error.WriteLine(
+                $"[VEXX] stream-map PLANT obj=0x{obj:X} table=0x{_streamMapTable:X} count={_streamMapCount}");
     }
 
     /// <summary>Spin loops so Step cannot miss the open/read PC (single-insn race).</summary>
@@ -343,14 +476,13 @@ public sealed class VexxAssist : IGameQuirkModule
             return true;
         }
 
-        // Prefer cdrom0: so FileOpen hits disc path (host: also remaps, but explicit is clearer).
+        // Prefer cdrom0: so FileOpen hits disc path.
         string tryPath = path.Contains(':') ? path : "cdrom0:\\" + path;
         int fd = mods.FileOpen(tryPath, 1);
         if (fd < 0 && !tryPath.Equals(path, StringComparison.OrdinalIgnoreCase))
             fd = mods.FileOpen(path, 1);
         if (fd < 0)
         {
-            // Basename fallback (stree0.tre / GAME.TXT).
             string leaf = System.IO.Path.GetFileName(path.Replace('/', '\\'));
             if (!string.IsNullOrEmpty(leaf))
                 fd = mods.FileOpen("cdrom0:\\" + leaf, 1);
@@ -358,7 +490,7 @@ public sealed class VexxAssist : IGameQuirkModule
 
         if (fd < 0)
         {
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens < 16)
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens < 24)
                 Console.Error.WriteLine(
                     $"[VEXX] host-open FAIL \"{raw}\" → \"{path}\" cyc={sys.Scheduler.MasterCycles}");
             ReturnHost(sys, 0);
@@ -397,9 +529,25 @@ public sealed class VexxAssist : IGameQuirkModule
             }
         }
 
+        // Reject non-RDRAM destinations (wave-5: Game.txt thrash used buf=0xFFFFFFF0).
+        uint phys = buf & 0x1FFFFFFFu;
+        if (buf == 0 || phys < 0x1000u || phys >= SystemMemory.RDRAM_SIZE
+            || size == 0 || size > HostReadMaxBytes && phys + Math.Min(size, HostReadMaxBytes) > SystemMemory.RDRAM_SIZE)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads < 24)
+                Console.Error.WriteLine(
+                    $"[VEXX] host-read BADARGS h={handle} buf=0x{buf:X} size=0x{size:X} cyc={sys.Scheduler.MasterCycles}");
+            ReturnHost(sys, unchecked((uint)(-14))); // EFAULT-ish
+            return true;
+        }
+
         if (size > HostReadMaxBytes)
             size = HostReadMaxBytes;
-        int n = mods.FileRead(sys.Memory, fd, buf & 0x1FFFFFFFu, size);
+        // Cap to remaining RDRAM from phys.
+        if (phys + size > SystemMemory.RDRAM_SIZE)
+            size = SystemMemory.RDRAM_SIZE - phys;
+
+        int n = mods.FileRead(sys.Memory, fd, phys, size);
         if (n > 0)
             sys.Cdvd.NoteHostReadSectors((n + 2047) / 2048);
         _hostReads++;
@@ -474,9 +622,10 @@ public sealed class VexxAssist : IGameQuirkModule
         }
         if (!mods.TryGetOpenFileSize(fd, out uint sz))
             sz = 0;
-        // Cap reported size for absurd TRE (~1GB) so callers that malloc(size) only take TOC.
-        // Stream open reads header then a derived TOC length — full size still available via seek-end
-        // when needed; report real size (alloc path rejects > FreelistMaxBump separately).
+        // Cap absurd TRE (~1GB) so malloc(size) takes TOC headroom only. Stream open uses the
+        // first u32 entry-count for the hash table (count×24), not this size.
+        if (sz > 8u * 1024 * 1024)
+            sz = 0x00492570; // STREE0 TOC byte length from header w1
         ReturnHost(sys, sz);
         return true;
     }
@@ -529,13 +678,39 @@ public sealed class VexxAssist : IGameQuirkModule
         uint table = 0;
         if (s5 >= 0x1000 && s5 + 0x20 < SystemMemory.RDRAM_SIZE)
             table = sys.Memory.Read32(s5 + 8);
+
+        // Wave-5: plant host-built STREE0 index before giving up on the lookup.
+        if ((table == 0 || table >= SystemMemory.RDRAM_SIZE) && _streamMapTable == 0
+            && sys.Cdvd.SectorsRead >= 50UL)
+            TryBuildStreamMapFromIso(sys);
+        if ((table == 0 || table >= SystemMemory.RDRAM_SIZE) && _streamMapTable != 0)
+        {
+            MaybePlantStreamMapOnObject(sys, s5);
+            table = sys.Memory.Read32(s5 + 8);
+            if (table == _streamMapTable)
+            {
+                // Restart at `lw v1, 8(s5)` so the walk uses the planted table.
+                sys.EE.PC = 0x001DD2CCu;
+                return;
+            }
+        }
+
         bool tableBad = table == 0
             || table >= SystemMemory.RDRAM_SIZE
             || (table & 3) != 0;
         // Also bail if a3 is a non-canonical / high garbage pointer mid-walk.
         uint a3 = (uint)sys.EE.GetGpr(7).Lo;
         bool a3Bad = a3 >= SystemMemory.RDRAM_SIZE || (a3 & 0x80000000u) != 0;
-        if (!tableBad && !a3Bad) return;
+        // Planted flat STREE0 index: entry pointer must fall inside [table, table+count*24).
+        if (!tableBad && _streamMapTable != 0 && table == _streamMapTable && _streamMapCount > 0)
+        {
+            uint mapEnd = _streamMapTable + _streamMapCount * 24u;
+            if (a3 < _streamMapTable || a3 >= mapEnd)
+                a3Bad = true;
+        }
+        // Stuck in lookup band across many quirk slices (planted table, bad chain) → miss.
+        if (!tableBad && !a3Bad && _streamMapLookupHits < 8)
+            return;
 
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0 = miss
         sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 }); // s0 = not-found

@@ -481,7 +481,10 @@ public sealed class Ps2System
                 // MidwayFamilyAssist soft-success needs tight slices or the window is missed.
                 bool mkFamHot = ActiveQuirk is MidwayFamilyAssist
                     && MidwayFamilyAssist.IsDecSysInitHotPc(pcPhys);
-                ulong slice = (criHot || gowHot || b3Hot || mkFamHot) ? sliceCri : sliceDefault;
+                // Vexx: host-serve CD I/O spin stubs at 0xF00000 (STREE stream-map open/read).
+                bool vexxHot = ActiveQuirk is VexxAssist
+                    && pcPhys is >= 0x00F00000UL and < 0x00F00100UL;
+                ulong slice = (criHot || gowHot || b3Hot || mkFamHot || vexxHot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never
                 // reached). One-shot kick of only thread 2 left ADX (entry 0x4147F8) and every
