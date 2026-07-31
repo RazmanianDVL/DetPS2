@@ -456,6 +456,8 @@ public sealed class Ps2System
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
                     or (>= 0x00100000UL and <= 0x00100200UL)  // CRT0 re-entry after AdEL (wave-2)
                     or (>= 0x002943C0UL and <= 0x00294590UL)  // cache-wb residual (0x2943D8/420)
+                    or (>= 0x00299300UL and <= 0x00299480UL)  // wave-6 word-scan residual (0x299354)
+                    or (>= 0x00289300UL and <= 0x00289340UL)  // wave-6 post-type-2 byte-copy
                     or (>= 0x00183880UL and <= 0x001838D0UL)
                     or (>= 0x0017A1D0UL and <= 0x0017A298UL)  // soft-tick wait leaf (*0x29C7D4)
                     or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait

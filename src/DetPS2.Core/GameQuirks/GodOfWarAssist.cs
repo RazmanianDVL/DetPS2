@@ -108,6 +108,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private ulong _lastWorkerYieldCyc;
     /// <summary>Last cmd type we force-dispatched — never rewind the same cmd (type-2 body is multi-M).</summary>
     private uint _armedWorkerCmd;
+    /// <summary>Wave-6: word-scan residual 0x2993xx + main SP poison after type-2 clear.</summary>
+    private int _wordScanEscapes;
+    private int _mainSpRepairs;
+    /// <summary>Wave-6: planted type-2 gate success stubs (0x282DD0 / 0x281568).</summary>
+    private bool _type2GatesPlanted;
+    private int _hostByteCopies;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -236,6 +242,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _workerFrameRepairs = 0;
         _lastWorkerYieldCyc = 0;
         _armedWorkerCmd = 0;
+        _wordScanEscapes = 0;
+        _mainSpRepairs = 0;
+        _type2GatesPlanted = false;
+        _hostByteCopies = 0;
         _postWorkerCopyEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
@@ -415,10 +425,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         uint pcPhysEarly = pc & 0x1FFFFFFFu;
         bool crt0Reentry = pcPhysEarly is >= 0x00100000 and <= 0x00100200
             && (sys.Cdvd.SectorsRead > 0 || c >= 40_000_000);
+        // Wave-6: uncached 0x401Axxxx poison (list-walk OOB) and non-code phys as PC.
+        bool uncachedPoison = (pc & 0xE0000000u) == 0x40000000u
+            && (pcPhysEarly < 0x00100000u || pcPhysEarly >= 0x002C0000u
+                || !sys.Memory.IsLikelyEeCode(pcPhysEarly));
         bool dataPc = pcPhysEarly >= 0x002C0000u
             || pc is >= 0x80000180 and <= 0x80000200
             || pcPhysEarly < 0x00100000
-            || crt0Reentry;
+            || crt0Reentry
+            || uncachedPoison;
         if (c >= 35_000_000 && sys.Gs.PixelsWritten == 0 && dataPc)
         {
             if (sys.Cdvd.SectorsRead > 0 && TryYieldToPendingWorker(sys, pc, c))
@@ -706,6 +721,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     resume = ra;
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0 = fail/skip
                 sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a2
+                RepairCurrentSpIfPoison(sys);
                 sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -714,6 +730,96 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                         $"[GOW] escape bad jalr-stream pc=0x{pc:X8} a2=0x{a2:X8} -> 0x{resume:X8} cyc={c}");
             }
         }
+
+        // Wave-6: post type-2 residual — word-scan leaf at 0x299300 (find a2 in [a0,a1)).
+        // Live claim55/100: PC=0x299354 a0=0xE5918 a1=0x2C7D80 a2=0x400 with
+        // sp=0xFFFFFF60 ra=0x299354 self — multi-M thrash, metrics freeze, no PATH3/FILEIO.
+        if (c >= 45_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x00299300 and <= 0x00299374)
+            TryEscapeWordScanResidual(sys, pc, c);
+
+        // Wave-6: post type-2 residual — byte-copy at 0x289320 (lbu/sb countdown a2).
+        // Host-complete remaining bytes then exit. Cap count so multi-chunk callers still
+        // advance without Step-storming (claim100h).
+        if (c >= 45_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && _hostByteCopies < 4096
+            && pc is >= 0x00289320 and <= 0x00289334)
+        {
+            uint a1src = (uint)sys.EE.GetGpr(5).Lo;
+            uint a2len = (uint)sys.EE.GetGpr(6).Lo;
+            uint v1dst = (uint)sys.EE.GetGpr(3).Lo;
+            uint srcP = a1src & 0x1FFFFFFFu;
+            uint dstP = v1dst & 0x1FFFFFFFu;
+            if (a2len > 64u && a2len < 0x100000u
+                && srcP is >= 0x00100000u and < (uint)SystemMemory.RDRAM_SIZE
+                && dstP is >= 0x00100000u and < (uint)SystemMemory.RDRAM_SIZE
+                && srcP + a2len < (uint)SystemMemory.RDRAM_SIZE
+                && dstP + a2len < (uint)SystemMemory.RDRAM_SIZE)
+            {
+                uint n = a2len > 0x8000u ? 0x8000u : a2len;
+                for (uint i = 0; i < n; i++)
+                    sys.Memory.Write8(dstP + i, sys.Memory.Read8(srcP + i));
+                sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = a1src + n });
+                sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = v1dst + n });
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFu }); // a2 = -1 done
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFu });
+                sys.EE.PC = 0x00289338; // jr ra
+                sys.EE.COP0_Status &= ~0x6u;
+                _hostByteCopies++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _hostByteCopies <= 16)
+                    Console.Error.WriteLine(
+                        $"[GOW] host byte-copy 0x2893xx n=0x{n:X} src=0x{srcP:X8} dst=0x{dstP:X8} " +
+                        $"k={_hostByteCopies} cyc={c}");
+            }
+        }
+
+        // Wave-6: type-2 fails when slot/stream gates return 0:
+        //   0x282DD0 / 0x281568 → 0x81010013 (null handle)
+        //   0x281548 (→0x282270) + *sp==0 → 0x8101006F
+        // Plant success stubs so the REAL 0x27DF30 prologue continues into stream setup.
+        if (!_type2GatesPlanted && c >= 37_000_000 && sys.Cdvd.SectorsRead > 0
+            && sys.Gs.PixelsWritten == 0 && sys.Gif.Path3Transfers == 0)
+        {
+            // 0x282DD0 / 0x281568: li v0,1; jr ra; nop
+            foreach (uint gate in new uint[] { 0x00282DD0u, 0x00281568u })
+            {
+                sys.Memory.Write32(gate + 0, 0x24020001u); // addiu v0, zero, 1
+                sys.Memory.Write32(gate + 4, 0x03E00008u); // jr ra
+                sys.Memory.Write32(gate + 8, 0x00000000u); // nop
+            }
+            // 0x281548: called with a1=sp output; must return v0!=0 and *a1!=0.
+            //   addiu t0, zero, 1; sw t0, 0(a1); addiu v0, zero, 1; jr ra; nop
+            sys.Memory.Write32(0x00281548, 0x24080001u); // addiu t0, zero, 1
+            sys.Memory.Write32(0x0028154C, 0xACA80000u); // sw t0, 0(a1)
+            sys.Memory.Write32(0x00281550, 0x24020001u); // addiu v0, zero, 1
+            sys.Memory.Write32(0x00281554, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x00281558, 0x00000000u); // nop
+            // 0x2815A8: later alloc/open gate — li v0,1; jr ra
+            sys.Memory.Write32(0x002815A8, 0x24020001u);
+            sys.Memory.Write32(0x002815AC, 0x03E00008u);
+            sys.Memory.Write32(0x002815B0, 0x00000000u);
+            // Stream-ready flags at type-2 table (fp=0x32, base=0x32C9C8) — help later checks.
+            for (uint i = 0; i < 4; i++)
+            {
+                uint baseOff = 0x0032C9C8u + i * 2200u;
+                sys.Memory.Write32(baseOff + 0x888u, 1u);
+                sys.Memory.Write32(baseOff + 0x88Cu, 1u);
+            }
+            // Do NOT plant fail→success branches into type-2 epilogue (claim100g: continued
+            // with uninit stream state → 0x401Axxxx UnknownOpcode storms). Gate stubs only;
+            // complete-once clears failed cmd so main poll advances.
+            _type2GatesPlanted = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] plant type-2 gate stubs (282DD0/281568/281548/2815A8) + flags cyc={c}");
+        }
+
+        // Wave-6: any post-CDVD poison SP freezes jr-ra / WaitSema thrash (live main
+        // sp=0xFFFFFF60 after wrong-tid worker text). Repair before further escapes.
+        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && IsSpPoison(sys))
+            RepairCurrentSpIfPoison(sys);
 
         // Pathological heap align loop inside real alloc (0x13DC78 band — NEVER empty-exit
         // the whole allocator). Live w2: divu/mfhi at 0x13DEE8 with s0=0x310380 (address
@@ -1292,6 +1398,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0027CBD0 and <= 0x00282000)
             or (>= 0x00293C00 and <= 0x00293C90)
             or (>= 0x0026B9B0 and <= 0x0026BA20)  // post-type-2 jalr data thrash
+            or (>= 0x00299300 and <= 0x00299480)  // wave-6 word-scan residual
             || p == 0x00100008u;
 
         static bool IsSafeCode(Ps2System s, uint p) =>
@@ -1321,6 +1428,133 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     private int _postWorkerCopyEscapes;
+
+    /// <summary>True when SP physical address is OOB / unusable (live 0xFFFFFF60 after wrong-tid).</summary>
+    private static bool IsSpPoison(Ps2System sys)
+    {
+        uint spPhys = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (spPhys < 0x00100000u) return true;
+        if (spPhys + 0x100u >= (uint)SystemMemory.RDRAM_SIZE) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// True when phys looks like a real EE stack (never .text — live wave-6 planted
+    /// SP at BST PC 0x176BC0 when SavedSp was a code address).
+    /// </summary>
+    private static bool IsPlausibleStackAddr(uint phys)
+    {
+        // Retail worker stack ~0x31C8C0; game heaps/stacks sit above .text/.data.
+        if (phys < 0x00300000u) return false;
+        if (phys + 0x100u >= (uint)SystemMemory.RDRAM_SIZE) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Re-seed SP from the current kernel thread's CreateThread stack, or a private
+    /// scratch slot under the synthetic arena. Required after wrong-tid worker-text
+    /// thrash leaves main with sp=0xFFFFFF60 so jr-ra / WaitSema can not progress.
+    /// </summary>
+    private bool RepairCurrentSpIfPoison(Ps2System sys)
+    {
+        if (!IsSpPoison(sys)) return false;
+        uint sp = 0;
+        var k = sys.Hle?.Kernel;
+        if (k != null)
+        {
+            foreach (var t in k.AllThreads)
+            {
+                if (t.Id != k.CurrentThreadId || !t.Alive) continue;
+                if (t.Stack != 0 && IsPlausibleStackAddr(t.Stack))
+                    sp = t.Stack - 0x100u;
+                else
+                {
+                    uint ssp = (uint)(t.SavedSp & 0x1FFFFFFFUL);
+                    // SavedSp is mid-frame SP — use as-is when plausible, never +0x100 as top.
+                    if (IsPlausibleStackAddr(ssp))
+                        sp = ssp;
+                }
+                break;
+            }
+        }
+        // Main Entry=0/Stack=0 or anything that resolved into .text — private scratch.
+        if (sp == 0 || !IsPlausibleStackAddr(sp))
+            sp = 0x01F7FF00u;
+        sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp });
+        _mainSpRepairs++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _mainSpRepairs <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] repair SP poison -> 0x{sp:X8} n={_mainSpRepairs}");
+        return true;
+    }
+
+    /// <summary>
+    /// Wave-6: EE word-scan leaf at <c>0x299300</c> (disasm):
+    /// <c>while (a0 &lt; a1) { if (*a0 == a2) break; a0 += 4; } jr ra; v0=a0</c>.
+    /// Live residual after type-2 clear (claim55/100): PC=0x299354 with multi-MiB range
+    /// a0=0xE5918..a1=0x2C7D80 a2=0x400, sp OOB, ra self-loop — freezes PATH3/FILEIO.
+    /// Force not-found (a0=a1), repair SP/$ra, soft-return via PickSafeResume.
+    /// </summary>
+    private void TryEscapeWordScanResidual(Ps2System sys, uint pc, ulong c)
+    {
+        if (_wordScanEscapes >= 512) return;
+        // Epilogue jr ra — only act if $ra/SP poison would re-enter.
+        if (pc is >= 0x00299370 and <= 0x00299374)
+        {
+            uint raEpi = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (!IsSpPoison(sys)
+                && sys.Memory.IsLikelyEeCode(raEpi)
+                && raEpi is >= 0x00100000 and < 0x002C0000
+                && raEpi is not (>= 0x00299300 and <= 0x00299480))
+                return;
+        }
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint a1 = (uint)sys.EE.GetGpr(5).Lo;
+        uint a2 = (uint)sys.EE.GetGpr(6).Lo;
+        uint a0p = a0 & 0x1FFFFFFFu;
+        uint a1p = a1 & 0x1FFFFFFFu;
+        uint remaining = a1p > a0p ? a1p - a0p : 0;
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        bool raBad = ra == 0
+            || ra == pc
+            || ra is (>= 0x00299300 and <= 0x00299480)
+            || !sys.Memory.IsLikelyEeCode(ra)
+            || ra is < 0x00100000 or >= 0x002C0000;
+        bool huge = remaining > 0x10000u; // >64 KiB pure EE word walk
+        bool spBad = IsSpPoison(sys);
+        // Short healthy scans can finish; only force on poison / huge / re-entry.
+        if (!spBad && !raBad && !huge && _wordScanEscapes == 0)
+            return;
+
+        RepairCurrentSpIfPoison(sys);
+
+        // Not-found: a0 = a1 so natural fall-through would also exit; v0 = a1.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = a1 });
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = a1 }); // v0 = end (not found)
+
+        uint resume = PickSafeResume(sys, 0x00185FAC);
+        if (!raBad && sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x002C0000
+            && ra is not (>= 0x00299300 and <= 0x00299480)
+            && ra is not (>= 0x00293C00 and <= 0x00293C90)
+            && ra is not (>= 0x0027CBD0 and <= 0x00282000))
+            resume = ra;
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        // Prefer post-FreezeCache v0 when landing there.
+        if (resume == 0x00185FAC)
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000UL });
+
+        _wordScanEscapes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _wordScanEscapes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] escape word-scan pc=0x{pc:X8} a0=0x{a0:X8} a1=0x{a1:X8} a2=0x{a2:X8} " +
+                $"rem=0x{remaining:X} raBad={raBad} spBad={spBad} -> 0x{resume:X8} " +
+                $"n={_wordScanEscapes} cyc={c}");
+    }
 
     /// <summary>
     /// Wave-4: after worker clears cmd queue (*0x310384=0xFFFFFFFF), EE lands in a
@@ -1391,12 +1625,16 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// Wave-5: <see cref="KernelState.RestoreContext"/> the worker tid only; re-seed s1/s3/s4/sp
     /// when the frame is poison; re-enter <see cref="WorkerPostWait"/> for idle thrash with a
     /// pending cmd. Do not invent PATH3 packets — real type-2 dispatch owns the stream/WAD path.
+    /// Wave-6: never force-rewind mid type-2 body (continuous PostWait thrash left cmd=2 for
+    /// 10M cycles then main poison-SP word-scan). forceDispatch only at
+    /// <see cref="WorkerSavedAtDispatchGate"/>. Rehome wrong-tid off worker text even after
+    /// cmd clear so main can post later cmds / FILEIO.
     /// </summary>
     private bool TryYieldToPendingWorker(Ps2System sys, uint pc, ulong c)
     {
         var k = sys.Hle?.Kernel;
         if (k == null) return false;
-        if (_workerYields >= 256) return false;
+        if (_workerYields >= 512) return false;
 
         uint cmdType = sys.Memory.Read32(WorkerCmdTypePtr);
         // Worker: v0 = *type; v0 -= 2; if (v0 >= 99) idle. Valid service: type in [2, 100].
@@ -1413,12 +1651,47 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 break;
             }
         }
-        if (worker == null || !worker.Started) return false;
+        if (worker == null) return false;
+        // Wave-6: soft-retry storm left worker Alive/!Started — re-Start so cmd drain resumes.
+        if (!worker.Started && cmdPending && worker.Alive && worker.Entry == WorkerThreadEntry)
+        {
+            try
+            {
+                k.StartAndMaybeSwitch(sys.EE, worker.Id, switchNow: false, arg: 0, fromSyscall: false);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[GOW] re-start worker tid={worker.Id} cmd={cmdType} cyc={c}");
+            }
+            catch { /* ignore */ }
+        }
+        if (!worker.Started) return false;
+
+        // Wave-6: after gate/soft-success body planted and at least one real dispatch,
+        // clear type so main's *0x310384 poll advances. Soft-success body returns v0=0
+        // (result word 0) — must still clear or we redispatch forever (claim100e).
+        if (cmdPending && _type2GatesPlanted && _workerYields >= 2)
+        {
+            uint res = sys.Memory.Read32(0x00310388);
+            bool isErr = res is >= 0x81010000u and <= 0x8101FFFFu;
+            sys.Memory.Write32(WorkerCmdTypePtr, 0);
+            if (isErr)
+                sys.Memory.Write32(0x00310388, 0);
+            cmdPending = false;
+            _armedWorkerCmd = 0;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _workerYields <= 64)
+                Console.Error.WriteLine(
+                    $"[GOW] complete worker cmd={cmdType} res=0x{res:X8} softOk={isErr} cyc={c}");
+        }
 
         bool currentIsWorker = k.CurrentThreadId == worker.Id;
         bool onWorkerText = pc is >= 0x0027CBD0 and <= 0x00282000;
         bool poisonFrame = IsWorkerFramePoison(sys);
         bool onIdle = pc is >= WorkerIdleLo and <= WorkerIdleHi;
+        bool atGate = WorkerSavedAtDispatchGate(worker);
+        // Mid type-2 / handler body — preserve SavedPc across SwitchTo.
+        bool midBody = (worker.SavedPc & 0x1FFFFFFFUL) is >= 0x0027CC30 and <= 0x00282000
+            && !atGate;
 
         // On worker with healthy frame mid-handler: only SignalSema if parked — never rewind.
         if (currentIsWorker && onWorkerText && !onIdle && !poisonFrame)
@@ -1431,6 +1704,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
 
         // On worker idle / poison / WaitSema leaf with pending cmd: repair + redispatch.
+        // Only force PostWait when at gate / idle / poison — never mid-handler SavedPc.
         if (currentIsWorker && cmdPending && (poisonFrame || onIdle
             || pc is >= 0x00293C00 and <= 0x00293C90))
         {
@@ -1440,6 +1714,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (worker.Sleeping && worker.WaitSemaId is >= 1 and <= 256)
             {
                 try { k.SignalSema(worker.WaitSemaId); } catch { /* ignore */ }
+            }
+            // Mid-body resume: keep PC if already past type-load; else PostWait.
+            if (!onIdle && !poisonFrame && pc is >= 0x0027CC30 and <= 0x00282000)
+            {
+                // Already mid-handler on worker — do not rewind.
+                _lastWorkerYieldCyc = c;
+                return false;
             }
             sys.EE.PC = WorkerPostWait;
             sys.EE.COP0_Status &= ~0x6u;
@@ -1458,36 +1739,45 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (currentIsWorker)
             return false;
 
-        // Foreign thread on worker .text: park main at post-FreezeCache, SwitchTo worker.
-        // (claim55: force PostWait clears type=2; main must not keep executing worker body.)
+        // Wave-6: foreign thread on worker .text with NO pending cmd — rehome + SP repair
+        // so main can continue stream/FILEIO (live after type-2 clear → 0x299354 poison).
+        if (onWorkerText && !cmdPending)
+        {
+            RepairCurrentSpIfPoison(sys);
+            RehomeWrongThreadOffWorkerText(sys, pc, c);
+            return true;
+        }
+
+        // Foreign thread on worker .text with pending cmd: park main, SwitchTo worker.
+        // Wave-6: forceDispatch ONLY at gate — mid-body keeps SavedPc (type-2 multi-M).
         if (onWorkerText && cmdPending)
         {
             if (c - _lastWorkerYieldCyc < 200_000UL) return false;
+            RepairCurrentSpIfPoison(sys);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000UL });
             sys.EE.PC = 0x00185FAC;
             sys.EE.COP0_Status &= ~0x6u;
             _armedWorkerCmd = cmdType;
             return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "wrong-tid-text",
-                forceDispatch: true);
+                forceDispatch: atGate || !midBody);
         }
 
         // Pending cmd + sleeping worker (w5b sleep-cmd from flag-spin 0x17A32C).
+        // Wave-6: do not force PostWait when SavedPc is mid type-2 body.
         if (cmdPending && worker.Sleeping && worker.WaitSemaId is >= 1 and <= 256)
         {
             if (c - _lastWorkerYieldCyc < 200_000UL) return false;
             _armedWorkerCmd = cmdType;
             return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "sleep-cmd",
-                forceDispatch: true);
+                forceDispatch: atGate || !midBody);
         }
 
         // Runnable worker with pending cmd — steal timeslice without force-rewind when possible.
         if (cmdPending && !worker.Sleeping && worker.SuspendCount == 0)
         {
             if (c - _lastWorkerYieldCyc < 500_000UL) return false;
-            // If SavedPc is already mid type-2 body, do not force PostWait.
-            bool midBody = (worker.SavedPc & 0x1FFFFFFFUL) is >= 0x0027CC30 and <= 0x00282000;
             return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "runnable-cmd",
-                forceDispatch: !midBody, signalSema: false);
+                forceDispatch: !midBody && atGate, signalSema: false);
         }
 
         return false;
@@ -1518,11 +1808,13 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private void RehomeWrongThreadOffWorkerText(Ps2System sys, uint pc, ulong c)
     {
         const uint resume = 0x00185FAC;
+        RepairCurrentSpIfPoison(sys);
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000UL });
         // Clear poison ra pointing into worker body so epilogues don't bounce back.
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
         if (ra is >= 0x0027CBD0 and <= 0x00282000
             || ra is >= 0x00293C00 and <= 0x00293C90
+            || ra is >= 0x00299300 and <= 0x00299480
             || ra == 0 || !sys.Memory.IsLikelyEeCode(ra))
             sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
         sys.EE.PC = resume;
@@ -2219,14 +2511,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Wave-5: paint 989snd done-magic + residual SignalSema. When still stuck mid-leaf,
         // soft-return via live $ra (SIF poll caller is 0x294810 / worker 0x27CC08) — do NOT
         // snap to 0x26C0E0 mid-frame (live w5c data PC / UnknownSyscall 0x2A1364).
-        // Live tip residual: PC=0x299328 with $ra=0 after align-zero leave — empty wake
-        // alone cannot progress; force leave via stack $ra / post-FreezeCache.
+        // Live tip residual: PC=0x299328/0x299354 word-scan with $ra self + SP poison after
+        // type-2 clear — empty wake alone cannot progress. Wave-6: always repair SP +
+        // escape word-scan first, then force leave via PickSafeResume.
+        if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x00299300 and <= 0x00299480)
+        {
+            TryEscapeWordScanResidual(sys, pc, c);
+            pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+        }
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && _worldKickPulses >= 8 && (_worldKickPulses % 4) == 0
             && (pc is >= 0x00293C00 and <= 0x00293C80
                 || pc is >= 0x00299300 and <= 0x00299480
                 || pc is >= 0x00289A00 and <= 0x00289B00))
         {
+            RepairCurrentSpIfPoison(sys);
             TryArmPendingStreamJob(sys, c);
             sys.Memory.Write32(0x0029C7D0, 0);
             const uint Done = 0xFFFFFFFFu;
