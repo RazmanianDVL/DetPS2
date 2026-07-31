@@ -42,8 +42,12 @@ namespace DetPS2.Core;
 /// <c>0x00345C30</c> / mul body <c>0x00352660</c> (band <c>0x00351xxx–0x00352xxx</c>).
 /// Interpreter soft-float costs 10k–100k cycles/sin → 100–250M cycles with no
 /// <c>DLL.DAT</c>/<c>FILEIO</c> string. Wave-2: register those entries on
-/// <see cref="SoftFloatBridge"/> (shared host IEEE). Haven-only still: VBlankStart sticky +
-/// poll-base repair. Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c>.
+/// <see cref="SoftFloatBridge"/> (shared host IEEE). Wave-3: clear software VIF1 busy
+/// (<c>*(0x39C0C4)</c>) when the wait at <c>0x188AE0</c> spins while CHCR.STR is clear /
+/// channel idle, and credit VIF1 DMA IRQ so the real handler can advance; NUSOUND2
+/// (sid <c>0x00012345</c>, not Midway MSL.IRX) bulk fno=0 is handled in
+/// <see cref="RealSifRpc"/>. Haven-only still: VBlankStart sticky + poll-base repair.
+/// Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c>.
 /// </para>
 ///
 /// <para>
@@ -64,11 +68,22 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     private const uint HavenVbPollB = 0x003316F0;
     private const uint HavenVbPollBEnd = 0x0033170C;
 
+    // Haven VIF1 software-busy wait (disasm 0x188AD8: jal 0x1883C8; 0x188AE0: bne v0,0).
+    // Callee returns *(0x39C0C4); set when a VIF1 chain is kicked (CHCR=0x1C5), cleared by
+    // the DMA completion path. When STR is already clear / channel idle, clear busy and
+    // credit VIF1 IRQ so the real handler can run (same class as B3/DA owed-handler assist).
+    private const uint HavenVifWaitSpin = 0x00188AE0;
+    private const uint HavenVifWaitJal = 0x00188AD8;
+    private const uint HavenVifBusyFlag = 0x0039C0C4;
+    private const uint HavenVifPendingFlag = 0x0039C0DC;
+
     private int _vbPulses;
     private int _vbBaseRepairs;
+    private int _vifBusyClears;
     private int _lateLogPulses;
     private ulong _lastLogCyc;
     private ulong _lastVbPulseCyc;
+    private ulong _lastVifBusyCyc;
 
     public TeamIcoAssist(string serial, string displayName)
     {
@@ -84,9 +99,11 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     {
         _vbPulses = 0;
         _vbBaseRepairs = 0;
+        _vifBusyClears = 0;
         _lateLogPulses = 0;
         _lastLogCyc = 0;
         _lastVbPulseCyc = 0;
+        _lastVifBusyCyc = 0;
         if (_isHaven)
             SoftFloatBridge.Reset();
     }
@@ -162,6 +179,12 @@ public sealed class TeamIcoAssist : IGameQuirkModule
             PulseHavenVblank(sys, force: false);
         }
 
+        // VIF1 software-busy spin @0x188AE0 (post soft-float residual).
+        bool inVifWait = pc is >= HavenVifWaitJal and <= HavenVifWaitSpin + 4
+            || (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu) is >= HavenVifWaitJal and <= HavenVifWaitSpin + 4;
+        if (inVifWait)
+            MaybeClearHavenVifBusy(sys, cyc);
+
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
             && (cyc - _lastLogCyc) > 5_000_000UL
             && _lateLogPulses < 8)
@@ -172,8 +195,49 @@ public sealed class TeamIcoAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[TEAMICO-HAVEN] residual #{_lateLogPulses} cyc={cyc} pc=0x{pc:X8} ra=0x{ra:X8} "
                 + $"binds={rpc.Binds} calls={rpc.Calls} fioOps={rpc.FileIoOps} "
-                + $"intcStat=0x{sys.Intc.Stat:X} vbPulse={_vbPulses} vbFix={_vbBaseRepairs}");
+                + $"intcStat=0x{sys.Intc.Stat:X} vbPulse={_vbPulses} vbFix={_vbBaseRepairs} "
+                + $"vifBusyClr={_vifBusyClears}");
         }
+    }
+
+    /// <summary>
+    /// When the wait-for-VIF1-idle loop at <c>0x188AE0</c> is live and the software busy
+    /// flag is stuck while VIF1 CHCR.STR is clear / DMAC channel idle, clear the flag and
+    /// credit the VIF1 AddDmacHandler path so completion side-effects can run.
+    /// </summary>
+    private void MaybeClearHavenVifBusy(Ps2System sys, ulong cyc)
+    {
+        if (_vifBusyClears >= 64) return;
+        if ((cyc - _lastVifBusyCyc) < 50_000UL) return;
+
+        uint busy = sys.Memory.Read32(HavenVifBusyFlag);
+        uint pending = sys.Memory.Read32(HavenVifPendingFlag);
+        if (busy == 0 && pending == 0) return;
+
+        bool vifActive = sys.Dmac.IsActive(Dmac.Channel.VIF1);
+        uint chcr = sys.Dmac.ReadRegister(0x10009000);
+        bool str = (chcr & 0x100) != 0;
+        if (vifActive || str) return;
+
+        if (busy != 0)
+            sys.Memory.Write32(HavenVifBusyFlag, 0);
+        if (pending != 0)
+            sys.Memory.Write32(HavenVifPendingFlag, 0);
+
+        try
+        {
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 1);
+        }
+        catch { /* ignore */ }
+
+        _vifBusyClears++;
+        _lastVifBusyCyc = cyc;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
+            && _vifBusyClears <= 16)
+            Console.Error.WriteLine(
+                $"[TEAMICO-HAVEN] VIF1 busy clear n={_vifBusyClears} chcr=0x{chcr:X} "
+                + $"busyWas=0x{busy:X} pendWas=0x{pending:X} cyc={cyc}");
     }
 
     private void PulseHavenVblank(Ps2System sys, bool force)

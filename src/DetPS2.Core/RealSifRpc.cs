@@ -456,6 +456,7 @@ public sealed class RealSifRpc
         _mwFileHandles.Clear();
         _mwFileNextHandle = 1;
         _mwFileInited = false;
+        _havenRootWarmed = false;
         _nextSlot = 0;
         ResetIopHeap();
         Binds = Calls = RdataOps = FileIoOps = SysmemOps = UnknownServiceCalls = UnknownBindSids = 0;
@@ -3937,6 +3938,8 @@ public sealed class RealSifRpc
         uint sid, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
     {
         // First MSL/MFL touch → ensure shared art archive TOC is ready (DA artps2 / Dec art).
+        // Haven (Traveller's Tales) ships NUSOUND2.IRX on the same sid 0x12345 without
+        // MKDA.PAK — mount is a no-op when the ISO has no Midway archive.
         EnsureMkdaPakMounted(iopModules, cdvd);
 
         // MFL file link (0x12347) — real open/read. Also accept file fnos on primary sid
@@ -3962,10 +3965,115 @@ public sealed class RealSifRpc
             return 0;
         }
 
+        // Haven NUSOUND2 (same sid 0x12345, no MSL.IRX on disc): live fno=0 with send=4096
+        // five times then Exit(8) when the bulk path returns a bare 0 without draining the
+        // send buffer / warming root assets. Treat large fno=0 as bank/init transfer:
+        // scan send for paths, warm DLL.DAT/FILEIO, and paint a multi-word OK recv.
+        if (fno == 0 && sendSize >= 256)
+        {
+            int nu = HandleNuSoundBulk(mem, iopModules, cdvd, argBuf, sendSize, recvBuf, recvSize);
+            return nu;
+        }
+
         // Remaining sound fnos (bank load / play / stream): soft-OK until per-fno ground truth.
         if (recvBuf != 0 && (recvSize == 0 || recvSize >= 4))
             mem.Write32(recvBuf, 0);
         return 0;
+    }
+
+    /// <summary>
+    /// NUSOUND2 / sid 0x12345 bulk fno=0 (Haven SLUS_205.17 live: send=4096, recv @ 0x4F5000).
+    /// Soft-success with path scan + DLL.DAT warm so the title leaves the Exit(8) assert
+    /// island and can reach first FILEIO of root game data.
+    /// </summary>
+    private int HandleNuSoundBulk(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+    {
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+        string path = argBuf != 0 && sendSize > 0
+            ? ScanSendBufferForPath(mem, argBuf, sendSize)
+            : "";
+
+        // Warm Haven root assets (always — path scan may miss pointer-indirect names).
+        WarmHavenRootAssets(iopModules, cdvd);
+
+        if (!string.IsNullOrEmpty(path))
+        {
+            int fd = iopModules.FileOpen(path, 1);
+            if (fd < 0 && path.IndexOf("DLL", StringComparison.OrdinalIgnoreCase) >= 0)
+                fd = iopModules.FileOpen(@"cdrom0:\DLL.DAT;1", 1);
+            if (fd >= 0)
+            {
+                if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
+                    cdvd.NoteHostReadSectors(Math.Min(64, (int)((sz + 2047) / 2048)));
+                try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                FileIoOps++;
+                if (trace)
+                    Console.Error.WriteLine($"[NUSOUND] bulk open path=\"{path}\" size={sz}");
+            }
+            else if (trace)
+            {
+                Console.Error.WriteLine($"[NUSOUND] bulk path miss \"{path}\"");
+            }
+        }
+
+        // Multi-word OK: +0 status=0, +4 version-ish, rest left alone unless recv==send echo.
+        if (recvBuf != 0)
+        {
+            uint lim = recvSize != 0 ? recvSize : Math.Min(sendSize, 64u);
+            if (lim >= 4) mem.Write32(recvBuf, 0);
+            if (lim >= 8) mem.Write32(recvBuf + 4, 1);
+            // Echo head of send into recv when sizes match (bank round-trip clients).
+            if (argBuf != 0 && sendSize > 0 && recvSize >= sendSize && sendSize <= 0x4000)
+            {
+                uint n = Math.Min(sendSize, 0x1000u);
+                for (uint i = 0; i < n; i++)
+                    mem.Write8(recvBuf + i, mem.Read8(argBuf + i));
+                if (n >= 4) mem.Write32(recvBuf, 0); // keep status OK after echo
+            }
+        }
+
+        if (trace)
+            Console.Error.WriteLine(
+                $"[NUSOUND] fno=0 bulk send={sendSize} recv=0x{recvBuf:X8}/{recvSize} " +
+                $"arg=0x{argBuf:X8} path=\"{path}\"");
+        return 0;
+    }
+
+    /// <summary>Idempotent Haven root warm (DLL.DAT first; skip multi-hundred-MiB stream files).</summary>
+    private bool _havenRootWarmed;
+
+    /// <summary>
+    /// Haven root disc assets (no MKDA.PAK). Opens DLL.DAT so FILEIO/cdvd metrics move and
+    /// subsequent sceOpen of the same leaf is warm. Once per boot.
+    /// </summary>
+    private void WarmHavenRootAssets(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_havenRootWarmed) return;
+        _havenRootWarmed = true;
+        // Prefer first-game-data DLL.DAT; skip RWLDS.DAT (~460 MiB stream blob).
+        string[] warm =
+        {
+            @"cdrom0:\DLL.DAT",
+            @"cdrom0:\DLL.DAT;1",
+            @"cdrom0:\MKSPACE.DAT",
+            @"cdrom0:\CUBE.BIN",
+        };
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string p in warm)
+        {
+            string key = p.Replace(";1", "", StringComparison.OrdinalIgnoreCase);
+            if (!seen.Add(key)) continue;
+            int fd = iopModules.FileOpen(p, 1);
+            if (fd < 0) continue;
+            uint sz = 0;
+            if (iopModules.TryGetOpenFileSize(fd, out sz) && sz > 0)
+                cdvd.NoteHostReadSectors(Math.Min(64, (int)((sz + 2047) / 2048)));
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            FileIoOps++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[NUSOUND] warm root \"{p}\" size={sz}");
+        }
     }
 
     /// <summary>
