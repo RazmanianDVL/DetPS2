@@ -4669,32 +4669,43 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// Dec SLUS_208.81: path-hash object used by open@0x23A180 lives at <c>0x62E570</c>
-    /// (+4 buckets, +8 nbuckets). Live 50M: still all-zero after MWFILE MKDA.PAK open, so
-    /// <c>/art/gameart.ssf</c> lookup returns null and EE never issues member MWFILE CallRpc.
-    /// Plant a minimal 32-bucket table + gameart entry → stream (size from PAK TOC).
+    /// (+4 buckets, +8 nbuckets). Alt table at <c>0x62E5A0</c> (0x21D810 branch).
+    /// WAVE-5 residual: single shared entry rewrote path to last key so strcmp for
+    /// <c>/art/gameart.ssf</c> (path builder @0x222790 with a1=1) failed → open v0=0.
+    /// WAVE-6: multi-entry plant (one node+path per key), mirror both headers, and load
+    /// real PAK member bytes into RDRAM for the stream object.
     /// </summary>
     public int DecGameartMemberOpens { get; private set; }
+    public int DecGameartBytesLoaded { get; private set; }
     private bool _decGameartHashPlanted;
 
-    private const uint DecPathHashHdr = 0x0062E570;
+    // Live open@0x23A180 tables (0x21D810): lui a0,0x62; addiu -6800/-6752
+    // → 0x61E570 / 0x61E5A0 (NOT 0x62E570 — W5 miscalc of sign-extended addiu).
+    private const uint DecPathHashHdr = 0x0061E570;
+    private const uint DecPathHashHdrAlt = 0x0061E5A0;
+    // Scratch only used if EE table still cold; prefer live buckets/entry pool.
     private const uint DecPathHashBuckets = 0x0007E000;
-    private const uint DecPathHashEntry = 0x0007E100;
-    private const uint DecPathHashPath = 0x0007E140;
-    private const uint DecPathHashStream = 0x0007E200;
+    private const uint DecPathHashEntryBase = 0x0007E100; // 8 x 16B entries (fallback)
+    private const uint DecPathHashPathBase = 0x0007E180;  // 8 x 64B path strings
+    private const uint DecPathHashStream = 0x0007E400;
+    private const uint DecPathHashData = 0x01800000; // high RDRAM payload for gameart.ssf
     private const int DecPathHashNBuckets = 32;
+    private const int DecPathHashMaxEntries = 8;
 
     private void TryRegisterDecGameartPathHash(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd)
     {
         if (_decGameartHashPlanted || mem == null || iopModules == null) return;
-        // Only when the EE object is still cold (boot never filled it).
-        uint buckets = mem.Read32(DecPathHashHdr + 4);
-        uint nbuckets = mem.Read32(DecPathHashHdr + 8);
-        if (buckets >= 0x00100000 && nbuckets is > 0 and <= 100_000)
+        // Prefer LIVE EE table at 0x61E5A0 (gameart open path). Fall back to 0x61E570.
+        uint liveHdr = 0;
+        foreach (uint hdr in new[] { DecPathHashHdrAlt, DecPathHashHdr })
         {
-            // Table already live — still ensure gameart is present.
-            // Fall through to insert if buckets point at our plant region.
-            if (buckets != DecPathHashBuckets)
-                return;
+            uint b = mem.Read32(hdr + 4);
+            uint n = mem.Read32(hdr + 8);
+            if (b >= 0x00100000 && b < SystemMemory.RDRAM_SIZE && n is > 0 and <= 100_000)
+            {
+                liveHdr = hdr;
+                break;
+            }
         }
 
         EnsureMkdaPakMounted(iopModules, cdvd);
@@ -4718,62 +4729,119 @@ public sealed class RealSifRpc
             }
         }
         if (mfd < 0 || msz == 0) return;
-        try { iopModules.FileClose(mfd); } catch { /* ignore */ }
 
-        // Init header + clear buckets once.
-        if (mem.Read32(DecPathHashHdr + 4) != DecPathHashBuckets
-            || mem.Read32(DecPathHashHdr + 8) != (uint)DecPathHashNBuckets)
+        // Load real member bytes into high RDRAM (cap at remaining RDRAM). Honest art stream.
+        uint loadSz = msz;
+        if (DecPathHashData + loadSz > (uint)SystemMemory.RDRAM_SIZE)
+            loadSz = (uint)SystemMemory.RDRAM_SIZE - DecPathHashData;
+        int got = 0;
+        try
+        {
+            uint off = 0;
+            while (off < loadSz)
+            {
+                uint chunk = Math.Min(0x100000u, loadSz - off);
+                int n = iopModules.FileRead(mem, mfd, DecPathHashData + off, chunk);
+                if (n <= 0) break;
+                got += n;
+                off += (uint)n;
+                if ((uint)n < chunk) break;
+            }
+        }
+        catch { /* ignore */ }
+        try { iopModules.FileClose(mfd); } catch { /* ignore */ }
+        DecGameartBytesLoaded = got;
+        if (got > 0)
+            cdvd?.NoteHostReadSectors(Math.Min(256, (got + 2047) / 2048));
+
+        // If EE table is still cold, plant a minimal scratch table on both headers.
+        if (liveHdr == 0)
         {
             for (int i = 0; i < DecPathHashNBuckets * 4; i += 4)
                 mem.Write32(DecPathHashBuckets + (uint)i, 0);
-            mem.Write32(DecPathHashHdr + 0, 0);
-            mem.Write32(DecPathHashHdr + 4, DecPathHashBuckets);
-            mem.Write32(DecPathHashHdr + 8, (uint)DecPathHashNBuckets);
+            foreach (uint hdr in new[] { DecPathHashHdr, DecPathHashHdrAlt })
+            {
+                mem.Write32(hdr + 0, 0);
+                mem.Write32(hdr + 4, DecPathHashBuckets);
+                mem.Write32(hdr + 8, (uint)DecPathHashNBuckets);
+            }
+            liveHdr = DecPathHashHdrAlt;
         }
 
-        // Stream object: size at +8/+12, ready at +20 (same shape as DA STFM plant).
+        // Stream object: STFM-like + data pointer for consumers that read through the open
+        // result (entry+4). Size from TOC; payload at DecPathHashData when load succeeded.
+        uint dataPtr = got > 0 ? DecPathHashData : 0;
         mem.Write32(DecPathHashStream + 0, 0x5354464Du); // 'MFTS' tag
-        mem.Write32(DecPathHashStream + 4, DecPathHashStream);
+        mem.Write32(DecPathHashStream + 4, dataPtr != 0 ? dataPtr : DecPathHashStream);
         mem.Write32(DecPathHashStream + 8, msz);
         mem.Write32(DecPathHashStream + 12, msz);
-        mem.Write32(DecPathHashStream + 16, 0);
+        mem.Write32(DecPathHashStream + 16, dataPtr);
         mem.Write32(DecPathHashStream + 20, 4); // status ready
         mem.Write32(DecPathHashStream + 24, msz);
+        mem.Write32(DecPathHashStream + 28, dataPtr);
+        mem.Write32(DecPathHashStream + 32, 0); // position
+
+        // Distinct keys EE path builder / open may strcmp against.
+        // Primary residual key: "/art/gameart.ssf" (0x222790 a1=1 + prefix @0x597660).
+        // Live 0x21D810 rewrites path-builder "/art/X" into "\ps2dvd\ART\X" (upper ART).
+        // Live 0x21D810 canonical form: \ps2dvd\ART\NAME.SSF (ART+leaf upper).
+        string[] keys =
+        {
+            @"\ps2dvd\ART\GAMEART.SSF",
+            @"\ps2dvd\ART\gameart.ssf",
+            @"\ps2dvd\art\gameart.ssf",
+            @"/ps2dvd/ART/GAMEART.SSF",
+            @"/art/gameart.ssf",
+            "GAMEART.SSF",
+            "gameart.ssf",
+            used,
+        };
+
 
         int planted = 0;
-        foreach (string key in new[] { used, @"/art/gameart.ssf", @"\ps2dvd\art\gameart.ssf", "gameart.ssf" })
+        int slot = 0;
+        foreach (string key in keys)
         {
             if (string.IsNullOrEmpty(key)) continue;
-            if (TryInsertDecPathHash(mem, key, DecPathHashStream))
+            if (slot >= DecPathHashMaxEntries) break;
+            if (TryInsertDecPathHashSlot(mem, liveHdr, key, DecPathHashStream, slot))
+            {
                 planted++;
+                slot++;
+            }
         }
         if (planted == 0) return;
 
         _decGameartHashPlanted = true;
-        // Honest sector credit for the member (cap) so cdvd reflects art stream.
-        cdvd?.NoteHostReadSectors(Math.Min(64, (int)((msz + 2047) / 2048)));
-        // Keep a live host open so subsequent Force / EE reads share the TOC stream.
+        // Keep a live host open + MWFILE handle so later reads share the TOC stream.
         if (DecGameartMemberOpens == 0 && cdvd != null)
             ForceDecGameartMemberOpen(iopModules, cdvd);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[MSL-MFL] Dec path-hash plant gameart entries={planted} size={msz} path=\"{used}\"");
+                $"[MSL-MFL] Dec path-hash plant gameart entries={planted} size={msz} " +
+                $"loaded={got} data=0x{dataPtr:X8} hdr=0x{liveHdr:X8} path=\"{used}\"");
     }
 
-    private bool TryInsertDecPathHash(SystemMemory mem, string path, uint value)
+    /// <summary>
+    /// Insert one path-hash entry at a dedicated slot (path string + node). WAVE-6: do not
+    /// reuse a single entry for multiple keys — open@0x23A180 strcmp's the stored path.
+    /// </summary>
+    private bool TryInsertDecPathHashSlot(SystemMemory mem, uint hdr, string path, uint value, int slot)
     {
         if (string.IsNullOrEmpty(path) || value == 0) return false;
-        uint buckets = mem.Read32(DecPathHashHdr + 4);
-        uint nbuckets = mem.Read32(DecPathHashHdr + 8);
+        if ((uint)slot >= DecPathHashMaxEntries) return false;
+        uint buckets = mem.Read32(hdr + 4);
+        uint nbuckets = mem.Read32(hdr + 8);
         if (buckets < 0x00010000 || nbuckets is 0 or > 100_000) return false;
 
-        // Same fold as DA / Dec open@0x23A1D8 (hash<<4 + c, fold hi nibble).
+        // Same fold as Dec open@0x23A1D8 main path: hash<<4 + RAW char (no A-Z fold).
+        // Live ctype@0x594E98 only rewrites special chars via 0x1EBD50; letters hash as-is.
+        // Lowercasing here put GAMEART.SSF in the wrong bucket vs open's raw-case hash.
         uint hash = 0;
         foreach (char ch in path)
         {
             uint c = (byte)ch;
-            if (c is >= 'A' and <= 'Z') c += 32;
             hash = (hash << 4) + c;
             uint hi = hash & 0xF0000000u;
             if (hi != 0) { hash ^= hi >> 24; hash ^= hi; }
@@ -4781,7 +4849,7 @@ public sealed class RealSifRpc
         uint idx = nbuckets == 0 ? 0 : hash % nbuckets;
         uint bucketAddr = buckets + idx * 4;
 
-        // Reuse existing entry for same path.
+        // Reuse existing entry for same path (any slot).
         for (uint e = mem.Read32(bucketAddr); e != 0; e = mem.Read32(e + 12))
         {
             if (e < 0x00010000 || e >= SystemMemory.RDRAM_SIZE) break;
@@ -4792,17 +4860,18 @@ public sealed class RealSifRpc
             }
         }
 
-        // One primary entry slot; additional keys share by rewriting path (last key wins)
-        // when the single scratch entry is already linked — allocate by path content match only.
-        uint entry = DecPathHashEntry;
-        uint pathPtr = DecPathHashPath;
-        // If entry already linked for a different key, still update path+value (single-slot plant).
-        for (int i = 0; i < path.Length && i < 80; i++)
+        // Always use host scratch entry/path slots so we never clobber EE pool nodes.
+        // Link them into the LIVE bucket array (hdr+4) so open@0x23A180 finds gameart.
+        uint entry = DecPathHashEntryBase + (uint)slot * 16u;
+        uint pathPtr = DecPathHashPathBase + (uint)slot * 64u;
+        int len = Math.Min(path.Length, 62);
+        for (int i = 0; i < len; i++)
             mem.Write8(pathPtr + (uint)i, (byte)path[i]);
-        mem.Write8(pathPtr + (uint)path.Length, 0);
+        mem.Write8(pathPtr + (uint)len, 0);
         mem.Write32(entry + 0, pathPtr);
         mem.Write32(entry + 4, value);
-        // Only splice if not already in this bucket chain.
+        mem.Write32(entry + 8, 0);
+        // Splice at bucket head.
         bool linked = false;
         for (uint e = mem.Read32(bucketAddr); e != 0; e = mem.Read32(e + 12))
         {
@@ -4818,9 +4887,9 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// Dec WAVE-5: force host open of gameart.ssf member via PAK TOC (real bytes + sector
+    /// Dec WAVE-5/6: force host open of gameart.ssf member via PAK TOC (real bytes + sector
     /// credit). Complements path-hash plant so EE open@0x23A180 finds a stream and metrics
-    /// show member traffic. Does not invent Soft-GS pixels.
+    /// show member traffic. Registers an MWFILE handle for later reads. Does not invent Soft-GS.
     /// </summary>
     public int ForceDecGameartMemberOpen(IopModuleHost iopModules, Cdvd cdvd)
     {
@@ -4830,13 +4899,15 @@ public sealed class RealSifRpc
         {
             int fd = TryOpenFromMkdaPak(iopModules, m, out uint msz);
             if (fd < 0 || msz == 0) continue;
+            int handle = _mwFileNextHandle++;
+            _mwFileHandles[handle] = fd;
             DecGameartMemberOpens++;
             if (msz > 0)
                 cdvd?.NoteHostReadSectors(Math.Min(128, (int)((msz + 2047) / 2048)));
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                 || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[MWFILE] open OK path=\"{m}\" handle={DecGameartMemberOpens} fd={fd} size={msz} (pak-member) force-dec");
+                    $"[MWFILE] open OK path=\"{m}\" handle={handle} fd={fd} size={msz} (pak-member) force-dec");
             return fd;
         }
         return -1;
