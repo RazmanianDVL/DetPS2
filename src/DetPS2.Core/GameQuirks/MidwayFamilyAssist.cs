@@ -520,7 +520,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             lockVal = 0;
         }
 
+        // Wave-2: after >=2 lock clears with VIF1/GIF idle, complete type-1 cmd.
+        // (Hit counter was reset by lock-clear so a second hits>=32 gate never fired.)
         if (_displayCmdCompletes >= 64) return;
+        if (_displayLockEscapes < 2) return;
         if (sys.Dmac.IsActive(Dmac.Channel.VIF1) || sys.Dmac.IsActive(Dmac.Channel.GIF))
             return;
 
@@ -528,12 +531,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if ((cmd & DaDisplayCmdDoneBit) != 0) return;
         uint cmdType = cmd & 0xFF;
         // Live: 0x88000501 / 0x00000501 type 1 = VIF1 chain; 0x80.. sibling ops after drain.
-        if (cmdType != 1 && cmdType != 0x80 && cmdType != 0x81 && cmdType != 0x82)
+        if (cmdType != 1 && cmdType is not (0x80 or 0x81 or 0x82 or 0x83 or 0x8F or 0xFF))
             return;
-
-        if (_displayLockEscapes < 1) return;
-        _displayLockHits++;
-        if (_displayLockHits < 32) return;
 
         sys.Memory.Write32(head, cmd | DaDisplayCmdDoneBit);
         uint newHead = head + 8;
