@@ -10,13 +10,13 @@
 |-------|--------|-------|----------------|------|
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | gifP3=11 FAE8 | selection/second chrome; C1C0 never binds |
 | **Burnout 3** | SLUS_210.50 | **YES** (logo-frontend) | px=24.4M dispfbPx=2.27M cdvd=6584 gifP2=14526 | wave-6 Soft-GS logo chrome; pad main-menu advance residual |
-| **Blood Omen 2** | SLUS_200.24 | **No** | px=3 cdvd=2135 stream=2.4MB LIST+ENGLISH PC=0x2CD884 | WAVE-5 low-ELF thrash fix; Soft-GS menu not drawn |
-| **God of War** | SCUS_973.99 | **No*** | **gifP3=1** first | FILEIO/LoadWad; px=0 |
-| **MK Deception** | SLUS_208.81 | **No** | cdvd 287→399 | no member .ssf CallRpc |
-| **MK Deadly Alliance** | SLUS_204.23 | **No** | **gameart open** cdvd=771 | px=0 post-open |
-| **Vexx** | SLUS_203.83 | **No** | **cdvd 0→4** GAME.TXT | WaitSema / more assets |
-| **Whiplash** | SLUS_206.84 | **No** | cdvd=256 RKV warm | MOD_LOAD path="" |
-| **Haven** | SLUS_205.17 | **No** | px=3 gifP3=67 dmac=197 cdvd=77 | soft-float cleared via SoftFloatBridge; residual VIF1 init spin @0x188AE0; no FILEIO yet |
+| **Blood Omen 2** | SLUS_200.24 | **No** | px=71680 logo gifP2=111 stream=2.4MB LIST+ENGLISH cdvd=2357 | WAVE-6 Soft-GS logo gate + list-walk; mainmenu Soft-GS not drawn |
+| **God of War** | SCUS_973.99 | **No** | worker type-2 cleared; gifP2=962 px=0 cdvd=142 | PATH3/WAD FILEIO residual |
+| **MK Deception** | SLUS_208.81 | **No** | px=822k dispfbPx=105k gameart.ssf loaded | WAVE-6 path-hash; no GIF IMAGE menu |
+| **MK Deadly Alliance** | SLUS_204.23 | **YES** (midway-menu) | px=716800 gifP2=35109 exitReq=False | wave-6 post-logo keep-alive |
+| **Vexx** | SLUS_203.83 | **No** | cdvd=227 STREE0 index | TRE member VFS residual |
+| **Whiplash** | SLUS_206.84 | **YES** (title-surface) | px=286720 frontend Start full | wave-6 full title path |
+| **Haven** | SLUS_205.17 | **No** | LIKELY-NEAR prior | WaitSema / IMAGE residual |
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
