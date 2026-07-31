@@ -144,3 +144,17 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | MENU / px | **No / 0** — not claiming logo-frontend; prims>0 but Soft-GS still black |
 | Next | prims to px (FRAME/DISPFB/scissor/IMAGE present); pad after non-black Soft-GS |
 
+## Wave-3 (2026-07-31) — agent/menu-b3-w3 Soft-GS prims→px
+
+| Field | Value |
+|-------|-------|
+| Tip base | `8da8267` (main + burnout-only.json) |
+| Branch | `agent/menu-b3-w3` @ `9b1af3d` |
+| Claim 100M | **STG+TXD+FRONTEND** cdvd=**6584** gifP3=**1651** dmac=1407 prims=**4066** **px=3638** binds=13 calls=659 PC=`0x10BE68` |
+| Soft-GS root cause | ATE on + AFAIL=FB_ONLY; MODULATE used /255 so 0x80×0x80→0x40 failed GEQUAL; also ZTE=0 soft-depth, FBP*2048 mis-scale |
+| Soft-GS fix | Mul80 (0x80=1.0); AFAIL FB_ONLY/RGB_ONLY paint; ZTE=0 skip soft depth; FRAME FBP×8192 + WriteFrameLocal; scissor staged expand; XYZ off-FB rescue; XYZF2/3 |
+| Telemetry | fragTest=3638 rejBounds=428 rejScissor=0 rejDepth=0 rejAlpha=3638 (AFAIL still paints); FRAME_1=`0xA0046` DISPFB1=0 SCISSOR full XYOFFSET=`0x72006C00` TEST=`0x5140B` |
+| STG | stable cdvd=6584 (unchanged assist) |
+| MENU | **No** — Soft-GS non-black logo-frontend pixels only; not claiming interactive menu |
+| Next | pad after non-black Soft-GS; natural DISPFB; improve tex sample so rejAlpha falls |
+
