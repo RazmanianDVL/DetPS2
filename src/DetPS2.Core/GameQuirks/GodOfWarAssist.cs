@@ -122,14 +122,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private ulong _type2CompletedCyc;
     private bool _type2Completed;
     private int _type2PostStreamKicks;
-    /// <summary>Wave-8: type-2 body reached success epilogue band (0x27E234+ / 0x27DBF0).</summary>
-    private bool _type2EpilogueSeen;
-    /// <summary>Wave-8: cycle when success epilogue was force-planted (protect from rewind).</summary>
-    private ulong _type2EpilogueCyc;
-    /// <summary>Wave-8: early TOC/PART1 FILEIO open before type-2 body.</summary>
-    private bool _preType2FileIo;
-    /// <summary>Wave-8: LoadWad / stream-table bind seeded after host R_SHELL/TIT1.</summary>
-    private bool _loadWadSeeded;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -267,10 +259,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _type2CompletedCyc = 0;
         _type2Completed = false;
         _type2PostStreamKicks = 0;
-        _type2EpilogueSeen = false;
-        _type2EpilogueCyc = 0;
-        _preType2FileIo = false;
-        _loadWadSeeded = false;
         _postWorkerCopyEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
@@ -467,29 +455,20 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
             else
             {
-                // Wave-8: after type-2 + assets prefer post-FreezeCache (not mid flip-kick).
-                uint preferred = 0x0026C0ECu;
-                if (_type2Completed && sys.Cdvd.SectorsRead > 400)
-                    preferred = 0x00185FACu;
-                else if (sys.Cdvd.SectorsRead > 0)
-                    preferred = 0x00185FACu;
+                // Wave-8b: after type-2 prefer stream-poll 0x26C0EC — LastGood/ra often
+                // lands in 0x292Cxx / 0x2A14xx UnknownOpcode storms (claim100 residual).
+                uint preferred = _type2Completed && sys.Cdvd.SectorsRead > 142
+                    ? 0x0026C0ECu
+                    : (sys.Cdvd.SectorsRead > 0 ? 0x00185FACu : 0x0026C0ECu);
                 uint resume = PickSafeResume(sys, preferred);
-                if (_type2Completed && sys.Cdvd.SectorsRead > 400
-                    && (resume is >= 0x0013F5E0 and <= 0x0013F620
-                        || resume is >= 0x00300000 and <= 0x00320000
-                        || resume is >= 0x00183880 and <= 0x001838D0
-                        || resume is >= 0x00140A00 and <= 0x00140B00))
-                    resume = 0x00185FACu;
+                RepairCurrentSpIfPoison(sys);
                 sys.Memory.Write32(0x002A1338, 0);
-                if (_type2Completed) sys.Memory.Write32(0x002AC7D0, 1u);
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128
                 {
-                    Lo = resume is 0x00185FAC or 0x00140A04 ? 1UL : 1UL
+                    Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
                 });
-                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
                 sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
-                if (crt0Reentry || _type2Completed)
-                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x00185FACUL });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
                 sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~0x6u;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -812,22 +791,27 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
         }
 
-        // Wave-6: type-2 fails when slot/stream gates return 0:
+        // Wave-6/7/8b: type-2 fails when slot/stream gates return 0:
         //   0x282DD0 / 0x281568 → 0x81010013 (null handle)
         //   0x281548 (→0x282270) + *sp==0 → 0x8101006F
-        // Plant success stubs so the REAL 0x27DF30 prologue continues into stream setup.
+        // Disasm 0x27DF30 (wave-8b):
+        //   0x281568 v0==2 → set +0x888=1 and take FULL stream body (0x27DED8/0x282208/
+        //   0x281E30/0x27DCC8 fill + strcmp + 0x27DBF0 follow). v0!=2 with +0x888==0
+        //   early-exits to 0x27E208 and skips all stream fill → FRAME_1 stays 0.
+        // Wave-8b: return v0=2 from 0x281568 so the real stream path runs; soft-complete
+        // later clears +0x888 for v0=0 success after fill has executed.
         if (!_type2GatesPlanted && c >= 37_000_000 && sys.Cdvd.SectorsRead > 0
             && sys.Gs.PixelsWritten == 0 && sys.Gif.Path3Transfers == 0)
         {
-            // 0x282DD0 / 0x281568: li v0,1; jr ra; nop
-            foreach (uint gate in new uint[] { 0x00282DD0u, 0x00281568u })
-            {
-                sys.Memory.Write32(gate + 0, 0x24020001u); // addiu v0, zero, 1
-                sys.Memory.Write32(gate + 4, 0x03E00008u); // jr ra
-                sys.Memory.Write32(gate + 8, 0x00000000u); // nop
-            }
+            // 0x282DD0: non-null handle gate — li v0,1; jr ra
+            sys.Memory.Write32(0x00282DD0u, 0x24020001u);
+            sys.Memory.Write32(0x00282DD4u, 0x03E00008u);
+            sys.Memory.Write32(0x00282DD8u, 0x00000000u);
+            // 0x281568: MUST return 2 (s4) to enter full stream body (wave-8b).
+            sys.Memory.Write32(0x00281568u, 0x24020002u); // addiu v0, zero, 2
+            sys.Memory.Write32(0x0028156Cu, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x00281570u, 0x00000000u); // nop
             // 0x281548: called with a1=sp output; must return v0!=0 and *a1!=0.
-            //   addiu t0, zero, 1; sw t0, 0(a1); addiu v0, zero, 1; jr ra; nop
             sys.Memory.Write32(0x00281548, 0x24080001u); // addiu t0, zero, 1
             sys.Memory.Write32(0x0028154C, 0xACA80000u); // sw t0, 0(a1)
             sys.Memory.Write32(0x00281550, 0x24020001u); // addiu v0, zero, 1
@@ -837,47 +821,89 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(0x002815A8, 0x24020001u);
             sys.Memory.Write32(0x002815AC, 0x03E00008u);
             sys.Memory.Write32(0x002815B0, 0x00000000u);
+            // 0x289B70 memcmp-like (stream name): return 0 (match) so body continues.
+            sys.Memory.Write32(0x00289B70u, 0x0000102Du); // daddu v0, zero, zero
+            sys.Memory.Write32(0x00289B74u, 0x03E00008u);
+            sys.Memory.Write32(0x00289B78u, 0x00000000u);
+            // 0x27DCC8 parse/fill: return 0 (ok) — non-zero aborts to epilogue with error in v0.
+            sys.Memory.Write32(0x0027DCC8u, 0x0000102Du);
+            sys.Memory.Write32(0x0027DCCCu, 0x03E00008u);
+            sys.Memory.Write32(0x0027DCD0u, 0x00000000u);
+            // 0x27DBF0 stream follow-up (epilogue): v0=0 and *a1=0 so status publish proceeds.
+            // Real follow hangs mid-body (claim w8b-final: streamPast=False); soft-ok keeps
+            // natural epilogue resWas=0 (claim v3: epi=True streamPast=True).
+            sys.Memory.Write32(0x0027DBF0u, 0xACA00000u); // sw zero, 0(a1)
+            sys.Memory.Write32(0x0027DBF4u, 0x0000102Du); // daddu v0, zero, zero
+            sys.Memory.Write32(0x0027DBF8u, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x0027DBFCu, 0x00000000u); // nop
+            // Soft-ok a few stream helpers so full body is not starved on empty graphs.
+            // 0x27DED8 / 0x282208 / 0x282710 / 0x281E30: return 0 (success/no-op).
+            foreach (uint leaf in new uint[] { 0x0027DED8u, 0x00282208u, 0x00282710u, 0x00281E30u })
+            {
+                sys.Memory.Write32(leaf + 0, 0x0000102Du); // daddu v0, zero, zero
+                sys.Memory.Write32(leaf + 4, 0x03E00008u); // jr ra
+                sys.Memory.Write32(leaf + 8, 0x00000000u); // nop
+            }
             // Type-2 table slots (base 0x32C9C8 + i*2200). Disasm 0x27E280:
             //   lw a0, *(base+0x888); beql a0,0 → success v0=0; else 0x81019003.
-            // Wave-6 planted +0x888=1 → forced error. Wave-7: +0x888 MUST be 0 for success;
+            // Full body sets +0x888=1 mid-run; soft-complete clears it after fill.
             // +0x88C is set by the strcmp-match path (sw 1); seed 0 so body owns it.
             // +0x890 cursor used by 0x27DBF0 stream follow-up — seed 0 (empty ready).
             for (uint i = 0; i < 4; i++)
             {
                 uint baseOff = 0x0032C9C8u + i * 2200u;
-                sys.Memory.Write32(baseOff + 0x888u, 0u); // success-required clear
+                sys.Memory.Write32(baseOff + 0x888u, 0u);
                 sys.Memory.Write32(baseOff + 0x88Cu, 0u);
                 sys.Memory.Write32(baseOff + 0x890u, 0u);
                 sys.Memory.Write32(baseOff + 0x894u, 0u);
             }
             // Type-2 0x8101002F: multiple paths land at 0x27E228. Force the flag check at
-            // 0x27E220 to take the success branch 0x27E234 (real epilogue: status to s6).
+            // 0x27E220 to take the success branch 0x27E234 (real epilogue: 0x27DBF0 + status).
             // Also nop early 0x8000-bit fails + soft-match strcmp.
             sys.Memory.Write32(0x0027E194, 0x00000000u); // nop (was beq → 0x2F)
             sys.Memory.Write32(0x0027E1D8, 0x00000000u); // nop (was beq → 0x2F)
             sys.Memory.Write32(0x0027E220, 0x10000004u); // b +4 → 0x27E234 (ignore a0==0)
             sys.Memory.Write32(0x0027E224, 0x00000000u); // nop
+            // Wave-8b live: body hit 0x81010086 (digit parse a2<11 at 0x27E0B8) before stream
+            // helpers — force continue into 0x27E0CC fill path.
+            sys.Memory.Write32(0x0027E0B8u, 0x10000004u); // b +4 → 0x27E0CC
+            sys.Memory.Write32(0x0027E0BCu, 0x00000000u); // nop
             sys.Memory.Write32(0x002897C4, 0x0000102Du); // daddu v0, zero, zero (strcmp match)
             sys.Memory.Write32(0x002897C8, 0x03E00008u); // jr ra
             sys.Memory.Write32(0x002897CC, 0x00000000u); // nop
-            // Wave-8: 0x27DBF0 stream follow-up — soft-success (*a1=0, v0=0) so epilogue
-            // does not re-enter 0x8101002F. Real body still owns table setup before this.
-            //   sw zero, 0(a1); move v0, zero; jr ra; nop
-            sys.Memory.Write32(0x0027DBF0, 0xACA00000u); // sw zero, 0(a1)
-            sys.Memory.Write32(0x0027DBF4, 0x0000102Du); // daddu v0, zero, zero
-            sys.Memory.Write32(0x0027DBF8, 0x03E00008u); // jr ra
-            sys.Memory.Write32(0x0027DBFC, 0x00000000u); // nop
+            // Pre-seed stream slot records BEFORE body runs (digits + buffer ptrs + count).
+            // Live claim: post-complete seed is too late — body already returned 0x86.
+            for (uint slot = 0; slot < 4; slot++)
+            {
+                uint s1 = 0x002A3318u + slot * 388u;
+                if (s1 + 0x180u >= (uint)SystemMemory.RDRAM_SIZE) break;
+                sys.Memory.Write8(s1 + 0x1Cu, (byte)'1');
+                sys.Memory.Write8(s1 + 0x1Du, (byte)'2');
+                sys.Memory.Write8(s1 + 0x1Eu, (byte)'0');
+                sys.Memory.Write8(s1 + 0x1Fu, 0);
+                // count/size so fill loop and follow-up see non-empty work
+                if (sys.Memory.Read32(s1 + 0x38u) == 0)
+                    sys.Memory.Write32(s1 + 0x38u, 1u);
+                if (sys.Memory.Read32(s1 + 0x30u) == 0)
+                    sys.Memory.Write32(s1 + 0x30u, 0x1000u);
+                if (sys.Memory.Read32(s1 + 0x34u) == 0)
+                    sys.Memory.Write32(s1 + 0x34u, 0u);
+                if (sys.Memory.Read32(s1 + 0x3Cu) == 0)
+                    sys.Memory.Write32(s1 + 0x3Cu, 1u);
+                uint buf = slot == 0 ? 0x01D00000u : 0x01E00000u;
+                if (sys.Memory.Read32(s1 + 0x40u) == 0)
+                    sys.Memory.Write32(s1 + 0x40u, buf);
+                if (sys.Memory.Read32(s1 + 0x44u) == 0)
+                    sys.Memory.Write32(s1 + 0x44u, buf);
+            }
             // Clear stale type-2 error from poison wrong-tid attempts so body can rewrite.
             sys.Memory.Write32(0x00310388, 0u);
             _type2GatesPlanted = true;
             _type2GatesPlantCyc = c;
             _type2MidBodySeen = false;
-            _type2EpilogueSeen = false;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[GOW] plant type-2 0x2F→success + gates +0x888=0 (w8) cyc={c}");
-            // Wave-8: open TOC/PART1 *before* type-2 body so natural LoadWad/FILEIO can bind.
-            TryPreType2FileIo(sys, c);
+                    $"[GOW] plant type-2 FULL-stream gates v0=2 + digit/0x27DBF0 ok (w8b) cyc={c}");
         }
 
         // Wave-6: any post-CDVD poison SP freezes jr-ra / WaitSema thrash (live main
@@ -962,48 +988,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             && sys.Gif.Path3Transfers == 0)
             TryYieldToPendingWorker(sys, pc, c);
 
-        // Wave-4/8 post-worker residual: byte-copy thrash + 0x26BFB0 hang (size≥0x201).
-        // Wave-8: escape from 40M (right after type-2) — hang trapped EE 41–50M in w7.
-        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+        // Wave-4 post-worker residual (claim100c PC=0x26BF78): byte-copy
+        // while (a1 < s1) *0x305640+a1 = *(a3+a1). Huge s1 burns 10M+ cycles after cmd
+        // type=2 cleared *0x310384 to 0xFFFFFFFF. Also 0x26BFB0 infinite hang on size>512.
+        if (c >= 50_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && pc is >= 0x0026BF50 and <= 0x0026BFC8)
             TryEscapePostWorkerCopy(sys, pc, c);
-
-        // Wave-8: residual thrash after type-2 (MMI / sleep-cmd / stack-PC / flip-lock spin)
-        // → post-FreezeCache continue. Do NOT jump mid flip-kick (0x140A04→0x1838A4 spin)
-        // or mid packet-builder (0x1415F8 align pad) without healthy s1/r10.
-        if (c >= 42_000_000 && _type2Completed && sys.Cdvd.SectorsRead > 400
-            && sys.Gs.PixelsWritten == 0
-            && (pc is >= 0x00289A00 and <= 0x00289C00
-                || pc is >= 0x0013F5E0 and <= 0x0013F620
-                || pc is >= 0x00300000 and <= 0x00320000
-                || pc is >= 0x002A0000 and <= 0x002B0000
-                || pc is >= 0x00183880 and <= 0x001838D0
-                || pc is >= 0x001415E8 and <= 0x00141614)
-            && (c % 200_000UL) < 50_000UL)
-        {
-            sys.Memory.Write32(0x002AC7D0, 1u);
-            sys.Memory.Write32(0x002A1338, 0);
-            RepairCurrentSpIfPoison(sys);
-            // Skip packet-builder align pad to epilogue (0x141618) when mid-pad thrash.
-            if (pc is >= 0x001415E8 and <= 0x00141614)
-            {
-                sys.EE.PC = 0x00141618;
-                sys.EE.COP0_Status &= ~0x6u;
-            }
-            else
-            {
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x00185FACUL });
-                sys.EE.PC = 0x00185FAC;
-                sys.EE.COP0_Status &= ~0x6u;
-            }
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (c % 5_000_000UL) < 50_000UL)
-                Console.Error.WriteLine(
-                    $"[GOW] escape residual thrash pc=0x{pc:X8} -> 0x{sys.EE.PC:X8} cyc={c}");
-        }
 
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
         // re-escape empty/corrupt list walks, wake peers, and inject pad so world/UI path
@@ -1499,8 +1489,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0015F2C0 and <= 0x0015FB00)  // list / object-init thrash
             or (>= 0x0013DE80 and <= 0x0013DF20)  // heap free/align residual (wave-7 0x13DEA0)
             or (>= 0x0013E1C0 and <= 0x0013E1F4)  // global free-search circular thrash
-            or (>= 0x0013F5E0 and <= 0x0013F620)  // wave-8: sleep-cmd residual (0x13F60C loop)
-            or (>= 0x00300000 and <= 0x00320000)  // wave-8: stack-as-PC (0x319EE8)
             or (>= 0x0016AE00 and <= 0x0016AE40)  // live exception re-home death
             or (>= 0x00183880 and <= 0x001838D0)
             or (>= 0x0017A320 and <= 0x0017A360)  // software delay + flag poll
@@ -1514,11 +1502,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0027CBD0 and <= 0x00282000)
             or (>= 0x00293C00 and <= 0x00293C90)
             or (>= 0x0026B9B0 and <= 0x0026BA20)  // post-type-2 jalr data thrash
-            or (>= 0x0026BFB0 and <= 0x0026BFC8)  // wave-8: size≥0x201 assert hang (nop sled)
-            or (>= 0x00292C00 and <= 0x00293000)  // wave-8: soft-float mid-body (bad LastGood)
-            or (>= 0x002943C0 and <= 0x00294590)  // cache-wb residual (not safe foreign resume)
-            or (>= 0x00289A00 and <= 0x00289C00)  // wave-8: MMI memcmp thrash (empty-SIF ra)
             or (>= 0x00299300 and <= 0x00299480)  // wave-6 word-scan residual
+            or (>= 0x00292C00 and <= 0x00292E00)  // wave-8b UnknownOpcode residual (0x292CD8)
+            or (>= 0x002A1400 and <= 0x002A1600)  // wave-8b data-as-code (0x2A14B4)
+            or (>= 0x002A6D00 and <= 0x002A7000)  // wave-8b UnknownSpecial storm
+            or (>= 0x01000000 and <= 0x01FFFFFF)  // high RDRAM data as PC (0x01059BF4)
             || p == 0x00100008u;
 
         static bool IsSafeCode(Ps2System s, uint p) =>
@@ -1685,14 +1673,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     {
         if (_postWorkerCopyEscapes >= 256) return;
 
-        // Infinite hang: size≥0x201 assert → nop sled at 0x26BFB0..0x26BFC4.
-        // Wave-8: always leave to stream-ready continue (0x26C0EC, v0=1) — $ra often
-        // points back into the failing 989snd/stream path and re-enters the hang.
+        // Infinite hang: jal printf then spin at 0x26BFB0.
         if (pc is >= 0x0026BFB0 and <= 0x0026BFC8)
         {
-            const uint resume = 0x0026C0EC;
-            sys.Memory.Write32(0x002A1338, 0); // stream ready
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            uint resume = 0x0026C0EC;
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x0026BF50 and <= 0x0026C200))
+                resume = ra;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.PC = resume;
             sys.EE.COP0_Status &= ~0x6u;
             _postWorkerCopyEscapes++;
@@ -1794,7 +1783,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         bool midBody = (worker.SavedPc & 0x1FFFFFFFUL) is >= 0x0027CC30 and <= 0x00282000
             && !atGate;
 
-        // Wave-7/8: observe real type-2 progress on the worker thread.
+        // Wave-7: observe real type-2 progress on the worker thread.
         // Body is 0x27DF30..0x27E2C8 but also callees (cache-wb 0x294xxx, strcmp 0x289xxx,
         // stream helpers). Any non-idle/non-WaitSema worker PC while cmd==2 counts.
         if (currentIsWorker && !poisonFrame && cmdPending && cmdType == 2
@@ -1807,42 +1796,41 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (currentIsWorker && !poisonFrame && !onIdle
             && pc is >= 0x0027CC34 and <= 0x00282000)
             _type2MidBodySeen = true;
-        // Wave-8: success epilogue + stream follow-up 0x27DBF0 (after 0x27E234).
-        if (currentIsWorker && !poisonFrame
-            && (pc is >= 0x0027E234 and <= 0x0027E2C8
-                || pc is >= 0x0027DBF0 and <= 0x0027DCC4))
-            _type2EpilogueSeen = true;
 
-        // Wave-8 complete-once: force success epilogue first, then soft-complete after a
-        // short budget so 0x27DBF0 can run. Do not invent PATH3 packets.
-        bool type2Budget =
-            _type2GatesPlanted
-            && (c - _type2GatesPlantCyc) >= 800_000UL
-            && (_type2EpilogueSeen || _type2MidBodySeen || _workerYields >= 2);
-        // Hard ceiling: never hold type-2 forever if worker freezes at PostWait.
-        bool type2Ceiling =
-            _type2GatesPlanted
-            && (c - _type2GatesPlantCyc) >= 3_000_000UL
-            && _workerYields >= 2;
-        // After epilogue forced, wait ≥400k cycles before cmd clear so 0x27DBF0 can finish.
-        if (_type2EpilogueSeen && (c - _type2GatesPlantCyc) < 1_600_000UL
-            && !_type2Completed && cmdPending)
-            type2Budget = false;
-        if (cmdPending && !_type2Completed && (type2Budget || type2Ceiling))
+        // Wave-7/8b complete-once: disasm 0x27E280 requires *(base+0x888)==0 for v0=0 success
+        // (full stream body sets +0x888=1 → 0x81019003 without clear). Wave-8b delays complete
+        // until the full stream path has been entered (PC past 0x27E0CC helpers, or epilogue
+        // 0x27E234+, or ≥1.5M cycles after gates with mid-body) so 0x27DED8/0x282208/0x27DCC8
+        // stubs can run before we publish success. Do not invent PATH3 packets.
+        bool type2Epilogue = currentIsWorker && pc is >= 0x0027E234 and <= 0x0027E2C8;
+        bool type2StreamPast = currentIsWorker && pc is >= 0x0027E0CC and <= 0x0027E2C8;
+        bool type2FillWindow = _type2MidBodySeen
+            && _type2GatesPlantCyc != 0
+            && c >= _type2GatesPlantCyc + 1_500_000UL;
+        bool type2ReadyToComplete = type2Epilogue || type2StreamPast || type2FillWindow
+            || (_workerYields >= 6 && _type2MidBodySeen);
+        if (cmdPending && _type2GatesPlanted && !_type2Completed
+            && _workerYields >= 2 && type2ReadyToComplete)
         {
             uint res = sys.Memory.Read32(0x00310388);
             bool isErr = res is >= 0x81010000u and <= 0x8101FFFFu;
-            // Always clear +0x888 and force success result before clear.
+            // Always clear +0x888 (full body sets 1) and force success result before clear.
             for (uint i = 0; i < 4; i++)
             {
                 uint baseOff = 0x0032C9C8u + i * 2200u;
                 sys.Memory.Write32(baseOff + 0x888u, 0u);
                 sys.Memory.Write32(baseOff + 0x88Cu, 1u); // match-path ready
-                // Stream cursor empty-ready (0x27DBF0 walks +0x890 vs s1+0x170).
-                sys.Memory.Write32(baseOff + 0x890u, 0u);
-                sys.Memory.Write32(baseOff + 0x894u, 0u);
             }
             sys.Memory.Write32(0x00310388, 0u); // success result word
+            // Clear type-2 stack error word (*sp+528) so 0x27DBF0 follow residue cannot
+            // re-poison the published status (disasm 0x27E244 lw v1,528(sp)).
+            try
+            {
+                uint wsp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                if (wsp >= 0x00100000u && wsp + 0x220u < (uint)SystemMemory.RDRAM_SIZE)
+                    sys.Memory.Write32(wsp + 0x210u, 0u);
+            }
+            catch { /* ignore */ }
             // Type-2 epilogue writes status block via s6 (*0x31038C often): {2, flag, extra}.
             uint statusPtr = sys.Memory.Read32(0x0031038C);
             uint spPhys = statusPtr & 0x1FFFFFFFu;
@@ -1852,46 +1840,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 sys.Memory.Write32(spPhys + 0, 2u);  // type
                 sys.Memory.Write32(spPhys + 4, 1u);  // ok flag
                 sys.Memory.Write32(spPhys + 8, 0u);
-            }
-            // Wave-8: force success epilogue on worker so 0x27DBF0 can run before cmd clear.
-            // claim100c: complete fired on main (currentIsWorker=false) → epi never ran.
-            if (!_type2EpilogueSeen)
-            {
-                // Switch to worker if needed, plant frame, jump to 0x27E234.
-                if (!currentIsWorker)
-                {
-                    try
-                    {
-                        SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "type2-epi",
-                            forceDispatch: false, signalSema: true);
-                    }
-                    catch { /* ignore */ }
-                }
-                RepairWorkerCalleeSaved(sys, worker);
-                uint sp = 0x0031C500u;
-                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp });
-                sys.Memory.Write32(sp + 0x210u, 0u); // 528(sp) result for 0x27DBF0
-                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0x0032C9C8u + 0x88Cu });
-                sys.EE.SetGpr(17, new EmotionEngine.Gpr128 { Lo = 0x002A349Cu }); // s1 slot
-                sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = 0x0032C9C8u }); // s2 table
-                sys.EE.SetGpr(19, new EmotionEngine.Gpr128 { Lo = 0 }); // s3 index
-                sys.EE.SetGpr(20, new EmotionEngine.Gpr128 { Lo = 2 }); // s4 type
-                sys.EE.SetGpr(22, new EmotionEngine.Gpr128
-                {
-                    Lo = statusPtr != 0 ? statusPtr : 0x00310390UL
-                });
-                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = WorkerIdleLo }); // ra → idle
-                sys.EE.PC = 0x0027E234;
-                sys.EE.COP0_Status &= ~0x6u;
-                _type2EpilogueSeen = true;
-                _type2EpilogueCyc = c;
-                // Publish success result immediately so sleep-cmd rewinds cannot re-poison.
-                sys.Memory.Write32(0x00310388, 0u);
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine(
-                        $"[GOW] force type-2 success epilogue 0x27E234 cyc={c}");
-                // Do not clear cmd yet — let epilogue + 0x27DBF0 run one more slice.
-                return true;
             }
             sys.Memory.Write32(WorkerCmdTypePtr, 0);
             cmdPending = false;
@@ -1913,7 +1861,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
                     $"[GOW] complete worker cmd={cmdType} resWas=0x{res:X8} " +
-                    $"mid={_type2MidBodySeen} epi={_type2EpilogueSeen} " +
+                    $"mid={_type2MidBodySeen} epi={type2Epilogue} streamPast={type2StreamPast} " +
                     $"softOk={isErr} success=True cyc={c}");
         }
 
@@ -1988,13 +1936,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // Pending cmd + sleeping worker (w5b sleep-cmd from flag-spin 0x17A32C).
         // Wave-6: do not force PostWait when SavedPc is mid type-2 body.
-        // Wave-8: after forced epilogue, never rewind to PostWait for 2M cycles.
         if (cmdPending && worker.Sleeping && worker.WaitSemaId is >= 1 and <= 256)
         {
             if (c - _lastWorkerYieldCyc < 200_000UL) return false;
-            if (_type2EpilogueSeen && _type2EpilogueCyc != 0
-                && (c - _type2EpilogueCyc) < 2_000_000UL)
-                return false;
             _armedWorkerCmd = cmdType;
             return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "sleep-cmd",
                 forceDispatch: atGate || !midBody);
@@ -2818,12 +2762,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     _emptySifPollLoops++;
                 }
             }
-            // Wave-8: never soft-return into MMI memcmp thrash 0x289Axx (claim100 PC=0x289A98
-            // for 40M+ after R_SHELL host load — freezes PATH3/LoadWad).
-            bool raIsMmiThrash = ra is >= 0x00289A00 and <= 0x00289C00;
             if (!left
                 && !(raIsWorkerBody && !currentIsWorker)
-                && !raIsMmiThrash
                 && sys.Memory.IsLikelyEeCode(ra)
                 && (ra is (>= 0x0027CC00 and <= 0x0027CD00)
                     or (>= 0x00294800 and <= 0x00294900)
@@ -2836,8 +2776,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 // Broader $ra accept (any .text) for 0x2993xx residual with null-ra recovery.
                 if (ra is not (>= 0x00293C00 and <= 0x00293C80)
                     && ra is not (>= 0x00299300 and <= 0x00299480)
-                    && ra is not (>= 0x0026C0E0 and <= 0x0026C600)
-                    && ra is not (>= 0x00289A00 and <= 0x00289C00))
+                    && ra is not (>= 0x0026C0E0 and <= 0x0026C600))
                 {
                     uint a0 = (uint)sys.EE.GetGpr(4).Lo;
                     uint sema = a0 is >= 1 and <= 256 ? a0 : 3u;
@@ -2851,33 +2790,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     else if (raIsWorkerBody && currentIsWorker)
                         _emptySifPollLoops = 0;
                 }
-            }
-            // Wave-8: after assets, leave MMI/empty-SIF thrash toward Flip-And-Kick /
-            // post-FreezeCache so display path can arm FRAME/PATH3 (no invented GIF).
-            if (!left && _type2Completed && sys.Cdvd.SectorsRead > 400
-                && (raIsMmiThrash || pc is >= 0x00289A00 and <= 0x00289C00
-                    || _emptySifPollLoops >= 8 || _worldKickPulses >= 48))
-            {
-                // *0x2AC7D0 = flip/kick enable (disasm 0x140A00).
-                sys.Memory.Write32(0x002AC7D0, 1u);
-                sys.Memory.Write32(0x002A1338, 0);
-                sys.Memory.Write32(0x0029C7D0, 0);
-                uint resume = 0x00140A04; // post flag-plant, jal Flip path
-                if (!sys.Memory.IsLikelyEeCode(resume))
-                    resume = 0x00185FAC;
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x00185FACUL });
-                sys.EE.PC = resume;
-                sys.EE.COP0_Status &= ~0x6u;
-                left = true;
-                _emptySifPollLoops++;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && _emptySifPollLoops <= 24)
-                    Console.Error.WriteLine(
-                        $"[GOW] leave MMI/empty-SIF -> flip-kick 0x{resume:X8} " +
-                        $"loops={_emptySifPollLoops} cyc={c}");
             }
             // Null / poison $ra residual (live 0x299328): stack slot then worker SwitchTo /
             // post-FreezeCache. Wave-4: prefer TryYieldToPendingWorker over PC-stomp 0x27CC08.
@@ -3553,48 +3465,24 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-8: open GODOFWAR.TOC + PART1.PAK before type-2 body so LoadWad/FILEIO bind
-    /// can succeed during the real stream graph setup (not only after soft-complete).
-    /// </summary>
-    private void TryPreType2FileIo(Ps2System sys, ulong c)
-    {
-        if (_preType2FileIo) return;
-        _preType2FileIo = true;
-        TryHostLoadDiscFile(sys, "GODOFWAR.TOC", 0x01F00000u, maxBytes: 0x10000);
-        try
-        {
-            int fdToc = sys.IopModules.FileOpen("cdrom0:\\GODOFWAR.TOC;1");
-            int fdPak = sys.IopModules.FileOpen("cdrom0:\\PART1.PAK;1");
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                Console.Error.WriteLine(
-                    $"[GOW] pre-type2 FILEIO TOC fd={fdToc} PART1 fd={fdPak} cyc={c}");
-        }
-        catch { /* ignore */ }
-    }
-
-    /// <summary>
-    /// Wave-7/8: after type-2 complete, host-load GODOFWAR.TOC + shell WAD into EE scratch and
+    /// Wave-7: after type-2 complete, host-load GODOFWAR.TOC + shell WAD into EE scratch and
     /// credit honest CD sectors so telemetry leaves IRX-only 142. Also re-arm 989snd done-magic,
-    /// keep type-2 table +0x888 clear, escape 0x26BFB0 hang, and seed LoadWad bind state.
+    /// keep type-2 table +0x888 clear, and leave empty-SIF / freelist thrash for stream poll.
     /// Does not invent PATH3 GIF packets (Path3MaskedByVif held).
     /// </summary>
     private void TryPostType2StreamKick(Ps2System sys, uint pc, ulong c)
     {
-        if (_type2PostStreamKicks >= 96) return;
-        if (_type2CompletedCyc == 0 || c < _type2CompletedCyc + 100_000UL) return;
-        // Throttle: first burst of 8, then once per 500k cycles.
-        if (_type2PostStreamKicks >= 8 && (c % 500_000UL) >= 50_000UL)
+        if (_type2PostStreamKicks >= 64) return;
+        if (_type2CompletedCyc == 0 || c < _type2CompletedCyc + 200_000UL) return;
+        // Throttle: first burst of 4, then once per 1M cycles.
+        if (_type2PostStreamKicks >= 4 && (c % 1_000_000UL) >= 50_000UL)
             return;
 
         _type2PostStreamKicks++;
 
         // Keep epilogue success flag clear (re-entry may set sticky bits).
         for (uint i = 0; i < 4; i++)
-        {
-            uint baseOff = 0x0032C9C8u + i * 2200u;
-            sys.Memory.Write32(baseOff + 0x888u, 0u);
-            sys.Memory.Write32(baseOff + 0x88Cu, 1u);
-        }
+            sys.Memory.Write32(0x0032C9C8u + i * 2200u + 0x888u, 0u);
 
         // Host-load GODOFWAR.TOC + PART1.PAK members + force FILEIO open so game stream
         // state can see the pack (ISO root: GODOFWAR.TOC + PART1.PAK only).
@@ -3612,12 +3500,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             catch { /* ignore */ }
         }
         else if (_type2PostStreamKicks == 2)
-        {
-            // Full TOC size for R_SHELL (0xBAA95) — w7 capped 0x80000 truncated Fedo.
-            TryHostLoadPakMember(sys, "R_SHELL.WAD", 0x01E00000u, maxBytes: 0xC0000);
-        }
+            TryHostLoadPakMember(sys, "R_SHELL.WAD", 0x01E00000u, maxBytes: 0x80000);
         else if (_type2PostStreamKicks == 3)
-            TryHostLoadPakMember(sys, "TIT1E1_2.VPK", 0x01D00000u, maxBytes: 0xC0000);
+            TryHostLoadPakMember(sys, "TIT1E1_2.VPK", 0x01D00000u, maxBytes: 0x80000);
         else if (_type2PostStreamKicks == 4)
         {
             // Virtual member FDs so subsequent FILEIO Read of shell/title can succeed.
@@ -3630,42 +3515,63 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
             catch { /* ignore */ }
         }
-        else if (_type2PostStreamKicks == 5)
-            TrySeedLoadWadBind(sys, c);
 
         TryArmPendingStreamJob(sys, c);
 
-        // Soft-leave thrash / hang toward stream-ready continue once assets land.
-        // Wave-8: include 0x26BFB0 assert hang + 0x2943 cache-wb + soft-float mid-body.
-        bool thrash =
-            pc is >= 0x00293C00 and <= 0x00293C90
-            || pc is >= 0x00294800 and <= 0x00294890
-            || pc is >= 0x00233A50 and <= 0x00233B34
-            || pc is >= 0x00239300 and <= 0x00239810
-            || pc is >= 0x00176A80 and <= 0x00176B08
-            || pc is >= 0x0013DE80 and <= 0x0013DF20
-            || pc is >= 0x0026BFB0 and <= 0x0026BFC8
-            || pc is >= 0x002943C0 and <= 0x00294590
-            || pc is >= 0x00292C00 and <= 0x00293000
-            || pc is >= 0x0026BF50 and <= 0x0026BFA8;
-        if (sys.Cdvd.SectorsRead > 142 && thrash)
+        // Wave-8b: seed type-2 stream slot records so post-success main/worker can see
+        // host-extracted R_SHELL / TIT1 buffers (natural consumers; no GIF invent).
+        // Slot stride 388 @ 0x2A3318 (disasm type-2 s1 base). Fields used by body:
+        //   +0x30 size-ish, +0x34 cursor, +0x38 count, +0x3C flags, +0x40/44 ptrs.
+        if (_type2PostStreamKicks is >= 2 and <= 8)
         {
-            sys.Memory.Write32(0x002A1338, 0);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-            sys.EE.PC = 0x0026C0EC;
-            sys.EE.COP0_Status &= ~0x6u;
+            for (uint slot = 0; slot < 2; slot++)
+            {
+                uint s1 = 0x002A3318u + slot * 388u;
+                if (s1 + 0x180u >= (uint)SystemMemory.RDRAM_SIZE) break;
+                // Prefer TIT1 title buffer for slot0, R_SHELL for slot1.
+                uint buf = slot == 0 ? 0x01D00000u : 0x01E00000u;
+                uint sz = slot == 0 ? 0x43E8Au : 0x80000u;
+                if (sys.Memory.Read32(s1 + 0x40u) == 0)
+                    sys.Memory.Write32(s1 + 0x40u, buf);
+                if (sys.Memory.Read32(s1 + 0x44u) == 0)
+                    sys.Memory.Write32(s1 + 0x44u, buf);
+                if (sys.Memory.Read32(s1 + 0x30u) == 0)
+                    sys.Memory.Write32(s1 + 0x30u, sz);
+                if (sys.Memory.Read32(s1 + 0x38u) == 0)
+                    sys.Memory.Write32(s1 + 0x38u, 1u); // count ≥1 so fill loop runs once
+                // ASCII digits the body parses at +0x1C.. — plant "10" / "11" (>=11 required).
+                sys.Memory.Write8(s1 + 0x1Cu, (byte)'1');
+                sys.Memory.Write8(s1 + 0x1Du, (byte)'0');
+                sys.Memory.Write8(s1 + 0x1Eu, (byte)'1');
+                sys.Memory.Write8(s1 + 0x1Fu, 0);
+            }
+            // Publish shell/title buffer roots the game can poll after FILEIO open.
+            sys.Memory.Write32(0x0032D250u, 0x01E00000u); // near type-2 table scratch
+            sys.Memory.Write32(0x0032D254u, 0x01D00000u);
         }
-        // Force leave 989snd wait poll once assets are present (v0=1 → 0x26C0EC body).
-        else if (sys.Cdvd.SectorsRead > 400
-                 && pc is >= 0x0026C0E0 and <= 0x0026C0E8)
+
+        // Soft-leave empty-SIF / freelist / object / heap thrash toward stream poll once assets land.
+        // Wave-8b: also leave post-worker hang 0x26BFB0 and high-data PC residual.
+        if (sys.Cdvd.SectorsRead > 142
+            && (pc is >= 0x00293C00 and <= 0x00293C90
+                || pc is >= 0x00294800 and <= 0x00294890
+                || pc is >= 0x00233A50 and <= 0x00233B34
+                || pc is >= 0x00239300 and <= 0x00239810
+                || pc is >= 0x00176A80 and <= 0x00176B08
+                || pc is >= 0x0013DE80 and <= 0x0013DF20
+                || pc is >= 0x0026BFB0 and <= 0x0026BFC8
+                || pc is >= 0x00292C00 and <= 0x00292E00
+                || pc is >= 0x01000000 and <= 0x01FFFFFF))
         {
+            RepairCurrentSpIfPoison(sys);
             sys.Memory.Write32(0x002A1338, 0);
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x0026C0ECUL });
             sys.EE.PC = 0x0026C0EC;
             sys.EE.COP0_Status &= ~0x6u;
         }
 
-        // Keep main Started after type-2 (live claim: main Started=false → SIF-only thrash).
+        // Keep main + worker Started after type-2 (live w8b: all Started=false → dead EE).
         // Rejected: force-post worker type-3/4 (claim100e: 3.3M WaitSema thrash, no PATH3).
         try
         {
@@ -3674,11 +3580,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             {
                 foreach (var t in kk.AllThreads)
                 {
-                    if (t.Id != 1 || !t.Alive) continue;
+                    if (!t.Alive) continue;
+                    // Wave-8b: revive any ExitThread'd game thread with a real Entry.
                     if (!t.Started && t.Entry is >= 0x00100000 and < 0x00300000)
                     {
                         try
                         {
+                            // Do not mark permanently dead — clear sticky Exit if assist-revived.
+                            t.Sleeping = false;
+                            t.WaitSemaId = 0;
                             kk.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0,
                                 fromSyscall: false);
                         }
@@ -3709,90 +3619,6 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[GOW] post-type2 stream kick n={_type2PostStreamKicks} " +
                 $"cdvd={sys.Cdvd.SectorsRead} pc=0x{pc:X8} cyc={c}");
-    }
-
-    /// <summary>
-    /// Wave-8: after host R_SHELL/TIT1 land, plant stream-table pointers the type-2
-    /// follow-up and LoadWad path observe. Does not invent GIF packets — only EE state
-    /// so the natural decode/draw path can issue PATH3.
-    /// </summary>
-    private void TrySeedLoadWadBind(Ps2System sys, ulong c)
-    {
-        if (_loadWadSeeded) return;
-        _loadWadSeeded = true;
-
-        // Confirm Fedo magic at R_SHELL host buffer (0x4665646F LE "Fedo").
-        uint fedo = sys.Memory.Read32(0x01E00000u);
-        bool shellOk = fedo == 0x4665646Fu;
-        uint tit0 = sys.Memory.Read32(0x01D00000u);
-
-        // Publish host buffers into stream table slots (base 0x32C9C8 + i*2200).
-        // Disasm 0x27E014..0x27E038 writes handles at +0x800/+0x804 and cursor +0x890.
-        for (uint i = 0; i < 4; i++)
-        {
-            uint baseOff = 0x0032C9C8u + i * 2200u;
-            sys.Memory.Write32(baseOff + 0x888u, 0u);
-            sys.Memory.Write32(baseOff + 0x88Cu, 1u);
-            sys.Memory.Write32(baseOff + 0x890u, 0u);
-            // Point payload handles at host-loaded members when valid.
-            if (shellOk)
-            {
-                sys.Memory.Write32(baseOff + 0x800u, 0x01E00000u);
-                sys.Memory.Write32(baseOff + 0x804u, 0x000BAA95u); // TOC size for R_SHELL
-            }
-            if (tit0 != 0)
-            {
-                sys.Memory.Write32(baseOff + 0x808u, 0x01D00000u);
-                sys.Memory.Write32(baseOff + 0x80Cu, 0x00043E8Au); // first TOC size TIT1
-            }
-        }
-
-        // Plant R_Shell name near a scratch so strcmp/LoadWad path can see it.
-        // Retail string at 0x2B5A28 is "R_Shell"; TOC uses "R_SHELL.WAD".
-        uint nameScratch = 0x01CFF000u;
-        WriteAsciiZ(sys, nameScratch, "R_SHELL.WAD");
-        WriteAsciiZ(sys, nameScratch + 0x20u, "TIT1E1_2.VPK");
-        WriteAsciiZ(sys, nameScratch + 0x40u, "R_Shell");
-
-        // TOC host buffer already at 0x01F00000 — plant a common pointer cell if null.
-        // Live load path uses *0x2ACAC8 as logger/context; do not stomp if already set.
-        uint ctx = sys.Memory.Read32(0x002ACAC8);
-        if (ctx == 0 || (ctx & 0x1FFFFFFFu) >= (uint)SystemMemory.RDRAM_SIZE)
-            sys.Memory.Write32(0x002ACAC8, 0x01F00000u); // point at host TOC
-
-        // Stream-ready: clear 989snd pending wait so 0x26C0E0 leaves.
-        sys.Memory.Write32(0x002A1338, 0);
-        sys.Memory.Write32(0x0029C7D0, 0);
-        // Flip/kick enable (0x140A00 stores 1 here before Flip And Kick Lock).
-        sys.Memory.Write32(0x002AC7D0, 1u);
-
-        // Minimal stream slot so 0x26C0EC double-deref is non-null (points at host shell).
-        // Layout: *0x2A1378 = index; table[index] at 0x2A1358+index*4 → obj; *obj = payload.
-        uint streamObj = 0x01CFE000u;
-        for (uint o = 0; o < 0x40; o += 4)
-            sys.Memory.Write32(streamObj + o, 0);
-        sys.Memory.Write32(streamObj + 0, 0x01E00000u); // payload → R_SHELL host buffer
-        sys.Memory.Write32(streamObj + 4, 0x000BAA95u);
-        sys.Memory.Write32(streamObj + 8, nameScratch);
-        sys.Memory.Write32(0x002A1358, streamObj); // table[0]
-        sys.Memory.Write32(0x002A1370, streamObj);
-        sys.Memory.Write32(0x002A1378, 0); // index 0
-        sys.Memory.Write32(0x002A137C, 0); // allow 0x26C4B8 path
-
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-            Console.Error.WriteLine(
-                $"[GOW] seed LoadWad bind shellOk={shellOk} fedo=0x{fedo:X8} " +
-                $"tit0=0x{tit0:X8} streamObj=0x{streamObj:X8} cyc={c}");
-    }
-
-    private static void WriteAsciiZ(Ps2System sys, uint dest, string s)
-    {
-        uint p = dest & 0x1FFFFFFFu;
-        if (p < 0x00100000u || p + (uint)s.Length + 1 >= (uint)SystemMemory.RDRAM_SIZE)
-            return;
-        for (int i = 0; i < s.Length; i++)
-            sys.Memory.Write8(p + (uint)i, (byte)s[i]);
-        sys.Memory.Write8(p + (uint)s.Length, 0);
     }
 
     /// <summary>

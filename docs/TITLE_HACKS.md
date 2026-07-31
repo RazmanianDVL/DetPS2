@@ -13,6 +13,6 @@ They should NOT be hand-edited into shared core files.
 | Mortal Kombat: Shaolin Monks (USA) | SLUS_210.87 | MidwayBootAssist — Wave-7: WAD body plant + type=2 arena-only + C1C0 force entered=1 + second-chrome Soft-GS PATH3 (FBB0-gated) + sel-idx; SearchFile gate; no type5/sm+0x28. | **mk-mainmenu MENU YES** gifP3=18 px=966k prims=9 | 2026-07-31 |
 | Burnout 3: Takedown (USA) | `SLUS_210.50` | `Burnout3Assist` + **`HandleLgDev`**; residual→STG; FRONTEND 4MiB plant; Soft-GS **merge composite** + DA XYZ; GIF `0x2198xx` ring leave; denser pad post-chrome | STG+TXD+FRONTEND cdvd=6584 **px=24407048** dispfbPx=2273160 **logo-frontend MENU YES** (wave-6) | 2026-07-31 |
 | Blood Omen 2 (USA) | `SLUS_200.24` | `BloodOmen2SnAssist` — WAVE-7 dual list-stub + ofx title FB; stream CODE/MAINMENU; FILEIO EOF-rewind; **no** fake warm sector credit | **MENU YES** title-surface Soft-GS px=286720 gifP2=106 stream=2.4MB cdvd=6512 | 2026-07-31 |
-| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — IOPRP `"3000"`; type-2 forced epi `0x27E234`; **wave-8** full Fedo R_SHELL host load + LoadWad bind seed; Path3MaskedByVif held | **cdvd=692**; Fedo OK; gifP2=1082 gifP3=0; **MENU NO** px=0 FRAME_1=0 | 2026-07-31 |
+| God of War (USA) | `SCUS_973.99` | `GodOfWarAssist` — type-2 FULL stream natural (w8b); PART1/TOC Fedo R_SHELL; classic StartThread PC+4 (Haven $ra plant broke GoW); Path3MaskedByVif held | cdvd=555–692; type2 natural; **px=0 gifP3=0 FRAME_1=0** shell decode residual | 2026-07-31 |
 
 Format: short description + link to issue/commit when available.
