@@ -520,40 +520,41 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             lockVal = 0;
         }
 
-        // Wave-2: after >=2 lock clears with VIF1/GIF idle, complete type-1 cmd.
-        // (Hit counter was reset by lock-clear so a second hits>=32 gate never fired.)
-        if (_displayCmdCompletes >= 64) return;
-        if (_displayLockEscapes < 2) return;
+        // Wave-2: after lock thrash with pending type-1 (0x88000501), credit VIF1/GIF
+        // CIS so the real DMA IRQ path @0x1B2588 can clear lock + advance head.
+        // Do NOT plant done-bit or advance head here — that caused Exit @0x80000200.
+        if (_displayCmdCompletes >= 32) return;
+        if (_displayLockEscapes < 1) return;
         if (sys.Dmac.IsActive(Dmac.Channel.VIF1) || sys.Dmac.IsActive(Dmac.Channel.GIF))
             return;
 
         uint cmd = sys.Memory.Read32(head);
         if ((cmd & DaDisplayCmdDoneBit) != 0) return;
         uint cmdType = cmd & 0xFF;
-        // Live: 0x88000501 / 0x00000501 type 1 = VIF1 chain; 0x80.. sibling ops after drain.
         if (cmdType != 1 && cmdType is not (0x80 or 0x81 or 0x82 or 0x83 or 0x8F or 0xFF))
             return;
 
-        sys.Memory.Write32(head, cmd | DaDisplayCmdDoneBit);
-        uint newHead = head + 8;
-        if (newHead <= tail)
-            sys.Memory.Write32(DaDisplayHead, newHead);
-        sys.Memory.Write32(DaDisplayLock, 0);
+        // Throttle credits: every 2 lock clears once DMA idle.
+        if ((_displayLockEscapes - _displayCmdCompletes) < 1) return;
+
         try
         {
-            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 1);
-            if (cmdType != 1)
-                sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 1);
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 2);
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 1);
         }
         catch { /* ignore */ }
 
+        // Ensure lock clear so process/IRQ handler can re-enter.
+        sys.Memory.Write32(DaDisplayLock, 0);
         _displayCmdCompletes++;
         _displayLockHits = 0;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _displayCmdCompletes <= 24)
+            && _displayCmdCompletes <= 16)
             Console.Error.WriteLine(
-                $"[MKFAM] DA display-cmd complete n={_displayCmdCompletes} " +
-                $"cmd=0x{cmd:X8} head=0x{head:X8}->0x{newHead:X8} tail=0x{tail:X8} " +
+                $"[MKFAM] DA display VIF1/GIF IRQ credit n={_displayCmdCompletes} " +
+                $"cmd=0x{cmd:X8} head=0x{head:X8} tail=0x{tail:X8} " +
                 $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
 
