@@ -104,6 +104,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _mflPathPlants;
     private int _postWaitKicks;
     private int _pathSrcRewrites;
+    private int _displayLockEscapes;
+    private int _displayLockHits;
+
+    // DA post-gameart display pump (live 2026-07-31 @20M):
+    // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
+    // Lock @ gp-25380 sticky=1 with pending queue + idle VIF1/GIF -> DI thrash @0x114Fxx.
+    private const uint DaGp = 0x00410D70;
+    private const uint DaDisplayLock = DaGp - 25380;   // 0x40AA4C
+    private const uint DaDisplayHead = DaGp - 25412;   // 0x40AA2C
+    private const uint DaDisplayTail = DaGp - 25416;   // 0x40AA28
+    private const uint DaDisplayLoopLo = 0x001B3960;
+    private const uint DaDisplayLoopHi = 0x001B3A10;
+    private const uint DaDiEiLo = 0x00114F20;
+    private const uint DaDiEiHi = 0x00114F80;
 
     // Dec post-0x127900 residual (live 200M+/280M host-present after exception plant):
     // main stays alive in 0x3B9E00 list helper (OUTSIDE shared freelist band 0x3BA948).
@@ -143,6 +157,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _mflPathPlants = 0;
         _postWaitKicks = 0;
         _pathSrcRewrites = 0;
+        _displayLockEscapes = 0;
+        _displayLockHits = 0;
         _openSendRetargetPlanted = false;
     }
 
@@ -192,6 +208,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryPlantDaOpenSendRetarget(sys);
             TryBridgeDaMflCallRpcArg(sys);
             TryKickDaPostWait(sys);
+            TryEscapeDaDisplayQueueLock(sys);
         }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
         // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
@@ -442,6 +459,52 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"[MKFAM] DA MFL path plant \"{DaGameartMemberPath}\" arg=0x{argBuf:X8} " +
                 $"send=0x{MflEeSendDa:X8} scratch=0x{DaMflPathScratch:X8} " +
                 $"n={_mflPathPlants} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// DA only: post-gameart display pump stuck with sticky lock @0x40AA4C while the
+    /// display command queue still has entries (head!=tail). Outer loop at 0x1B3960 then
+    /// only DI/EI (0x114Fxx) and never re-enters process@0x1B3BB0. Live 20M: lock=1,
+    /// head/tail RDRAM with 2 cmds, VIF1/GIF STR idle. Clear lock so process can run.
+    /// Gated on STFM stream + RDRAM queue ptrs. Does NOT advance head (that caused Exit).
+    /// </summary>
+    private void TryEscapeDaDisplayQueueLock(Ps2System sys)
+    {
+        if (sys.MasterCycles < 5_000_000) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+
+        uint pc = (uint)sys.EE.PC;
+        bool inLoop = pc is >= DaDisplayLoopLo and <= DaDisplayLoopHi;
+        bool inDiEi = pc is >= DaDiEiLo and <= DaDiEiHi;
+        if (!inLoop && !inDiEi)
+        {
+            _displayLockHits = 0;
+            return;
+        }
+
+        uint lockVal = sys.Memory.Read32(DaDisplayLock);
+        uint head = sys.Memory.Read32(DaDisplayHead);
+        uint tail = sys.Memory.Read32(DaDisplayTail);
+        if (lockVal == 0 || head == tail
+            || head < 0x00100000 || head >= 0x02000000
+            || tail < 0x00100000 || tail >= 0x02000000)
+        {
+            _displayLockHits = 0;
+            return;
+        }
+
+        _displayLockHits++;
+        if (_displayLockHits < 64) return;
+        if (_displayLockEscapes >= 32) return;
+
+        sys.Memory.Write32(DaDisplayLock, 0);
+        _displayLockEscapes++;
+        _displayLockHits = 0;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _displayLockEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA display-lock clear n={_displayLockEscapes} " +
+                $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

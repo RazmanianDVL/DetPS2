@@ -354,8 +354,11 @@ public sealed class EmotionEngine : ISchedulable
 
     /// <summary>
     /// Mirror INTC pending into COP0 Cause IP bits.
-    /// Status bit0 = IE, bit16 = EIE (simplified: either enables recognition).
+    /// Status bit0 = IE, bit16 = EIE — R5900 requires <b>both</b> (Play!
+    /// <c>INTERRUPTS_ENABLED_MASK = IE|EIE</c>; PCSX2 <c>EIE &amp;&amp; IE</c>).
     /// EXL (bit 1) and ERL (bit 2) block delivery.
+    /// Historical DetPS2 used IE||EIE which let interrupts fire after DI cleared only EIE,
+    /// trapping titles that busy-wait on EIE clear (DA <c>0x114F38</c> DI spin post-gameart).
     /// </summary>
     public void SyncInterruptsFromIntc()
     {
@@ -377,7 +380,8 @@ public sealed class EmotionEngine : ISchedulable
         else if (_cop0Compare == 0 || _cop0Count < _cop0Compare)
             COP0_Cause &= ~(1u << 15);
 
-        bool ie = (COP0_Status & 1) != 0 || (COP0_Status & (1u << 16)) != 0;
+        // Both IE and EIE required — DI (clear EIE) must fully mask IRQs.
+        bool ie = (COP0_Status & 1) != 0 && (COP0_Status & (1u << 16)) != 0;
         // EXL | ERL block delivery on real R5900. Our HLE also refuses nested
         // TryDispatchRegisteredIntcHandler while an outer frame is still live
         // (_savedGprAcrossIntcDispatch non-empty), even if software cleared EXL mid-handler
@@ -2768,14 +2772,27 @@ public sealed class EmotionEngine : ISchedulable
                 break;
             case 0x04: // MTC0
                 WriteCop0((int)rd, (uint)GetGpr(rt).Lo);
+                // Status.IE/EIE/IM/EXL/ERL changes must refresh InterruptPending immediately —
+                // the Step loop only re-syncs every 64 insns otherwise.
+                if ((int)rd == Cop0Status)
+                    SyncInterruptsFromIntc();
                 break;
             case 0x10: // CO
                 if (function == 0x18) // ERET
                     ExecuteEret();
                 else if (function == 0x38) // EI — set EIE (Status bit 16)
+                {
                     COP0_Status |= 1u << 16;
+                    SyncInterruptsFromIntc();
+                }
                 else if (function == 0x39) // DI — clear EIE (Status bit 16)
+                {
                     COP0_Status &= ~(1u << 16);
+                    // Immediate re-sync: without this InterruptPending stays latched true for
+                    // up to 63 insns and Step re-enters ISR before MFC0 EIE polls
+                    // (DA 0x114F38 DI spin). Play!/PCSX2 re-evaluate enable on every EI/DI.
+                    SyncInterruptsFromIntc();
+                }
                 break;
             default:
                 break;
