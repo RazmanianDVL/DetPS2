@@ -14,7 +14,23 @@ Faster commercial bring-up without blind 150M runs. Soft-GS metrics do **not** r
 | **`compare-scoreboard.ps1`** | Markdown delta of two scoreboard JSONs; flag regressions |
 | **`regression-matrix.ps1`** | Fixed SM + B3 + BO2 + GoW matrix via scoreboard; optional baseline gate |
 
-Policy: **`docs/AGENT_SOP.md`**. Play! map: **`docs/PLAY_HLE_ORACLE.md`**. Library: **`docs/LIBRARY_SAMPLING.md`**.
+Policy: **`docs/AGENT_SOP.md`**. Play! map: **`docs/PLAY_HLE_ORACLE.md`**. Library: **`docs/LIBRARY_SAMPLING.md`**.  
+**IRX-first plan:** **`docs/IRX_EXECUTION_PHASE_PLAN.md`** (epic #12).
+
+### Environment: literal IRX
+
+| Variable | Values | Meaning |
+|----------|--------|---------|
+| **`DETPS2_LITERAL_IRX`** | `1` (default target) / `0` | When **1**, boot path must **load and execute** real BIOS/disc IRX on IOP. When **0**, legacy HLE-first path for bisect only. |
+| `DETPS2_TRACE_IOP` | `1` | Sample IOP PC (module map when available). |
+| `DETPS2_SEMA_STALL_YIELD` | unset / OFF | Must stay off. |
+
+```powershell
+$env:DETPS2_LITERAL_IRX = "1"
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+```
+
+**Freeze:** no new GameQuirk thrash plants / multi-title HLE plant waves while #12 is active.
 
 ---
 
@@ -23,6 +39,7 @@ Policy: **`docs/AGENT_SOP.md`**. Play! map: **`docs/PLAY_HLE_ORACLE.md`**. Libra
 ```powershell
 # From repo root (detps2/)
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_LITERAL_IRX = "1"
 
 # Before inventing HLE:
 pwsh ./tools/play-lookup.ps1 -Serial SLUS_210.87 -Wall PAD
