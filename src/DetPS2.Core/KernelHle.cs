@@ -171,7 +171,7 @@ public sealed class KernelState
     /// <summary>Bump allocator for synthetic Vpl/Fpl pointer cookies (not real RDRAM).</summary>
     private uint _nextPoolCookie = 0x0E000000;
 
-    public bool WaitingVblank { get; private set; }
+    public bool WaitingVblank { get; set; } // nested end_function/alarm clear temporarily
     public ulong VblankWaits { get; private set; }
     public int ThreadCount => _threads.Count;
     public int CurrentThreadId => _currentTid;
