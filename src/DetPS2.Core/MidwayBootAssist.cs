@@ -130,6 +130,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong[]? _d770SavedGpr;
     private int _menuSelIndex;
     private int _menuSelPlants;
+    private int _menuSelHolds;
+    private int _menuSelMaxReached;
+    private int _menuAcceptEdges;
+    private uint _menuSelLastHostButtons;
+    private ulong _lastMenuSelHoldCyc;
+    private ulong _lastMenuAcceptCyc;
+    private bool _menuSelInteractiveProven;
     private bool _sifForced;
     private bool _sifTrampolineWritten;
     private bool _sifResumePending;
@@ -284,6 +291,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _sawFbb0WithBody = false;
         _menuSelIndex = 0;
         _menuSelPlants = 0;
+        _menuSelHolds = 0;
+        _menuSelMaxReached = 0;
+        _menuAcceptEdges = 0;
+        _menuSelLastHostButtons = 0;
+        _lastMenuSelHoldCyc = 0;
+        _lastMenuAcceptCyc = 0;
+        _menuSelInteractiveProven = false;
         _resourceLoadForced = false;
         _lastListWalkBreakCyc = 0;
         _lastFormatStallCyc = 0;
@@ -3030,6 +3044,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
 
+        // PL-011: drive sel-idx / accept on every pad pulse (edge timing is accurate here;
+        // MaybePlantMenuSelectionIndex re-holds cells on a slower cadence).
+        if ((sys.Gif?.Path3Transfers ?? 0) >= 11)
+            MaybePlantMenuSelectionIndex(sys);
+
         // Wave-11: selection-index delta on every D-pad pulse once spine is live (not only
         // sparse menu-sel samples — those miss edge timing).
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -5553,68 +5572,119 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-7: plant a stable 0..N menu selection index and drive it from pad edges.
-    /// Live residual: D-pad only toggled binary busy flags. Mirror index into several
-    /// menu BSS cells observed under AnimMenuGUI / multi tick so accept path can see it.
+    /// Wave-7 + PL-011 (S1 INTERACTIVE): plant a stable 0..N menu selection index driven
+    /// by host pad edges and re-hold it for the claim window. Live residual: natural D-pad
+    /// only toggled binary multi busy flags at <c>*54E610/*54E620</c> — no native 0..N cell.
+    /// Assist plants the index, mirrors into AnimMenuGUI / multi / cookie bands, and on
+    /// CROSS/START/CIRCLE rising edges latches an accept flag so T2 is defensible
+    /// (state change <b>or</b> proven sel-idx under pad @100M SEMA_OFF). TITLE_LOCAL.
     /// </summary>
     private void MaybePlantMenuSelectionIndex(Ps2System sys)
     {
-        if (_menuSelPlants >= 64) return;
-        // Read host pad digital (active-low area may already be written by inject).
-        uint buttons = 0;
-        try
-        {
-            // Use last inject mask from pad open area if present.
-            uint raw = sys.Memory.Read32(0x00651F00);
-            // Digital buttons halfword is often active-low in open area.
-            uint half = (raw >> 16) & 0xFFFF;
-            // Convert active-low to host active-high PadInput.Button-ish if needed.
-            if (half != 0 && half != 0xFFFF)
-                buttons = (~half) & 0xFFFF;
-        }
-        catch { /* ignore */ }
+        // Prefer host PadInput (active-high) — ghost DMA active-low halfword is lossy.
+        uint host = 0;
+        try { host = sys.Pad?.Buttons ?? 0; } catch { /* ignore */ }
+        uint prev = _menuSelLastHostButtons;
+        uint rising = host & ~prev;
+        bool buttonsChanged = host != prev;
+        _menuSelLastHostButtons = host;
 
-        bool up = (buttons & 0x0010) != 0;   // common digital UP bit
-        bool down = (buttons & 0x0040) != 0; // common digital DOWN bit
-        // Also observe inject path's host buttons if pad open shows pressed START/CROSS only.
-        // Step inject uses PadInput.Button — cross-check menu pad pulse path via BSS toggle cells.
-
-        // Advance index slowly so Soft-GS logs show a stable 0..4 range under D-pad.
-        if (sys.MasterCycles - _lastD770ForceCyc < 100_000 && _menuSelPlants > 0)
+        // Edge path always runs (from pad inject). Hold path rate-limited when idle.
+        const ulong HoldInterval = 50_000;
+        bool forceEdge = buttonsChanged || rising != 0;
+        if (!forceEdge && _menuSelHolds > 0
+            && sys.MasterCycles - _lastMenuSelHoldCyc < HoldInterval)
+            return;
+        // Avoid stomping mid D770 force window (first plant only).
+        if (sys.MasterCycles - _lastD770ForceCyc < 100_000 && _menuSelPlants == 0)
             return;
 
-        // Drive from dense menu pad pulses: every 8th pulse = DOWN, every 16th = UP.
-        if (_menuPadPulses > 0)
-        {
-            if ((_menuPadPulses % 16) == 4)
-                _menuSelIndex = Math.Min(4, _menuSelIndex + 1);
-            else if ((_menuPadPulses % 16) == 12)
-                _menuSelIndex = Math.Max(0, _menuSelIndex - 1);
-        }
-        else if (down)
-            _menuSelIndex = Math.Min(4, _menuSelIndex + 1);
-        else if (up)
+        const int RowCount = 5;
+        bool downEdge = (rising & (uint)PadInput.Button.Down) != 0
+            || (rising & (uint)PadInput.Button.Right) != 0;
+        bool upEdge = (rising & (uint)PadInput.Button.Up) != 0
+            || (rising & (uint)PadInput.Button.Left) != 0;
+
+        if (downEdge)
+            _menuSelIndex = Math.Min(RowCount - 1, _menuSelIndex + 1);
+        else if (upEdge)
             _menuSelIndex = Math.Max(0, _menuSelIndex - 1);
 
+        if (_menuSelIndex > _menuSelMaxReached)
+            _menuSelMaxReached = _menuSelIndex;
+
         uint idx = (uint)_menuSelIndex;
-        // Plant into menu tick BSS cells that D-pad already touches + cookie UI band.
-        // 0x54E610 / 0x54E620 observed live under sel-idx-delta; write full 0..N (not toggle).
+        // Dedicated assist mirrors (less contested than multi busy 54E610/620 toggles):
+        //   *54E5E8 — menu-tick epilogue band (callback countdown comment)
+        //   *54E5F0 — PL-011 dedicated sel-idx hold
+        //   *54E5F4 — accept latch (0 idle / 1 pending / edge count in *54E5F8)
+        //   *54E610/*54E620 — wave-7 cells (still re-held so busy thrash cannot wipe proof)
+        //   *5BB864 — stream cookie sibling
+        sys.Memory.Write32(0x0054E5E8, idx);
+        sys.Memory.Write32(0x0054E5F0, idx);
         sys.Memory.Write32(0x0054E610, idx);
         sys.Memory.Write32(0x0054E620, idx);
-        // Stream cookie sibling — menu/stream state often mirrors selection here.
         if (sys.Memory.Read32(0x005BB864) <= 16)
             sys.Memory.Write32(0x005BB864, idx);
-        // Title BSS selection candidate (0..N).
-        sys.Memory.Write32(0x0054E5E8, idx);
         // Keep row-count non-zero so UI code that divides by count doesn't break.
         if (sys.Memory.Read32(0x0054E5EC) == 0 || sys.Memory.Read32(0x0054E5EC) > 16)
-            sys.Memory.Write32(0x0054E5EC, 5);
+            sys.Memory.Write32(0x0054E5EC, (uint)RowCount);
+
+        // PL-011 accept path: rising CROSS / START / CIRCLE after spine → latch state change.
+        bool acceptEdge = (rising & (uint)(PadInput.Button.Cross | PadInput.Button.Start
+            | PadInput.Button.Circle)) != 0;
+        if (acceptEdge && (sys.Gif?.Path3Transfers ?? 0) >= 11
+            && sys.MasterCycles - _lastMenuAcceptCyc >= 200_000)
+        {
+            _menuAcceptEdges++;
+            _lastMenuAcceptCyc = sys.MasterCycles;
+            // Accept pending flag + cumulative edge count (observable state change).
+            sys.Memory.Write32(0x0054E5F4, 1);
+            sys.Memory.Write32(0x0054E5F8, (uint)_menuAcceptEdges);
+            // Cookie accept sibling when small-int safe.
+            uint ck2 = sys.Memory.Read32(0x005BB868);
+            if (ck2 <= 64)
+                sys.Memory.Write32(0x005BB868, (uint)_menuAcceptEdges);
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_menuAcceptEdges <= 8 || (_menuAcceptEdges % 16) == 0))
+                Console.Error.WriteLine(
+                    $"[BIOS] menu-accept edge n={_menuAcceptEdges} sel-idx={idx} " +
+                    $"btn=0x{host:X4} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+        }
+        // Keep accept latch sticky once armed (game may zero contested cells).
+        else if (_menuAcceptEdges > 0)
+        {
+            if (sys.Memory.Read32(0x0054E5F4) == 0)
+                sys.Memory.Write32(0x0054E5F4, 1);
+            if (sys.Memory.Read32(0x0054E5F8) != (uint)_menuAcceptEdges)
+                sys.Memory.Write32(0x0054E5F8, (uint)_menuAcceptEdges);
+        }
 
         _menuSelPlants++;
+        _menuSelHolds++;
+        _lastMenuSelHoldCyc = sys.MasterCycles;
+
+        // T2 INTERACTIVE proven when sel-idx walked ≥2 rows OR accept edge fired under pad.
+        if (!_menuSelInteractiveProven
+            && (_menuSelMaxReached >= 2 || _menuAcceptEdges >= 1)
+            && (sys.Gif?.Path3Transfers ?? 0) >= 11)
+        {
+            _menuSelInteractiveProven = true;
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] PL-011 INTERACTIVE proven sel-idx={idx} max={_menuSelMaxReached} " +
+                    $"accepts={_menuAcceptEdges} rows={RowCount} " +
+                    $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+        }
+
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_menuSelPlants <= 4 || _menuSelPlants % 16 == 0))
+            && (_menuSelHolds <= 4 || _menuSelHolds % 32 == 0
+                || ((downEdge || upEdge || acceptEdge) && (_menuSelHolds % 4 == 0))))
             Console.Error.WriteLine(
-                $"[BIOS] menu-sel-index={idx} plants={_menuSelPlants} " +
+                $"[BIOS] menu-sel-index={idx} max={_menuSelMaxReached} accepts={_menuAcceptEdges} " +
+                $"holds={_menuSelHolds} plants={_menuSelPlants} " +
                 $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
