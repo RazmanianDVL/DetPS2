@@ -89,6 +89,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _free2Escapes;
     private int _worldKickPulses;
     private int _padInjectPulses;
+    /// <summary>PL-016: last Soft-GS-gated pad inject cycle (densify after px&gt;0).</summary>
+    private ulong _lastPadInjectCyc;
+    /// <summary>PL-016: Soft-GS metrics / UI cells at first post-px pad (INTERACTIVE delta baseline).</summary>
+    private bool _padBaselineCaptured;
+    private long _padBaselinePrims;
+    private ulong _padBaselineGifP2;
+    private ulong _padBaselineGifP3;
+    private uint _padBaselineFlip;
+    private uint _padBaselineWorkerCmd;
+    private int _padStateDeltas;
+    private int _padSoftGsDeltas;
     private int _objDispatchEscapes;
     private int _listCmpEscapes;
     private int _linkSearchEscapes;
@@ -258,6 +269,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _free2Escapes = 0;
         _worldKickPulses = 0;
         _padInjectPulses = 0;
+        _lastPadInjectCyc = 0;
+        _padBaselineCaptured = false;
+        _padBaselinePrims = 0;
+        _padBaselineGifP2 = 0;
+        _padBaselineGifP3 = 0;
+        _padBaselineFlip = 0;
+        _padBaselineWorkerCmd = 0;
+        _padStateDeltas = 0;
+        _padSoftGsDeltas = 0;
         _objDispatchEscapes = 0;
         _listCmpEscapes = 0;
         _linkSearchEscapes = 0;
@@ -331,7 +351,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         PlantIopRpVersion(sys);
     }
 
-    public void OnHostPresent(Ps2System sys) => _ = sys;
+    public void OnHostPresent(Ps2System sys)
+    {
+        // PL-016: keep PADMAN dual-buffer STABLE while title Soft-GS is live so pad
+        // inject edges are visible to EE padRead between VBlank ticks.
+        if (sys.Gs.PixelsWritten <= 0) return;
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+    }
 
     /// <summary>
     /// Plant IOPRP 3.0.0 version tag the freeze-region constructor compares after GetVersion.
@@ -1144,10 +1171,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
 
         // After first CDVD, list-walk residual + sleeping workers leave px=0. Periodically
-        // re-escape empty/corrupt list walks, wake peers, and inject pad so world/UI path
-        // can reach a GS frame. Also freelist residual 0x2393xx (live w5).
+        // re-escape empty/corrupt list walks, wake peers so world/UI path can reach a GS frame.
+        // Also freelist residual 0x2393xx (live w5).
         if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0)
             MaybeKickWorldProgress(sys, pc, c);
+
+        // PL-016: pad AFTER Soft-GS px only — denser START/CROSS/D-pad + ForceRefreshPad.
+        // Soft-GS title surface is live from ~20M; do not wait for 40M world-kick.
+        if (c >= 15_000_000 && sys.Gs.PixelsWritten > 0)
+            MaybeInjectPadAfterSoftGs(sys, c);
 
         // Pre-CDVD freelist thrash at 0x23A9xx / 0x13DCxx: keep escaping so first CDVD lands.
         if (c >= 35_000_000 && sys.Cdvd.SectorsRead == 0 && pc is >= 0x0023A900 and <= 0x0023AA30)
@@ -3141,20 +3173,99 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     $"arms={_streamArmPulses} n={_worldKickPulses} cyc={c}");
         }
 
-        if (_padInjectPulses < 8192)
+        // PL-016: pad moved to MaybeInjectPadAfterSoftGs (gated on Soft-GS px>0).
+        // World-kick still runs list/stream escapes; pad no longer fires pre-px.
+    }
+
+    /// <summary>
+    /// PL-016 — INTERACTIVE pad after Soft-GS <c>px&gt;0</c>.
+    /// <list type="bullet">
+    /// <item>Never inject before Soft-GS paints (title surface must be live).</item>
+    /// <item>Dense START/CROSS/D-pad/Circle edges with release gaps for edge-triggered polls.</item>
+    /// <item><see cref="RealSifRpc.ForceRefreshPad"/> so PADMAN dual-buffer sees presses now.</item>
+    /// <item>Track Soft-GS + UI-cell deltas after first post-px pad for P1 claim evidence.</item>
+    /// </list>
+    /// No invent PATH3 / no ofx expand / no global WaitSema.
+    /// </summary>
+    private void MaybeInjectPadAfterSoftGs(Ps2System sys, ulong c)
+    {
+        if (sys.Gs.PixelsWritten <= 0) return;
+        if (_padInjectPulses >= 8192) return;
+        // Dense after Soft-GS: ~50k cycle edges so menu/title polls see press/release pairs.
+        if (_lastPadInjectCyc != 0 && c - _lastPadInjectCyc < 50_000UL) return;
+        _lastPadInjectCyc = c;
+        _padInjectPulses++;
+
+        // Capture baseline on first post-px pulse for INTERACTIVE delta proof.
+        if (!_padBaselineCaptured)
         {
-            _padInjectPulses++;
-            int phase = _padInjectPulses % 5;
-            uint buttons = phase switch
+            _padBaselinePrims = sys.Gs.PrimitivesDrawn;
+            _padBaselineGifP2 = sys.Gif?.Path2Transfers ?? 0;
+            _padBaselineGifP3 = sys.Gif?.Path3Transfers ?? 0;
+            try
             {
-                0 or 1 => (uint)PadInput.Button.Start,
-                2 or 3 => (uint)PadInput.Button.Cross,
-                _ => 0u
-            };
-            if (_padInjectPulses % 13 == 0)
-                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
-            try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+                _padBaselineFlip = sys.Memory.Read32(0x002AC7D0u);
+                _padBaselineWorkerCmd = sys.Memory.Read32(WorkerCmdTypePtr);
+            }
+            catch { /* ignore */ }
+            _padBaselineCaptured = true;
         }
+        else if (_padInjectPulses > 4)
+        {
+            long prims = sys.Gs.PrimitivesDrawn;
+            ulong gifP2 = sys.Gif?.Path2Transfers ?? 0;
+            ulong gifP3 = sys.Gif?.Path3Transfers ?? 0;
+            if (prims != _padBaselinePrims || gifP2 != _padBaselineGifP2 || gifP3 != _padBaselineGifP3)
+            {
+                _padSoftGsDeltas++;
+                _padBaselinePrims = prims;
+                _padBaselineGifP2 = gifP2;
+                _padBaselineGifP3 = gifP3;
+            }
+            try
+            {
+                uint flip = sys.Memory.Read32(0x002AC7D0u);
+                uint cmd = sys.Memory.Read32(WorkerCmdTypePtr);
+                if (flip != _padBaselineFlip || cmd != _padBaselineWorkerCmd)
+                {
+                    _padStateDeltas++;
+                    _padBaselineFlip = flip;
+                    _padBaselineWorkerCmd = cmd;
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        int phase = _padInjectPulses % 12;
+        uint buttons = phase switch
+        {
+            0 or 1 => (uint)PadInput.Button.Start,
+            2 or 3 => (uint)PadInput.Button.Cross,
+            4 => (uint)PadInput.Button.Down,
+            5 => (uint)PadInput.Button.Up,
+            6 => (uint)PadInput.Button.Circle,
+            7 or 8 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+            9 => (uint)PadInput.Button.Left,
+            10 => (uint)PadInput.Button.Right,
+            _ => 0u, // brief release so edge-triggered readers see press/release
+        };
+        try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+
+        // Push buttons into PADMAN DMA immediately (not only next PCRTC VBlank).
+        try
+        {
+            var rpc = sys.Hle?.Sony?.RealRpc;
+            rpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_padInjectPulses <= 8 || _padInjectPulses % 64 == 0))
+                Console.Error.WriteLine(
+                    $"[GOW] PL-016 pad-after-px n={_padInjectPulses} btn=0x{buttons:X4} " +
+                    $"open={rpc?.OpenPadCount ?? -1} ghost={rpc?.GhostPadCount ?? -1} " +
+                    $"px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
+                    $"gifP2={sys.Gif?.Path2Transfers ?? 0} softGsΔ={_padSoftGsDeltas} " +
+                    $"stateΔ={_padStateDeltas} cyc={c}");
+        }
+        catch { /* ignore */ }
     }
 
     /// <summary>
