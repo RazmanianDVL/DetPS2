@@ -1539,6 +1539,19 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-7: resume forced D770 before other thrash escapes can steal PC.
         if (_d770ForceResumePending)
             MaybeResumeAfterForcedD770(sys);
+        // PL-031: if EE is spinning on assist trampoline with no force pending, re-home
+        // (jr ra after force can land here after resume cleared pending → permanent hang).
+        if (!_resourceBindResumePending && !_d770ForceResumePending
+            && (uint)(sys.EE.PC & 0x1FFFFFFFUL) == ResourceBindReturnTrampoline
+            && c >= 70_000_000)
+        {
+            sys.EE.PC = 0x0043FAE8UL;
+            sys.LastGoodEePc = 0x0043FAE8UL;
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (ra == ResourceBindReturnTrampoline || ra < 0x00100000)
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x0043FAE8UL });
+            Assists++;
+        }
         // Wave-7: after slot+type2 body live, force FUN_0044D770 so type-2 jump table
         // (44D860→44DA10/44DAC0) runs with real WAD body — FBB0 alone early-outs on skeleton.
         if (c >= 72_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending
@@ -1551,10 +1564,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && !_resourceBindResumePending && !_d770ForceResumePending
             && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 16)
             MaybeForceStreamTick(sys);
-        // Wave-7: when natural FBB0/D770 walks live type-2+WAD body, submit second-chrome
-        // PATH3 through real GIF→Soft-GS (WAD-backed sprite list in scratch).
-        if (c >= 72_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
-            && _c1c0Entered && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 20)
+        // Wave-7 + PL-031: gap-fill second-chrome PATH3 only after D770 natural attempt
+        // and while Soft-GS floor still missing (see MaybeSubmitSecondChromePath3).
+        if (c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
+            && _c1c0Entered && _d770ForceCount >= 1
+            && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 20)
             MaybeSubmitSecondChromePath3(sys);
         // Wave-7: stable menu selection index driven by D-pad (0..N rows).
         if (c >= 60_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending
@@ -4919,8 +4933,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         mem.Write32(obj + 0x44, 1);
         // Type 2 (not 5): jump table 0x5AD538→44D860 does real work (44DA10/44DAC0).
         // Type 1 is a near-nop adjust; type 5 early-outs the 1..4 range check.
+        // PL-031: subtype 4 (not 2) — 44D950 subtype2 only state-returns; 4/6 → 44DE00/44ED40.
         mem.Write32(obj + 0x48, 2);
-        mem.Write32(obj + 0x4C, 2); // subtype for 44D920/44D950
+        mem.Write32(obj + 0x4C, 4);
         mem.Write32(obj + 0x50, 0);
         mem.Write32(obj + 0x54, 0);
         mem.Write32(obj + 0x58, 0);
@@ -4961,9 +4976,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         uint ty = mem.Read32(obj + 0x48);
         if (ty == 0 || ty == 1 || ty > 4)
             mem.Write32(obj + 0x48, 2);
+        // PL-031: prefer subtype 4 (44DE00→44ED40 arm). Preserve 3/4/6 if natural advanced.
         uint sub = mem.Read32(obj + 0x4C);
-        if (sub == 0 || sub > 6)
-            mem.Write32(obj + 0x4C, 2);
+        if (sub == 0 || sub == 2 || sub > 6)
+            mem.Write32(obj + 0x4C, 4);
         // Dimensions for draw helpers.
         if (mem.Read32(obj + 0x08) == 0)
             mem.Write32(obj + 0x08, ResourceLevel0Width);
@@ -4979,9 +4995,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-7: plant type-2 draw body into the descriptor arena so D770→44D860→44DA10/44DAC0
-    /// has non-skeleton fields. Loads real GAMEDATA.WAD (PWF) head via CRI/ISO into a payload
-    /// buffer and wires method tables for groups 0..15. TITLE_LOCAL — not type5.
+    /// Wave-7 + PL-031: plant type-2 draw body into the descriptor arena so
+    /// D770→44D860→44DA10/44DAC0/44DE00 has non-skeleton fields. Loads real GAMEDATA.WAD
+    /// (PWF) head via CRI/ISO into a payload buffer and wires method tables for groups 0..15.
+    /// <para>
+    /// PL-031 diagnosis (ELF ground truth): type2 worker <c>FUN_0044D950</c> with
+    /// <c>*obj+0x4C==2</c> only runs presence probes then returns state=2 — never
+    /// <c>44DE00→44ED40</c>. Subtype 4/6 is the texture/state-advance arm. No GIF/DMAC
+    /// MMIO lives in <c>0x44D000..0x452000</c>; PATH3 submit is elsewhere. TITLE_LOCAL — not type5.
+    /// </para>
     /// </summary>
     private void PlantResourceDrawBody(SystemMemory mem, uint obj)
     {
@@ -5009,8 +5031,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
 
         // 4505E0(obj, idx): return *(obj + idx*4 + 0xA0C). 44DA10 probes idx 5/6/7;
-        // 44DC20 probes idx 0x19. Non-zero = "slot present".
-        foreach (uint idx in new uint[] { 1, 2, 5, 6, 7, 0x0F, 0x19 })
+        // 44DC20 / 44E430 probe 0x19; 44DF18 probes 0x43. Non-zero = "slot present".
+        foreach (uint idx in new uint[] { 1, 2, 5, 6, 7, 0x0F, 0x19, 0x43, 0x48 })
             mem.Write32(obj + 0xA0C + idx * 4, 1);
 
         // 44DAF0 / 44DB98 walk &obj+0xA0C as a mini-struct: +0x14/+0x18 state words,
@@ -5019,6 +5041,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         mem.Write32(obj + 0xA0C + 0x18, 1);
         mem.Write32(obj + 0xA0C + 0x38, 1);
         mem.Write32(obj + 0xA0C + 0x3C, 2);
+        // 44DE00 gate: *(obj+0xA0C+0xB4) must be > *(obj+0xD30+0x2CC) (=obj+0xFFC).
+        mem.Write32(obj + 0xA0C + 0xB4, 0x100);
+        // 44DE00: *(obj+0xD30+0x2B0)==0 and *(obj+0xD30+0x2CC) < threshold.
+        mem.Write32(obj + 0xFE0, 0);
+        mem.Write32(obj + 0xFFC, 0);
+        // Side band used by 44DE00 as obj+0xD30 (a1 after ready check).
+        mem.Write32(obj + 0xD30 + 0x2B0, 0);
+        mem.Write32(obj + 0xD30 + 0x2CC, 0);
 
         // Nested sub-object for 442C18 path (vtable at *(*(nested+4)+0x24)).
         // Minimal: nested+0 → self, nested+4 → vtable stub block that jr-ra returns 1.
@@ -5040,6 +5070,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         mem.Write32(obj + 0x28, payloadBase);
         mem.Write32(obj + 0x2C, ResourceLevel0Width);
         mem.Write32(obj + 0x30, ResourceLevel0Height);
+        // PL-031: subtype=4 so type2 worker takes 44DE00→44ED40 (not state-only subtype2).
+        // *obj+0x4C is the subtype word D770 loads into s0 before the type jump.
+        if (mem.Read32(obj + 0x4C) == 0 || mem.Read32(obj + 0x4C) == 2)
+            mem.Write32(obj + 0x4C, 4);
+        // obj+0x950 band used by type==4 residual checks (44E4F8 / 44DE68).
+        if (mem.Read32(obj + 0x950 + 0x20) == 0)
+            mem.Write32(obj + 0x950 + 0x20, 0);
+        if (mem.Read32(obj + 0x950 + 0x24) == 0)
+            mem.Write32(obj + 0x950 + 0x24, 1);
 
         // 452678 / 4526E0: group g → *(obj + g*0x44 + 0x1F3C) method table,
         // *(obj + g*0x44 + 0x1F30) sibling field. Plant all groups 0..15.
@@ -5077,6 +5116,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                         mem.Write32(payloadBase + (uint)i, w);
                     }
                     // Tag payload header so consumers see live size.
+                    // 44E4F8 treats *obj+0x50==1 as "already bound" — keep pointer (not 1).
                     if (got >= 16)
                     {
                         mem.Write32(obj + 0x50, payloadBase);
@@ -5085,7 +5125,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                         Console.Error.WriteLine(
                             $"[BIOS] plant resource WAD body obj=0x{obj:X8} payload=0x{payloadBase:X8} " +
-                            $"bytes={got} magic=0x{mem.Read32(payloadBase):X8}");
+                            $"bytes={got} magic=0x{mem.Read32(payloadBase):X8} sub={mem.Read32(obj + 0x4C)}");
                 }
             }
             catch
@@ -5094,11 +5134,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             }
         }
 
-        // Synthetic PS2 GIF PATH3 packet chain in payload tail when WAD missing/short —
-        // real DMA only if game submits it; structure keeps type-2 from pure early-out.
+        // Payload-tail GIF words: structure only — game must DMA; assist does not invent
+        // new PATH3 submits from this buffer (PL-031 / invent freeze).
         uint gifScratch = payloadBase + ResourceBodyPayloadSize - 0x100;
-        // GIF tag: NLOOP=1, EOP=1, PRE=0, PRIM=SPRITE, FLG=PACKED, NREG=1, REGS=RGBAQ
-        // Minimal packed sprite-ish words — Soft-GS may reject; primary path is WAD body.
         mem.Write32(gifScratch + 0x00, 0x00008001); // NLOOP=1 EOP
         mem.Write32(gifScratch + 0x04, 0x10000000); // FLG/NREG
         mem.Write32(gifScratch + 0x08, 0x00000001); // REGS
@@ -5228,8 +5266,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // D7C8 clears +0x44 on entry; restore so type path can run again.
         sys.Memory.Write32(obj + 0x44, 1);
         // Wave-7: always type=2 (upgrade lingering type1 from wave-6 PatchAb88).
+        // PL-031: do not clobber subtype if natural advanced to 3/4/6.
         sys.Memory.Write32(obj + 0x48, 2);
-        sys.Memory.Write32(obj + 0x4C, 2);
+        uint resealSub = sys.Memory.Read32(obj + 0x4C);
+        if (resealSub == 0 || resealSub == 2 || resealSub > 6)
+            sys.Memory.Write32(obj + 0x4C, 4);
         sys.Memory.Write32(Slot + 0x3C, obj);
         sys.Memory.Write32(Slot, 1);
         sys.Memory.Write32(Slot + 0x38, 1);
@@ -5302,7 +5343,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         EnrichResourceObjectForBind(sys.Memory, obj);
         sys.Memory.Write32(obj + 0x44, 1);
         sys.Memory.Write32(obj + 0x48, 2);
-        sys.Memory.Write32(obj + 0x4C, 2);
+        // PL-031: subtype 4 for 44DE00 arm (preserve 3/4/6 if already advanced).
+        uint forceSub = sys.Memory.Read32(obj + 0x4C);
+        if (forceSub == 0 || forceSub == 2 || forceSub > 6)
+            sys.Memory.Write32(obj + 0x4C, 4);
         sys.Memory.Write32(Slot + 0x3C, obj);
         sys.Memory.Write32(Slot + 0x60, 0);
         sys.Memory.Write32(Slot, 1);
@@ -5314,10 +5358,18 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             _resourceBindTrampolineWritten = true;
         }
 
-        _d770SavedPc = sys.EE.PC;
+        // PL-031: never save assist trampoline as resume PC (infinite b -1).
+        ulong savePc = sys.EE.PC;
+        if (((uint)(savePc & 0x1FFFFFFFUL)) == ResourceBindReturnTrampoline)
+            savePc = 0x0043FAE8UL;
+        _d770SavedPc = savePc;
         _d770SavedGpr = new ulong[32];
         for (int i = 0; i < 32; i++)
             _d770SavedGpr[i] = sys.EE.GetGpr(i).Lo;
+        // Sanitize saved $ra so resume never re-arms trampoline via jr ra.
+        if (((uint)(_d770SavedGpr[31] & 0x1FFFFFFFUL)) == ResourceBindReturnTrampoline
+            || ((uint)(_d770SavedGpr[31] & 0x1FFFFFFFUL)) < 0x00100000)
+            _d770SavedGpr[31] = 0x0043FAE8UL;
 
         for (int i = 4; i <= 11; i++)
             sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -5336,8 +5388,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[BIOS] force D770 a0=0x{obj:X8} ty={sys.Memory.Read32(obj + 0x48):X} " +
-                $"body={(_resourceBodyPlanted ? 1 : 0)} n={_d770ForceCount} " +
-                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+                $"sub={sys.Memory.Read32(obj + 0x4C):X} body={(_resourceBodyPlanted ? 1 : 0)} " +
+                $"n={_d770ForceCount} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
     }
 
     private void MaybeResumeAfterForcedD770(Ps2System sys)
@@ -5345,8 +5397,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (!_d770ForceResumePending) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         bool onTramp = pc == ResourceBindReturnTrampoline;
-        // Short budget — D770 early-outs in ~50k when body incomplete; long thrash poisons PC.
-        bool timedOut = sys.MasterCycles > _lastD770ForceCyc + 400_000;
+        // PL-031: longer budget when body planted so 44DE00/44ED40 can finish;
+        // still short enough to avoid data-as-code thrash (wave-7b residual).
+        ulong d770Budget = _resourceBodyPlanted ? 800_000UL : 400_000UL;
+        bool timedOut = sys.MasterCycles > _lastD770ForceCyc + d770Budget;
         bool badPc = pc < 0x00100000
             || pc >= (uint)SystemMemory.RDRAM_SIZE
             || (pc >= 0x00500000 && pc < 0x00780000) // BSS / stream manager data
@@ -5374,6 +5428,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         {
             sys.Memory.Write32(obj + 0x44, 1);
             sys.Memory.Write32(obj + 0x48, 2);
+            // PL-031: preserve subtype 3/4/6 if natural advanced; else keep subtype-4 arm.
+            uint sub = sys.Memory.Read32(obj + 0x4C);
+            if (sub == 0 || sub == 2 || sub > 6)
+                sys.Memory.Write32(obj + 0x4C, 4);
             sys.Memory.Write32(0x0055E25C + 0x3C, obj);
             sys.Memory.Write32(0x0055E25C + 0x60, 0);
             sys.Memory.Write32(0x0055E25C, 1);
@@ -5381,16 +5439,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         // Wave-7b: NEVER restore thrash/data PC (live: 0x55E1F0 stream-manager). Always
         // land on known-good stream body / ADX pump.
+        // PL-031: never restore PC/ra to assist trampoline (infinite b -1) — that stuck
+        // claim PC at 0x01FE0030 for ~28M after longer subtype-4 D770 budgets.
         uint resume = 0x0043FAE8u; // FAE8 stream work
         uint saved = (uint)(_d770SavedPc & 0x1FFFFFFFUL);
-        if (saved is (>= 0x00414000 and <= 0x00416000)
+        if (saved != ResourceBindReturnTrampoline
+            && saved is (>= 0x00414000 and <= 0x00416000)
             or (>= 0x00427000 and <= 0x00428000)
             or (>= 0x0043FAE0 and <= 0x0043FD00)
-            or (>= 0x00427500 and <= 0x00427700))
+            or (>= 0x00427500 and <= 0x00427700)
+            or (>= 0x00421000 and <= 0x00423000))
             resume = saved;
 
         sys.EE.PC = resume;
         sys.LastGoodEePc = resume;
+        // Ensure $ra is not the assist trampoline (restored GPR may still point there).
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        if (ra == ResourceBindReturnTrampoline || ra < 0x00100000
+            || ra >= (uint)SystemMemory.RDRAM_SIZE)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
         _d770ForceResumePending = false;
         _d770SavedGpr = null;
         Assists++;
@@ -5407,15 +5474,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private bool _sawFbb0WithBody;
 
     /// <summary>
-    /// Wave-7: after C1C0 + type-2 WAD body + natural FBB0/D770 visit, submit a second-chrome
-    /// GIF PATH3 transfer through the real GIF→Soft-GS path. Packet lives in HLE scratch and
-    /// is a packed SPRITE list tinted from the planted PWF/WAD head (not host overlay).
-    /// Only fires once the game is in FBB0/D770/FAE8 with live arena object. TITLE_LOCAL.
+    /// Wave-7 + PL-031: gap-fill second-chrome GIF PATH3 through real GIF→Soft-GS.
+    /// <para>
+    /// PL-031 demotion: only after at least one natural D770 force (subtype-4 bind arm),
+    /// only while Soft-GS floor still missing (gifP3&lt;18 or prims&lt;9), early-stop when
+    /// floor held, first kick delayed so FAE8/D770 get a natural window. Cap remains 4
+    /// only as gap-fill residual — prefer fewer when natural advances. TITLE_LOCAL.
+    /// </para>
     /// </summary>
     private void MaybeSubmitSecondChromePath3(Ps2System sys)
     {
+        // PL-031: cap 4 as residual gap-fill only; early-stop when MENU floor held.
         if (_secondChromePath3Kicks >= 4) return;
         if (sys.Gif == null) return;
+        // Require one natural D770 force attempt so bind path runs before assist PATH3.
+        if (_d770ForceCount < 1) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         bool inDraw = pc is (>= 0x0043FBB0 and <= 0x0043FD00)
@@ -5432,7 +5505,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (sys.Memory.Read32(obj + 0x48) != 2) return;
         if (sys.Memory.Read32(Slot) != 1) return;
 
-        if (sys.MasterCycles - _lastSecondChromePath3Cyc < 2_500_000) return;
+        // Gap-fill only: stop once Soft-GS MENU floor is held without more assist kicks.
+        ulong gifP3 = sys.Gif.Path3Transfers;
+        long prims = sys.Gs.PrimitivesDrawn;
+        if (gifP3 >= 18 && prims >= 9) return;
+        if (gifP3 >= 18 && prims >= 6 && _secondChromePath3Kicks >= 2) return;
+
+        // Longer cadence + first-kick delay so natural subtype-4 D770 can contribute.
+        ulong minGap = _secondChromePath3Kicks == 0 ? 4_000_000UL : 3_000_000UL;
+        if (sys.MasterCycles - _lastSecondChromePath3Cyc < minGap
+            && _lastSecondChromePath3Cyc != 0) return;
+        if (_secondChromePath3Kicks == 0
+            && sys.MasterCycles - _lastD770ForceCyc < 1_500_000) return;
+
+        if (_secondChromePath3Kicks == 0 && Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] PL-031 second-chrome gap-fill start natural gifP3={gifP3} prims={prims} " +
+                $"sub={sys.Memory.Read32(obj + 0x4C)} d770n={_d770ForceCount} cyc={sys.MasterCycles}");
 
         // Build packed SPRITE GIF chain in scratch (above BFC0 out-buf).
         const uint GifPkt = 0x01FE0400;
@@ -5482,7 +5571,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (sys.Gif.PacketInFlight)
             sys.Gif.AbortIncompletePacket("sm-second-chrome");
         sys.Gif.ReceivePath3Data(GifPkt, 4);
-        // Second kick: slightly different rect for multi-chrome feel.
+        // Second rect only on later gap-fill rounds (same shape as wave-7; no new invent).
         if (_secondChromePath3Kicks >= 1)
         {
             sys.Memory.Write32(GifPkt + 0x20, 0x18000800);
@@ -5497,7 +5586,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[BIOS] second-chrome PATH3 kick n={_secondChromePath3Kicks} " +
+                $"[BIOS] second-chrome PATH3 gap-fill n={_secondChromePath3Kicks} " +
                 $"obj=0x{obj:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} prims={sys.Gs.PrimitivesDrawn} " +
                 $"px={sys.Gs.PixelsWritten} pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
@@ -5552,6 +5641,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _d770SavedGpr = new ulong[32];
         for (int i = 0; i < 32; i++)
             _d770SavedGpr[i] = sys.EE.GetGpr(i).Lo;
+        // PL-031: sanitize ra so stream-tick resume cannot re-arm assist trampoline.
+        if (((uint)(_d770SavedGpr[31] & 0x1FFFFFFFUL)) == ResourceBindReturnTrampoline
+            || ((uint)(_d770SavedGpr[31] & 0x1FFFFFFFUL)) < 0x00100000)
+            _d770SavedGpr[31] = 0x00427678UL;
 
         for (int i = 4; i <= 11; i++)
             sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -5697,9 +5790,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         uint obj = (ResourceArenaBase + 31u) & ~31u;
         // Pre-enrich so success-tail consumers see type/method contract immediately.
         // Wave-7: type=2 (not type1) so D770 jump table takes 44D860 draw path.
+        // PL-031: subtype 4 for 44DE00→44ED40 arm.
         mem.Write32(obj + 0x44, 1);
         mem.Write32(obj + 0x48, 2);
-        mem.Write32(obj + 0x4C, 2);
+        mem.Write32(obj + 0x4C, 4);
         mem.Write32(obj + 0x08, ResourceLevel0Width);
         mem.Write32(obj + 0x0C, ResourceLevel0Height);
         EnrichResourceObjectForBind(mem, obj);
@@ -5749,7 +5843,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         {
             sys.Memory.Write32(obj + 0x44, 1);
             sys.Memory.Write32(obj + 0x48, 2);
-            sys.Memory.Write32(obj + 0x4C, 2);
+            sys.Memory.Write32(obj + 0x4C, 4); // PL-031 subtype-4 arm
             sys.Memory.Write32(obj + 0x08, ResourceLevel0Width);
             sys.Memory.Write32(obj + 0x0C, ResourceLevel0Height);
         }
@@ -5904,11 +5998,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (_resourceBindPhase == 1 || lost)
             RestoreAb88Patch(sys.Memory);
 
-        sys.EE.PC = _resourceBindSavedPc;
+        // PL-031: never resume onto assist trampoline (b -1 stick).
+        ulong resumePc = _resourceBindSavedPc;
+        if (((uint)(resumePc & 0x1FFFFFFFUL)) == ResourceBindReturnTrampoline
+            || ((uint)(resumePc & 0x1FFFFFFFUL)) < 0x00100000)
+            resumePc = 0x0043FAE8UL;
+        sys.EE.PC = resumePc;
         if (_resourceBindSavedGpr != null)
+        {
             for (int i = 1; i < 32; i++)
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _resourceBindSavedGpr[i] });
-        sys.LastGoodEePc = _resourceBindSavedPc;
+            uint ra = (uint)(_resourceBindSavedGpr[31] & 0x1FFFFFFFUL);
+            if (ra == ResourceBindReturnTrampoline || ra < 0x00100000)
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resumePc });
+        }
+        sys.LastGoodEePc = resumePc;
         _resourceBindResumePending = false;
         _resourceBindForceStartCyc = 0;
 
