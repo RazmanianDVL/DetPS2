@@ -806,38 +806,82 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Post-LGDEV poll @0x2AF80C: while(*(gp-23104)==0 && s0<600) SleepThread.
-        // Plant the producer flag + wake pure SleepThread — do NOT snap PC to epi without a
-        // valid frame (that returned garbage \ and blocked STG; tip saw cdvd plant-only 609).
+        // Success: flag!=0 && s0!=600 → 0x2AF914 v0=1 → epi 0x2AF984.
+        // Fail timeout: 0x2AF91C/0x2AF920 — never soft-leave there.
         bool irxOnly = sys.Cdvd.SectorsRead is >= 400 and < 600;
         bool postTxd = sys.Cdvd.SectorsRead >= 2000;
         if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && (irxOnly || postTxd))
         {
-            uint gpW = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
-            if (gpW is < 0x00400000 or >= 0x01000000) gpW = 0x004E8670;
-            uint f23104 = unchecked((uint)((int)gpW - 23104));
-            if (f23104 is >= 0x00400000 and < 0x01000000)
-                sys.Memory.Write32(f23104, 1);
-            sys.Memory.Write32(BootWaitFlagDefault, 1);
-
             uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            // Only soft-return WaitSema when \ is the post-LGDEV continue (natural ABI).
-            if (irxOnly && pcW is >= 0x0010BE60 and <= 0x0010BE70
-                && raW is >= 0x002AF860 and <= 0x002AF870)
+            const uint postLgDevSuccess = 0x002AF914u;
+            bool raInPostLgDev = raW is >= 0x002AF800 and <= 0x002AF994;
+            bool pcInPostLgDev = pcW is >= 0x002AF800 and <= 0x002AF980;
+            bool pcInSleep = pcW is >= 0x0010C0A0 and <= 0x0010C0AC;
+            bool pcInWaitSema = pcW is >= 0x0010BE60 and <= 0x0010BE70;
+            if (irxOnly && (pcInPostLgDev || (pcInSleep && raInPostLgDev)
+                || (pcInWaitSema && raInPostLgDev)))
             {
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.PC = raW;
-                sys.EE.COP0_Status &= ~(1u << 1);
-            }
-            // If EE is inside the poll body with a live frame, re-check with flag set.
-            if (irxOnly && pcW is >= 0x002AF80C and <= 0x002AF838)
-            {
+                uint gpW = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
+                if (gpW is < 0x00400000 or >= 0x01000000) gpW = 0x004E8670;
+                uint f23104 = unchecked((uint)((int)gpW - 23104));
+                if (f23104 is >= 0x00400000 and < 0x01000000)
+                    sys.Memory.Write32(f23104, 1);
+                sys.Memory.Write32(BootWaitFlagDefault, 1);
                 uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
                 if (s0w >= 600)
                     sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.PC = 0x002AF80C; // re-load flag (now 1) → success path
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.PC = postLgDevSuccess;
+                sys.EE.COP0_Status &= ~(1u << 1);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_menuKickPulses % 8) == 0)
+                    Console.Error.WriteLine(
+                        $"[B3] leave post-LGDEV spin SUCCESS pc=0x{pcW:X8} ra=0x{raW:X8} " +
+                        $"-> 0x{postLgDevSuccess:X8} v0=1 cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
             }
-            if (k != null && (_menuKickPulses % 2) == 0)
+            if (irxOnly && k != null && (_menuKickPulses % 2) == 0)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping) continue;
+                    uint savedRa = (uint)(t.SavedRa & 0x1FFFFFFFUL);
+                    if (savedRa == 0 && t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 31)
+                        savedRa = (uint)(t.SavedGprFull[31] & 0x1FFFFFFFUL);
+                    uint savedPc = (uint)(t.SavedPc & 0x1FFFFFFFUL);
+                    bool postPark = (savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010C0A0 and <= 0x0010C0AC && savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010BE60 and <= 0x0010BE70 && savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (t.Id == 1 && t.WaitSemaId >= 0x40)
+                        || (t.Id == 1 && t.WaitSemaId == 0 && !t.WaitVblank && _menuKickPulses >= 16);
+                    if (t.WaitSemaId >= 32)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    if (postPark && t.Id == 1)
+                    {
+                        t.SavedPc = postLgDevSuccess;
+                        if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
+                        {
+                            t.SavedGprFull[2] = 1;
+                            if (t.SavedGprFull.Length > 16) t.SavedGprFull[16] = 1;
+                        }
+                        t.WaitSemaId = 0;
+                        t.Sleeping = false;
+                        t.WaitVblank = false;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                            && (_menuKickPulses % 8) == 0)
+                            Console.Error.WriteLine(
+                                $"[B3] re-home sleeping main post-LGDEV SUCCESS " +
+                                $"savedRa=0x{savedRa:X8} -> 0x{postLgDevSuccess:X8} " +
+                                $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+                    }
+                    else if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        k.WakeupThread(t.Id);
+                }
+            }
+            else if (k != null && (_menuKickPulses % 2) == 0)
             {
                 foreach (var t in k.AllThreads)
                 {
@@ -1748,22 +1792,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x002B35C0; // past wait-3 → jal 0x2AFDD0
             sys.EE.COP0_Status &= ~0x6u;
         }
-        else if (inPostLgDevSpin)
+        else if (inPostLgDevSpin || inPostLgDevWaitSema)
         {
-            // Re-enter poll head with flag already planted above — natural success path.
+            // Success leave: flag set + s0!=600 → v0=1 epi (NOT timeout 0x2AF920).
             uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
             if (s0w >= 600)
                 sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
-            sys.EE.PC = 0x002AF80C;
-            sys.EE.COP0_Status &= ~0x6u;
-        }
-        else if (inPostLgDevWaitSema)
-        {
-            // Natural WaitSema return to ra@0x2AF86C.
-            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-            if (ra is >= 0x002AF860 and <= 0x002AF870)
-                sys.EE.PC = ra;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x002AF914;
             sys.EE.COP0_Status &= ~0x6u;
         }
 
