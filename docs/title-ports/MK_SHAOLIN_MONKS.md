@@ -8,16 +8,59 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w4` |
-| Agent date | 2026-07-31 (wave-4) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w5` |
+| Agent date | 2026-07-31 (wave-5) |
 | ROMDIR gate | **CLOSED** |
 | IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
-| Wave-14 tip | SifRpc MSFLAG plant removed; WAD + gifP3=11 restored |
+| Branch | `agent/menu-sm-w5` tip main@9657852 |
 
 ---
 
 
-## Result this session (wave-4 / sm+0x28 jalr poison + arena)
+## Result this session (wave-5 / SearchFile gate + 43AB88 object residual)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — Soft-GS gifP3=**11** px=**573440** prims=2; slot0+obj live; **not MENU YES** |
+| Tip regression (fleet gifP3=5) | **Fixed** — SHARED `RealSifRpc` SearchFile EE copy-back stomped ELF image (`ee=0x7584C0`); gate copy-back to heap-class CdlFILE only |
+| Force 43B670 | Completes; type-1 path enters; **FUN_0043AB88 / 44E628 still returns null** (object factory residual) |
+| Slot object | **Landed** TITLE_LOCAL — after 43AB88 null, plant obj from real desc arena `0xC00000` into slot `0x55E25C+0x3C`, seal flag=1; force `26FBF0` |
+| 26FBF0 bind | **Fires** then ESCAPE (~750k) into ADX/lock bands — residual |
+| Synthetic type5 | **Not used** |
+| Selection index | Still unproven |
+
+### Soft-GS scoreboard (wave-5)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Tip main@9657852 (pre-w5)** | `0x564290` | 286720 | 1 | **5** | 7 | GS? SearchFile stomp |
+| **sm-w4 claim** | FAE8 | 573440 | 2 | **11** | 30 | slot0 empty |
+| **Wave-5 100M claim** | FAE8 / `0x47FDxx` | **573440** | 2 | **11** | **106** | slot0=1 obj=`0xC00000` |
+
+### Change class
+
+- **SHARED** `RealSifRpc.cs`: SearchFile copy-back only when `sendSize∈[0x100,0x200]`, `ee≥0x800000`, `!IsLikelyEeCode` (Vexx CdlFILE heap-safe; SM image protected).
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `PrepResourceObjectFactoryState` — clear `0x55FA0C` table / `*0x55FA48`; seed `*0x55E1DC=0x4000`
+  - `TryCompleteResourceSlotObject` — post-43AB88-null slot object from arena
+  - Force `26FBF0` after plant; expand force PC bands; escape 250k→750k
+- **Rejected**: synthetic type5; ungated SearchFile copy-back; re-plant sm+0x28 capacity
+
+### Residual wall (wave-5)
+
+1. **44E628/43AB88 still null** on natural path — object plant is post-fail completion, not full type-1 ctor success.
+2. **26FBF0 ESCAPE** before full C1C0 chrome; prims still 2.
+3. **Selection index + second UI chrome** unproven — MENU YES open (#7, #3).
+4. Do not re-enable ungated SearchFile copy-back into ELF band.
+
+### Play! / PINE
+
+- Play! GameConfig.xml: no SLUS_210.87 entry
+- PINE: **N** (pcbreak 43B7E8/44E628 + SearchFile SKIP log sufficient)
+
+---
+
+## Result prior session (wave-4 / sm+0x28 jalr poison + arena)
 
 | Goal | Status |
 |------|--------|

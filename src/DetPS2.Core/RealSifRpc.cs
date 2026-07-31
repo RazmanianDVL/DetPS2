@@ -1160,15 +1160,38 @@ public sealed class RealSifRpc
             // Play! Cdvdfsv::SearchFile writes lsn/size into args in place. EE→IOP DMA'd the
             // sceCdlFILE to argBuf; copy the result head back to the EE send buffer so the
             // title sees lsn/size for subsequent CdRead (Vexx GAME.TXT / STREE0 TOC).
+            //
+            // WAVE-5 SM: ungated copy-back stomped live EE text when loose argBuf→eeSrc
+            // matching pointed at code (tip main@9657852: gifP3 11→5 spine death; sm-w4
+            // without this path held gifP3=11). Only copy into heap-class CdlFILE buffers:
+            // refuse ELF image band and IsLikelyEeCode destinations; prefer CdlFILE sizes.
             if (sf != 0 && argBuf != 0 && sendSize >= 8
                 && _argBufToEeSend.TryGetValue(argBuf, out uint eeSend) && eeSend != 0)
             {
-                uint n = Math.Min(sendSize, 0x130u);
-                for (uint i = 0; i < n; i++)
-                    mem.Write8(eeSend + i, mem.Read8(argBuf + i));
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                uint ee = eeSend & 0x1FFFFFFFu;
+                // sceCdlFILE is typically ≥0x124; refuse tiny/unknown DMA tails.
+                bool sizeOk = sendSize is >= 0x100 and <= 0x200;
+                // Commercial ELF images load near 0x00100000..~0x00800000 (SM memsz≈0x680898).
+                // Vexx/CdlFILE live in higher BSS/heap. Never write into primary image band.
+                bool notElfImage = ee >= 0x00800000u
+                    && ee + 0x130u < (uint)SystemMemory.RDRAM_SIZE;
+                bool notCode = !mem.IsLikelyEeCode(ee) && !mem.IsLikelyEeCode(ee + 4);
+                if (sizeOk && notElfImage && notCode)
+                {
+                    uint n = Math.Min(sendSize, 0x130u);
+                    for (uint i = 0; i < n; i++)
+                        mem.Write8(ee + i, mem.Read8(argBuf + i));
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                        Console.Error.WriteLine(
+                            $"[RPC] SearchFile copy-back EE=0x{ee:X} n={n} lsn={mem.Read32(argBuf)} size={mem.Read32(argBuf + 4)}");
+                }
+                else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                         || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                {
                     Console.Error.WriteLine(
-                        $"[RPC] SearchFile copy-back EE=0x{eeSend:X} n={n} lsn={mem.Read32(argBuf)} size={mem.Read32(argBuf + 4)}");
+                        $"[RPC] SearchFile copy-back SKIP ee=0x{ee:X} sendSize=0x{sendSize:X} " +
+                        $"sizeOk={sizeOk} notElf={notElfImage} notCode={notCode}");
+                }
             }
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;

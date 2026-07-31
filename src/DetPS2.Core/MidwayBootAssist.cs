@@ -94,8 +94,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private const uint ResourceLevel0Height = 384;
     private const uint ResourceLevel0Id = 0;
     private const uint ResourceHeapTable = 0x0065E998;
-    /// <summary>Wave-4: early abort if force PC leaves target bands (AdEL rehome).</summary>
-    private const ulong ResourceBindEscapeCyc = 250_000;
+    /// <summary>Wave-4/5: early abort if force PC leaves target bands (AdEL rehome).
+    /// Wave-5 raised 250k→750k so 26FBF0 bind poll can finish before ESCAPE.</summary>
+    private const ulong ResourceBindEscapeCyc = 750_000;
     // Wave-4: scratch arena + EE bump-alloc stubs for stream-manager allocator slots.
     // FUN_0043BE08 does jalr *(sm+0x28) with a0=*(sm+0x30); FUN_0043BE98 jalr *(sm+0x2C).
     // Wave-3 planted 0x100000 into +0x28/+0x2C as "capacity" — that is a jalr target, not a size
@@ -4339,8 +4340,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             && sys.Memory.Read32(0x0055E1EC) != 1)
             return;
 
+        // Fully bound only when flag+object live AND bind poll has run (phase≥4),
+        // or object already bound by natural 43B670 success (v0=slot).
         uint slot0 = sys.Memory.Read32(0x0055E25C);
-        if (slot0 == 1 && sys.Memory.Read32(0x0055E25C + 0x3C) != 0)
+        uint slot0objLive = sys.Memory.Read32(0x0055E25C + 0x3C);
+        if (_resourceBindPhase >= 4 && slot0 == 1 && slot0objLive != 0)
+            return;
+        if (slot0 == 1 && slot0objLive != 0 && _resourceBindPollForced)
         {
             _resourceBindPhase = 4;
             return;
@@ -4350,6 +4356,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (pc is (>= 0x0026F900 and <= 0x0026FD80)
             or (>= 0x0043B670 and <= 0x0043C400)
             or (>= 0x0043FAE0 and <= 0x0043FD00)
+            or (>= 0x00440000 and <= 0x00457000) // wave-5 object factory
             or (>= 0x00450000 and <= 0x00452000)
             or (>= 0x00420000 and <= 0x00422000))
             return;
@@ -4365,6 +4372,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         {
             EnsureResourceArenaAndAllocators(sys.Memory);
             SeedMidwayResourceHeap(sys.Memory);
+            PrepResourceObjectFactoryState(sys.Memory);
 
             uint pathPtr = PrepareResourceHandleForKick(sys.Memory, ResourceLevel0Id);
             uint descPtr = ResourceHandleBase + 0x24;
@@ -4611,6 +4619,79 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// Wave-5: prep globals for FUN_0043AB88 → FUN_0044E628 type-1 object factory.
+    /// Clears free-list table at 0x55FA0C, sticky size gate *0x55FA48, and ensures
+    /// *0x55E1DC is a non-zero divisor (441EB0 div). Live fail: 44E628 returns 0.
+    /// </summary>
+    private static void PrepResourceObjectFactoryState(SystemMemory mem)
+    {
+        // Object pointer table scanned by FUN_0044E728 (8 slots).
+        for (uint i = 0; i < 8; i++)
+        {
+            uint p = 0x0055FA0C + i * 4;
+            if (mem.Read32(p) != 0 && mem.Read32(p) < 0x100000)
+                mem.Write32(p, 0);
+        }
+        // Sticky size from a prior failed 44E768 — must match next size or fail.
+        mem.Write32(0x0055FA48, 0);
+        // Stream pitch/size used as frame+0x28 divisor in 441EB0. Zero → BREAK/null.
+        // 0x4000 matches FUN_0043A698 primary size output (sp+160).
+        uint pitch = mem.Read32(0x0055E1DC);
+        if (pitch == 0 || pitch > 0x20000)
+            mem.Write32(0x0055E1DC, 0x4000);
+    }
+
+    /// <summary>
+    /// Wave-5: after 43B670/43AB88 returns null, bind stream slot0 to a live object carved
+    /// from the real descriptor arena (already allocated by 43BD30 during the force path).
+    /// Mirrors the 43B800 success tail minimum: *slot=1, *slot+0x38=1, *slot+0x3C=obj.
+    /// </summary>
+    private static bool TryCompleteResourceSlotObject(SystemMemory mem, out uint slot, out uint obj)
+    {
+        slot = 0x0055E25C;
+        obj = 0;
+        uint existing = mem.Read32(slot + 0x3C);
+        if (existing >= 0x100000 && existing < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            obj = existing;
+            if (mem.Read32(slot) == 0)
+                mem.Write32(slot, 1);
+            if (mem.Read32(ResourceHandleBase) == 0)
+                mem.Write32(ResourceHandleBase, slot);
+            return true;
+        }
+
+        // Arena base is the first 43BD30 bump return (desc+0x18 path). Align like 44E768.
+        obj = (ResourceArenaBase + 31u) & ~31u;
+        if (obj + 0x100 >= ResourceArenaBase + ResourceDescBufSize)
+            return false;
+
+        // Minimal object fields set by 44E768 before deeper ctors.
+        mem.Write32(obj + 0x44, 1);
+        mem.Write32(obj + 0x48, 0);
+        mem.Write32(obj + 0x4C, 0);
+        mem.Write32(obj + 0x50, 0);
+        mem.Write32(obj + 0x54, 0);
+        mem.Write32(obj + 0x58, 0);
+        // Dimensions from reconstructed level-0 descriptor (useful for later draw).
+        mem.Write32(obj + 0x08, ResourceLevel0Width);
+        mem.Write32(obj + 0x0C, ResourceLevel0Height);
+
+        mem.Write32(slot + 0x3C, obj);
+        // Leave *slot=0 until 26FBF0/C1C0 runs — MaybeForceResourceSlotBind treats
+        // flag=1+obj as "done" and would skip the bind poll phase.
+        mem.Write32(slot + 0x38, 0);
+        mem.Write32(slot + 0x00, 0);
+        mem.Write32(ResourceHandleBase, slot);
+
+        // Publish into free-list table so later factory lookups see the object.
+        if (mem.Read32(0x0055FA0C) == 0)
+            mem.Write32(0x0055FA0C, obj);
+
+        return true;
+    }
+
+    /// <summary>
     /// Mirror FUN_0026FD80 setup: zero handle, flags, path at +0xEC, stream allocators.
     /// Returns path string pointer written into the handle (0 if missing).
     /// </summary>
@@ -4661,11 +4742,16 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool atTrampoline = pc == ResourceBindReturnTrampoline;
         bool timedOut = _resourceBindForceStartCyc != 0
             && sys.MasterCycles >= _resourceBindForceStartCyc + ResourceBindTimeoutCyc;
+        // Wave-5: include type-1 object factory + FAE8 stream body + bind chain so early
+        // ESCAPE does not abort mid-43AB88 / mid-26FBF0 (live: phase-3 ESCAPE @0x43FBE8).
         bool inForceBand = (pc is >= 0x0026F900 and <= 0x0026FD80)
-            || (pc is >= 0x0043A000 and <= 0x0043F000)
+            || (pc is >= 0x0043A000 and <= 0x00440000)
+            || (pc is >= 0x00440000 and <= 0x00457000)
             || (pc is >= 0x00450000 and <= 0x00452000)
             || (pc is >= 0x00420000 and <= 0x00422000)
             || (pc is >= 0x00474000 and <= 0x00475000)
+            || (pc is >= 0x002C6000 and <= 0x002C7000) // 26FBF0 helper 2C6878
+            || (pc is >= 0x00415000 and <= 0x00416000) // 4154E0
             || (pc >= ResourceAllocStub && pc < ResourceAllocStub + 0x40)
             || pc == ResourceBindReturnTrampoline;
         bool escaped = !atTrampoline && _resourceBindForceStartCyc != 0
@@ -4686,10 +4772,44 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             sys.Memory.Write32(ResourceHandleBase, v0);
             handlePtr = v0;
         }
+        // Wave-5 residual: FUN_0043AB88/44E628 returns null after type-1 arena path
+        // (pcbreak: 43B7E8 s2=0). Complete slot+object from the real desc arena so
+        // 26FBF0→C1C0 can bind. Not a synthetic type5 plant — buffers already allocated.
+        if (_resourceBindPhase == 1 && _resourceBindUsedSlotAlloc
+            && (handlePtr < 0x100000 || slot0obj == 0))
+        {
+            if (TryCompleteResourceSlotObject(sys.Memory, out uint plantedSlot, out uint plantedObj))
+            {
+                handlePtr = plantedSlot;
+                slot0 = sys.Memory.Read32(0x0055E25C);
+                slot0obj = plantedObj;
+                v0 = plantedSlot;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[BIOS] complete resource slot object slot=0x{plantedSlot:X} obj=0x{plantedObj:X8} " +
+                        $"(43AB88 was null) cyc={sys.MasterCycles}");
+            }
+        }
         if (handlePtr > 0 && handlePtr < 0x100000)
         {
             sys.Memory.Write32(ResourceHandleBase, 0);
             handlePtr = 0;
+        }
+
+        // Seal slot when object is live (bind poll may have ESCAPE'd out of band while
+        // still leaving a usable *slot+0x3C for FAE8/C1C0 consumers).
+        if (slot0obj >= 0x100000 && slot0obj < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            if (sys.Memory.Read32(0x0055E25C) == 0)
+                sys.Memory.Write32(0x0055E25C, 1);
+            if (sys.Memory.Read32(0x0055E25C + 0x38) == 0)
+                sys.Memory.Write32(0x0055E25C + 0x38, 1);
+            slot0 = 1;
+            if (handlePtr < 0x100000)
+            {
+                sys.Memory.Write32(ResourceHandleBase, 0x0055E25C);
+                handlePtr = 0x0055E25C;
+            }
         }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
