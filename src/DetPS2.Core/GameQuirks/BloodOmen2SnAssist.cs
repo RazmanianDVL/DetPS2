@@ -332,6 +332,12 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (postPackAsset && sys.Gs.PixelsWritten < 50_000)
             MaybeEscapeInMapNullDest(sys, c);
 
+        // Post-InMap residual: bit-pack / multiprecision heat @0x479E30 / 0x47A0xx burns
+        // tens of M with no CODE.BG2 Open. Soft-leave via $ra so usebigfile / StartBigFile
+        // can run (member extract alone does not open CODE).
+        if (postPackAsset && _inMapEscapes > 0 && sys.Gs.PixelsWritten < 50_000)
+            MaybeEscapePostEntityBitPack(sys, c);
+
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
         // started=False — re-start so boot can continue past RPC-complete plateau.
         if (sys.Cdvd.SectorsRead >= 200)
@@ -487,7 +493,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// Entity Dest-Database glue 0x2AD8E0 remains soft-stubbed.
     ///
     /// Residual (#17/#8): still no proven game FILEIO/IOPFILE Open of CODE.BG2 /
-    /// MAINMENU.BG2. SHARED goefile member extract for .IMP remains structural.
+    /// MAINMENU.BG2 after entity path. Pack path now uses goefile member extract.
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
@@ -697,6 +703,46 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // ELF rodata window (usebigfile / InMap / entity strings live here) — keep.
         if (a2 is >= 0x004B0000 and < 0x00520000) return false;
         return false;
+    }
+
+    /// <summary>
+    /// Soft-leave post-InMap multiprecision / bit-pack heat (<c>0x479E00..0x47A280</c>).
+    /// Live wave-1 residual after InMap leave: profiler heat in bit-pack helpers with no
+    /// FILEIO Open of CODE.BG2. Natural $ra when cold-safe; else post-flush init.
+    /// Rate-limited; never fakes CODE/MAINMENU sector credit.
+    /// </summary>
+    private void MaybeEscapePostEntityBitPack(Ps2System sys, ulong c)
+    {
+        if (_codeOpenNudges >= 48) return;
+        if (c - _lastTitleSmCyc < 80_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // Bit-pack / div helpers (live heat) — not menu-draw entries.
+        bool inBitPack = pc is >= 0x00479E00 and <= 0x0047A280;
+        if (!inBitPack) return;
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = 0;
+        if (IsColdSafeResume(sys, ra) && ra != pc && ra is < 0x004A0000)
+            resume = ra;
+        if (resume == 0)
+            resume = PickSafeResume(sys, pc);
+        if (resume == 0 || resume == pc || !IsColdSafeResume(sys, resume))
+            resume = 0x0048A980;
+        if (!IsSafeCodeTarget(sys, resume) || resume == pc)
+            return;
+
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        ArmGifPath3(sys);
+        _codeOpenNudges++;
+        _titleSmEscapes++;
+        _lastTitleSmCyc = c;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_codeOpenNudges <= 12 || _codeOpenNudges % 8 == 0))
+            Console.Error.WriteLine(
+                $"[BO2] leave post-entity bit-pack 0x{pc:X8} -> 0x{resume:X8} " +
+                $"n={_codeOpenNudges} cyc={c}");
     }
 
     /// <summary>

@@ -429,7 +429,7 @@ public sealed class RealSifRpc
         _goeArchiveMounted = false;
         _bo2CodeBg2Warmed = false;
         _bo2PackIndexBuilt = false;
-        _bo2PackPathToParent.Clear();
+        _bo2PackMembers.Clear();
         _bo2PackBytes.Clear();
         Bo2PackResidentOpens = 0;
         _goeArchiveFd = -1;
@@ -5994,22 +5994,39 @@ public sealed class RealSifRpc
     // Retail disc (usebigfile=1): entity .IMP/.ETP under ASSETS/ are NOT ISO leaves —
     // they are baked into Crystal Dynamics "goefile" bigfiles. Live FILEIO of
     // cdrom0:\GOGAMES\BO2\ASSETS\ETYPES\KAIN\KAIN.IMP → honest ENOENT without this HLE.
-    // Ground-truthed 2026-07-30: PRECODE/CODE/MAINMENU start with "goefile\0" + nested
-    // "symlist\0" and embed path strings like "assets/etypes/kain/kain.imp". When a
-    // request path matches a goefile-resident string, serve the parent bigfile payload
-    // (real disc bytes) so the factory path gets a non-empty goefile stream.
+    //
+    // goefile layout (ground-truthed 2026-07-31): tag[8] + size(incl. 16-byte hdr) + flags
+    // + payload; nested "goefile" regions are real sub-packages. Path strings live in
+    // "symlist" payloads. Prefer MEMBER EXTRACT (nested goefile slice) over whole-parent
+    // serve so factory parsers see a single package stream — not the entire CODE.BG2
+    // (914 KiB) for one .etp. Root-only symbols (kain.imp in PRECODE) still map to the
+    // parent goefile at offset 0 (the package *is* the member).
     // -------------------------------------------------------------------------
     private bool _bo2PackIndexBuilt;
-    /// <summary>Normalized relative path → parent pack disc path.</summary>
-    private readonly Dictionary<string, string> _bo2PackPathToParent =
+    /// <summary>Normalized relative path → member location inside a parent pack.</summary>
+    private readonly Dictionary<string, Bo2PackMember> _bo2PackMembers =
         new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Parent pack disc path → raw goefile bytes (≤16 MiB packs only).</summary>
     private readonly Dictionary<string, byte[]> _bo2PackBytes =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly struct Bo2PackMember
+    {
+        public readonly string Parent;
+        public readonly int Offset;
+        public readonly int Size;
+        public Bo2PackMember(string parent, int offset, int size)
+        {
+            Parent = parent;
+            Offset = offset;
+            Size = size;
+        }
+    }
+
     /// <summary>
     /// Open a pack-resident BO2 asset (.IMP/.ETP/ASSETS/…) from PRECODE/CODE/MAINMENU
-    /// goefile bigfiles when the path is not an ISO leaf.
+    /// goefile bigfiles when the path is not an ISO leaf. Serves the member slice when
+    /// known (nested goefile), else the parent goefile for root-level symbols.
     /// </summary>
     private int TryOpenBo2PackResident(IopModuleHost iopModules, Cdvd cdvd, string path,
         out uint size)
@@ -6018,51 +6035,70 @@ public sealed class RealSifRpc
         if (string.IsNullOrEmpty(path) || !LooksLikeBo2PackResidentPath(path))
             return -1;
         EnsureBo2PackIndex(iopModules, cdvd);
-        if (_bo2PackPathToParent.Count == 0) return -1;
+        if (_bo2PackMembers.Count == 0) return -1;
 
         string key = NormalizeBo2PackMemberKey(path);
         if (string.IsNullOrEmpty(key)) return -1;
 
-        if (!_bo2PackPathToParent.TryGetValue(key, out string? parent)
-            || string.IsNullOrEmpty(parent))
+        if (!_bo2PackMembers.TryGetValue(key, out Bo2PackMember member))
         {
-            // Basename fallback (KAIN.IMP → assets/etypes/kain/kain.imp).
+            // Basename fallback (KAIN.IMP → assets/etypes/kain/kain.imp). Prefer tightest.
             int slash = key.LastIndexOf('/');
             string baseName = slash >= 0 ? key[(slash + 1)..] : key;
-            if (baseName.Length >= 3)
+            if (baseName.Length < 3) return -1;
+            Bo2PackMember? best = null;
+            string? bestKey = null;
+            foreach (var kv in _bo2PackMembers)
             {
-                foreach (var kv in _bo2PackPathToParent)
+                if (!(kv.Key.EndsWith("/" + baseName, StringComparison.OrdinalIgnoreCase)
+                      || kv.Key.Equals(baseName, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                if (best is null || kv.Value.Size < best.Value.Size)
                 {
-                    if (kv.Key.EndsWith("/" + baseName, StringComparison.OrdinalIgnoreCase)
-                        || kv.Key.Equals(baseName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        parent = kv.Value;
-                        key = kv.Key;
-                        break;
-                    }
+                    best = kv.Value;
+                    bestKey = kv.Key;
                 }
             }
+            if (best is null || string.IsNullOrEmpty(bestKey)) return -1;
+            member = best.Value;
+            key = bestKey;
         }
+
+        string parent = member.Parent;
         if (string.IsNullOrEmpty(parent)) return -1;
 
-        // Serve parent goefile bytes as a memory image (complete "goefile" payload).
-        // Entity .IMP/.ETP paths resolve here too — factory expects a goefile stream when
-        // the path is pack-resident (live: KAIN.IMP → PRECODE). Format thrash inside the
-        // EE parser is handled by BloodOmen2SnAssist soft-stub of leaf 0x482F60.
-        //
-        // Do NOT NoteHostReadSectors for unopened CODE.BG2 / MAINMENU.BG2 — that inflated
-        // cdvd to ~1733 while game never Open'd those packs and tripped post-menu assists
-        // before real usebigfile / GOE Open (#17 residual). Prefer Bo2PackResidentOpens.
+        // Serve MEMBER bytes (slice of parent goefile). Do NOT inflate cdvd via unopened
+        // CODE/MAINMENU NoteHostReadSectors — game Open of those packs is the honest signal.
         if (_bo2PackBytes.TryGetValue(parent, out byte[]? bytes) && bytes is { Length: > 0 })
         {
-            size = (uint)bytes.Length;
+            int off = member.Offset;
+            int memSz = member.Size;
+            if (off < 0 || memSz <= 0 || off + memSz > bytes.Length)
+            {
+                off = 0;
+                memSz = bytes.Length;
+            }
+            byte[] slice;
+            if (off == 0 && memSz == bytes.Length)
+                slice = bytes;
+            else
+            {
+                slice = new byte[memSz];
+                Buffer.BlockCopy(bytes, off, slice, 0, memSz);
+            }
+            size = (uint)slice.Length;
             Bo2PackResidentOpens++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                 || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                string leaf = parent;
+                int bs = parent.LastIndexOf('\\');
+                if (bs >= 0) leaf = parent[(bs + 1)..];
                 Console.Error.WriteLine(
-                    $"[BO2] pack-resident open key=\"{key}\" parent=\"{parent}\" size={size} " +
-                    $"n={Bo2PackResidentOpens}");
-            return iopModules.FileOpenMemoryStub("bo2pack:" + key, bytes);
+                    $"[BO2] pack-member open key=\"{key}\" parent={leaf} " +
+                    $"off=0x{off:X} size={size} n={Bo2PackResidentOpens}");
+            }
+            return iopModules.FileOpenMemoryStub("bo2pack:" + key, slice);
         }
 
         int fd = iopModules.FileOpen(parent, 1);
@@ -6111,8 +6147,9 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// Scan PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2 for embedded path strings and index
-    /// them to the parent pack. Packs are small (≤2 MiB) so full host read is fine.
+    /// Scan PRECODE.BG2 / CODE.BG2 / MAINMENU.BG2: parse goefile structure, index path
+    /// strings to member ranges (prefer nested goefile slices over whole-parent).
+    /// Packs are small (≤2 MiB) so full host read is fine.
     /// </summary>
     private void EnsureBo2PackIndex(IopModuleHost iopModules, Cdvd cdvd)
     {
@@ -6158,19 +6195,52 @@ public sealed class RealSifRpc
                 continue;
             _bo2PackBytes[packKey] = data;
 
-            int added = IndexBo2GoeFilePaths(data, packKey);
+            int added = IndexBo2GoeFileMembers(data, packKey);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
-                    $"[BO2] pack index {packKey} size={data.Length} paths+={added} total={_bo2PackPathToParent.Count}");
+                    $"[BO2] pack index {packKey} size={data.Length} members+={added} " +
+                    $"total={_bo2PackMembers.Count}");
         }
     }
 
-    /// <summary>Walk C-string runs in a goefile and register path-like members.</summary>
-    private int IndexBo2GoeFilePaths(byte[] data, string packKey)
+    /// <summary>
+    /// Index path-like strings in a goefile to member (offset, size) ranges.
+    /// Nested <c>goefile</c> regions claim their symlist paths as tight slices; root
+    /// symlist paths map to the whole pack (offset 0). Prefer smaller ranges on conflict.
+    /// </summary>
+    private int IndexBo2GoeFileMembers(byte[] data, string packKey)
     {
         int added = 0;
-        int i = 0;
-        while (i < data.Length)
+        // 1) Nested goefile packages first (tightest members).
+        int search = 1; // skip root magic at 0
+        while (search + 16 <= data.Length)
+        {
+            int nest = IndexOfBo2GoeMagic(data, search);
+            if (nest < 0) break;
+            int nestSize = ReadBo2GoeSizeField(data, nest);
+            if (nestSize < 32 || nest + nestSize > data.Length)
+            {
+                search = nest + 7;
+                continue;
+            }
+            added += RegisterBo2PathsInRange(data, nest, nest + nestSize, packKey, nest, nestSize,
+                preferTighter: true);
+            search = nest + Math.Max(7, nestSize);
+        }
+
+        // 2) Root-level paths (whole parent) for symbols not claimed by a nested package.
+        added += RegisterBo2PathsInRange(data, 0, data.Length, packKey, 0, data.Length,
+            preferTighter: false);
+        return added;
+    }
+
+    private int RegisterBo2PathsInRange(byte[] data, int rangeStart, int rangeEnd,
+        string packKey, int memberOff, int memberSize, bool preferTighter)
+    {
+        int added = 0;
+        int i = Math.Max(0, rangeStart);
+        int end = Math.Min(data.Length, rangeEnd);
+        while (i < end)
         {
             byte b = data[i];
             if (b is < (byte)'A' or > (byte)'z')
@@ -6179,7 +6249,7 @@ public sealed class RealSifRpc
                 continue;
             }
             int start = i;
-            while (i < data.Length)
+            while (i < end)
             {
                 byte c = data[i];
                 if (c is >= 32 and <= 126 && c != (byte)'"' && c != (byte)'\'')
@@ -6188,22 +6258,53 @@ public sealed class RealSifRpc
                     break;
             }
             int len = i - start;
-            if (len is >= 8 and <= 180 && i < data.Length && data[i] == 0)
+            if (len is >= 8 and <= 180 && i < end && data[i] == 0)
             {
                 string s = System.Text.Encoding.ASCII.GetString(data, start, len);
                 if (IsBo2GoeMemberPath(s))
                 {
                     string key = NormalizeBo2PackMemberKey(s);
-                    if (key.Length > 0 && !_bo2PackPathToParent.ContainsKey(key))
+                    if (key.Length > 0)
                     {
-                        _bo2PackPathToParent[key] = packKey;
-                        added++;
+                        var cand = new Bo2PackMember(packKey, memberOff, memberSize);
+                        if (!_bo2PackMembers.TryGetValue(key, out Bo2PackMember existing))
+                        {
+                            _bo2PackMembers[key] = cand;
+                            added++;
+                        }
+                        else if (preferTighter && cand.Size > 0 && cand.Size < existing.Size)
+                        {
+                            _bo2PackMembers[key] = cand;
+                        }
+                        else if (!preferTighter && existing.Size <= 0)
+                        {
+                            _bo2PackMembers[key] = cand;
+                        }
                     }
                 }
             }
-            if (i < data.Length && data[i] == 0) i++;
+            if (i < end && data[i] == 0) i++;
         }
         return added;
+    }
+
+    private static int IndexOfBo2GoeMagic(byte[] data, int start)
+    {
+        for (int i = start; i + 7 < data.Length; i++)
+        {
+            if (data[i] == (byte)'g' && data[i + 1] == (byte)'o' && data[i + 2] == (byte)'e'
+                && data[i + 3] == (byte)'f' && data[i + 4] == (byte)'i' && data[i + 5] == (byte)'l'
+                && data[i + 6] == (byte)'e' && data[i + 7] == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Read goefile size field (bytes from tag start, includes 16-byte header).</summary>
+    private static int ReadBo2GoeSizeField(byte[] data, int off)
+    {
+        if (off + 12 > data.Length) return 0;
+        return data[off + 8] | (data[off + 9] << 8) | (data[off + 10] << 16) | (data[off + 11] << 24);
     }
 
     private static bool IsBo2GoeMemberPath(string s)

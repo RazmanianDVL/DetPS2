@@ -8,9 +8,9 @@
 | **BIOS** | SCPH70008 / native BIOS HLE |
 | **ROMDIR gate** | **CLOSED** |
 | **Parent** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
-| **Branch** | `agent/menu-bo2` @ `cc821b9` |
+| **Branch** | `agent/menu-bo2-w2` @ tip main `3748553` |
 | **Date** | 2026-07-31 |
-| **Status** | **FILEIO KAIN.IMP pack-resolved** (`Bo2PackResidentOpens`); format leaf soft-stubbed; **InMap 0x2B9F34 wall cleared**; post-entity heat @`0x479E30`/`0x47A0xx`; **px=3**; **#17** no game CODE/MAINMENU Open; **#8** draw stall. **MENU? No.** |
+| **Status** | **goefile member extract** (`pack-member open`); KAIN.IMP → PRECODE off=0 size=172028; InMap leave; **no** game CODE/MAINMENU Open; **px=3**; **MENU? No.** |
 
 ---
 
@@ -25,69 +25,70 @@
 | PS2.RKV mount + TOC | **OK** — **5592** keys |
 | PRECODE/CODE/MAINMENU .BG2 | **Real disc** (host warm, **no** sector credit) |
 | Thrash @0x538738 | **CLEARED** — method-walker @0x166390 stubbed |
-| FILEIO `KAIN.IMP` | **YES** — pack-resident open → PRECODE.BG2 (size=172028, full read @0xA242A0) |
-| Pack index | **201** paths |
+| FILEIO `KAIN.IMP` | **YES** — **member extract** → PRECODE.BG2 off=0x0 size=172028 |
+| Pack index | **201** members (nested goefile slices preferred when present) |
 | Honest cdvd (no fake CODE/MAINMENU note) | **548** |
 | SN Dest-Database storm | **CLEARED** — soft-stub SN printf @0x46FAF8 post pack-open |
-| Post-KAIN format thrash @0x4830xx | **CLEARED** — soft-stub format **leaf only** `0x482F60` (wrapper/bridge intact) |
-| InMap null-dest park @0x2B9F34 | **CLEARED** — `MaybeEscapeInMapNullDest` leave → ra `0x2B9E28` slot `0x5378A8` |
-| Game GOE Open CODE/MAINMENU .BG2 | **NO** (host warm only; no FILEIO game Open; no CODE.BG2 in RDRAM) |
-| PC @ 100M | **`0x00441FBC`** (post-InMap; heat in `0x479E30` bit-pack + `0x47A0xx`) |
+| Post-KAIN format thrash @0x4830xx | **CLEARED** — soft-stub format **leaf only** `0x482F60` |
+| InMap null-dest park @0x2B9F34 | **CLEARED** — leave → ra `0x2B9E8C` slot `0x5378A8` @~93.6M |
+| Game GOE Open CODE/MAINMENU .BG2 | **NO** (host warm only; no FILEIO game Open) |
+| PC @ 100M | **`0x004891E8`** (RPC worker / WaitSema fabric residual on tip) |
 | cdvdSectors | **548** (honest; Bo2PackResidentOpens=2) |
-| px / gifP3 / dmac | **3 / 2 / 185** |
+| px / gifP3 / dmac | **3 / 2 / 380** |
 | Main menu (`mainmenu-bg2`) | **Not reached** (px still logo-class) |
 
-### blocker-trace @ 100M (host-present, SEMA_STALL_YIELD OFF) — 2026-07-31 agent/menu-bo2
+### blocker-trace @ 100M (host-present, SEMA_STALL_YIELD OFF) — 2026-07-31 agent/menu-bo2-w2
 
 ```
-PC=0x00441FBC  px=3 gifPath3=2 dmac=185 sifBytes=39264
-syscalls=1070 cdvdSectors=548
+PC=0x004891E8  px=3 gifPath3=2 dmac=380 sifBytes=39264
+syscalls=3752500 cdvdSectors=548
 RealSifRpc: binds=15 calls=104 unknownBindSids=0
-[BO2] pack-resident open key="assets/etypes/kain/kain.imp" parent=PRECODE.BG2 n=1..2
+[BO2] pack index PRECODE members+=4; CODE +=193; MAINMENU +=4 total=201
+[BO2] pack-member open key="assets/etypes/kain/kain.imp" parent=PRECODE.BG2 off=0x0 size=172028 n=1..2
 [BO2] soft-stub SN printf @ 0x46FAF8
 [BO2] soft-stub format leaf @ 0x482F60 (wrapper intact)
-[BO2] soft-stub entity printf glue @ 0x2AD8E0/0x2AD910 (format intact)
-[BO2] leave InMap helper 0x002B9F34 -> ra=0x002B9E28 slot=0x005378A8
+[BO2] soft-stub entity printf glue @ 0x2AD8E0/0x2AD910
+[BO2] leave InMap helper 0x002B9F5C -> ra=0x002B9E8C slot=0x005378A8 n=1 cyc=93600000
 fio2200=False
-find-string CODE.BG2 / MAINMENU: no match in RDRAM (no game Open path plant)
+no game Open of CODE.BG2 / MAINMENU.BG2 (host warm only; no sector credit)
 ```
 
-### Wall analysis (2026-07-31)
+### Wall analysis (wave-2)
 
-1. **Honesty:** Fake CODE+MAINMENU sector credit removed on main (`c423c4f`). Gating uses
-   `Bo2PackResidentOpens` (not inflated cdvd). Honest plateaus at **cdvd=548**.
-2. **KAIN.IMP pack-resident** — YES via FILEIO; full read 172028 → `0xA242A0` (PRECODE goefile).
-3. **Format thrash** — leaf-only stub after pack open. Permanent wrapper/bridge plants rejected:
-   they broke `0x485318` ("Bad Destination for InMap %s") and rescue-looped mid `0x2B9F34`.
-4. **InMap wall cleared** — a1==0 path + bad vtable jalr; soft-leave helper with default slot.
-   Live: leave @ ~64.6M → brief data thrash → PC lands **`0x441FBC`**.
-5. **Post-InMap residual** — PcProfiler heat at `0x479E30` (bit-pack) and `0x47A0xx` (near
-   historical Manager State diagnose `0x47A23C`). Still **no** `"Starting code big file"` /
-   CODE.BG2 FILEIO Open. Method-walker stub may leave entity vtables incomplete → null InMap
-   destinations; structural fix remains goefile member extract for `.IMP`.
-6. **px≈3 / menu (#8):** Soft-GS logo-class. **No mainmenu-bg2 claim.**
+1. **Member extract:** `TryOpenBo2PackResident` now indexes goefile members with
+   `(parent, offset, size)`. Nested `goefile` regions claim tight slices; root-only
+   symbols (kain.imp in PRECODE) map to parent off=0 (package *is* the member). Live:
+   `pack-member open … off=0x0 size=172028` — same bytes as whole PRECODE, but
+   infrastructure serves slices when nested packages exist (CODE has nested goefiles).
+2. **No fake sectors:** CODE/MAINMENU host warm remains `countSectors=false`. Honest
+   plateau **cdvd=548**.
+3. **InMap** still leaves; residual is post-entity / tip WaitSema fabric (`WHIP_SEMA_FIX_V2`
+   sema=3 storm @0x488894, PC ends 0x4891E8) — not a CODE Open.
+4. **#17/#8:** Still no `"Starting code big file"` / game FILEIO of CODE.BG2 or
+   MAINMENU.BG2. Soft-GS logo-class px=3. **No mainmenu-bg2 claim.**
 
 ### Assists (current)
 
+- Goefile **member extract** (offset/size TOC; nested slice prefer)
 - Soft-stub format **leaf** @`0x482F60` after pack-resident open; wrapper/bridge intact
 - Soft-stub method-walker @`0x166390`, SN printf @`0x46FAF8`, entity printf glue @`0x2AD8E0`
 - `MaybeEscapeInMapNullDest` — leave a1==0 helper / skip bad jalr
+- `MaybeEscapePostEntityBitPack` — soft-leave 0x479E00..0x47A280 after InMap (rate-limited)
 - Huge-memcpy abort @`0x4803E0` when remaining count > 64K
-- Cold-resume rejects mid format / InMap helper frames
 - **No** fake CODE/MAINMENU sector credit
 
 ## MENU / #8 residual
 
-**NOT REACHED** (px=3 ≪ menu; no claim). Next: real goefile member extract for `.IMP` (not
-whole-PRECODE serve), or PINE ground-truth of post-entity `"Starting code big file"` /
-CODE.BG2 Open (Whiplash-transferable GOE #17).
+**NOT REACHED** (px=3 ≪ menu; no claim). Next: PINE ground-truth of post-entity
+`"Starting code big file"` / CODE.BG2 Open path (usebigfile StartBigFile), or deeper
+entity registration without method-walker full-stub so InMap destinations are real.
 
 ## Commands
 
 ```powershell
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-bo2
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-bo2-w2
 # do NOT set DETPS2_SEMA_STALL_YIELD
 $env:DETPS2_TRACE_BIOS='1'; $env:DETPS2_TRACE_RPC='1'
-dotnet exec out/game-bo2/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=100000000 --host-present
-# expect: KAIN PACK n=2, format leaf stub, leave InMap, PC near 0x441Fxx, cdvd=548, px=3
+dotnet exec out/game-bo2-w2/DetPS2.Core.dll blocker-trace user-media-bloodomen2.json --cycles=100000000 --host-present
+# expect: pack-member open kain.imp off=0, format leaf stub, leave InMap, cdvd=548, px=3
 ```
