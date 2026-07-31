@@ -8,14 +8,93 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w7` |
-| Agent date | 2026-07-31 (wave-7) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s1` |
+| Agent date | 2026-07-31 (S0+G0 / PL-005 + GX-008) |
 | ROMDIR gate | **CLOSED** |
-| Branch | `agent/menu-sm-w7` |
+| Branch | `agent/seat-s1/s0-g0` |
+| menuKind | **mk-mainmenu** MENU YES (baseline gifP3=18 px≈966k) |
+| Seat | **S1** MIDWAY-SM |
 
 ---
 
-## Result this session (wave-7 / WAD body + second-chrome PATH3 MENU YES)
+## S0 residual charter + draw graph (PL-005 / GX-008)
+
+**Season:** S0 foundation + G0 graphics telemetry. **No new Soft-GS PATH3 plants** this wave — charter + claim re-verify + one tiny sticky-GIF abort fix so existing second-chrome plant still rasters under post–GoW WAVE-11C sticky reassembly.
+
+### Claim table (SEMA_OFF, host-present)
+
+| Budget | PC | px | prims | gifP1 | gifP2 | gifP3 | dmac | imgBytes | dispfbPx | exit | notes |
+|--------|-----|-----|-------|-------|-------|-------|------|----------|----------|------|-------|
+| **diagnose 20M** | `0x426E34` | **286720** | 1 | 0 | 0 | **5** | 7 | 1024 | 0 | F | logo spine clear only |
+| **claim 100M** | FAE8 `0x43FBDC` | **966656** | **9** | 0 | 0 | **18** | 30 | 1024 | 0 | F | mk-mainmenu MENU YES hold |
+
+**softgs-regs @100M:** `FRAME_1=0x100000` · `DISPFB1=0` · `SCISSOR=0x0400000004000000` · `XYOFFSET=0` · `TEST=0x30000`  
+**softgs-writes:** total=61 PRIM=20 **XYZ2=14** XYZ3=0 XYZF2=4 FRAME=2  
+**gif-pkts:** completed=110605 aborted=1 inFlight=False · RealSifRpc binds=24 calls=259 · cdvd=201914  
+**TEX0:** not in claim line (GX-022 S10); no textured sample observed at menu — solid SPRITE chrome only.
+
+### Draw graph (menu surface)
+
+```
+EE Midway stream (FAE8 / FBB0 / D770)
+  │
+  ├─ Path1 (VU1 XgKick):  gifP1=0  — unused at menu
+  ├─ Path2 (VIF1 DIRECT): gifP2=0  — unused at menu
+  └─ Path3 (GIF DMA/HLE): gifP3=18
+        │
+        ├─ NATURAL  ~gifP3 0→11  (logo spine + first chrome)
+        │     · early clear: px=286720 prims=1 @20M (full Soft-GS FB)
+        │     · plateau: px=573440 prims=2 @ pre-second-chrome
+        │     · FRAME path; DISPFB unset; imgBytes=1024 (tiny IMAGE)
+        │
+        └─ ASSIST   gifP3 11→18  (MaybeSubmitSecondChromePath3 ×4)
+              · Soft-GS-real GIF→GS packed SPRITE (PRE+RGBAQ+XYZ2×2)
+              · gated on natural FBB0/D770 + type-2 arena obj + WAD body
+              · NOT ofx title-strip expand (expandHits class: n/a; ofx=0 non-strip rects)
+              · S0 tiny fix: AbortIncompletePacket before plant so sticky mid-packet
+                (GoW WAVE-11C) cannot swallow PATH3 as IMAGE continuation
+```
+
+| Path | At menu? | Natural vs assist | Formats / prims |
+|------|----------|-------------------|-----------------|
+| **Path3** | **YES** (primary) | Natural logo/spine + **assist second chrome** | PACKED SPRITE; solid RGBA (no TEX0 sample) |
+| Path2 | no | — | — |
+| Path1 | no | — | — |
+| IMAGE / BITBLT | residual only | natural tiny (`imgBytes=1024`) | not menu chrome source |
+| DISPFB present | **no** (`dispfbPx=0`) | FRAME_1 composite | FBP page via FRAME |
+| ofx expand | **no** at SM menu | second chrome is real XYZ2 SPRITE raster | not BO2/GoW strip-expand class |
+
+### One primary wall for INTERACTIVE (P1)
+
+**Wall:** **Natural Midway texture/chrome DMA + AnimMenuGUI accept** — menu is Soft-GS MENU YES with assist PATH3 second chrome and assist-stable sel-idx; P1 needs natural type-2 draw body DMA (drop assist PATH3) and a proven accept path past row index plant (`*54E610/*54E620`) into real menu transition.
+
+**Residual wall one-liner:** assist PATH3 second chrome holds mk-mainmenu; natural texture DMA + menu accept still residual.
+
+### Oracle next step (Play! / PINE)
+
+| Source | Status | Ask |
+|--------|--------|-----|
+| Play! `GameConfig.xml` | **no** `SLUS_210.87` entry | generic IOP only — no title HLE list |
+| **PINE / PCSX2** | **YES recommended next** | live dump of type-2 object @ slot `0x55E25C+0x3C` after real menu bind: method tables, texture descriptor, GIF/PATH3 submit from `44D860→44DA10` so assist plant can retire |
+| ELF pcbreak | sufficient for C1C0/D770 force | not enough for natural tex DMA layout |
+
+### S0 change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`: abort GIF sticky mid-packet before existing second-chrome `ReceivePath3Data` (claim hold after WAVE-11C sticky regression: gifP3↑ but prims stuck@2).
+- **Docs only** otherwise: residual charter + draw graph (this section).
+- **Rejected / freezes held:** no new PATH3 plants; no FFmpeg; no sm+0x28; no type5; no global WaitSema fabricate; SEMA_OFF; no Gs/Gif/Dmac edits (S8/S9).
+
+### Soft-GS scoreboard (S0 re-claim)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Wave-7 baseline** | FAE8 `0x43FBDC` | **966656** | **9** | **18** | 30 | MENU YES |
+| **S0 tip@main pre-fix** | FAE8 | 573440 | 2 | 18 | 30 | sticky swallowed plant |
+| **S0 claim 100M** | FAE8 `0x43FBDC` | **966656** | **9** | **18** | 30 | sticky abort + MENU YES hold |
+
+---
+
+## Result prior session (wave-7 / WAD body + second-chrome PATH3 MENU YES)
 
 | Goal | Status |
 |------|--------|

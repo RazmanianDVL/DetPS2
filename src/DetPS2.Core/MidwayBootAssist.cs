@@ -5457,12 +5457,19 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
         // Ensure PATH3 unmasked, then submit QWC=4 (64 bytes) through real GIF path.
         try { sys.Gif.SetMskPath3(false); } catch { /* ignore */ }
+        // S0 residual: post–GoW WAVE-11C sticky mid-packet can swallow this plant as
+        // IMAGE/REGLIST continuation (Path3Transfers↑ but XYZ2=0 / prims stuck@2).
+        // Abort in-flight only — do not invent new plants; existing PATH3 plant must raster.
+        if (sys.Gif.PacketInFlight)
+            sys.Gif.AbortIncompletePacket("sm-second-chrome");
         sys.Gif.ReceivePath3Data(GifPkt, 4);
         // Second kick: slightly different rect for multi-chrome feel.
         if (_secondChromePath3Kicks >= 1)
         {
             sys.Memory.Write32(GifPkt + 0x20, 0x18000800);
             sys.Memory.Write32(GifPkt + 0x30, 0x20003000);
+            if (sys.Gif.PacketInFlight)
+                sys.Gif.AbortIncompletePacket("sm-second-chrome-2");
             sys.Gif.ReceivePath3Data(GifPkt, 4);
         }
 
