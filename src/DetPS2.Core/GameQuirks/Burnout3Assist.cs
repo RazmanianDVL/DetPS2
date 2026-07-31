@@ -423,13 +423,17 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Pad inject once disc assets stream — menu probes need non-zero buttons.
-        if (sys.Cdvd.SectorsRead > 0 && _padInjectPulses < 256)
+        // Wave-5: raise cap after Soft-GS logo chrome so front-end pad path keeps live.
+        int padCap = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 ? 1024 : 256;
+        if (sys.Cdvd.SectorsRead > 0 && _padInjectPulses < padCap)
         {
             _padInjectPulses++;
             int phase = _padInjectPulses % 8;
             uint buttons = 0;
             if (phase is 2 or 3) buttons = (uint)PadInput.Button.Start;
             else if (phase is 5 or 6) buttons = (uint)PadInput.Button.Cross;
+            if (sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 && phase is 0 or 1)
+                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
             try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
         }
     }
@@ -944,6 +948,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Dense START/CROSS after disc IRX path (cdvd>0). Pad inject is allowed.
+        // Wave-5: after Soft-GS non-black + FRONTEND plant, denser edges so logo-frontend
+        // can advance past static logo into more chrome (pad if needed).
         int phase = _menuKickPulses % 6;
         uint buttons = phase switch
         {
@@ -956,6 +962,18 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // After LGDEV cleared, hold START longer so title front-end sees a press edge.
         if (_lgDevEscapes >= 3 && (_menuKickPulses % 4) < 2)
             buttons = (uint)PadInput.Button.Start;
+        bool logoChromeLive = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000;
+        if (logoChromeLive)
+        {
+            int p2 = _menuKickPulses % 4;
+            buttons = p2 switch
+            {
+                0 => (uint)PadInput.Button.Start,
+                1 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                2 => (uint)PadInput.Button.Cross,
+                _ => (uint)PadInput.Button.Start
+            };
+        }
         try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
 
         // Sticky: keep fno=18 path dead while we try to leave VBlank-only workers.

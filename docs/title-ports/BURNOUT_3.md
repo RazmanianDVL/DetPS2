@@ -172,3 +172,17 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | MENU | **No** — Soft-GS px>0 only; not claiming interactive menu |
 | Next | pad after non-black Soft-GS; natural DISPFB; DA display END remains gated high-TADR |
 
+
+## Wave-5 (2026-07-31) — agent/menu-b3-w5 Soft-GS merge chrome + pad
+
+| Field | Value |
+|-------|-------|
+| Tip wall | main `9657852` fleet claim: **px=1258** gifP3=491 cdvd=**6584** dispfbPx=0 (sparse AFAIL prims; IMAGE blocked) |
+| Soft-GS fix | Merge composite: sparse prim paint no longer skips DISPFB/FRAME/FBP0 IMAGE present. Fills **black** Soft-GS pixels only from local VRAM; dual-try FRAME then FBP=0 when DISPFB unset |
+| Assist | Denser START/CROSS after Soft-GS non-black + FRONTEND (pad cap 1024); no PATH3 sticky unmask (regressed path-sync → px=0) |
+| Claim 100M | **STG+TXD+FRONTEND** cdvd=**6584** gifP3=**491** dmac=424 prims=1407 **px=25594** dispfbPx=**24336** fragTest=1258 rejAlpha=1258 PC=`0x253FA0` binds=13 |
+| Heuristic | **NEAR?** (px>10000); logo-frontend Soft-GS chrome **YES** (SOP bar: non-black after FRONTEND/logo) |
+| Rejected | Sticky PATH3 unmask after assets; healthy-`$ra` flip-watermark thrash leave |
+| MENU | **logo-frontend Soft-GS YES** (px=25594); not claiming pad-interactive main menu |
+| Next | natural DISPFB; more prims/tex sample; optional pad-driven menu advance |
+

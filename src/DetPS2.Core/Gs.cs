@@ -113,6 +113,7 @@ public sealed class Gs : ISchedulable
         DispfbPixelsComposited = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
+        _lastCompositeImageBytes = 0;
         _localMemHasImage = false;
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
@@ -1142,6 +1143,11 @@ public sealed class Gs : ISchedulable
             _localMem[bi + 2] = (byte)(p >> 16);
             _localMem[bi + 3] = (byte)(p >> 24);
         }
+        if (n > 0)
+        {
+            ImageBytesWritten += (long)n * 4;
+            _localMemHasImage = true;
+        }
     }
 
     /// <summary>Upload 16-bit RGB555 texture (PSMCT16) into local GS memory.</summary>
@@ -1454,19 +1460,30 @@ public sealed class Gs : ISchedulable
     /// </summary>
     public ReadOnlySpan<uint> GetPresentSpan()
     {
-        if (PixelsWritten == 0 && _localMemHasImage)
+        // Wave-5: merge composite even after sparse prim paint so logo IMAGE under
+        // DISPFB/FRAME/FBP0 can still fill Soft-GS chrome (B3 early px blocked this).
+        if (_localMemHasImage)
             CompositeDispfbToFramebuffer();
         return _framebuffer;
     }
 
+    private long _lastCompositeImageBytes;
+
     /// <summary>
-    /// Copy DISPFB1/2 (else FRAME_1) local VRAM into the software present FB when raster
-    /// <see cref="PixelsWritten"/> is still 0. Returns non-black pixels written.
+    /// Copy DISPFB1/2 (else FRAME_1, else FBP=0 IMAGE) local VRAM into the software present FB.
+    /// When raster <see cref="PixelsWritten"/> is already &gt;0, only fills black Soft-GS
+    /// pixels (merge) so sparse AFAIL prims no longer block commercial logo IMAGE chrome.
     /// </summary>
     public long CompositeDispfbToFramebuffer()
     {
-        if (PixelsWritten > 0) return 0;
         if (!_localMemHasImage) return 0;
+
+        bool mergeMode = PixelsWritten > 0;
+        // Avoid re-scanning every host-present once a full merge already ran and IMAGE
+        // has not grown (1M-slice OnHostPresent).
+        if (mergeMode && DispfbPixelsComposited > 0
+            && ImageBytesWritten <= _lastCompositeImageBytes)
+            return 0;
 
         bool fromDispfb = Registers.DISPFB1 != 0 || Registers.DISPFB2 != 0;
         ulong fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1
@@ -1475,11 +1492,34 @@ public sealed class Gs : ISchedulable
         bool syntheticFb = false;
         if (fb == 0)
         {
-            if (ImageBytesWritten <= 0) return 0;
+            if (ImageBytesWritten <= 0 && !_localMemHasImage) return 0;
             fromDispfb = false;
             syntheticFb = true;
         }
 
+        long written = CompositeLocalToFb(fb, fromDispfb, syntheticFb, mergeMode);
+
+        // When DISPFB unset and FRAME is a high FBP (draw target), also try FBP=0 IMAGE
+        // page — commercial logo BITBLT often lands at page 0 while FRAME holds sparse UI.
+        if (!fromDispfb && !syntheticFb && ImageBytesWritten > 0
+            && (Registers.FRAME_1 & 0x1FF) != 0)
+        {
+            written += CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true, mergeMode: true);
+        }
+
+        if (written > 0)
+        {
+            PixelsWritten += written;
+            PrimitivesDrawn++;
+            DispfbPixelsComposited += written;
+            _lastCompositeImageBytes = ImageBytesWritten;
+        }
+        return written;
+    }
+
+    /// <summary>Inner local-mem → Soft-GS FB copy used by <see cref="CompositeDispfbToFramebuffer"/>.</summary>
+    private long CompositeLocalToFb(ulong fb, bool fromDispfb, bool syntheticFb, bool mergeMode)
+    {
         int fbp;
         int fbw;
         int psm;
@@ -1552,16 +1592,13 @@ public sealed class Gs : ISchedulable
                 }
 
                 if ((pixel & 0x00FFFFFF) == 0) continue;
-                _framebuffer[y * FB_WIDTH + x] = pixel | 0xFF000000;
+                int idx = y * FB_WIDTH + x;
+                // Merge: never overwrite prim/AFAIL chrome already on Soft-GS FB.
+                if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
+                    continue;
+                _framebuffer[idx] = pixel | 0xFF000000;
                 written++;
             }
-        }
-
-        if (written > 0)
-        {
-            PixelsWritten += written;
-            PrimitivesDrawn++;
-            DispfbPixelsComposited = written;
         }
         return written;
     }
