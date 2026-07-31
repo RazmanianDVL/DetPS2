@@ -4963,11 +4963,15 @@ public sealed class RealSifRpc
     {
         if (recvSize < 256 || sendSize < 16 || argBuf == 0) return false;
         uint w0 = mem.Read32(argBuf);
+        // Live: w0=0xFF4 buffer size; bulk w1=0x40; per-slot w1=0 and w2=stream index
+        // (indices climb past 128 to 0xFF at 50M — must not fall through to WriteGoeReply wipe).
         if (w0 is < 0x100 or > 0x10000) return false;
         uint w1 = mem.Read32(argBuf + 4);
         uint w2 = sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
-        if (w1 is >= 8 and <= 128) return true;
-        if (w1 == 0 && w2 <= 128) return true;
+        if (w1 is >= 8 and <= 256) return true;
+        if (w1 == 0 && w2 <= 512) return true;
+        // Also: sendSize 64/128 with buffer-size w0 alone is enough for this title.
+        if (sendSize is 64 or 128) return true;
         return false;
     }
 
