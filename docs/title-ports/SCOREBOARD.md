@@ -20,7 +20,7 @@
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
-> **Burnout 3 logo-frontend MENU YES** (wave-6 Soft-GS). Other titles still open.
+> **MENU YES 9/9** on tip `649846b` (Soft-GS truth, SEMA_STALL_YIELD OFF). Residual polish: richer chrome / pad deep menus still open on several titles.
 
 ## 9-title wave commits (`32b4e62..f807ab1`)
 
