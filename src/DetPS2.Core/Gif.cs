@@ -33,13 +33,16 @@ public sealed class Gif : ISchedulable
     private uint _pktNloop;      // PACKED/REGLIST: total loops; IMAGE: total QWs
     private uint _pktLoop;       // PACKED: completed loops; REGLIST: values written
     private uint _pktRegI;       // PACKED: reg index within current loop
-    private bool _pktEop;        // stop after this packet completes
+    private bool _pktEop;        // EOP on current tag (path free after packet drains)
+    private uint _pktPath;       // APATH that owns sticky mid-packet (1/2/3); GX-010
     private ulong _pktPartialQws; // telemetry: times a packet spanned Receive* calls
     private ulong _pktCompleted;
     private ulong _pktAborted;
     private ulong _abortNewDirect;
     private ulong _abortDirectTruncate;
     private ulong _abortOther;
+    private ulong _path2StalledByPath3; // Path2 xfer while Path3 owned sticky
+    private ulong _path3StalledByPath2; // Path3 xfer while Path2 owned sticky
     private string _lastAbortReason = "";
     private uint _lastTagFlg;
     private uint _lastTagNloop;
@@ -58,6 +61,10 @@ public sealed class Gif : ISchedulable
     private int _traceRingW;
     private int _traceRingCount;
     private bool? _traceGifCached;
+
+    // GX-011: private 1-QW buffer for FIFO DIRECT assembly (no EE poke).
+    private readonly uint[] _inlineQw = new uint[4];
+    private bool _inlineActive;
 
     // GIF I/O (0x10003000)
     private uint _ctrl;
@@ -122,6 +129,12 @@ public sealed class Gif : ISchedulable
     public ulong TagsCompletedImage => _tagsCompletedImage;
     public ulong TagsCompletedDisable => _tagsCompletedDisable;
     public int TraceRingCount => _traceRingCount;
+    /// <summary>Path (1/2/3) that owns the in-flight sticky packet; 0 if idle.</summary>
+    public uint PacketPath => _pktActive ? _pktPath : 0;
+    /// <summary>Path2 Receive* rejected because Path3 owned sticky (Play!-style arbitration).</summary>
+    public ulong Path2StalledByPath3 => _path2StalledByPath3;
+    /// <summary>Path3 Receive* held/stalled because Path2 owned sticky.</summary>
+    public ulong Path3StalledByPath2 => _path3StalledByPath2;
 
     /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
     public bool Path3MaskedByVif => _m3p;
@@ -163,6 +176,7 @@ public sealed class Gif : ISchedulable
         _pktCompleted = 0;
         _pktAborted = 0;
         _abortNewDirect = _abortDirectTruncate = _abortOther = 0;
+        _path2StalledByPath3 = _path3StalledByPath2 = 0;
         _lastAbortReason = "";
         _lastTagFlg = _lastTagNloop = _lastTagNreg = 0;
         _lastTagRegs = 0;
@@ -188,6 +202,7 @@ public sealed class Gif : ISchedulable
         _pktLoop = 0;
         _pktRegI = 0;
         _pktEop = false;
+        _pktPath = 0;
     }
 
     private bool TraceGifEnabled
@@ -228,21 +243,35 @@ public sealed class Gif : ISchedulable
     /// nloop=12301 sticky-swallowed later real PACKED A+D at 0x3969xx).
     /// Each commercial DIRECT is typically a self-contained Path2 unit (EOP packets sized
     /// to IMM); multi-DIRECT continuous IMAGE is Path3's job.
+    /// GX-010: VIF DIRECT boundaries must not abort Path3-owned sticky (Play! path arb).
     /// </summary>
     public void AbortIncompletePacket(string reason = "")
     {
         if (!_pktActive) return;
+        // Reduce harmful aborts: VIF DIRECT supersede/truncate is Path2-scoped.
+        // Do not clear Path3-owned sticky (Play! path arbitration).
+        if (_pktPath == 3 &&
+            (reason == "new-DIRECT" || reason == "DIRECT-end-truncate"))
+        {
+            if (TraceGifEnabled)
+            {
+                Console.Error.WriteLine(
+                    $"[GIF] skip Path2-boundary abort of Path3 sticky flg={_pktFlg} " +
+                    $"progress={_pktLoop}/{_pktNloop} reason={reason}");
+            }
+            return;
+        }
         _pktAborted++;
         _lastAbortReason = reason ?? "";
         if (reason == "new-DIRECT") _abortNewDirect++;
-        else if (reason == "DIRECT-end-truncated") _abortDirectTruncate++;
+        else if (reason == "DIRECT-end-truncate") _abortDirectTruncate++;
         else _abortOther++;
-        byte path = (byte)(_apath != 0 ? _apath : 2);
+        byte path = (byte)(_pktPath != 0 ? _pktPath : (_apath != 0 ? _apath : 2));
         RingPush(3, path, (byte)_pktFlg, 0, 0, _pktNloop);
         if (TraceGifEnabled)
         {
             Console.Error.WriteLine(
-                $"[GIF] abort in-flight flg={_pktFlg} progress={_pktLoop}/{_pktNloop} " +
+                $"[GIF] abort in-flight flg={_pktFlg} path={_pktPath} progress={_pktLoop}/{_pktNloop} " +
                 $"reason={reason} n={_pktAborted} completed={_pktCompleted}");
         }
         ClearPacketState();
@@ -367,6 +396,9 @@ public sealed class Gif : ISchedulable
                     _apath = 0;
                     _heldPath3Count = 0;
                     _heldPath3TotalQwc = 0;
+                    // GX-010: RST must drop sticky mid-packet so next path is not
+                    // swallowed as body data (Play! / PCSX2 clear path state on RST).
+                    ClearPacketState();
                 }
                 break;
             case 0x3010: // GIF_MODE
@@ -413,6 +445,22 @@ public sealed class Gif : ISchedulable
     public void ReceivePath3Data(uint address, uint qwc)
     {
         if (qwc == 0) return;
+        // GX-010: Path2-owned sticky — do not clobber mid-DIRECT as Path3 body (Play! stalls).
+        // Hold like M3P so real PATH3 is not invented and Path2 reassembly stays intact.
+        if (_pktActive && _pktPath == 2)
+        {
+            _path3StalledByPath2++;
+            _path3HeldSubmits++;
+            EnqueueHeldPath3(address, qwc);
+            RingPush(0, 3, 0xFF, 0x01, address, qwc);
+            if (TraceGifEnabled)
+            {
+                Console.Error.WriteLine(
+                    $"[GIF] Path3 STALL(path2-sticky) addr=0x{address:X8} qwc={qwc} " +
+                    $"heldN={_heldPath3Count} stalled={_path3StalledByPath2}");
+            }
+            return;
+        }
         _path3Transfers++;
         _path3Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path3->GS", address, 0, qwc * 16);
@@ -444,12 +492,27 @@ public sealed class Gif : ISchedulable
         }
         ProcessTransfer(address, qwc);
         _apath = 0;
+        // Path2 sticky finished during this call — drain any Path3 held for path2-stall.
+        if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
     }
 
     /// <summary>Path2 — from VIF1 DIRECT/HL. Sticky mid-packet across QW-sliced DMA.</summary>
     public void ReceivePath2Data(uint address, uint qwc)
     {
         if (qwc == 0) return; // match Path3: do not inflate transfer counts on empty feeds
+        // GX-010: Path3-owned sticky — do not feed Path2 QWs as Path3 body (Play! stalls Path2).
+        if (_pktActive && _pktPath == 3)
+        {
+            _path2StalledByPath3++;
+            if (TraceGifEnabled)
+            {
+                Console.Error.WriteLine(
+                    $"[GIF] Path2 STALL(path3-sticky) addr=0x{address:X8} qwc={qwc} " +
+                    $"stalled={_path2StalledByPath3} progress={_pktLoop}/{_pktNloop}");
+            }
+            return;
+        }
         _path2Transfers++;
         _path2Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
@@ -464,6 +527,42 @@ public sealed class Gif : ISchedulable
         }
         ProcessTransfer(address, qwc);
         _apath = 0;
+        // If Path2 sticky just finished, drain Path3 held during path2-stall.
+        if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
+    }
+    /// <summary>
+    /// GX-011: feed one assembled Path2 QW from VIF FIFO / partial DIRECT buffer
+    /// without requiring a contiguous EE address (Play! m_directQwordBuffer path).
+    /// Words are processed via a private inline buffer — no EE/SPR poke.
+    /// </summary>
+    public void ReceivePath2Quadword(uint w0, uint w1, uint w2, uint w3)
+    {
+        if (_pktActive && _pktPath == 3)
+        {
+            _path2StalledByPath3++;
+            return;
+        }
+        _path2Transfers++;
+        _path2Qws += 1;
+        _apath = 2;
+        RingPush(0, 2, 0xFF, (byte)(_pktActive ? 2 : 0), 0, 1);
+        _inlineQw[0] = w0;
+        _inlineQw[1] = w1;
+        _inlineQw[2] = w2;
+        _inlineQw[3] = w3;
+        _inlineActive = true;
+        try
+        {
+            ProcessTransfer(0, 1);
+        }
+        finally
+        {
+            _inlineActive = false;
+            _apath = 0;
+        }
+        if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
     }
 
     /// <summary>Path1 — VU1 XGKICK style: process tags from memory.</summary>
@@ -488,8 +587,8 @@ public sealed class Gif : ISchedulable
     /// <summary>
     /// Process an in-memory GIF stream. Sticky: if a prior call left a mid-packet
     /// (common when VIF1 feeds Path2 one QW at a time), continue that packet before
-    /// parsing a new GIFtag. EOP still ends the current logical stream once the
-    /// in-flight packet fully drains.
+    /// parsing a new GIFtag. GX-010: EOP frees the path after the packet drains, but
+    /// remaining QWs in the same transfer may start a new tag (Play! ProcessMultiplePackets).
     /// </summary>
     public void ProcessTransfer(uint address, uint qwc)
     {
@@ -561,11 +660,14 @@ public sealed class Gif : ISchedulable
                         _pktFlg = 3;
                         _pktNloop = nloop - skip;
                         _pktEop = eop;
+                        _pktPath = _apath != 0 ? _apath : _pktPath;
+                        _pktLoop = 0;
+                        _pktRegI = 0;
                     }
                     else
                     {
                         NotePacketCompleted(3);
-                        if (eop) break;
+                        // EOP frees path; more tags may follow in this transfer (Play!).
                     }
                     continue;
                 }
@@ -573,7 +675,7 @@ public sealed class Gif : ISchedulable
                 if (nloop == 0)
                 {
                     NotePacketCompleted(flg);
-                    if (eop) break;
+                    // EOP frees path; continue if remaining QWs hold another tag.
                     continue;
                 }
 
@@ -583,6 +685,7 @@ public sealed class Gif : ISchedulable
                 _pktLoop = 0;
                 _pktRegI = 0;
                 _pktEop = eop;
+                _pktPath = _apath != 0 ? _apath : 2; // default Path2 when apath unset
             }
 
             // Drain active packet body with available QWs.
@@ -605,7 +708,8 @@ public sealed class Gif : ISchedulable
             }
 
             NotePacketCompleted(flgBefore);
-            if (_pktEop) break;
+            // GX-010: do not break on EOP while remaining > 0 — next tag may follow
+            // in the same DIRECT/DMA buffer (Play! ProcessMultiplePackets loop).
         }
     }
 
@@ -697,8 +801,23 @@ public sealed class Gif : ISchedulable
         Span<byte> qw = stackalloc byte[16];
         while (remaining > 0 && _pktLoop < _pktNloop)
         {
-            for (int b = 0; b < 16; b++)
-                qw[b] = Memory.Read8(addr + (uint)b);
+            if (_inlineActive)
+            {
+                // Little-endian pack of the private Path2 QW (GX-011 FIFO DIRECT).
+                for (int i = 0; i < 4; i++)
+                {
+                    uint w = _inlineQw[i];
+                    qw[i * 4 + 0] = (byte)w;
+                    qw[i * 4 + 1] = (byte)(w >> 8);
+                    qw[i * 4 + 2] = (byte)(w >> 16);
+                    qw[i * 4 + 3] = (byte)(w >> 24);
+                }
+            }
+            else
+            {
+                for (int b = 0; b < 16; b++)
+                    qw[b] = Memory.Read8(addr + (uint)b);
+            }
             // dest offset for legacy fallback; TRX cursor owns commercial path
             _gs.WriteImageData(qw, (int)(_pktLoop * 16));
             addr += 16;
@@ -730,7 +849,12 @@ public sealed class Gif : ISchedulable
 
     private SystemMemory Memory => _gs.Memory;
 
-    private uint Read32(uint addr) => Memory.Read32(addr);
+    private uint Read32(uint addr)
+    {
+        if (_inlineActive)
+            return _inlineQw[(addr >> 2) & 3];
+        return Memory.Read32(addr);
+    }
 
     public int Step(ulong maxCycles)
     {

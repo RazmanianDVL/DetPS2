@@ -33,6 +33,13 @@ public sealed class Vif : ISchedulable
     private Gif? _gif;
     /// <summary>Remaining QWs expected by DIRECT/DIRECTHL (PATH2 → GIF).</summary>
     private uint _directRemaining;
+    /// <summary>Play!-style partial QW assembly for DIRECT via FIFO FeedData.</summary>
+    private readonly uint[] _directQwBuf = new uint[4];
+    private int _directQwWords;
+    /// <summary>Words to skip after DIRECT code until next QW boundary (FIFO mid-QW pad).</summary>
+    private int _directPadWords;
+    /// <summary>Running word phase 0..3 for FIFO stream alignment (GX-011).</summary>
+    private int _fifoWordPhase;
     private int _path2TraceLeft = 8;
 
     public ulong CommandsProcessed { get; private set; }
@@ -41,6 +48,10 @@ public sealed class Vif : ISchedulable
     public ulong MscalCount { get; private set; }
     /// <summary>Count of MSKPATH3 commands processed (diagnostics / smokes).</summary>
     public ulong MskPath3Count { get; private set; }
+    /// <summary>QWs still expected by active DIRECT/DIRECTHL (0 = idle).</summary>
+    public uint DirectRemaining => _directRemaining;
+    /// <summary>True while DIRECT is assembling a partial QW via FeedData.</summary>
+    public bool DirectPartialQw => _directQwWords > 0 || _directPadWords > 0;
     public uint Itop { get; private set; }
     public uint Base { get; private set; }
     public uint Cycle { get; private set; } = 0x0101;
@@ -79,6 +90,9 @@ public sealed class Vif : ISchedulable
         _unpackDest = 0;
         _unpackVnVl = 0;
         _directRemaining = 0;
+        _directQwWords = 0;
+        _directPadWords = 0;
+        _fifoWordPhase = 0;
         _path2TraceLeft = 8;
     }
 
@@ -158,9 +172,18 @@ public sealed class Vif : ISchedulable
                             $"gifInFlight={_gif?.PacketInFlight} code=0x{code:X8}");
                     }
                     _directRemaining = 0;
+                    _directQwWords = 0;
+                    _directPadWords = 0;
                     _gif?.AbortIncompletePacket("new-DIRECT");
                 }
                 _directRemaining = imm == 0 ? 65536u : imm;
+                // GX-011: residual words in the same QW as the DIRECT code are pad,
+                // not GIF (ps2tek / Play! stream alignment). FIFO path uses pad counter;
+                // ProcessStream uses address misalign skip (unchanged).
+                _directQwWords = 0;
+                // Phase of the DIRECT code word itself is current fifo phase;
+                // pad = words left in this QW after the code (0..3).
+                _directPadWords = (4 - ((_fifoWordPhase + 1) & 3)) & 3;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1")
                 {
                     Console.Error.WriteLine(
@@ -232,8 +255,32 @@ public sealed class Vif : ISchedulable
             return;
         }
 
+        // GX-011: DIRECT Path2 FIFO (Play! m_directQwordBuffer). Pad to QW, then assemble
+        // 4 words → ReceivePath2Quadword. IMM=0 already latched as 65536 QWs.
+        if (_directRemaining > 0 && _gif != null)
+        {
+            if (_directPadWords > 0)
+            {
+                _directPadWords--;
+                _fifoWordPhase = (_fifoWordPhase + 1) & 3;
+                return;
+            }
+            _directQwBuf[_directQwWords++] = word;
+            _fifoWordPhase = (_fifoWordPhase + 1) & 3;
+            if (_directQwWords < 4)
+                return;
+            _gif.ReceivePath2Quadword(
+                _directQwBuf[0], _directQwBuf[1], _directQwBuf[2], _directQwBuf[3]);
+            _directQwWords = 0;
+            _directRemaining--;
+            if (_directRemaining == 0 && _gif.PacketInFlight)
+                _gif.AbortIncompletePacket("DIRECT-end-truncate");
+            return;
+        }
+
         // Idle VIF: FIFO poke is a command word (matches DMAC ProcessStream path).
         ProcessVifCode(word);
+        _fifoWordPhase = (_fifoWordPhase + 1) & 3;
     }
 
     /// <summary>Process a stream of VIF words from memory (tag + data).</summary>
@@ -249,6 +296,9 @@ public sealed class Vif : ISchedulable
             // GIFtag (GoW residual: flg=IMAGE nloop=20586 at 0x…BE8C, FRAME never seen).
             if (_directRemaining > 0 && _gif != null)
             {
+                // Address-based mid-QW pad owns alignment; FIFO pad/partial not used here.
+                _directPadWords = 0;
+                _directQwWords = 0;
                 uint byteAddr = address + i * 4;
                 uint misalign = byteAddr & 15u;
                 if (misalign != 0)
