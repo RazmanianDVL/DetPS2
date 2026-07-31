@@ -463,6 +463,9 @@ public sealed class Ps2System
                     or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait
                     or (>= 0x00233AD0UL and <= 0x00233B44UL)
                     or (>= 0x00284600UL and <= 0x00284B00UL)  // soft-float + wrappers (0x2849C4 heat)
+                    or (>= 0x00292C00UL and <= 0x00293000UL)  // wave-8 soft-float mid-body thrash
+                    or (>= 0x00289A00UL and <= 0x00289C00UL)  // wave-8 MMI memcmp thrash
+                    or (>= 0x0026BFB0UL and <= 0x0026BFC8UL)  // wave-8 post-worker size hang
                     or (>= 0x00155AB0UL and <= 0x00156400UL)  // table-index + post-table residual (0x156324)
                     or (>= 0x001390F0UL and <= 0x00139114UL)  // huge byte-sum
                     or (>= 0x0023E7C0UL and <= 0x0023E7F0UL)  // align-zero poison a0
