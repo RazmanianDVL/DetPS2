@@ -56,6 +56,13 @@ namespace DetPS2.Core;
 /// toward INTERACTIVE (T2 / P1). WaitSema pulse stays <b>title-local</b> (WHIP-gated only);
 /// never global WaitSema fabricate.
 /// </para>
+///
+/// <para>
+/// S2 / PL-033: progressive texture ring fill into EE <c>0x45BC94</c> (live setup packet
+/// ring pointer) from GOE/RKV firstscreen+frontend so Soft-GS can sample richer title
+/// chrome (imgBytes/prims residual toward G-GFX). Shared RealSifRpc ring service remains;
+/// assist supplements when RPC cadence stalls. No invent PATH3 / no global WaitSema.
+/// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
 {
@@ -112,6 +119,14 @@ public sealed class WhiplashAssist : IGameQuirkModule
     private bool _titleSurfaceWarmed;
     private int _titleSurfaceKicks;
     private int _padInjectPulses;
+    /// <summary>PL-033 EE title ring base (live stream-table setup packet +0x1C).</summary>
+    public const uint TitleRingBase = 0x0045BC94;
+    /// <summary>Ring capacity word from stream-table (0xFF4 class).</summary>
+    public const uint TitleRingChunk = 0xFF4u;
+    private long _ringBytesFilled;
+    private int _ringFillKicks;
+    private ulong _lastRingFillCyc;
+    private readonly Dictionary<string, long> _ringMemberPos = new(StringComparer.OrdinalIgnoreCase);
 
     public void Reset()
     {
@@ -127,6 +142,10 @@ public sealed class WhiplashAssist : IGameQuirkModule
         _titleSurfaceWarmed = false;
         _titleSurfaceKicks = 0;
         _padInjectPulses = 0;
+        _ringBytesFilled = 0;
+        _ringFillKicks = 0;
+        _lastRingFillCyc = 0;
+        _ringMemberPos.Clear();
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -253,12 +272,20 @@ public sealed class WhiplashAssist : IGameQuirkModule
             MaybeEscapeDataThrash(sys, pc, c);
 
         // Host-open PS2.RKV for first-title cdvd surface once past CD_NCMD.
-        if (!_rkvWarmed && c >= 2_000_000 && _flushRescues > 0)
+        // Tip often skips FlushCache rescue while still loading GOE — arm on post-reboot alone.
+        if (!_rkvWarmed && c >= 2_000_000 && (_flushRescues > 0 || c >= 3_000_000))
             MaybeWarmPs2Rkv(sys, c);
 
         // After IRX + GOE, warm title-surface names and credit GS/VIF so PATH3 can drain.
-        if (c >= 4_000_000 && _rkvWarmed)
+        // Also arm when Soft-GS / cdvd already live (FlushCache rescue may be skipped on tip).
+        if (c >= 4_000_000 && (_rkvWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 100UL))
             MaybeWarmTitleSurface(sys, c);
+
+        // PL-033: progressive firstscreen/frontend ring fill into EE 0x45BC94.
+        // Gate on Soft-GS / disc activity — do not require assist RKV warm (GOE bridge may own it).
+        if (c >= 5_000_000
+            && (_titleSurfaceWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 200UL))
+            MaybeFillTitleRing(sys, c);
 
         // PL-018: pad inject once post-reboot title path is live (Soft-GS or GOE/cdvd).
         // Keep WHIP WaitSema title-local; no global fabricate.
@@ -367,6 +394,152 @@ public sealed class WhiplashAssist : IGameQuirkModule
             }
             catch { /* ignore */ }
         }
+    }
+
+    /// <summary>
+    /// PL-033: push next ring-sized chunk into EE title ring (<see cref="TitleRingBase"/>).
+    /// Prefers the GOE Open+Start high-RDRAM dump (RealSifRpc bridge destBase 0x01C00000,
+    /// SlotStride 640 KiB: Code / firstscreen / frontend) — honest already-streamed RKV
+    /// bytes, no synthetic pixels. Falls back to disc path open when dump looks empty.
+    /// Caps at ~768 KiB total.
+    /// </summary>
+    private void MaybeFillTitleRing(Ps2System sys, ulong c)
+    {
+        // Throttle: one chunk per ~150k cycles; enough to drain firstscreen (~180 KiB / 0xFF4).
+        if (_lastRingFillCyc != 0 && c - _lastRingFillCyc < 150_000UL)
+            return;
+        if (_ringBytesFilled >= 768 * 1024)
+            return;
+
+        uint ringPtr = TitleRingBase;
+        try
+        {
+            foreach (uint probe in new uint[] { 0x0045BC80, 0x0044FBC0, 0x0045BC00 })
+            {
+                if (probe + 0x20 >= SystemMemory.RDRAM_SIZE) continue;
+                for (uint off = 0; off < 0x40; off += 4)
+                {
+                    uint cand = sys.Memory.Read32(probe + off) & 0x1FFFFFFFu;
+                    if (cand is >= 0x00450000 and <= 0x00470000
+                        && cand + TitleRingChunk <= SystemMemory.RDRAM_SIZE)
+                    {
+                        ringPtr = cand;
+                        break;
+                    }
+                }
+            }
+        }
+        catch { /* keep default */ }
+
+        if (ringPtr + TitleRingChunk > SystemMemory.RDRAM_SIZE)
+            return;
+
+        // GOE bridge layout (RealSifRpc.BridgeWhipGoeOpenStart): streamIdx * 640KiB @ 0x1C00000.
+        // Prefer firstscreen (1) then frontend (2) then Code (0) — title chrome first.
+        const uint DestBase = 0x01C00000u;
+        const uint SlotStride = 640u * 1024;
+        // Approx member caps matching MaxStart bridge (firstscreen ~180K, frontend ~1.2M capped).
+        (string name, int streamIdx, uint maxBytes)[] order =
+        {
+            ("firstscreen", 1, 256u * 1024),
+            ("frontend", 2, 512u * 1024),
+            ("Code", 0, 256u * 1024),
+        };
+
+        foreach (var (name, streamIdx, maxBytes) in order)
+        {
+            long pos = _ringMemberPos.TryGetValue(name, out long p) ? p : 0;
+            if (pos >= maxBytes) continue;
+
+            uint srcBase = DestBase + (uint)streamIdx * SlotStride;
+            if (srcBase + TitleRingChunk > SystemMemory.RDRAM_SIZE) continue;
+
+            // Detect empty dump: first QW all zero → try next member / FILEIO fallback.
+            uint w0 = sys.Memory.Read32(srcBase);
+            uint w1 = sys.Memory.Read32(srcBase + 4);
+            if (w0 == 0 && w1 == 0 && pos == 0)
+            {
+                // FILEIO fallback for disc-exposed names (rare; most live only in RKV).
+                if (!TryRingFillFromDisc(sys, name, ringPtr, ref pos, c))
+                    continue;
+                _ringMemberPos[name] = pos;
+                return;
+            }
+
+            uint want = (uint)Math.Min((long)TitleRingChunk, maxBytes - pos);
+            if (want == 0) continue;
+            uint src = srcBase + (uint)pos;
+            if (src + want > SystemMemory.RDRAM_SIZE) continue;
+
+            // Copy EE→EE (already honest GOE Start payload).
+            for (uint i = 0; i + 4 <= want; i += 4)
+                sys.Memory.Write32(ringPtr + i, sys.Memory.Read32(src + i));
+            for (uint i = want & ~3u; i < want; i++)
+                sys.Memory.Write8(ringPtr + i, sys.Memory.Read8(src + i));
+
+            _ringMemberPos[name] = pos + want;
+            _ringBytesFilled += want;
+            _ringFillKicks++;
+            _lastRingFillCyc = c;
+            // Token sector credit so claim cdvd reflects ring drain progress.
+            sys.Cdvd.NoteHostReadSectors(Math.Max(1, (int)((want + 2047) / 2048)));
+            _hostWarmSectors += Math.Max(1, (int)((want + 2047) / 2048));
+
+            if (_ringFillKicks <= 4 || (_ringFillKicks % 8) == 0)
+            {
+                try
+                {
+                    sys.Intc.Raise(Intc.InterruptSource.GS);
+                    sys.Intc.Raise(Intc.InterruptSource.Vif1);
+                }
+                catch { /* ignore */ }
+            }
+
+            if (TraceWhip && (_ringFillKicks <= 4 || _ringFillKicks % 16 == 0))
+                Console.Error.WriteLine(
+                    $"[WHIP] ring fill #{_ringFillKicks} \"{name}\" src=0x{src:X8} dest=0x{ringPtr:X8} " +
+                    $"n={want} pos={pos + want}/{maxBytes} total={_ringBytesFilled} " +
+                    $"px={sys.Gs.PixelsWritten} cyc={c}");
+            return;
+        }
+    }
+
+    private bool TryRingFillFromDisc(Ps2System sys, string name, uint ringPtr, ref long pos, ulong c)
+    {
+        string[] paths =
+        {
+            $@"cdrom0:\WHIPLASH\{name.ToUpperInvariant()}",
+            $@"cdrom0:\WHIPLASH\{name}",
+            $@"cdrom0:\{name}",
+        };
+        int fd = -1;
+        foreach (var path in paths)
+        {
+            fd = sys.IopModules.FileOpen(path, 1);
+            if (fd >= 0) break;
+        }
+        if (fd < 0) return false;
+        sys.IopModules.TryGetOpenFileSize(fd, out uint sz);
+        if (sz == 0 || pos >= sz)
+        {
+            try { sys.IopModules.FileClose(fd); } catch { /* ignore */ }
+            return false;
+        }
+        uint want = (uint)Math.Min((long)TitleRingChunk, sz - pos);
+        try { sys.IopModules.FileSeek(fd, (int)pos, 0); } catch { /* ignore */ }
+        int n = sys.IopModules.FileRead(sys.Memory, fd, ringPtr, want);
+        try { sys.IopModules.FileClose(fd); } catch { /* ignore */ }
+        if (n <= 0) return false;
+        pos += n;
+        _ringBytesFilled += n;
+        _ringFillKicks++;
+        _lastRingFillCyc = c;
+        sys.Cdvd.NoteHostReadSectors((n + 2047) / 2048);
+        _hostWarmSectors += (n + 2047) / 2048;
+        if (TraceWhip && _ringFillKicks <= 4)
+            Console.Error.WriteLine(
+                $"[WHIP] ring fill disc #{_ringFillKicks} \"{name}\" n={n} total={_ringBytesFilled} cyc={c}");
+        return true;
     }
 
     private static bool TraceWhip =>
