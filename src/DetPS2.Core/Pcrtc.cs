@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -40,6 +41,21 @@ public sealed class Pcrtc : ISchedulable
     {
         _gs.SaveFramebufferAsPPM(filename);
         FrameCount++;
+    }
+
+    /// <summary>
+    /// GX-002 helper: write Soft-GS PPM only when raster px&gt;0 (claim-friendly dump).
+    /// Returns false when nothing has been drawn (avoids empty black claim artifacts).
+    /// </summary>
+    public bool DumpSoftGsIfDrawn(string filename)
+    {
+        if (_gs.PixelsWritten <= 0) return false;
+        string? dir = Path.GetDirectoryName(filename);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        _gs.SaveFramebufferAsPPM(filename);
+        FrameCount++;
+        return true;
     }
 
     public void PresentFrame()

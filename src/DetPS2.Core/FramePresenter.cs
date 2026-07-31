@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -37,6 +38,31 @@ public sealed class SoftwareFramePresenter : IFramePresenter
         LastFrame = null;
         PresentCount = 0;
         Width = Height = 0;
+    }
+
+    /// <summary>
+    /// Write last software present snapshot as PPM (display path). Soft-GS claim truth
+    /// remains <see cref="Gs.SaveFramebufferAsPPM"/> / <c>--dump-softgs</c>.
+    /// </summary>
+    public bool TryDumpLastFramePpm(string path)
+    {
+        if (LastFrame == null || Width <= 0 || Height <= 0) return false;
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        using var writer = new StreamWriter(path);
+        writer.WriteLine("P3");
+        writer.WriteLine($"{Width} {Height}");
+        writer.WriteLine("255");
+        for (int y = 0; y < Height; y++)
+        {
+            for (int x = 0; x < Width; x++)
+            {
+                uint p = LastFrame[y * Width + x];
+                writer.WriteLine($"{(p >> 16) & 0xFF} {(p >> 8) & 0xFF} {p & 0xFF}");
+            }
+        }
+        return true;
     }
 }
 

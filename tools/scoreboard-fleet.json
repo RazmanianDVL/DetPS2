@@ -1,11 +1,26 @@
 {
   "description": "Default commercial menu campaign fleet for tools/scoreboard.ps1",
+  "schema": "tools/SCOREBOARD_SCHEMA.md",
+  "schemaVersion": 2,
+  "tiers": {
+    "play": ["T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7"],
+    "gfx": ["G1", "G2", "G3", "G4"],
+    "notes": "Heuristic stubs OK until pad-inject (T2), gameplay charters (T5–T6), IRX flags (T7). Soft-GS truth only."
+  },
+  "metrics": [
+    "px", "prims", "gifP1", "gifP2", "gifP3", "imgBytes", "dispfbPx",
+    "expandHits", "gifCompleted", "gifAborted", "dmac", "cdvdSectors"
+  ],
   "defaultCycles": {
     "diagnose": 20000000,
     "verify": 50000000,
     "claim": 100000000
   },
   "hostPresent": true,
+  "dumpSoftGs": {
+    "flag": "--dump-softgs=path",
+    "when": "px>0"
+  },
   "titles": [
     {
       "id": "mk-shaolin-monks",

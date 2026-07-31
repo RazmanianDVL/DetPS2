@@ -4,10 +4,11 @@ Faster commercial bring-up without blind 150M runs. Soft-GS metrics do **not** r
 
 | Script | Purpose |
 |--------|---------|
-| **`scoreboard.ps1`** | Multi-title Soft-GS metrics table → `out/traces/scoreboard-*.md` + `.json` |
+| **`scoreboard.ps1`** | Multi-title Soft-GS metrics + **T0–T7 / G1–G4** → `out/traces/scoreboard-*.md` + `.json` |
+| **`SCOREBOARD_SCHEMA.md`** | Claim field + tier schema (PL-001 / GX-001/002) |
 | **`run-title.ps1`** | One title at diagnose/verify/claim cycle budget |
 | **`play-lookup.ps1`** | Play! GameConfig + wall→source map (`C:\Windows\Play`) |
-| **`scoreboard-fleet.json`** | Default fleet list + serials + media JSON names |
+| **`scoreboard-fleet.json`** | Default fleet list + serials + media JSON names + tier schema pointer |
 | **`pine-helper.ps1`** | Locate PCSX2, check/write PINE config, optional `-batch` ISO boot |
 | **`pin-gpu.ps1`** | List adapters + pin exe to high-performance dGPU (UserGpuPreferences) |
 | **`nas-media.ps1`** | Probe PS2 dump library UNC, list/search ISOs, scaffold `user-media-*.json` |
@@ -54,8 +55,16 @@ pwsh ./tools/run-title.ps1 -Media user-media-mk.json -Budget diagnose
 # Full fleet diagnose (expects media JSON + ISOs):
 pwsh ./tools/scoreboard.ps1 -Budget diagnose
 
+# Native JSON metrics + optional Soft-GS PPM dump dir (px>0 only):
+pwsh ./tools/scoreboard.ps1 -Budget diagnose -NativeMetrics -DumpSoftGsDir out/traces/softgs `
+  -Titles mk-shaolin-monks,god-of-war
+
 # Subset after a fix:
 pwsh ./tools/scoreboard.ps1 -Budget verify -Titles mk-shaolin-monks,burnout-3,god-of-war
+
+# Schema (T0–T7, G1–G4, claim fields):
+#   tools/SCOREBOARD_SCHEMA.md
+
 
 # Fixed four-title regression matrix:
 pwsh ./tools/regression-matrix.ps1 -Budget diagnose

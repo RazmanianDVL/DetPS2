@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 
 namespace DetPS2.Core;
 
@@ -45,5 +46,30 @@ public sealed class GsPipeline
         else
             _pcrtc.PresentFrame();
         FramesPresented++;
+    }
+
+    /// <summary>
+    /// GX-002: dump Soft-GS framebuffer as PPM when any pixels have been written.
+    /// Returns true if a file was written; false if px==0 (no dump / black-only skip).
+    /// Host present is never the truth source — this always uses software GS.
+    /// </summary>
+    public bool DumpSoftGsIfDrawn(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        if (_gs.PixelsWritten <= 0) return false;
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        _gs.SaveFramebufferAsPPM(path);
+        return true;
+    }
+
+    /// <summary>Always dump Soft-GS PPM (even if black) — diagnostics only.</summary>
+    public void DumpSoftGs(string path)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        _gs.SaveFramebufferAsPPM(path);
     }
 }

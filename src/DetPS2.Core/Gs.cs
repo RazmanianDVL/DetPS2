@@ -72,6 +72,11 @@ public sealed class Gs : ISchedulable
     public long ImageBytesWritten { get; private set; }
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
+    /// <summary>
+    /// Soft-GS title-strip expand rescues (ofx/thin-sprite → full FB). Metric for G4/T4 demotion
+    /// (PL-003 / GX-004 refine legal conditions; S10 surfaces the counter for claims).
+    /// </summary>
+    public long ExpandHits { get; private set; }
     /// <summary>Fragments rejected for FB bounds (before scissor).</summary>
     public long FragmentsRejectedBounds { get; private set; }
     /// <summary>Fragments rejected by SCISSOR_1.</summary>
@@ -129,6 +134,7 @@ public sealed class Gs : ISchedulable
         _trxPartial = 0;
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
+        ExpandHits = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
         RegWritesTotal = RegWritesPrim = RegWritesXyz2 = RegWritesXyz3 = RegWritesXyzf2 = 0;
@@ -711,7 +717,10 @@ public sealed class Gs : ISchedulable
             int sw = Math.Clamp(w, 1, FB_WIDTH);
             int sh = Math.Clamp(h, 1, FB_HEIGHT);
             if (titleStrip)
+            {
                 sh = FB_HEIGHT;
+                ExpandHits++;
+            }
             minX = 0; minY = 0;
             maxX = sw; maxY = sh;
             x0 = 0; y0 = 0;
@@ -721,6 +730,7 @@ public sealed class Gs : ISchedulable
         else if (titleStrip)
         {
             // Partially on-FB one-row (WAVE-6 Y=0 rescue): still expand to full title FB.
+            ExpandHits++;
             minX = 0; minY = 0;
             maxX = FB_WIDTH; maxY = FB_HEIGHT;
             x0 = 0; y0 = 0;

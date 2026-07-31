@@ -110,6 +110,16 @@ function Get-Metric([string]$pattern, [string]$src) {
     return ""
 }
 
+# Prefer compact claim: line (PL-001 / GX-001) when present; fall back to legacy fields.
+$claimLine = (Get-Metric '(?m)^\s*claim:\s*(.+)$' $joined)
+function Claim-Or([string]$claimKey, [string]$fallbackPattern) {
+    if ($claimLine) {
+        $cm = [regex]::Match($claimLine, "$claimKey=([0-9]+)", "IgnoreCase")
+        if ($cm.Success) { return $cm.Groups[1].Value }
+    }
+    return (Get-Metric $fallbackPattern $joined)
+}
+
 $result = [ordered]@{
     media       = $Media
     budget      = $Budget
@@ -119,8 +129,16 @@ $result = [ordered]@{
     titleId     = (Get-Metric '\[([^\]]+)\] Booted' $joined)
     bootSerial  = (Get-Metric 'Booted ([^\s]+)' $joined)
     pc          = (Get-Metric 'PC=(0x[0-9A-Fa-f]+)' $joined)
-    px          = (Get-Metric 'px=([0-9]+)' $joined)
-    gifPath3    = (Get-Metric 'gifPath3=([0-9]+)' $joined)
+    px          = (Claim-Or 'px' 'px=([0-9]+)')
+    prims       = (Claim-Or 'prims' 'prims=([0-9]+)')
+    gifPath1    = (Claim-Or 'gifP1' 'gifPath1=([0-9]+)')
+    gifPath2    = (Claim-Or 'gifP2' 'gifPath2=([0-9]+)')
+    gifPath3    = (Claim-Or 'gifP3' 'gifPath3=([0-9]+)')
+    imgBytes    = (Claim-Or 'imgBytes' 'imgBytes=([0-9]+)')
+    dispfbPx    = (Claim-Or 'dispfbPx' 'dispfbPx=([0-9]+)')
+    expandHits  = (Claim-Or 'expandHits' 'expandHits=([0-9]+)')
+    gifCompleted = (Claim-Or 'gifCompleted' 'completed=([0-9]+)')
+    gifAborted  = (Claim-Or 'gifAborted' 'aborted=([0-9]+)')
     dmac        = (Get-Metric 'dmac=([0-9]+)' $joined)
     cdvd        = (Get-Metric 'cdvdSectors=([0-9]+)' $joined)
     syscalls    = (Get-Metric 'syscalls=([0-9]+)' $joined)
