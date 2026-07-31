@@ -1124,10 +1124,9 @@ public sealed class SonyKernelHle
                         }
                         else if (_system.ActiveQuirk is WhiplashAssist)
                         {
-                            // WHIP_SEMA_FIX_V2 (title-local): multi-thread soft-signal for SN seq
-                            // + SIF worker. Global always-fabricate (wave-1 whip merge) starved
-                            // GoW SIF-cmd WaitSema(3) — 0.5M fabricate thrash @20M with binds=0
-                            // and blocked MOD_LOAD/cdvd (agent/menu-gow-w2, tip 3748553).
+                            // WHIP only: always soft-signal SN seq WaitSema (multi-thread GAME.INI path).
+                            // Must NOT apply to all titles — that starved GoW/Dec SIF-cmd WaitSema(3)
+                            // (fabricate thrash, binds=0 / DEVCTL storm). agent/menu-gow-w2 + dec-w2.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
                             if (_kernel.ThreadCount < 2)
@@ -1137,9 +1136,8 @@ public sealed class SonyKernelHle
                         }
                         else if (!_kernel.TryYieldToOtherRunnable(ee))
                         {
-                            // SHARED (pre-WHIP): yield to peer when possible; only if alone and
-                            // no matching SIF RPC pending — park on VBlank then soft-signal.
-                            // Restores GoW DualInfo/MOD_LOAD path past empty SIF poll thrash.
+                            // SHARED: yield to peer first; fabricate only when alone.
+                            // Restores GoW MOD_LOAD/cdvd and Dec PADDATAEX residual past WaitSema(3).
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no matching RPC / no runnable thread)");
                             _kernel.WaitSemaVblank();
