@@ -245,6 +245,43 @@ public static class SmokeTests
         Console.WriteLine($"[Smoke] Gs_Xyz2_Kicks_Xyz3_DoesNot OK (px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn})");
     }
 
+    /// <summary>
+    /// Wave-5: sparse prim paint must not block DISPFB/FBP0 IMAGE merge composite
+    /// (B3 early AFAIL prims left logo IMAGE invisible on Soft-GS).
+    /// </summary>
+    public static void Gs_MergeComposite_AfterSparsePrims()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.DrawQuad(0, 0, 2, 2, 0xFFFF0000);
+        long sparse = sys.Gs.PixelsWritten;
+        if (sparse <= 0) throw new Exception("expected sparse prim px");
+        // Host→Local BITBLT into FBP=0 with DBW=640 so composite swizzle matches.
+        sys.Gs.WriteGsRegister(0x50, (10UL << 16) | (10UL << 48)); // SBW=10 DBW=10
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 64UL | (64UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0); // Host→Local
+        var blob = new byte[64 * 64 * 4];
+        for (int i = 0; i < 64 * 64; i++)
+        {
+            blob[i * 4] = 0xFF;     // B
+            blob[i * 4 + 1] = 0x00; // G
+            blob[i * 4 + 2] = 0x00; // R
+            blob[i * 4 + 3] = 0xFF; // A
+        }
+        sys.Gs.WriteImageData(blob, 0);
+        long merged = sys.Gs.CompositeDispfbToFramebuffer();
+        if (merged <= 0)
+            throw new Exception($"expected merge composite after sparse prims, got {merged}");
+        uint p0 = sys.Gs.GetPixel(0, 0);
+        if ((p0 & 0xFFFFFF) != 0xFF0000)
+            throw new Exception($"prim pixel overwritten: 0x{p0:X8}");
+        uint pFar = sys.Gs.GetPixel(32, 32);
+        if ((pFar & 0xFFFFFF) != 0x0000FF)
+            throw new Exception($"expected merge blue at (32,32), got 0x{pFar:X8}");
+        Console.WriteLine($"[Smoke] Gs_MergeComposite_AfterSparsePrims OK (sparse={sparse} merged={merged})");
+    }
+
     /// <summary>ZTE=0 must not soft-depth-reject overdraw.</summary>
     public static void Gs_DepthDisabled_AllowsOverdraw()
     {
@@ -912,6 +949,7 @@ public static class SmokeTests
             Gs_DepthTest_RejectsFar();
             Gs_Modulate80_AlphaTestPasses();
             Gs_Xyz2_Kicks_Xyz3_DoesNot();
+            Gs_MergeComposite_AfterSparsePrims();
             Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();
             Gs_TextureSample_NonUniform();
