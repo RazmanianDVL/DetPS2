@@ -8,83 +8,80 @@
 | **ISO** | `C:/Users/xxraz/Downloads/GodofWar(USA).iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w10` |
-| **Branch** | `agent/menu-gow-w10` |
+| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-gow-w11c` |
+| **Branch** | `agent/menu-gow-w11c` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **Wave-10 residual:** real 0x27DBF0 hang-escape + no 989snd stomp of LoadWad streamObj; GIF DMA tag builders (0x13F5xx) allowed; **MENU NO** — Soft-GS **px=0 gifPath3=0 FRAME_1=0** (Path3MaskedByVif held; shell decode→FRAME+PRIM wall) |
+| **Status** | **Wave-11C Soft-GS:** Path2 sticky reassembly + DIRECT QW pad + DIRECT supersede abort → **px=1026 prims=2 FRAME_1≠0** (Path2 truth). MENU NO — shell/PATH3 residual. |
 | **Last updated** | 2026-07-31 |
 
 ### MENU gate
 
 **first-gs-interactive** = Soft-GS **px>0 non-black** + pad interactive surface — **not** MK MAINMENU.
 
-### Wave-10 evidence (agent/menu-gow-w10)
+### Wave-11C evidence (agent/menu-gow-w11c) — Soft-GS Path2
+
+#### Root cause (why FRAME_1=0 / prims=0 at gifP2=1082)
+
+1. **VIF1 QW-sliced Path2** delivered one QW per `ReceivePath2Data` → GIFtag consumed, PACKED body dropped (sticky reassembly fix).
+2. **DIRECT mid-QW** started Path2 at `addr&0xF!=0` → garbage IMAGE/REGLIST tags (QW-align pad fix).
+3. **First DIRECT IMM=0xBF0** at `0x46BE90` was non-GIF payload (`A90BB00D…`). Sticky REGLIST `nloop=12301` **swallowed later real PACKED A+D** at `0x3969xx` (`NLOOP=13 REGS=A+D`, FRAME/SCISSOR/TEST/XYOFFSET/XYZ2). Fix: abort incomplete GIF packet on new DIRECT / DIRECT-end truncate.
+
+XYZ2 kick map already global (DA WAVE-5). **No invent PATH3.** Rejection counters: `fragTest=1026 rejBounds=0 rejScissor=0 rejDepth=0 rejAlpha=0` — paint not AFAIL/TEST blocked.
 
 #### Claim 100M (SEMA_STALL_YIELD OFF) — Soft-GS
 
 ```
-@100M: PC=0x17ED70 px=0 gifPath2=1082 gifPath3=0 dmac=28 spu2Samples=32552
-       cdvdSectors=1202 (full R_SHELL+TIT1 host × pre-type2)
-       type-2: force 0x27DBF0 @40.0M → hang-escape n=1 @40.55M → complete success
-               dbf0Esc=1 shellOk=True resWas=0 (no permanent soft-ok plant)
-       R_SHELL.WAD full 0xBAA95 @0x01E00000 Fedo magic 0x4665646F OK (pre-type2)
-       TIT1E1_2.VPK @0x01D00000; LoadWad bind seed shellOk=True *obj=0x100 magic
-       softgs-regs: FRAME_1=0 DISPFB1=0x800005090D0 SCISSOR full XYOFFSET=0 TEST=0
-       prims=0 fragTest=0 — Path2 setup only (no XYZ kick / no FRAME write)
-       *0x310384 posts after type-2: none (cmd stays 0; no invented type-3/4)
-       989snd done-magic: refused on streamObj/Fedo (pending paints real recv only)
-       threads all Started; final PC list-walk 0x17EDxx (not mid-pack 0x26C3A4)
-       Path3MaskedByVif + high-TADR END held
+@100M: PC=0x13F5F8 px=1026 prims=2 gifPath2=19 gifPath3=0 p2qws=1082 dmac=28
+       softgs: imgBytes=0 dispfbPx=0 fragTest=1026 rejBounds=0 rejScissor=0 rejDepth=0 rejAlpha=0
+       softgs-regs: FRAME_1=0x80000 DISPFB1=0x800005090D0 SCISSOR=0x019F000001FF0000
+                    XYOFFSET=0x730000007000 TEST=0x50000
+       softgs-writes: total=1924 PRIM=1230 XYZ2=4 XYZ3=245 FRAME=13 SCISSOR=13 TEST=13 XYOFF=13
+       gif-pkts: completed=18 aborted=1 spannedCalls=1 inFlight=False tags=19
+       Path2: real PACKED A+D setup + XYZ2 kicks (no PATH3 invent)
+       cdvdSectors=142 (IRX-only class this run; stream residual separate from Soft-GS px)
 ```
 
-Wave-10 assist changes:
+Wave-11C core changes (`Gif.cs` / `Vif.cs` / `Dmac.cs` / `Gs.cs`):
 
-1. **Disasm 0x26C3A4** = stream-work mid-pack **byte-copy** (not GIF). Size gate s0&lt;513; *obj is counter starting at magic 0x100, incremented by 0x26C478.
-2. **Stop rehoming 0x13F540..0x13F6A8** as thrash — retail GIF/VIF **DMA tag builder** (QWC patch + END 0x70000000). Prior "sleep-cmd" escape killed FRAME chain finalize.
-3. **Do not RefreshLoadWadStreamTable mid pack-producer** 0x26C150..0x26C470 (was resetting *obj counter → re-entry thrash).
-4. **Refuse 989snd done-magic** on LoadWad streamObj / host Fedo/TIT1 windows (w9b regress restored).
-5. **Real 0x27DBF0 force-entry** with a1/s6 status (not 0x27E234 with s6=0 which **skips** jal 0x27DBF0) + hang-escape after 50k → post-jal 0x27E258.
-6. **No invent type-3/4**; post-type2 SignalSema wake only. Retail posters at 0x27C4xx still never re-arm *0x310384.
-7. Path3MaskedByVif **held**.
+1. GIF sticky mid-packet reassembly across Path2 `Receive*` calls.
+2. VIF DIRECT pad to next QW before Path2 feed.
+3. New DIRECT / DIRECT-end aborts truncated sticky packet.
+4. Dmac VIF segment → single `ProcessStream` (batch DIRECT).
+5. Soft-GS reg-write + rejection + gif-pkts telemetry in blocker-trace.
 
-Rejected:
+Smokes: `Gif_Path2_QwSliced_PackedSprite_WritesPixels`, `Vif_Direct_MidQw_PadsBeforePath2`,
+`Vif_Direct_Supersede_AbortsStickyGarbage`, `Dmac_Vif1EndAddr0_InlineDirectPath2` (FRAME assert).
 
-- Force-post worker type-3/4 (w7 thrash).
-- Inventing PATH3 GIF packets / fake Soft-GS pixels / FRAME plant.
-- Ungating Path3MaskedByVif.
-- Permanent soft-ok 0x27DBF0 at gate plant (skips real DMA arm).
-- Painting 989snd done-magic onto streamObj 0x01CFE000.
+### Wave-10 evidence (agent/menu-gow-w10) — residual before Path2 fix
+
+```
+@100M: px=0 gifPath2=1082 gifPath3=0 FRAME_1=0 prims=0 fragTest=0
+       Path2 setup only (DISPFB+SCISSOR default) — QW-slice / sticky garbage (see w11c)
+```
 
 ### How far
 
 | Milestone | Result |
 |-----------|--------|
 | Disc boot + ELF | **Yes** |
-| DualInfo / MOD_LOAD IRX | **Yes** (binds=10) |
-| CDVD IRX-only 142 | **Broken** → **cdvd=1202** |
-| Worker cmd type=2 soft-success | **Yes** (force dbf0 + hang-escape) |
-| PART1.PAK / TOC FILEIO open | **Yes** (pre+post type-2) |
-| R_SHELL Fedo host extract (full) | **Yes** (`shellOk=True`) |
-| LoadWad bind seed (*obj=0x100) | **Yes** (not stomped by 989snd) |
-| Real 0x27DBF0 entry + hang-escape | **Yes** (dbf0Esc=1) |
-| GIF DMA tag builders 0x13F5xx live | **Yes** (post-type2 PC samples) |
-| Post-type-2 *0x310384 next cmd | **No** (cmd=0 forever) |
-| **gifPath3** | **No** (gifPath2=1082) |
-| Soft-GS px>0 | **No** (FRAME_1=0, prims=0) |
-| Interactive title surface | **No** |
+| DualInfo / MOD_LOAD IRX | **Yes** |
+| Soft-GS Path2 FRAME+PRIM+XYZ2 | **Yes** (w11c) |
+| Soft-GS **px>0** | **Yes** (**px=1026**) |
+| gifPath3 / shell IMAGE | **No** (gifPath3=0) |
+| Interactive title surface | **No** (MENU NO) |
+| Full R_SHELL / type-2 stream | Residual (cdvd variance) |
 
 ### Wall / next
 
-1. **Shell decode → FRAME+PRIM:** Fedo R_SHELL is compressed (no raw A+D FRAME in host buffer). Hang-escape leaves follow without full DMA graph arm. Need natural consumer past 0x27D7C8 / LoadWad('R_Shell') expand path.
-2. **Post-type-2 cmd posters** at 0x27C4xx..0x27C8xx (type 3/5/6/7) require empty queue + SignalSema — queue stays 0; main list-walk residual 0x17EDxx never reaches posters.
-3. **Path2 @ gifP2=1082:** DISPFB1 + SCISSOR set; **FRAME_1=0**, **TEST=0**, **XYOFFSET=0**, **prims=0** — setup only. Soft-GS cannot paint.
-4. Path3MaskedByVif held — do not ungate as MENU shortcut.
+1. **Shell / PATH3 IMAGE** for title chrome — do not invent PATH3 packets.
+2. **Post-type-2 cmd posters** / stream past IRX-only when cdvd stuck 142.
+3. Path3MaskedByVif held unless game unmasks with real GIF PATH3.
 
 ### Reproduce
 
 ```powershell
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w10
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w11c
 $env:DETPS2_TRACE_BIOS='1'
-dotnet exec out/game-gow-w10/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
+dotnet exec out/game-gow-w11c/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
 ```

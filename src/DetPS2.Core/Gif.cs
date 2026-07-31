@@ -20,6 +20,26 @@ public sealed class Gif : ISchedulable
     private ulong _regs;
     private uint _nreg;
 
+    // Mid-packet sticky state — VIF1 DMA delivers DIRECT one QW at a time
+    // (DeliverSegment → SendQuadwordToVu1 → ReceivePath2Data(qwc=1)). Without this,
+    // ProcessTransfer consumed the GIFtag and returned with remaining=0, so PACKED
+    // A+D data (FRAME/PRIM/XYZ2) never reached Soft-GS. GoW residual gifP2=1082 with
+    // FRAME_1=0 / prims=0 was this path. Path3 still delivers full OriginalQWC at once.
+    private bool _pktActive;
+    private uint _pktFlg;
+    private uint _pktNloop;      // PACKED/REGLIST: total loops; IMAGE: total QWs
+    private uint _pktLoop;       // PACKED: completed loops; REGLIST: values written
+    private uint _pktRegI;       // PACKED: reg index within current loop
+    private bool _pktEop;        // stop after this packet completes
+    private ulong _pktPartialQws; // telemetry: times a packet spanned Receive* calls
+    private ulong _pktCompleted;
+    private uint _lastTagFlg;
+    private uint _lastTagNloop;
+    private uint _lastTagNreg;
+    private ulong _lastTagRegs;
+    private ulong _tagsSeen;
+    private ulong _path2Qws; // total Path2 QWs delivered (vs transfer count)
+
     // GIF I/O (0x10003000)
     private uint _ctrl;
     private uint _mode;
@@ -52,6 +72,23 @@ public sealed class Gif : ISchedulable
     public ulong Path1Transfers => _path1Transfers;
     public uint HeldPath3Qwc => _heldPath3TotalQwc;
     public int HeldPath3Entries => _heldPath3Count;
+    /// <summary>Completed GIFtag packets (PACKED/REGLIST/IMAGE/DISABLE) that fully drained.</summary>
+    public ulong PacketsCompleted => _pktCompleted;
+    /// <summary>Times a GIFtag needed more QWs than the current Receive* call (sticky reassembly).</summary>
+    public ulong PacketsSpannedCalls => _pktPartialQws;
+    /// <summary>True while a multi-QW GIFtag is waiting for more Path2/3 data.</summary>
+    public bool PacketInFlight => _pktActive;
+    public uint LastTagFlg => _lastTagFlg;
+    public uint LastTagNloop => _lastTagNloop;
+    public uint LastTagNreg => _lastTagNreg;
+    public ulong LastTagRegs => _lastTagRegs;
+    public ulong TagsSeen => _tagsSeen;
+    /// <summary>Total Path2 QWs fed (batch-aware; better than Path2Transfers when DIRECT is coalesced).</summary>
+    public ulong Path2Qws => _path2Qws;
+    /// <summary>In-flight packet progress: loops/values/QWs consumed so far.</summary>
+    public uint PacketProgress => _pktLoop;
+    public uint PacketNloop => _pktActive ? _pktNloop : 0;
+    public uint PacketFlg => _pktActive ? _pktFlg : 0;
 
     /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
     public bool Path3MaskedByVif => _m3p;
@@ -67,12 +104,56 @@ public sealed class Gif : ISchedulable
         _path1Transfers = _path2Transfers = _path3Transfers = 0;
         _regs = 0;
         _nreg = 0;
+        ClearPacketState();
+        _pktPartialQws = 0;
+        _pktCompleted = 0;
+        _pktAborted = 0;
+        _lastTagFlg = _lastTagNloop = _lastTagNreg = 0;
+        _lastTagRegs = 0;
+        _tagsSeen = 0;
+        _path2Qws = 0;
         _ctrl = _mode = 0;
         _fifoR = _fifoW = _fifoCount = 0;
         _m3p = false;
         _apath = 0;
         _heldPath3Count = 0;
         _heldPath3TotalQwc = 0;
+    }
+
+    private void ClearPacketState()
+    {
+        _pktActive = false;
+        _pktFlg = 0;
+        _pktNloop = 0;
+        _pktLoop = 0;
+        _pktRegI = 0;
+        _pktEop = false;
+    }
+
+    private ulong _pktAborted;
+
+    /// <summary>Count of incomplete GIFtag packets aborted (new DIRECT / truncated stream).</summary>
+    public ulong PacketsAborted => _pktAborted;
+
+    /// <summary>
+    /// Drop an in-flight GIFtag so the next Path2 QW is parsed as a fresh tag.
+    /// Used when VIF1 issues a new DIRECT while a prior DIRECT left a truncated / garbage
+    /// packet mid-stream (GoW: first DIRECT IMM=0xBF0 at 0x46BE90 was not GIF — REGLIST
+    /// nloop=12301 sticky-swallowed later real PACKED A+D at 0x3969xx).
+    /// Each commercial DIRECT is typically a self-contained Path2 unit (EOP packets sized
+    /// to IMM); multi-DIRECT continuous IMAGE is Path3's job.
+    /// </summary>
+    public void AbortIncompletePacket(string reason = "")
+    {
+        if (!_pktActive) return;
+        _pktAborted++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[GIF] abort in-flight flg={_pktFlg} progress={_pktLoop}/{_pktNloop} " +
+                $"reason={reason} n={_pktAborted}");
+        }
+        ClearPacketState();
     }
 
     /// <summary>
@@ -257,10 +338,11 @@ public sealed class Gif : ISchedulable
         _apath = 0;
     }
 
-    /// <summary>Path2 — from VIF1 DIRECT/HL.</summary>
+    /// <summary>Path2 — from VIF1 DIRECT/HL. Sticky mid-packet across QW-sliced DMA.</summary>
     public void ReceivePath2Data(uint address, uint qwc)
     {
         _path2Transfers++;
+        _path2Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
         _apath = 2;
         ProcessTransfer(address, qwc);
@@ -275,92 +357,137 @@ public sealed class Gif : ISchedulable
         ProcessTransfer(address, qwc);
     }
 
-    /// <summary>Process an in-memory GIF packet (tests can call this directly).</summary>
+    /// <summary>
+    /// Process an in-memory GIF stream. Sticky: if a prior call left a mid-packet
+    /// (common when VIF1 feeds Path2 one QW at a time), continue that packet before
+    /// parsing a new GIFtag. EOP still ends the current logical stream once the
+    /// in-flight packet fully drains.
+    /// </summary>
     public void ProcessTransfer(uint address, uint qwc)
     {
         if (qwc == 0) return;
         _lastQwcProcessed = qwc;
-        // Phase 10: batch accounting — single cost report for whole transfer
 
         uint currentAddr = address;
         uint remaining = qwc;
 
         while (remaining > 0)
         {
-            // GIFTag is 128-bit
-            uint w0 = Read32(currentAddr);
-            uint w1 = Read32(currentAddr + 4);
-            uint w2 = Read32(currentAddr + 8);
-            uint w3 = Read32(currentAddr + 12);
-
-            uint nloop = w0 & 0x7FFF;
-            bool eop = (w0 & (1u << 15)) != 0;
-            bool pre = (w0 & (1u << 14)) != 0; // actually bit 46 in full — see layout
-            // Correct GIFtag layout (from GS docs):
-            // bits 0-14 NLOOP, 15 EOP, 46 PRE, 47-57 PRIM, 58-59 FLG, 60-63 NREG
-            // 64-127 REGS
-            // With little-endian QW as 4×u32: w0 has NLOOP/EOP low; PRE/PRIM/FLG/NREG span w1
-            pre = ((w1 >> 14) & 1) != 0; // approximate when packed in high of first 64
-            // More portable parse of first 64 bits as ulong
-            ulong tagLo = w0 | ((ulong)w1 << 32);
-            nloop = (uint)(tagLo & 0x7FFF);
-            eop = (tagLo & (1UL << 15)) != 0;
-            pre = (tagLo & (1UL << 46)) != 0;
-            uint prim = (uint)((tagLo >> 47) & 0x7FF);
-            uint flg = (uint)((tagLo >> 58) & 0x3);
-            uint nreg = (uint)((tagLo >> 60) & 0xF);
-            if (nreg == 0) nreg = 16;
-            _nreg = nreg;
-            _regs = w2 | ((ulong)w3 << 32);
-
-            currentAddr += 16;
-            remaining--;
-
-            if (pre)
-                _gs.WriteGsRegister(0x00, prim);
-
-            switch (flg)
+            if (!_pktActive)
             {
-                case 0: // PACKED
-                    remaining = ProcessPacked(ref currentAddr, remaining, nloop, nreg);
-                    break;
-                case 1: // REGLIST
-                    remaining = ProcessReglist(ref currentAddr, remaining, nloop, nreg);
-                    break;
-                case 2: // IMAGE / HWREG
-                    remaining = ProcessImage(ref currentAddr, remaining, nloop);
-                    break;
-                default:
-                    // DISABLE — skip nloop * nreg qwords best-effort
+                // GIFtag is 128-bit
+                uint w0 = Read32(currentAddr);
+                uint w1 = Read32(currentAddr + 4);
+                uint w2 = Read32(currentAddr + 8);
+                uint w3 = Read32(currentAddr + 12);
+
+                // bits 0-14 NLOOP, 15 EOP, 46 PRE, 47-57 PRIM, 58-59 FLG, 60-63 NREG
+                // 64-127 REGS
+                ulong tagLo = w0 | ((ulong)w1 << 32);
+                uint nloop = (uint)(tagLo & 0x7FFF);
+                bool eop = (tagLo & (1UL << 15)) != 0;
+                bool pre = (tagLo & (1UL << 46)) != 0;
+                uint prim = (uint)((tagLo >> 47) & 0x7FF);
+                uint flg = (uint)((tagLo >> 58) & 0x3);
+                uint nreg = (uint)((tagLo >> 60) & 0xF);
+                if (nreg == 0) nreg = 16;
+                _nreg = nreg;
+                _regs = w2 | ((ulong)w3 << 32);
+
+                currentAddr += 16;
+                remaining--;
+
+                if (pre)
+                    _gs.WriteGsRegister(0x00, prim);
+
+                _tagsSeen++;
+                _lastTagFlg = flg;
+                _lastTagNloop = nloop;
+                _lastTagNreg = nreg;
+                _lastTagRegs = _regs;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1"
+                    && _tagsSeen <= 24)
+                {
+                    Console.Error.WriteLine(
+                        $"[GIF] tag#{_tagsSeen} flg={flg} nloop={nloop} nreg={nreg} eop={eop} " +
+                        $"pre={pre} regs=0x{_regs:X16} apath={_apath} addr=0x{currentAddr - 16:X8}");
+                }
+
+                // Empty NLOOP or DISABLE with nothing to skip: packet complete immediately.
+                if (flg == 3)
+                {
+                    // DISABLE — skip nloop QWs (best-effort; same as prior HLE)
                     uint skip = Math.Min(nloop, remaining);
                     currentAddr += skip * 16;
                     remaining -= skip;
-                    break;
+                    if (skip < nloop)
+                    {
+                        _pktActive = true;
+                        _pktFlg = 3;
+                        _pktNloop = nloop - skip;
+                        _pktEop = eop;
+                    }
+                    else
+                    {
+                        _pktCompleted++;
+                        if (eop) break;
+                    }
+                    continue;
+                }
+
+                if (nloop == 0)
+                {
+                    _pktCompleted++;
+                    if (eop) break;
+                    continue;
+                }
+
+                _pktActive = true;
+                _pktFlg = flg;
+                _pktNloop = nloop;
+                _pktLoop = 0;
+                _pktRegI = 0;
+                _pktEop = eop;
             }
 
-            if (eop) break;
+            // Drain active packet body with available QWs.
+            remaining = _pktFlg switch
+            {
+                0 => DrainPacked(ref currentAddr, remaining),
+                1 => DrainReglist(ref currentAddr, remaining),
+                2 => DrainImage(ref currentAddr, remaining),
+                3 => DrainDisable(ref currentAddr, remaining),
+                _ => DrainDisable(ref currentAddr, remaining)
+            };
+
+            if (_pktActive)
+            {
+                // Still need more data from a future Receive* call (VIF1 QW-slice).
+                if (remaining == 0)
+                    _pktPartialQws++;
+                break;
+            }
+
+            _pktCompleted++;
+            if (_pktEop) break;
         }
     }
 
-    private uint ProcessPacked(ref uint addr, uint remaining, uint nloop, uint nreg)
+    /// <summary>PACKED: each loop writes nreg registers; each register is one QW.</summary>
+    private uint DrainPacked(ref uint addr, uint remaining)
     {
-        // Each "loop" writes nreg registers; each register is one QW
-        for (uint loop = 0; loop < nloop; loop++)
+        uint nreg = _nreg == 0 ? 1u : _nreg;
+        while (remaining > 0 && _pktLoop < _pktNloop)
         {
-            for (uint r = 0; r < nreg; r++)
+            while (remaining > 0 && _pktRegI < nreg)
             {
-                if (remaining == 0) return 0;
                 uint lo = Read32(addr);
                 uint hi = Read32(addr + 4);
                 uint mid = Read32(addr + 8);
-                uint top = Read32(addr + 12);
-                uint regId = RegAt(r);
-                // PACKED data is 64-bit in low QW half typically; full QW for ST/RGBAQ etc.
+                uint regId = RegAt(_pktRegI);
                 ulong data = lo | ((ulong)hi << 32);
-                // Some packed formats put data in full 128 — use low 64
                 if (regId == 0x0E) // A+D
                 {
-                    // data = value, reg = low 8 of upper 64
                     uint adReg = mid & 0x7F;
                     _gs.WriteGsRegister(adReg, data);
                 }
@@ -370,17 +497,25 @@ public sealed class Gif : ISchedulable
                 }
                 addr += 16;
                 remaining--;
+                _pktRegI++;
+            }
+            if (_pktRegI >= nreg)
+            {
+                _pktRegI = 0;
+                _pktLoop++;
             }
         }
+        if (_pktLoop >= _pktNloop)
+            _pktActive = false;
         return remaining;
     }
 
-    private uint ProcessReglist(ref uint addr, uint remaining, uint nloop, uint nreg)
+    /// <summary>REGLIST: 64-bit values tightly packed, 2 per QW. _pktLoop = values written.</summary>
+    private uint DrainReglist(ref uint addr, uint remaining)
     {
-        // REGLIST: data is tightly packed 64-bit values, 2 per QW
-        uint total = nloop * nreg;
-        uint i = 0;
-        while (i < total && remaining > 0)
+        uint nreg = _nreg == 0 ? 1u : _nreg;
+        uint total = _pktNloop * nreg;
+        while (remaining > 0 && _pktLoop < total)
         {
             uint lo = Read32(addr);
             uint hi = Read32(addr + 4);
@@ -389,38 +524,50 @@ public sealed class Gif : ISchedulable
             ulong d0 = lo | ((ulong)hi << 32);
             ulong d1 = lo2 | ((ulong)hi2 << 32);
 
-            uint reg0 = RegAt(i % nreg);
+            uint reg0 = RegAt(_pktLoop % nreg);
             _gs.WriteGsRegister(reg0, d0);
-            i++;
-            if (i < total)
+            _pktLoop++;
+            if (_pktLoop < total)
             {
-                uint reg1 = RegAt(i % nreg);
+                uint reg1 = RegAt(_pktLoop % nreg);
                 _gs.WriteGsRegister(reg1, d1);
-                i++;
+                _pktLoop++;
             }
             addr += 16;
             remaining--;
         }
+        if (_pktLoop >= total)
+            _pktActive = false;
         return remaining;
     }
 
-    private uint ProcessImage(ref uint addr, uint remaining, uint nloop)
+    /// <summary>IMAGE: nloop QWs of raw host→local data. _pktLoop = QWs written.</summary>
+    private uint DrainImage(ref uint addr, uint remaining)
     {
-        // IMAGE: nloop QWs of raw host→local data. Gs owns BITBLT/TRX cursor (TRXDIR=0);
-        // when no transfer is active WriteImageData falls back to linear at dest.
-        // dest offset is only used by that legacy fallback (commercial path ignores it).
-        int dest = 0;
-        uint count = Math.Min(nloop, remaining);
         Span<byte> qw = stackalloc byte[16];
-        for (uint i = 0; i < count; i++)
+        while (remaining > 0 && _pktLoop < _pktNloop)
         {
             for (int b = 0; b < 16; b++)
                 qw[b] = Memory.Read8(addr + (uint)b);
-            _gs.WriteImageData(qw, dest);
-            dest += 16;
+            // dest offset for legacy fallback; TRX cursor owns commercial path
+            _gs.WriteImageData(qw, (int)(_pktLoop * 16));
             addr += 16;
             remaining--;
+            _pktLoop++;
         }
+        if (_pktLoop >= _pktNloop)
+            _pktActive = false;
+        return remaining;
+    }
+
+    private uint DrainDisable(ref uint addr, uint remaining)
+    {
+        uint skip = Math.Min(_pktNloop, remaining);
+        addr += skip * 16;
+        remaining -= skip;
+        _pktNloop -= skip;
+        if (_pktNloop == 0)
+            _pktActive = false;
         return remaining;
     }
 

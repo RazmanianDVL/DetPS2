@@ -1144,6 +1144,9 @@ public static class SmokeTests
             Dmac_MfifoAndChainTags();
             Dmac_ChainEndIrq_LatchesChcrTag();
             Dmac_Vif1EndAddr0_InlineDirectPath2();
+            Vif_Direct_MidQw_PadsBeforePath2();
+            Vif_Direct_Supersede_AbortsStickyGarbage();
+            Gif_Path2_QwSliced_PackedSprite_WritesPixels();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -4992,13 +4995,17 @@ public static class SmokeTests
     /// <summary>
     /// WAVE-3 DA: END+IRQ tag with ADDR=0, QWC&gt;0, TTE DIRECT must pull payload from the
     /// QWs following the DMAtag (not phys 0) so Path2 reaches Soft-GS.
+    /// WAVE-11C: assert FRAME_1 is actually written (not just Path2Transfers++). Prior
+    /// QW-sliced Path2 consumed the GIFtag alone and dropped A+D data → FRAME_1 stayed 0.
     /// </summary>
     public static void Dmac_Vif1EndAddr0_InlineDirectPath2()
     {
         var sys = new Ps2System();
         sys.Dmac.WriteRegister(0x1000E000, 1);
         const uint vif1Base = 0x10009000u;
-        const uint tadr = 0x00006000u;
+        // DA-band TADR so END ADDR=0 remaps to inline payload (TADR+16). Outside this band
+        // legitimate ADDR=0 ENDs must not be remapped (B3 residual).
+        const uint tadr = 0x01FB2A80u;
         // END+IRQ QWC=2, ADDR=0 — inline 2 QWs after tag
         sys.Memory.Write32(tadr, 0xF0000002u);
         sys.Memory.Write32(tadr + 4, 0); // ADDR=0
@@ -5010,9 +5017,10 @@ public static class SmokeTests
         sys.Memory.Write32(data + 4, 0x10000000u);
         sys.Memory.Write32(data + 8, 0x0000000Eu);
         sys.Memory.Write32(data + 12, 0);
-        sys.Memory.Write32(data + 16, 0); // data
-        sys.Memory.Write32(data + 20, 0);
-        sys.Memory.Write32(data + 24, 0x4Cu); // reg FRAME
+        const ulong frameVal = 0x0000000000200001UL; // FBP=1 FBW=1 PSM=0
+        sys.Memory.Write32(data + 16, (uint)frameVal);
+        sys.Memory.Write32(data + 20, (uint)(frameVal >> 32));
+        sys.Memory.Write32(data + 24, 0x4Cu); // reg FRAME_1
         sys.Memory.Write32(data + 28, 0);
 
         ulong p2before = sys.Gif.Path2Transfers;
@@ -5025,7 +5033,169 @@ public static class SmokeTests
             throw new Exception("VIF1 still active");
         if (sys.Gif.Path2Transfers <= p2before)
             throw new Exception($"Path2 not delivered p2={sys.Gif.Path2Transfers} before={p2before}");
-        Console.WriteLine($"[Smoke] Dmac_Vif1EndAddr0_InlineDirectPath2 OK (path2={sys.Gif.Path2Transfers})");
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"Path2 FRAME_1 not applied: got 0x{sys.Gs.Registers.FRAME_1:X} want 0x{frameVal:X} " +
+                $"writesFrame={sys.Gs.RegWritesFrame} pkts={sys.Gif.PacketsCompleted}");
+        if (sys.Gs.RegWritesFrame < 1)
+            throw new Exception("RegWritesFrame still 0 after Path2 A+D FRAME");
+        Console.WriteLine(
+            $"[Smoke] Dmac_Vif1EndAddr0_InlineDirectPath2 OK (path2={sys.Gif.Path2Transfers} " +
+            $"FRAME_1=0x{sys.Gs.Registers.FRAME_1:X} pkts={sys.Gif.PacketsCompleted})");
+    }
+
+    /// <summary>
+    /// WAVE-11C: a truncated/garbage DIRECT mid-packet must not sticky-swallow the next
+    /// DIRECT's real PACKED A+D (GoW: IMM=0xBF0 garbage then real NLOOP=13 A+D setup).
+    /// </summary>
+    public static void Vif_Direct_Supersede_AbortsStickyGarbage()
+    {
+        var sys = new Ps2System();
+        // DIRECT #1: IMM=4 of non-GIF garbage (looks like huge REGLIST if parsed)
+        const uint g1 = 0x4000;
+        sys.Memory.Write32(g1 + 0, 0x50000004u); // DIRECT IMM=4
+        sys.Memory.Write32(g1 + 4, 0);
+        sys.Memory.Write32(g1 + 8, 0);
+        sys.Memory.Write32(g1 + 12, 0);
+        // 4 QWs of garbage starting with high nloop-ish words
+        for (uint k = 0; k < 4; k++)
+        {
+            uint a = g1 + 16 + k * 16;
+            sys.Memory.Write32(a + 0, 0xA90BB00Du);
+            sys.Memory.Write32(a + 4, 0xE70DA807u);
+            sys.Memory.Write32(a + 8, 0);
+            sys.Memory.Write32(a + 12, 0xE0D008ADu);
+        }
+        sys.Vif.ProcessStream(g1, 5 * 4); // DIRECT QW + 4 data QWs
+
+        // DIRECT #2: real PACKED A+D FRAME
+        const uint g2 = 0x4100;
+        sys.Memory.Write32(g2 + 0, 0x50000002u);
+        sys.Memory.Write32(g2 + 4, 0);
+        sys.Memory.Write32(g2 + 8, 0);
+        sys.Memory.Write32(g2 + 12, 0);
+        sys.Memory.Write32(g2 + 16, 0x00008001u);
+        sys.Memory.Write32(g2 + 20, 0x10000000u);
+        sys.Memory.Write32(g2 + 24, 0x0000000Eu);
+        sys.Memory.Write32(g2 + 28, 0);
+        const ulong frameVal = 0x99UL;
+        sys.Memory.Write32(g2 + 32, (uint)frameVal);
+        sys.Memory.Write32(g2 + 36, 0);
+        sys.Memory.Write32(g2 + 40, 0x4Cu);
+        sys.Memory.Write32(g2 + 44, 0);
+        sys.Vif.ProcessStream(g2, 3 * 4);
+
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"second DIRECT FRAME lost to sticky: got 0x{sys.Gs.Registers.FRAME_1:X} " +
+                $"aborted={sys.Gif.PacketsAborted} tags={sys.Gif.TagsSeen} " +
+                $"writesFrame={sys.Gs.RegWritesFrame}");
+        if (sys.Gif.PacketsAborted < 1)
+            throw new Exception("expected at least one sticky abort on DIRECT supersede");
+        Console.WriteLine(
+            $"[Smoke] Vif_Direct_Supersede_AbortsStickyGarbage OK (FRAME=0x{frameVal:X} " +
+            $"aborted={sys.Gif.PacketsAborted} tags={sys.Gif.TagsSeen})");
+    }
+
+    /// <summary>
+    /// WAVE-11C: DIRECT command mid-QW must pad to next QW before Path2 GIF data.
+    /// Without pad, GIFtag is read at addr&amp;0xF!=0 → garbage IMAGE nloop swallows setup.
+    /// </summary>
+    public static void Vif_Direct_MidQw_PadsBeforePath2()
+    {
+        var sys = new Ps2System();
+        // Stream at 0x3000: word0=NOP, word1=DIRECT IMM=2, word2-3=pad, then 2 QWs GIFtag+FRAME
+        const uint baseAddr = 0x3000;
+        sys.Memory.Write32(baseAddr + 0, 0x00000000u);       // NOP
+        sys.Memory.Write32(baseAddr + 4, 0x50000002u);       // DIRECT IMM=2
+        sys.Memory.Write32(baseAddr + 8, 0xDEADBEEFu);       // pad (must NOT be GIF)
+        sys.Memory.Write32(baseAddr + 12, 0xCAFEBABEu);      // pad
+        // QW1 GIFtag PACKED A+D NLOOP=1 EOP
+        sys.Memory.Write32(baseAddr + 16, 0x00008001u);
+        sys.Memory.Write32(baseAddr + 20, 0x10000000u);
+        sys.Memory.Write32(baseAddr + 24, 0x0000000Eu);
+        sys.Memory.Write32(baseAddr + 28, 0);
+        const ulong frameVal = 0x0000000000000042UL;
+        sys.Memory.Write32(baseAddr + 32, (uint)frameVal);
+        sys.Memory.Write32(baseAddr + 36, 0);
+        sys.Memory.Write32(baseAddr + 40, 0x4Cu);
+        sys.Memory.Write32(baseAddr + 44, 0);
+
+        // 3 QWs of stream (12 words)
+        sys.Vif.ProcessStream(baseAddr, 12);
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"mid-QW DIRECT did not apply FRAME: got 0x{sys.Gs.Registers.FRAME_1:X} " +
+                $"want 0x{frameVal:X} tags={sys.Gif.TagsSeen} lastFlg={sys.Gif.LastTagFlg} " +
+                $"nloop={sys.Gif.LastTagNloop} inflight={sys.Gif.PacketInFlight}");
+        if (sys.Gif.LastTagFlg == 2 && sys.Gif.LastTagNloop > 100)
+            throw new Exception("still misparsing Path2 as huge IMAGE");
+        Console.WriteLine(
+            $"[Smoke] Vif_Direct_MidQw_PadsBeforePath2 OK (FRAME=0x{sys.Gs.Registers.FRAME_1:X} " +
+            $"p2qws={sys.Gif.Path2Qws} tags={sys.Gif.TagsSeen})");
+    }
+
+    /// <summary>
+    /// WAVE-11C Soft-GS: VIF1 DIRECT Path2 delivered one QW at a time must still assemble
+    /// PACKED A+D PRIM+RGBAQ+XYZ2×2 sprite (sticky GIF reassembly). Proves QW-slice residual
+    /// (GoW gifP2 high / FRAME=0 / prims=0) is fixed without inventing PATH3.
+    /// </summary>
+    public static void Gif_Path2_QwSliced_PackedSprite_WritesPixels()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+
+        // Build contiguous DIRECT payload at 0x2000: GIFtag + 5× A+D (FRAME,PRIM,RGBAQ,XYZ2,XYZ2)
+        const uint baseAddr = 0x2000;
+        // NLOOP=5 EOP NREG=1 REGS=A+D FLG=PACKED
+        sys.Memory.Write32(baseAddr + 0, 0x00008005u);
+        sys.Memory.Write32(baseAddr + 4, 0x10000000u);
+        sys.Memory.Write32(baseAddr + 8, 0x0000000Eu);
+        sys.Memory.Write32(baseAddr + 12, 0);
+
+        uint d = baseAddr + 16;
+        void Ad(uint reg, ulong val)
+        {
+            sys.Memory.Write32(d + 0, (uint)val);
+            sys.Memory.Write32(d + 4, (uint)(val >> 32));
+            sys.Memory.Write32(d + 8, reg);
+            sys.Memory.Write32(d + 12, 0);
+            d += 16;
+        }
+        static ulong Xyz(int x, int y, uint z) =>
+            ((ulong)(uint)((x << 4) & 0xFFFF)) | ((ulong)(uint)((y << 4) & 0xFFFF) << 16) | ((ulong)z << 32);
+
+        Ad(0x4C, 0x0000000000000001UL); // FRAME_1 FBP=1
+        Ad(0x00, 0x01);                 // PRIM sprite
+        Ad(0x01, 0xFFFFFFFFUL);         // RGBAQ white
+        Ad(0x05, Xyz(32, 32, 0x1000));
+        Ad(0x05, Xyz(160, 120, 0x1000));
+
+        uint totalQwc = (d - baseAddr) / 16; // 6
+        // Simulate VIF1 QW-sliced DIRECT: one ReceivePath2Data per QW (pre-batch residual)
+        for (uint i = 0; i < totalQwc; i++)
+            sys.Gif.ReceivePath2Data(baseAddr + i * 16, 1);
+
+        if (sys.Gif.PacketInFlight)
+            throw new Exception("GIF packet still in-flight after full DIRECT");
+        if (sys.Gs.RegWritesFrame < 1)
+            throw new Exception($"FRAME not written (writes={sys.Gs.RegWritesFrame})");
+        if (sys.Gs.Registers.FRAME_1 == 0)
+            throw new Exception("FRAME_1 still 0 after sliced Path2");
+        if (sys.Gs.RegWritesPrim < 1 || sys.Gs.RegWritesXyz2 < 2)
+            throw new Exception(
+                $"PRIM/XYZ2 missing: primW={sys.Gs.RegWritesPrim} xyz2={sys.Gs.RegWritesXyz2}");
+        if (sys.Gs.PrimitivesDrawn < 1 || sys.Gs.PixelsWritten == 0)
+            throw new Exception(
+                $"Soft-GS no paint: prims={sys.Gs.PrimitivesDrawn} px={sys.Gs.PixelsWritten} " +
+                $"fragTest={sys.Gs.FragmentsTested} rejB={sys.Gs.FragmentsRejectedBounds} " +
+                $"rejS={sys.Gs.FragmentsRejectedScissor} spanned={sys.Gif.PacketsSpannedCalls}");
+        if (sys.Gif.PacketsSpannedCalls == 0)
+            throw new Exception("expected sticky reassembly (spannedCalls>0) for QW-sliced Path2");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path2_QwSliced_PackedSprite_WritesPixels OK " +
+            $"(px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
+            $"FRAME=0x{sys.Gs.Registers.FRAME_1:X} spanned={sys.Gif.PacketsSpannedCalls})");
     }
 
     public static void Timer_GateAndClockSelect()

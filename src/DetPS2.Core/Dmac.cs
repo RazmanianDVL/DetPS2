@@ -259,8 +259,12 @@ public sealed class Dmac : ISchedulable
                 break;
             case Channel.VIF0 when _vif != null:
             case Channel.VIF1 when _vif != null:
-                for (uint i = 0; i < ch.OriginalQWC; i++)
-                    _vif.SendQuadwordToVu1(ch.StartMADR + i * 16);
+                // Batch the whole segment as one VIF stream. DIRECT Path2 then reaches GIF
+                // as a contiguous QW run (ProcessStream coalesces _directRemaining into one
+                // ReceivePath2Data). QW-by-QW SendQuadwordToVu1 still works via Gif sticky
+                // reassembly, but batching matches Path3 full-segment delivery and avoids
+                // per-QW Path2 transfer counter inflation.
+                _vif.ProcessStream(ch.StartMADR, ch.OriginalQWC * 4);
                 break;
             case Channel.IPU_TO when _ipu != null:
                 _ipu.DmaIn(_memory, ch.StartMADR, ch.OriginalQWC);
