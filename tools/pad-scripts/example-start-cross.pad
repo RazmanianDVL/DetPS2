@@ -1,0 +1,16 @@
+# DetPS2 pad-script (PL-002) — T2 interactive claim helper
+# Usage:
+#   detps2 pad-inject user-media-b3.json --cycles=50000000 --host-present --pad-script=tools/pad-scripts/example-start-cross.pad
+#   detps2 scoreboard-metrics user-media-b3.json --cycles=20000000 --host-present --pad-script=tools/pad-scripts/example-start-cross.pad
+#   detps2 blocker-trace user-media-b3.json --cycles=20000000 --host-present --pad-script=tools/pad-scripts/example-start-cross.pad
+#
+# Forms:
+#   @CYCLE BUTTON [HOLD]
+#   CYCLE BUTTON [HOLD]
+#   press CYCLE BUTTON [HOLD]
+# HOLD defaults to 50000 cycles. Comments with #.
+
+# Tap Start after logo path typically settles (~10M), hold ~2 frames-ish
+@10000000 Start 100000
+# Cross accept a few million later
+@15000000 Cross 100000

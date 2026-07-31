@@ -10,3 +10,5 @@ Append-only. When pad/menu advances and Soft-GS shows a **new** wall, add a row.
 | 2026-07-31 | GoW | Path2 sticky aborted=1 garbage DIRECT | intentional residual; see PATH2_STICKY_W11C.md | S8 | GX-010 inv |
 | 2026-07-31 | (fleet) | expandHits telemetry | ofx title-strip expand still MENU crutch (G-GFX-6 demote later) | S9 | GX-004 |
 | 2026-07-31 | fleet | S0+G0 merge train | 10 seats landed; expandHits+gif metrics on main | T0 | S0/G0 |
+| 2026-07-31 | fleet | DISPFB1/2+DISPLAY1/2 decode + circuit select (Play! layout); naturalDispfbPx metric | No DISPFB plants; FRAME/FBP0 residual still valid for B3 | S10 | GX-040 |
+| 2026-07-31 | tooling | `--pad-script=` on pad-inject / scoreboard-metrics / blocker-trace; T2 heuristic | T2 still `?` without script | S10 | PL-002 |

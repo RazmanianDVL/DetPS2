@@ -73,6 +73,13 @@ public sealed class Gs : ISchedulable
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
     /// <summary>
+    /// GX-040: pixels composited from a software-programmed DISPFB (not FRAME/FBP0 fallback).
+    /// Zero when present is residual composite-only (common B3 residual until GX-041).
+    /// </summary>
+    public long NaturalDispfbPixels { get; private set; }
+    /// <summary>Last preferred PCRTC circuit (0/1/2) seen during composite.</summary>
+    public int LastDisplayCircuit { get; private set; }
+    /// <summary>
     /// Soft-GS title-strip expand events (temporary MENU chrome; G-GFX-6 demotes later).
     /// See docs/graphics/EXPAND_POLICY.md. Legal ofx: 0/0, 0x8000/0x8000, or [0x6000,0x9000] band.
     /// </summary>
@@ -134,6 +141,8 @@ public sealed class Gs : ISchedulable
         _trxPartial = 0;
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
+        NaturalDispfbPixels = 0;
+        LastDisplayCircuit = 0;
         ExpandHits = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
@@ -1545,10 +1554,16 @@ public sealed class Gs : ISchedulable
 
     private long _lastCompositeImageBytes;
 
+    /// <summary>GX-040: snapshot of privileged DISPFB/DISPLAY/PMODE circuit state.</summary>
+    public GsDisplayCircuitInfo GetDisplayCircuitInfo() =>
+        GsDisplayCircuitInfo.FromRegisters(Registers);
+
     /// <summary>
     /// Copy DISPFB1/2 (else FRAME_1, else FBP=0 IMAGE) local VRAM into the software present FB.
     /// When raster <see cref="PixelsWritten"/> is already &gt;0, only fills black Soft-GS
     /// pixels (merge) so sparse AFAIL prims no longer block commercial logo IMAGE chrome.
+    /// GX-040: prefers PMODE-selected circuit DISPFB when software programmed it; does not plant DISPFB.
+    /// FRAME/FBP0 fallback remains for residual composite-only titles (B3 — GX-041 tightens later).
     /// </summary>
     public long CompositeDispfbToFramebuffer()
     {
@@ -1561,26 +1576,62 @@ public sealed class Gs : ISchedulable
             && ImageBytesWritten <= _lastCompositeImageBytes)
             return 0;
 
-        bool fromDispfb = Registers.DISPFB1 != 0 || Registers.DISPFB2 != 0;
-        ulong fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1
-            : Registers.DISPFB2 != 0 ? Registers.DISPFB2
-            : Registers.FRAME_1;
+        var circuit = GetDisplayCircuitInfo();
+        LastDisplayCircuit = circuit.PreferredCircuit;
+
+        bool fromDispfb = false;
+        ulong fb = 0;
+        bool natural = false;
+        // Natural path: software programmed DISPFB on an enabled circuit (or raw DISPFB set
+        // even if PMODE EN bits are still 0 — many titles write DISPFB before EN).
+        if (circuit.HasNaturalDispfb)
+        {
+            fb = circuit.PreferredDispfbRaw;
+            fromDispfb = true;
+            natural = true;
+        }
+        else if (Registers.DISPFB1 != 0 || Registers.DISPFB2 != 0)
+        {
+            // PMODE EN=0 but DISPFB non-zero: still treat as natural source (honest read).
+            fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1 : Registers.DISPFB2;
+            fromDispfb = true;
+            natural = true;
+            LastDisplayCircuit = Registers.DISPFB1 != 0 ? 1 : 2;
+        }
+        else
+        {
+            fb = Registers.FRAME_1;
+        }
+
         bool syntheticFb = false;
         if (fb == 0)
         {
             if (ImageBytesWritten <= 0 && !_localMemHasImage) return 0;
             fromDispfb = false;
+            natural = false;
             syntheticFb = true;
         }
 
-        long written = CompositeLocalToFb(fb, fromDispfb, syntheticFb, mergeMode);
+        // When DISPLAY is programmed with a sensible rect, limit composite size (natural CRT).
+        DisplayRect? outRect = null;
+        if (fromDispfb)
+        {
+            DisplayDecoded disp = Registers.DISPFB1 != 0
+                ? DisplayDecoded.From(Registers.DISPLAY1)
+                : DisplayDecoded.From(Registers.DISPLAY2);
+            var r = disp.GetOutputRect();
+            if (r.IsSensible)
+                outRect = r;
+        }
+
+        long written = CompositeLocalToFb(fb, fromDispfb, syntheticFb, mergeMode, outRect);
 
         // When DISPFB unset and FRAME is a high FBP (draw target), also try FBP=0 IMAGE
         // page — commercial logo BITBLT often lands at page 0 while FRAME holds sparse UI.
         if (!fromDispfb && !syntheticFb && ImageBytesWritten > 0
             && (Registers.FRAME_1 & 0x1FF) != 0)
         {
-            written += CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true, mergeMode: true);
+            written += CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true, mergeMode: true, outRect: null);
         }
 
         if (written > 0)
@@ -1588,13 +1639,15 @@ public sealed class Gs : ISchedulable
             PixelsWritten += written;
             PrimitivesDrawn++;
             DispfbPixelsComposited += written;
+            if (natural)
+                NaturalDispfbPixels += written;
             _lastCompositeImageBytes = ImageBytesWritten;
         }
         return written;
     }
 
     /// <summary>Inner local-mem → Soft-GS FB copy used by <see cref="CompositeDispfbToFramebuffer"/>.</summary>
-    private long CompositeLocalToFb(ulong fb, bool fromDispfb, bool syntheticFb, bool mergeMode)
+    private long CompositeLocalToFb(ulong fb, bool fromDispfb, bool syntheticFb, bool mergeMode, DisplayRect? outRect)
     {
         int fbp;
         int fbw;
@@ -1608,11 +1661,13 @@ public sealed class Gs : ISchedulable
         }
         else if (fromDispfb)
         {
-            fbp = (int)(fb & 0x1FF);
-            fbw = (int)((fb >> 9) & 0x3F) * 64;
-            psm = (int)((fb >> 15) & 0x1F);
-            dbx = (int)((fb >> 32) & 0x7FF);
-            dby = (int)((fb >> 43) & 0x7FF);
+            // GX-040: same bit layout as DispfbDecoded / Play! DISPFB.
+            var d = DispfbDecoded.From(fb);
+            fbp = d.Fbp;
+            fbw = d.BufWidthPixels;
+            psm = d.Psm;
+            dbx = d.Dbx;
+            dby = d.Dby;
         }
         else
         {
@@ -1631,6 +1686,19 @@ public sealed class Gs : ISchedulable
         long written = 0;
         int h = FB_HEIGHT;
         int w = Math.Min(FB_WIDTH, fbw);
+        int dstOx = 0, dstOy = 0;
+        if (outRect is { } rect && rect.IsSensible)
+        {
+            // Limit source/dest to CRT output size (do not invent offsets beyond Soft-GS FB).
+            w = Math.Min(w, (int)rect.Width);
+            h = Math.Min(h, (int)rect.Height);
+            w = Math.Min(w, FB_WIDTH);
+            h = Math.Min(h, FB_HEIGHT);
+            dstOx = (int)Math.Min(rect.OffsetX, (uint)(FB_WIDTH - 1));
+            dstOy = (int)Math.Min(rect.OffsetY, (uint)(FB_HEIGHT - 1));
+            if (dstOx + w > FB_WIDTH) w = FB_WIDTH - dstOx;
+            if (dstOy + h > FB_HEIGHT) h = FB_HEIGHT - dstOy;
+        }
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < w; x++)
@@ -1668,7 +1736,10 @@ public sealed class Gs : ISchedulable
                 }
 
                 if ((pixel & 0x00FFFFFF) == 0) continue;
-                int idx = y * FB_WIDTH + x;
+                int dx = dstOx + x;
+                int dy = dstOy + y;
+                if ((uint)dx >= (uint)FB_WIDTH || (uint)dy >= (uint)FB_HEIGHT) continue;
+                int idx = dy * FB_WIDTH + dx;
                 // Merge: never overwrite prim/AFAIL chrome already on Soft-GS FB.
                 if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
                     continue;

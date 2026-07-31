@@ -17,6 +17,9 @@ public sealed class Pcrtc : ISchedulable
 
     public ulong FrameCount { get; private set; }
     public bool InVblank => _inVblank;
+
+    /// <summary>GX-040: DISPFB/DISPLAY circuit as seen by present path.</summary>
+    public GsDisplayCircuitInfo GetDisplayCircuitInfo() => _gs.GetDisplayCircuitInfo();
     public ulong VblankPeriod
     {
         get => _vblankPeriod;

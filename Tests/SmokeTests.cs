@@ -317,6 +317,136 @@ public static class SmokeTests
         Console.WriteLine($"[Smoke] Gs_MergeComposite_AfterSparsePrims OK (sparse={sparse} merged={merged})");
     }
 
+    /// <summary>
+    /// GX-040: DISPFB/DISPLAY pack-unpack + PMODE circuit preference (Play! layout).
+    /// Does not invent commercial plant values — unit values only.
+    /// </summary>
+    public static void Gs_DisplayCircuit_DispfbDisplayDecode()
+    {
+        // DISPFB: FBP=0x10 pages, FBW=10 (640), PSM=0, DBX=8, DBY=16
+        ulong packed = DispfbDecoded.From(0).Pack(); // smoke zero
+        if (packed != 0) throw new Exception("zero DISPFB pack failed");
+
+        var d = new DispfbDecoded { Fbp = 0x10, FbwUnits = 10, Psm = 0, Dbx = 8, Dby = 16 };
+        ulong raw = d.Pack();
+        var round = DispfbDecoded.From(raw);
+        if (round.Fbp != 0x10 || round.FbwUnits != 10 || round.Dbx != 8 || round.Dby != 16)
+            throw new Exception($"DISPFB round-trip fail: {round}");
+        if (round.BufPtrBytes != 0x10u * 8192u || round.BufWidthPixels != 640)
+            throw new Exception($"DISPFB scale fail: ptr=0x{round.BufPtrBytes:X} w={round.BufWidthPixels}");
+
+        // DISPLAY: DX=100, DY=50, MAGH=1 (2×), MAGV=0 (1×), DW=1279, DH=447
+        var disp = new DisplayDecoded { Dx = 100, Dy = 50, MagH = 1, MagV = 0, Dw = 1279, Dh = 447 };
+        var disp2 = DisplayDecoded.From(disp.Pack());
+        if (disp2.Dx != 100 || disp2.Dy != 50 || disp2.MagH != 1 || disp2.Dw != 1279 || disp2.Dh != 447)
+            throw new Exception($"DISPLAY round-trip fail: {disp2}");
+        var rect = disp2.GetOutputRect();
+        // width = (1279+1)/(1+1) = 640; height = (447+1)/1 = 448; offsetX = 100/2 = 50; offsetY = 50/1 = 50
+        if (rect.Width != 640 || rect.Height != 448 || rect.OffsetX != 50 || rect.OffsetY != 50)
+            throw new Exception($"GetOutputRect fail: {rect.Width}x{rect.Height}+{rect.OffsetX},{rect.OffsetY}");
+
+        var sys = new Ps2System();
+        // Privileged MMIO: PMODE EN1, DISPFB1, DISPLAY1
+        sys.Gs.WritePrivileged64(0x12000000, 1); // EN1
+        sys.Gs.WritePrivileged64(0x12000070, raw);
+        sys.Gs.WritePrivileged64(0x12000080, disp.Pack());
+        var info = sys.Gs.GetDisplayCircuitInfo();
+        if (!info.En1 || info.En2) throw new Exception("PMODE EN bits wrong");
+        if (info.PreferredCircuit != 1) throw new Exception($"expected circuit 1, got {info.PreferredCircuit}");
+        if (!info.HasNaturalDispfb) throw new Exception("expected natural DISPFB");
+        if (info.PreferredDispfb.Fbp != 0x10) throw new Exception("circuit DISPFB FBP mismatch");
+        if (sys.Pcrtc.GetDisplayCircuitInfo().PreferredCircuit != 1)
+            throw new Exception("Pcrtc circuit mirror mismatch");
+        if (sys.Gs.ReadPrivileged64(0x12000070) != raw)
+            throw new Exception("DISPFB1 privileged readback mismatch");
+
+        // Dual-circuit: EN1|EN2, only DISPFB2 set → prefer 2
+        sys.Gs.WritePrivileged64(0x12000000, 3);
+        sys.Gs.WritePrivileged64(0x12000070, 0);
+        sys.Gs.WritePrivileged64(0x12000090, raw);
+        info = sys.Gs.GetDisplayCircuitInfo();
+        if (info.PreferredCircuit != 2) throw new Exception($"dual-circuit prefer 2, got {info.PreferredCircuit}");
+
+        Console.WriteLine($"[Smoke] Gs_DisplayCircuit_DispfbDisplayDecode OK ({info.SummaryLine()})");
+    }
+
+    /// <summary>
+    /// GX-040: when software programs DISPFB + IMAGE, composite counts as naturalDispfbPx.
+    /// </summary>
+    public static void Gs_NaturalDispfb_CompositeUsesCircuit()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        // BITBLT host→local at FBP=0
+        sys.Gs.WriteGsRegister(0x50, (10UL << 16) | (10UL << 48));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 32UL | (32UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var blob = new byte[32 * 32 * 4];
+        for (int i = 0; i < 32 * 32; i++)
+        {
+            blob[i * 4] = 0x00;
+            blob[i * 4 + 1] = 0xFF;
+            blob[i * 4 + 2] = 0x00;
+            blob[i * 4 + 3] = 0xFF;
+        }
+        sys.Gs.WriteImageData(blob, 0);
+
+        // Program natural DISPFB1: FBP=0, FBW=10 (640), PSM=0 — no plant from titles, unit only.
+        var dispfb = new DispfbDecoded { Fbp = 0, FbwUnits = 10, Psm = 0, Dbx = 0, Dby = 0 };
+        // DISPLAY 640x448 progressive
+        var display = new DisplayDecoded { Dx = 0, Dy = 0, MagH = 0, MagV = 0, Dw = 639, Dh = 447 };
+        sys.Gs.WritePrivileged64(0x12000000, 1);
+        sys.Gs.WritePrivileged64(0x12000070, dispfb.Pack());
+        sys.Gs.WritePrivileged64(0x12000080, display.Pack());
+
+        long written = sys.Gs.CompositeDispfbToFramebuffer();
+        if (written <= 0) throw new Exception("expected natural DISPFB composite px");
+        if (sys.Gs.NaturalDispfbPixels <= 0)
+            throw new Exception("NaturalDispfbPixels must be >0 when DISPFB programmed");
+        if (sys.Gs.DispfbPixelsComposited < sys.Gs.NaturalDispfbPixels)
+            throw new Exception("dispfbPx must cover naturalDispfbPx");
+        uint p = sys.Gs.GetPixel(8, 8);
+        if ((p & 0xFFFFFF) != 0x00FF00)
+            throw new Exception($"expected green from DISPFB composite, got 0x{p:X8}");
+        Console.WriteLine($"[Smoke] Gs_NaturalDispfb_CompositeUsesCircuit OK (written={written} natural={sys.Gs.NaturalDispfbPixels})");
+    }
+
+    /// <summary>PL-002: pad-script parse + ApplyAt press/release.</summary>
+    public static void PadScript_ParseAndApply()
+    {
+        const string script = @"
+# sample T2 script
+@1000 Start 200
+2000 Cross
+press 3000 Circle 100
+";
+        var ps = PadScript.Parse(script, "unit");
+        if (ps.Events.Count != 3) throw new Exception($"expected 3 events, got {ps.Events.Count}");
+        if (ps.Events[0].Button != PadInput.Button.Start || ps.Events[0].PressAt != 1000 || ps.Events[0].Hold != 200)
+            throw new Exception("Start event parse fail");
+        if (ps.Events[1].Button != PadInput.Button.Cross || ps.Events[1].Hold != PadScript.DefaultHoldCycles)
+            throw new Exception("Cross default hold fail");
+        if (ps.Events[2].Button != PadInput.Button.Circle || ps.Events[2].PressAt != 3000)
+            throw new Exception("press form fail");
+
+        if (!PadScript.TryParsePressArg("--press=Square:5000:1234", out var cli, out _))
+            throw new Exception("CLI press parse failed");
+        var merged = PadScript.Merge(ps, new[] { cli });
+        if (merged.Events.Count != 4) throw new Exception("merge failed");
+
+        var pad = new PadInput();
+        int idx = 0;
+        var pending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
+        if (ps.ApplyAt(pad, 999, ref idx, pending) != 0) throw new Exception("no fire before press");
+        if (ps.ApplyAt(pad, 1000, ref idx, pending) <= 0) throw new Exception("expected Start press");
+        if (!pad.IsDown(PadInput.Button.Start)) throw new Exception("Start not down");
+        if (ps.ApplyAt(pad, 1200, ref idx, pending) <= 0) throw new Exception("expected Start release");
+        if (pad.IsDown(PadInput.Button.Start)) throw new Exception("Start still down after release");
+
+        Console.WriteLine($"[Smoke] PadScript_ParseAndApply OK (events={merged.Events.Count})");
+    }
+
     /// <summary>ZTE=0 must not soft-depth-reject overdraw.</summary>
     public static void Gs_DepthDisabled_AllowsOverdraw()
     {
@@ -986,6 +1116,9 @@ public static class SmokeTests
             Gs_Xyz2_Kicks_Xyz3_DoesNot();
             GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric();
             Gs_MergeComposite_AfterSparsePrims();
+            Gs_DisplayCircuit_DispfbDisplayDecode();
+            Gs_NaturalDispfb_CompositeUsesCircuit();
+            PadScript_ParseAndApply();
             Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();
             Gs_TextureSample_NonUniform();
