@@ -1431,6 +1431,14 @@ press 3000 Circle 100
             Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface();
             Gs_RetailOfx_NaturalHeight_DoesNotExpand();
             Gs_Ofx8000_CollapsedStrip_StillExpands();
+            // G2 GX-025…035 Host→Local IMAGE + TEX sample
+            Gs_HostToLocal_Psmct32_RoundTrip_Sample();
+            Gs_HostToLocal_Psmct16_RoundTrip_Sample();
+            Gs_HostToLocal_Psmt8_Clut_Sample();
+            Gs_Tex0_Valid_DisablesProcedural();
+            Gs_Tex0_Cld_LoadsClutFromLocal();
+            Gs_LocalToLocal_Blit();
+            Gs_Texa_Psmct16_Alpha();
             // GX-010/011 Path2 sticky harden
             Vif_Direct_Imm0_Means65536_NotEmpty();
             Vif_FeedData_Direct_MidQwPad_Path2Frame();
@@ -5595,6 +5603,252 @@ press 3000 Circle 100
         Console.WriteLine(
             $"[Smoke] Gs_Ofx8000_CollapsedStrip_StillExpands OK " +
             $"(px={px} expandHits={expandHits} titleFloor={titleFloor})");
+    }
+
+    /// <summary>
+    /// GX-025/028: Host→Local BITBLT PSMCT32 swizzle round-trip — IMAGE upload then TEX0
+    /// sample must see the same layout (commercial GIF IMAGE texture path).
+    /// </summary>
+    public static void Gs_HostToLocal_Psmct32_RoundTrip_Sample()
+    {
+        var sys = new Ps2System();
+        // BITBLT: DBP=0, DBW=1 (64px), DPSM=PSMCT32; RRW=4 RRH=4
+        sys.Gs.WriteGsRegister(0x50, (1UL << 48) | (0UL << 56)); // DBW=1 DPSM=0
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 4UL | (4UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0); // Host→Local
+        var blob = new byte[4 * 4 * 4];
+        // Pixel (0,0)=red, (1,0)=green, (0,1)=blue, rest white
+        void Put(int x, int y, uint rgba)
+        {
+            int i = (y * 4 + x) * 4;
+            blob[i] = (byte)rgba;
+            blob[i + 1] = (byte)(rgba >> 8);
+            blob[i + 2] = (byte)(rgba >> 16);
+            blob[i + 3] = (byte)(rgba >> 24);
+        }
+        Put(0, 0, 0xFF0000FFu); // ABGR store order matches GS B,G,R,A little-endian word
+        Put(1, 0, 0xFF00FF00u);
+        Put(0, 1, 0xFFFF0000u);
+        Put(1, 1, 0xFFFFFFFFu);
+        long imgBefore = sys.Gs.ImageBytesWritten;
+        sys.Gs.WriteImageData(blob, 0);
+        if (sys.Gs.ImageBytesWritten < imgBefore + 64)
+            throw new Exception($"imgBytes not advanced: {sys.Gs.ImageBytesWritten}");
+        // TEX0: TBP0=0 TBW=1 PSM=0 TW=2 TH=2 (4×4)
+        ulong tex0 = 0UL
+            | (1UL << 14) // TBW=1
+            | (0UL << 20) // PSMCT32
+            | (2UL << 26) // TW=2 → 4
+            | (2UL << 30); // TH=2 → 4
+        sys.Gs.WriteGsRegister(0x06, tex0);
+        if (sys.Gs.Tex0Valid == false)
+            throw new Exception("TEX0 write must disable procedural (GX-035)");
+        uint p00 = sys.Gs.SampleTexture(0.0f, 0.0f);
+        uint p10 = sys.Gs.SampleTexture(0.3f, 0.0f);
+        // Stored as B,G,R,A in local mem; SampleTexel reconstructs uint = B|G<<8|R<<16|A<<24
+        // Put(0,0,0xFF0000FF) → B=FF G=00 R=00 A=FF → sample 0xFF0000FF (blue-ish in RGB view)
+        if ((p00 & 0xFF) < 200) throw new Exception($"p00 low B channel 0x{p00:X8}");
+        if (((p10 >> 8) & 0xFF) < 200) throw new Exception($"p10 low G channel 0x{p10:X8}");
+        if (sys.Gs.TexSamplesLocal < 2)
+            throw new Exception("expected local tex samples");
+        Console.WriteLine(
+            $"[Smoke] Gs_HostToLocal_Psmct32_RoundTrip_Sample OK " +
+            $"(imgBytes={sys.Gs.ImageBytesWritten} p00=0x{p00:X8} localSamp={sys.Gs.TexSamplesLocal})");
+    }
+
+    /// <summary>GX-025/029: Host→Local PSMCT16 + TEX0 sample with TEXA default opaque.</summary>
+    public static void Gs_HostToLocal_Psmct16_RoundTrip_Sample()
+    {
+        var sys = new Ps2System();
+        // DPSM=PSMCT16 (0x02), DBW=1, 2×2
+        sys.Gs.WriteGsRegister(0x50, (1UL << 48) | (0x02UL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 2UL | (2UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        ushort r = (ushort)(0x1F << 10);
+        ushort g = (ushort)(0x1F << 5);
+        var blob = new byte[2 * 2 * 2];
+        blob[0] = (byte)r; blob[1] = (byte)(r >> 8);
+        blob[2] = (byte)g; blob[3] = (byte)(g >> 8);
+        blob[4] = 0; blob[5] = 0;
+        blob[6] = 0xFF; blob[7] = 0x7F; // white-ish
+        sys.Gs.WriteImageData(blob, 0);
+        ulong tex0 = (1UL << 14) | (0x02UL << 20) | (1UL << 26) | (1UL << 30); // 2×2 PSMCT16
+        sys.Gs.WriteGsRegister(0x06, tex0);
+        uint p0 = sys.Gs.SampleTexture(0.0f, 0.0f);
+        uint p1 = sys.Gs.SampleTexture(0.9f, 0.0f);
+        if (((p0 >> 16) & 0xFF) < 200) throw new Exception($"p0 not red 0x{p0:X8}");
+        if (((p1 >> 8) & 0xFF) < 200) throw new Exception($"p1 not green 0x{p1:X8}");
+        Console.WriteLine($"[Smoke] Gs_HostToLocal_Psmct16_RoundTrip_Sample OK (p0=0x{p0:X8} p1=0x{p1:X8})");
+    }
+
+    /// <summary>
+    /// GX-025/031: Host→Local PSMT8 indices + separate CLUT IMAGE at CBP, TEX0.CLD loads palette.
+    /// </summary>
+    public static void Gs_HostToLocal_Psmt8_Clut_Sample()
+    {
+        var sys = new Ps2System();
+        // 1) Upload 2×2 PSMT8 indices at DBP=0
+        sys.Gs.WriteGsRegister(0x50, (1UL << 48) | (0x13UL << 56)); // DBW=1 DPSM=PSMT8
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 2UL | (2UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        sys.Gs.WriteImageData(new byte[] { 0, 1, 2, 3 }, 0);
+
+        // 2) Upload 4 PSMCT32 CLUT entries at word addr 0x100 (byte 0x4000)
+        const int cbpWords = 0x100;
+        sys.Gs.WriteGsRegister(0x50, ((ulong)cbpWords << 32) | (1UL << 48) | (0UL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 4UL | (1UL << 32)); // 4×1
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var clut = new byte[4 * 4];
+        void Clut(int i, uint abgr)
+        {
+            clut[i * 4] = (byte)abgr;
+            clut[i * 4 + 1] = (byte)(abgr >> 8);
+            clut[i * 4 + 2] = (byte)(abgr >> 16);
+            clut[i * 4 + 3] = (byte)(abgr >> 24);
+        }
+        Clut(0, 0xFF0000FFu); // B
+        Clut(1, 0xFF00FF00u); // G
+        Clut(2, 0xFFFF0000u); // R
+        Clut(3, 0xFFFFFFFFu);
+        sys.Gs.WriteImageData(clut, 0);
+
+        // TEX0: TBP0=0 TBW=1 PSMT8 TW=1 TH=1 CBP=0x100 CPSM=0 CLD=1
+        ulong tex0 = 0UL
+            | (1UL << 14)
+            | (0x13UL << 20)
+            | (1UL << 26) | (1UL << 30)
+            | ((ulong)cbpWords << 37)
+            | (0UL << 51)
+            | (1UL << 61); // CLD=1
+        sys.Gs.WriteGsRegister(0x06, tex0);
+        uint p0 = sys.Gs.SampleTexture(0.0f, 0.0f);
+        uint p1 = sys.Gs.SampleTexture(0.9f, 0.0f);
+        if ((p0 & 0xFF) < 200) throw new Exception($"idx0 should be blue-ish 0x{p0:X8}");
+        if (((p1 >> 8) & 0xFF) < 200) throw new Exception($"idx1 should be green 0x{p1:X8}");
+        Console.WriteLine(
+            $"[Smoke] Gs_HostToLocal_Psmt8_Clut_Sample OK (p0=0x{p0:X8} p1=0x{p1:X8} img={sys.Gs.ImageBytesWritten})");
+    }
+
+    /// <summary>
+    /// GX-035: TEX0 with TBP0=0 (valid page-0 texture) must disable procedural checker.
+    /// </summary>
+    public static void Gs_Tex0_Valid_DisablesProcedural()
+    {
+        var sys = new Ps2System();
+        // Before TEX0: procedural on
+        uint proc = sys.Gs.SampleTexture(0.1f, 0.1f);
+        // TEX0 TBP0=0 PSM=0 TW=6 TH=6 — still valid commercial descriptor
+        sys.Gs.WriteGsRegister(0x06, (6UL << 26) | (6UL << 30) | (1UL << 14));
+        if (!sys.Gs.Tex0Valid)
+            throw new Exception("TEX0 (TBP0=0) must set Tex0Valid / disable procedural");
+        // Local mem empty → sample black/white garbage not magenta/cyan checker pair exclusively
+        uint local = sys.Gs.SampleTexture(0.1f, 0.1f);
+        // Procedural is magenta 0xFFFF00FF or cyan 0xFF00FFFF — after TEX0, zeros from empty local
+        if (local == 0xFFFF00FF || local == 0xFF00FFFF)
+        {
+            // Could still match by chance if local mem has that pattern — require TexSamplesLocal
+            if (sys.Gs.TexSamplesLocal < 1)
+                throw new Exception("expected local sample after TEX0");
+        }
+        if (sys.Gs.TexSamplesLocal < 1)
+            throw new Exception("TEX0 valid must sample local mem");
+        // TME path still paints (non-procedural zeros)
+        _ = proc;
+        Console.WriteLine(
+            $"[Smoke] Gs_Tex0_Valid_DisablesProcedural OK (proc=0x{proc:X8} local=0x{local:X8} samp={sys.Gs.TexSamplesLocal})");
+    }
+
+    /// <summary>GX-031: TEX0.CLD loads CLUT from pre-filled local mem at CBP without re-upload helpers.</summary>
+    public static void Gs_Tex0_Cld_LoadsClutFromLocal()
+    {
+        var sys = new Ps2System();
+        // Plant CLUT at byte 0x800 via WriteLocalMem
+        var pal = new byte[8];
+        pal[0] = 0x00; pal[1] = 0x00; pal[2] = 0xFF; pal[3] = 0xFF; // R
+        pal[4] = 0x00; pal[5] = 0xFF; pal[6] = 0x00; pal[7] = 0xFF; // G
+        sys.Gs.WriteLocalMem(0x800, pal);
+        // Index tex at 0: two texels
+        sys.Gs.WriteLocalMem(0, new byte[] { 0, 1 });
+        // Force indices into swizzle positions for (0,0) and (1,0) via Upload path for indices only
+        sys.Gs.UploadTexture8(0, 2, 2, new byte[] { 0, 1, 0, 1 }, ReadOnlySpan<uint>.Empty);
+        // Now CLD load from CBP word 0x800/64 = 0x20
+        const int cbpWords = 0x800 / 64;
+        ulong tex0 = (ulong)(0 & 0x3FFF)
+            | (1UL << 14)
+            | (0x13UL << 20)
+            | (1UL << 26) | (1UL << 30)
+            | ((ulong)cbpWords << 37)
+            | (1UL << 61);
+        sys.Gs.WriteGsRegister(0x06, tex0);
+        uint p0 = sys.Gs.SampleTexture(0.0f, 0.0f);
+        uint p1 = sys.Gs.SampleTexture(0.9f, 0.0f);
+        if (((p0 >> 16) & 0xFF) < 200) throw new Exception($"CLD red entry fail 0x{p0:X8}");
+        if (((p1 >> 8) & 0xFF) < 200) throw new Exception($"CLD green entry fail 0x{p1:X8}");
+        Console.WriteLine($"[Smoke] Gs_Tex0_Cld_LoadsClutFromLocal OK (p0=0x{p0:X8} p1=0x{p1:X8})");
+    }
+
+    /// <summary>GX-026: Local→Local blit copies a PSMCT32 block; sample at dest sees source color.</summary>
+    public static void Gs_LocalToLocal_Blit()
+    {
+        var sys = new Ps2System();
+        // Source: 2×2 red at DBP=0 via Host→Local
+        sys.Gs.WriteGsRegister(0x50, (1UL << 48));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 2UL | (2UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var red = new byte[2 * 2 * 4];
+        for (int i = 0; i < 4; i++)
+        {
+            red[i * 4] = 0x00;
+            red[i * 4 + 1] = 0x00;
+            red[i * 4 + 2] = 0xFF;
+            red[i * 4 + 3] = 0xFF;
+        }
+        sys.Gs.WriteImageData(red, 0);
+
+        // Local→Local: SBP=0 → DBP=0x40 words (byte 0x1000), 2×2
+        const int dbpWords = 0x40;
+        ulong blt = 0UL
+            | (0UL) // SBP
+            | (1UL << 16) // SBW
+            | (0UL << 24) // SPSM
+            | ((ulong)dbpWords << 32)
+            | (1UL << 48) // DBW
+            | (0UL << 56); // DPSM
+        sys.Gs.WriteGsRegister(0x50, blt);
+        sys.Gs.WriteGsRegister(0x51, 0); // SSAX/SSAY/DSAX/DSAY = 0
+        sys.Gs.WriteGsRegister(0x52, 2UL | (2UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 2); // Local→Local
+
+        ulong tex0 = (ulong)dbpWords | (1UL << 14) | (1UL << 26) | (1UL << 30);
+        sys.Gs.WriteGsRegister(0x06, tex0);
+        uint p = sys.Gs.SampleTexture(0.0f, 0.0f);
+        if (((p >> 16) & 0xFF) < 200)
+            throw new Exception($"L2L dest sample not red 0x{p:X8}");
+        Console.WriteLine($"[Smoke] Gs_LocalToLocal_Blit OK (p=0x{p:X8} imgBytes={sys.Gs.ImageBytesWritten})");
+    }
+
+    /// <summary>GX-033: TEXA TA0/TA1 applied to PSMCT16 alpha expand.</summary>
+    public static void Gs_Texa_Psmct16_Alpha()
+    {
+        var sys = new Ps2System();
+        // RGB555 red with A-bit=0, and green with A-bit=1
+        ushort r = (ushort)(0x1F << 10); // A=0
+        ushort g = (ushort)((0x1F << 5) | (1 << 15)); // A=1
+        sys.Gs.UploadTexture16(0, 2, 2, new[] { r, g, r, g });
+        // TEXA: TA0=0x40 TA1=0xC0
+        sys.Gs.WriteGsRegister(0x3B, 0x40UL | (0xC0UL << 32));
+        uint p0 = sys.Gs.SampleTexture(0.0f, 0.0f);
+        uint p1 = sys.Gs.SampleTexture(0.9f, 0.0f);
+        int a0 = (int)((p0 >> 24) & 0xFF);
+        int a1 = (int)((p1 >> 24) & 0xFF);
+        if (a0 != 0x40) throw new Exception($"TA0 expected 0x40 got 0x{a0:X}");
+        if (a1 != 0xC0) throw new Exception($"TA1 expected 0xC0 got 0x{a1:X}");
+        Console.WriteLine($"[Smoke] Gs_Texa_Psmct16_Alpha OK (a0=0x{a0:X} a1=0x{a1:X})");
     }
 
     /// <summary>

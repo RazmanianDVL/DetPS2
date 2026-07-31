@@ -49,11 +49,17 @@ public sealed class Gs : ISchedulable
     private float _lastU, _lastV, _lastS = 1f, _lastT = 1f, _lastQ = 1f;
     private float _lastFog;
     private int _texWidth = 64, _texHeight = 64;
+    /// <summary>Texture buffer width in pixels (TEX0.TBW×64) used for swizzle addressing.</summary>
+    private int _texBufWidth = 64;
     private uint _texBase;
     private bool _useProceduralTexture = true;
     private uint _clutBase;
     private readonly uint[] _clut = new uint[256]; // PSMCT32 palette
     private bool _hasClut;
+    /// <summary>GX-035: TEX0/TEX2 was programmed this session — sample local mem, not checker.</summary>
+    public bool Tex0Valid => !_useProceduralTexture;
+    /// <summary>Telemetry: texels sampled from local mem (non-procedural).</summary>
+    public long TexSamplesLocal { get; private set; }
     public long FragmentsRejectedAlpha { get; private set; }
     public long TexFlushCount { get; private set; }
     /// <summary>Phase 42: nearest (false) or bilinear (true) when sampling non-procedural textures.</summary>
@@ -180,8 +186,10 @@ public sealed class Gs : ISchedulable
         _lastFog = 0;
         _texWidth = 64;
         _texHeight = 64;
+        _texBufWidth = 64;
         _texBase = 0;
         _useProceduralTexture = true;
+        TexSamplesLocal = 0;
         _verts.Clear();
         _stripCount = 0;
         PrimitivesDrawn = PixelsWritten = FragmentsTested = FragmentsRejectedDepth = 0;
@@ -372,6 +380,13 @@ public sealed class Gs : ISchedulable
             case 0x06: // TEX0_1
                 ApplyTex0(value);
                 break;
+            case 0x07: // TEX0_2 — context 2; Soft-GS samples context-1 state but still arm local tex
+                ApplyTex0(value);
+                break;
+            case 0x16: // TEX2_1 — partial TEX0 (PSM/CBP/CLD) for CLUT reload without full TEX0
+            case 0x17: // TEX2_2
+                ApplyTex2(value);
+                break;
             // GS register map (Sony / Play! GSHandler.h):
             //   0x04 XYZF2 kick+fog, 0x05 XYZ2 kick, 0x0C XYZF3 no-kick+fog, 0x0D XYZ3 no-kick.
             // An earlier map had XYZ2/XYZ3 swapped with XYZF2/XYZF3, so commercial XYZ2
@@ -397,16 +412,28 @@ public sealed class Gs : ISchedulable
     }
 
     /// <summary>
-    /// TRXDIR.XDIR: 0 = Host→Local (GIF IMAGE), 1 = Local→Host, 2 = Local→Local, 3 = deactivate.
-    /// Soft-GS implements Host→Local for commercial texture/FB uploads; other dirs clear active.
+    /// TRXDIR.XDIR: 0 = Host→Local (GIF IMAGE), 1 = Local→Host (stub), 2 = Local→Local, 3 = deactivate.
+    /// Soft-GS implements Host→Local + Local→Local for commercial texture/FB paths.
     /// </summary>
     private void BeginTrxFromDir(ulong trxdir)
     {
         int xdir = (int)(trxdir & 0x3);
         _trxPending = 0;
         _trxPartial = 0;
+        if (xdir == 3)
+        {
+            _trxActive = false;
+            return;
+        }
+        if (xdir == 2)
+        {
+            _trxActive = false;
+            RunLocalToLocalBlit();
+            return;
+        }
         if (xdir != 0)
         {
+            // Local→Host readback not needed for current title fleet; deactivate.
             _trxActive = false;
             return;
         }
@@ -433,14 +460,215 @@ public sealed class Gs : ISchedulable
             _useProceduralTexture = false;
     }
 
+    /// <summary>
+    /// GX-026: Local→Local BITBLT — copy RRW×RRH from (SSAX,SSAY)@SBP to (DSAX,DSAY)@DBP.
+    /// Same-PSM path only (commercial logo/FB moves); cross-PSM conversion is residual.
+    /// </summary>
+    private void RunLocalToLocalBlit()
+    {
+        ulong blt = Registers.BITBLTBUF;
+        ulong pos = Registers.TRXPOS;
+        ulong reg = Registers.TRXREG;
+
+        uint sbpBytes = (uint)(blt & 0x3FFF) * 64u;
+        int sbwUnits = (int)((blt >> 16) & 0x3F);
+        int sbwPx = Math.Max(64, sbwUnits * 64);
+        int spsm = (int)((blt >> 24) & 0x3F);
+
+        uint dbpBytes = (uint)((blt >> 32) & 0x3FFF) * 64u;
+        int dbwUnits = (int)((blt >> 48) & 0x3F);
+        int dbwPx = Math.Max(64, dbwUnits * 64);
+        int dpsm = (int)((blt >> 56) & 0x3F);
+
+        int ssax = (int)(pos & 0x7FF);
+        int ssay = (int)((pos >> 16) & 0x7FF);
+        int dsax = (int)((pos >> 32) & 0x7FF);
+        int dsay = (int)((pos >> 48) & 0x7FF);
+        int rrw = (int)(reg & 0xFFF);
+        int rrh = (int)((reg >> 32) & 0xFFF);
+        if (rrw <= 0 || rrh <= 0) return;
+
+        // Same-PSM copy via LoadTrxPixel/Store helpers.
+        int psm = dpsm;
+        if (spsm != dpsm)
+            psm = dpsm; // residual: dest format wins for store layout
+
+        for (int y = 0; y < rrh; y++)
+        {
+            for (int x = 0; x < rrw; x++)
+            {
+                uint pix = LoadLocalPixel(sbpBytes, ssax + x, ssay + y, sbwPx, spsm);
+                StoreLocalPixel(dbpBytes, dsax + x, dsay + y, dbwPx, dpsm, pix);
+            }
+        }
+        _localMemHasImage = true;
+        _useProceduralTexture = false;
+        ImageBytesWritten += (long)rrw * rrh * Math.Max(1, TrxBytesPerPixel(psm));
+    }
+
+    private uint LoadLocalPixel(uint baseBytes, int px, int py, int bufW, int psm)
+    {
+        int bpp = TrxBytesPerPixel(psm);
+        if (bpp <= 0) bpp = 4;
+        int bi = LocalPixelByteOffset(baseBytes, px, py, bufW, psm, bpp);
+        if (bi < 0 || bi >= _localMem.Length) return 0;
+        uint pix = 0;
+        for (int b = 0; b < bpp && bi + b < _localMem.Length; b++)
+            pix |= (uint)_localMem[bi + b] << (8 * b); // byte is 0..255; shift is well-defined
+        if (psm is 0x14) // PSMT4: return nibble in low 4 bits
+        {
+            int nibbleIndex = py * bufW + px;
+            byte packed = _localMem[bi];
+            return ((nibbleIndex & 1) == 0) ? (uint)(packed & 0xF) : (uint)(packed >> 4);
+        }
+        return pix;
+    }
+
+    private void StoreLocalPixel(uint baseBytes, int px, int py, int bufW, int psm, uint pixel)
+    {
+        int bpp = TrxBytesPerPixel(psm);
+        if (bpp <= 0) bpp = 4;
+        if (psm is 0x14)
+        {
+            int bi = (int)baseBytes + (py * bufW + px) / 2;
+            if (bi < 0 || bi >= _localMem.Length) return;
+            int nibbleIndex = py * bufW + px;
+            if ((nibbleIndex & 1) == 0)
+                _localMem[bi] = (byte)((_localMem[bi] & 0xF0) | (pixel & 0xF));
+            else
+                _localMem[bi] = (byte)((_localMem[bi] & 0x0F) | ((pixel & 0xF) << 4));
+            return;
+        }
+        int off = LocalPixelByteOffset(baseBytes, px, py, bufW, psm, bpp);
+        if (off < 0 || off >= _localMem.Length) return;
+        for (int b = 0; b < bpp && off + b < _localMem.Length; b++)
+            _localMem[off + b] = (byte)(pixel >> (8 * b));
+    }
+
+    private static int LocalPixelByteOffset(uint baseBytes, int px, int py, int bufW, int psm, int bpp)
+    {
+        if (psm is 0x13 or 0x1B)
+            return (int)SwizzleOffset8(baseBytes, px, py, bufW);
+        if (psm is 0x00 or 0x01)
+            return (int)SwizzleOffset32(baseBytes, px, py, bufW);
+        if (psm is 0x02 or 0x0A)
+            return (int)SwizzleOffset16(baseBytes, px, py, bufW);
+        if (psm is 0x14)
+            return (int)baseBytes + (py * bufW + px) / 2;
+        return (int)baseBytes + (py * bufW + px) * bpp;
+    }
+
+    /// <summary>
+    /// GX-035: any programmed TEX0 is a real texture descriptor — sample local mem.
+    /// TBP0=0 is valid (textures at GS page 0). Procedural checker only when TEX0 never written.
+    /// Also arms TW/TH/TBW/PSM and loads CLUT when CLD≠0 (GX-031).
+    /// </summary>
     private void ApplyTex0(ulong tex0)
     {
         _texWidth = Registers.TexWidth;
         _texHeight = Registers.TexHeight;
-        _texBase = Registers.TexBaseWords * 64;
-        // If TEX0 was explicitly set with non-zero TBP0, sample local mem
-        if ((tex0 & 0x3FFF) != 0 || ((tex0 >> 20) & 0x3F) != 0)
-            _useProceduralTexture = false;
+        // When called for TEX0_2 before Registers.TEX0_1 update path differs — parse value directly.
+        int twLog = (int)((tex0 >> 26) & 0xF);
+        int thLog = (int)((tex0 >> 30) & 0xF);
+        if (twLog == 0) twLog = 6;
+        if (thLog == 0) thLog = 6;
+        twLog = Math.Clamp(twLog, 0, 10);
+        thLog = Math.Clamp(thLog, 0, 10);
+        _texWidth = 1 << twLog;
+        _texHeight = 1 << thLog;
+        _texBase = (uint)(tex0 & 0x3FFF) * 64u;
+        int tbwUnits = (int)((tex0 >> 14) & 0x3F);
+        _texBufWidth = tbwUnits <= 0 ? Math.Max(64, _texWidth) : Math.Max(64, tbwUnits * 64);
+        _useProceduralTexture = false;
+        MaybeLoadClut(tex0);
+    }
+
+    /// <summary>TEX2 carries PSM (20-25) + CBP/CPSM/CSM/CSA/CLD like the upper TEX0 fields.</summary>
+    private void ApplyTex2(ulong tex2)
+    {
+        // TEX2: PSM bits 20-25, CBP 37-50, CPSM 51-54, CSM 55, CSA 56-60, CLD 61-63
+        // Soft-GS: merge PSM into sample path via a synthetic TEX0-shaped word using current TBP/TBW/TW/TH.
+        ulong merged = (Registers.TEX0_1 & 0xFFFFFul) // keep TBP0+TBW
+            | (tex2 & ~0xFFFFFul); // overlay PSM + CLUT fields from TEX2
+        // If TEX0 was never set, still arm dimensions from current state.
+        if ((Registers.TEX0_1 & 0x3FFF) == 0 && ((Registers.TEX0_1 >> 26) & 0xF) == 0)
+        {
+            // keep _texWidth/_texHeight as-is
+        }
+        else
+        {
+            _texBase = Registers.TexBaseWords * 64;
+            _texWidth = Registers.TexWidth;
+            _texHeight = Registers.TexHeight;
+            _texBufWidth = Registers.TexBufWidthPixels;
+        }
+        int psm = (int)((tex2 >> 20) & 0x3F);
+        // Update TEX0_1 PSM in register file via re-write so SampleTexel sees it
+        ulong newTex0 = (Registers.TEX0_1 & ~((ulong)0x3F << 20))
+            | ((ulong)(uint)psm << 20)
+            | (tex2 & (0x7FFFFFUL << 37)); // CBP..CLD
+        Registers.WriteRegister64(0x06, newTex0);
+        _useProceduralTexture = false;
+        MaybeLoadClut(newTex0);
+    }
+
+    /// <summary>
+    /// GX-031: when TEX0/TEX2.CLD ≠ 0, load palette from local mem at CBP into Soft-GS CLUT cache.
+    /// CPSM PSMCT32 (0) or PSMCT16 (2); CSA selects starting entry (×16 when CSM=0).
+    /// </summary>
+    private void MaybeLoadClut(ulong tex0)
+    {
+        int cld = (int)((tex0 >> 61) & 0x7);
+        if (cld == 0) return;
+
+        uint cbpBytes = (uint)((tex0 >> 37) & 0x3FFF) * 64u;
+        int cpsm = (int)((tex0 >> 51) & 0xF);
+        int csa = (int)((tex0 >> 56) & 0x1F);
+        int start = csa * 16; // CSM=0 units of 16; Soft-GS ignores CSM=1 residual
+        if (start >= 256) start = 0;
+        int count = 256 - start;
+
+        _clutBase = cbpBytes;
+        if (cpsm is 0x02 or 0x0A)
+        {
+            // PSMCT16 palette
+            for (int i = 0; i < count; i++)
+            {
+                int bi = (int)cbpBytes + i * 2;
+                if (bi + 1 >= _localMem.Length) break;
+                ushort p = (ushort)(_localMem[bi] | (_localMem[bi + 1] << 8));
+                _clut[start + i] = ExpandRgb555(p);
+            }
+        }
+        else
+        {
+            // PSMCT32 (default) — linear palette in local mem (common PATH3 upload layout)
+            for (int i = 0; i < count; i++)
+            {
+                int bi = (int)cbpBytes + i * 4;
+                if (bi + 3 >= _localMem.Length) break;
+                _clut[start + i] = (uint)(_localMem[bi]
+                    | (_localMem[bi + 1] << 8)
+                    | (_localMem[bi + 2] << 16)
+                    | (_localMem[bi + 3] << 24));
+            }
+        }
+        _hasClut = true;
+    }
+
+    /// <summary>Expand RGB555 (+ optional A bit) with TEXA TA0/TA1 / AEM.</summary>
+    private uint ExpandRgb555(ushort p)
+    {
+        int r = ((p >> 10) & 0x1F) * 255 / 31;
+        int g = ((p >> 5) & 0x1F) * 255 / 31;
+        int b = (p & 0x1F) * 255 / 31;
+        int aBit = (p >> 15) & 1;
+        int a = aBit != 0 ? Registers.TexaTa1 : Registers.TexaTa0;
+        // Default TEXA=0 → treat as opaque when TA not programmed (smoke/host uploads).
+        if (Registers.TEXA == 0) a = 0xFF;
+        if (Registers.TexaAem && r == 0 && g == 0 && b == 0)
+            a = 0;
+        return ((uint)a << 24) | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
     }
 
     public void SetPrim(uint prim) => WriteGsRegister(0x00, prim);
@@ -1074,18 +1302,48 @@ public sealed class Gs : ISchedulable
         return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx);
     }
 
+    // PCSX2-derived block table for PSMCT16: page 64×64, block 16×8, 2 bytes/pixel.
+    private static readonly int[,] BlockTable16 =
+    {
+        { 0,  2,  8, 10},
+        { 1,  3,  9, 11},
+        { 4,  6, 12, 14},
+        { 5,  7, 13, 15},
+        {16, 18, 24, 26},
+        {17, 19, 25, 27},
+        {20, 22, 28, 30},
+        {21, 23, 29, 31}
+    };
+
+    /// <summary>
+    /// PSMCT16/PSMCT16S swizzled byte offset (GX-029). Page 64×64px, block 16×8px,
+    /// 2 bytes/pixel, 256 bytes/block. Column uses Morton interleave of (x%16, y%8).
+    /// </summary>
+    private static uint SwizzleOffset16(uint texBaseBytes, int x, int y, int bufferWidthPx)
+    {
+        const int pageW = 64, pageH = 64, blockW = 16, blockH = 8;
+        int pagesPerRow = Math.Max(1, (bufferWidthPx + pageW - 1) / pageW);
+        int pageX = x / pageW, pageY = y / pageH;
+        int pageIdx = pageY * pagesPerRow + pageX;
+        int ix = x % pageW, iy = y % pageH;
+        int blockIdx = BlockTable16[(iy / blockH) % 8, (ix / blockW) % 4];
+        int pixelIdx = MortonInterleave(ix % blockW, iy % blockH, 4); // 0..127 for 16×8
+        // 16×8 block = 128 texels × 2 bytes = 256 bytes
+        pixelIdx &= 127;
+        return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx * 2);
+    }
+
     public uint SampleTexture(float u, float v)
     {
         int tw = _texWidth;
         int th = _texHeight;
         float fu = u, fv = v;
 
+        // GX-034: CLAMP WMS/WMT — 0=REPEAT, 1=CLAMP, 2=REGION_CLAMP, 3=REGION_REPEAT
         int wms = Registers.ClampWms;
         int wmt = Registers.ClampWmt;
-        if (wms == 1) fu = Math.Clamp(fu, 0f, 1f);
-        else fu = fu - MathF.Floor(fu);
-        if (wmt == 1) fv = Math.Clamp(fv, 0f, 1f);
-        else fv = fv - MathF.Floor(fv);
+        ApplyClampCoord(ref fu, wms, Registers.ClampMinU, Registers.ClampMaxU, tw);
+        ApplyClampCoord(ref fv, wmt, Registers.ClampMinV, Registers.ClampMaxV, th);
 
         if (BilinearFilter && !_useProceduralTexture && tw > 1 && th > 1)
         {
@@ -1116,6 +1374,41 @@ public sealed class Gs : ISchedulable
         return SampleTexel(tu, tv);
     }
 
+    /// <summary>Normalize ST/UV scalar into [0,1]-ish domain per CLAMP mode, then texel scale.</summary>
+    private static void ApplyClampCoord(ref float f, int mode, int minT, int maxT, int texSize)
+    {
+        switch (mode)
+        {
+            case 1: // CLAMP
+                f = Math.Clamp(f, 0f, 1f);
+                break;
+            case 2: // REGION_CLAMP — clamp to [MIN,MAX] in texel space, return as normalized
+            {
+                float t = f * texSize;
+                float lo = minT;
+                float hi = Math.Max(minT, maxT);
+                t = Math.Clamp(t, lo, hi);
+                f = texSize > 0 ? t / texSize : 0f;
+                break;
+            }
+            case 3: // REGION_REPEAT — wrap within [MIN, MAX]
+            {
+                float t = f * texSize;
+                float lo = minT;
+                float hi = Math.Max(minT + 1, maxT + 1);
+                float span = hi - lo;
+                if (span <= 0) span = 1;
+                float rel = t - lo;
+                rel = rel - span * MathF.Floor(rel / span);
+                f = texSize > 0 ? (lo + rel) / texSize : 0f;
+                break;
+            }
+            default: // REPEAT
+                f = f - MathF.Floor(f);
+                break;
+        }
+    }
+
     private uint SampleTexel(int tu, int tv)
     {
         int tw = _texWidth;
@@ -1128,40 +1421,50 @@ public sealed class Gs : ISchedulable
             return checker ? 0xFFFF00FF : 0xFF00FFFF;
         }
 
+        TexSamplesLocal++;
         int psm = Registers.TexPsm;
-        // PSMT8 (0x13): 8-bit index → CLUT. Real block-swizzled addressing (see
-        // SwizzleOffset8) — buffer width defaults to the texture's own width, which is
-        // correct for the common single-texture case; real TBW isn't modeled separately.
-        if (psm == 0x13)
+        int bufW = _texBufWidth > 0 ? _texBufWidth : Math.Max(64, tw);
+
+        // PSMT8 (0x13) / PSMT8H (0x1B): 8-bit index → CLUT (swizzled)
+        if (psm is 0x13 or 0x1B)
         {
-            int bi = (int)SwizzleOffset8(_texBase, tu, tv, tw);
+            int bi = (int)SwizzleOffset8(_texBase, tu, tv, bufW);
             if (bi < 0 || bi >= _localMem.Length) return 0xFFFFFFFF;
             byte idx8 = _localMem[bi];
             return _hasClut ? _clut[idx8] : 0xFF000000u | ((uint)idx8 << 16) | ((uint)idx8 << 8) | idx8;
         }
-        // PSMT4 (0x14): 4-bit index
+        // PSMT4 (0x14): 4-bit index → CLUT (linear residual layout)
         if (psm == 0x14)
         {
-            int bi = (int)(_texBase + (tv * tw + tu) / 2);
+            int bi = (int)(_texBase + (tv * bufW + tu) / 2);
             if (bi < 0 || bi >= _localMem.Length) return 0xFFFFFFFF;
             byte packed = _localMem[bi];
-            int nibble = ((tu + tv * tw) & 1) == 0 ? (packed & 0xF) : (packed >> 4);
+            int nibble = ((tu + tv * bufW) & 1) == 0 ? (packed & 0xF) : (packed >> 4);
             return _hasClut ? _clut[nibble & 0xF] : 0xFF000000u | (uint)(nibble * 17) * 0x010101u;
         }
-        // PSMCT16 (0x02): 16-bit RGB555 expand
-        if (psm == 0x02)
+        // PSMCT16 / PSMCT16S (0x02 / 0x0A): RGB555 + TEXA (swizzled, GX-029)
+        if (psm is 0x02 or 0x0A)
         {
-            int bi = (int)(_texBase + (tv * tw + tu) * 2);
+            int bi = (int)SwizzleOffset16(_texBase, tu, tv, bufW);
             if (bi < 0 || bi + 1 >= _localMem.Length) return 0xFFFFFFFF;
             ushort p = (ushort)(_localMem[bi] | (_localMem[bi + 1] << 8));
-            int r = ((p >> 10) & 0x1F) * 255 / 31;
-            int g = ((p >> 5) & 0x1F) * 255 / 31;
-            int b = (p & 0x1F) * 255 / 31;
-            return 0xFF000000u | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
+            return ExpandRgb555(p);
+        }
+        // PSMCT24 (0x01): 24-bit RGB in 32-bit slot (low 24), alpha from TEXA.TA0
+        if (psm == 0x01)
+        {
+            int bi = (int)SwizzleOffset32(_texBase, tu, tv, bufW);
+            if (bi < 0 || bi + 2 >= _localMem.Length) return 0xFFFFFFFF;
+            int b = _localMem[bi];
+            int g = _localMem[bi + 1];
+            int r = _localMem[bi + 2];
+            int a = Registers.TEXA == 0 ? 0xFF : Registers.TexaTa0;
+            if (Registers.TexaAem && r == 0 && g == 0 && b == 0) a = 0;
+            return ((uint)a << 24) | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
         }
 
         // PSMCT32 / default — real block-swizzled addressing (see SwizzleOffset32).
-        int byteIndex = (int)SwizzleOffset32(_texBase, tu, tv, tw);
+        int byteIndex = (int)SwizzleOffset32(_texBase, tu, tv, bufW);
         if (byteIndex < 0 || byteIndex + 3 >= _localMem.Length)
             return 0xFFFFFFFF;
         return (uint)(_localMem[byteIndex]
@@ -1191,16 +1494,19 @@ public sealed class Gs : ISchedulable
         _texBase = (uint)(destWordAddr * 64);
         _texWidth = width;
         _texHeight = height;
+        _texBufWidth = Math.Max(64, width);
         _useProceduralTexture = false;
+        int tbw = Math.Max(1, (width + 63) / 64);
         Registers.WriteRegister64(0x06,
             (ulong)(destWordAddr & 0x3FFF)
+            | ((ulong)(tbw & 0x3F) << 14)
             | ((ulong)0x13 << 20) // PSMT8
             | ((ulong)Log2(width) << 26)
             | ((ulong)Log2(height) << 30));
         int n = Math.Min(indices.Length, width * height);
         for (int i = 0; i < n; i++)
         {
-            int bi = (int)SwizzleOffset8(_texBase, i % width, i / width, width);
+            int bi = (int)SwizzleOffset8(_texBase, i % width, i / width, _texBufWidth);
             if (bi >= _localMem.Length) break;
             _localMem[bi] = indices[i];
         }
@@ -1244,9 +1550,12 @@ public sealed class Gs : ISchedulable
         _texBase = (uint)(destWordAddr * 64);
         _texWidth = width;
         _texHeight = height;
+        _texBufWidth = Math.Max(64, width);
         _useProceduralTexture = false;
+        int tbw = Math.Max(1, (width + 63) / 64);
         Registers.WriteRegister64(0x06,
             (ulong)(destWordAddr & 0x3FFF)
+            | ((ulong)(tbw & 0x3F) << 14)
             | ((ulong)0 << 20) // PSMCT32
             | ((ulong)Log2(width) << 26)
             | ((ulong)Log2(height) << 30));
@@ -1254,7 +1563,7 @@ public sealed class Gs : ISchedulable
         int n = Math.Min(pixels.Length, width * height);
         for (int i = 0; i < n; i++)
         {
-            int bi = (int)SwizzleOffset32(_texBase, i % width, i / width, width);
+            int bi = (int)SwizzleOffset32(_texBase, i % width, i / width, _texBufWidth);
             if (bi + 3 >= _localMem.Length) break;
             uint p = pixels[i];
             _localMem[bi] = (byte)p;
@@ -1269,15 +1578,18 @@ public sealed class Gs : ISchedulable
         }
     }
 
-    /// <summary>Upload 16-bit RGB555 texture (PSMCT16) into local GS memory.</summary>
+    /// <summary>Upload 16-bit RGB555 texture (PSMCT16) into local GS memory (swizzled, GX-029).</summary>
     public void UploadTexture16(int destWordAddr, int width, int height, ReadOnlySpan<ushort> pixels)
     {
         _texBase = (uint)(destWordAddr * 64);
         _texWidth = width;
         _texHeight = height;
+        _texBufWidth = Math.Max(64, width);
         _useProceduralTexture = false;
+        int tbw = Math.Max(1, (width + 63) / 64);
         Registers.WriteRegister64(0x06,
             (ulong)(destWordAddr & 0x3FFF)
+            | ((ulong)(tbw & 0x3F) << 14)
             | ((ulong)0x02 << 20) // PSMCT16
             | ((ulong)Log2(width) << 26)
             | ((ulong)Log2(height) << 30));
@@ -1285,11 +1597,16 @@ public sealed class Gs : ISchedulable
         int n = Math.Min(pixels.Length, width * height);
         for (int i = 0; i < n; i++)
         {
-            int bi = (int)(_texBase + i * 2);
+            int bi = (int)SwizzleOffset16(_texBase, i % width, i / width, _texBufWidth);
             if (bi + 1 >= _localMem.Length) break;
             ushort p = pixels[i];
             _localMem[bi] = (byte)p;
             _localMem[bi + 1] = (byte)(p >> 8);
+        }
+        if (n > 0)
+        {
+            ImageBytesWritten += (long)n * 2;
+            _localMemHasImage = true;
         }
     }
 
@@ -1320,6 +1637,13 @@ public sealed class Gs : ISchedulable
     /// <summary>Stream host IMAGE bytes into local mem using BITBLT/TRX cursor.</summary>
     private void WriteImageTransfer(ReadOnlySpan<byte> data)
     {
+        // PSMT4: two pixels per byte — special packing path.
+        if (_trxDpsm == 0x14)
+        {
+            WriteImageTransferPsmt4(data);
+            return;
+        }
+
         int bpp = TrxBytesPerPixel(_trxDpsm);
         if (bpp <= 0) bpp = 4;
 
@@ -1345,6 +1669,32 @@ public sealed class Gs : ISchedulable
         }
     }
 
+    /// <summary>PSMT4 Host→Local: each host byte holds two 4-bit indices (lo nibble first).</summary>
+    private void WriteImageTransferPsmt4(ReadOnlySpan<byte> data)
+    {
+        for (int i = 0; i < data.Length && _trxActive; i++)
+        {
+            byte b = data[i];
+            ImageBytesWritten++;
+            _localMemHasImage = true;
+            for (int n = 0; n < 2 && _trxActive; n++)
+            {
+                uint nibble = (n == 0) ? (uint)(b & 0xF) : (uint)(b >> 4);
+                int px = _trxDsaX + _trxX;
+                int py = _trxDsaY + _trxY;
+                StoreLocalPixel(_trxDbpBytes, px, py, _trxDbwPx, 0x14, nibble);
+                _trxX++;
+                if (_trxX >= _trxW)
+                {
+                    _trxX = 0;
+                    _trxY++;
+                    if (_trxY >= _trxH)
+                        _trxActive = false;
+                }
+            }
+        }
+    }
+
     private static int TrxBytesPerPixel(int psm) => psm switch
     {
         0x00 => 4, // PSMCT32
@@ -1353,6 +1703,7 @@ public sealed class Gs : ISchedulable
         0x0A => 2, // PSMCT16S
         0x13 => 1, // PSMT8
         0x1B => 1, // PSMT8H
+        0x14 => 1, // PSMT4 counted as packed bytes (special path)
         _ => 4
     };
 
@@ -1360,18 +1711,7 @@ public sealed class Gs : ISchedulable
     {
         int px = _trxDsaX + _trxX;
         int py = _trxDsaY + _trxY;
-        int bi;
-        if (_trxDpsm == 0x13 || _trxDpsm == 0x1B)
-            bi = (int)SwizzleOffset8(_trxDbpBytes, px, py, _trxDbwPx);
-        else if (_trxDpsm == 0x00 || _trxDpsm == 0x01)
-            bi = (int)SwizzleOffset32(_trxDbpBytes, px, py, _trxDbwPx);
-        else
-            // PSMCT16 family: SampleTexel still uses linear — match it
-            bi = (int)_trxDbpBytes + (py * _trxDbwPx + px) * bpp;
-
-        if (bi < 0 || bi >= _localMem.Length) return;
-        for (int b = 0; b < bpp && bi + b < _localMem.Length; b++)
-            _localMem[bi + b] = (byte)(pixel >> (8 * b));
+        StoreLocalPixel(_trxDbpBytes, px, py, _trxDbwPx, _trxDpsm, pixel);
         ImageBytesWritten += bpp;
         _localMemHasImage = true;
     }
@@ -1388,7 +1728,12 @@ public sealed class Gs : ISchedulable
         _texBase = baseAddr;
         _texWidth = width;
         _texHeight = height;
-        _useProceduralTexture = baseAddr == 0;
+        _texBufWidth = Math.Max(64, width);
+        // GX-035: only pure zero-size / unprogrammed host path keeps procedural.
+        // Non-zero base or any positive size arms local sample (commercial TBP0=0 still uses Upload*).
+        _useProceduralTexture = baseAddr == 0 && width <= 0;
+        if (width > 0 && height > 0 && baseAddr == 0)
+            _useProceduralTexture = false; // TBP0=0 is valid local page 0
     }
 
     private uint Blend(uint src, uint dst)

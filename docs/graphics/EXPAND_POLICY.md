@@ -113,6 +113,8 @@ When `titleStrip` remains true:
 
 **S1 baseline (diagnose 20M, SEMA_OFF):** GoW `expandHits=2` (2× ofx=0 strip); Whip `expandHits=1` (0x8000 collapse). Accurate counters, not demoted yet.
 
+**S2-G2 hold:** expandHits policy **unchanged** while G2 IMAGE/TEX lands (GX-025…035). Do **not** remove collapse-strip expand without MENU hold (forbidden: GoW/Whip demotion without proof).
+
 ---
 
 ## 6. Forbidden / freezes

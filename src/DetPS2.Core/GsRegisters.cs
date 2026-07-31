@@ -35,6 +35,8 @@ public sealed class GsRegisters
     public ulong CLAMP_1 { get; private set; }
     public ulong CLAMP_2 { get; private set; }
     public ulong TEXCLUT { get; private set; }
+    /// <summary>GS 0x3B TEXA — AEM / TA0 / TA1 for PSMCT16/24 / PSMT* alpha expand.</summary>
+    public ulong TEXA { get; private set; }
 
     public ulong FRAME_1 { get; private set; }
     public ulong FRAME_2 { get; private set; }
@@ -90,7 +92,7 @@ public sealed class GsRegisters
         PRMODE = 0;
 
         TEX0_1 = TEX0_2 = TEX1_1 = TEX1_2 = TEX2_1 = TEX2_2 = 0;
-        CLAMP_1 = CLAMP_2 = TEXCLUT = 0;
+        CLAMP_1 = CLAMP_2 = TEXCLUT = TEXA = 0;
 
         FRAME_1 = FRAME_2 = ZBUF_1 = ZBUF_2 = 0;
         XYOFFSET_1 = XYOFFSET_2 = 0;
@@ -104,6 +106,7 @@ public sealed class GsRegisters
         PABE = 0;
 
         PMODE = SMODE2 = DISPLAY1 = DISPLAY2 = DISPFB1 = DISPFB2 = 0;
+        BITBLTBUF = TRXPOS = TRXREG = TRXDIR = HWREG = 0;
         _regs.Clear();
     }
 
@@ -171,6 +174,7 @@ public sealed class GsRegisters
             case 0x0A: FOG = value; break;
             case 0x3D: FOGCOL = value; break;
             case 0x1C: TEXCLUT = value; break;
+            case 0x3B: TEXA = value; break;
             case 0x14: TEX1_1 = value; break;
             case 0x15: TEX1_2 = value; break;
             case 0x16: TEX2_1 = value; break;
@@ -234,6 +238,7 @@ public sealed class GsRegisters
             0x47 => TEST_1,
             0x42 => ALPHA_1,
             0x4A => FBA_1,
+            0x3B => TEXA,
             0x50 => BITBLTBUF,
             0x51 => TRXPOS,
             0x52 => TRXREG,
@@ -350,6 +355,56 @@ public sealed class GsRegisters
     public int TexHeight => 1 << TexHeightLog2;
     public int TexPsm => (int)((TEX0_1 >> 20) & 0x3F);
     public uint TexBaseWords => (uint)(TEX0_1 & 0x3FFF);
+
+    /// <summary>TEX0.TBW (bits 14-19): buffer width in 64-pixel units. 0 → use TW pixels.</summary>
+    public int TexBufWidthUnits => (int)((TEX0_1 >> 14) & 0x3F);
+
+    /// <summary>Texture buffer width in pixels for swizzle (TBW×64, min TW, min 64 when TBW=0).</summary>
+    public int TexBufWidthPixels
+    {
+        get
+        {
+            int units = TexBufWidthUnits;
+            if (units <= 0) return Math.Max(64, TexWidth);
+            return Math.Max(64, units * 64);
+        }
+    }
+
+    /// <summary>TEX0.CBP (bits 37-50): CLUT base pointer in 64-byte units.</summary>
+    public uint TexClutBaseWords => (uint)((TEX0_1 >> 37) & 0x3FFF);
+
+    /// <summary>TEX0.CPSM (bits 51-54): CLUT storage format (0=PSMCT32, 2=PSMCT16).</summary>
+    public int TexClutPsm => (int)((TEX0_1 >> 51) & 0xF);
+
+    /// <summary>TEX0.CSM (bit 55): CLUT storage mode.</summary>
+    public int TexClutStorageMode => (int)((TEX0_1 >> 55) & 1);
+
+    /// <summary>TEX0.CSA (bits 56-60): CLUT entry offset (×16 when CSM=0).</summary>
+    public int TexClutEntryOffset => (int)((TEX0_1 >> 56) & 0x1F);
+
+    /// <summary>TEX0.CLD (bits 61-63): CLUT load control (0=none, 1-5=load from CBP).</summary>
+    public int TexClutLoadControl => (int)((TEX0_1 >> 61) & 0x7);
+
+    /// <summary>TEXA.AEM (bit 15): when set, RGB=0 texels force A=0.</summary>
+    public bool TexaAem => ((TEXA >> 15) & 1) != 0;
+
+    /// <summary>TEXA.TA0 (bits 0-7): alpha for A=0 in 16/24-bit formats.</summary>
+    public int TexaTa0 => (int)(TEXA & 0xFF);
+
+    /// <summary>TEXA.TA1 (bits 32-39): alpha for A=1 in PSMCT16 family.</summary>
+    public int TexaTa1 => (int)((TEXA >> 32) & 0xFF);
+
+    /// <summary>CLAMP.MINU (bits 4-13).</summary>
+    public int ClampMinU => (int)((CLAMP_1 >> 4) & 0x3FF);
+
+    /// <summary>CLAMP.MAXU (bits 14-23).</summary>
+    public int ClampMaxU => (int)((CLAMP_1 >> 14) & 0x3FF);
+
+    /// <summary>CLAMP.MINV (bits 24-33).</summary>
+    public int ClampMinV => (int)((CLAMP_1 >> 24) & 0x3FF);
+
+    /// <summary>CLAMP.MAXV (bits 34-43).</summary>
+    public int ClampMaxV => (int)((CLAMP_1 >> 34) & 0x3FF);
 
     /// <summary>ZTE (bit 16). When set, depth testing is active.</summary>
     public bool DepthTestEnabled => ((TEST_1 >> 16) & 1) != 0;
