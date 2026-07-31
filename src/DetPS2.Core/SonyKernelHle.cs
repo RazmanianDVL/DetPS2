@@ -1124,23 +1124,19 @@ public sealed class SonyKernelHle
                         }
                         else
                         {
-                            // Hybrid (wave-2 Dec): WHIP always-fabricate starved Midway SIF-cmd
-                            // poll (WaitSema(3) @0x10BE24) → CreateSema/WaitSema thrash ~120k @20M.
-                            // Low-id mutexes (1..16): TryYield first (pre-whip). High-id SN client
-                            // semas (>16): keep multi-thread soft-signal (WHIP_SEMA_FIX_V2).
-                            bool snClientSema = a0 > 16;
-                            if (!snClientSema && _kernel.TryYieldToOtherRunnable(ee))
-                            {
-                                // Yielded — leave wait; result still returns sema id below.
-                            }
-                            else
+                            // Wave-2 Dec: restore pre-whip TryYield-first for ALL non-RPC waits.
+                            // WHIP always-fabricate starved Midway SIF-cmd poll (WaitSema(3)) and
+                            // also soft-signaled high-id FILEIO DEVCTL command semas too early,
+                            // leaving Dec in DEVCTL thrash @0x10BE28 (cdvd~187). Only fabricate
+                            // when no other runnable thread (f2f74f0 / pre-whip). Whiplash SN can
+                            // still complete via fabricate-when-alone + multi-thread Signal path.
+                            if (!_kernel.TryYieldToOtherRunnable(ee))
                             {
                                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                     Console.Error.WriteLine(
                                         $"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} " +
-                                        $"(sn={snClientSema} thr={_kernel.ThreadCount})");
-                                if (_kernel.ThreadCount < 2)
-                                    _kernel.WaitSemaVblank();
+                                        $"(no matching RPC / no runnable thr={_kernel.ThreadCount})");
+                                _kernel.WaitSemaVblank();
                                 _kernel.SignalSema((int)a0);
                                 _kernel.WakeupThread(_kernel.CurrentThreadId);
                             }
