@@ -420,7 +420,9 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 }
             }
         }
-        Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
+        Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
+        Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
+        Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
         Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
         if (traceSys.Hle.Sony != null)
         {
@@ -595,6 +597,8 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         {
             smSys.RunFor(smCycles);
         }
+        // Headless Soft-GS DISPFB residual (IMAGE/local may hold logo without prim px).
+        smSys.Gs.CompositeDispfbToFramebuffer();
 
         var rpc = smSys.Hle.Sony?.RealRpc;
         var metrics = new Dictionary<string, object?>
@@ -614,6 +618,18 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["exitRequested"] = smSys.Hle.ExitRequested,
             ["exitCode"] = smSys.Hle.ExitCode,
             ["cycles"] = smSys.MasterCycles,
+            ["imgBytes"] = smSys.Gs.ImageBytesWritten,
+            ["dispfbPx"] = smSys.Gs.DispfbPixelsComposited,
+            ["fragTest"] = smSys.Gs.FragmentsTested,
+            ["rejBounds"] = smSys.Gs.FragmentsRejectedBounds,
+            ["rejScissor"] = smSys.Gs.FragmentsRejectedScissor,
+            ["rejDepth"] = smSys.Gs.FragmentsRejectedDepth,
+            ["rejAlpha"] = smSys.Gs.FragmentsRejectedAlpha,
+            ["frame1"] = $"0x{smSys.Gs.Registers.FRAME_1:X16}",
+            ["dispfb1"] = $"0x{smSys.Gs.Registers.DISPFB1:X16}",
+            ["scissor"] = $"0x{smSys.Gs.Registers.SCISSOR_1:X16}",
+            ["xyoffset"] = $"0x{smSys.Gs.Registers.XYOFFSET_1:X16}",
+            ["test1"] = $"0x{smSys.Gs.Registers.TEST_1:X16}",
         };
         smResults.Add(metrics);
         Console.WriteLine(JsonSerializer.Serialize(metrics, jsonOpts));

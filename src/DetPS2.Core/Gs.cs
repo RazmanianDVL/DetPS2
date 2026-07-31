@@ -72,6 +72,10 @@ public sealed class Gs : ISchedulable
     public long ImageBytesWritten { get; private set; }
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
+    /// <summary>Fragments rejected for FB bounds (before scissor).</summary>
+    public long FragmentsRejectedBounds { get; private set; }
+    /// <summary>Fragments rejected by SCISSOR_1.</summary>
+    public long FragmentsRejectedScissor { get; private set; }
     private bool _localMemHasImage;
 
     public struct Vertex
@@ -107,6 +111,8 @@ public sealed class Gs : ISchedulable
         _trxPartial = 0;
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
+        FragmentsRejectedBounds = 0;
+        FragmentsRejectedScissor = 0;
         _localMemHasImage = false;
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
@@ -301,6 +307,14 @@ public sealed class Gs : ISchedulable
             case 0x05: // XYZ3 — no kick (strip build)
                 AddVertexFromXyz(value, kick: false);
                 break;
+            case 0x0C: // XYZF2 — XYZ + fog, kick
+                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
+                AddVertexFromXyz(value, kick: true);
+                break;
+            case 0x0D: // XYZF3 — XYZ + fog, no kick
+                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
+                AddVertexFromXyz(value, kick: false);
+                break;
             case 0x53: // TRXDIR — start host↔local transfer after BITBLTBUF/TRXPOS/TRXREG
                 BeginTrxFromDir(value);
                 break;
@@ -412,6 +426,42 @@ public sealed class Gs : ISchedulable
                     y = (yRaw - 0x8000) >> 4;
                 }
             }
+        }
+
+        // Off-FB rescue when XYOFFSET is programmed but verts still land outside Soft-GS
+        // FB (B3: ofx=0x6C00 ofy=0x7200 → prims↑ rejBounds=prims fragTest=0 without this).
+        if (x < -64 || y < -64 || x >= FB_WIDTH + 64 || y >= FB_HEIGHT + 64)
+        {
+            int ax = (xRaw - 0x8000) >> 4;
+            int ay = (yRaw - 0x8000) >> 4;
+            if (ax >= -64 && ay >= -64 && ax < FB_WIDTH + 64 && ay < FB_HEIGHT + 64)
+            {
+                x = ax; y = ay;
+            }
+            else
+            {
+                int px = xRaw >> 4, py = yRaw >> 4;
+                if (px >= -64 && py >= -64 && px < FB_WIDTH + 64 && py < FB_HEIGHT + 64)
+                {
+                    x = px; y = py;
+                }
+                else
+                {
+                    int sx = unchecked((short)(ushort)xRaw) >> 4;
+                    int sy = unchecked((short)(ushort)yRaw) >> 4;
+                    if (sx >= -64 && sy >= -64 && sx < FB_WIDTH + 64 && sy < FB_HEIGHT + 64)
+                    {
+                        x = sx; y = sy;
+                    }
+                }
+            }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GS") == "1" && PrimitivesDrawn < 12)
+        {
+            Console.Error.WriteLine(
+                $"[GS] XYZ raw=({xRaw:X4},{yRaw:X4}) of=({ofx:X4},{ofy:X4}) -> ({x},{y}) " +
+                $"kick={kick} prim={_currentPrim & 7}");
         }
 
         float z = zRaw / (float)0xFFFFFF;
@@ -663,24 +713,25 @@ public sealed class Gs : ISchedulable
 
     private void WriteFragment(int x, int y, float z, uint color, float u, float v, float fog)
     {
-        if (x < 0 || y < 0 || x >= FB_WIDTH || y >= FB_HEIGHT) return;
-        if (!InScissor(x, y)) return;
+        if (x < 0 || y < 0 || x >= FB_WIDTH || y >= FB_HEIGHT)
+        {
+            FragmentsRejectedBounds++;
+            return;
+        }
+        if (!InScissor(x, y))
+        {
+            FragmentsRejectedScissor++;
+            return;
+        }
 
         int idx = y * FB_WIDTH + x;
         FragmentsTested++;
 
+        // Hardware: ZTE=0 disables depth test entirely. Soft less-z against a cleared
+        // buffer is not a GS feature and blocked commercial overdraw paths.
         if (Registers.DepthTestEnabled)
         {
             if (!DepthPass(z, _depthBuffer[idx], Registers.DepthTestMode))
-            {
-                FragmentsRejectedDepth++;
-                return;
-            }
-        }
-        else
-        {
-            // Default: closer (smaller z) wins like OpenGL less
-            if (z > _depthBuffer[idx])
             {
                 FragmentsRejectedDepth++;
                 return;
@@ -694,11 +745,21 @@ public sealed class Gs : ISchedulable
             final = Modulate(color, tex);
         }
 
-        // Alpha test (Phase 28) — ATE bit in TEST
-        if (!AlphaTestPass(final))
+        // Alpha test — ATE; AFAIL bits 12-13: 0=KEEP 1=FB_ONLY 2=ZB_ONLY 3=RGB_ONLY
+        bool alphaPass = AlphaTestPass(final);
+        int afail = (int)((Registers.TEST_1 >> 12) & 3);
+        if (!alphaPass)
         {
             FragmentsRejectedAlpha++;
-            return;
+            if (afail == 0)
+                return; // KEEP
+            if (afail == 2)
+            {
+                if (Registers.DepthWriteEnabled)
+                    _depthBuffer[idx] = z;
+                return;
+            }
+            // FB_ONLY / RGB_ONLY: still paint RGB below
         }
 
         if (Registers.PrimFge)
@@ -707,10 +768,42 @@ public sealed class Gs : ISchedulable
         if (Registers.PrimAbe || Registers.ALPHA_1 != 0)
             final = Blend(final, _framebuffer[idx]);
 
-        _framebuffer[idx] = final | 0xFF000000;
-        if (!Registers.DepthTestEnabled || Registers.DepthWriteEnabled)
+        if (alphaPass || afail is 1 or 3)
+        {
+            _framebuffer[idx] = (final & 0x00FFFFFFu) | 0xFF000000u;
+            WriteFrameLocal(x, y, _framebuffer[idx]);
+            PixelsWritten++;
+        }
+        if (alphaPass && (!Registers.DepthTestEnabled || Registers.DepthWriteEnabled))
             _depthBuffer[idx] = z;
-        PixelsWritten++;
+        else if (!Registers.DepthTestEnabled)
+            _depthBuffer[idx] = z;
+    }
+
+    /// <summary>
+    /// Mirror a painted pixel into local VRAM at FRAME_1 (FBP units = 8192 bytes).
+    /// Real GS draws into local mem; DISPFB composite then matches prim paint.
+    /// </summary>
+    private void WriteFrameLocal(int x, int y, uint pixel)
+    {
+        ulong frame = Registers.FRAME_1;
+        int fbp = (int)(frame & 0x1FF);
+        int fbw = (int)((frame >> 16) & 0x3F) * 64;
+        int psm = (int)((frame >> 24) & 0x3F);
+        if (fbw <= 0) fbw = FB_WIDTH;
+        if (fbw > 4096) fbw = 4096;
+        uint baseBytes = (uint)fbp * 8192u;
+        if (baseBytes >= (uint)_localMem.Length) return;
+        if (psm is 0x00 or 0x01 or 0)
+        {
+            int bi = (int)SwizzleOffset32(baseBytes, x, y, fbw);
+            if ((uint)bi + 3u >= (uint)_localMem.Length) return;
+            _localMem[bi] = (byte)pixel;
+            _localMem[bi + 1] = (byte)(pixel >> 8);
+            _localMem[bi + 2] = (byte)(pixel >> 16);
+            _localMem[bi + 3] = (byte)(pixel >> 24);
+            _localMemHasImage = true;
+        }
     }
 
     private static bool DepthPass(float z, float buf, int mode) => mode switch
@@ -722,6 +815,11 @@ public sealed class Gs : ISchedulable
         _ => z <= buf
     };
 
+    /// <summary>
+    /// GS texture MODULATE: components multiply with 0x80 = 1.0 (not 0xFF).
+    /// Using /255 dimmed 0x80×0x80 → 0x40 so ATE GEQUAL AREF=0x80 rejected every
+    /// commercial textured fragment (B3 claim: fragTest=1904 rejAlpha=1904 px=0).
+    /// </summary>
     private static uint Modulate(uint color, uint tex)
     {
         byte cr = (byte)((color >> 16) & 0xFF);
@@ -732,11 +830,14 @@ public sealed class Gs : ISchedulable
         byte tg = (byte)((tex >> 8) & 0xFF);
         byte tb = (byte)(tex & 0xFF);
         byte ta = (byte)((tex >> 24) & 0xFF);
-        byte r = (byte)((cr * tr) / 255);
-        byte g = (byte)((cg * tg) / 255);
-        byte b = (byte)((cb * tb) / 255);
-        byte a = (byte)((ca * ta) / 255);
-        return (uint)((a << 24) | (r << 16) | (g << 8) | b);
+        return (uint)((Mul80(ca, ta) << 24) | (Mul80(cr, tr) << 16) | (Mul80(cg, tg) << 8) | Mul80(cb, tb));
+    }
+
+    /// <summary>PS2 GS (a*b)/128 with clamp; 0x80×0x80 → 0x80.</summary>
+    private static byte Mul80(byte a, byte b)
+    {
+        int v = (a * b) >> 7;
+        return v > 255 ? (byte)255 : (byte)v;
     }
 
     private uint ApplyFog(uint color, float fog)
@@ -1385,7 +1486,8 @@ public sealed class Gs : ISchedulable
         }
         if (fbw <= 0) fbw = FB_WIDTH;
         if (fbw > 4096) fbw = 4096;
-        uint baseBytes = (uint)fbp * 2048u;
+        // FRAME/DISPFB FBP: units of 2048 words → 8192 bytes (GS page / PCSX2 Block()).
+        uint baseBytes = (uint)fbp * 8192u;
         if (baseBytes >= (uint)_localMem.Length) return 0;
         if (psm is not (0x00 or 0x01 or 0x02 or 0x0A))
             psm = 0x00;

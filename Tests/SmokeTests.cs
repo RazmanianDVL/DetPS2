@@ -196,6 +196,45 @@ public static class SmokeTests
         Console.WriteLine("[Smoke] Gs_DepthTest_RejectsFar OK");
     }
 
+    /// <summary>
+    /// PS2 MODULATE uses 0x80=1.0. Textured path with A=0x80×0x80 must pass
+    /// ATE GEQUAL AREF=0x80 (B3 logo: fragTest↑ rejAlpha=all without Mul80).
+    /// </summary>
+    public static void Gs_Modulate80_AlphaTestPasses()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        var tex = new uint[8 * 8];
+        Array.Fill(tex, 0x80808080u);
+        sys.Gs.UploadTexture(0, 8, 8, tex);
+        // ATE=1 ATST=GEQUAL(5) AREF=0x80
+        sys.Gs.WriteGsRegister(0x47, 1u | (5u << 1) | (0x80u << 4));
+        sys.Gs.WriteGsRegister(0x00, (1UL << 4) | 6); // sprite + TME
+        sys.Gs.WriteGsRegister(0x01, 0x80808080UL);
+        long before = sys.Gs.PixelsWritten;
+        sys.Gs.WriteGsRegister(0x04, (ulong)(20 * 16) | ((ulong)(20 * 16) << 16));
+        sys.Gs.WriteGsRegister(0x04, (ulong)(60 * 16) | ((ulong)(50 * 16) << 16) | (0x1000UL << 32));
+        if (sys.Gs.PixelsWritten <= before)
+            throw new Exception($"Modulate80 ATE failed px={sys.Gs.PixelsWritten} rejA={sys.Gs.FragmentsRejectedAlpha} fragT={sys.Gs.FragmentsTested}");
+        Console.WriteLine($"[Smoke] Gs_Modulate80_AlphaTestPasses OK (px={sys.Gs.PixelsWritten})");
+    }
+
+    /// <summary>ZTE=0 must not soft-depth-reject overdraw.</summary>
+    public static void Gs_DepthDisabled_AllowsOverdraw()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000, 0f);
+        sys.Gs.DrawQuad(10, 10, 20, 20, 0xFF0000FF);
+        long mid = sys.Gs.PixelsWritten;
+        sys.Gs.DrawQuad(10, 10, 20, 20, 0xFF00FF00);
+        if (sys.Gs.PixelsWritten <= mid)
+            throw new Exception("ZTE=0 overdraw rejected by soft depth");
+        uint p = sys.Gs.GetPixel(15, 15);
+        if ((p & 0xFFFFFF) != 0x00FF00)
+            throw new Exception($"Expected green overdraw, got 0x{p:X8}");
+        Console.WriteLine("[Smoke] Gs_DepthDisabled_AllowsOverdraw OK");
+    }
+
     public static void Gs_AlphaBlend_Mixes()
     {
         var sys = new Ps2System();
@@ -845,6 +884,8 @@ public static class SmokeTests
 
             Gs_Sprite_FillsRect();
             Gs_DepthTest_RejectsFar();
+            Gs_Modulate80_AlphaTestPasses();
+            Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();
             Gs_TextureSample_NonUniform();
             Gif_PackedTriangle_WritesPixels();
