@@ -138,6 +138,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _stageHedSize = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
+        _frontendPlanted = false;
+        _frontendEeAddr = 0;
+        _frontendSize = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -800,14 +803,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x002371E0;
         }
 
-        // High WaitSema pulse only while IRX-only after residual settle (≥30M).
-        // Live tip: main WaitSemaId=70 (gp-23068) at 0x2AF864 after post-LGDEV spin —
-        // SignalSema alone can race; also soft-complete WaitSema when ra is in 0x2AF8xx.
-        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && sys.Cdvd.SectorsRead < 600)
+        // High WaitSema pulse while IRX-only after residual settle, and again after
+        // STG/TXD (cdvd>=2000) so presentation workers are not stuck on high ids.
+        // Soft-complete post-LGDEV spin WaitSema only while IRX-only (ra@0x2AF8xx).
+        bool irxOnly = sys.Cdvd.SectorsRead is >= 400 and < 600;
+        bool postTxd = sys.Cdvd.SectorsRead >= 2000;
+        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && (irxOnly || postTxd))
         {
             uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            if (pcW is >= 0x0010BE60 and <= 0x0010BE70
+            if (irxOnly && pcW is >= 0x0010BE60 and <= 0x0010BE70
                 && raW is >= 0x002AF800 and <= 0x002AF910)
             {
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -900,22 +905,64 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _deadEpiLeaves;
     private int _postTxdEscapes;
     private ulong _lastPostTxdEscapeCyc;
+    private bool _frontendPlanted;
+    private uint _frontendEeAddr;
+    private uint _frontendSize;
 
     /// <summary>
-    /// After STG + full Global.txd (cdvd≥2000), live wave-7 parks in the SIF transfer
-    /// byte-copy at <c>0x10FB80..0x10FBCC</c> (disasm: <c>lbu/sb</c> loop with
-    /// <c>*(a3+4)</c> size and <c>*(a3+12)|0x20000000</c> dest) when size/dest are
-    /// garbage → UnknownMmioRead flood. Exit the real loop epilogue at <c>0x10FD9C</c>
-    /// so CallRpc/DBC peers can resume and open FRONTEND via SHARED GTFS.
-    /// Never rewrites residual LGDEV force cadence.
+    /// After STG + full Global.txd (cdvd>=2000). Wave-9: sticky PATH3 M3P unmask,
+    /// host-plant FRONTEND.TXD slice, dead flip-watermark $ra rescue.
+    /// Never soft-complete generic CallRpc (DBC abort). No residual LGDEV force rewrite.
     /// </summary>
     private void MaybeEscapePostTxdHang(Ps2System sys)
     {
-        if (_postTxdEscapes >= 1024) return;
+        if (_postTxdEscapes >= 2048) return;
         if (sys.MasterCycles - _lastPostTxdEscapeCyc < 4_000) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+
+        if (!_frontendPlanted && sys.Cdvd.SectorsRead >= 2000)
+            MaybePlantFrontendTxd(sys);
+
+        // PATH3 M3P: transfers count while packets are held -> gifP3 climbs, px=0.
+        if (sys.Gif.Path3MaskedByVif && sys.Gs.PixelsWritten == 0
+            && sys.Gif.Path3Transfers >= 30)
+        {
+            sys.Gif.SetMskPath3(false);
+            _postTxdEscapes++;
+            _lastPostTxdEscapeCyc = sys.MasterCycles;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_postTxdEscapes <= 8 || _postTxdEscapes % 32 == 0))
+                Console.Error.WriteLine(
+                    $"[B3] post-TXD unmask PATH3 M3P gifP3={sys.Gif.Path3Transfers} " +
+                    $"px={sys.Gs.PixelsWritten} n={_postTxdEscapes} cyc={sys.MasterCycles}");
+        }
+
+        // Flip watermark jr @0x228068 - only when $ra is dead.
+        if (pc is >= 0x00228054 and <= 0x0022806C)
+        {
+            bool badRa = ra < 0x00100000 || ra >= 0x00400000 || !sys.Memory.IsLikelyEeCode(ra)
+                || ra is (>= 0x00228040 and <= 0x00228070)
+                || ra is (>= 0x001F24E0 and <= 0x001F2510);
+            if (badRa)
+            {
+                const uint resume = 0x001F2518u;
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                _postTxdEscapes++;
+                _lastPostTxdEscapeCyc = sys.MasterCycles;
+                ArmFlipConsumer(sys);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_postTxdEscapes <= 16 || _postTxdEscapes % 16 == 0))
+                    Console.Error.WriteLine(
+                        $"[B3] post-TXD leave flip-watermark jr ra was 0x{ra:X8} -> 0x{resume:X8} " +
+                        $"n={_postTxdEscapes} cyc={sys.MasterCycles}");
+                return;
+            }
+        }
 
         // Wave-8: GIF path-flush 0x21A4F0 bulk lq/sq with MMIO src (UnknownMmioRead) /
         // submit 0x1F308C. Collapse absurd gp ring; leave flush epilogue (not 0x1F2520).
@@ -1247,8 +1294,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // j 0x1F2520 = 0x08000000 | (0x001F2520 >> 2) = 0x0807C948
         // After FRONTEND/Global DMA (cdvd≫2000), delay bypass so real flip can present
         // Soft-GS frames — early bypass left gifP3 climbing with px=0.
+        // Wave-9: after STG only plant at >=95M while still px=0.
         if (_vblankExits >= 2 && !_flipWaitStubPlanted
-            && (sys.Cdvd.SectorsRead < 2000 || sys.MasterCycles >= 90_000_000)
+            && (sys.Cdvd.SectorsRead < 2000
+                || (sys.MasterCycles >= 95_000_000 && sys.Gs.PixelsWritten == 0
+                    && sys.Gif.Path3Transfers >= 100))
             && sys.Memory.Read32(0x001F24E0) != 0x0807C948u)
         {
             sys.Memory.Write32(0x001F24E0, 0x0807C948u); // j 0x001F2520
@@ -1256,7 +1306,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
             _flipWaitStubPlanted = true;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[B3] plant flip-wait bypass j 0x1F2520 @ 0x001F24E0 cyc={sys.MasterCycles}");
+                    $"[B3] plant flip-wait bypass j 0x1F2520 @ 0x001F24E0 " +
+                    $"gifP3={sys.Gif.Path3Transfers} px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
         }
 
         // Snap past the wait loop so di/ei drain + FILEIO path can run.
@@ -1483,6 +1534,62 @@ public sealed class Burnout3Assist : IGameQuirkModule
     /// 0..a0 load table[t1] and compare — empty HLE tables never match → infinite with
     /// gifP3 climbing. Snap counters to ends and fall out of both loops.
     /// </summary>
+    /// <summary>High-RDRAM scratch for FRONTEND.TXD (~8.5 MiB).</summary>
+    public const uint FrontendScratch = 0x00A00000;
+
+    /// <summary>
+    /// After STG + Global.txd (cdvd>=2000), host-plant a capped FRONTEND.TXD slice so
+    /// presentation/logo walks can see real TXD payload (first 2 MiB = dir + early mips).
+    /// </summary>
+    private void MaybePlantFrontendTxd(Ps2System sys)
+    {
+        if (_frontendPlanted) return;
+        if (sys.Cdvd.MountedPath == null) return;
+
+        try
+        {
+            var vol = Iso9660.OpenFile(sys.Cdvd.MountedPath);
+            if (vol == null) return;
+
+            byte[]? fe = Iso9660.ReadFile(vol, "DATA/FRONTEND.TXD")
+                         ?? Iso9660.ReadFile(vol, "FRONTEND.TXD")
+                         ?? Iso9660.ReadFile(vol, "Data/FRONTEND.TXD");
+            if (fe == null || fe.Length == 0) return;
+
+            const int maxPlant = 2 * 1024 * 1024;
+            int n = Math.Min(fe.Length, maxPlant);
+            uint dest = FrontendScratch;
+            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
+                dest = 0x00C00000;
+            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
+                return;
+
+            for (int i = 0; i < n; i++)
+                sys.Memory.Write8(dest + (uint)i, fe[i]);
+
+            _frontendEeAddr = dest;
+            _frontendSize = (uint)n;
+            sys.Cdvd.NoteHostReadSectors((fe.Length + 2047) / 2048);
+
+            sys.Memory.Write32(0x0066E090, 0);
+            sys.Memory.Write32(0x0066E094, 2);
+            sys.Memory.Write32(0x0066E098, (uint)fe.Length);
+            sys.Memory.Write32(0x0066E09C, dest);
+
+            _frontendPlanted = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[B3] plant FRONTEND.TXD @ 0x{dest:X8} planted={n}/{fe.Length} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+        }
+        catch (Exception ex)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine($"[B3] FRONTEND plant failed: {ex.Message}");
+            _frontendPlanted = true;
+        }
+    }
+
     private void MaybeEscapeTableWalk(Ps2System sys)
     {
         if (!_lgDevFullyDone) return;

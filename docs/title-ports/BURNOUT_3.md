@@ -104,3 +104,15 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | Tip 100M | residual n=2–3 cdvd=**425** (residual-STG still flaky vs deliver) |
 | MENU / px | **No / 0** |
 | Next | tip residual→STG restore → FRONTEND DMA → sane GIF flush → px>0 |
+
+## Wave-9 (2026-07-30 presentation PATH3 / FRONTEND plant)
+
+| Field | Value |
+|-------|-------|
+| Play! | `play-lookup SLUS_210.50 TITLE` → no GameConfig; FILEIO handlers OK |
+| Diagnose 20M | residual force@~18.6M pristine FC00; PC `0x293A30`; cdvd=425 IRX; px=0 |
+| Claim 100M quiet | STG+Global + **FRONTEND plant** cdvd=**6584** gifP3=**436** dmac=423 binds=13 PC=`0x10BE68` **px=0** |
+| Assist | sticky PATH3 `SetMskPath3(false)` when M3P+px=0; host-plant FRONTEND.TXD 2MiB @`0xA00000`; post-TXD high WaitSema pulse; flip-wait bypass delayed to ≥95M; dead flip-watermark `$ra` rescue only |
+| Rejected | VBlank poll sticky stub @25.9M → UnknownOpcode `0x4E3BD0` + STG loss; generic CallRpc soft-complete → DBC thrash abort |
+| MENU / px | **No / 0** — PATH3 unmask fires; prims still 0 (IMAGE/hold or no real PRIM path) |
+| Next | natural FRONTEND fno=5 dest bind (SHARED GTFS) + sane prim submit; no invented Soft-GS clear |
