@@ -35,6 +35,7 @@ FABRICATING signal for sema=0x3 (WHIP_SEMA_FIX_V2)  // forever
 @20M:  PC=0x283EF4 px=0 gifPath3=0 dmac=2 binds=10 calls=21 cdvd=142 WaitSema x36
 @100M: PC=0x156324 px=0 gifPath3=0 dmac=93 sifBytes=19080 binds=10 calls=88 cdvd=142
 @100M post-table: PC=0x294420 px=0 gifPath3=0 dmac=2992 sifBytes=203056 binds=10 calls=1047 cdvd=142
+@100M cache-wb widen: PC=0x293C68 px=0 gifPath3=0 dmac=93 binds=10 calls=88 WaitSema thrash (empty-sif left=True ra=0x294810; non-deterministic vs claim100d)
 ```
 
 No early SetIopRpVersionAscii. Post-reboot EnsureIopRp only.
