@@ -122,10 +122,13 @@ public static class SoftFloatBridge
             ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = result });
 
         // Return like jr ra (no delay slot — we replace the whole callee).
+        // Mask to 32-bit kuseg and sign-extend — $ra high halves can hold adjacent
+        // pointer garbage; a full 64-bit PC would fetch from the wrong phys band.
         ulong ra = ee.GetGpr(31).Lo;
-        if (ra == 0)
+        uint ra32 = (uint)(ra & 0xFFFFFFFFu);
+        if (ra32 == 0)
             return false; // refuse to jump to null; let guest run
-        ee.PC = ra;
+        ee.PC = (ulong)(int)ra32; // sign-extend like real MIPS PC
         _hits++;
         return true;
     }
