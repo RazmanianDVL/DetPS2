@@ -4,7 +4,10 @@
 **Tip anchor:** `45debf9` / `d64cb85` / `649846b` (MENU YES Soft-GS, SEMA_STALL_YIELD OFF)  
 **Epic:** [#12](https://github.com/RazmanianDVL/DetPS2/issues/12)  
 **Doctrine:** [CORRECTNESS.md](CORRECTNESS.md) · [AGENT_SOP.md](AGENT_SOP.md) · Soft-GS truth only  
-**Sibling plan (IOP purity):** [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)  
+**Sibling plans:**  
+- **Graphics (required past MENU):** [GRAPHICS_PIPELINE_PHASE_PLAN.md](GRAPHICS_PIPELINE_PHASE_PLAN.md) — **WP-GX-000…079**, gates **G-GFX-0…9**  
+- **IOP purity:** [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)  
+
 **Orchestration:** **T0 (orchestrator) + 10 concurrent work subagents at all times**
 
 ---
@@ -27,26 +30,36 @@
 - Not natural DISPFB / IMAGE / texture DMA everywhere
 - Not pad **New Game → first room**
 - Not free-ride of new serials without assists
+- **Not a finished graphics pipeline** — many menus use expand strips / assist PATH3 / composite-only present
 
-### 0.3 Dual-stack north-star
+### 0.3 Triple-stack north-star
 
 ```text
-STACK PLAY  (this plan)   MENU → INTERACTIVE → FRONTEND → GAMEPLAY → SOAK → FREE-RIDE
-STACK IRX   (sibling)     G1 exec → G2 IOPRP → G3 FILEIO → G4 PAD → G5 surface → G6 det → G7 debt
-                    └── Block E/F of this plan couple the stacks
+STACK GFX   (graphics plan)  Path fidelity → IMAGE/TEX → DISPFB → natural Path3/Path1 → textured gameplay
+STACK PLAY  (this plan)      MENU → INTERACTIVE → FRONTEND → GAMEPLAY → SOAK → FREE-RIDE
+STACK IRX   (sibling)        G1 exec → G2 IOPRP → G3 FILEIO → G4 PAD → G5 → G6 det → G7 debt
+
+  Pad past menu without GFX  = black frames hiding bugs
+  GFX without title pad      = no new draw graphs
+  IRX without both           = long-term debt only
 ```
 
-**Stop saying “behind” when P1–P12 green** (see §1).
+**Past-menu discovery rule:** honest Soft-GS pipeline work (**S8–S10**) runs **in parallel from day 0**, not after playability. Title seats report new GIF/TEX walls to GFX seats (see graphics plan §6 discovery loop).
+
+**Stop saying “behind” when P1–P12 green and G-GFX-0…9 green** (see §1 + graphics plan §1).
 
 ### 0.4 Scale of this plan
 
 | Dimension | Size |
 |-----------|------|
-| Work packages | **WP-PL-000 … WP-PL-099** (100 packages) |
-| Seasons | **S0 … S9** (10 seasons) |
+| Work packages (play) | **WP-PL-000 … WP-PL-099** (100 packages) |
+| Work packages (graphics) | **WP-GX-000 … WP-GX-079** (80 packages) — [GRAPHICS_PIPELINE_PHASE_PLAN.md](GRAPHICS_PIPELINE_PHASE_PLAN.md) |
+| Seasons (play) | **S0 … S9** |
+| Seasons (graphics) | **G0 … G6** (interleaved) |
 | Concurrent agents | **10 always** (seats S1–S10) + **T0** |
-| Primary fleet | **9 titles** + free-ride slot (SotC / next) |
-| Calendar budget | **~20–28 weeks** wall-clock if 10 agents stay saturated (optimistic); **~6 months** realistic with soak/regress |
+| Of which **GFX permanent** | **S8 PATH · S9 RASTER · S10 DISPLAY** (3/10) |
+| Primary fleet | **9 titles** (S1–S7 primary + Whip/Haven secondary queues) + free-ride |
+| Calendar budget | **~20–28 weeks** optimistic; **~6 months** realistic |
 
 ---
 
@@ -68,8 +81,18 @@ STACK IRX   (sibling)     G1 exec → G2 IOPRP → G3 FILEIO → G4 PAD → G5 s
 | **P11** | Free-ride ×2 | Two new serials reach INTERACTIVE with **no new** GameQuirk module |
 | **P12** | Release | v0.2.0 “Commercial menus + interactive” notes + fleet matrix artifact |
 
-**Minimum shippable intermediate:** P1 + P4 + P12 notes.  
-**Plan complete:** P1–P12 all green or deferred with owner + issue.
+**Minimum shippable intermediate:** P1 + P4 + **G-GFX-3** (IMAGE/tex path) + P12 notes.  
+**Plan complete:** P1–P12 **and** G-GFX-0…9 all green or deferred with owner + issue.
+
+### 1.1 Graphics gates (summary — full table in graphics plan)
+
+| Gate | Name | Blocks |
+|------|------|--------|
+| G-GFX-1/2 | Path + register fidelity | honest INTERACTIVE for strip-expand titles |
+| G-GFX-3/4 | IMAGE + texture sample | FRONTEND / textured menus |
+| G-GFX-5/6 | DISPFB + expand demotion | NATURAL |
+| G-GFX-7/8 | Natural Path3 + Path1 | post-menu 3D |
+| G-GFX-9 | Textured gameplay surface | P4–P6 quality |
 
 ---
 
@@ -110,48 +133,53 @@ STACK IRX   (sibling)     G1 exec → G2 IOPRP → G3 FILEIO → G4 PAD → G5 s
 - Fixed **file ownership**  
 - A **backlog queue** (never idle — pull next WP or soak)
 
-### 3.1 Seat roster
+### 3.1 Seat roster (graphics triad permanent)
+
+**3 of 10 seats are permanent Soft-GS pipeline** so we can leave menus and *see* the next walls.
 
 | Seat | Codename | Primary ownership | Owned paths (write) | Forbidden |
 |------|----------|-------------------|---------------------|-----------|
-| **S1** | **MIDWAY-SM** | MK Shaolin Monks | `MidwayBootAssist.cs`, `docs/title-ports/MK_SHAOLIN_MONKS.md` | GoW assist, Gs.cs without handoff |
-| **S2** | **MIDWAY-DEC** | MK Deception | `MidwayFamilyAssist.cs` **Dec-only regions***, Dec docs | SM MidwayBootAssist |
-| **S3** | **MIDWAY-DA** | MK Deadly Alliance | `MidwayFamilyAssist.cs` **DA-only regions***, DA docs | Dec-only blocks |
-| **S4** | **BURNOUT** | Burnout 3 | `Burnout3Assist.cs`, B3 docs | Midway assists |
-| **S5** | **BO2** | Blood Omen 2 | `BloodOmen2SnAssist.cs`, BO2 docs | GoW assist |
-| **S6** | **GOW** | God of War | `GodOfWarAssist.cs`, GoW docs | Midway, Whip WaitSema globalize |
-| **S7** | **VEXX** | Vexx (+ TRE/VFS shared if seat-owned helper) | `VexxAssist.cs`, Vexx docs | RealSifRpc bulk without handoff |
-| **S8** | **WHIP** | Whiplash | `WhiplashAssist.cs`, Whip docs | Global WaitSema |
-| **S9** | **HAVEN** | Haven (+ Team Ico class) | `TeamIcoAssist.cs`, Haven docs | KernelHle StartThread `$ra` global |
-| **S10** | **PLATFORM** | Shared platform (rotating focus) | See §3.2 sub-lanes | Title GameQuirks |
+| **S1** | **MIDWAY-SM** | MK Shaolin Monks | `MidwayBootAssist.cs`, SM docs | Gs/Gif without S9/S8 handoff |
+| **S2** | **MIDWAY-DEC** | MK Deception | `MidwayFamilyAssist` **DEC region***, Dec docs | SM assist |
+| **S3** | **MIDWAY-DA** | MK Deadly Alliance (+ Midway soak) | `MidwayFamilyAssist` **DA region***, DA docs | Dec-only blocks |
+| **S4** | **BURNOUT** | Burnout 3 | `Burnout3Assist.cs`, B3 docs | invent DISPFB plant |
+| **S5** | **BO2** | Blood Omen 2 | `BloodOmen2SnAssist.cs`, BO2 docs | invent pixels |
+| **S6** | **GOW** | God of War | `GodOfWarAssist.cs`, GoW docs | global WaitSema; ofx expand without S9 |
+| **S7** | **STREAM** | Vexx **primary**; Whiplash **secondary** queue | `VexxAssist.cs`, `WhiplashAssist.cs`, docs | Global WaitSema fabricate |
+| **S8** | **GFX-PATH** | GIF / VIF / DMAC paths | `Gif.cs`, `Vif*.cs`, `VifUnpacker.cs`, `Dmac.cs` (GIF/VIF ch) | GameQuirks; Gs raster |
+| **S9** | **GFX-RASTER** | Soft-GS draw / tex / Z / blend | `Gs.cs`, `GsRegisters.cs`, `GsCommandBuffer.cs` | Dmac Path3 policy alone |
+| **S10** | **GFX-DISPLAY** | DISPFB / PCRTC / present / GS tools | `Pcrtc.cs`, `GsPipeline.cs`, `FramePresenter.cs`, scoreboard GS metrics, GS smokes | Title assists |
 
-\*S2/S3 co-own `MidwayFamilyAssist.cs`: **file lock protocol** — only one of S2/S3 may have open merge PR at a time; other works docs/traces or waits T0 merge. Prefer **region comments** `// REGION: DEC` / `// REGION: DA`.
+\*S2/S3 co-own `MidwayFamilyAssist.cs`: **file lock** — one open merge at a time; `// REGION: DEC|DA`.
 
-### 3.2 Seat S10 — PLATFORM sub-lanes (always one active focus)
+**Haven** and other free-ride titles: secondary backlog on **S6/S7** or season overflow (not a dedicated seat — graphics triad is higher priority than 9th title agent).
 
-S10 is the **shared infra** agent. T0 assigns **exactly one sub-lane** per wave so S10 never thrash-edits the world:
+### 3.2 GFX triad duty (always)
 
-| Sub-lane | Focus files | Typical WPs |
-|----------|-------------|-------------|
-| **S10-GS** | `Gs.cs`, `GsRegisters.cs`, Soft-GS present | PL-020…, PL-040… |
-| **S10-GIF** | `Gif.cs`, `Vif.cs`, `Dmac.cs` | PL-021…, Path2 sticky residual |
-| **S10-SIF** | `Sif.cs`, `SifRpc.cs`, shared `RealSifRpc.cs` | PL-030…, SearchFile gates |
-| **S10-IOP** | `Iop.cs`, `IrxLoader.cs`, `IopExtendedBiosHost.cs` | IRX couple PL-070… |
-| **S10-EE** | `KernelHle.cs`, `SonyKernelHle.cs`, `Ps2System.cs` hot slices | PL-035… |
-| **S10-PAD** | `PadInput.cs`, `Sio2.cs` | PL-050… |
-| **S10-CDVD** | `Cdvd.cs`, ISO | PL-031… |
-| **S10-TOOL** | `tools/scoreboard*.ps1`, fleet JSON, smoke | PL-001… |
-| **S10-DEBT** | delete dead soft-success; TITLE_HACKS hygiene | PL-080… |
+| Seat | Pipeline stage | Typical WPs |
+|------|----------------|-------------|
+| **S8** | EE/VU → GIF tags | GX-010…024, GX-050…055 |
+| **S9** | Registers → raster → GS mem | GX-018…039, GX-043…044, GX-056…058 |
+| **S10** | DISPFB → Soft-GS FB → claim telemetry | GX-001…002, GX-040…042, GX-066…074 |
 
-When S10 needs a second shared lane, T0 **parks one title seat** (lowest priority residual) for that wave only — **still 10 agents**, seat reassigned.
+Full package list: **[GRAPHICS_PIPELINE_PHASE_PLAN.md](GRAPHICS_PIPELINE_PHASE_PLAN.md)**.
 
-### 3.3 Overflow: free-ride seat
+### 3.3 Platform work outside GFX
 
-When a title seat hits **idle backlog** (all of its WPs in current season done):
+SIF / IOP / EE / PAD / CDVD / DEBT when needed:
 
-1. Pull **soak/regress** WPs for own title  
-2. Or take **free-ride serial** (SotC) under **no new GameQuirk** rule  
-3. Or assist S10 as **read-only disasm / PCSX2 oracle** (docs only)
+- T0 **reassigns one title seat** (lowest priority) for a wave, **or**  
+- S10 takes a **time-boxed** sub-lane after current GX WP exits (never starve DISPFB telemetry)  
+- IRX season S7: temporarily run S8 on IOP/SIF **only if** G-GFX-3 already green; else keep S8 on Path3
+
+### 3.4 Overflow
+
+When a title seat is idle:
+
+1. Soak/regress own title (MENU hold)  
+2. **Draw-graph charter** + PCSX2 FRAME/TEX dump notes for S8/S9  
+3. Free-ride serial (no new GameQuirk)  
+4. Haven residual if STREAM seat
 
 ### 3.4 Agent spawn contract (every subagent prompt must include)
 
@@ -172,14 +200,23 @@ DELIVERABLE: commit + push branch; final claim table line; residual if not exit
 ### 3.5 T0 orchestrator loop (never stop)
 
 ```text
-loop forever until P12:
-  1. Ensure 10 seats have live subagents (respawn if completed)
-  2. Collect finished branches → merge order by risk (platform first if shared, then titles)
-  3. Build + smoke + spot-claim 3 titles if shared files touched
-  4. Push main; update SCOREBOARD + #12
-  5. Assign next WP from season backlog to freed seats
-  6. If conflict thrash → file-lock protocol; serialize S2/S3 and S10
+loop forever until P12 AND G-GFX-9:
+  1. Ensure 10 seats live (respawn); S8–S10 always on GX backlog until G-GFX-9
+  2. Merge order: S8/S9/S10 graphics FIRST → then titles (S2 before S3 if Midway lock)
+  3. If Gs/Gif/Vif/Dmac touched: full GS smoke + spot-claim 3 titles (incl. one expand-class: GoW/Whip/BO2)
+  4. Push main; SCOREBOARD + #12 + docs/graphics/DISCOVERY_LOG.md if new wall
+  5. Assign next PL-* to title seats, next GX-* to S8–S10
+  6. Discovery: title pad advanced → new gif/tex? file wall for S8/S9/S10
 ```
+
+### 3.6 Merge train order (risk-aware)
+
+1. **S8 GFX-PATH** (Gif/Vif/Dmac)  
+2. **S9 GFX-RASTER** (Gs)  
+3. **S10 GFX-DISPLAY** (Pcrtc/Pipeline/tools)  
+4. **S1 SM** (SearchFile coupling)  
+5. **S2 Dec → S3 DA** (serialize MidwayFamilyAssist)  
+6. **S4 B3 → S5 BO2 → S6 GoW → S7 Vexx/Whip**
 
 ---
 
@@ -197,6 +234,10 @@ Extend `tools/scoreboard-fleet.json` + `scoreboard.ps1`:
 | Gameplay | T5 | Scene change post–New Game + stream |
 | Playable-slice | T6 | Deep budget alive + in-game pad |
 | IRX-honest | T7 | FILEIO/PAD via IRX flags in telemetry |
+| GFX path | G1 | gif completed/aborted healthy; path1/2/3 counts |
+| GFX tex | G2 | imgBytes>0 or textured sample (non-procedural) |
+| GFX present | G3 | dispfbPx>0 natural or documented FRAME path |
+| GFX natural | G4 | expandHits=0 and no assist PATH3 plant |
 
 **Claim budgets:** diagnose 20M · verify 50M · claim 100M · deep 500M · soak 2B (optional).
 
@@ -221,22 +262,24 @@ Extend `tools/scoreboard-fleet.json` + `scoreboard.ps1`:
 
 ---
 
-## 6. Seasons overview (S0–S9)
+## 6. Seasons overview (S0–S9) + graphics G0–G6
 
-| Season | Theme | Primary gates | Default seat mode |
-|--------|-------|---------------|-------------------|
-| **S0** | Foundation & telemetry | measure | All 10: tooling + residual charters |
-| **S1** | INTERACTIVE pad | **P1** | 9 title + S10-PAD |
-| **S2** | FRONTEND chrome | **P2** | 9 title + S10-GS/GIF |
-| **S3** | NATURAL draw | **P3** | title + S10-GS (reduce plants) |
-| **S4** | FIRST-GAMEPLAY wave A | **P4** | 3 gameplay + 6 soak + S10 stream |
-| **S5** | FIRST-GAMEPLAY wave B | **P5** | 3 more gameplay + soak |
-| **S6** | PLAYABLE-SLICE | **P6** | 1–2 deep + 8 hold MENU |
-| **S7** | IRX couple FILEIO/PAD | **P7–P8** | S10-IOP/SIF + 3 title pilots |
-| **S8** | Debt demolition | **P9** | S10-DEBT + title delete plants |
-| **S9** | Determinism + free-ride + release | **P10–P12** | matrix + SotC×2 + notes |
+| Season | Theme | Play gates | **GFX parallel** | Seat mode |
+|--------|-------|------------|------------------|-----------|
+| **S0** | Foundation & telemetry | measure | **G0** inventory | S1–S7 charters; **S8–S10 GX-000…009** |
+| **S1** | INTERACTIVE pad | **P1** | **G1** path fidelity | S1–S7 pad; **S8–S10 GX-010…024** |
+| **S2** | FRONTEND chrome | **P2** | **G2** IMAGE/TEX | S1–S7 frontend; **S8–S10 GX-025…039** |
+| **S3** | NATURAL draw | **P3** | **G3** DISPFB + expand↓ | titles demote plants; **GX-040…049** |
+| **S4** | FIRST-GAMEPLAY A | **P4** | **G4** Path3/Path1 | 3 gameplay; **GX-050…059** |
+| **S5** | FIRST-GAMEPLAY B | **P5** | **G5** textured gameplay | more gameplay; **GX-060…069** |
+| **S6** | PLAYABLE-SLICE | **P6** | G5 hold | deep slice + GFX soak |
+| **S7** | IRX couple | **P7–P8** | G-GFX hold | IRX pilots; S8–S10 fix draw regressions only |
+| **S8** | Debt demolition | **P9** | **G6** ban expand/PATH3 plants | debt + GX-070…079 |
+| **S9** | Det + free-ride + release | **P10–P12** | all G-GFX hold | matrix + release notes |
 
-Each season has **≥8 WPs** and **≥2 merge trains**. Seats never idle: if season WP blocked, run **soak claims** or **oracle notes**.
+**Hard rule:** Do not declare P2/P4 “done” if surfaces are only expand-strips / assist PATH3 — require matching **G-GFX** gates (graphics plan §6).
+
+Each season has **≥8 PL WPs** + **≥ concurrent GX WPs**. Seats never idle.
 
 ---
 
@@ -244,22 +287,24 @@ Each season has **≥8 WPs** and **≥2 merge trains**. Seats never idle: if sea
 
 Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 
-### Season S0 — Foundation (PL-000 … PL-009)
+### Season S0 — Foundation (PL-000 … PL-009) + **G0**
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-000** | T0 | — | Land this plan; NEXT_PLAN pointer; #12 | docs on main | 0.25d |
-| **PL-001** | S10-TOOL | PL-000 | Scoreboard T0–T7 columns + JSON schema | `scoreboard.ps1 -Budget diagnose` emits tiers | 1.5d |
-| **PL-002** | S10-TOOL | PL-001 | Pad-inject claim mode (`--pad-script`) for T2 | unit + one title demo | 1d |
-| **PL-003** | S10-GS | PL-000 | Soft-GS **expand policy** + `expandHits` telemetry | counter in claim output | 1d |
-| **PL-004** | S10-TOOL | PL-001 | Fleet matrix script 9×100M → `out/traces/matrix/` | one full matrix | 1d |
-| **PL-005** | S1–S9 | PL-000 | Per-title **residual charter** (1 wall, 1 oracle, 1 exit) | 9 docs sections | 0.5d each |
-| **PL-006** | S10-DEBT | PL-000 | GameQuirk LOC baseline CSV at `d64cb85` | `docs/debt/QUIRK_LOC_BASELINE.md` | 0.5d |
-| **PL-007** | S10-SIF | PL-000 | HLE→IRX matrix refresh commercial SIDs | `docs/irx/HLE_TO_IRX_MATRIX.md` update | 1d |
-| **PL-008** | T0 | PL-001 | Worktree seat bootstrap script (10 trees) | `tools/seat-bootstrap.ps1` | 0.5d |
-| **PL-009** | T0 | PL-005 | S0 merge train; freeze baseline scoreboard JSON | artifact on main | 0.5d |
+| **PL-000** | T0 | — | Land plans (play + **graphics**); NEXT_PLAN; #12 | docs on main | 0.25d |
+| **PL-001** | S10 | PL-000 | Scoreboard T0–T7 + **G1–G4 GFX** columns | scoreboard emits tiers | 1.5d |
+| **PL-002** | S10 | PL-001 | Pad-inject claim mode (`--pad-script`) for T2 | unit + one title | 1d |
+| **PL-003** | S9 | PL-000 | Soft-GS **expand policy** + `expandHits` (also GX-004) | counter in claim | 1d |
+| **PL-004** | S10 | PL-001 | Fleet matrix 9×100M + GIF/GS metrics | `out/traces/matrix/` | 1d |
+| **PL-005** | S1–S7 | PL-000 | Title residual + **draw-graph** charter | docs | 0.5d each |
+| **PL-006** | S7 | PL-000 | GameQuirk LOC baseline (tooling assist) | CSV | 0.5d |
+| **PL-007** | S5 | PL-000 | HLE→IRX matrix note (title can draft) | md update | 1d |
+| **PL-008** | T0 | PL-001 | `tools/seat-bootstrap.ps1` (10 trees) | script | 0.5d |
+| **PL-009** | T0 | PL-005 | S0+G0 merge; baseline JSON | artifact | 0.5d |
 
-**S0 exit:** Measurement live; 10 seats bootstrapped; residual charters exist.
+**Parallel G0 (mandatory):** GX-000…009 on S8–S10 — telemetry, GIF trace, PATH3 mask matrix, PPM dump (see graphics plan).
+
+**S0 exit:** Measurement live; GFX telemetry live; 10 seats bootstrapped; draw-graph charters exist.
 
 ---
 
@@ -283,7 +328,8 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 | **PL-023** | S6 | PL-016 | GoW thrash PC band escape without killing DMA tags | T2 hold | 2d |
 | **PL-024** | T0 | PL-011…019 | Merge train S1; **P1 assert** | INTERACTIVE 9/9 | 1d |
 
-**S1 exit = P1.** Parallelism: **S1–S9 + S10** = 10 agents entire season.
+**S1 exit = P1.** Parallelism: **S1–S7 titles + S8–S10 GFX (G1: GX-010…024)** = 10 agents.  
+**Do not** ship P1 for GoW/Whip/BO2-class if Soft-GS is only expand-strips without G-GFX-1 path health.
 
 ---
 
@@ -307,7 +353,7 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 | **PL-038** | S1–S9 | PL-025… | Frontend claim wave | T3 count report | 2d |
 | **PL-039** | T0 | PL-038 | **P2 assert** FRONTEND 9/9 | scoreboard | 0.5d |
 
-**S2 exit = P2.**
+**S2 exit = P2 + G-GFX-3/4 progress.** Parallel: **G2 GX-025…039** on S8–S10 (IMAGE/TEX). Title FRONTEND WPs must call out imgBytes/dispfb — not only expand px.
 
 ---
 
@@ -326,14 +372,15 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 | **PL-048** | S10-DEBT | PL-044… | Soft-success call-site inventory | CSV | 1d |
 | **PL-049** | T0 | PL-040… | **P3 assert** NATURAL ≥6/9 | scoreboard | 0.5d |
 
-**S3 exit = P3.**
+**S3 exit = P3 + G-GFX-5/6.** Parallel: **G3 GX-040…049** (DISPFB + expand demotion). NATURAL is meaningless if expandHits still carry menus.
 
 ---
 
 ### Season S4 — FIRST-GAMEPLAY wave A (PL-050 … PL-059) → **P4**
 
 **Targets (fixed):** B3, DA, Vexx (best stream spine).  
-**Other seats:** hold T1–T3 + soak + oracle.
+**Other seats:** hold T1–T3 + soak + oracle.  
+**GFX:** **G4 GX-050…059** Path3 natural + Path1 — gameplay will open new draw graphs; S8/S9 triage.
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
@@ -440,18 +487,17 @@ Couples [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md) Blocks D–E.
 ## 8. Dependency DAG (high level)
 
 ```text
-S0 measure ──► S1 INTERACTIVE (P1) ──► S2 FRONTEND (P2) ──► S3 NATURAL (P3)
-                      │                      │
-                      ├──────────────────────┼──► S4 GAMEPLAY A (P4) ──► S5 GAMEPLAY B (P5)
-                      │                      │                              │
-                      │                      └──────────────────────────────┼──► S6 PLAYABLE (P6)
-                      │                                                     │
-                      └──► S7 IRX couple (P7–P8) ◄── IRX plan Blocks D–E     │
-                                      │                                      │
-                                      └──► S8 DEBT (P9) ──► S9 DET/FREE/REL (P10–P12)
+     G0 telemetry ──► G1 Path ──► G2 IMAGE/TEX ──► G3 DISPFB/expand↓ ──► G4 Path3/Path1 ──► G5 textured GP
+         │               │              │                 │                    │
+S0 measure ──► S1 INTERACTIVE ──► S2 FRONTEND ──► S3 NATURAL ──► S4–S5 GAMEPLAY ──► S6 PLAYABLE
+   (P1 needs G1)     (P2 needs G2–3)   (P3 needs G3)     (P4–6 need G4–5)
+
+S7 IRX couple (P7–P8)  ◄── IRX plan D–E   (hold G-GFX)
+S8 DEBT (P9) + G6 ban crutches
+S9 DET / FREE-RIDE / REL (P10–P12)
 ```
 
-Platform WPs (S10) run **every season** in parallel with title seats.
+**S8–S10 run every season** on GX packages until G-GFX-9.
 
 ---
 
@@ -496,10 +542,10 @@ Platform WPs (S10) run **every season** in parallel with title seats.
 | S4 B3 | PL-014,022 | PL-026 | PL-047 | **PL-051** | — | PL-088 |
 | S5 BO2 | PL-015 | PL-027 | PL-043 | PL-063 | pilot | PL-088 |
 | S6 GoW | PL-016,023 | PL-034 | PL-041 | PL-065 | pilot | PL-088 |
-| S7 Vexx | PL-017 | PL-032 | — | **PL-053** | pilot | PL-088 |
-| S8 Whip | PL-018 | PL-033 | PL-042 | PL-062 | — | PL-088 |
-| S9 Haven | PL-019 | PL-028 | — | PL-066 | — | PL-088 |
-| S10 | PAD/TOOL | GS/GIF/SIF | GS/GIF | SIF/CDVD/EE | IOP/SIF/PAD | DEBT/TOOL |
+| S7 Vexx/Whip | PL-017/018 | PL-032/033 | PL-042 | **PL-053**/062 | pilot | PL-088 |
+| **S8 PATH** | **G1** GX-010… | **G2** support | **G3** | **G4** Path3/1 | hold | G6 |
+| **S9 RASTER** | G1 regs | **G2** TEX/IMAGE | **G3** expand↓ | G4 Z/blend | G5 tex GP | G6 |
+| **S10 DISPLAY** | metrics/pad tool | DISPFB tools | DISPFB | scene hash | IRX soak tools | DEBT/CI |
 
 ---
 
@@ -530,13 +576,14 @@ Platform WPs (S10) run **every season** in parallel with title seats.
 
 | Hour | Action |
 |------|--------|
-| 0–4 | T0: confirm plan on main; `seat-bootstrap` 10 worktrees |
-| 4–12 | Spawn **10 subagents**: S1–S9 on PL-005 charters + S10 on PL-001 scoreboard tiers |
-| 12–24 | S10 lands PL-001/003; titles finish charters |
-| 24–48 | T0 merge S0; assign S1 PL-011…S9 PL-019 + S10-PAD PL-010 |
-| 48–72 | First INTERACTIVE claims streaming; mid-merge if S10-PAD ready |
+| 0–4 | T0: plans on main (play **+ graphics**); `seat-bootstrap` 10 worktrees |
+| 4–12 | Spawn **10**: S1–S7 on PL-005/draw charters; **S8–S10 on GX-001/003/004 telemetry** |
+| 12–24 | S10 scoreboard tiers+GIF metrics; S8 GIF trace; S9 expand policy |
+| 24–48 | T0 merge S0+G0; assign S1–S7 INTERACTIVE PL-011…; S8–S10 **G1 Path** GX-010… |
+| 48–72 | Pad claims + Path2 harden claims; first DISCOVERY_LOG walls |
 
-**Do not** start free-ride or GameQuirk deletions until **P1**.
+**Do not** start free-ride or mass GameQuirk deletions until **P1**.  
+**Do not** stall S8–S10 on title assists — graphics is the past-menu instrument.
 
 ---
 
@@ -544,6 +591,7 @@ Platform WPs (S10) run **every season** in parallel with title seats.
 
 | Doc | Role |
 |-----|------|
+| [GRAPHICS_PIPELINE_PHASE_PLAN.md](GRAPHICS_PIPELINE_PHASE_PLAN.md) | **Soft-GS pipeline 80 WPs, G-GFX gates** |
 | [SCOREBOARD.md](title-ports/SCOREBOARD.md) | Fleet table |
 | [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md) | IOP G1–G7 |
 | [AGENT_SOP.md](AGENT_SOP.md) | Budgets, oracle |
@@ -559,8 +607,9 @@ Platform WPs (S10) run **every season** in parallel with title seats.
 | Date | Note |
 |------|------|
 | 2026-07-31 | Initial post-MENU plan (40 WPs) |
-| 2026-07-31 | **Mega expansion:** 100 WPs (PL-000…099), 10 permanent seats, 10 seasons, 12 product gates, dual-stack IRX couple |
+| 2026-07-31 | Mega expansion: 100 PL WPs, 10 seats, P0–P12, dual-stack IRX |
+| 2026-07-31 | **Graphics stack:** 80 GX WPs, seats S8–S10 permanent GFX triad, triple-stack PLAY+GFX+IRX |
 
 ---
 
-*T0-owned. Revise only via main merge. Ten subagents stay saturated until P12.*
+*T0-owned. Revise only via main merge. Ten subagents stay saturated until P12 **and** G-GFX-9.*
