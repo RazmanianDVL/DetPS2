@@ -564,13 +564,15 @@ public sealed class Dmac : ISchedulable
                 // (CNT-style), not physical address 0. When ADDR==0 and QWC>0, treat as
                 // inline data after the DMAtag so DIRECT Path2 can reach Soft-GS.
                 //
-                // WAVE-4 (B3): gate to high-RDRAM DA display chains only. Ungated
-                // ADDR=0 rewrite (merge agent/menu-da-w3 @1d2348f) remapped Burnout 3
-                // END tags with legitimate ADDR=0 onto TADR+16 garbage → residual stuck
-                // at cdvd=609 (STAGEHED plant only), never STG/Global.txd (cdvd≥2425).
+                // Inline END payload after tag when ADDR=0 (TADR+16 CNT-style):
+                // - DA display chains: high TADR [0x01F00000,0x02000000) — Midway PATH2
+                // - GIF channel: always (Whiplash title FRAME/XYOFFSET @~0x417960 qwc=12;
+                //   tip B3 high-TADR-only gate left these unmapped → px 640→3, FRAME=0)
+                // Do NOT ungate VIF*/others: B3 residual ENDs with legitimate ADDR=0
+                // outside DA band remapped to TADR+16 garbage (cdvd stuck 609).
                 // Bisect: 45d8c3c alone OK; merge + Path3Masked gate → tip px=0/cdvd=609.
-                if (ch.QWC > 0 && ch.MADR == 0
-                    && ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u)
+                bool daHigh = ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u;
+                if (ch.QWC > 0 && ch.MADR == 0 && (daHigh || channel == Channel.GIF))
                 {
                     ch.MADR = ch.TADR + 16;
                     ch.StartMADR = ch.MADR;

@@ -653,6 +653,12 @@ public sealed class Gs : ISchedulable
             // still produce a Soft-GS surface instead of pure rejBounds.
             int sw = Math.Clamp(w, 1, FB_WIDTH);
             int sh = Math.Clamp(h, 1, FB_HEIGHT);
+            // WAVE-5: retail ofx/ofy=0x8000 full-width strip often collapses to h=1 after
+            // transform (tip: px=640 one-row). Expand to a title band so Soft-GS title-
+            // surface is richer than a single scanline — color/UV still from the prim.
+            Registers.GetXyOffset(out int ofxR, out int ofyR);
+            if (ofxR == 0x8000 && ofyR == 0x8000 && sw >= FB_WIDTH / 2 && sh < 8)
+                sh = Math.Min(FB_HEIGHT, 112);
             minX = 0; minY = 0;
             maxX = sw; maxY = sh;
             x0 = 0; y0 = 0;

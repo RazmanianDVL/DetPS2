@@ -5526,16 +5526,18 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// WAVE-3/4 bridge: after stream-table bulk/ring arm, Open RKV title surfaces into GOE
+    /// WAVE-3/4/5 bridge: after stream-table bulk/ring arm, Open RKV title surfaces into GOE
     /// stream slots and Start payload into EE memory so Soft-GS path can drain.
     /// Honest RKV payload via <see cref="TryOpenFromRkv"/> + FileRead — no synthetic pixels.
-    /// WAVE-4: real title sizes (firstscreen ~180 KiB) + multi-chunk Start, Code-first order.
+    /// WAVE-4: real title sizes (firstscreen ~180 KiB) + Code-first order.
+    /// WAVE-5: full-member Start (≤256 KiB) not ring-only; retry until ≥64 KiB streamed.
     /// </summary>
     private void BridgeWhipGoeOpenStart(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
         uint streamTable, uint streamTableSize, uint bufferSize)
     {
         // Allow a single retry when a prior bridge only streamed collapsed TOC sizes (<4 KiB).
-        if (_whipOpenStartBridged && _whipTitleBytesStarted >= 4096)
+        // WAVE-5: retry until we have streamed a real firstscreen-class payload (~64 KiB+).
+        if (_whipOpenStartBridged && _whipTitleBytesStarted >= 64 * 1024)
             return;
         bool retry = _whipOpenStartBridged;
         _whipOpenStartBridged = true;
@@ -5551,9 +5553,11 @@ public sealed class RealSifRpc
         // Resolve title-surface names from TOC (format-B may use paths / case variants).
         string[] names = ResolveWhipTitleNames();
         uint ring = bufferSize is >= 0x100 and <= 0x10000 ? bufferSize : 0xFF4u;
-        // High RDRAM window for Start DMA — avoid clobbering the live stream table @recvBuf
-        // and the game's nearby float/ptr ring (0x45BCxx) seen in setup packets.
-        const uint SlotStride = 0x1000;
+        // WAVE-5: stream full title members (firstscreen ~180 KiB) not just one ring.
+        // Ring still paints into EE stream-table word1 (avoids multi-ring WaitSema storm);
+        // Start payload uses MaxStart so Soft-GS path has real chrome bytes in EE.
+        const uint MaxStart = 256u * 1024;
+        const uint SlotStride = MaxStart;
         uint destBase = 0x01E00000u;
         if (destBase + SlotStride * 4u > SystemMemory.RDRAM_SIZE)
             destBase = 0x01A00000u;
@@ -5607,11 +5611,11 @@ public sealed class RealSifRpc
                 }
             }
 
-            // Start one ring into EE scratch. Full member size is tracked in
-            // _iopFileStreamSize so later Goe Start can pull the rest; dumping full
-            // firstscreen here was not EE-consumed and hurt boot timing.
-            // Honest sector credit for the full firstscreen Open still counts below.
-            uint want = sz == 0 ? ring : Math.Min(sz, ring);
+            // WAVE-5: Start full title member (capped MaxStart). WAVE-4 ring-only left
+            // firstscreen as a 4 KiB header fragment; full Open size is still in
+            // _iopFileStreamSize for later Goe Start. Prefer firstscreen/frontend depth.
+            uint want = sz == 0 ? ring : Math.Min(sz, MaxStart);
+            if (want < ring && sz >= ring) want = ring;
             uint dest = destBase + (uint)streamIdx * SlotStride;
             if (dest + want <= SystemMemory.RDRAM_SIZE && want > 0)
             {

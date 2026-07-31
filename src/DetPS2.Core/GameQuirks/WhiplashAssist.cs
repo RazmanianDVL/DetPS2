@@ -44,6 +44,8 @@ namespace DetPS2.Core;
 /// sid 0x40 control workspace init; Soft-GS residual still EE-driven.
 /// Wave-4: real firstscreen/Code/frontend sizes (format-B id≠size; hudscripts sentinel) +
 /// multi-chunk Start (≤256 KiB) so title-surface Soft-GS can grow past px=3.
+/// Wave-5: GIF END ADDR=0 inline (restore tip Soft-GS after B3 high-TADR gate) + full
+/// firstscreen Start + Soft-GS ofx=0x8000 title-band clamp for richer title surface.
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
