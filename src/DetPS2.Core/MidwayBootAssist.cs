@@ -77,12 +77,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private const uint ResourceKickFn = 0x0026F918;
     /// <summary>FUN_0026FBF0 post-load bind; sole caller of BFC0-C1C0.</summary>
     private const uint ResourceBindFn = 0x0026FBF0;
+    /// <summary>FUN_0043BFC0 — sole parent of C1C0. Wave-6 force target (skip 26FBF0 helpers).</summary>
+    private const uint ResourceBfc0Fn = 0x0043BFC0;
+    /// <summary>Scratch out-buf for BFC0 a1 (0x90 bytes; fail path memsets 0x90).</summary>
+    private const uint ResourceBfc0Scratch = 0x01FE0300;
     /// <summary>Static load-handle area for FUN_0026FD80 / FUN_0026FBF0(0x678458).</summary>
     private const uint ResourceHandleBase = 0x00678458;
     /// <summary>FUN_0043B670 stream-slot alloc from descriptor (26F918 core). Prefer when heaps dead.</summary>
     private const uint ResourceSlotAllocFn = 0x0043B670;
-    /// <summary>Max master-cycles on resource force trampoline before abandon.</summary>
-    private const ulong ResourceBindTimeoutCyc = 2_000_000;
+    /// <summary>Max master-cycles on resource force trampoline before abandon.
+    /// Wave-6: 2M→4M so BFC0→C1C0 chrome bind can finish (live: C1C0 entered then TIMEOUT).</summary>
+    private const ulong ResourceBindTimeoutCyc = 4_000_000;
     // Wave-3 reconstructed 32EA08/26FD80 load-request (ELF ground truth).
     // Level table 0x4D3BA0[0] MIDWAY.SFD: dims 512x384, resource id 0.
     // a1/a2 are display dimensions; t0 is heap id; path at handle+0xEC via 211148.
@@ -94,9 +99,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private const uint ResourceLevel0Height = 384;
     private const uint ResourceLevel0Id = 0;
     private const uint ResourceHeapTable = 0x0065E998;
-    /// <summary>Wave-4/5: early abort if force PC leaves target bands (AdEL rehome).
-    /// Wave-5 raised 250k→750k so 26FBF0 bind poll can finish before ESCAPE.</summary>
-    private const ulong ResourceBindEscapeCyc = 750_000;
+    /// <summary>Wave-4/5/6: early abort if force PC leaves target bands (AdEL rehome).
+    /// Wave-5 raised 250k→750k; wave-6 750k→1.5M so BFC0→C1C0 can finish before ESCAPE.</summary>
+    private const ulong ResourceBindEscapeCyc = 1_500_000;
     // Wave-4: scratch arena + EE bump-alloc stubs for stream-manager allocator slots.
     // FUN_0043BE08 does jalr *(sm+0x28) with a0=*(sm+0x30); FUN_0043BE98 jalr *(sm+0x2C).
     // Wave-3 planted 0x100000 into +0x28/+0x2C as "capacity" — that is a jalr target, not a size
@@ -135,6 +140,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private ulong[]? _resourceBindSavedGpr;
     private ulong _resourceBindForceStartCyc;
     private bool _resourceBindUsedSlotAlloc;
+    private bool _resourceAb88Patched;
+    private readonly uint[] _resourceAb88Saved = new uint[4];
     private bool _logoPrepared;
     private bool _logoActive;
     private bool _midwayDone;
@@ -244,6 +251,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _resourceBindSavedGpr = null;
         _resourceBindForceStartCyc = 0;
         _resourceBindUsedSlotAlloc = false;
+        _resourceAb88Patched = false;
+        _resourceSlotReseals = 0;
+        _lastResourceSlotResealCyc = 0;
+        _c1c0Entered = false;
+        _c1c0EnterCyc = 0;
         _resourceArenaReady = false;
         _resourceLoadForced = false;
         _lastListWalkBreakCyc = 0;
@@ -958,8 +970,16 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (sys.MasterCycles < 5_000_000) return;
 
         // HLE scratch / synthetic packet region — never valid game code
+        // Wave-6: force-call trampolines + EE stubs live here (0x01FE0000..0x01FE03FF).
+        // Never yank those — resume handlers park PC on self-loop trampolines intentionally.
         if (pc is >= 0x01FD0000 and < 0x01FF0000)
         {
+            if (pc is (>= 0x01FE0000 and < 0x01FE0400)
+                || _resourceBindResumePending
+                || _sifResumePending
+                || _managerInitResumePending
+                || _initLocksResumePending)
+                return;
             ulong safe = sys.LastGoodEePc;
             uint safePhys = (uint)(safe & 0x1FFFFFFF);
             if (safePhys is < 0x00100000 or >= 0x01FD0000 or (>= 0x01FD0000 and < 0x01FF0000))
@@ -1376,11 +1396,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeRepairAdxWaiterS0(sys);
         // Main sets DAT_00534164=1 then busy-polls ReferThreadStatus without Sleep/yield —
         // ADX pump never runs to clear the flag. Service after bulk WAD.
-        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        // Wave-6: do not switch threads mid resource force (BFC0/C1C0).
+        if (c >= 55_000_000 && sys.Cdvd.SectorsRead >= 100_000 && !_resourceBindResumePending)
             MaybeServiceAdxPumpLock(sys);
         // Post-WAD bad fnptr → past-RDRAM open bus (0x024Fxxxx): recover every Step once WAD is real.
-        if (sys.Cdvd.SectorsRead >= 100_000)
+        // Wave-6: never yank PC during resource force (live: nop-sled @0x29E1AC aborted 26FBF0→BFC0).
+        if (sys.Cdvd.SectorsRead >= 100_000 && !_resourceBindResumePending)
             MaybeRescuePostWadNopSled(sys);
+        else if (_resourceBindResumePending)
+            MaybeRescueForceBindNopSled(sys);
         // Runaway linked-list walk at 0x475608 with corrupted count (s0 >> real list size)
         // freezes boot forever after resource gate (live 2026-07-30: s0≈0x3037953D).
         if (c >= 50_000_000)
@@ -1450,6 +1474,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Wave-2: real resource->stream-slot bind (26F918 alloc -> 26FBF0 -> BFC0 -> C1C0).
         // Resume every Step so trampoline cannot starve. No synthetic type5 plants.
         MaybeResumeAfterForcedResourceBind(sys);
+        // Wave-6: while 43B670 is forced, inject arena object at 43B7E8 when 43AB88 nulls
+        // so the 43B800 success tail runs (method tables / C1C0 prerequisites).
+        if (_resourceBindResumePending && _resourceBindPhase == 1)
+            MaybeInjectResourceObjectAtFactoryNull(sys);
+        // Wave-6: C1C0 enters with correct args then wanders into 0x474xxx thrash for 2M+.
+        // Once C1C0 has been entered, soft-complete to trampoline with sealed slot.
+        if (_resourceBindResumePending && _resourceBindPhase == 3)
+            MaybeCompleteC1C0AfterEntry(sys);
         if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 180_000
             && sys.Gif.Path3Transfers >= 8
             && !_resourceBindResumePending)
@@ -1459,13 +1491,18 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000
             && !_resourceBindResumePending)
             MaybeRearmStreamCas(sys);
+        // Wave-6: after BFC0 bind, re-seal slot0/object if thrash corrupted them and re-arm
+        // D770 sticky +0x44 so FBB0→D770 can re-enter (D7C8 clears +0x44 on first visit).
+        if (c >= 71_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending)
+            MaybeResealResourceSlot(sys);
         // Wave-9: post-spine sticky park in syscall-68 / worker 0x47FD..0x480B and ADX
         // re-init 0x4143A0 — starve second chrome + pad accept.
-        if (c >= 75_000_000 && sys.Gif.Path3Transfers >= 11)
+        // Wave-6: skip while resource force is live (thrash escapes abort BFC0 mid-call).
+        if (c >= 75_000_000 && sys.Gif.Path3Transfers >= 11 && !_resourceBindResumePending)
             MaybeEscapePostSpineWorkerThrash(sys);
         // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
-        // Wave-8: gifP3>=11 (not 12).
-        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 11)
+        // Wave-8: gifP3>=11 (not 12). Wave-6: gate on force bind.
+        if (c >= 70_000_000 && sys.Gif.Path3Transfers >= 11 && !_resourceBindResumePending)
             MaybeBreakLockWrapperThrash(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
@@ -2497,6 +2534,61 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// </summary>
     private int _openBusStickyHits;
     private ulong _lastOpenBusCyc;
+
+    /// <summary>
+    /// Wave-6: during resource force, a nop/open-bus PC must not re-home to ADX pump
+    /// (wave-5: 0x29E1AC → 0x4147F8 aborted 26FBF0 mid-call → ESCAPE). Instead land on
+    /// the force trampoline so MaybeResumeAfterForcedResourceBind can seal + advance.
+    /// </summary>
+    private void MaybeRescueForceBindNopSled(Ps2System sys)
+    {
+        if (!_resourceBindResumePending) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc == ResourceBindReturnTrampoline) return;
+        // Stay in known force bands — only rescue genuine nop / open-bus.
+        bool pastRdram = pc >= (uint)SystemMemory.RDRAM_SIZE;
+        if (pc < 0x00100000 && !pastRdram) return;
+        uint op = pastRdram ? 0u : (pc + 4 < (uint)SystemMemory.RDRAM_SIZE ? sys.Memory.Read32(pc) : 0u);
+        if (!pastRdram && op != 0) return;
+        if (!pastRdram && pc + 8 < (uint)SystemMemory.RDRAM_SIZE
+            && sys.Memory.Read32(pc + 4) != 0 && sys.Memory.Read32(pc + 8) != 0)
+            return;
+
+        // Re-enter BFC0 if phase-3 still live and slot object present; else trampoline.
+        uint slot0obj = sys.Memory.Read32(0x0055E25C + 0x3C);
+        bool canRetryBfc0 = _resourceBindPhase == 3
+            && slot0obj >= 0x100000 && slot0obj < (uint)SystemMemory.RDRAM_SIZE
+            && sys.MasterCycles < _resourceBindForceStartCyc + ResourceBindEscapeCyc / 2;
+        if (canRetryBfc0)
+        {
+            EnrichResourceObjectForBind(sys.Memory, slot0obj);
+            if (sys.Memory.Read32(0x0055E25C) == 0)
+                sys.Memory.Write32(0x0055E25C, 1);
+            for (uint o = 0; o < 0xA0; o += 4)
+                sys.Memory.Write32(ResourceBfc0Scratch + o, 0);
+            for (int i = 4; i <= 11; i++)
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0x0055E25C });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = ResourceBfc0Scratch });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
+            sys.EE.PC = ResourceBfc0Fn;
+            sys.LastGoodEePc = ResourceBfc0Fn;
+            ReHomeSpIfInHleScratch(sys);
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] force-bind nop re-enter BFC0 from 0x{pc:X8} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        sys.EE.PC = ResourceBindReturnTrampoline;
+        sys.LastGoodEePc = ResourceBindReturnTrampoline;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] force-bind nop → trampoline from 0x{pc:X8} phase={_resourceBindPhase} " +
+                $"cyc={sys.MasterCycles}");
+    }
 
     private void MaybeRescuePostWadNopSled(Ps2System sys)
     {
@@ -4356,9 +4448,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (pc is (>= 0x0026F900 and <= 0x0026FD80)
             or (>= 0x0043B670 and <= 0x0043C400)
             or (>= 0x0043FAE0 and <= 0x0043FD00)
-            or (>= 0x00440000 and <= 0x00457000) // wave-5 object factory
-            or (>= 0x00450000 and <= 0x00452000)
-            or (>= 0x00420000 and <= 0x00422000))
+            or (>= 0x00440000 and <= 0x00458000) // wave-5/6 object factory + 44F490
+            or (>= 0x00450000 and <= 0x00454000)
+            or (>= 0x00420000 and <= 0x00422000)
+            or (>= 0x002C6000 and <= 0x002C8000)
+            or (>= 0x00415000 and <= 0x00416000))
             return;
 
         if (!_resourceBindTrampolineWritten)
@@ -4380,6 +4474,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
             // Always force 43B670 with reconstructed descriptor + arena buffers.
             _resourceBindUsedSlotAlloc = true;
+
+            // Wave-6: patch FUN_0043AB88 to return the arena object so 43B670 takes the
+            // 43B800 success tail (natural 43AB88 returns null under HLE — PC-window inject
+            // misses the 4-insn window between slices).
+            PatchAb88ReturnObject(sys.Memory);
 
             _resourceBindSavedPc = sys.EE.PC;
             _resourceBindSavedGpr = new ulong[32];
@@ -4435,6 +4534,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                     }
                 }
             }
+            // Prefer live slot0 even when *handle was left 0 after plant.
+            if (handlePtr < 0x100000 || handlePtr >= (uint)SystemMemory.RDRAM_SIZE)
+            {
+                uint s0 = 0x0055E25C;
+                uint o0 = sys.Memory.Read32(s0 + 0x3C);
+                if (o0 >= 0x100000 && o0 < (uint)SystemMemory.RDRAM_SIZE)
+                {
+                    handlePtr = s0;
+                    sys.Memory.Write32(ResourceHandleBase, s0);
+                }
+            }
             if (handlePtr < 0x100000 || handlePtr >= (uint)SystemMemory.RDRAM_SIZE)
             {
                 _resourceBindPhase = 4;
@@ -4448,11 +4558,32 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 return;
             }
 
-            ForceResourceHandleDone(sys.Memory, handlePtr);
+            // Wave-6: prep slot/object for BFC0 (43E038 needs *slot==1; 44F490 needs type≠0).
+            uint slotObj = sys.Memory.Read32(handlePtr + 0x3C);
+            if (slotObj >= 0x100000 && slotObj < (uint)SystemMemory.RDRAM_SIZE)
+                EnrichResourceObjectForBind(sys.Memory, slotObj);
+            if (sys.Memory.Read32(handlePtr) == 0)
+                sys.Memory.Write32(handlePtr, 1);
+            if (sys.Memory.Read32(handlePtr + 0x38) == 0)
+                sys.Memory.Write32(handlePtr + 0x38, 1);
+            // 43C128 bind-token: 0 is safe first-bind.
+            uint tok = sys.Memory.Read32(handlePtr + 0x2A8);
+            if (tok != 0 && (tok < 0x100000 || tok >= (uint)SystemMemory.RDRAM_SIZE))
+                sys.Memory.Write32(handlePtr + 0x2A8, 0);
+
+            // Static load-handle status only — never write slot+0x48 (not a status field).
             ForceResourceHandleDone(sys.Memory, ResourceHandleBase);
-            uint st = sys.Memory.Read32(handlePtr + 0x48);
-            if (st == 0 || (int)st > 0)
-                sys.Memory.Write32(handlePtr + 0x48, unchecked((uint)(-1)));
+            if (handlePtr != 0x0055E25C && handlePtr != ResourceHandleBase)
+            {
+                ForceResourceHandleDone(sys.Memory, handlePtr);
+                uint st = sys.Memory.Read32(handlePtr + 0x48);
+                if (st == 0 || (int)st > 0)
+                    sys.Memory.Write32(handlePtr + 0x48, unchecked((uint)(-1)));
+            }
+
+            // Zero BFC0 out-buf (a1).
+            for (uint o = 0; o < 0xA0; o += 4)
+                sys.Memory.Write32(ResourceBfc0Scratch + o, 0);
 
             _resourceBindSavedPc = sys.EE.PC;
             _resourceBindSavedGpr = new ulong[32];
@@ -4461,23 +4592,28 @@ public sealed class MidwayBootAssist : IGameQuirkModule
 
             for (int i = 4; i <= 11; i++)
                 sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
-            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = ResourceHandleBase });
+            // Wave-6: force BFC0 directly (a0=slot, a1=scratch). Full 26FBF0 first jals
+            // 2C6878/4154E0 which walked into nop sled 0x29E1AC and ESCAPE'd (wave-5 residual).
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = handlePtr });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = ResourceBfc0Scratch });
             sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
             ReHomeSpIfInHleScratch(sys);
 
-            sys.EE.PC = ResourceBindFn;
-            sys.LastGoodEePc = ResourceBindFn;
+            sys.EE.PC = ResourceBfc0Fn;
+            sys.LastGoodEePc = ResourceBfc0Fn;
             _resourceBindPollForced = true;
             _resourceBindResumePending = true;
             _resourceBindForceStartCyc = sys.MasterCycles;
             _resourceBindPhase = 3;
             Assists++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                uint oty = slotObj >= 0x100000 ? sys.Memory.Read32(slotObj + 0x48) : 0;
                 Console.Error.WriteLine(
-                    $"[BIOS] force resource bind FUN_0026FBF0 a0=0x{ResourceHandleBase:X} " +
-                    $"*handle=0x{handlePtr:X8} slot0={sys.Memory.Read32(0x0055E25C):X} " +
-                    $"obj={sys.Memory.Read32(0x0055E25C + 0x3C):X8} " +
+                    $"[BIOS] force resource BFC0 a0=0x{handlePtr:X} a1=0x{ResourceBfc0Scratch:X} " +
+                    $"slot0={sys.Memory.Read32(0x0055E25C):X} obj=0x{slotObj:X8} ty={oty:X} " +
                     $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+            }
         }
     }
 
@@ -4642,9 +4778,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-5: after 43B670/43AB88 returns null, bind stream slot0 to a live object carved
+    /// Wave-5/6: after 43B670/43AB88 returns null, bind stream slot0 to a live object carved
     /// from the real descriptor arena (already allocated by 43BD30 during the force path).
     /// Mirrors the 43B800 success tail minimum: *slot=1, *slot+0x38=1, *slot+0x3C=obj.
+    /// Wave-6: plant type=1 at +0x48 (not type5). BFC0→44F490 and D770→442A0 both require
+    /// +0x48≠0; +0x44=1 is the D7C8 sticky gate. Not a synthetic type5 plant.
     /// </summary>
     private static bool TryCompleteResourceSlotObject(SystemMemory mem, out uint slot, out uint obj)
     {
@@ -4654,6 +4792,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (existing >= 0x100000 && existing < (uint)SystemMemory.RDRAM_SIZE)
         {
             obj = existing;
+            EnrichResourceObjectForBind(mem, obj);
             if (mem.Read32(slot) == 0)
                 mem.Write32(slot, 1);
             if (mem.Read32(ResourceHandleBase) == 0)
@@ -4666,9 +4805,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (obj + 0x100 >= ResourceArenaBase + ResourceDescBufSize)
             return false;
 
-        // Minimal object fields set by 44E768 before deeper ctors.
+        // Minimal object fields set by 44E768 before deeper ctors + wave-6 type contract.
         mem.Write32(obj + 0x44, 1);
-        mem.Write32(obj + 0x48, 0);
+        mem.Write32(obj + 0x48, 1); // type 1 (resource) — required by 442A0/44F490/D7C8
         mem.Write32(obj + 0x4C, 0);
         mem.Write32(obj + 0x50, 0);
         mem.Write32(obj + 0x54, 0);
@@ -4676,12 +4815,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Dimensions from reconstructed level-0 descriptor (useful for later draw).
         mem.Write32(obj + 0x08, ResourceLevel0Width);
         mem.Write32(obj + 0x0C, ResourceLevel0Height);
+        EnrichResourceObjectForBind(mem, obj);
 
         mem.Write32(slot + 0x3C, obj);
-        // Leave *slot=0 until 26FBF0/C1C0 runs — MaybeForceResourceSlotBind treats
+        // Leave *slot=0 until BFC0/C1C0 runs — MaybeForceResourceSlotBind treats
         // flag=1+obj as "done" and would skip the bind poll phase.
         mem.Write32(slot + 0x38, 0);
         mem.Write32(slot + 0x00, 0);
+        // 43C128 bind-token at slot+0x2A8 must be 0 or match a1; clear garbage.
+        mem.Write32(slot + 0x2A8, 0);
         mem.Write32(ResourceHandleBase, slot);
 
         // Publish into free-list table so later factory lookups see the object.
@@ -4689,6 +4831,262 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             mem.Write32(0x0055FA0C, obj);
 
         return true;
+    }
+
+    /// <summary>
+    /// Wave-6: ensure object satisfies 442A0 (type≠0 → register *0x55F800) and D7C8
+    /// (type∈1..4, +0x44≠0). Type 1 is the natural resource path — not type5.
+    /// Also seeds +0x58 CAS (44F630) and a minimal method-table pointer for 452678
+    /// (BFC0→44F490 needs *(obj+0x20D4) non-null to jalr a producer into the out-buf).
+    /// </summary>
+    private static void EnrichResourceObjectForBind(SystemMemory mem, uint obj)
+    {
+        if (obj < 0x100000 || obj + 0x60 >= (uint)SystemMemory.RDRAM_SIZE) return;
+        if (mem.Read32(obj + 0x44) == 0)
+            mem.Write32(obj + 0x44, 1);
+        uint ty = mem.Read32(obj + 0x48);
+        if (ty == 0 || ty > 4)
+            mem.Write32(obj + 0x48, 1);
+        // 44F630 sticky: first-set +0x58=1 succeeds when zero.
+        if (mem.Read32(obj + 0x58) == 0)
+            mem.Write32(obj + 0x58, 0);
+        // Mirror 442A0 global register so consumers that only read *0x55F800 see the object.
+        if (mem.Read32(0x0055F800) == 0)
+            mem.Write32(0x0055F800, obj);
+
+        // 452678(obj, group=6, idx=11, out, 0): t1=*(obj + 6*0x44 + 0x1F3C)=*(obj+0x20D4).
+        // When t1==0 the leaf returns 0 and BFC0 never reaches C1C0. Plant a tiny method
+        // table in the arena tail: [11] → ResourceMethodStub which stores a0 into *a1 and
+        // returns 1 (enough for 44F490 to leave *out non-zero → C1C0 entry).
+        EnsureResourceMethodStub(mem);
+        const uint MethodTableOff = 0x20D4;
+        if (obj + MethodTableOff + 4 < ResourceArenaBase + ResourceDescBufSize
+            || obj + MethodTableOff + 4 < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            // Method table lives just after the object header in the arena.
+            uint table = (obj + 0x100 + 15u) & ~15u;
+            if (table + 0x40 < ResourceArenaBase + ResourceDescBufSize)
+            {
+                if (mem.Read32(obj + MethodTableOff) == 0)
+                {
+                    // 452678: v1 = a2*4 + t1; jalr *v1 with a2=11 → slot 11.
+                    for (uint i = 0; i < 16; i++)
+                        mem.Write32(table + i * 4, ResourceMethodStub);
+                    mem.Write32(obj + MethodTableOff, table);
+                }
+            }
+        }
+    }
+
+    private const uint ResourceMethodStub = 0x01FE0140;
+    /// <summary>Mini resource descriptor for C1C0 (a1). Written by method stub into *out.</summary>
+    private const uint ResourceMiniDesc = 0x01FE0180;
+
+    /// <summary>
+    /// EE stub for 452678: store mini-descriptor pointer into *a1 and return 1.
+    /// C1C0 needs a1 → descriptor (type/dims/bufs), not the object pointer itself.
+    /// <c>lui/ori t0, desc; sw t0, 0(a1); li v0,1; jr ra</c>
+    /// </summary>
+    private static void EnsureResourceMethodStub(SystemMemory mem)
+    {
+        // Keep mini-descriptor in sync with level-0 reconstruct.
+        BuildResourceDescriptor(mem, ResourceMiniDesc, ResourceLevel0Width, ResourceLevel0Height);
+
+        uint desc = ResourceMiniDesc;
+        uint hi = (desc >> 16) & 0xFFFF;
+        uint lo = desc & 0xFFFF;
+        // lui t0, hi ; ori t0, t0, lo ; sw t0, 0(a1) ; addiu v0, zero, 1 ; jr ra ; nop
+        mem.Write32(ResourceMethodStub + 0x00, 0x3C080000u | hi);       // lui t0, hi
+        mem.Write32(ResourceMethodStub + 0x04, 0x35080000u | lo);       // ori t0, t0, lo
+        mem.Write32(ResourceMethodStub + 0x08, 0xACA80000u);            // sw t0, 0(a1)
+        mem.Write32(ResourceMethodStub + 0x0C, 0x24020001u);            // li v0, 1
+        mem.Write32(ResourceMethodStub + 0x10, 0x03E00008u);            // jr ra
+        mem.Write32(ResourceMethodStub + 0x14, 0x00000000u);            // nop
+    }
+
+    private const uint ResourceAb88Fn = 0x0043AB88;
+    private int _resourceSlotReseals;
+    private ulong _lastResourceSlotResealCyc;
+    private bool _c1c0Entered;
+    private ulong _c1c0EnterCyc;
+
+    /// <summary>
+    /// Wave-6: phase-3 BFC0→C1C0 is pcbreak-proven (a0=slot a1=mini-desc) but C1C0 body
+    /// wanders into 0x474xxx thrash and never returns. Scheduler slices can miss the narrow
+    /// C1C0 PC window, so after 300k on phase-3 force we always soft-complete: seal slot
+    /// and land on the trampoline. TITLE_LOCAL.
+    /// </summary>
+    private void MaybeCompleteC1C0AfterEntry(Ps2System sys)
+    {
+        if (!_resourceBindResumePending || _resourceBindPhase != 3) return;
+        if (_resourceBindForceStartCyc == 0) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is >= 0x0043C1C0 and <= 0x0043C400 && !_c1c0Entered)
+        {
+            _c1c0Entered = true;
+            _c1c0EnterCyc = sys.MasterCycles;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] C1C0 entered pc=0x{pc:X8} a0=0x{(uint)sys.EE.GetGpr(4).Lo:X} " +
+                    $"a1=0x{(uint)sys.EE.GetGpr(5).Lo:X} cyc={sys.MasterCycles}");
+        }
+        // Soft-complete after 600k on phase-3 (C1C0 enters in ~200 cyc; deep body thrash
+        // starts ~1M — give chrome helpers a little room without 2M hang).
+        if (sys.MasterCycles < _resourceBindForceStartCyc + 600_000) return;
+        if (pc == ResourceBindReturnTrampoline) return;
+
+        uint obj = sys.Memory.Read32(0x0055E25C + 0x3C);
+        if (obj < 0x100000 || obj >= (uint)SystemMemory.RDRAM_SIZE)
+            obj = (ResourceArenaBase + 31u) & ~31u;
+        EnrichResourceObjectForBind(sys.Memory, obj);
+        sys.Memory.Write32(0x0055E25C + 0x3C, obj);
+        sys.Memory.Write32(0x0055E25C, 1);
+        sys.Memory.Write32(0x0055E25C + 0x38, 1);
+        if (sys.Memory.Read32(0x0055E25C + 0x60) == 1)
+            sys.Memory.Write32(0x0055E25C + 0x60, 0);
+        sys.Memory.Write32(ResourceHandleBase, 0x0055E25C);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+        sys.EE.PC = ResourceBindReturnTrampoline;
+        sys.LastGoodEePc = ResourceBindReturnTrampoline;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] C1C0 soft-complete → trampoline from 0x{pc:X8} obj=0x{obj:X8} " +
+                $"entered={(_c1c0Entered ? 1 : 0)} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-6: keep slot0 bound after BFC0. Live claim3: slot flag/obj corrupted by ~85M
+    /// (obj→0x760000, flag→0) while gifP3 stuck at 11. Re-plant arena object + D770 sticky
+    /// +0x44 so FBB0 can re-enter work. Rate-limited. TITLE_LOCAL.
+    /// </summary>
+    private void MaybeResealResourceSlot(Ps2System sys)
+    {
+        if (_resourceSlotReseals >= 48) return;
+        if (sys.MasterCycles - _lastResourceSlotResealCyc < 1_000_000) return;
+        if (sys.Gif.Path3Transfers < 11) return;
+
+        const uint Slot = 0x0055E25C;
+        uint flag = sys.Memory.Read32(Slot);
+        uint obj = sys.Memory.Read32(Slot + 0x3C);
+        bool objLive = obj >= 0x100000 && obj < (uint)SystemMemory.RDRAM_SIZE
+                       && obj >= ResourceArenaBase && obj < ResourceArenaBase + ResourceDescBufSize;
+        bool needs = flag != 1 || !objLive
+                     || (objLive && sys.Memory.Read32(obj + 0x44) == 0)
+                     || (objLive && sys.Memory.Read32(obj + 0x48) == 0);
+
+        // Also re-arm when gifP3 plateaued — force another D770 attempt.
+        if (!needs && sys.Gif.Path3Transfers >= 11 && sys.Gif.Path3Transfers < 14
+            && objLive && (_resourceSlotReseals % 2) == 0)
+            needs = true;
+        if (!needs) return;
+
+        if (!objLive)
+        {
+            if (!TryCompleteResourceSlotObject(sys.Memory, out _, out obj))
+                return;
+        }
+        EnrichResourceObjectForBind(sys.Memory, obj);
+        // D7C8 clears +0x44 on entry; restore so type path can run again.
+        sys.Memory.Write32(obj + 0x44, 1);
+        if (sys.Memory.Read32(obj + 0x48) == 0 || sys.Memory.Read32(obj + 0x48) > 4)
+            sys.Memory.Write32(obj + 0x48, 1);
+        sys.Memory.Write32(Slot + 0x3C, obj);
+        sys.Memory.Write32(Slot, 1);
+        sys.Memory.Write32(Slot + 0x38, 1);
+        if (sys.Memory.Read32(Slot + 0x60) == 1)
+            sys.Memory.Write32(Slot + 0x60, 0);
+        if (sys.Memory.Read32(ResourceHandleBase) == 0)
+            sys.Memory.Write32(ResourceHandleBase, Slot);
+        // Keep stream work gate open + CAS free.
+        if (sys.Memory.Read32(0x0055E1EC) == 0)
+            sys.Memory.Write32(0x0055E1EC, 1);
+        if (sys.Memory.Read32(0x0055E248) != 0)
+            sys.Memory.Write32(0x0055E248, 0);
+        // Stream manager lock must not stick.
+        if (sys.Memory.Read32(StreamManagerBase + 0x24) == 1)
+            sys.Memory.Write32(StreamManagerBase + 0x24, 0);
+
+        _resourceSlotReseals++;
+        _lastResourceSlotResealCyc = sys.MasterCycles;
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_resourceSlotReseals <= 8 || _resourceSlotReseals % 4 == 0))
+            Console.Error.WriteLine(
+                $"[BIOS] re-seal resource slot0 obj=0x{obj:X8} ty={sys.Memory.Read32(obj + 0x48):X} " +
+                $"+44={sys.Memory.Read32(obj + 0x44):X} n={_resourceSlotReseals} " +
+                $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Wave-6: rewrite FUN_0043AB88 entry to <c>li v0, obj; jr ra</c> so force 43B670
+    /// takes the 43B800 success tail. Restored on force resume. Not a permanent ELF patch.
+    /// </summary>
+    private void PatchAb88ReturnObject(SystemMemory mem)
+    {
+        uint obj = (ResourceArenaBase + 31u) & ~31u;
+        // Pre-enrich so success-tail consumers see type/method contract immediately.
+        mem.Write32(obj + 0x44, 1);
+        mem.Write32(obj + 0x48, 1);
+        mem.Write32(obj + 0x08, ResourceLevel0Width);
+        mem.Write32(obj + 0x0C, ResourceLevel0Height);
+        EnrichResourceObjectForBind(mem, obj);
+
+        if (!_resourceAb88Patched)
+        {
+            for (int i = 0; i < 4; i++)
+                _resourceAb88Saved[i] = mem.Read32(ResourceAb88Fn + (uint)(i * 4));
+            _resourceAb88Patched = true;
+        }
+        // lui v0, hi(obj); ori v0, v0, lo(obj); jr ra; nop
+        uint hi = (obj >> 16) & 0xFFFF;
+        uint lo = obj & 0xFFFF;
+        mem.Write32(ResourceAb88Fn + 0x00, 0x3C020000u | hi);       // lui v0, hi
+        mem.Write32(ResourceAb88Fn + 0x04, 0x34420000u | lo);       // ori v0, v0, lo
+        mem.Write32(ResourceAb88Fn + 0x08, 0x03E00008u);            // jr ra
+        mem.Write32(ResourceAb88Fn + 0x0C, 0x00000000u);            // nop
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] patch 43AB88 → return obj=0x{obj:X8}");
+    }
+
+    private void RestoreAb88Patch(SystemMemory mem)
+    {
+        if (!_resourceAb88Patched) return;
+        for (int i = 0; i < 4; i++)
+            mem.Write32(ResourceAb88Fn + (uint)(i * 4), _resourceAb88Saved[i]);
+        _resourceAb88Patched = false;
+    }
+
+    /// <summary>
+    /// Wave-6 legacy: PC-window inject at 43B7E8 (kept as belt-and-suspenders; primary
+    /// path is <see cref="PatchAb88ReturnObject"/> because slice granularity misses the window).
+    /// </summary>
+    private void MaybeInjectResourceObjectAtFactoryNull(Ps2System sys)
+    {
+        if (!_resourceBindResumePending || _resourceBindPhase != 1) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is < 0x0043B7E0 or > 0x0043B7F0) return;
+        uint v0 = (uint)sys.EE.GetGpr(2).Lo;
+        if (v0 >= 0x100000 && v0 < (uint)SystemMemory.RDRAM_SIZE) return;
+
+        uint obj = (ResourceArenaBase + 31u) & ~31u;
+        if (obj + 0x2200 >= ResourceArenaBase + ResourceDescBufSize) return;
+        if (sys.Memory.Read32(obj + 0x44) == 0 && sys.Memory.Read32(obj + 0x48) == 0)
+        {
+            sys.Memory.Write32(obj + 0x44, 1);
+            sys.Memory.Write32(obj + 0x48, 1);
+            sys.Memory.Write32(obj + 0x08, ResourceLevel0Width);
+            sys.Memory.Write32(obj + 0x0C, ResourceLevel0Height);
+        }
+        EnrichResourceObjectForBind(sys.Memory, obj);
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = obj });
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = obj });
+        Assists++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] inject resource object at 43B7E8 obj=0x{obj:X8} pc=0x{pc:X8} " +
+                $"cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -4742,17 +5140,21 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool atTrampoline = pc == ResourceBindReturnTrampoline;
         bool timedOut = _resourceBindForceStartCyc != 0
             && sys.MasterCycles >= _resourceBindForceStartCyc + ResourceBindTimeoutCyc;
-        // Wave-5: include type-1 object factory + FAE8 stream body + bind chain so early
-        // ESCAPE does not abort mid-43AB88 / mid-26FBF0 (live: phase-3 ESCAPE @0x43FBE8).
+        // Wave-5/6: type-1 factory + FAE8 + BFC0/C1C0 + 44F490/D770 chains so early
+        // ESCAPE does not abort mid-bind (wave-5: phase-3 ESCAPE @0x426E34 after nop yank).
         bool inForceBand = (pc is >= 0x0026F900 and <= 0x0026FD80)
             || (pc is >= 0x0043A000 and <= 0x00440000)
-            || (pc is >= 0x00440000 and <= 0x00457000)
-            || (pc is >= 0x00450000 and <= 0x00452000)
+            || (pc is >= 0x00440000 and <= 0x00458000)
+            || (pc is >= 0x00450000 and <= 0x00454000) // 451E00 / 452678
             || (pc is >= 0x00420000 and <= 0x00422000)
-            || (pc is >= 0x00474000 and <= 0x00475000)
-            || (pc is >= 0x002C6000 and <= 0x002C7000) // 26FBF0 helper 2C6878
+            || (pc is >= 0x00474000 and <= 0x00478000) // C1C0 helpers / list
+            || (pc is >= 0x002C6000 and <= 0x002C8000) // 26FBF0 helper 2C6878/2C7658
             || (pc is >= 0x00415000 and <= 0x00416000) // 4154E0
+            || (pc is >= 0x0042D700 and <= 0x0042D900) // 4154E0 → 42D7A8
             || (pc >= ResourceAllocStub && pc < ResourceAllocStub + 0x40)
+            || (pc >= ResourceMethodStub && pc < ResourceMethodStub + 0x20)
+            || (pc >= ResourceMiniDesc && pc < ResourceMiniDesc + 0x40)
+            || (pc >= ResourceBfc0Scratch && pc < ResourceBfc0Scratch + 0xA0)
             || pc == ResourceBindReturnTrampoline;
         bool escaped = !atTrampoline && _resourceBindForceStartCyc != 0
             && sys.MasterCycles >= _resourceBindForceStartCyc + ResourceBindEscapeCyc
@@ -4800,10 +5202,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // still leaving a usable *slot+0x3C for FAE8/C1C0 consumers).
         if (slot0obj >= 0x100000 && slot0obj < (uint)SystemMemory.RDRAM_SIZE)
         {
+            EnrichResourceObjectForBind(sys.Memory, slot0obj);
             if (sys.Memory.Read32(0x0055E25C) == 0)
                 sys.Memory.Write32(0x0055E25C, 1);
             if (sys.Memory.Read32(0x0055E25C + 0x38) == 0)
                 sys.Memory.Write32(0x0055E25C + 0x38, 1);
+            // Keep work flag clear so FBB0 does not early-out (*slot+0x60!=1).
+            if (sys.Memory.Read32(0x0055E25C + 0x60) == 1)
+                sys.Memory.Write32(0x0055E25C + 0x60, 0);
             slot0 = 1;
             if (handlePtr < 0x100000)
             {
@@ -4819,6 +5225,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 $"*0x678458=0x{handlePtr:X8} slot0={slot0:X} obj=0x{slot0obj:X8} " +
                 $"v0=0x{v0:X} pc=0x{pc:X8} gifP3={sys.Gif.Path3Transfers} " +
                 $"cyc={sys.MasterCycles}");
+
+        // Restore 43AB88 after phase-1 force so later natural calls are not stubbed.
+        if (_resourceBindPhase == 1 || lost)
+            RestoreAb88Patch(sys.Memory);
 
         sys.EE.PC = _resourceBindSavedPc;
         if (_resourceBindSavedGpr != null)

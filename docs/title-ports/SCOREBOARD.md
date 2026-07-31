@@ -8,7 +8,7 @@
 
 | Title | Serial | Menu? | Key tip metric | Wall |
 |-------|--------|-------|----------------|------|
-| **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | gifP3=11 FAE8 | selection/second chrome; C1C0 never binds |
+| **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | gifP3=11 FAE8 slot0+obj C1C0 | second-chrome Path3 (gifP3≥12); MENU YES open |
 | **Burnout 3** | SLUS_210.50 | **No** | gifP3=436 cdvd=6584 | presentation px=0 |
 | **Blood Omen 2** | SLUS_200.24 | **No** | px=3 cdvd=2135 stream=2.4MB LIST+ENGLISH PC=0x2CD884 | WAVE-5 low-ELF thrash fix; Soft-GS menu not drawn |
 | **God of War** | SCUS_973.99 | **No*** | **gifP3=1** first | FILEIO/LoadWad; px=0 |
