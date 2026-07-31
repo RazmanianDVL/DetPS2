@@ -1521,7 +1521,9 @@ public sealed class SonyKernelHle
                 // CRI DTX (and any future IOP consumer of EE→IOP bulk DMA) needs an IOP-side
                 // completion signal after the payload lands. RealSifRpc tracks CRI DTX channels
                 // created via sid=0x90000200 fno=2 and advances their EE work-buffer counter.
-                _realRpc.NotifyDtxEeToIopDma(_system.Memory, dest, size);
+                // Pass EE src so SearchFile (and similar in-out RPCs) can write CdlFILE results
+                // back to the EE send buffer (Play! modifies args in place).
+                _realRpc.NotifyDtxEeToIopDma(_system.Memory, dest, size, src);
             }
         }
 

@@ -1843,6 +1843,11 @@ public sealed class IopModuleHost
         if (path.StartsWith("~/", StringComparison.Ordinal) || path.StartsWith("~\\", StringComparison.Ordinal))
             path = path[2..];
         path = path.TrimStart('\\', '/');
+        // Vexx (and some Acclaim) virtual root: "$/stree0.tre" / "$/Data/..." → ISO leaf.
+        if (path.StartsWith("$/", StringComparison.Ordinal) || path.StartsWith("$\\", StringComparison.Ordinal))
+            path = path[2..];
+        else if (path.Length > 0 && path[0] == '$')
+            path = path[1..].TrimStart('\\', '/');
         int semi = path.IndexOf(';');
         if (semi >= 0) path = path[..semi];
         return path.Replace('\\', '/').ToUpperInvariant();
