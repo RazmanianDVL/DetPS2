@@ -223,9 +223,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         // Wave-2: after force FullyDone, tip residual often parks in WaitSema/SIF poll
         // bands (0x293xxx / 0x123Exx) with IRX-only cdvd - never reaches STG bind.
-        if (_lgDevFullyDone && sys.MasterCycles >= 20_000_000
-            && sys.Cdvd.SectorsRead is >= 400 and < 2000)
-            MaybeLeaveResidualBootThrash(sys);
+        // Wave-2 thrash leave disabled: early snap to 0x2AF914 caused UnknownSpecial @0x480xxx.
+        // Residual CallRpc->parent + VBlank gate + Soft-GS DISPFB remain the path to STG.
+        // if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && _lgDevEscapes >= 2
+        //     && sys.Cdvd.SectorsRead is >= 400 and < 2000)
+        //     MaybeLeaveResidualBootThrash(sys);
 
         // Direct flip-leave once LGDEV is done — do not depend solely on menu-kick cadence
         // (live menu14 stuck at 0x1F24E0 with re-arm only, never leave).
@@ -501,36 +503,54 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
             if (IsLgDevCallRpcThrash(sys, pc, ra) && _lgDevEscapes < 256)
             {
-                // After STG/game FILEIO, stop faking LGDEV residual CallRpc.
+                // After STG/game FILEIO, stop faking LGDEV residual CallRpc — live tip
+                // re-entered n→32 @92–99M and monopolized EE after full FRONTEND DMA.
                 if (sys.Cdvd.SectorsRead >= 600)
                     return;
                 uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                // menu4 residual: main high-stack (FC10). Also allow mid-high frames that
+                // share the CallRpc leaf shape; skip pure worker 0x01EDxxxx parks.
                 if (sp is >= 0x01FFF000 and < 0x02000000)
                 {
-                    // Wave-2: residual n=2-3 must not return into LGDEV leaf (0x443D94).
-                    // Complete to parent post-jal so STG can bind (was plant-only cdvd=609).
-                    sys.Memory.Write32(sp + 176, 0x004427FCu);
-                    sys.Memory.Write32(sp + 180, 0);
+                    uint savedRa = sys.Memory.Read32(sp + 176) & 0x1FFFFFFFu;
+                    // menu4 rewrite window (pre-401dbbb): leaf body + bad + CallRpc + init.
+                    if (savedRa is >= 0x00443D00 and <= 0x00443DAC
+                        || savedRa is < 0x00100000 or >= 0x00800000
+                        || savedRa is (>= 0x0010BE00 and <= 0x0010F400)
+                        || savedRa is (>= 0x004438E0 and <= 0x00443C6C)
+                        || savedRa is >= 0x00443800 and < 0x00445000)
+                    {
+                        sys.Memory.Write32(sp + 176, 0x00443D94u);
+                        sys.Memory.Write32(sp + 180, 0);
+                        savedRa = 0x00443D94u;
+                    }
+                    // Plant leaf frame $ra after CallRpc epi pops 192 (delay-slot 0x443DA8).
                     uint leafSp = sp + 192;
                     if (leafSp is >= 0x01FFF000 and < 0x02000000)
                     {
                         sys.Memory.Write32(leafSp + 40, 0x004427FCu);
                         sys.Memory.Write32(leafSp + 44, 0);
                     }
-                    PlantLgDevEntryStub(sys);
-                    PlantLgDevCallRpcLeafStub(sys);
+                    // After menu4 residual window (~48), complete CallRpc to parent post-jal
+                    // so residual cannot monopolize EE (HEAD: n→256 WaitSema, no STG).
+                    if (_lgDevEscapes >= 47)
+                    {
+                        sys.Memory.Write32(sp + 176, 0x004427FCu);
+                        sys.Memory.Write32(sp + 180, 0);
+                        savedRa = 0x004427FCu;
+                        PlantLgDevEntryStub(sys);
+                        PlantLgDevCallRpcLeafStub(sys);
+                    }
                     sys.Memory.Write32(0x01ECDF00, 0);
-                    sys.Memory.Write32(LgDevPostFlag, 0);
                     sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x004427FCu });
-                    sys.EE.PC = 0x004427FCu;
+                    sys.EE.PC = 0x0010F3A8;
                     sys.EE.COP0_Status &= ~(1u << 1);
                     _lgDevEscapes++;
                     if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                         && (_lgDevEscapes <= 8 || _lgDevEscapes % 16 == 0))
                         Console.Error.WriteLine(
-                            $"[B3] residual LGDEV->parent post-jal pc=0x{pc:X8} sp=0x{sp:X8} " +
-                            $"-> 0x4427FC n={_lgDevEscapes} cyc={sys.MasterCycles}");
+                            $"[B3] residual LGDEV CallRpc complete pc=0x{pc:X8} sp=0x{sp:X8} " +
+                            $"savedRa=0x{savedRa:X8} n={_lgDevEscapes} cyc={sys.MasterCycles}");
                 }
             }
             // Deep LGDEV body after bad residual return — snap to parent post-jal.

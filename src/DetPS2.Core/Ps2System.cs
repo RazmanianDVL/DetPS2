@@ -472,8 +472,7 @@ public sealed class Ps2System
                     or (>= 0x00293A00UL and <= 0x00294200UL)
                     or (>= 0x00123E00UL and <= 0x00124080UL)
                     or (>= 0x002AF800UL and <= 0x002AF994UL)
-                    or (>= 0x002B34C0UL and <= 0x002B35D0UL)
-                    or (>= 0x0010BE60UL and <= 0x0010BE70UL);
+                    or (>= 0x002B34C0UL and <= 0x002B35D0UL);
                 // Dec post-MSL factory/sys-init fail gates (one-instruction v0 checks) —
                 // MidwayFamilyAssist soft-success needs tight slices or the window is missed.
                 bool mkFamHot = ActiveQuirk is MidwayFamilyAssist
