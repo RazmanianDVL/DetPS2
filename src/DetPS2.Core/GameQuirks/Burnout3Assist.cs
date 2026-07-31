@@ -154,7 +154,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         PlantIopRpVersion(sys);
     }
 
-    public void OnHostPresent(Ps2System sys) => _ = sys;
+    public void OnHostPresent(Ps2System sys)
+    {
+        // Soft-GS: PATH3 may upload logo IMAGE under M3P; DISPFB→FB composite each present.
+        sys.Gs.CompositeDispfbToFramebuffer();
+    }
 
     /// <summary>
     /// Plant IOPRP 2.8.0 version tag the SifLoadModule gate compares after GetVersion.
@@ -220,13 +224,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (_lgDevFullyDone && sys.MasterCycles >= 24_000_000 && sys.Cdvd.SectorsRead >= 400)
             MaybeLeaveFlipPark(sys);
 
-        // Plant STAGEHED only after residual LGDEV CallRpc has stabilized (menu4/final10:
-        // residual ~48× at sp@FC10 then STG). Planting mid-residual (escapes≪48) or at
-        // force-cycle disturbed frames and left cdvd plant-only (609) without STG bind.
-        // Wave-7: also plant once STG+full Global.txd already advanced cdvd (≫2000) even
-        // if residual n stayed short (preferIopRp=OFF force@pristine residual n=2–3).
-        if (_lgDevFullyDone && sys.MasterCycles >= 30_000_000
-            && (_lgDevEscapes >= 48 || sys.Cdvd.SectorsRead >= 2000)
+        // Plant STAGEHED after residual LGDEV settled. Tip IRX-era residual dies at n=2–3
+        // after force@pristine (entry+leaf stubs) — n≥48 left STAGEHED unplanted forever.
+        // Wave-7: also plant once game FILEIO already advanced cdvd (≫2000).
+        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000
+            && (_lgDevEscapes >= 1 || sys.Cdvd.SectorsRead >= 2000)
             && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
 
@@ -803,28 +805,83 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x002371E0;
         }
 
-        // High WaitSema pulse while IRX-only after residual settle, and again after
-        // STG/TXD (cdvd>=2000) so presentation workers are not stuck on high ids.
-        // Soft-complete post-LGDEV spin WaitSema only while IRX-only (ra@0x2AF8xx).
+        // Post-LGDEV poll @0x2AF80C: while(*(gp-23104)==0 && s0<600) SleepThread.
+        // Success: flag!=0 && s0!=600 → 0x2AF914 v0=1 → epi 0x2AF984.
+        // Fail timeout: 0x2AF91C/0x2AF920 — never soft-leave there.
         bool irxOnly = sys.Cdvd.SectorsRead is >= 400 and < 600;
         bool postTxd = sys.Cdvd.SectorsRead >= 2000;
-        if (_lgDevFullyDone && sys.MasterCycles >= 28_000_000 && (irxOnly || postTxd))
+        if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && (irxOnly || postTxd))
         {
             uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            if (irxOnly && pcW is >= 0x0010BE60 and <= 0x0010BE70
-                && raW is >= 0x002AF800 and <= 0x002AF910)
+            const uint postLgDevSuccess = 0x002AF914u;
+            bool raInPostLgDev = raW is >= 0x002AF800 and <= 0x002AF994;
+            bool pcInPostLgDev = pcW is >= 0x002AF800 and <= 0x002AF980;
+            bool pcInSleep = pcW is >= 0x0010C0A0 and <= 0x0010C0AC;
+            bool pcInWaitSema = pcW is >= 0x0010BE60 and <= 0x0010BE70;
+            if (irxOnly && (pcInPostLgDev || (pcInSleep && raInPostLgDev)
+                || (pcInWaitSema && raInPostLgDev)))
             {
-                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                sys.EE.PC = raW;
+                uint gpW = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
+                if (gpW is < 0x00400000 or >= 0x01000000) gpW = 0x004E8670;
+                uint f23104 = unchecked((uint)((int)gpW - 23104));
+                if (f23104 is >= 0x00400000 and < 0x01000000)
+                    sys.Memory.Write32(f23104, 1);
+                sys.Memory.Write32(BootWaitFlagDefault, 1);
+                uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
+                if (s0w >= 600)
+                    sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.PC = postLgDevSuccess;
                 sys.EE.COP0_Status &= ~(1u << 1);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && (_menuKickPulses % 16) == 0)
+                    && (_menuKickPulses % 8) == 0)
                     Console.Error.WriteLine(
-                        $"[B3] soft-complete post-LGDEV WaitSema ra=0x{raW:X8} " +
-                        $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+                        $"[B3] leave post-LGDEV spin SUCCESS pc=0x{pcW:X8} ra=0x{raW:X8} " +
+                        $"-> 0x{postLgDevSuccess:X8} v0=1 cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
             }
-            if (k != null && (_menuKickPulses % 2) == 0)
+            if (irxOnly && k != null && (_menuKickPulses % 2) == 0)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive || !t.Sleeping) continue;
+                    uint savedRa = (uint)(t.SavedRa & 0x1FFFFFFFUL);
+                    if (savedRa == 0 && t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 31)
+                        savedRa = (uint)(t.SavedGprFull[31] & 0x1FFFFFFFUL);
+                    uint savedPc = (uint)(t.SavedPc & 0x1FFFFFFFUL);
+                    bool postPark = (savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010C0A0 and <= 0x0010C0AC && savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010BE60 and <= 0x0010BE70 && savedRa is >= 0x002AF800 and <= 0x002AF994)
+                        || (t.Id == 1 && t.WaitSemaId >= 0x40)
+                        || (t.Id == 1 && t.WaitSemaId == 0 && !t.WaitVblank && _menuKickPulses >= 16);
+                    if (t.WaitSemaId >= 32)
+                    {
+                        try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                    }
+                    if (postPark && t.Id == 1)
+                    {
+                        t.SavedPc = postLgDevSuccess;
+                        if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
+                        {
+                            t.SavedGprFull[2] = 1;
+                            if (t.SavedGprFull.Length > 16) t.SavedGprFull[16] = 1;
+                        }
+                        t.WaitSemaId = 0;
+                        t.Sleeping = false;
+                        t.WaitVblank = false;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                            && (_menuKickPulses % 8) == 0)
+                            Console.Error.WriteLine(
+                                $"[B3] re-home sleeping main post-LGDEV SUCCESS " +
+                                $"savedRa=0x{savedRa:X8} -> 0x{postLgDevSuccess:X8} " +
+                                $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+                    }
+                    else if (t.WaitSemaId == 0 && !t.WaitVblank)
+                        k.WakeupThread(t.Id);
+                }
+            }
+            else if (k != null && (_menuKickPulses % 2) == 0)
             {
                 foreach (var t in k.AllThreads)
                 {
@@ -1366,8 +1423,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.Cdvd.SectorsRead < 400) return;
         if (_ioQueueEscapes >= 256) return;
 
-        // Ensure STAGEHED is in EE before we try to plant an iovec (same settle gate).
-        if (!_stageAssetsPlanted && sys.MasterCycles >= 28_000_000 && _lgDevEscapes >= 8)
+        // Ensure STAGEHED is in EE before we try to plant an iovec (short residual n=2–3 OK).
+        if (!_stageAssetsPlanted && sys.MasterCycles >= 28_000_000 && _lgDevEscapes >= 1)
             MaybePlantStageAssets(sys);
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
@@ -1665,9 +1722,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         bool inSleep = pc is >= 0x0010C0A0 and <= 0x0010C0AC;
         // 0x2AF80C..0x2AF90C: post-LGDEV poll *(gp-23104) before STG bind.
         bool inPostLgDevSpin = pc is >= 0x002AF800 and <= 0x002AF910;
+        bool inPostLgDevWaitSema = pc is >= 0x0010BE60 and <= 0x0010BE70
+            && ((uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL) is >= 0x002AF800 and <= 0x002AF910);
         // Periodic plant only while IRX-only — stop once game FILEIO opens (cdvd≫425).
         bool periodic = (_menuKickPulses % 4) == 0 && sys.Cdvd.SectorsRead is >= 400 and < 600;
-        if (!inWait1 && !inWait2 && !inWait3 && !inSleep && !inPostLgDevSpin && !periodic) return;
+        if (!inWait1 && !inWait2 && !inWait3 && !inSleep && !inPostLgDevSpin
+            && !inPostLgDevWaitSema && !periodic) return;
 
         _lastBootWaitPlantCyc = sys.MasterCycles;
         _bootWaitFlagPlants++;
@@ -1730,6 +1790,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
             sys.EE.PC = 0x002B35C0; // past wait-3 → jal 0x2AFDD0
+            sys.EE.COP0_Status &= ~0x6u;
+        }
+        else if (inPostLgDevSpin || inPostLgDevWaitSema)
+        {
+            // Success leave: flag set + s0!=600 → v0=1 epi (NOT timeout 0x2AF920).
+            uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
+            if (s0w >= 600)
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = 0x002AF914;
             sys.EE.COP0_Status &= ~0x6u;
         }
 

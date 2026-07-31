@@ -68,6 +68,11 @@ public sealed class Gs : ISchedulable
     public long PixelsWritten { get; private set; }
     public long FragmentsTested { get; private set; }
     public long FragmentsRejectedDepth { get; private set; }
+    /// <summary>Bytes accepted by IMAGE / BITBLT host→local (telemetry).</summary>
+    public long ImageBytesWritten { get; private set; }
+    /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
+    public long DispfbPixelsComposited { get; private set; }
+    private bool _localMemHasImage;
 
     public struct Vertex
     {
@@ -100,6 +105,9 @@ public sealed class Gs : ISchedulable
         _trxDpsm = 0;
         _trxPending = 0;
         _trxPartial = 0;
+        ImageBytesWritten = 0;
+        DispfbPixelsComposited = 0;
+        _localMemHasImage = false;
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
         _lastU = _lastV = 0;
@@ -367,11 +375,22 @@ public sealed class Gs : ISchedulable
         int x = (xRaw - ofx) >> 4;
         int y = (yRaw - ofy) >> 4;
 
-        // If offset is 0 and values look like already-screen or scaled 0..4096 homebrew style
-        if (ofx == 0 && ofy == 0 && xRaw > FB_WIDTH * 16)
+        // Retail GS: XYOFFSET often left 0 while verts use a 2048.0 (0x8000 in 12.4)
+        // origin so screen space is (raw - 0x8000) / 16. Without this, commercial titles
+        // kick thousands of prims with every fragment off-FB (B3: prims=2389 px=0).
+        // Homebrew path: large raw without retail centering → map 0..4096 → FB.
+        if (ofx == 0 && ofy == 0)
         {
-            x = (xRaw * FB_WIDTH) / 4096;
-            y = (yRaw * FB_HEIGHT) / 4096;
+            if (xRaw >= 0x6000 || yRaw >= 0x6000)
+            {
+                x = (xRaw - 0x8000) >> 4;
+                y = (yRaw - 0x8000) >> 4;
+            }
+            else if (xRaw > FB_WIDTH * 16 || yRaw > FB_HEIGHT * 16)
+            {
+                x = (xRaw * FB_WIDTH) / 4096;
+                y = (yRaw * FB_HEIGHT) / 4096;
+            }
         }
 
         float z = zRaw / (float)0xFFFFFF;
@@ -1027,6 +1046,8 @@ public sealed class Gs : ISchedulable
         if (n <= 0) return;
         data.Slice(0, n).CopyTo(_localMem.AsSpan(destByteOffset));
         _useProceduralTexture = false;
+        ImageBytesWritten += n;
+        _localMemHasImage = true;
     }
 
     /// <summary>Stream host IMAGE bytes into local mem using BITBLT/TRX cursor.</summary>
@@ -1084,6 +1105,8 @@ public sealed class Gs : ISchedulable
         if (bi < 0 || bi >= _localMem.Length) return;
         for (int b = 0; b < bpp && bi + b < _localMem.Length; b++)
             _localMem[bi + b] = (byte)(pixel >> (8 * b));
+        ImageBytesWritten += bpp;
+        _localMemHasImage = true;
     }
 
     private static int Log2(int v)
@@ -1284,8 +1307,109 @@ public sealed class Gs : ISchedulable
     /// Host FMV/boot overlay is retired (IRX era) — never preferred over Soft-GS, even if a
     /// legacy assist still toggled <see cref="HostOverlayActive"/>.
     /// Desktop and PresentPipeline should use this for display / PPM.
+    /// When prim raster is still empty but IMAGE filled local VRAM and DISPFB/FRAME is set,
+    /// composite local→FB (SOFTGS_IRX_ERA residual #1 — commercial logo path).
     /// </summary>
-    public ReadOnlySpan<uint> GetPresentSpan() => _framebuffer;
+    public ReadOnlySpan<uint> GetPresentSpan()
+    {
+        if (PixelsWritten == 0 && _localMemHasImage)
+            CompositeDispfbToFramebuffer();
+        return _framebuffer;
+    }
+
+    /// <summary>
+    /// Copy DISPFB1/2 (else FRAME_1) local VRAM into the software present FB when raster
+    /// <see cref="PixelsWritten"/> is still 0. Returns non-black pixels written.
+    /// </summary>
+    public long CompositeDispfbToFramebuffer()
+    {
+        if (PixelsWritten > 0) return 0;
+        if (!_localMemHasImage) return 0;
+
+        bool fromDispfb = Registers.DISPFB1 != 0 || Registers.DISPFB2 != 0;
+        ulong fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1
+            : Registers.DISPFB2 != 0 ? Registers.DISPFB2
+            : Registers.FRAME_1;
+        if (fb == 0) return 0;
+
+        int fbp;
+        int fbw;
+        int psm;
+        int dbx = 0, dby = 0;
+        if (fromDispfb)
+        {
+            fbp = (int)(fb & 0x1FF);
+            fbw = (int)((fb >> 9) & 0x3F) * 64;
+            psm = (int)((fb >> 15) & 0x1F);
+            dbx = (int)((fb >> 32) & 0x7FF);
+            dby = (int)((fb >> 43) & 0x7FF);
+        }
+        else
+        {
+            fbp = (int)(fb & 0x1FF);
+            fbw = (int)((fb >> 16) & 0x3F) * 64;
+            psm = (int)((fb >> 24) & 0x3F);
+        }
+        if (fbw <= 0) fbw = FB_WIDTH;
+        if (fbw > 4096) fbw = 4096;
+        uint baseBytes = (uint)fbp * 2048u;
+        if (baseBytes >= (uint)_localMem.Length) return 0;
+        if (psm is not (0x00 or 0x01 or 0x02 or 0x0A))
+            psm = 0x00;
+
+        long written = 0;
+        int h = FB_HEIGHT;
+        int w = Math.Min(FB_WIDTH, fbw);
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int sx = dbx + x;
+                int sy = dby + y;
+                uint pixel;
+                if (psm == 0x00)
+                {
+                    int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
+                    if ((uint)bi + 3u >= (uint)_localMem.Length) continue;
+                    pixel = (uint)_localMem[bi]
+                            | ((uint)_localMem[bi + 1] << 8)
+                            | ((uint)_localMem[bi + 2] << 16)
+                            | ((uint)_localMem[bi + 3] << 24);
+                }
+                else if (psm == 0x01)
+                {
+                    int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
+                    if ((uint)bi + 2u >= (uint)_localMem.Length) continue;
+                    pixel = (uint)_localMem[bi]
+                            | ((uint)_localMem[bi + 1] << 8)
+                            | ((uint)_localMem[bi + 2] << 16)
+                            | 0xFF000000u;
+                }
+                else
+                {
+                    int bi = (int)baseBytes + (sy * fbw + sx) * 2;
+                    if ((uint)bi + 1u >= (uint)_localMem.Length) continue;
+                    ushort p16 = (ushort)(_localMem[bi] | (_localMem[bi + 1] << 8));
+                    int r = (p16 & 0x1F) << 3;
+                    int g = ((p16 >> 5) & 0x1F) << 3;
+                    int b = ((p16 >> 10) & 0x1F) << 3;
+                    pixel = (uint)(0xFF000000 | (r << 16) | (g << 8) | b);
+                }
+
+                if ((pixel & 0x00FFFFFF) == 0) continue;
+                _framebuffer[y * FB_WIDTH + x] = pixel | 0xFF000000;
+                written++;
+            }
+        }
+
+        if (written > 0)
+        {
+            PixelsWritten += written;
+            PrimitivesDrawn++;
+            DispfbPixelsComposited = written;
+        }
+        return written;
+    }
 
     public bool HostOverlayActive => _hostOverlayActive;
 

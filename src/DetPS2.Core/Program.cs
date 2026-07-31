@@ -292,12 +292,15 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 ulong step = Math.Min(slice, remaining);
                 traceSys.RunFor(step);
                 traceSys.ActiveQuirk?.OnHostPresent(traceSys);
+                // Soft-GS DISPFB residual: IMAGE may fill local VRAM without prim raster.
+                traceSys.Gs.CompositeDispfbToFramebuffer();
                 remaining -= step;
             }
         }
         else
         {
             traceSys.RunFor(remaining);
+            traceSys.Gs.CompositeDispfbToFramebuffer();
         }
         // telemetryHits/telemetryUniqueKeys (previously printed as bare "hits"/"unique" right next
         // to "PC=..." — easy to misread as a PC-visit or loop-iteration counter, which it is NOT;
@@ -584,6 +587,7 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
                 ulong step = Math.Min(slice, remaining);
                 smSys.RunFor(step);
                 smSys.ActiveQuirk?.OnHostPresent(smSys);
+                smSys.Gs.CompositeDispfbToFramebuffer();
                 remaining -= step;
             }
         }
