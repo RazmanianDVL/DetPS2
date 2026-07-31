@@ -82,6 +82,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _menuKickPulses;
     private int _vblankExits;
     private int _bootWaitFlagPlants;
+    private int _logoPadAdvances;
     private ulong _lastGifP3;
     private ulong _lastClearCyc;
     private ulong _lastRearmCyc;
@@ -89,6 +90,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private ulong _lastMenuKickCyc;
     private ulong _lastVblankExitCyc;
     private ulong _lastBootWaitPlantCyc;
+    private ulong _lastLogoPadCyc;
+    private ulong _logoChromeFirstCyc;
     private bool _flipEverUnblocked;
     private bool _versionPlanted;
     private bool _lgDevPostCleared;
@@ -114,6 +117,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _menuKickPulses = 0;
         _vblankExits = 0;
         _bootWaitFlagPlants = 0;
+        _logoPadAdvances = 0;
         _tableWalkEscapes = 0;
         _tableWalkEscapes = 0;
         _ioQueueEscapes = 0;
@@ -125,6 +129,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _lastMenuKickCyc = 0;
         _lastVblankExitCyc = 0;
         _lastBootWaitPlantCyc = 0;
+        _lastLogoPadCyc = 0;
+        _logoChromeFirstCyc = 0;
         _lastFlipLeaveCyc = 0;
         _lastIoQueueEscapeCyc = 0;
         _flipEverUnblocked = false;
@@ -160,7 +166,15 @@ public sealed class Burnout3Assist : IGameQuirkModule
     {
         // Soft-GS: PATH3 may upload logo IMAGE under M3P; DISPFB→FB composite each present.
         sys.Gs.CompositeDispfbToFramebuffer();
+        // PL-014: after logo Soft-GS chrome, pulse START/CROSS edges on present ticks so
+        // libpad2/DBC poll (every host-present ~1M) sees press→release. No DISPFB plant.
+        if (LogoChromeLive(sys))
+            PulseLogoPadAdvance(sys, fromPresent: true);
     }
+
+    /// <summary>Soft-GS non-black + FRONTEND/STG spine (cdvd≥2000) — logo chrome live.</summary>
+    private static bool LogoChromeLive(Ps2System sys) =>
+        sys.Gs.PixelsWritten > 10_000 && sys.Cdvd.SectorsRead >= 2000;
 
     /// <summary>
     /// Plant IOPRP 2.8.0 version tag the SifLoadModule gate compares after GetVersion.
@@ -423,11 +437,18 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Pad inject once disc assets stream — menu probes need non-zero buttons.
-        // Wave-5: raise cap after Soft-GS logo chrome so front-end pad path keeps live.
-        // Wave-6: after rich chrome (px>10k), keep pulsing through full budget with
-        // Start/Cross/Circle/D-pad edges so logo→menu advance can be observed.
-        int padCap = sys.Gs.PixelsWritten > 10_000 && sys.Cdvd.SectorsRead >= 2000 ? 2048
-            : sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 ? 1024 : 256;
+        // Wave-5/6: raise cap after Soft-GS logo chrome.
+        // PL-014: after logo chrome, prefer edge pulse (press/release) + DBC work refresh
+        // so Criterion libpad2 sees START/CROSS transitions (not level-hold thrash).
+        if (LogoChromeLive(sys))
+        {
+            if (_logoChromeFirstCyc == 0)
+                _logoChromeFirstCyc = sys.MasterCycles;
+            PulseLogoPadAdvance(sys, fromPresent: false);
+            return;
+        }
+
+        int padCap = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 ? 1024 : 256;
         if (sys.Cdvd.SectorsRead > 0 && _padInjectPulses < padCap)
         {
             _padInjectPulses++;
@@ -438,10 +459,64 @@ public sealed class Burnout3Assist : IGameQuirkModule
             else if (phase == 7) buttons = (uint)PadInput.Button.Circle;
             else if (phase == 8) buttons = (uint)PadInput.Button.Down;
             else if (phase == 9) buttons = (uint)PadInput.Button.Up;
-            if (sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000 && phase is 0 or 1)
-                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
             try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
         }
+    }
+
+    /// <summary>
+    /// PL-014 logo→frontend pad advance: edge-based START/CROSS/Circle/D-pad with explicit
+    /// release frames, DualShock analog mode, and ForceRefreshPad / DBC work paint so
+    /// libpad2 (PsIIlibpad2 2800) + DBCMAN polls see host buttons. No invented DISPFB.
+    /// </summary>
+    private void PulseLogoPadAdvance(Ps2System sys, bool fromPresent)
+    {
+        // Present ticks are rare (~1M); Step may fire every ~50k — rate-limit Step path.
+        ulong minGap = fromPresent ? 0UL : 80_000UL;
+        if (!fromPresent && sys.MasterCycles - _lastLogoPadCyc < minGap) return;
+        if (_logoPadAdvances >= 4096) return;
+        _lastLogoPadCyc = sys.MasterCycles;
+        _logoPadAdvances++;
+        _padInjectPulses++;
+
+        try { sys.Pad.AnalogMode = true; } catch { /* ignore */ }
+
+        // 16-phase edge train: press windows with clear zeros between so edge detectors fire.
+        int phase = _logoPadAdvances % 16;
+        uint buttons = phase switch
+        {
+            0 or 1 => (uint)PadInput.Button.Start,
+            2 => 0u, // release
+            3 or 4 => (uint)PadInput.Button.Cross,
+            5 => 0u,
+            6 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+            7 => 0u,
+            8 => (uint)PadInput.Button.Circle,
+            9 => 0u,
+            10 => (uint)PadInput.Button.Down,
+            11 => 0u,
+            12 => (uint)PadInput.Button.Up,
+            13 => 0u,
+            14 => (uint)PadInput.Button.Start,
+            _ => 0u
+        };
+        // After chrome has been live ≥5M cycles, denser START hold (skip-logo / press-start).
+        if (_logoChromeFirstCyc != 0
+            && sys.MasterCycles - _logoChromeFirstCyc >= 5_000_000
+            && (phase is 0 or 1 or 14))
+            buttons = (uint)PadInput.Button.Start;
+
+        try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+
+        // PADMAN open areas (if any). B3 uses libdbc/DBCMAN — ForceRefresh is best-effort.
+        // DBC work buffer is refreshed by RealSifRpc when SetWorkAddr was captured.
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_logoPadAdvances <= 8 || _logoPadAdvances % 64 == 0))
+            Console.Error.WriteLine(
+                $"[B3] PL-014 logo-pad edge n={_logoPadAdvances} btn=0x{buttons:X4} " +
+                $"present={fromPresent} px={sys.Gs.PixelsWritten} cdvd={sys.Cdvd.SectorsRead} " +
+                $"pc=0x{(uint)(sys.EE.PC & 0x1FFFFFFFUL):X8} cyc={sys.MasterCycles}");
     }
 
     private static void PlantWakeFlags(Ps2System sys, uint baseP)
@@ -954,39 +1029,26 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Dense START/CROSS after disc IRX path (cdvd>0). Pad inject is allowed.
-        // Wave-5: after Soft-GS non-black + FRONTEND plant, denser edges so logo-frontend
-        // can advance past static logo into more chrome (pad if needed).
-        int phase = _menuKickPulses % 6;
-        uint buttons = phase switch
+        // PL-014: after Soft-GS logo chrome, edge pulse + DBC scratch (not level thrash).
+        if (LogoChromeLive(sys))
         {
-            0 or 1 => (uint)PadInput.Button.Start,
-            3 or 4 => (uint)PadInput.Button.Cross,
-            _ => 0u
-        };
-        if (_menuKickPulses % 11 == 0)
-            buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
-        // After LGDEV cleared, hold START longer so title front-end sees a press edge.
-        if (_lgDevEscapes >= 3 && (_menuKickPulses % 4) < 2)
-            buttons = (uint)PadInput.Button.Start;
-        // Wave-6: after Soft-GS logo chrome, cycle Start/Cross/Circle/D-pad so the
-        // Criterion front-end can leave static logo into interactive chrome when pad is read.
-        bool logoChromeLive = sys.Gs.PixelsWritten > 0 && sys.Cdvd.SectorsRead >= 2000;
-        if (logoChromeLive)
-        {
-            int p2 = _menuKickPulses % 8;
-            buttons = p2 switch
-            {
-                0 => (uint)PadInput.Button.Start,
-                1 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
-                2 => (uint)PadInput.Button.Cross,
-                3 => (uint)PadInput.Button.Circle,
-                4 => (uint)PadInput.Button.Down,
-                5 => (uint)PadInput.Button.Up,
-                6 => (uint)(PadInput.Button.Start | PadInput.Button.Circle),
-                _ => (uint)PadInput.Button.Cross
-            };
+            PulseLogoPadAdvance(sys, fromPresent: false);
         }
-        try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+        else
+        {
+            int phase = _menuKickPulses % 6;
+            uint buttons = phase switch
+            {
+                0 or 1 => (uint)PadInput.Button.Start,
+                3 or 4 => (uint)PadInput.Button.Cross,
+                _ => 0u
+            };
+            if (_menuKickPulses % 11 == 0)
+                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+            if (_lgDevEscapes >= 3 && (_menuKickPulses % 4) < 2)
+                buttons = (uint)PadInput.Button.Start;
+            try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+        }
 
         // Sticky: keep fno=18 path dead while we try to leave VBlank-only workers.
         sys.Memory.Write32(LgDevPostFlag, 0);
@@ -1432,7 +1494,15 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Snap past the wait loop so di/ei drain + FILEIO path can run.
-        if (inFlipWait || (_flipWaitStubPlanted && pc is >= 0x001F24E0 and <= 0x001F251C))
+        // PL-014: once logo Soft-GS chrome is live and queues are healthy (out==in,
+        // pending==0), do NOT thrash-leave every 50k — that monopolized EE at 0x1F2508
+        // for 50–100M and starved libpad2/DBC pad consumers needed for logo→menu.
+        bool queuesHealthy = qOut == qIn && pending == 0;
+        bool logoChrome = LogoChromeLive(sys);
+        bool allowHealthyLeave = !logoChrome || !queuesHealthy;
+
+        if (allowHealthyLeave
+            && (inFlipWait || (_flipWaitStubPlanted && pc is >= 0x001F24E0 and <= 0x001F251C)))
         {
             sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 0 }); // s0 = 0 → fall through
             sys.EE.PC = 0x001F2520; // di / sync / mfc0 Status
@@ -1446,6 +1516,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x001F2520;
             sys.EE.COP0_Status &= ~0x6u;
             _vblankExits++;
+        }
+        else if (logoChrome && queuesHealthy && inFlipWait)
+        {
+            // Soft re-arm only — keep flip consumer live without PC stomp.
+            ArmFlipConsumer(sys);
+            PlantWakeFlags(sys, VblankWakeFlagBase);
         }
 
         var k = sys.Hle?.Kernel;

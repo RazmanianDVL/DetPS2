@@ -1309,11 +1309,11 @@ public sealed class RealSifRpc
             return;
         }
 
-        // libdbc extension SIDs (siblings of dbcman 0x80001300) — bind-only on GoW so far,
-        // but accept calls with the same version-shaped reply so pad path cannot wedge.
+        // libdbc extension SIDs (siblings of dbcman 0x80001300) — DS2O/DualShock on B3.
+        // Same pad-aware reply as SidDbcMan so button inject reaches Criterion libpad2.
         if (IsDbcManSibling(sid))
         {
-            int db = HandleDbcMan(mem, rpcNumber, argBuf, recvBuf);
+            int db = HandleDbcMan(mem, pad, rpcNumber, argBuf, recvBuf, recvSize);
             if (recvBuf != 0 && recvSize >= 4)
                 mem.Write32(recvBuf, unchecked((uint)db));
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
@@ -3408,7 +3408,8 @@ public sealed class RealSifRpc
                 // dbcman.irx (libdbc). fno often equals sid|0x63 style version/init.
                 // libdbc prints "Module version mismatch [libdbc.a = %d.%02x, dbcman.irx = %d.%02x]"
                 // when IRX major/minor don't match the static lib — write 3.10 (3, 0x10).
-                return HandleDbcMan(mem, fno, argBuf, recvBuf);
+                // Burnout 3 / Criterion: libpad2 + DS2O — button report must follow host Pad.
+                return HandleDbcMan(mem, pad, fno, argBuf, recvBuf, recvSize: 0);
 
             case SidLgDev:
                 return HandleLgDev(mem, fno, argBuf, sendSize: 0, recvBuf, recvSize: 0x240);
@@ -5509,7 +5510,14 @@ public sealed class RealSifRpc
         return path;
     }
 
-    private static int HandleDbcMan(SystemMemory mem, uint fno, uint argBuf, uint recvBuf)
+    /// <summary>
+    /// Last EE work buffer from <c>sceDbcSetWorkAddr</c> (B3 libpad2). Only set when
+    /// arg word0 is a high-RDRAM 64-aligned pointer outside Criterion gp boot cells.
+    /// </summary>
+    private uint _dbcWorkAddr;
+    private uint _dbcPadFrame;
+
+    private int HandleDbcMan(SystemMemory mem, PadInput pad, uint fno, uint argBuf, uint recvBuf, uint recvSize)
     {
         // libdbc prints versions as %d.%02x from a u16 where major=(v>>8), minor=(v&0xff).
         // Pack 3.10 as 0x0310 so (v>>8)=3, (v&0xff)=0x10.
@@ -5524,6 +5532,7 @@ public sealed class RealSifRpc
             ? unchecked((int)Ver310)
             : 1 + (int)(op & 0x1F);
 
+        // Preserve original header layout exactly (GoW + B3 residual depend on it).
         if (recvBuf != 0)
         {
             mem.Write32(recvBuf, unchecked((uint)result));
@@ -5533,10 +5542,58 @@ public sealed class RealSifRpc
         }
         if (argBuf != 0)
         {
+            // Capture work addr BEFORE overwriting arg[0] with result (SetWorkAddr / create).
+            if (!versionProbe)
+            {
+                uint cand = mem.Read32(argBuf) & 0x1FFFFFFFu;
+                // High-RDRAM only (0x01000000+), 64-align, not Criterion gp (0x4Exxxx).
+                if (cand is >= 0x01000000 and < (uint)SystemMemory.RDRAM_SIZE - 0x100
+                    && (cand & 0x3F) == 0
+                    && cand is not (>= 0x01F00000)) // leave EE stack alone
+                    _dbcWorkAddr = cand;
+            }
             mem.Write32(argBuf, unchecked((uint)result));
             mem.Write32(argBuf + 4, versionProbe ? Ver310 : unchecked((uint)result));
         }
+
+        // PL-014 / B3: refresh a captured high-RDRAM libpad2 work buffer only.
+        // Never stomp recv payload during DBC init — writing STABLE+buttons into recv+0x10
+        // while sockets were still creating collapsed residual→STG (cdvd plant-only 609).
+        bool dataOp = !versionProbe && op is not 0x04;
+        if (dataOp && _dbcWorkAddr != 0)
+            WriteDbcPadWorkArea(mem, pad, _dbcWorkAddr);
+
         return result;
+    }
+
+    /// <summary>Standard DualShock <c>padButtonStatus</c> (active-low btns) at <paramref name="dataBase"/>.</summary>
+    private static void WriteDbcPadButtonStatus(SystemMemory mem, PadInput pad, uint dataBase)
+    {
+        if (dataBase == 0 || dataBase >= (uint)SystemMemory.RDRAM_SIZE - 32) return;
+        mem.Write8(dataBase + 0, 0x00); // ok
+        mem.Write8(dataBase + 1, 0x79); // DualShock analog mode id
+        ushort btns = (ushort)(~pad.Buttons & 0xFFFF);
+        mem.Write8(dataBase + 2, (byte)(btns & 0xFF));
+        mem.Write8(dataBase + 3, (byte)(btns >> 8));
+        mem.Write8(dataBase + 4, pad.Rx);
+        mem.Write8(dataBase + 5, pad.Ry);
+        mem.Write8(dataBase + 6, pad.Lx);
+        mem.Write8(dataBase + 7, pad.Ly);
+        for (uint o = 8; o < 32; o++)
+            mem.Write8(dataBase + o, 0x00);
+    }
+
+    /// <summary>libpad2 work area: STABLE + DualShock report (high-RDRAM only).</summary>
+    private void WriteDbcPadWorkArea(SystemMemory mem, PadInput pad, uint baseP)
+    {
+        if (baseP < 0x01000000 || baseP >= (uint)SystemMemory.RDRAM_SIZE - 0x40) return;
+        if (baseP is >= 0x01F00000) return; // EE stack
+        _dbcPadFrame++;
+        mem.Write32(baseP + 0x00, _dbcPadFrame);
+        mem.Write8(baseP + 0x04, 6); // STABLE
+        mem.Write8(baseP + 0x05, 0);
+        mem.Write8(baseP + 0x06, 1);
+        WriteDbcPadButtonStatus(mem, pad, baseP + 0x08);
     }
 
     /// <summary>

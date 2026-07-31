@@ -6,10 +6,10 @@
 | **Serial** | `SLUS_210.50` |
 | **ISO** | `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
-| **Worktree / seat** | `detps2-seat-s4` · branch `agent/seat-s4/s0-g0` |
+| **Worktree / seat** | `detps2-seat-s4` · branch `agent/seat-s4/s1-g1` |
 | **Agent date** | 2026-07-31 |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **logo-frontend MENU YES** Soft-GS (W6 hold); PL-005 draw-graph charter landed; residuals: **pad past logo (P1)** + **natural DISPFB (G-GFX-5)** — no invented DISPFB plant |
+| **Status** | **logo-frontend MENU YES** Soft-GS hold; PL-014 pad edges live (libdbc/DBCMAN path); INTERACTIVE logo→menu **not claimed**; residual **natural DISPFB** + DBC SetWorkAddr button DMA |
 
 ---
 
@@ -340,8 +340,72 @@ dotnet exec out/seat-s4/DetPS2.Core.dll blocker-trace burnout-only.json --cycles
 
 ### F. Next seats (do not expand this WP)
 
-1. **PL-014** — pad logo→frontend advance (T2) without inventing menu pixels.  
-2. **PL-026 / GX-045** — natural DISPFB or **documented** FRAME-only present (composite demotion when DISPFB programs).  
-3. **PL-047** — natural FRONTEND dest bind (plant↓).  
-4. Handoff DISPFB circuit work to **S10 GFX-DISPLAY** (GX-040/041); S4 only observes title write.
+1. **PL-014 residual** — capture libpad2 SetWorkAddr / DS2O SRData so DBC work buffer gets host START; then re-claim INTERACTIVE.  
+2. **PL-022** — START/CROSS pad-script claim once consumer polls.  
+3. **PL-026 / GX-045** — natural DISPFB or **documented** FRAME-only present.  
+4. **PL-047** — natural FRONTEND dest bind (plant↓).  
+
+---
+
+## Seat S1-G1 (2026-07-31) — PL-014 pad logo→frontend
+
+| Field | Value |
+|-------|-------|
+| Seat | **S4 BURNOUT** · branch `agent/seat-s4/s1-g1` |
+| WP | **PL-014** B3 pad logo→frontend advance INTERACTIVE |
+| Build | `out/seat-s4` Release · **SEMA_OFF** · `--host-present` · `burnout-only.json` |
+| FREEZES | Soft-GS truth · SEMA_OFF · no FFmpeg · **no invent DISPFB plant** |
+
+### Discovery
+
+| Finding | Evidence |
+|---------|----------|
+| **No PADMAN OPEN** | TRACE_RPC 50–100M: zero `[RPC] PADMAN OPEN`; pad inject via classic PADMAN DMA is a no-op |
+| **libdbc / DBCMAN pad path** | IRX: SIO2MAN→SIO2D→DBCMAN→**DS2O**; binds `0x80001300` + siblings `0x8000131B/1C`; live poll fno `0x80001301`/`02` thrash |
+| **PsIIlibpad2 2800** | ISO strings next to `PsIIlibdbc 2800`; states EXECCMD/STABLE/NOLINK |
+| Flip thrash after chrome | Pre-fix: leave flip park every ~1.6M @ `0x1F2508` with out=in=0 monopolized EE 50–100M |
+
+### Assist / HLE changes
+
+| Change | File | Notes |
+|--------|------|-------|
+| Edge pad train after logo chrome | `Burnout3Assist.cs` | START/CROSS/Circle/D-pad with explicit release frames; AnalogMode; cap via PL-014 pulse (n≈700 @100M) |
+| Flip healthy leave gate | `Burnout3Assist.cs` | After Soft-GS chrome + healthy queues, stop PC-stomp thrash at flip wait |
+| DBC work-buffer refresh | `RealSifRpc.cs` | `HandleDbcMan` captures high-RDRAM SetWorkAddr-class pointer and paints DualShock `padButtonStatus` (active-low) |
+| Rejected | — | Painting `0x4E28xx` / random 64-align arg pointers / recv+0x10 during DBC init → residual→STG collapse (cdvd=609) |
+
+### Claim 100M (SEMA_OFF)
+
+```
+PC=0x00253F88 px=24407048 prims=1513 gifP1=0 gifP2=328 gifP3=491 dmac=424
+  sifBytes=149428 syscalls=41025 cdvdSectors=6584
+softgs: imgBytes=2694848 dispfbPx=2273160 fragTest=22133895
+  rejBounds=0 rejScissor=0 rejDepth=7 rejAlpha=0
+softgs-regs: FRAME_1=0xA0046 DISPFB1=0 SCISSOR full XYOFFSET=0x72006C00 TEST=0x5140B
+RealSifRpc: binds=13 calls=226 unknown=0
+PL-014 logo-pad edges: n≥704 (first @28.6M cdvd=2425; denser after FRONTEND@40M)
+```
+
+**Claim line:**
+
+```
+B3 SLUS_210.50 seat-s4/s1-g1 SEMA_OFF 100M: STG+TXD+FRONTEND cdvd=6584
+  gifP1=0 gifP2=328(p2qws=14526) gifP3=491 dmac=424 prims=1513
+  px=24407048 dispfbPx=2273160 imgBytes=2694848 DISPFB1=0
+  binds=13 calls=226 PC=0x253F88 — logo-frontend MENU YES hold
+  PL-014: edge pad n≥704 + DBC path mapped; INTERACTIVE logo→menu NOT claimed
+  residual: DBC SetWorkAddr/SRData button DMA + natural DISPFB; no DISPFB plant
+```
+
+**MENU:** logo-frontend Soft-GS **YES** (hold). **Not** claiming pad-interactive main menu / P1 complete — no second stream / scene change / sel-index delta after pad.
+
+### Reproduce
+
+```powershell
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = '1'
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s4 --nologo -v q
+dotnet exec out/seat-s4/DetPS2.Core.dll blocker-trace burnout-only.json --cycles=100000000 --host-present
+# expect: cdvd=6584 px≈24.4M DISPFB1=0; [B3] PL-014 logo-pad edge lines; no DETPS2_SEMA_STALL_YIELD
+```
 
