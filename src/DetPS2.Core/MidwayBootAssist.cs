@@ -1345,6 +1345,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // post-init header (ready *base+0x38=1). Slots still need FUN_0043C1C0 object bind.
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
             MaybeInitStreamManager(sys);
+        // Wave-12 REJECTED: synthetic stream slot0 plant (flag=1 + type5 stub @0x01FD5000 +
+        // D6F8[0]) → EE death at 0x8000018x by ~80M (baseline FAE8@0x43FB40 healthy). Do not
+        // re-enable. C1C0 never runs under HLE (pcbreak: 26FBF0/43BFC0/43C1C0 = 0 hits @100M;
+        // sole chain 26FC34→43BFC0→C1C0). Need real resource bind or PCSX2 slot dump.
         // Wave-9: re-arm stream CAS *0x55E248 so FUN_0043FAE8 can re-enter after first pass
         // (live 120M: cas248 stuck at 1 while gifP3 plateaus 11; skip200 already 0).
         if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000)
@@ -3577,17 +3581,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-11: log 0..8 integer cells that change under D-pad (selection index hunt).
-    /// Scans menu tick BSS + stream manager header + cookie. Only logs when pad has D-pad bits.
+    /// Wave-11/12: log 0..N integer cells that change under D-pad (selection index hunt).
+    /// Scans menu tick BSS + multi busy band + stream manager + cookie.
+    /// Wave-12: raise cap to 0..16; add multi-group busy base <c>0x54E608</c> (disasm
+    /// <c>FUN_00427518</c>: re-entrancy flags, not selection index — negative evidence)
+    /// and multi table <c>0x75E7A0</c>. No stable 0..N cell found under dense D-pad.
     /// </summary>
     private void MaybeLogSelectionIndexDelta(Ps2System sys, uint buttons)
     {
-        if (_selIndexDeltaLogs >= 32) return;
+        if (_selIndexDeltaLogs >= 48) return;
         // Host-active pad mask from MaybeInjectMenuPad (PadInput.Button flags).
         bool dpad = (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
             | PadInput.Button.Left | PadInput.Button.Right)) != 0;
         // Always snapshot; only emit on dpad edge or first post-spine sample.
-        uint[] bases = { 0x0054E5E0, 0x0054E680, 0x0054E800, 0x0054F000, 0x0055E1F0, 0x005BB860 };
+        uint[] bases = {
+            0x0054E5E0, 0x0054E608, 0x0054E680, 0x0054E800, 0x0054F000,
+            0x0055E1F0, 0x0055E25C, 0x005BB860, 0x005BB830, 0x0075E7A0, 0x0075E950
+        };
         var deltas = new System.Text.StringBuilder();
         var now = new Dictionary<uint, uint>();
         foreach (uint b in bases)
@@ -3595,8 +3605,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             for (uint off = 0; off < 0x80; off += 4)
             {
                 uint addr = b + off;
+                if (addr + 4 > (uint)SystemMemory.RDRAM_SIZE) continue;
                 uint v = sys.Memory.Read32(addr);
-                if (v > 8) continue;
+                // Wave-12: allow 0..16 (menus with more than 8 rows).
+                if (v > 16) continue;
                 now[addr] = v;
                 if (_selIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
                     deltas.Append($" 0x{addr:X6}:{prev}->{v}");
