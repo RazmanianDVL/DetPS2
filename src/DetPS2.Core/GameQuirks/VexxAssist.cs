@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 
 namespace DetPS2.Core;
@@ -11,7 +12,12 @@ namespace DetPS2.Core;
 /// (lsn/size ~1GB). Wave-3: hang was null CD I/O vtable @0x3BD3A8 (install never ran) →
 /// STREE open fails → hash-map walk thrash @0x1DD2E0 with table=null. Plant game default
 /// open/read stubs (partial TRE stream, not full 1GB map); expand freelist/bump for TOC
-/// (~4.6MB header, not full TRE); escape null-table walk. Soft-GS residual. See issue #19.
+/// (~4.6MB header, not full TRE); escape null-table walk.
+///
+/// Wave-4: retail open prefixes <c>host:</c> then FILEIO RPC — bind never appears after
+/// SearchFile (empty SIFCMD cid=0 thrash), so STREE TOC never CdReads (cdvd=0). Host-serve
+/// CD I/O open/read/seek/tell/size/close against the mounted ISO (real sector stream for
+/// TRE TOC / GAME.TXT); strip <c>$/</c> virtual root. Soft-GS residual. See issue #19.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -35,10 +41,10 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint ReallocStub = 0x00090160;
     public const uint BumpCursorCell = 0x00090180;
     public const uint BumpArenaBase = 0x01800000;
-    /// <summary>8 MiB bump — STREE0 TOC/partial map (~4.6MB) must fit; never full 1GB TRE.</summary>
-    public const uint BumpArenaEnd = 0x02000000;
+    /// <summary>16 MiB bump — STREE0 TOC (~4.6MB) + stream tables + GAME.TXT headroom; never full 1GB TRE.</summary>
+    public const uint BumpArenaEnd = 0x02800000;
     /// <summary>Freelist host-bump cap (partial TRE header / stream tables, not full map).</summary>
-    public const uint FreelistMaxBump = 0x00800000;
+    public const uint FreelistMaxBump = 0x00A00000;
     public const uint PathNormalizeLoop = 0x00372ABC;
     public const uint PathNormalizeAfterLoop = 0x00372B04;
     public const uint EmptyStringSentinel = 0x003C4C58;
@@ -46,7 +52,6 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint FreelistWalkHi = 0x001CE210;
     public const uint FreelistSuccessStore = 0x001CE280;
     public const uint SearchFileArgBuf = 0x1C1F4000;
-    public const uint SearchFilePacket = 0x003F7B00;
 
     /// <summary>
     /// CD file-backend vtable the game install writes at 0x3BD3A8.. (open/read/…).
@@ -64,6 +69,21 @@ public sealed class VexxAssist : IGameQuirkModule
     public const uint CdIoDefaultSize = 0x001D0ED0;
     public const uint CdIoDefaultMisc = 0x001D0F40;
 
+    /// <summary>
+    /// Host-serve CD I/O stubs (spin until Step fulfills). Vtable points here so open/read
+    /// cannot race past a single-instruction PC sample (wave-4).
+    /// Layout: open, close, read, write, seek, tell, size — 0x20 bytes each (spin + nops).
+    /// </summary>
+    public const uint HostCdStubBase = 0x00090200;
+    public const uint HostCdStubOpen = HostCdStubBase + 0x00;
+    public const uint HostCdStubClose = HostCdStubBase + 0x20;
+    public const uint HostCdStubRead = HostCdStubBase + 0x40;
+    public const uint HostCdStubWrite = HostCdStubBase + 0x60;
+    public const uint HostCdStubSeek = HostCdStubBase + 0x80;
+    public const uint HostCdStubTell = HostCdStubBase + 0xA0;
+    public const uint HostCdStubSize = HostCdStubBase + 0xC0;
+    public const uint HostCdStubEnd = HostCdStubBase + 0xE0;
+
     /// <summary>Hash-map lookup thrash when stream table at s5+8 is null (PC 0x1DD2E0).</summary>
     public const uint StreamMapLookupLo = 0x001DD2C0;
     public const uint StreamMapLookupHi = 0x001DD370;
@@ -72,12 +92,18 @@ public sealed class VexxAssist : IGameQuirkModule
     /// <summary>Allow freelist bump after CRT plant settles (not during whip-era thrash).</summary>
     public const ulong FreelistEscapeMinCycles = 1_000_000UL;
 
+    /// <summary>Cap single host read (TOC / stream tables — never full 1GB TRE).</summary>
+    public const uint HostReadMaxBytes = 0x00800000;
+
     private bool _pathPatched, _mallocPlanted, _cdIoPlanted;
     private int _versionReplants, _nullPathEscapes, _pathNormEscapes, _mallocReplants;
     private int _hookReplants, _freelistEscapes, _searchPathFixes, _searchPlants;
     private int _stackRescues, _cdIoReplants, _streamMapEscapes;
+    private int _hostOpens, _hostReads, _hostCloses, _hostSeeks;
     private Iso9660.Volume? _isoVol;
     private string? _isoVolPath;
+    /// <summary>Game 1-based handle → IopModules FILEIO fd (0-based).</summary>
+    private readonly Dictionary<int, int> _hostFds = new();
 
     public void Reset()
     {
@@ -85,6 +111,8 @@ public sealed class VexxAssist : IGameQuirkModule
         _versionReplants = _nullPathEscapes = _pathNormEscapes = _mallocReplants = 0;
         _hookReplants = _freelistEscapes = _searchPathFixes = _searchPlants = 0;
         _stackRescues = _cdIoReplants = _streamMapEscapes = 0;
+        _hostOpens = _hostReads = _hostCloses = _hostSeeks = 0;
+        _hostFds.Clear();
         try { _isoVol?.Disc?.Dispose(); } catch { }
         _isoVol = null; _isoVolPath = null;
     }
@@ -127,23 +155,31 @@ public sealed class VexxAssist : IGameQuirkModule
             _pathPatched = true;
         }
 
-        // Keep CD I/O vtable alive — open/read defaults enable partial TRE stream.
-        if (!_cdIoPlanted || sys.Memory.Read32(CdIoVtableBase) == 0)
+        // Keep host-serve CD I/O vtable alive (STREE0 TOC open/read).
+        if (!_cdIoPlanted || sys.Memory.Read32(CdIoVtableBase) != HostCdStubOpen)
         {
             PlantCdIoVtable(sys);
             _cdIoReplants++;
         }
 
-        if (sys.Scheduler.MasterCycles >= 3_000_000UL)
+        // SearchFile path slide/plant + TRE size cap (TOC only, not full ~1GB).
+        // Only the IOP arg buffer (sceCdlFILE) — never the EE SIF packet at 0x3F7B00
+        // (wave-4: sliding the packet produced "E.TXT;1" / "EE0.TRE;1" garbage).
+        if (sys.Scheduler.MasterCycles >= 500_000UL)
         {
-            foreach (uint buf in new[] { SearchFileArgBuf, SearchFilePacket })
-            {
-                if (MaybeFixSearchFilePathLayout(sys, buf)) _searchPathFixes++;
-                if (MaybePlantSearchFileResult(sys, buf)) _searchPlants++;
-            }
+            uint buf = SearchFileArgBuf;
+            if (MaybeFixSearchFilePathLayout(sys, buf)) _searchPathFixes++;
+            if (MaybePlantSearchFileResult(sys, buf)) _searchPlants++;
+            if (MaybeCapTreSearchSize(sys, buf)) _searchPlants++;
         }
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+
+        // Wave-4: host-serve CD I/O open/read/… so STREE0 TOC streams real ISO sectors
+        // (retail host: + FILEIO bind never completes after SearchFile). No cycle gate —
+        // stubs only spin when the game actually calls them.
+        if (MaybeHostCdIo(sys, pc))
+            return;
 
         if ((pc is >= 0x0014619C and <= 0x001461BC) || (pc is >= 0x0014625C and <= 0x0014627C))
         {
@@ -223,26 +259,264 @@ public sealed class VexxAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Install game-default CD file backends (partial stream open/read). Same pointers the
-    /// retail install writes when caller args are null.
+    /// Install host-serve CD file backends. Wave-3 planted retail defaults that go through
+    /// <c>host:</c>+FILEIO RPC (bind never appears). Wave-4 points the vtable at spin stubs
+    /// serviced by <see cref="MaybeHostCdIo"/> with real ISO open/read + sector credit.
     /// </summary>
     public void PlantCdIoVtable(Ps2System sys)
     {
+        PlantHostCdStubs(sys);
         // Slot layout (8-byte stride): +0 open, +8 close, +16 read, +24 write, +32 stub0,
         // +40 seek, +48 tell, +56 size, +64 misc — matches default-install order.
-        sys.Memory.Write32(CdIoVtableBase + 0x00, CdIoDefaultOpen);
-        sys.Memory.Write32(CdIoVtableBase + 0x08, CdIoDefaultClose);
-        sys.Memory.Write32(CdIoVtableBase + 0x10, CdIoDefaultRead);
-        sys.Memory.Write32(CdIoVtableBase + 0x18, CdIoDefaultWrite);
-        sys.Memory.Write32(CdIoVtableBase + 0x20, CdIoDefaultStub0);
-        sys.Memory.Write32(CdIoVtableBase + 0x28, CdIoDefaultSeek);
-        sys.Memory.Write32(CdIoVtableBase + 0x30, CdIoDefaultTell);
-        sys.Memory.Write32(CdIoVtableBase + 0x38, CdIoDefaultSize);
+        sys.Memory.Write32(CdIoVtableBase + 0x00, HostCdStubOpen);
+        sys.Memory.Write32(CdIoVtableBase + 0x08, HostCdStubClose);
+        sys.Memory.Write32(CdIoVtableBase + 0x10, HostCdStubRead);
+        sys.Memory.Write32(CdIoVtableBase + 0x18, HostCdStubWrite); // spin; rb path unused
+        sys.Memory.Write32(CdIoVtableBase + 0x20, CdIoDefaultStub0); // retail nop-ish
+        sys.Memory.Write32(CdIoVtableBase + 0x28, HostCdStubSeek);
+        sys.Memory.Write32(CdIoVtableBase + 0x30, HostCdStubTell);
+        sys.Memory.Write32(CdIoVtableBase + 0x38, HostCdStubSize);
         sys.Memory.Write32(CdIoVtableBase + 0x40, CdIoDefaultMisc);
         _cdIoPlanted = true;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
             Console.Error.WriteLine(
-                $"[VEXX] CD I/O vtable @0x{CdIoVtableBase:X} open=0x{CdIoDefaultOpen:X} read=0x{CdIoDefaultRead:X}");
+                $"[VEXX] CD I/O vtable @0x{CdIoVtableBase:X} host-stubs open=0x{HostCdStubOpen:X} read=0x{HostCdStubRead:X}");
+    }
+
+    /// <summary>Spin loops so Step cannot miss the open/read PC (single-insn race).</summary>
+    private static void PlantHostCdStubs(Ps2System sys)
+    {
+        // beq r0,r0,0; nop  — tight spin at each stub base
+        for (uint s = HostCdStubBase; s < HostCdStubEnd; s += 0x20)
+        {
+            sys.Memory.Write32(s + 0, 0x1000FFFFu); // beq zero,zero,-1 (branch to self in delay)
+            sys.Memory.Write32(s + 4, 0x00000000u); // nop delay
+            for (uint i = 8; i < 0x20; i += 4)
+                sys.Memory.Write32(s + i, 0);
+        }
+    }
+
+    /// <summary>
+    /// Host-serve CD I/O vtable entries: open/read/close/seek/tell/size against mounted ISO.
+    /// Real disc bytes + <see cref="Cdvd.NoteHostReadSectors"/> — honest TRE TOC stream.
+    /// </summary>
+    private bool MaybeHostCdIo(Ps2System sys, uint pc)
+    {
+        var mods = sys.IopModules;
+        if (mods == null) return false;
+        // Accept any PC inside the stub slot (spin may land on +0 or +4).
+        if (pc is >= HostCdStubOpen and < HostCdStubClose)
+            return HostCdOpen(sys, mods);
+        if (pc is >= HostCdStubClose and < HostCdStubRead)
+            return HostCdClose(sys, mods);
+        if (pc is >= HostCdStubRead and < HostCdStubWrite)
+            return HostCdRead(sys, mods);
+        if (pc is >= HostCdStubWrite and < HostCdStubSeek)
+        {
+            ReturnHost(sys, unchecked((uint)(-1))); // write not used for TRE rb
+            return true;
+        }
+        if (pc is >= HostCdStubSeek and < HostCdStubTell)
+            return HostCdSeek(sys, mods);
+        if (pc is >= HostCdStubTell and < HostCdStubSize)
+            return HostCdTell(sys, mods);
+        if (pc is >= HostCdStubSize and < HostCdStubEnd)
+            return HostCdSize(sys, mods);
+        // Also catch retail entries if something still jumps there
+        if (pc == CdIoDefaultOpen) return HostCdOpen(sys, mods);
+        if (pc == CdIoDefaultRead) return HostCdRead(sys, mods);
+        if (pc == CdIoDefaultClose) return HostCdClose(sys, mods);
+        if (pc == CdIoDefaultSeek) return HostCdSeek(sys, mods);
+        if (pc == CdIoDefaultTell) return HostCdTell(sys, mods);
+        if (pc == CdIoDefaultSize) return HostCdSize(sys, mods);
+        return false;
+    }
+
+    private bool HostCdOpen(Ps2System sys, IopModuleHost mods)
+    {
+        uint pathPtr = (uint)(sys.EE.GetGpr(4).Lo & 0x1FFFFFFFu); // a0
+        string raw = ReadCString(sys, pathPtr, 256);
+        string path = NormalizeHostCdPath(raw);
+        if (path.Length == 0)
+        {
+            ReturnHost(sys, 0);
+            return true;
+        }
+
+        // Prefer cdrom0: so FileOpen hits disc path (host: also remaps, but explicit is clearer).
+        string tryPath = path.Contains(':') ? path : "cdrom0:\\" + path;
+        int fd = mods.FileOpen(tryPath, 1);
+        if (fd < 0 && !tryPath.Equals(path, StringComparison.OrdinalIgnoreCase))
+            fd = mods.FileOpen(path, 1);
+        if (fd < 0)
+        {
+            // Basename fallback (stree0.tre / GAME.TXT).
+            string leaf = System.IO.Path.GetFileName(path.Replace('/', '\\'));
+            if (!string.IsNullOrEmpty(leaf))
+                fd = mods.FileOpen("cdrom0:\\" + leaf, 1);
+        }
+
+        if (fd < 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens < 16)
+                Console.Error.WriteLine(
+                    $"[VEXX] host-open FAIL \"{raw}\" → \"{path}\" cyc={sys.Scheduler.MasterCycles}");
+            ReturnHost(sys, 0);
+            return true;
+        }
+
+        int handle = fd + 1; // retail open returns 1-based; read does a0--
+        _hostFds[handle] = fd;
+        _hostOpens++;
+        // Do NOT credit full 1GB TRE at open — only actual FileRead bytes (TOC stream).
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens <= 16)
+        {
+            mods.TryGetOpenFileSize(fd, out uint sz);
+            Console.Error.WriteLine(
+                $"[VEXX] host-open #{_hostOpens} \"{raw}\" → \"{path}\" h={handle} fd={fd} size={sz} cyc={sys.Scheduler.MasterCycles}");
+        }
+        ReturnHost(sys, unchecked((uint)handle));
+        return true;
+    }
+
+    private bool HostCdRead(Ps2System sys, IopModuleHost mods)
+    {
+        // Entry is `j real_read; addiu a0,a0,-1` — intercept before delay-slot, a0 still 1-based.
+        int handle = (int)sys.EE.GetGpr(4).Lo;
+        uint buf = (uint)sys.EE.GetGpr(5).Lo;
+        uint size = (uint)sys.EE.GetGpr(6).Lo;
+        if (!_hostFds.TryGetValue(handle, out int fd))
+        {
+            // Maybe already 0-based from a direct call
+            if (_hostFds.TryGetValue(handle + 1, out fd))
+                handle = handle + 1;
+            else
+            {
+                ReturnHost(sys, unchecked((uint)(-9))); // EBADF-ish
+                return true;
+            }
+        }
+
+        if (size > HostReadMaxBytes)
+            size = HostReadMaxBytes;
+        int n = mods.FileRead(sys.Memory, fd, buf & 0x1FFFFFFFu, size);
+        if (n > 0)
+            sys.Cdvd.NoteHostReadSectors((n + 2047) / 2048);
+        _hostReads++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads <= 24)
+            Console.Error.WriteLine(
+                $"[VEXX] host-read #{_hostReads} h={handle} buf=0x{buf:X} size=0x{size:X} n={n} cdvd={sys.Cdvd.SectorsRead} cyc={sys.Scheduler.MasterCycles}");
+        ReturnHost(sys, unchecked((uint)n));
+        return true;
+    }
+
+    private bool HostCdClose(Ps2System sys, IopModuleHost mods)
+    {
+        int handle = (int)sys.EE.GetGpr(4).Lo;
+        if (_hostFds.TryGetValue(handle, out int fd))
+        {
+            mods.FileClose(fd);
+            _hostFds.Remove(handle);
+            _hostCloses++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostCloses <= 16)
+                Console.Error.WriteLine(
+                    $"[VEXX] host-close #{_hostCloses} h={handle} cyc={sys.Scheduler.MasterCycles}");
+        }
+        ReturnHost(sys, 0);
+        return true;
+    }
+
+    private bool HostCdSeek(Ps2System sys, IopModuleHost mods)
+    {
+        // seek(fd, off, whence): a0=handle, a1=off, a2=whence (retail wrapper).
+        int handle = (int)sys.EE.GetGpr(4).Lo;
+        int off = (int)sys.EE.GetGpr(5).Lo;
+        int whence = (int)sys.EE.GetGpr(6).Lo;
+        if (!_hostFds.TryGetValue(handle, out int fd))
+        {
+            // tell path uses a0-- before jump; accept 0-based
+            if (!_hostFds.TryGetValue(handle + 1, out fd))
+            {
+                ReturnHost(sys, unchecked((uint)(-1)));
+                return true;
+            }
+        }
+        int pos = mods.FileSeek(fd, off, whence);
+        _hostSeeks++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostSeeks <= 16)
+            Console.Error.WriteLine(
+                $"[VEXX] host-seek #{_hostSeeks} h={handle} off={off} wh={whence} → {pos} cyc={sys.Scheduler.MasterCycles}");
+        ReturnHost(sys, unchecked((uint)pos));
+        return true;
+    }
+
+    private bool HostCdTell(Ps2System sys, IopModuleHost mods)
+    {
+        // tell entry: addiu a0,a0,-1 then j seek-like with whence=1 off=0 — handle still 1-based here.
+        int handle = (int)sys.EE.GetGpr(4).Lo;
+        if (!_hostFds.TryGetValue(handle, out int fd))
+        {
+            ReturnHost(sys, unchecked((uint)(-1)));
+            return true;
+        }
+        int pos = mods.FileSeek(fd, 0, 1); // SEEK_CUR
+        ReturnHost(sys, unchecked((uint)pos));
+        return true;
+    }
+
+    private bool HostCdSize(Ps2System sys, IopModuleHost mods)
+    {
+        int handle = (int)sys.EE.GetGpr(4).Lo;
+        if (!_hostFds.TryGetValue(handle, out int fd))
+        {
+            ReturnHost(sys, 0);
+            return true;
+        }
+        if (!mods.TryGetOpenFileSize(fd, out uint sz))
+            sz = 0;
+        // Cap reported size for absurd TRE (~1GB) so callers that malloc(size) only take TOC.
+        // Stream open reads header then a derived TOC length — full size still available via seek-end
+        // when needed; report real size (alloc path rejects > FreelistMaxBump separately).
+        ReturnHost(sys, sz);
+        return true;
+    }
+
+    private static void ReturnHost(Ps2System sys, uint v0)
+    {
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = v0 });
+        sys.EE.PC = sys.EE.GetGpr(31).Lo;
+    }
+
+    /// <summary>
+    /// Map retail <c>host:$/stree0.tre</c> / <c>$/Data/…</c> / bare leaves onto ISO open paths.
+    /// </summary>
+    internal static string NormalizeHostCdPath(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        string path = raw.Trim();
+        // Strip device prefixes (open also strcat's "host:" in retail — we intercept before that
+        // when a0 is the caller's path; stream open passes "$/stree0.tre" or resolved leaf).
+        if (path.StartsWith("host0:", StringComparison.OrdinalIgnoreCase))
+            path = path[6..];
+        else if (path.StartsWith("host:", StringComparison.OrdinalIgnoreCase))
+            path = path[5..];
+        else if (path.StartsWith("cdrom0:", StringComparison.OrdinalIgnoreCase))
+            path = path[7..];
+        else if (path.StartsWith("cdrom:", StringComparison.OrdinalIgnoreCase))
+            path = path[6..];
+        path = path.TrimStart('\\', '/');
+        if (path.StartsWith("$/", StringComparison.Ordinal) || path.StartsWith("$\\", StringComparison.Ordinal))
+            path = path[2..];
+        else if (path.Length > 0 && path[0] == '$')
+            path = path[1..].TrimStart('\\', '/');
+        int semi = path.IndexOf(';');
+        if (semi >= 0) path = path[..semi];
+        // Prefer leaf for ISO root files (STREE0.TRE / GAME.TXT live at disc root).
+        string leaf = System.IO.Path.GetFileName(path.Replace('/', '\\'));
+        if (!string.IsNullOrEmpty(leaf) && leaf.IndexOf('.') > 0
+            && leaf.IndexOfAny(new[] { '/', '\\' }) < 0)
+            return leaf;
+        return path.Replace('/', '\\');
     }
 
     /// <summary>
@@ -392,9 +666,17 @@ public sealed class VexxAssist : IGameQuirkModule
     public static bool MaybeFixSearchFilePathLayout(Ps2System sys, uint buf)
     {
         if (buf + 0x120 >= SystemMemory.RDRAM_SIZE) return false;
+        // Do not touch a completed sceCdlFILE (valid lsn + planted leaf) — sliding mid-string
+        // fragments like "E.TXT;1" after GAME.TXT corrupts the live SearchFile result while
+        // NCMD CdRead is in flight (wave-4 residual).
+        uint curLsn = sys.Memory.Read32(buf);
+        string planted = ReadCStringStatic(sys, buf + 8, 16);
+        if (curLsn != 0 && IsPlausibleSearchLeaf(planted))
+            return false;
+
         byte at24 = sys.Memory.Read8(buf + 0x24);
-        if (at24 is not ((byte)'\\' or (byte)'/' or (>= (byte)'A' and <= (byte)'Z')
-            or (>= (byte)'a' and <= (byte)'z') or (byte)'$'))
+        // Require path-shaped start: \ / $ or drive-ish — not mid-leaf "E.TXT".
+        if (at24 is not ((byte)'\\' or (byte)'/' or (byte)'$'))
             return false;
 
         var tmp = new byte[0x100];
@@ -466,18 +748,104 @@ public sealed class VexxAssist : IGameQuirkModule
                 ?? Iso9660.FindFile(_isoVol, System.IO.Path.GetFileName(name));
             if (entry == null) return false;
 
+            uint reportSize = CapTreSizeIfNeeded(entry.Name, entry.Size, _isoVol, entry);
             sys.Memory.Write32(buf + 0, entry.ExtentLba);
-            sys.Memory.Write32(buf + 4, entry.Size);
+            sys.Memory.Write32(buf + 4, reportSize);
             string leaf = entry.Name.Length > 15 ? entry.Name[..15] : entry.Name;
             for (int i = 0; i < 16; i++)
                 sys.Memory.Write8(buf + 8 + (uint)i, i < leaf.Length ? (byte)leaf[i] : (byte)0);
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
                 Console.Error.WriteLine(
-                    $"[VEXX] SearchFile plant @0x{buf:X} \"{name}\" lsn={entry.ExtentLba} size={entry.Size}");
+                    $"[VEXX] SearchFile plant @0x{buf:X} \"{name}\" lsn={entry.ExtentLba} size={reportSize}" +
+                    (reportSize != entry.Size ? $" (full={entry.Size})" : ""));
             return true;
         }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// After HLE SearchFile writes full ~1GB STREE size, rewrite +4 to TOC byte length so
+    /// freelist/bump can allocate and host-open can stream the header.
+    /// </summary>
+    private bool MaybeCapTreSearchSize(Ps2System sys, uint buf)
+    {
+        if (buf + 0x20 >= SystemMemory.RDRAM_SIZE) return false;
+        uint size = sys.Memory.Read32(buf + 4);
+        if (size <= 8 * 1024 * 1024u) return false;
+        string leaf = ReadCString(sys, buf + 8, 16);
+        if (leaf.Length < 4 || !leaf.EndsWith(".TRE", StringComparison.OrdinalIgnoreCase)
+            && !leaf.StartsWith("STREE", StringComparison.OrdinalIgnoreCase))
+        {
+            // Also sniff path at +0x20/+0x24
+            string p = ReadCString(sys, buf + 0x20, 64);
+            if (p.Length == 0) p = ReadCString(sys, buf + 0x24, 64);
+            if (p.IndexOf(".TRE", StringComparison.OrdinalIgnoreCase) < 0
+                && p.IndexOf("STREE", StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            leaf = System.IO.Path.GetFileName(p.Replace('/', '\\'));
+        }
+
+        uint lsn = sys.Memory.Read32(buf);
+        uint toc = 0;
+        string? isoPath = sys.Cdvd.MountedPath;
+        if (!string.IsNullOrEmpty(isoPath) && lsn != 0)
+        {
+            try
+            {
+                if (_isoVol == null || _isoVolPath != isoPath)
+                {
+                    try { _isoVol?.Disc?.Dispose(); } catch { }
+                    _isoVol = Iso9660.OpenFile(isoPath);
+                    _isoVolPath = isoPath;
+                }
+                if (_isoVol?.Disc != null)
+                {
+                    var hdr = new byte[16];
+                    int got = _isoVol.Disc.ReadAt((long)lsn * Iso9660.SectorSize, hdr);
+                    if (got >= 8)
+                    {
+                        uint w0 = BitConverter.ToUInt32(hdr, 0);
+                        uint w1 = BitConverter.ToUInt32(hdr, 4);
+                        if (w1 is >= 0x10000 and <= 0x800000) toc = w1;
+                        else if (((ulong)w0 << 4) is >= 0x10000 and <= 0x800000) toc = w0 << 4;
+                    }
+                }
+            }
+            catch { /* fall through */ }
+        }
+        if (toc == 0) toc = 0x00480000; // ~4.5MB default
+        if (toc >= size) return false;
+        sys.Memory.Write32(buf + 4, toc);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+            Console.Error.WriteLine(
+                $"[VEXX] TRE size cap @0x{buf:X} \"{leaf}\" {size} → {toc} cyc={sys.Scheduler.MasterCycles}");
+        return true;
+    }
+
+    private static uint CapTreSizeIfNeeded(string name, uint fullSize, Iso9660.Volume? vol, Iso9660.FileEntry entry)
+    {
+        if (fullSize <= 8 * 1024 * 1024u) return fullSize;
+        if (name.IndexOf(".TRE", StringComparison.OrdinalIgnoreCase) < 0
+            && name.IndexOf("STREE", StringComparison.OrdinalIgnoreCase) < 0)
+            return fullSize;
+        try
+        {
+            if (vol?.Disc != null && entry.ExtentLba != 0)
+            {
+                var hdr = new byte[16];
+                int got = vol.Disc.ReadAt((long)entry.ExtentLba * Iso9660.SectorSize, hdr);
+                if (got >= 8)
+                {
+                    uint w0 = BitConverter.ToUInt32(hdr, 0);
+                    uint w1 = BitConverter.ToUInt32(hdr, 4);
+                    if (w1 is >= 0x10000 and <= 0x800000) return w1;
+                    if (((ulong)w0 << 4) is >= 0x10000 and <= 0x800000) return w0 << 4;
+                }
+            }
+        }
+        catch { /* ignore */ }
+        return 0x00480000;
     }
 
     private static string NormalizeSearchLeaf(string name)

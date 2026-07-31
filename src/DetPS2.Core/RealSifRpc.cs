@@ -474,6 +474,7 @@ public sealed class RealSifRpc
         _mkdaPakToc.Clear();
         _cdToSid.Clear();
         _cdToArgBuf.Clear();
+        _argBufToEeSend.Clear();
         _fioEeArgSnap.Clear();
         _fioLastFd = -1;
         _fio2200ResultPtr0 = 0;
@@ -624,6 +625,7 @@ public sealed class RealSifRpc
         int n1 = r.ReadInt32();
         for (int i = 0; i < n1; i++) { uint k = r.ReadUInt32(); uint v = r.ReadUInt32(); _cdToSid[k] = v; }
         _cdToArgBuf.Clear();
+        _argBufToEeSend.Clear();
         _fioEeArgSnap.Clear();
         int n2 = r.ReadInt32();
         for (int i = 0; i < n2; i++) { uint k = r.ReadUInt32(); uint v = r.ReadUInt32(); _cdToArgBuf[k] = v; }
@@ -691,7 +693,10 @@ public sealed class RealSifRpc
     /// SN FILEIO wrapper (<c>seq + eeArgs*</c>), snapshot <c>*eeArgs</c> (16B) so later async CALL
     /// can decode lseek/read/write even if the EE stack was cleared.
     /// </summary>
-    public void NotifyRpcArgDma(SystemMemory mem, uint iopDest, uint size)
+    /// <summary>Last EE→IOP DMA source per IOP argBuf (so SearchFile can copy CdlFILE results back).</summary>
+    private readonly Dictionary<uint, uint> _argBufToEeSend = new();
+
+    public void NotifyRpcArgDma(SystemMemory mem, uint iopDest, uint size, uint eeSrc = 0)
     {
         if (size < 8 || _cdToArgBuf.Count == 0) return;
         uint destMap = iopDest;
@@ -709,6 +714,10 @@ public sealed class RealSifRpc
             }
         }
         if (matched == 0) return;
+
+        // Remember EE source so in-out RPCs (SearchFile sceCdlFILE) can write results back.
+        if (eeSrc != 0 && (eeSrc & 0x1FFFFFFFu) < SystemMemory.RDRAM_SIZE)
+            _argBufToEeSend[matched] = eeSrc & 0x1FFFFFFFu;
 
         uint w1 = mem.Read32(matched + 4);
         if (!IsEeRamPointer(w1)) return;
@@ -728,9 +737,9 @@ public sealed class RealSifRpc
         }
     }
 
-    public void NotifyDtxEeToIopDma(SystemMemory mem, uint iopDest, uint size)
+    public void NotifyDtxEeToIopDma(SystemMemory mem, uint iopDest, uint size, uint eeSrc = 0)
     {
-        NotifyRpcArgDma(mem, iopDest, size);
+        NotifyRpcArgDma(mem, iopDest, size, eeSrc);
         if (_dtxChannels.Count == 0 || size == 0) return;
         // Dest may be IOP-physical (0x000000-0x1FFFFF) or EE-visible IOP window (0x1C000000+).
         uint destPhys = iopDest & 0x1FFFFFu;
@@ -1070,6 +1079,19 @@ public sealed class RealSifRpc
         {
             int sf = HandleCdSearchFile(mem, cdvd, argBuf, recvBuf, sendSize);
             if (recvBuf != 0) mem.Write32(recvBuf, unchecked((uint)sf));
+            // Play! Cdvdfsv::SearchFile writes lsn/size into args in place. EE→IOP DMA'd the
+            // sceCdlFILE to argBuf; copy the result head back to the EE send buffer so the
+            // title sees lsn/size for subsequent CdRead (Vexx GAME.TXT / STREE0 TOC).
+            if (sf != 0 && argBuf != 0 && sendSize >= 8
+                && _argBufToEeSend.TryGetValue(argBuf, out uint eeSend) && eeSend != 0)
+            {
+                uint n = Math.Min(sendSize, 0x130u);
+                for (uint i = 0; i < n; i++)
+                    mem.Write8(eeSend + i, mem.Read8(argBuf + i));
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[RPC] SearchFile copy-back EE=0x{eeSend:X} n={n} lsn={mem.Read32(argBuf)} size={mem.Read32(argBuf + 4)}");
+            }
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
         }
@@ -7159,16 +7181,30 @@ public sealed class RealSifRpc
             }
 
             // sceCdlFILE: +0 lsn, +4 size, +8 name[16], +0x18 date[8]
+            // Vexx STREE0.TRE is ~1GB of streamed payload; boot only needs the TOC/header
+            // (~4.6MB, first u32s of the file). Reporting full size makes EE malloc fail
+            // (bump/freelist reject) → null stream map → open never runs (cdvd stuck at 0).
+            uint reportSize = entry.Size;
+            string leafName = entry.Name;
+            if (reportSize > 8 * 1024 * 1024u
+                && leafName.EndsWith(".TRE", StringComparison.OrdinalIgnoreCase))
+            {
+                uint toc = TryReadTreTocSize(vol, entry);
+                if (toc > 0 && toc < reportSize)
+                    reportSize = toc;
+            }
             mem.Write32(argBuf + 0, entry.ExtentLba);
-            mem.Write32(argBuf + 4, entry.Size);
+            mem.Write32(argBuf + 4, reportSize);
             // name[16] at +8
-            string leaf = entry.Name.Length > 15 ? entry.Name[..15] : entry.Name;
+            string leaf = leafName.Length > 15 ? leafName[..15] : leafName;
             for (int i = 0; i < 16; i++)
                 mem.Write8(argBuf + 8 + (uint)i, i < leaf.Length ? (byte)leaf[i] : (byte)0);
 
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
-                    $"[RPC] SearchFile ok \"{name}\" lsn={entry.ExtentLba} size={entry.Size} send={sendSize} arg=0x{argBuf:X}");
+                    $"[RPC] SearchFile ok \"{name}\" lsn={entry.ExtentLba} size={reportSize}" +
+                    (reportSize != entry.Size ? $" (full={entry.Size} TOC-cap)" : "") +
+                    $" send={sendSize} arg=0x{argBuf:X}");
 
             try { vol.Disc?.Dispose(); } catch { /* ignore */ }
             return 1;
@@ -7177,6 +7213,32 @@ public sealed class RealSifRpc
         {
             return 0;
         }
+    }
+
+    /// <summary>
+    /// Vexx/Acclaim <c>.TRE</c> stream archives: first two LE u32s are count-ish and TOC byte
+    /// length (~4.6MB for STREE0). Used to cap SearchFile size so boot can malloc+CdRead the
+    /// TOC without attempting a full ~1GB map.
+    /// </summary>
+    private static uint TryReadTreTocSize(Iso9660.Volume vol, Iso9660.FileEntry entry)
+    {
+        try
+        {
+            if (vol.Disc == null || entry.ExtentLba == 0) return 0;
+            var hdr = new byte[16];
+            int got = vol.Disc.ReadAt((long)entry.ExtentLba * Iso9660.SectorSize, hdr);
+            if (got < 8) return 0;
+            uint w0 = System.BitConverter.ToUInt32(hdr, 0);
+            uint w1 = System.BitConverter.ToUInt32(hdr, 4);
+            // Prefer word1 when it looks like a TOC byte length (64KB..8MB).
+            if (w1 is >= 0x10000 and <= 0x800000) return w1;
+            // Fallback: word0 << 4 (entry-count * 16) when in range.
+            ulong alt = (ulong)w0 << 4;
+            if (alt is >= 0x10000 and <= 0x800000) return (uint)alt;
+            // Last resort: 4.6MB default for known-huge TRE.
+            return 0x00480000;
+        }
+        catch { return 0; }
     }
 
     /// <summary>Heuristic: printable path-ish string for sceCdSearchFile path sniffing.</summary>
