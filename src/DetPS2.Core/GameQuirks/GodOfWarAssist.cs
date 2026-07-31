@@ -806,13 +806,20 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 sys.Memory.Write32(baseOff + 0x888u, 1u);
                 sys.Memory.Write32(baseOff + 0x88Cu, 1u);
             }
-            // Do NOT plant fail→success branches into type-2 epilogue (claim100g: continued
-            // with uninit stream state → 0x401Axxxx UnknownOpcode storms). Gate stubs only;
-            // complete-once clears failed cmd so main poll advances.
+            // Type-2 0x8101002F: multiple paths land at 0x27E228. Force the flag check at
+            // 0x27E220 to take the success branch 0x27E234 (real epilogue: status to s6).
+            // Also nop early 0x8000-bit fails + soft-match strcmp.
+            sys.Memory.Write32(0x0027E194, 0x00000000u); // nop (was beq → 0x2F)
+            sys.Memory.Write32(0x0027E1D8, 0x00000000u); // nop (was beq → 0x2F)
+            sys.Memory.Write32(0x0027E220, 0x10000004u); // b +4 → 0x27E234 (ignore a0==0)
+            sys.Memory.Write32(0x0027E224, 0x00000000u); // nop
+            sys.Memory.Write32(0x002897C4, 0x0000102Du); // daddu v0, zero, zero (strcmp match)
+            sys.Memory.Write32(0x002897C8, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x002897CC, 0x00000000u); // nop
             _type2GatesPlanted = true;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine(
-                    $"[GOW] plant type-2 gate stubs (282DD0/281568/281548/2815A8) + flags cyc={c}");
+                    $"[GOW] plant type-2 0x2F→success (0x27E234) + gate stubs cyc={c}");
         }
 
         // Wave-6: any post-CDVD poison SP freezes jr-ra / WaitSema thrash (live main

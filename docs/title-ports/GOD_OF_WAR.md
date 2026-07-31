@@ -40,7 +40,8 @@ Wave-6 assist changes:
 1. **Repair poison SP** with plausible-stack check (never plant SP in .text — live 0x176BC0 bug).
 2. **Escape word-scan** residual 0x299300 (live 0x299354 a2=0x400 multi-MiB + ra self + sp OOB).
 3. **No force-rewind mid type-2 body** — forceDispatch only at WaitSema/idle gate.
-4. **Type-2 gate stubs** 0x282DD0 / 0x281568 / 0x281548 / 0x2815A8 → li v0,1 (null-handle path).
+4. **Type-2 gate stubs** 0x282DD0 / 0x281568 / 0x281548 / 0x2815A8 → li v0,1 (null-handle path);
+   0x2F-path nops + strcmp soft-match + 0x27E220→0x27E234 (still residual res=0x8101002F once).
 5. **Complete-once** after first dispatch: clear *0x310384 on 0x8101* error so main poll advances.
 6. **Rehome wrong-tid** off worker text even when cmd clear; uncached 0x401A poison PC rescue.
 7. **gowHot** 0x2993xx + 0x2893xx; host byte-copy accel for 0x289320 residual (capped).
