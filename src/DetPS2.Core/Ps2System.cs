@@ -458,7 +458,7 @@ public sealed class Ps2System
                     or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait
                     or (>= 0x00233AD0UL and <= 0x00233B44UL)
                     or (>= 0x00284600UL and <= 0x00284B00UL)  // soft-float + wrappers (0x2849C4 heat)
-                    or (>= 0x00155AB0UL and <= 0x00155B94UL)  // table-index zero-step
+                    or (>= 0x00155AB0UL and <= 0x00156400UL)  // table-index + post-table residual (0x156324)
                     or (>= 0x001390F0UL and <= 0x00139114UL)  // huge byte-sum
                     or (>= 0x0023E7C0UL and <= 0x0023E7F0UL)  // align-zero poison a0
                     or (>= 0x0021FF00UL and <= 0x00220600UL)

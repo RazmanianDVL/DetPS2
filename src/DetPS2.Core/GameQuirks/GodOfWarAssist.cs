@@ -412,6 +412,29 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 12_000_000 && pc is >= TableIndexWalkPcLo and <= TableIndexWalkPcHi)
             TryEscapeTableIndexWalk(sys, pc, c);
 
+        // Wave-2 residual after table-index leave: PC=0x156324 thrash for 40M–100M (claim100c:
+        // dmac=93 binds=10 gifPath3=0, no more GOW escape logs). Soft-return via $ra / worker.
+        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x00155BA0 and <= 0x00156400)
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            uint resume = PickSafeResume(sys, 0x0027CC08);
+            if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00280000
+                && ra is not (>= 0x00155AB0 and <= 0x00156400)
+                && ra is not (>= 0x00100000 and <= 0x00100200))
+                resume = ra;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            {
+                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+            });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (c % 5_000_000) < 50_000)
+                Console.Error.WriteLine(
+                    $"[GOW] escape post-table residual pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+        }
+
         // Byte-sum loop 0x1390F8 with huge length after table-index leave.
         if (c >= 12_000_000 && pc is >= ByteSumLoopPcLo and <= ByteSumLoopPcHi)
             TryEscapeByteSumLoop(sys, pc, c);
