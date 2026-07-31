@@ -12,10 +12,36 @@
 | Agent date | 2026-07-31 |
 | ROMDIR gate | **CLOSED** |
 | IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
+| Wave-14 tip | SifRpc MSFLAG plant removed; WAD + gifP3=11 restored |
 
 ---
 
-## Result this session (wave-13 / IRX Soft-GS GS?)
+## Result this session (wave-14 / WAD restore + spine)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR?** @100M — gifP3=11 dmac=88 Soft-GS; selection + second chrome still unproven |
+| Root cause of tip cdvd=1 | **Fixed** — `SifRpc.StartLoadedModule` PresentEeSifHandshake before every SIFMAN/SIFCMD/SIFINIT `_start` (c423c4f) collapsed GAMEDATA.WAD |
+| LooksLikeAsciiWord EPC | **Fixed** — aligned code PCs (e.g. `0x414A30`) matched ≥3 printable; removed from data-as-code test |
+| Logo spine main kick | **Added** — one Midway main re-entry when gifP3≤5 after cdvd≥180k (mirrors historical AdEL→main) |
+| diagnose 20M | PC=`0x47FCF4` px=286720 prims=1 gifP3=5 dmac=7 cdvd=**198840** binds=16/252 |
+| 100M host-present | PC=`0x43FAB4` px=573440 gifP3=**11** dmac=**88** cdvd=201400 (FAE8 stream body) |
+
+### Change class
+
+- **SHARED** `SifRpc.cs`: remove PresentEeSifHandshake from StartLoadedModule (keep `Sif.PresentSifInit` cold path)
+- **TITLE_LOCAL** `MidwayBootAssist.cs`: data-EPC unaligned/past-RDRAM only; post-WAD main spine kick; delay group-6 plant until gifP3≥8
+- **Not done:** synthetic stream slots, C1C0 force, FFmpeg
+
+### Residual wall
+
+1. gifP3 plateau **11** — empty stream slots / C1C0 never binds
+2. Selection index still unproven
+3. Soft-GS prims low — not full interactive MAINMENU claim
+
+---
+
+## Result prior session (wave-13 / IRX Soft-GS GS?)
 
 | Goal | Status |
 |------|--------|

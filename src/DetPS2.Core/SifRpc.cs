@@ -651,11 +651,10 @@ public sealed class IopModuleHost
         else if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
             system.Memory.IopWrite32(0xBF801450, 0);
 
-        // EE MSFLAG SIFINIT before SIFMAN/SIFCMD/SIFINIT _start so GetMsFlag poll completes.
-        if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(m.Name, "SIFCMD", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(m.Name, "SIFINIT", StringComparison.OrdinalIgnoreCase))
-            system.Sif.PresentEeSifHandshake();
+        // Wave-14 SM: do NOT PresentEeSifHandshake here before every SIFMAN/SIFCMD/SIFINIT
+        // _start. Live tip regression: that plant (c423c4f) collapsed MK Shaolin Monks
+        // GAMEDATA.WAD cdvd 198840->1 when combined with IOPRP StartLoadedModule path.
+        // EE MSFLAG is still planted from Sif.PresentSifInit / explicit cold-boot sites.
 
         if (!PrepareModuleEntry(iop, id, system.Memory))
             return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
