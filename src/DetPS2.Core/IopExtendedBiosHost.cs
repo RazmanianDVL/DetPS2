@@ -109,9 +109,9 @@ public sealed class IopExtendedBiosHost
     }
 
     /// <summary>
-    /// <c>DETPS2_LITERAL_IRX=1</c> — load+prepare real disc/BIOS IRX for IOP exec (IRX-first plan).
-    /// When unset or <c>0</c>, commercial UDNL handoff stays name-only (legacy HLE-first bisect).
-    /// Delegates to <see cref="IopModuleHost.IsLiteralIrxEnabled"/> (single env contract).
+    /// Always load+prepare real disc/BIOS IRX unless emergency HLE bisect
+    /// (<c>DETPS2_FORCE_HLE_IOP=1</c> / legacy <c>DETPS2_LITERAL_IRX=0</c>).
+    /// Delegates to <see cref="IopModuleHost.IsLiteralIrxEnabled"/>.
     /// </summary>
     public static bool IsLiteralIrxEnabled() => IopModuleHost.IsLiteralIrxEnabled;
 
@@ -242,16 +242,12 @@ public sealed class IopExtendedBiosHost
         }
 
         // Prefer real IOPRP/DNAS container when path is resolvable via FILEIO/ISO.
-        //
-        // Default (LITERAL_IRX off): name-only RegisterModule — HLE already provides
-        // FILEIO/PADMAN/CDVD/… without upgrading those names with retail IRX bodies.
-        // DETPS2_LITERAL_IRX=1: LoadIrx extractable ELFs + record Entry/LoadBase for IOP exec
-        // (WP-25). DETPS2_IOPRP_NAME_ONLY=1 still forces name-only for bisect.
+        // Always LoadIrx extractable ELFs (IRX is the product). Name-only only if
+        // DETPS2_IOPRP_NAME_ONLY=1 or emergency FORCE_HLE_IOP / LITERAL_IRX=0.
         byte[]? image = TryResolveUdnlImageBytes(sys, _lastUdnlArg);
         if (image != null && image.Length >= 32)
         {
             string src = ExtractUdnlImagePath(_lastUdnlArg) ?? "udnl-image";
-            // Name-only only when NOT on the literal-IRX path (unless NAME_ONLY forced inside core).
             _iopRpNameOnlyApply = !IsLiteralIrxEnabled();
             try { ApplyIopRpImage(sys, image, src); }
             finally { _iopRpNameOnlyApply = false; }
@@ -337,12 +333,7 @@ public sealed class IopExtendedBiosHost
         int elfs = 0;
         var names = new List<string>();
         var loaded = new List<IopRpLoadedEntry>();
-        // Load policy:
-        //   DETPS2_IOPRP_NAME_ONLY=1  → never LoadIrx (bisect override).
-        //   DETPS2_LITERAL_IRX=1      → always LoadIrx extractable ELFs (retail + handoff).
-        //   else                      → LoadIrx unless commercial handoff set name-only.
-        // Historically commercial UDNL set name-only always; under LITERAL_IRX we must not
-        // skip LoadIrx for retail IOPRP/DNAS images (WP-25 prep).
+        // Load policy: always LoadIrx extractable ELFs unless name-only forced or HLE bisect.
         bool loadElfs = !IsIopRpNameOnlyForced()
             && (IsLiteralIrxEnabled() || !_iopRpNameOnlyApply);
         foreach (string modName in loadList)

@@ -9,7 +9,7 @@
 ## 0. Non-negotiables
 
 0. **Correct over working.** No host cheats that fake PS2 video/UI/I/O (no FFmpeg logos, no synthetic branded overlays, no force-complete waits that skip real RPC). A black Soft-GS frame with honest residuals beats a pretty lie. Full list: **[CORRECTNESS.md](CORRECTNESS.md)**.  
-1. **IRX-first pivot (active).** Prefer **literal BIOS/disc IRX execution** on IOP over new C# service clones or GameQuirk plants. Plan: **[IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)**. Do not start multi-title plant waves.  
+1. **IRX is the product (not a mode).** The emulator loads and runs real BIOS/disc IRX on IOP by default. Do not add HLE “modes” or plant waves. Plan: **[IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)**. Emergency bisect only: `DETPS2_FORCE_HLE_IOP=1`.  
 2. **BIOS G0 HLE is a floor/fallback**, not “platform complete.” Deepen **devices + IOP exec**; shared HLE only when IRX cannot run.  
 3. **Do not guess** boot flow, RPC shapes, FILEIO layouts, or menu type.  
 4. **Soft-GS metrics are ground truth for DetPS2** (CPU Soft-GS). Host GPU is only for optional present/PCSX2 UI — this machine has **no iGPU**; use dGPU if a window is required, else stay headless.  

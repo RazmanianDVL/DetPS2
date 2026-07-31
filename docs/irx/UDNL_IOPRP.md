@@ -36,7 +36,7 @@ Core path (`ApplyIopRpImageCore`):
 Before WP-25 prep, **UDNL commercial handoff always skipped LoadIrx**:
 
 ```csharp
-// ApplyUdnlHandoff — legacy (LITERAL_IRX off)
+// ApplyUdnlHandoff — LEGACY only when DETPS2_FORCE_HLE_IOP=1 (IRX is now always default)
 _iopRpNameOnlyApply = true;
 try { ApplyIopRpImage(sys, image, src); }
 finally { _iopRpNameOnlyApply = false; }

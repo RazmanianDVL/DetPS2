@@ -232,12 +232,27 @@ public sealed class IopModuleHost
     public ulong ModuleEntryRuns { get; private set; }
 
     /// <summary>
-    /// When <c>DETPS2_LITERAL_IRX=1</c>, <see cref="LoadIrx"/> records the last loaded module so
-    /// <see cref="TryArmPendingLiteralEntry"/> can set <see cref="Iop.PC"/> for T0/Ps2System quanta
-    /// (WP-11). <see cref="StartLoadedModule"/> is the explicit smoke/exec API (always available).
+    /// IRX execution is the <b>only</b> normal boot path: load real modules and run them on IOP.
+    /// Opt-out only for emergency bisect: <c>DETPS2_FORCE_HLE_IOP=1</c> (or legacy
+    /// <c>DETPS2_LITERAL_IRX=0</c>). There is no separate "IRX mode" — IRX is the emulator.
     /// </summary>
-    public static bool IsLiteralIrxEnabled =>
-        string.Equals(Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX"), "1", StringComparison.Ordinal);
+    public static bool IsLiteralIrxEnabled
+    {
+        get
+        {
+            string? forceHle = Environment.GetEnvironmentVariable("DETPS2_FORCE_HLE_IOP");
+            if (string.Equals(forceHle, "1", StringComparison.Ordinal) ||
+                string.Equals(forceHle, "true", StringComparison.OrdinalIgnoreCase))
+                return false;
+            // Legacy opt-out only (was opt-in =1; now default on unless explicitly 0).
+            string? legacy = Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX");
+            if (string.Equals(legacy, "0", StringComparison.Ordinal) ||
+                string.Equals(legacy, "false", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(legacy, "off", StringComparison.OrdinalIgnoreCase))
+                return false;
+            return true;
+        }
+    }
 
     /// <summary>Return address planted in <c>$ra</c> so <c>jr ra</c> from module entry is detectable.</summary>
     public const uint ModuleReturnSentinel = 0x0000BEE0u;
@@ -850,7 +865,7 @@ public sealed class IopModuleHost
 
         // MODLOAD LoadStartModule: after load, real hardware runs _start. DetPS2 still soft-marks
         // Started for registry/LOADFILE compatibility (games probes must see the module as up).
-        // Literal R3000 execution is opt-in via StartLoadedModule or DETPS2_LITERAL_IRX arming.
+        // R3000 entry is armed for scheduler quanta (always unless DETPS2_FORCE_HLE_IOP=1).
         StartModule(id, out _);
 
         if (IsLiteralIrxEnabled && result.Entry != 0)

@@ -19,10 +19,10 @@ tooling — all verified only against synthetic fixtures and homebrew, not real 
 **What is not done**: any commercial title reaching its main menu, let alone being playable.
 **Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
 
-**Active work (pivot 2026-07-30)**: **literal BIOS/disc IRX execution** on the IOP — same model as
-other PS2 emulators — not endless C# HLE trial-and-error. Phase plan:
-**[docs/IRX_EXECUTION_PHASE_PLAN.md](docs/IRX_EXECUTION_PHASE_PLAN.md)** · pointer [NEXT_PLAN.md](NEXT_PLAN.md).
-EE/Soft-GS stay C#; IOP modules should **run**. Epic: GitHub **#12**.
+**Active work (pivot 2026-07-30)**: the emulator **fully uses real BIOS/disc IRX on the IOP** (not
+an optional “mode”) — same model as other PS2 emulators. C# owns EE/Soft-GS/devices; IOP modules
+**load and execute**. Phase plan: **[docs/IRX_EXECUTION_PHASE_PLAN.md](docs/IRX_EXECUTION_PHASE_PLAN.md)**.
+Epic: GitHub **#12**. Emergency HLE bisect only: `DETPS2_FORCE_HLE_IOP=1`.
 
 ```bash
 dotnet run --project src/DetPS2.Core -c Release -- dump-spine

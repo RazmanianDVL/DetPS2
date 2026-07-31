@@ -7,10 +7,9 @@ namespace DetPS2.Core;
 /// Subsystem Interface (Phase 8 + 13 RPC) — <b>SIF bridge</b> for IRX-first (WP-19/T4).
 /// DMA SIF0/SIF1 + SBUS mailbox + RPC queues. See <c>docs/irx/SIF_BRIDGE.md</c>.
 /// <para>
-/// Under <c>DETPS2_LITERAL_IRX=1</c> the long-term owner of sifcmd transport is executing
-/// SIFMAN/SIFCMD on the IOP R3000; this class remains the shared DMA/mailbox engine those
-/// modules (or HLE stand-ins) drive. Paths that pure-HLE without IOP exec are marked
-/// <c>LITERAL_IRX HLE bypass</c> below — do not extend them; demote via WP-20/WP-49.
+/// SIFMAN/SIFCMD should run as real IRX on the IOP; this class is the shared DMA/mailbox
+/// engine those modules (or temporary HLE stand-ins) drive. Paths that pure-HLE without IOP
+/// exec are debt — demote via WP-20/WP-49. IRX is the product, not an optional mode.
 /// </para>
 /// </summary>
 public sealed class Sif : ISchedulable
@@ -22,11 +21,9 @@ public sealed class Sif : ISchedulable
     }
 
     /// <summary>
-    /// True unless <c>DETPS2_LITERAL_IRX=0</c> (explicit legacy HLE-first bisect).
-    /// Default / unset / any other value → literal IRX mode (WP-00).
+    /// True unless emergency HLE bisect (<c>DETPS2_FORCE_HLE_IOP=1</c> / <c>DETPS2_LITERAL_IRX=0</c>).
     /// </summary>
-    public static bool LiteralIrxMode =>
-        !string.Equals(Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX"), "0", StringComparison.Ordinal);
+    public static bool LiteralIrxMode => IopModuleHost.IsLiteralIrxEnabled;
 
     /// <summary>Optional log of pure-HLE SIF paths when <c>DETPS2_TRACE_SIF_HLE=1</c>.</summary>
     public static bool TraceSifHleBypass =>

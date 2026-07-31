@@ -8,10 +8,10 @@ If a change makes a title *look* better or *get further* by lying about what the
 
 ## Platform strategy (2026-07-30)
 
-**Default path to playability:** execute **real BIOS and disc IRX** on a deterministic IOP
-(see [`IRX_EXECUTION_PHASE_PLAN.md`](IRX_EXECUTION_PHASE_PLAN.md)).  
+**The emulator uses real BIOS/disc IRX on the IOP** — same model as other PS2 emulators
+(see [`IRX_EXECUTION_PHASE_PLAN.md`](IRX_EXECUTION_PHASE_PLAN.md)). This is not an optional mode.
 C# owns EE, Soft-GS, devices, and scheduler — **not** a second invented IOP OS.  
-HLE service clones and title thrash plants are debt, not the product.
+HLE service clones and title thrash plants are debt to remove, not the product.
 
 ## North star
 

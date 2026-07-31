@@ -17,17 +17,21 @@ Faster commercial bring-up without blind 150M runs. Soft-GS metrics do **not** r
 Policy: **`docs/AGENT_SOP.md`**. Play! map: **`docs/PLAY_HLE_ORACLE.md`**. Library: **`docs/LIBRARY_SAMPLING.md`**.  
 **IRX-first plan:** **`docs/IRX_EXECUTION_PHASE_PLAN.md`** (epic #12).
 
-### Environment: literal IRX
+### Environment: IRX is the product (not a “mode”)
+
+The emulator **always** loads and runs real BIOS/disc IRX on the IOP. There is no separate IRX mode.
 
 | Variable | Values | Meaning |
 |----------|--------|---------|
-| **`DETPS2_LITERAL_IRX`** | `1` (default target) / `0` | When **1**, boot path must **load and execute** real BIOS/disc IRX on IOP. When **0**, legacy HLE-first path for bisect only. |
-| `DETPS2_TRACE_IOP` | `1` | Sample IOP PC (module map when available). |
+| **`DETPS2_FORCE_HLE_IOP`** | unset (normal) / `1` | **Emergency bisect only** — disables IRX exec arming and forces name-only/HLE-first IOP path. Do not use for normal runs. |
+| `DETPS2_LITERAL_IRX` | unset / `0` | **Legacy:** only `=0` opts out (same as FORCE_HLE_IOP). Unset means IRX on. |
+| `DETPS2_IOPRP_NAME_ONLY` | `1` | Force name-only IOPRP register (bisect). |
+| `DETPS2_TRACE_IOP` | `1` | Sample IOP PC. |
 | `DETPS2_SEMA_STALL_YIELD` | unset / OFF | Must stay off. |
 
 ```powershell
-$env:DETPS2_LITERAL_IRX = "1"
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+# IRX on by default — do NOT set FORCE_HLE_IOP for normal use
 ```
 
 **Freeze:** no new GameQuirk thrash plants / multi-title HLE plant waves while #12 is active.
@@ -39,7 +43,7 @@ Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 ```powershell
 # From repo root (detps2/)
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-$env:DETPS2_LITERAL_IRX = "1"
+# IRX is default — no DETPS2_LITERAL_IRX required
 
 # Before inventing HLE:
 pwsh ./tools/play-lookup.ps1 -Serial SLUS_210.87 -Wall PAD

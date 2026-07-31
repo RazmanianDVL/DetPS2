@@ -80,7 +80,7 @@ Each WP: **ID · Track · Depends · Deliverable · Exit test · Est**
 
 | ID | Track | Depends | Deliverable | Exit test | Est |
 |----|-------|---------|-------------|-----------|-----|
-| **WP-00** | T0/T10 | — | Document `DETPS2_LITERAL_IRX=0\|1` (default **1** after WP-08); bisect switch design | Doc in tools/README + this file | 0.5d |
+| **WP-00** | T0/T10 | — | IRX is **always on**; document emergency `DETPS2_FORCE_HLE_IOP=1` only | Doc in tools/README + this file | 0.5d |
 | **WP-01** | T10 | — | Clean `out/`, traces, root dumps; `.gitignore` hardened; size report | Worktree rebuildable; sources dominate size | 0.5d |
 | **WP-02** | T0 | — | Freeze PR policy: reject plant waves; label `debt-hle` | Written in CONTRIBUTING + #12 | 0.25d |
 | **WP-03** | T10 | — | Inventory matrix: every RealSifRpc SID → “IRX name or DEBT” CSV/md | `docs/irx/HLE_TO_IRX_MATRIX.md` | 1d |

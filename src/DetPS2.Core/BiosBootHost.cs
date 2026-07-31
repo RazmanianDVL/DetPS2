@@ -224,10 +224,22 @@ public sealed class BiosBootHost
         // 3) Contract table (RPC SIDs + aliases) — forces REQ modules even if ROMDIR parse missed.
         InstallContractModules(sys);
 
-        // 4) Best-effort: load BIOS IRX ELFs that own RPC sids into IopModuleHost.
+        // 4) Load real BIOS IRX ELFs into IOP RAM (always — IRX is the product path).
+        // Emergency HLE bisect: DETPS2_FORCE_HLE_IOP=1 / DETPS2_LITERAL_IRX=0 still loads
+        // RPC-critical ELFs but BootIopBtConfLiteral is the full IOPBTCONF chain.
+        if (IopModuleHost.IsLiteralIrxEnabled)
+        {
+            var lit = BootIopBtConfLiteral(sys);
+            ServicesInstalled += (ulong)lit.ElfsLoaded;
+        }
+        // Always also load BootCritical RPC modules (PADMAN, FILEIO, …) if extractable.
         foreach (var c in BootCriticalContracts)
         {
             if (c.RpcSid == 0) continue;
+            if (sys.IopModules.TryGetModule(c.RomdirName, out int existingId) &&
+                sys.IopModules.TryGetIrx(existingId, out var existing) &&
+                existing.HasImage)
+                continue;
             try
             {
                 byte[]? mod = RomdirExtractor.ExtractModule(_biosImage, c.RomdirName);
@@ -416,16 +428,11 @@ public sealed class BiosBootHost
     }
 
     /// <summary>
-    /// True when <c>DETPS2_LITERAL_IRX=1</c> (default target after WP-08; currently opt-in until
-    /// orchestrator flips default). Empty/unset is treated as disabled for bisect safety.
+    /// IRX path is always on unless emergency HLE bisect
+    /// (<c>DETPS2_FORCE_HLE_IOP=1</c> / legacy <c>DETPS2_LITERAL_IRX=0</c>).
+    /// Delegates to <see cref="IopModuleHost.IsLiteralIrxEnabled"/>.
     /// </summary>
-    public static bool IsLiteralIrxEnabled()
-    {
-        string? v = Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX");
-        return string.Equals(v, "1", StringComparison.Ordinal) ||
-               string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(v, "yes", StringComparison.OrdinalIgnoreCase);
-    }
+    public static bool IsLiteralIrxEnabled() => IopModuleHost.IsLiteralIrxEnabled;
 
     /// <summary>
     /// Pure IOPBTCONF text parser — unit-testable without a BIOS image.
