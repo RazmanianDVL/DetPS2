@@ -1122,12 +1122,14 @@ public sealed class SonyKernelHle
                                 Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
                             ee.RequestSemaStall();
                         }
-                        else
+                        else if (!_kernel.TryYieldToOtherRunnable(ee))
                         {
-                            // WHIP_SEMA_FIX_V2: non-RPC soft-signal (Whiplash SN seq + SIF worker).
-                            // No yield-without-wake; VBlank park only when ThreadCount < 2.
+                            // WHIP_SEMA_FIX_V2 + DA restore: yield to other runnable threads first
+                            // (DA MFL/SIF worker). Only fabricate when alone — multi-thread yield
+                            // is required or DA thrash-WaitSema and never opens gameart (cdvd stuck).
+                            // VBlank park only when ThreadCount < 2 (WHIP SN path).
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no runnable peer)");
                             if (_kernel.ThreadCount < 2)
                                 _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
