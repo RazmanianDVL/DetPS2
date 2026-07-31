@@ -35,16 +35,15 @@ namespace DetPS2.Core;
 ///
 /// <para>
 /// <b>Haven residual (#21 — first FILEIO / game-data open):</b> after the IRX stack the EE
-/// burns ≥150M cycles in multi-precision soft-float at <c>0x00351xxx–0x00352xxx</c>
-/// (multi-prec body <c>0x00352660</c>, callers <c>0x00345C30</c> / <c>0x00343328</c>,
-/// outerRa live <c>0x00345Dxx</c>; libm-class poly / range-reduce on doubles — EE has no
-/// hardware double FPU). Rodata doubles at <c>0x00614640+</c> (π etc.) are live post-decompress.
-/// INTC_STAT already sticky bit2|3 (<c>0xC</c>); Vb poll at <c>0x00331650</c> is secondary.
-/// No <c>sceSifBindRpc(FILEIO 0x80000001)</c>, no <c>DLL.DAT</c>/<c>DATA/</c> path string in
-/// RDRAM. Title-local epi/double-pop thrash escapes re-enter more soft-float and do not unlock
-/// FILEIO — next work is shared EE soft-float fidelity or a proven outer-game resume (PINE),
-/// not more stack invent. Haven-only: keep VBlankStart sticky + repair poll base if mid-function
-/// re-home. Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c> (NuFile / TT).
+/// enters a sin/cos LUT fill at <c>0x0010CCD8</c> —
+/// <c>for (i=0..N) table[i] = (float)sin((double)(i * k))</c> with <c>k≈π/16384</c>
+/// (<c>0x39490FDB</c>). Each iteration calls soft-double f32→f64 (<c>0x00353A28</c>),
+/// sin (<c>0x003432F0</c>), f64→f32 (<c>0x00352E30</c>); the sin poly lives at
+/// <c>0x00345C30</c> / mul body <c>0x00352660</c> (band <c>0x00351xxx–0x00352xxx</c>).
+/// Interpreter soft-float costs 10k–100k cycles/sin → 100–250M cycles with no
+/// <c>DLL.DAT</c>/<c>FILEIO</c> string. Wave-2: register those entries on
+/// <see cref="SoftFloatBridge"/> (shared host IEEE). Haven-only still: VBlankStart sticky +
+/// poll-base repair. Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c>.
 /// </para>
 ///
 /// <para>
@@ -88,6 +87,8 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         _lateLogPulses = 0;
         _lastLogCyc = 0;
         _lastVbPulseCyc = 0;
+        if (_isHaven)
+            SoftFloatBridge.Reset();
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -95,11 +96,35 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         Reset();
         if (sys.Hle?.Sony?.RealRpc != null)
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+        if (_isHaven)
+            RegisterHavenSoftFloat();
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1")
             Console.Error.WriteLine(
                 $"[TEAMICO] OnDiscMounted: PreferIopRpGetVersion serial={_serial}"
-                + (_isHaven ? " havenVbAssist=on" : ""));
+                + (_isHaven ? $" havenVbAssist=on softFloatEntries={SoftFloatBridge.EntryCount}" : ""));
+    }
+
+    /// <summary>
+    /// Haven post-decompress soft-double library (live @90M). Shared
+    /// <see cref="SoftFloatBridge"/> evaluates IEEE on host so the sin LUT fill at
+    /// <c>0x0010CCD8</c> can finish and reach first game-data FILEIO.
+    /// </summary>
+    private static void RegisterHavenSoftFloat()
+    {
+        SoftFloatBridge.RegisterMany(new (uint, SoftFloatBridge.Op)[]
+        {
+            // Core multi-precision arithmetic (sin/cos poly body)
+            (0x00352660u, SoftFloatBridge.Op.DMul),
+            (0x003525A0u, SoftFloatBridge.Op.DAdd),
+            (0x003525F8u, SoftFloatBridge.Op.DSub),
+            // libm
+            (0x003432F0u, SoftFloatBridge.Op.DSin),
+            (0x00342EB0u, SoftFloatBridge.Op.DCos),
+            // float↔double bridges used by the 0x10CCD8 LUT fill
+            (0x00353A28u, SoftFloatBridge.Op.F32ToF64),
+            (0x00352E30u, SoftFloatBridge.Op.F64ToF32),
+        });
     }
 
     public void OnHostPresent(Ps2System sys)

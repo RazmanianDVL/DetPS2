@@ -891,6 +891,20 @@ public sealed class EmotionEngine : ISchedulable
                 }
             }
 
+            // Shared soft-double host bridge (see SoftFloatBridge): titles register EE
+            // multi-precision libm entries so interpreter soft-float table fills do not
+            // burn 100M+ cycles before FILEIO (Haven sin LUT @ 0x10CCD8).
+            if (SoftFloatBridge.Active)
+            {
+                ulong softPc = PC;
+                if (SoftFloatBridge.TryFastPath(this))
+                {
+                    if (PcProfiler.Enabled) PcProfiler.Sample(softPc);
+                    executed++;
+                    continue;
+                }
+            }
+
             uint opcode = _memory.Read32(PC);
             _tracer?.LogInstruction(cyc, PC, opcode);
             if (SystemMemory.WatchAddr.HasValue || SystemMemory.TrackLastWriter)

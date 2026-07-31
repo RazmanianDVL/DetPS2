@@ -16,7 +16,7 @@
 | **MK Deadly Alliance** | SLUS_204.23 | **No** | **gameart open** cdvd=771 | px=0 post-open |
 | **Vexx** | SLUS_203.83 | **No** | **cdvd 0→4** GAME.TXT | WaitSema / more assets |
 | **Whiplash** | SLUS_206.84 | **No** | cdvd=256 RKV warm | MOD_LOAD path="" |
-| **Haven** | SLUS_205.17 | **No** | px=3 cdvd=77 | soft-float; no FILEIO |
+| **Haven** | SLUS_205.17 | **No** | px=3 gifP3=67 dmac=197 cdvd=77 | soft-float cleared via SoftFloatBridge; residual VIF1 init spin @0x188AE0; no FILEIO yet |
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
