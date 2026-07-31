@@ -624,7 +624,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                     Console.Error.WriteLine($"[GOW] plant cache-wb stub @ 0x002944F0 cyc={c}");
             }
-            if (pc is >= 0x002944F0 and <= 0x00294580)
+            if (pc is >= 0x00294400 and <= 0x00294580)  // include pre-stub residual 0x294420 (claim100d)
             {
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
                 sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0x1000 }); // a2 = 4096 done
