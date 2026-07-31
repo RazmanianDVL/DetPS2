@@ -58,11 +58,11 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _cacheFlushSkips = 0;
         _snPrintfStubbed = false;
         _vtCallStubbed = false;
-        _fmtScanStubbed = false;
-        _fmtWrapperStubbed = false;
         _entityPrintfGlueStubbed = false;
+        _fmtScanStubbed = false;
         _goeTokenEscapes = 0;
         _codeOpenNudges = 0;
+        _inMapEscapes = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -323,8 +323,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
         // Post-KAIN: suppress entity Dest-Database printf glue (format+SN) so cycles leave
         // mid-wrapper park @0x480500. Do NOT soft-stub game printf 0x2B99B8 (host AV).
+        // Do NOT permanent-stub shared format leaf/wrapper (breaks InMap 0x485318).
         if (postPackAsset && sys.Gs.PixelsWritten < 100_000)
             SoftStubEntityPrintfChain(sys);
+
+        // Post-KAIN InMap a1==0 / bad vtable jalr — leave the destination helper instead of
+        // rescue-looping mid 0x2B9F34 (honest wall after format plants were removed).
+        if (postPackAsset && sys.Gs.PixelsWritten < 50_000)
+            MaybeEscapeInMapNullDest(sys, c);
 
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
         // started=False — re-start so boot can continue past RPC-complete plateau.
@@ -462,36 +468,31 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
     private bool _snPrintfStubbed;
     private bool _vtCallStubbed;
-    private bool _fmtScanStubbed;
-    private bool _fmtWrapperStubbed;
     private bool _entityPrintfGlueStubbed;
+    private bool _fmtScanStubbed;
 
     private int _goeTokenEscapes;
     private int _codeOpenNudges;
+    private int _inMapEscapes;
 
     /// <summary>
-    /// Unstick post-KAIN format thrash and entity-printf park toward CODE/MAINMENU Open.
+    /// Unstick post-KAIN format thrash toward CODE/MAINMENU Open.
     ///
-    /// Entry <c>0x482F60</c> is a 720-byte frame (epilogue <c>0x484448</c>).
-    /// Live thrash root (2026-07-30): after FILEIO pack-open of KAIN.IMP serves whole
-    /// PRECODE.BG2 goefile @0xA242A0, format is called with a2 in goefile string tables
-    /// (0x5378A8) — '%' scan @0x483040 burns tens of M cycles.
-    /// Soft-stub the leaf after asset I/O (jr ra; v0=0). Mid-frame residual: unwind the
-    /// 0x2D0 frame from a valid $sp. Never interrupt real epilogue 0x484448..0x484478.
-    ///
-    /// Live residual @100M: leaf stub lands but final PC parks mid format-wrapper
-    /// prologue <c>0x480500</c> (frame <c>0x4804E8</c>, jal <c>0x482EE8</c>). Glue
-    /// <c>0x2AD8E0</c> = format-wrapper + SN printf. Soft-stub wrapper + glue and unwind
-    /// mid-wrapper frames so post-entity boot can reach usebigfile /
-    /// "Starting code big file" (<c>0x1B54A0..0x1B57A4</c>, rodata @0x4BEDB8).
+    /// Live (2026-07-31): pure thrash-only escape failed — Step is 50k-cycle sliced and
+    /// deep '%' scan (0x483048/0x486EC0) + bulk memcpy (0x4803EC) burn tens of M with
+    /// no reliable stack ra. Permanent soft-stub of the format LEAF only (0x482F60)
+    /// after pack-resident open kills the heat; wrapper/bridge stay intact.
+    /// InMap 0x485318 then completes (leaf returns 0) and MaybeEscapeInMapNullDest
+    /// leaves the a1==0 / bad-jalr wall that previously rescue-looped at 0x2B9F34.
+    /// Entity Dest-Database glue 0x2AD8E0 remains soft-stubbed.
     ///
     /// Residual (#17/#8): still no proven game FILEIO/IOPFILE Open of CODE.BG2 /
-    /// MAINMENU.BG2 (host warm + sector-credit note only). SHARED goefile member extract
-    /// for .IMP remains the structural fix. Rejected: soft-stub game printf 0x2B99B8 (AV).
+    /// MAINMENU.BG2. SHARED goefile member extract for .IMP remains structural.
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
-        // Permanent leaf stub once past pack-resident entity I/O — prevents re-entry thrash.
+        // Permanent format leaf stub after pack open — only path that stops 0x483048 heat
+        // under 50k-cycle Step slices. Wrapper/bridge NOT stubbed (InMap 0x485318).
         if (!_fmtScanStubbed && HasBo2PackAssetIo(sys))
         {
             uint head = sys.Memory.Read32(0x00482F60);
@@ -502,51 +503,73 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 _fmtScanStubbed = true;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                     Console.Error.WriteLine(
-                        "[BO2] soft-stub format leaf @ 0x482F60 (jr ra; v0=0)");
+                        "[BO2] soft-stub format leaf @ 0x482F60 (jr ra; v0=0; wrapper intact)");
             }
         }
 
-        // Soft-stub format-wrapper entry @0x4804E8 (live park PC=0x480500 mid-prologue).
-        if (!_fmtWrapperStubbed && HasBo2PackAssetIo(sys))
-        {
-            uint headW = sys.Memory.Read32(0x004804E8);
-            if (headW != 0 && headW != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x004804E8, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x004804EC, 0x24020001u); // addiu v0, zero, 1
-                _fmtWrapperStubbed = true;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine(
-                        "[BO2] soft-stub format wrapper @ 0x4804E8 (jr ra; v0=1)");
-            }
-            uint bridge = sys.Memory.Read32(0x00482EE8);
-            if (bridge != 0 && bridge != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x00482EE8, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x00482EEC, 0x24020001u); // addiu v0, zero, 1
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine(
-                        "[BO2] soft-stub format bridge @ 0x482EE8 (jr ra; v0=1)");
-            }
-        }
-
-        if (_goeTokenEscapes >= 48) return;
-        if (c - _lastTitleSmCyc < 60_000) return;
+        if (_goeTokenEscapes >= 96) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0x1FFFFFFFUL);
 
-        // Soft-stubbed leaf is two words — let it return naturally.
+        // Soft-stubbed leaf is two words — let jr ra complete.
         if (_fmtScanStubbed && pc is >= 0x00482F60 and <= 0x00482F68)
             return;
-        // Soft-stubbed wrapper entry — let jr ra complete.
-        if (_fmtWrapperStubbed && pc is >= 0x004804E8 and <= 0x004804F0)
-            return;
-        // Real epilogue — never interrupt mid-restore.
+
+        // Bulk byte-copy thrash near format lib (live final PC 0x4803F4): when remaining
+        // count (a2) is absurd, force return. Real short copies finish in << 50k cycles.
+        if (pc is >= 0x004803E0 and <= 0x00480410)
+        {
+            uint rem = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
+            if (rem > 0x10000u)
+            {
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                if (!IsSafeCodeTarget(sys, ra) || !IsColdSafeResume(sys, ra) || ra == pc)
+                    ra = 0x0048A980;
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = ra;
+                sys.EE.COP0_Status &= ~0x6u;
+                _goeTokenEscapes++;
+                _titleSmEscapes++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] abort huge memcpy thrash rem=0x{rem:X8} -> 0x{ra:X8} n={_goeTokenEscapes} cyc={c}");
+                return;
+            }
+        }
+
+        // Real format epilogue — never interrupt mid-restore.
         if (pc is >= 0x00484448 and <= 0x00484478)
             return;
 
+        // Entry gate residual (if leaf plant not yet applied this slice).
+        if (pc is >= 0x00482F60 and <= 0x00482FA0 && LooksLikeBo2BinaryFmtPtr(a2))
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            if (IsSafeCodeTarget(sys, ra) && IsColdSafeResume(sys, ra) && ra != pc)
+            {
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = ra;
+                sys.EE.COP0_Status &= ~0x6u;
+                _goeTokenEscapes++;
+                _titleSmEscapes++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_goeTokenEscapes <= 16 || _goeTokenEscapes % 16 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] reject binary format entry a2=0x{a2:X8} -> ra=0x{ra:X8} " +
+                        $"n={_goeTokenEscapes} cyc={c}");
+                return;
+            }
+        }
+
+        if (c - _lastTitleSmCyc < 40_000) return;
+
         // Mid format-wrapper body (0x4804F0..0x480534): frame addiu sp,-144 / ra@0(sp).
         bool inFmtWrapper = pc is > 0x004804F0 and < 0x00480538;
-        if (inFmtWrapper)
+        if (inFmtWrapper && LooksLikeBo2BinaryFmtPtr(a2))
         {
             uint spW = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
             if (spW is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x90u)
@@ -554,7 +577,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 uint raSlot = sys.Memory.Read32(spW + 0x0) & 0x1FFFFFFFu;
                 if (raSlot is >= 0x00200000 and < 0x004A0000
                     && raSlot is not (>= 0x004804E8 and <= 0x00480538)
-                    && raSlot is not (>= 0x00482E00 and <= 0x00484480)
+                    && raSlot is not (>= 0x00482E00 and <= 0x00486F00)
                     && IsSafeCodeTarget(sys, raSlot)
                     && IsColdSafeResume(sys, raSlot))
                 {
@@ -573,55 +596,70 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                         && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
                         Console.Error.WriteLine(
                             $"[BO2] unwind format-wrapper 0x{pc:X8} -> 0x{raSlot:X8} " +
-                            $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+                            $"(bad a2=0x{a2:X8}) n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
                     return;
                 }
             }
         }
 
-        bool inFmtFrame = pc is > 0x00482F68 and < 0x00484448;
+        // Deep '%' scan / mbtowc helper (live PcProfiler heat). a2 is clobbered mid-loop —
+        // any long stay past 0x483000 post-pack is thrash (real format strings finish fast).
+        bool inFmtScan = pc is >= 0x00483000 and < 0x00484448
+            || pc is >= 0x00486EC0 and <= 0x00486EF8;
+        bool inFmtFrame = pc is > 0x00482F68 and < 0x00484448 || inFmtScan;
         bool dataThrash = pc is < 0x00120000
             || (pc is >= 0x00500000 and < 0x02000000)
             || (pc is >= 0x00800000 and < 0x02000000);
-        if (!inFmtFrame && !dataThrash && !inFmtWrapper) return;
+        if (!inFmtFrame && !dataThrash) return;
 
         if (inFmtFrame)
         {
             uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+            uint resume = 0;
             if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x2D0u)
             {
-                uint raSlot = sys.Memory.Read32(sp + 0x2C0) & 0x1FFFFFFFu;
-                uint resume = 0;
-                if (raSlot is >= 0x00200000 and < 0x004A0000
-                    && (raSlot < 0x00482F60u || raSlot > 0x00484480u)
-                    && IsSafeCodeTarget(sys, raSlot))
+                foreach (uint off in new uint[] { 0x2C0, 0x2D0, 0x10, 0x0, 0x60 })
                 {
-                    resume = raSlot;
-                    sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + 0x2D0 });
+                    if (sp + off + 4 > (uint)SystemMemory.RDRAM_SIZE) continue;
+                    uint raSlot = sys.Memory.Read32(sp + off) & 0x1FFFFFFFu;
+                    if (raSlot is >= 0x00200000 and < 0x004A0000
+                        && raSlot is not (>= 0x00482E00 and <= 0x00486F00)
+                        && raSlot is not (>= 0x004804E8 and <= 0x00480538)
+                        && IsSafeCodeTarget(sys, raSlot)
+                        && IsColdSafeResume(sys, raSlot))
+                    {
+                        resume = raSlot;
+                        uint pop = off >= 0x2C0 ? 0x2D0u : (off + 0x10u);
+                        if (sp + pop < (uint)SystemMemory.RDRAM_SIZE)
+                            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + pop });
+                        break;
+                    }
                 }
-                if (resume != 0)
-                {
-                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
-                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
-                    sys.EE.PC = resume;
-                    sys.EE.COP0_Status &= ~0x6u;
-                    ArmGifPath3(sys);
-                    EnsureMainThreadRunning(sys);
-                    _goeTokenEscapes++;
-                    _titleSmEscapes++;
-                    _lastTitleSmCyc = c;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                        && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
-                        Console.Error.WriteLine(
-                            $"[BO2] unwind format frame 0x{pc:X8} -> 0x{resume:X8} " +
-                            $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
-                    return;
-                }
+            }
+            if (resume != 0)
+            {
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                ArmGifPath3(sys);
+                EnsureMainThreadRunning(sys);
+                _goeTokenEscapes++;
+                _titleSmEscapes++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] unwind format scan 0x{pc:X8} -> 0x{resume:X8} " +
+                        $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+                return;
             }
         }
 
+        if (!dataThrash) return;
+
         uint resume2 = PickSafeResume(sys, pc);
-        if (resume2 is >= 0x00482E00 and <= 0x00484474)
+        if (resume2 is >= 0x00482E00 and <= 0x00486F00)
             resume2 = 0;
         if (resume2 is >= 0x004804E8 and <= 0x00480538)
             resume2 = 0;
@@ -643,13 +681,119 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
             Console.Error.WriteLine(
-                $"[BO2] rescue format/data thrash 0x{pc:X8} -> 0x{resume2:X8} " +
+                $"[BO2] rescue data thrash 0x{pc:X8} -> 0x{resume2:X8} " +
                 $"n={_goeTokenEscapes} cdvd={sys.Cdvd.SectorsRead} cyc={c}");
     }
 
     /// <summary>
+    /// Format a2 is thrash-class when it lands in goefile string heaps / high unpacked
+    /// blobs rather than ELF rodata (0x4Bxxxx error strings, path templates).
+    /// </summary>
+    private static bool LooksLikeBo2BinaryFmtPtr(uint a2)
+    {
+        if (a2 is >= 0x00500000 and < 0x02000000) return true; // goefile / BSS heaps
+        if (a2 is >= 0x00A00000 and < 0x02000000) return true; // PRECODE load @0xA242A0
+        if (a2 is < 0x00100000) return true; // null / low garbage
+        // ELF rodata window (usebigfile / InMap / entity strings live here) — keep.
+        if (a2 is >= 0x004B0000 and < 0x00520000) return false;
+        return false;
+    }
+
+    /// <summary>
+    /// Escape post-KAIN InMap null-destination path.
+    /// Live (2026-07-31): after KAIN.IMP full read, EE parks mid <c>0x2B9F34</c>
+    /// (a1==0 → "Bad Destination for InMap") with ra=<c>0x2B9E28</c>, then the caller's
+    /// <c>jalr *(s1+4)</c> lands in goefile/data and rescue re-enters 0x2B9F34.
+    /// Soft-return the helper so boot can leave entity registration toward usebigfile.
+    /// </summary>
+    private void MaybeEscapeInMapNullDest(Ps2System sys, ulong c)
+    {
+        if (_inMapEscapes >= 32) return;
+        if (c - _lastTitleSmCyc < 40_000) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+
+        bool inInMapHelper = pc is >= 0x002B9F08 and <= 0x002B9F94;
+        bool inInMapCaller = pc is >= 0x002B9E0C and <= 0x002B9E38;
+        if (!inInMapHelper && !inInMapCaller) return;
+
+        uint a1 = (uint)(sys.EE.GetGpr(5).Lo & 0x1FFFFFFFUL);
+        uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0x1FFFFFFFUL);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+
+        if (inInMapCaller)
+        {
+            uint target = pc <= 0x002B9E14
+                ? (uint)(sys.EE.GetGpr(2).Lo & 0x1FFFFFFFUL)
+                : (uint)(sys.EE.GetGpr(3).Lo & 0x1FFFFFFFUL);
+            if (target != 0 && IsSafeCodeTarget(sys, target) && target is < 0x004A0000)
+                return;
+            uint cont = pc <= 0x002B9E14 ? 0x002B9E14u : 0x002B9E38u;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = cont;
+            sys.EE.COP0_Status &= ~0x6u;
+            _inMapEscapes++;
+            _titleSmEscapes++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_inMapEscapes <= 12 || _inMapEscapes % 8 == 0))
+                Console.Error.WriteLine(
+                    $"[BO2] skip InMap bad jalr pc=0x{pc:X8} tgt=0x{target:X8} -> 0x{cont:X8} " +
+                    $"n={_inMapEscapes} cyc={c}");
+            return;
+        }
+
+        // In helper: a1==0 error path or mid-body after several visits — return default slot.
+        if (a1 != 0 && _inMapEscapes < 4) return;
+
+        uint slot = 0;
+        if (s1 is >= 0x00500000 and < 0x00600000)
+            slot = s1 + 0x78A8u;
+
+        if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 0x50u)
+        {
+            uint raSlot = sys.Memory.Read32(sp + 0x40) & 0x1FFFFFFFu;
+            if (raSlot is >= 0x002B9E00 and <= 0x002B9F00)
+            {
+                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + 0x50 });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = slot });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = raSlot });
+                sys.EE.PC = raSlot;
+                sys.EE.COP0_Status &= ~0x6u;
+                _inMapEscapes++;
+                _codeOpenNudges++;
+                _titleSmEscapes++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_inMapEscapes <= 12 || _inMapEscapes % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] leave InMap helper 0x{pc:X8} -> ra=0x{raSlot:X8} slot=0x{slot:X8} " +
+                        $"n={_inMapEscapes} cyc={c}");
+                return;
+            }
+        }
+
+        if (ra is >= 0x002B9E14 and <= 0x002B9E40 && IsSafeCodeTarget(sys, ra))
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = slot });
+            sys.EE.PC = ra;
+            sys.EE.COP0_Status &= ~0x6u;
+            _inMapEscapes++;
+            _codeOpenNudges++;
+            _titleSmEscapes++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_inMapEscapes <= 12 || _inMapEscapes % 8 == 0))
+                Console.Error.WriteLine(
+                    $"[BO2] leave InMap helper 0x{pc:X8} -> ra=0x{ra:X8} slot=0x{slot:X8} " +
+                    $"n={_inMapEscapes} cyc={c}");
+        }
+    }
+
+    /// <summary>
     /// Soft-stub entity Dest-Database printf glue after KAIN pack I/O.
-    /// <c>0x2AD8E0</c> / <c>0x2AD910</c>: format-wrapper + SN printf (+ optional 0x296B50).
+    /// <c>0x2AD8E0</c> / <c>0x2AD910</c>: format-wrapper + SN printf with binary a2.
+    /// Do NOT permanent-stub shared format leaf/wrapper — InMap / other consumers need them.
     /// </summary>
     private void SoftStubEntityPrintfChain(Ps2System sys)
     {
@@ -668,29 +812,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         }
         _entityPrintfGlueStubbed = true;
         SoftStubSnPrintf(sys);
-        if (!_fmtWrapperStubbed)
-        {
-            uint w = sys.Memory.Read32(0x004804E8);
-            if (w != 0 && w != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x004804E8, 0x03E00008u);
-                sys.Memory.Write32(0x004804EC, 0x24020001u);
-                _fmtWrapperStubbed = true;
-            }
-        }
-        if (!_fmtScanStubbed)
-        {
-            uint leaf = sys.Memory.Read32(0x00482F60);
-            if (leaf != 0 && leaf != 0x03E00008u)
-            {
-                sys.Memory.Write32(0x00482F60, 0x03E00008u);
-                sys.Memory.Write32(0x00482F64, 0x0000102Du);
-                _fmtScanStubbed = true;
-            }
-        }
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                "[BO2] soft-stub entity printf glue @ 0x2AD8E0/0x2AD910 (jr ra; v0=1)");
+                "[BO2] soft-stub entity printf glue @ 0x2AD8E0/0x2AD910 (jr ra; v0=1; format intact)");
     }
 
     private static void EnsureMainThreadRunning(Ps2System sys)
@@ -973,14 +1097,15 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (addr is >= 0x0035C000 and <= 0x0035E000) return false;
         // 0x2F17xx epilogue delay parks are real code but cold-resume without frame is dead.
         if (addr is >= 0x002F1700 and <= 0x002F1780) return false;
-        // Format leaf / mid-body / bridge — only natural $ra after jal may re-enter.
-        if (addr is >= 0x00482E00 and <= 0x00484474) return false;
+        // Format leaf / mid-body / mbtowc helper — only natural $ra after jal may re-enter.
+        if (addr is >= 0x00482E00 and <= 0x00486F00) return false;
         // Format-wrapper (soft-stubbed post-KAIN) — no cold re-entry.
         if (addr is >= 0x004804E8 and <= 0x00480538) return false;
         // Entity printf glue (soft-stubbed).
         if (addr is >= 0x002AD8E0 and <= 0x002AD940) return false;
-        // Live vector storm after bad format unwind: stack held 0x2B9E28 mid-utility.
-        if (addr is >= 0x002B9E00 and <= 0x002B9F00) return false;
+        // InMap / destination helpers (live park 0x2B9F34 a1==0 + caller 0x2B9E28).
+        // Cold re-entry mid-frame rescue-loops forever after permanent format stubs were removed.
+        if (addr is >= 0x002B9DB0 and <= 0x002B9F98) return false;
         return true;
     }
 
