@@ -40,6 +40,8 @@ namespace DetPS2.Core;
 /// remains EE-driven via shared RealSifRpc (not edited here).
 /// Live wave-1 (WaitSema V2): MOD_LOAD SIO2MAN..IOPSND, binds 13, stream-table, px=3 @20M.
 /// Wave-2: WaitSema V3 + stream-table recv preserve + firstscreen/frontend RKV warm.
+/// Wave-3: bridge stream-table → GOE Open+Start (RKV title surface into stream slots) +
+/// sid 0x40 control workspace init; Soft-GS residual still EE-driven.
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule

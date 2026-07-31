@@ -416,6 +416,9 @@ public sealed class RealSifRpc
         _iopFileAcquires = 0;
         _goeArchiveMounted = false;
         _bo2CodeBg2Warmed = false;
+        _whipTitleWarmed = false;
+        _whipOpenStartBridged = false;
+        _whipControlInited = false;
         _bo2PackIndexBuilt = false;
         _bo2PackPathToParent.Clear();
         _bo2PackBytes.Clear();
@@ -4873,6 +4876,18 @@ public sealed class RealSifRpc
         // the status buffer; EE treats status!=0 / non-error as "server ready".
         if (op == 0)
         {
+            // Whiplash sid=0x40 control init (live): send=8 with two EE workspace pointers
+            // (0x423CC0 / 0x423DC0) and recvSize=0 — IOP paints service state into those
+            // out-params. Leaving them zero stalls post-stream Open (WAVE-3).
+            if (sid == SidIopFile40 && sendSize >= 8 && argBuf != 0)
+            {
+                EnsureGoeArchiveMounted(iopModules, cdvd);
+                InitWhipControlWorkspaces(mem, iopModules, cdvd, argBuf, sendSize);
+                if (recvBuf != 0 && recvSize >= 4)
+                    WriteGoeReply(mem, recvBuf, recvSize, status: 1, filesize: 0, scefd: 0, iStream: 0);
+                return 1;
+            }
+
             // Whiplash GOE v2 stream-table setup (sid=0x31 live 2026-07-31): fno=0 send=64..128
             // with w0=bufferSize (0xFF4) and w1=slotCount (0x40) or stream index @+8; recv is a
             // 4 KiB live EE stream table. Painting GOE status over that table wiped slots.
@@ -4884,6 +4899,8 @@ public sealed class RealSifRpc
                 // Paint ready markers into the EE stream table without wiping floats/pointers
                 // the client already wrote. Bulk (w1=slotCount): mark each slot. Per-slot:
                 // mark index w2. Stride 16 B (4096/256) covers the full 0xFF ring seen live.
+                // WAVE-3: fill full GOE reply layout per slot (status/bufSize/handle/iStream)
+                // so EE sees non-zero capacity — ready-only left filesize=0 and never Open'd.
                 if (recvBuf != 0 && recvSize >= 16)
                 {
                     const uint Stride = 16;
@@ -4891,34 +4908,26 @@ public sealed class RealSifRpc
                     {
                         uint n = Math.Min(w1, recvSize / Stride);
                         for (uint i = 0; i < n; i++)
-                        {
-                            uint baseOff = recvBuf + i * Stride;
-                            // word0 ready/status=1 if zero; leave non-zero client state intact
-                            if (mem.Read32(baseOff) == 0)
-                                mem.Write32(baseOff, 1);
-                        }
+                            PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, i, w0);
                     }
                     else if (w1 == 0)
                     {
                         uint idx = w2;
                         if (idx < recvSize / Stride)
-                        {
-                            uint baseOff = recvBuf + idx * Stride;
-                            if (mem.Read32(baseOff) == 0)
-                                mem.Write32(baseOff, 1);
-                        }
+                            PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, idx, w0);
                     }
                 }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 {
                     Console.Error.WriteLine(
                         $"[IOPFILE] stream-table setup sid=0x{sid:X} w0=0x{w0:X} w1=0x{w1:X} w2=0x{w2:X} " +
-                        $"recv=0x{recvBuf:X8}/{recvSize} (ready-mark)");
+                        $"recv=0x{recvBuf:X8}/{recvSize} (slot-fill)");
                 }
                 EnsureGoeArchiveMounted(iopModules, cdvd);
-                // After first bulk, warm title surface members for later Open/Start.
-                if (w1 is >= 8 and <= 256)
-                    WarmWhipTitleSurface(iopModules, cdvd);
+                // WAVE-3: bridge stream-table → GOE Open+Start for firstscreen/frontend/Code.
+                // Bulk or late ring index (≥0x3F) is enough surface to arm title streams.
+                if ((w1 is >= 8 and <= 256) || (w1 == 0 && w2 >= 0x3F))
+                    BridgeWhipGoeOpenStart(mem, iopModules, cdvd, recvBuf, recvSize, w0);
                 return 1;
             }
 
@@ -5007,6 +5016,203 @@ public sealed class RealSifRpc
     }
 
     private bool _whipTitleWarmed;
+    private bool _whipOpenStartBridged;
+    private bool _whipControlInited;
+
+    /// <summary>
+    /// Fill one 16-byte EE stream-table slot: status / bufferSize / handle / iStream.
+    /// Only fills zero words so pre-written EE client state is preserved.
+    /// </summary>
+    private static void PaintWhipStreamSlot(SystemMemory mem, uint recvBuf, uint recvSize,
+        uint stride, uint idx, uint bufferSize)
+    {
+        uint baseOff = recvBuf + idx * stride;
+        if (baseOff + 16 > recvBuf + recvSize) return;
+        if (mem.Read32(baseOff) == 0)
+            mem.Write32(baseOff, 1); // status ready
+        if (mem.Read32(baseOff + 4) == 0)
+            mem.Write32(baseOff + 4, bufferSize != 0 ? bufferSize : 0xFF4u);
+        if (mem.Read32(baseOff + 8) == 0)
+            mem.Write32(baseOff + 8, 0x3100u + idx); // synthetic scefd / handle
+        if (mem.Read32(baseOff + 12) == 0)
+            mem.Write32(baseOff + 12, idx); // iStream
+    }
+
+    /// <summary>
+    /// Whiplash sid=0x40 fno=0: two EE pointers in send are out-params for control/state.
+    /// Paint ready markers + TOC count so post-stream Open path sees a live server.
+    /// </summary>
+    private void InitWhipControlWorkspaces(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint argBuf, uint sendSize)
+    {
+        if (_whipControlInited) return;
+        uint p0 = mem.Read32(argBuf) & 0x1FFFFFFFu;
+        uint p1 = sendSize >= 8 ? mem.Read32(argBuf + 4) & 0x1FFFFFFFu : 0;
+        EnsureGoeArchiveMounted(iopModules, cdvd);
+        // Each workspace: status=1, tocEntries, archiveSize lo, ready flag.
+        void Paint(uint p)
+        {
+            if (p == 0 || p + 16 > SystemMemory.RDRAM_SIZE) return;
+            if (mem.Read32(p) == 0) mem.Write32(p, 1);
+            if (mem.Read32(p + 4) == 0) mem.Write32(p + 4, (uint)_rkvTocCount);
+            if (mem.Read32(p + 8) == 0) mem.Write32(p + 8, _goeArchiveSize);
+            if (mem.Read32(p + 12) == 0) mem.Write32(p + 12, 1);
+        }
+        Paint(p0);
+        Paint(p1);
+        _whipControlInited = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[IOPFILE] whip control init p0=0x{p0:X8} p1=0x{p1:X8} toc={_rkvTocCount} rkv={_goeArchiveSize}");
+    }
+
+    /// <summary>
+    /// WAVE-3 bridge: after stream-table bulk/ring arm, Open RKV title surfaces into GOE
+    /// stream slots and Start a first buffer into EE memory so Soft-GS path can drain.
+    /// Honest RKV payload via <see cref="TryOpenFromRkv"/> + FileRead — no synthetic pixels.
+    /// </summary>
+    private void BridgeWhipGoeOpenStart(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint streamTable, uint streamTableSize, uint bufferSize)
+    {
+        if (_whipOpenStartBridged) return;
+        _whipOpenStartBridged = true;
+        EnsureGoeArchiveMounted(iopModules, cdvd);
+        WarmWhipTitleSurface(iopModules, cdvd);
+        if (_rkvTocCount == 0)
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine("[IOPFILE] whip Open+Start bridge SKIP (no RKV TOC)");
+            return;
+        }
+
+        // Resolve title-surface names from TOC (format-B may use paths / case variants).
+        string[] names = ResolveWhipTitleNames();
+        uint chunk = bufferSize is >= 0x100 and <= 0x10000 ? bufferSize : 0xFF4u;
+        // EE scratch for first Start DMA: just past the 4 KiB stream table when present,
+        // else a high RDRAM window used by other HLE temps.
+        uint destBase = streamTable != 0 && streamTableSize >= 0x1000
+            ? (streamTable + 0x1000u) & 0x1FFFFFFFu
+            : 0x01F00000u;
+        if (destBase + chunk * 4 > SystemMemory.RDRAM_SIZE)
+            destBase = 0x01F00000u;
+
+        int opened = 0;
+        int started = 0;
+        int streamIdx = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string name in names)
+        {
+            if (!seen.Add(name)) continue;
+            int fd = TryOpenFromRkv(iopModules, name, out uint sz);
+            if (fd < 0) continue;
+
+            // Map stream slot → host fd (same tables Open/Start use).
+            if (_iopFileStreamToFd.TryGetValue(streamIdx, out int oldFd) && oldFd != fd)
+            {
+                try { iopModules.FileClose(oldFd); } catch { /* ignore */ }
+                _iopFileFds.Remove(oldFd);
+            }
+            _iopFileStreamToFd[streamIdx] = fd;
+            _iopFileStreamSize[streamIdx] = sz;
+            _iopFileStreamPos[streamIdx] = 0;
+            _iopFileFds[fd] = "rkv:" + name;
+            opened++;
+
+            // Reflect real Open reply into stream-table slot (status/filesize/scefd/iStream).
+            if (streamTable != 0 && streamTableSize >= 16)
+            {
+                const uint Stride = 16;
+                if ((uint)streamIdx < streamTableSize / Stride)
+                {
+                    uint slot = streamTable + (uint)streamIdx * Stride;
+                    mem.Write32(slot + 0, 1);
+                    mem.Write32(slot + 4, sz != 0 ? sz : chunk);
+                    mem.Write32(slot + 8, unchecked((uint)fd));
+                    mem.Write32(slot + 12, (uint)streamIdx);
+                }
+            }
+
+            // Start first chunk into EE scratch (async IOP would SifSetDma this).
+            uint dest = destBase + (uint)streamIdx * chunk;
+            if (dest + chunk <= SystemMemory.RDRAM_SIZE && sz > 0)
+            {
+                uint want = Math.Min(chunk, sz);
+                int n = iopModules.FileRead(mem, fd, dest, want);
+                if (n > 0)
+                {
+                    cdvd.NoteHostReadSectors((n + 2047) / 2048);
+                    _iopFileStreamPos[streamIdx] = n;
+                    started++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                        Console.Error.WriteLine(
+                            $"[IOPFILE] whip Open+Start \"{name}\" iStream={streamIdx} fd={fd} " +
+                            $"size={sz} dest=0x{dest:X8} n={n} cdvd={cdvd.SectorsRead}");
+                }
+            }
+            else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            {
+                Console.Error.WriteLine(
+                    $"[IOPFILE] whip Open \"{name}\" iStream={streamIdx} fd={fd} size={sz} (no Start dest)");
+            }
+            streamIdx++;
+            if (streamIdx >= 8) break; // GOE client caps at a small active set
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[IOPFILE] whip Open+Start bridge done opened={opened} started={started} " +
+                $"toc={_rkvTocCount} cdvd={cdvd.SectorsRead}");
+    }
+
+    /// <summary>
+    /// Pick RKV TOC keys for Whiplash title chrome. Exact names first; else substring match
+    /// (format-B keys may be path-qualified).
+    /// </summary>
+    private string[] ResolveWhipTitleNames()
+    {
+        string[] prefer = { "firstscreen", "frontend", "Code", "code" };
+        var resolved = new List<string>();
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string want in prefer)
+        {
+            if (_rkvToc.ContainsKey(want) && used.Add(want))
+            {
+                resolved.Add(want);
+                continue;
+            }
+            string? hit = null;
+            foreach (string k in _rkvToc.Keys)
+            {
+                if (k.Equals(want, StringComparison.OrdinalIgnoreCase)
+                    || k.EndsWith("/" + want, StringComparison.OrdinalIgnoreCase)
+                    || k.EndsWith("\\" + want, StringComparison.OrdinalIgnoreCase)
+                    || k.Contains(want, StringComparison.OrdinalIgnoreCase))
+                {
+                    hit = k;
+                    break;
+                }
+            }
+            if (hit != null && used.Add(hit))
+                resolved.Add(hit);
+        }
+        // Fallback: largest few TOC members (likely Code / frontend payloads).
+        if (resolved.Count == 0)
+        {
+            foreach (var kv in _rkvToc.OrderByDescending(e => e.Value.Size).Take(4))
+            {
+                if (used.Add(kv.Key))
+                    resolved.Add(kv.Key);
+            }
+        }
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+        {
+            string sample = string.Join(",", _rkvToc.Keys.Take(12));
+            Console.Error.WriteLine(
+                $"[IOPFILE] whip title names resolved=[{string.Join(",", resolved)}] " +
+                $"tocSample=[{sample}]");
+        }
+        return resolved.ToArray();
+    }
 
     private void WarmWhipTitleSurface(IopModuleHost iopModules, Cdvd cdvd)
     {
@@ -5014,7 +5220,7 @@ public sealed class RealSifRpc
         _whipTitleWarmed = true;
         EnsureGoeArchiveMounted(iopModules, cdvd);
         if (_rkvTocCount == 0) return;
-        foreach (string name in new[] { "firstscreen", "frontend", "Code", "code" })
+        foreach (string name in ResolveWhipTitleNames())
         {
             int fd = TryOpenFromRkv(iopModules, name, out uint sz);
             if (fd < 0) continue;
@@ -5024,7 +5230,14 @@ public sealed class RealSifRpc
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
                     $"[IOPFILE] warm whip surface \"{name}\" size={sz} token={token} cdvd={cdvd.SectorsRead}");
-            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            // Leave fd open only if already mapped by Open+Start bridge; else close probe.
+            bool mapped = false;
+            foreach (var kv in _iopFileStreamToFd)
+                if (kv.Value == fd) { mapped = true; break; }
+            if (!mapped)
+            {
+                try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            }
         }
     }
 
@@ -5419,7 +5632,8 @@ public sealed class RealSifRpc
         // Prefer a host-side read through FileSeek/FileRead into a temporary SystemMemory window
         // is heavy — instead use a small managed buffer via FileRead into a scratch EE addr.
         const uint Scratch = 0x01FC8000;
-        const uint MaxToc = 0x1A000;
+        // Whiplash live tocBytes=0x1C7F8 — keep headroom above that (was 0x1A000, truncated).
+        const uint MaxToc = 0x20000;
         uint tocBytes = Math.Min(fsz, MaxToc);
         // Ensure fd at start.
         iopModules.FileSeek(fd, 0, 0);
@@ -5485,23 +5699,55 @@ public sealed class RealSifRpc
         }
 
         // --- Format B (Whiplash SLUS_206.84): no null after name.
-        // Sliding scan: u32 nlen, char name[nlen], u32 type==1, u32 size, u32 offset, u32 pad.
-        // Folder headers interleave with shorter records; byte-scan is robust.
-        // Live 2026-07-30: ver=1 tocBytes=0x1C7F8, names "Code","firstscreen","frontend",… ---
+        // Layout: u32 nlen, char name[nlen], u32 type (1=file 2=folder), u32 size/id, u32 offset, u32 pad.
+        // Folder records interleave non-uniform trailers ("english" type=2 then "null"/"strstrem"),
+        // so a pure sequential walk stalls — combine: (1) plant known title names by string scan,
+        // (2) sliding scan for the rest. Live tocBytes=0x1C7F8.
         if (offsets.Count == 0)
         {
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            for (p = 0x0C; p + 24 < limit; p += 4)
+            // (1) Title-surface plant: locate "Code"/"firstscreen"/"frontend" by raw scan.
+            foreach (string want in new[] { "Code", "firstscreen", "frontend" })
             {
-                uint nlen = BitConverter.ToUInt32(toc, p);
+                byte[] needle = System.Text.Encoding.ASCII.GetBytes(want);
+                for (int i = 0; i + needle.Length + 16 < limit; i++)
+                {
+                    bool match = true;
+                    for (int k = 0; k < needle.Length; k++)
+                        if (toc[i + k] != needle[k]) { match = false; break; }
+                    if (!match) continue;
+                    if (i < 4) continue;
+                    uint nlen = BitConverter.ToUInt32(toc, i - 4);
+                    if (nlen != (uint)needle.Length) continue;
+                    int block = i + needle.Length;
+                    uint type = BitConverter.ToUInt32(toc, block);
+                    if (type != 1) continue;
+                    uint w1 = BitConverter.ToUInt32(toc, block + 4);
+                    uint w2 = BitConverter.ToUInt32(toc, block + 8);
+                    uint off = w2, sz = w1;
+                    if (off < tocFloor || off >= _goeArchiveSize)
+                    {
+                        if (w1 >= tocFloor && w1 < _goeArchiveSize)
+                        { off = w1; sz = w2; }
+                        else
+                            continue;
+                    }
+                    if (!seen.Add(want)) break;
+                    offsets.Add((want, off, sz));
+                    break; // first well-formed hit
+                }
+            }
+            // (2) Sliding scan for remaining members.
+            for (int sp = 0x0C; sp + 24 < limit; sp += 4)
+            {
+                uint nlen = BitConverter.ToUInt32(toc, sp);
                 if (nlen is < 1 or > 64) continue;
-                int ns = p + 4;
+                int ns = sp + 4;
                 if (ns + (int)nlen + 16 > limit) continue;
                 bool bad = false;
                 for (int i = 0; i < (int)nlen; i++)
                 {
                     byte b = toc[ns + i];
-                    // Names are [A-Za-z0-9_./-]
                     if (!((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
                           || b is (byte)'_' or (byte)'.' or (byte)'/' or (byte)'-' or (byte)'\\'))
                     { bad = true; break; }
@@ -5526,20 +5772,24 @@ public sealed class RealSifRpc
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine(
-                    $"[IOPFILE] RKV format-B (Whiplash-style) candidates={offsets.Count}");
+                    $"[IOPFILE] RKV format-B (Whiplash-style) candidates={offsets.Count} " +
+                    $"hasFirstscreen={seen.Contains("firstscreen")} hasFrontend={seen.Contains("frontend")} " +
+                    $"hasCode={seen.Contains("Code")}");
         }
 
-        // Fill zero sizes from next offset delta (sorted by offset).
+        // Fill sizes from next offset delta (sorted by offset). Format-B often stores a
+        // small id/count in the size field (firstscreen w1=0xBB) — prefer delta when larger.
         var byOff = offsets.Where(e => e.Off >= tocFloor && e.Off < Math.Max(_goeArchiveSize, tocFloor + 1))
             .OrderBy(e => e.Off).ToList();
         for (int i = 0; i < byOff.Count; i++)
         {
             uint sz = byOff[i].Sz;
-            if (sz == 0 || sz > _goeArchiveSize)
+            uint next = i + 1 < byOff.Count ? byOff[i + 1].Off : _goeArchiveSize;
+            if (next > byOff[i].Off)
             {
-                uint next = i + 1 < byOff.Count ? byOff[i + 1].Off : _goeArchiveSize;
-                if (next > byOff[i].Off)
-                    sz = next - byOff[i].Off;
+                uint delta = next - byOff[i].Off;
+                if (sz == 0 || sz > _goeArchiveSize || (sz < 0x1000 && delta > sz && delta < _goeArchiveSize))
+                    sz = delta;
             }
             if (sz == 0 || sz > _goeArchiveSize) continue;
             string key = byOff[i].Name.Replace('\\', '/').Trim().ToLowerInvariant();
@@ -5553,9 +5803,42 @@ public sealed class RealSifRpc
                     _rkvToc[baseName] = (byOff[i].Off, sz);
             }
         }
+        // Title-surface size repair: sliding-scan false positives pollute offset-delta sizes
+        // (firstscreen collapsed to ~800 B). Recompute among known names only.
+        string[] titleKeys = { "code", "firstscreen", "frontend" };
+        var titleOffs = new List<(string Key, uint Off)>();
+        foreach (string k in titleKeys)
+        {
+            if (_rkvToc.TryGetValue(k, out var e) && e.Offset > 0)
+                titleOffs.Add((k, e.Offset));
+        }
+        titleOffs.Sort((a, b) => a.Off.CompareTo(b.Off));
+        for (int i = 0; i < titleOffs.Count; i++)
+        {
+            uint next = i + 1 < titleOffs.Count ? titleOffs[i + 1].Off : _goeArchiveSize;
+            // Cap single title member at 64 MiB (Code can be multi-MB; avoid end-of-archive blowup).
+            uint sz = next > titleOffs[i].Off ? next - titleOffs[i].Off : 0;
+            if (sz == 0 || sz > 64u * 1024 * 1024)
+            {
+                // Fallback: keep existing if sane, else 256 KiB probe window.
+                if (_rkvToc.TryGetValue(titleOffs[i].Key, out var cur) && cur.Size is > 0x1000 and < 64u * 1024 * 1024)
+                    continue;
+                sz = Math.Min(256u * 1024, _goeArchiveSize - titleOffs[i].Off);
+            }
+            if (sz == 0) continue;
+            _rkvToc[titleOffs[i].Key] = (titleOffs[i].Off, sz);
+        }
+
         _rkvTocCount = _rkvToc.Count;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-            Console.Error.WriteLine($"[IOPFILE] RKV TOC parsed entries={_rkvTocCount} (raw={offsets.Count})");
+        {
+            string titleInfo = "";
+            foreach (string k in titleKeys)
+                if (_rkvToc.TryGetValue(k, out var e))
+                    titleInfo += $" {k}=off:0x{e.Offset:X}/sz:0x{e.Size:X}";
+            Console.Error.WriteLine(
+                $"[IOPFILE] RKV TOC parsed entries={_rkvTocCount} (raw={offsets.Count}){titleInfo}");
+        }
     }
 
     /// <summary>Open a path from the mounted PS2.RKV TOC as a virtual disc stream.</summary>
