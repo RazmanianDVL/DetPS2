@@ -33,6 +33,11 @@ namespace DetPS2.Core;
 /// S1 / PL-017: after STREE0 stream + Soft-GS title surface, dense START/CROSS pad inject
 /// (edge phases + ForceRefreshPad) so frontend/pad readers can advance toward INTERACTIVE
 /// (T2 / P1). No WaitSema fabricate; no invent PATH3 / plant pixels.
+///
+/// S2 / PL-032: TRE member completeness — binary .tgax/.bmpx score was 8–9 &lt; MemberMinScore
+/// so many fonts/shadows failed CRC open; host-read BADARGS (buf=0xFFFFFFF0 size=-1) on
+/// text/begin.atr recovered via freelist/s-reg buffer hunt + host bump; nested stree1/patch0
+/// open as minimal TRE stubs when not in STREE0 index.
 /// </summary>
 public sealed class VexxAssist : IGameQuirkModule
 {
@@ -120,6 +125,7 @@ public sealed class VexxAssist : IGameQuirkModule
     private int _stackRescues, _cdIoReplants, _streamMapEscapes;
     private int _hostOpens, _hostReads, _hostCloses, _hostSeeks;
     private int _hostMemberOpens, _hostMemberFail;
+    private int _hostBadArgsRecovered, _hostNestedTreStubs;
     private int _streamMapProbes, _streamMapPlants;
     private int _streamMapLookupHits;
     private int _padInjectPulses;
@@ -128,6 +134,11 @@ public sealed class VexxAssist : IGameQuirkModule
     private string? _isoVolPath;
     /// <summary>Game 1-based handle → IopModules FILEIO fd (0-based).</summary>
     private readonly Dictionary<int, int> _hostFds = new();
+    /// <summary>1-based handle → last successful open size (for BADARGS bulk-read recovery).</summary>
+    private readonly Dictionary<int, uint> _hostFdSizes = new();
+    /// <summary>Recent freelist bump bases (PL-032 BADARGS buffer hunt).</summary>
+    private readonly uint[] _recentBumpBases = new uint[8];
+    private int _recentBumpCount;
 
     /// <summary>STREE0 disc byte offset (LBA×2048) once resolved.</summary>
     private long _stree0DiscByteOff;
@@ -135,8 +146,11 @@ public sealed class VexxAssist : IGameQuirkModule
     /// <summary>NameCRC32 (path) → (offset within STREE0, size, score). Built once from TOC words.</summary>
     private Dictionary<uint, (uint Off, uint Size, int Score)>? _streeMemberByCrc;
     private int _streeMemberIndexCount;
-    /// <summary>Minimum payload probe score to accept a NameCRC→(off,sz) candidate.</summary>
-    private const int MemberMinScore = 10;
+    /// <summary>
+    /// Minimum payload probe score. PL-032: was 10 which rejected compact binary .tgax
+    /// (score 8–9) — button2–9 / shadows / loadtimer all failed open despite valid NameCRC.
+    /// </summary>
+    private const int MemberMinScore = 8;
 
     public void Reset()
     {
@@ -146,12 +160,16 @@ public sealed class VexxAssist : IGameQuirkModule
         _stackRescues = _cdIoReplants = _streamMapEscapes = 0;
         _hostOpens = _hostReads = _hostCloses = _hostSeeks = 0;
         _hostMemberOpens = _hostMemberFail = 0;
+        _hostBadArgsRecovered = _hostNestedTreStubs = 0;
         _streamMapProbes = _streamMapPlants = 0;
         _streamMapLookupHits = 0;
         _padInjectPulses = 0;
         _tocProbeDone = false;
         _streamMapTable = _streamMapCount = _streamMapObj = 0;
         _hostFds.Clear();
+        _hostFdSizes.Clear();
+        _recentBumpCount = 0;
+        Array.Clear(_recentBumpBases);
         _stree0DiscByteOff = 0;
         _stree0Size = 0;
         _streeMemberByCrc = null;
@@ -273,6 +291,7 @@ public sealed class VexxAssist : IGameQuirkModule
                     uint mem = HostBumpAlloc(sys, size + 64);
                     if (mem != 0)
                     {
+                        NoteBumpBase(mem);
                         sys.EE.SetGpr(20, new EmotionEngine.Gpr128 { Lo = mem });
                         sys.EE.SetGpr(21, new EmotionEngine.Gpr128 { Lo = mem + 32 });
                         sys.EE.PC = FreelistSuccessStore;
@@ -566,7 +585,7 @@ public sealed class VexxAssist : IGameQuirkModule
                 fd = mods.FileOpen("cdrom0:\\" + leaf, 1);
         }
 
-        // Wave-6: data\… / fonts / frontend live inside STREE0 — virtual member stream.
+        // Wave-6 / PL-032: data\… / fonts / frontend live inside STREE0 — virtual member stream.
         bool member = false;
         uint memberSz = 0;
         if (fd < 0)
@@ -576,11 +595,30 @@ public sealed class VexxAssist : IGameQuirkModule
             member = fd >= 0;
         }
 
+        // Nested probe packs (streeN.tre / patch0.tre) are often NOT in STREE0 NameCRC index.
+        // Do NOT stub empty TRE success — retail treats open-ok as "pack present" and walks
+        // stree1…stree24 forever (PL-032 claim: blocked font/button opens). Leave FAIL so
+        // the loader continues to in-STREE0 members (fontindex / buttons / begin.atr).
+        // Only stub sound.ad6 when CRC miss (audio residual, not the streeN probe loop).
+        if (fd < 0 && LooksLikeSoundPackOnly(raw, path))
+        {
+            fd = OpenNestedTreStub(mods, raw.Length > 0 ? raw : path);
+            if (fd >= 0)
+            {
+                memberSz = 16;
+                _hostNestedTreStubs++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1"
+                    && _hostNestedTreStubs <= 8)
+                    Console.Error.WriteLine(
+                        $"[VEXX] sound-pack stub #{_hostNestedTreStubs} \"{raw}\" cyc={sys.Scheduler.MasterCycles}");
+            }
+        }
+
         if (fd < 0)
         {
             _hostMemberFail++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1"
-                && (_hostOpens + _hostMemberFail) <= 40)
+                && (_hostOpens + _hostMemberFail) <= 48)
                 Console.Error.WriteLine(
                     $"[VEXX] host-open FAIL \"{raw}\" → \"{path}\" cyc={sys.Scheduler.MasterCycles}");
             ReturnHost(sys, 0);
@@ -589,21 +627,45 @@ public sealed class VexxAssist : IGameQuirkModule
 
         int handle = fd + 1; // retail open returns 1-based; read does a0--
         _hostFds[handle] = fd;
+        if (!member) mods.TryGetOpenFileSize(fd, out memberSz);
+        if (memberSz > 0) _hostFdSizes[handle] = memberSz;
         _hostOpens++;
         if (member) _hostMemberOpens++;
         // Do NOT credit full 1GB TRE at open — only actual FileRead bytes (TOC stream).
         // Member open credits a small sector token so cdvd advances with asset binds.
         if (member && memberSz > 0)
             sys.Cdvd.NoteHostReadSectors((int)Math.Min((memberSz + 2047) / 2048, 64));
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens <= 32)
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostOpens <= 48)
         {
-            if (!member) mods.TryGetOpenFileSize(fd, out memberSz);
             Console.Error.WriteLine(
                 $"[VEXX] host-open #{_hostOpens}{(member ? " MEMBER" : "")} \"{raw}\" → \"{path}\" " +
                 $"h={handle} fd={fd} size={memberSz} members={_hostMemberOpens} cyc={sys.Scheduler.MasterCycles}");
         }
         ReturnHost(sys, unchecked((uint)handle));
         return true;
+    }
+
+    private void NoteBumpBase(uint mem)
+    {
+        if (mem < BumpArenaBase || mem >= BumpArenaEnd) return;
+        int slot = _recentBumpCount % _recentBumpBases.Length;
+        _recentBumpBases[slot] = mem;
+        _recentBumpCount++;
+    }
+
+    private static bool LooksLikeSoundPackOnly(string raw, string path)
+    {
+        string s = (raw.Length > 0 ? raw : path).ToLowerInvariant().Replace('/', '\\');
+        string leaf = System.IO.Path.GetFileName(s);
+        // Never stub streeN.tre / patch0.tre — open FAIL is required for probe skip.
+        return leaf is "sound.ad6" || s.EndsWith("\\sound.ad6");
+    }
+
+    /// <summary>Minimal empty payload so sound-pack open leaves ENOENT thrash.</summary>
+    private static int OpenNestedTreStub(IopModuleHost mods, string name)
+    {
+        var stub = new byte[16];
+        return mods.FileOpenMemoryStub("vexx-sound-stub:" + name, stub);
     }
 
     /// <summary>
@@ -620,8 +682,8 @@ public sealed class VexxAssist : IGameQuirkModule
         string key = NormalizeMemberPath(raw.Length > 0 ? raw : path);
         if (key.Length == 0) return -1;
 
-        // Try full path, leaf-prefixed data\, and plain leaf under common roots.
-        var alts = new List<string>(8) { key };
+        // Path alts: full, leaf, data\ prefix, $/ strip already done in Normalize.
+        var alts = new List<string>(12) { key };
         string leaf = System.IO.Path.GetFileName(key.Replace('/', '\\'));
         if (!string.IsNullOrEmpty(leaf) && leaf != key)
         {
@@ -629,8 +691,10 @@ public sealed class VexxAssist : IGameQuirkModule
             if (!key.StartsWith("data\\", StringComparison.Ordinal))
                 alts.Add("data\\" + key);
         }
-        // Uppercase path variants (some TOC NameCRCs use mixed case; we CRC lower).
-        // Already lowercased in NormalizeMemberPath.
+        // SOUND.AD6 retail sometimes uppercases the whole path after Normalize lower — CRC is
+        // lowercased; also try without data\ for packs that live under sound\ only.
+        if (key.StartsWith("data\\", StringComparison.Ordinal) && key.Length > 5)
+            alts.Add(key[5..]);
 
         foreach (string a in alts)
         {
@@ -639,8 +703,8 @@ public sealed class VexxAssist : IGameQuirkModule
                 continue;
             // Reject weak matches (e.g. sound0.tre false positive → UnknownOpcode thrash).
             if (ent.Score < MemberMinScore) continue;
-            // Nested .tre must start with a plausible entry-count header.
-            if (a.EndsWith(".tre", StringComparison.Ordinal) && ent.Score < 20)
+            // Nested .tre must start with a plausible entry-count header (score≥20 from probe).
+            if (a.EndsWith(".tre", StringComparison.Ordinal) && ent.Score < 12)
                 continue;
             long abs = _stree0DiscByteOff + ent.Off;
             if (abs > uint.MaxValue) continue;
@@ -708,10 +772,18 @@ public sealed class VexxAssist : IGameQuirkModule
             int words = n / 4;
             uint tocEnd = 4 + bytes;
 
-            // Dual sliding layouts over the index word stream (not only 24-byte aligned):
-            //   A: NameCRC, DataCRC, offset, size
-            //   C: offset, size, NameCRC, DataCRC
-            // Score candidates by payload probe; keep best per NameCRC.
+            // STREE0 hash entry is 24 bytes / 6 u32 (ground-truthed PL-032):
+            //   [0] link/unk  [1] unk  [2] NameCRC  [3] DataCRC  [4] offset  [5] size
+            // Prefer aligned entries; also keep dual sliding 4-word layouts for residual.
+            int entryCount = (int)(bytes / 24u);
+            for (int e = 0; e < entryCount; e++)
+            {
+                int baseOff = e * 24;
+                uint nameCrc = BitConverter.ToUInt32(buf, baseOff + 8);
+                uint off = BitConverter.ToUInt32(buf, baseOff + 16);
+                uint sz = BitConverter.ToUInt32(buf, baseOff + 20);
+                TryOfferMember(nameCrc, off, sz, tocEnd);
+            }
             for (int i = 0; i + 3 < words; i++)
             {
                 uint w0 = BitConverter.ToUInt32(buf, i * 4);
@@ -798,7 +870,9 @@ public sealed class VexxAssist : IGameQuirkModule
                 score += 6;
         }
 
-        // Binary texture-ish: low printable, non-zero header (tgax/bmpx)
+        // Binary texture-ish: low printable, non-zero header (tgax/bmpx/atf).
+        // PL-032: compact binary was score 8–9 &lt; old min 10 → systematic open FAIL for
+        // button2–9 / shadows / loadtimer despite valid NameCRC. Boost to clear min=8.
         int printable = 0;
         int n = Math.Min(b.Length, 32);
         for (int i = 0; i < n; i++)
@@ -807,7 +881,8 @@ public sealed class VexxAssist : IGameQuirkModule
             if (c is >= 32 and < 127 or 9 or 10 or 13) printable++;
         }
         score += printable / 5;
-        if (printable <= 6 && w0 != 0) score += 8; // compact binary head
+        if (printable <= 6 && w0 != 0) score += 10; // compact binary head (was +8)
+        else if (printable <= 12 && w0 != 0) score += 4;
 
         // Reject pure zeros / near-empty
         if (score < 4 && printable < 4) return -1;
@@ -871,15 +946,34 @@ public sealed class VexxAssist : IGameQuirkModule
             }
         }
 
-        // Reject non-RDRAM destinations (wave-5: Game.txt thrash used buf=0xFFFFFFF0).
+        // PL-032: retail text/begin.atr path often arrives with buf=0xFFFFFFF0 size=0xFFFFFFFF
+        // (unwired out-buffer + "read all"). Recover a destination from recent freelist bumps
+        // or s-registers before failing EFAULT — open already succeeded with real size.
         uint phys = buf & 0x1FFFFFFFu;
-        if (buf == 0 || phys < 0x1000u || phys >= SystemMemory.RDRAM_SIZE)
+        bool badBuf = buf == 0 || phys < 0x1000u || phys >= SystemMemory.RDRAM_SIZE;
+        if (badBuf)
         {
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads < 24)
-                Console.Error.WriteLine(
-                    $"[VEXX] host-read BADARGS h={handle} buf=0x{buf:X} size=0x{size:X} cyc={sys.Scheduler.MasterCycles}");
-            ReturnHost(sys, unchecked((uint)(-14))); // EFAULT-ish
-            return true;
+            uint recovered = RecoverReadBuffer(sys, handle, mods, ref size);
+            if (recovered != 0)
+            {
+                buf = recovered;
+                phys = recovered & 0x1FFFFFFFu;
+                badBuf = false;
+                _hostBadArgsRecovered++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1"
+                    && _hostBadArgsRecovered <= 16)
+                    Console.Error.WriteLine(
+                        $"[VEXX] host-read BADARGS recover #{_hostBadArgsRecovered} h={handle} " +
+                        $"buf→0x{buf:X} size=0x{size:X} cyc={sys.Scheduler.MasterCycles}");
+            }
+            else
+            {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads < 24)
+                    Console.Error.WriteLine(
+                        $"[VEXX] host-read BADARGS h={handle} buf=0x{buf:X} size=0x{size:X} cyc={sys.Scheduler.MasterCycles}");
+                ReturnHost(sys, unchecked((uint)(-14))); // EFAULT-ish
+                return true;
+            }
         }
 
         // Wave-6: retail often passes size=0xFFFFFFFF ("read all") for host:$ members.
@@ -902,6 +996,8 @@ public sealed class VexxAssist : IGameQuirkModule
             // restore position after tell
             if (pos >= 0) mods.FileSeek(fd, pos, 0); // SEEK_SET
         }
+        else if (_hostFdSizes.TryGetValue(handle, out uint known) && known > 0 && size > known)
+            size = known;
         if (phys + size > SystemMemory.RDRAM_SIZE)
             size = SystemMemory.RDRAM_SIZE - phys;
         if (size == 0)
@@ -914,11 +1010,63 @@ public sealed class VexxAssist : IGameQuirkModule
         if (n > 0)
             sys.Cdvd.NoteHostReadSectors((n + 2047) / 2048);
         _hostReads++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads <= 32)
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostReads <= 48)
             Console.Error.WriteLine(
                 $"[VEXX] host-read #{_hostReads} h={handle} buf=0x{buf:X} size=0x{size:X} n={n} cdvd={sys.Cdvd.SectorsRead} cyc={sys.Scheduler.MasterCycles}");
         ReturnHost(sys, unchecked((uint)n));
         return true;
+    }
+
+    /// <summary>
+    /// PL-032 BADARGS recovery: pick a writable EE buffer for bulk host-read when a1/a2 are
+    /// poison (0xFFFFFFF0 / 0xFFFFFFFF). Prefer recent freelist bump, then s0–s7 pointers in
+    /// the CRT bump arena, else host-bump a fresh block sized to the open file.
+    /// </summary>
+    private uint RecoverReadBuffer(Ps2System sys, int handle, IopModuleHost mods, ref uint size)
+    {
+        uint want = size;
+        if (want == 0 || want > HostReadMaxBytes)
+            want = HostReadMaxBytes;
+        if (_hostFdSizes.TryGetValue(handle, out uint known) && known > 0)
+            want = Math.Min(want, known);
+        else if (_hostFds.TryGetValue(handle, out int fd)
+                 && mods.TryGetOpenFileSize(fd, out uint fsz) && fsz > 0)
+            want = Math.Min(want, fsz);
+        if (want == 0 || want > HostReadMaxBytes)
+            want = 0x1000;
+        size = want;
+
+        // 1) Recent freelist bumps (most recent first).
+        int n = Math.Min(_recentBumpCount, _recentBumpBases.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int slot = (_recentBumpCount - 1 - i) % _recentBumpBases.Length;
+            if (slot < 0) slot += _recentBumpBases.Length;
+            uint baseAddr = _recentBumpBases[slot];
+            if (baseAddr >= BumpArenaBase && baseAddr + want <= BumpArenaEnd)
+                return baseAddr;
+        }
+
+        // 2) Callee-saved regs that look like bump-arena pointers.
+        for (int r = 16; r <= 23; r++) // s0–s7
+        {
+            uint p = (uint)(sys.EE.GetGpr(r).Lo & 0x1FFFFFFFu);
+            if (p >= BumpArenaBase && p + want <= BumpArenaEnd)
+                return p;
+            if (p is >= 0x00100000 and < SystemMemory.RDRAM_SIZE && p + want <= SystemMemory.RDRAM_SIZE
+                && p + want > p)
+                return p;
+        }
+
+        // 3) Fresh host bump — game may not retain the pointer, but v0=n still advances
+        //    readers that only check the return count (fontindex/history list parse).
+        uint alloc = HostBumpAlloc(sys, want + 64);
+        if (alloc != 0)
+        {
+            NoteBumpBase(alloc);
+            return alloc;
+        }
+        return 0;
     }
 
     private bool HostCdClose(Ps2System sys, IopModuleHost mods)
@@ -928,8 +1076,9 @@ public sealed class VexxAssist : IGameQuirkModule
         {
             mods.FileClose(fd);
             _hostFds.Remove(handle);
+            _hostFdSizes.Remove(handle);
             _hostCloses++;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostCloses <= 16)
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1" && _hostCloses <= 24)
                 Console.Error.WriteLine(
                     $"[VEXX] host-close #{_hostCloses} h={handle} cyc={sys.Scheduler.MasterCycles}");
         }
@@ -980,15 +1129,28 @@ public sealed class VexxAssist : IGameQuirkModule
         int handle = (int)sys.EE.GetGpr(4).Lo;
         if (!_hostFds.TryGetValue(handle, out int fd))
         {
-            ReturnHost(sys, 0);
-            return true;
+            // Size wrappers may a0-- before call (0-based).
+            if (!_hostFds.TryGetValue(handle + 1, out fd))
+            {
+                if (_hostFdSizes.TryGetValue(handle, out uint known0))
+                {
+                    ReturnHost(sys, known0);
+                    return true;
+                }
+                ReturnHost(sys, 0);
+                return true;
+            }
+            handle = handle + 1;
         }
         if (!mods.TryGetOpenFileSize(fd, out uint sz))
             sz = 0;
+        if (sz == 0 && _hostFdSizes.TryGetValue(handle, out uint known))
+            sz = known;
         // Cap only multi-100MB TRE roots (STREE0 ~1GB) so malloc takes TOC headroom.
         // Wave-6 members (fonts/textures/mcf) must report real size — do not clamp them.
         if (sz > 100u * 1024 * 1024)
             sz = 0x00492570; // STREE0 TOC byte length from header w1
+        if (sz > 0) _hostFdSizes[handle] = sz;
         ReturnHost(sys, sz);
         return true;
     }
