@@ -661,8 +661,10 @@ public sealed class Gs : ISchedulable
         // WAVE-5/6: retail ofx/ofy=0x8000 full-width strip collapses to h=1 (Whiplash
         // title sprite raw Y=0 both corners). Expand to a full Soft-GS title surface so
         // menuKind title-surface is MENU-class chrome — color/UV still from the prim.
+        // WAVE-7: also expand partial-height logo bands (BO2 ofx=0x8000 ~112-row clear
+        // → full title FB) so post-stream Path2 sprites paint MENU-class chrome.
         bool titleStrip = ofxR == 0x8000 && ofyR == 0x8000
-            && w >= FB_WIDTH / 2 && h < 8;
+            && w >= FB_WIDTH / 2 && h < FB_HEIGHT / 2;
         if (x0 > x1 || y0 > y1)
         {
             // Commercial rescue: sprite fully off Soft-GS FB after XYOFFSET — clamp onto
