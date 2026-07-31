@@ -117,6 +117,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
+    private int _daPostLogoSoftSuccess;
+    private bool _daPostLogoPlanted;
 
     // DA post-gameart display pump (live 2026-07-31 @20M):
     // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
@@ -132,6 +134,22 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DaDiEiLo = 0x00114F20;
     private const uint DaDiEiHi = 0x00114F80;
     private const uint DaDisplayCmdDoneBit = 0x40000000u;
+
+    // DA WAVE-6 post-logo soft-success (live 2026-07-31 Soft-GS px=716800 then CRT Exit):
+    // main@0x11F800 → 0x123A30 → 0x1A8840 → list-dispatch@0x1A4E20.
+    // Primary handlers paint Midway Path2 sprites; last node jalr@0x1CB200 returns 0 →
+    // cleanup → 0x1A8840 returns 0 → main gate@0x11F93C fails → CRT Exit(0)@0x10C044.
+    // Soft-succeed the one-instruction v0 checks so main reaches the real loop@0x11F9D4
+    // (midway-menu keep-alive) without inventing Soft-GS pixels.
+    private const uint DaListDispatchCheck = 0x001A4E58; // bne v0 after primary jalr
+    private const uint DaLogoStateFailLo = 0x001A88C4;   // fail a1=3 cleanup after 0x1A4E20==0
+    private const uint DaLogoStateFailHi = 0x001A88EC;
+    private const uint DaLogoStateEpi = 0x001A88DC;      // shared epilogue (v0 already set)
+    private const uint DaLogoStateObj = 0x005335C0;      // s0 in 0x1A8840
+    private const uint DaLogoStateWord = DaLogoStateObj + 0x14C; // state machine word
+    private const uint DaMainLogoGateLo = 0x0011F93C;    // bne after jal 0x123A30
+    private const uint DaMainLogoGateHi = 0x0011F948;
+    private const uint DaMainLogoContinue = 0x0011F94C;  // post-success next jal
 
     // Dec post-0x127900 residual (live 200M+/280M host-present after exception plant):
     // main stays alive in 0x3B9E00 list helper (OUTSIDE shared freelist band 0x3BA948).
@@ -219,6 +237,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
+        _daPostLogoSoftSuccess = 0;
+        _daPostLogoPlanted = false;
         _openSendRetargetPlanted = false;
     }
 
@@ -239,6 +259,18 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             or (>= 0x00126CE0UL and <= 0x00126F60UL)
             or (>= 0x00127900UL and <= 0x00127A00UL)
             or (>= 0x001D9620UL and <= 0x001D9900UL);
+
+    /// <summary>
+    /// DA post-logo one-instruction v0 gates + CRT Exit residual. Exposed so
+    /// <see cref="Ps2System"/> tightens the EE slice (same class as Dec sys-init).
+    /// </summary>
+    public static bool IsDaPostLogoHotPc(ulong pcPhys) =>
+        pcPhys is (>= 0x001A4E50UL and <= 0x001A4EACUL)   // list-dispatch + fail/success tails
+            or (>= 0x001A8840UL and <= 0x001A88ECUL)      // logo state transition
+            or (>= 0x00123A30UL and <= 0x00123BC0UL)      // main logo init body
+            or (>= 0x0011F930UL and <= 0x0011F960UL)      // main gate after 0x123A30
+            or (>= 0x0010C040UL and <= 0x0010C050UL)      // CRT Exit stub
+            or (>= 0x001152F0UL and <= 0x00115318UL);     // CRT exit wrapper
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
 
@@ -269,7 +301,12 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryBridgeDaMflCallRpcArg(sys);
             TryKickDaPostWait(sys);
             TryEscapeDaDisplayQueueLock(sys);
+            // WAVE-6: permanent fail-tail plants + runtime soft-success so main reaches
+            // menu loop after Midway Path2 paint (no CRT Exit freeze).
+            TryPlantDaPostLogoFailTails(sys);
+            TrySoftSuccessDaPostLogoInit(sys);
             TryRescueDaPostDisplayExit(sys);
+            TryKeepAliveDaMidwayMenu(sys);
         }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
         // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
@@ -894,6 +931,271 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// DA WAVE-6: permanent Dec-class fail-tail plants so post-Path2 logo init cannot
+    /// abort main→CRT Exit. Plants once after ELF is resident (same timing as Dec plants).
+    /// <list type="bullet">
+    /// <item>0x1A4E58: list-dispatch always continue (not cleanup on v0==0)</item>
+    /// <item>0x1A4E94: fail return v0=1 instead of 0</item>
+    /// <item>0x1A888C: skip 0x1A8840 fail cleanup after 0x1A4E20</item>
+    /// <item>0x11F93C / 0x11F944: main always continues past 0x123A30</item>
+    /// </list>
+    /// Does not invent Soft-GS pixels. Does not force wait status=4.
+    /// </summary>
+    private void TryPlantDaPostLogoFailTails(Ps2System sys)
+    {
+        if (_daPostLogoPlanted) return;
+        // EE code resident after PT_LOAD; plant once before logo gate (~7.5M).
+        if (sys.MasterCycles < 5_000_000) return;
+
+        int plants = 0;
+
+        // list-dispatch@0x1A4E58: bne v0,zero,success(0x1A4E98) → always branch
+        // 0x1440000F → 0x1000000F (beq zero,zero,+15)
+        if (sys.Memory.Read32(0x001A4E58) == 0x1440000Fu)
+        {
+            sys.Memory.Write32(0x001A4E58, 0x1000000Fu);
+            plants++;
+        }
+        // fail return at 0x1A4E94: daddu v0,zero,zero → addiu v0,zero,1
+        if (sys.Memory.Read32(0x001A4E94) == 0x0000102Du)
+        {
+            sys.Memory.Write32(0x001A4E94, 0x24020001u);
+            plants++;
+        }
+        // 0x1A8840: after jal 0x1A4E20, beq v0,zero,fail@0x1A88C4 → nop (fall into success)
+        // 0x1040000D at 0x1A888C
+        if (sys.Memory.Read32(0x001A888C) == 0x1040000Du)
+        {
+            sys.Memory.Write32(0x001A888C, 0x00000000u);
+            plants++;
+        }
+        // success tail already does state=3 + v0=1; if we fall through from nop'd beq
+        // with v0==0, force the success store path by also planting the fail epilogue
+        // v0=0 at 0x1A88D8 → v0=1, and state word write at 0x1A88C0 runs only on success.
+        // Plant fail epilogue return as success:
+        if (sys.Memory.Read32(0x001A88D8) == 0x0000102Du)
+        {
+            sys.Memory.Write32(0x001A88D8, 0x24020001u); // addiu v0, zero, 1
+            plants++;
+        }
+        // Also force state=3 store on fail cleanup path: 0x1A88C0 is delay of success branch;
+        // on fail path state is not set. Plant at 0x1A88D4 (before v0 clear) is messy.
+        // Rely on main-gate plant below as belt.
+
+        // main@0x11F93C: bne v0,zero,continue → always continue
+        // 0x14400003 → 0x10000003
+        if (sys.Memory.Read32(0x0011F93C) == 0x14400003u)
+        {
+            sys.Memory.Write32(0x0011F93C, 0x10000003u);
+            plants++;
+        }
+        // main fail b epilogue@0x11F944: 0x10000099 → b continue@0x11F94C (imm 1)
+        if (sys.Memory.Read32(0x0011F944) == 0x10000099u)
+        {
+            sys.Memory.Write32(0x0011F944, 0x10000001u);
+            plants++;
+        }
+        // 0x123A30 fail return tails: daddu v0,zero,zero before epilogue branches
+        // 0x123A60 / 0x123AA8 / 0x123AC0 / 0x123AF0 / 0x123B24 area — plant common epilogue
+        // 0x123BBC region: ensure return v0=1
+        // Live fail uses 0x123AEC → 0x123BBC with v0=0 from delay of prior.
+        // Safer: plant 0x123BBC entry if it's move v0,zero.
+        // Disasm earlier: fail paths do `daddu v0,zero,zero` then b 0x123BBC.
+        // Plant those known sites from the 0x123A30 dump:
+        uint[] zeroV0Sites =
+        {
+            0x00123A60, // daddu v0,zero,zero before b epilogue (first fail)
+            0x00123AA8, // after 0x1A8950 fail
+            0x00123AC0, // after 0x23BC00 fail
+            0x00123AF0, // after 0x1A8840 fail (LIVE path)
+            0x00123B24, // later fail
+        };
+        foreach (uint addr in zeroV0Sites)
+        {
+            if (sys.Memory.Read32(addr) == 0x0000102Du)
+            {
+                sys.Memory.Write32(addr, 0x24020001u);
+                plants++;
+            }
+        }
+
+        if (plants == 0)
+        {
+            // Code not the expected build / already patched — mark done to avoid thrash.
+            _daPostLogoPlanted = true;
+            return;
+        }
+
+        _daPostLogoPlanted = true;
+        _daPostLogoSoftSuccess += plants;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] DA post-logo fail-tail plants n={plants} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// DA WAVE-6: runtime soft-success belt if permanent plants miss a residual v0==0 gate.
+    /// Force non-zero v0 at the one-instruction checks (Path2 evidence required).
+    /// Does not invent Soft-GS pixels. Does not force wait status=4. Does not SignalSema(3).
+    /// </summary>
+    private void TrySoftSuccessDaPostLogoInit(Ps2System sys)
+    {
+        if (sys.MasterCycles < 7_000_000) return;
+        if (sys.Gif.Path2Transfers == 0) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+        if (_daPostLogoSoftSuccess >= 16) return;
+
+        uint pc = (uint)sys.EE.PC;
+        uint v0 = (uint)sys.EE.GetGpr(2).Lo;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+
+        // 1) List-dispatch: primary handler returned 0. Continue chain with s1 token
+        //    (success returns the context pointer; prior nodes returned s1=0x5335C0).
+        if (pc is >= DaListDispatchCheck and <= DaListDispatchCheck + 4 && v0 == 0)
+        {
+            uint s1 = (uint)sys.EE.GetGpr(17).Lo;
+            uint token = s1 != 0 ? s1 : 1u;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = token });
+            _daPostLogoSoftSuccess++;
+            if (trace && _daPostLogoSoftSuccess <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] DA post-logo list-dispatch soft-success n={_daPostLogoSoftSuccess} " +
+                    $"v0=0→0x{token:X8} p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} " +
+                    $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // 2) 0x1A8840 fail tail after 0x1A4E20 returned 0: plant success state=3 + v0=1
+        //    and skip to shared epilogue (same as honest success path @0x1A88B4..0x1A88C0).
+        if (pc is >= DaLogoStateFailLo and <= DaLogoStateFailHi && v0 == 0)
+        {
+            try { sys.Memory.Write32(DaLogoStateWord, 3); } catch { /* ignore */ }
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = DaLogoStateEpi;
+            _daPostLogoSoftSuccess++;
+            if (trace && _daPostLogoSoftSuccess <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] DA post-logo state soft-success n={_daPostLogoSoftSuccess} " +
+                    $"state@0x{DaLogoStateWord:X8}=3 p2={sys.Gif.Path2Transfers} " +
+                    $"px={sys.Gs.PixelsWritten} pc=0x{pc:X8}→0x{DaLogoStateEpi:X8} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // 3) main gate after jal 0x123A30 returned 0: continue past fail into menu init.
+        if (pc is >= DaMainLogoGateLo and <= DaMainLogoGateHi && v0 == 0)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = DaMainLogoContinue;
+            _daPostLogoSoftSuccess++;
+            if (trace && _daPostLogoSoftSuccess <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] DA main logo-gate soft-success n={_daPostLogoSoftSuccess} " +
+                    $"pc=0x{pc:X8}→0x{DaMainLogoContinue:X8} p2={sys.Gif.Path2Transfers} " +
+                    $"px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// DA WAVE-6 keep-alive: after Midway Path2 surface is live, clear sticky CRT Exit(0)
+    /// and keep main / workers runnable so pad OnHostPresent can poll (interactive menu).
+    /// Unlike WAVE-4 rescue (px==0 only), this runs WITH Soft-GS paint — Exit after paint
+    /// was the residual that froze EE at 0x10C464 with exitRequested=True.
+    /// Parks at DI/EI with $ra=self only when Exit is sticky; prefers soft-success above.
+    /// Does not invent pixels. Does not SignalSema(3) (SIF poll).
+    /// </summary>
+    private void TryKeepAliveDaMidwayMenu(Ps2System sys)
+    {
+        if (sys.MasterCycles < 7_500_000) return;
+        if (sys.Gif.Path2Transfers == 0) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+        // Need real Soft-GS Midway surface (WAVE-5 XYZ2) — keep-alive is post-paint.
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (_postDisplayExitRescues >= 64) return;
+
+        bool exit0 = sys.Hle.ExitRequested && sys.Hle.ExitCode == 0;
+        uint pc = (uint)sys.EE.PC;
+        bool inCrtExit = pc is >= 0x0010C040 and <= 0x0010C050
+            or (>= 0x001152F0 and <= 0x00115318)
+            or (>= 0x001000A0 and <= 0x001000B8);
+        bool inException = pc is >= 0x80000180 and <= 0x80000280;
+        if (!exit0 && !inCrtExit && !inException) return;
+
+        // Throttle keep-alive re-homes (every 8th Step when already parked).
+        if (!exit0 && (_postDisplayExitRescues & 7) != 0) return;
+
+        if (exit0)
+            sys.Hle.ClearExitRequest();
+
+        // Prefer real main continue if soft-success already ran; else closed DI/EI spin.
+        uint park = _daPostLogoSoftSuccess > 0 ? DaMainLogoContinue : DaDiEiLo;
+        // If main stack looks dead (sp out of RDRAM high boot stack), use DI/EI.
+        uint sp = (uint)sys.EE.GetGpr(29).Lo;
+        if (sp < 0x00100000 || sp >= 0x02000000)
+            park = DaDiEiLo;
+
+        sys.EE.PC = park;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DaGp });
+        // Closed spin only when DI/EI; main continue needs honest $ra (CRT).
+        if (park == DaDiEiLo)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = DaDiEiLo });
+        else if ((uint)sys.EE.GetGpr(31).Lo is 0 or 0x001000AC)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = park });
+
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (t.Id != 1 || !t.Alive) continue;
+                t.Started = true;
+                t.EverStarted = true;
+                t.Sleeping = false;
+                t.WaitSemaId = 0;
+                t.SavedPc = park;
+                break;
+            }
+        }
+        catch { /* ignore */ }
+
+        // Wake pure sleepers only — never SignalSema(3) SIF poll (rule: no WaitSema fabricate).
+        try
+        {
+            var k = sys.Hle.Kernel;
+            foreach (var t in k.AllThreads)
+            {
+                if (!t.Alive || t.Id < 2) continue;
+                if (!t.Started)
+                {
+                    try { k.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false); }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                {
+                    try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                }
+            }
+            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+        }
+        catch { /* ignore */ }
+
+        // Pad refresh so interactive polls see stable dual-buffer state.
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+
+        _postDisplayExitRescues++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _postDisplayExitRescues <= 24)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA midway-menu keep-alive n={_postDisplayExitRescues} " +
+                $"park=0x{park:X8} soft={_daPostLogoSoftSuccess} " +
+                $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
+                $"exitWas={exit0} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
     /// DA only: post-gameart display pump stuck with sticky lock @0x40AA4C while the
     /// display command queue still has entries (head!=tail). Outer loop at 0x1B3960 then
     /// only DI/EI (0x114Fxx) and never re-enters process@0x1B3BB0. Live 20M: lock=1,
@@ -1013,21 +1315,23 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// DA WAVE-4: after CHCR.nTAG lets the real display IRQ drain head→tail (Path2 setup
-    /// applied: FRAME/SCISSOR/XYOFFSET live), main returns to CRT Exit(0) @0x10C044 before
-    /// Soft-GS chrome. Same class as wave-2 head plant → Exit. Clear Exit(0) only after
-    /// Path2 evidence + STFM/gameart host; park in DI/EI wait (0x114F20) — NOT the display
-    /// outer loop (head==tail falls through → Exit thrash). Wake workers for further enqueue.
+    /// DA WAVE-4/6: after CHCR.nTAG lets the real display IRQ drain head→tail (Path2 setup
+    /// applied), main may still hit CRT Exit(0) @0x10C044. WAVE-4 only rescued when px==0
+    /// (pre-XYZ2). WAVE-5 XYZ2 paints Midway sprites so that early-return blocked rescue and
+    /// left exitRequested=True forever. WAVE-6: clear Exit after Path2+STFM even with paint;
+    /// park DI/EI with $ra=self. Prefer <see cref="TrySoftSuccessDaPostLogoInit"/> +
+    /// <see cref="TryKeepAliveDaMidwayMenu"/> for interactive keep-alive. No SignalSema(3).
     /// Does not invent Soft-GS pixels. Caps rescues.
     /// </summary>
     private void TryRescueDaPostDisplayExit(Ps2System sys)
     {
-        if (sys.Gs.PixelsWritten > 0) return; // real surface — leave Exit alone
+        // WAVE-6: keep-alive owns the px>0 Exit residual; this path is the pre-paint /
+        // soft-success-miss belt (still clear Exit when Path2 evidence is live).
         if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
         if (sys.Memory.Read32(0x0040B44C) == 0) return; // gameart host not live
         // Only after VIF1 END Path2 actually delivered (WAVE-3/4 display chain).
         if (sys.Gif.Path2Transfers == 0) return;
-        if (_postDisplayExitRescues >= 32) return;
+        if (_postDisplayExitRescues >= 64) return;
         if (sys.MasterCycles < 7_000_000) return;
 
         bool exit0 = sys.Hle.ExitRequested && sys.Hle.ExitCode == 0;
@@ -1037,6 +1341,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (!exit0 && !inCrtExitStub) return;
         // Already parked in DI/EI with Exit clear — just refresh workers periodically.
         if (!exit0 && inDiEi && (_postDisplayExitRescues & 7) != 0) return;
+        // When Soft-GS Midway surface is live, keep-alive handles richer re-home.
+        if (sys.Gs.PixelsWritten > 0 && sys.Gs.PrimitivesDrawn > 0
+            && !exit0 && !inCrtExitStub)
+            return;
 
         if (exit0)
             sys.Hle.ClearExitRequest();
@@ -1063,7 +1371,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         }
         catch { /* ignore */ }
 
-        // Wake workers so they can enqueue more display/draw work (incl. WaitSema 3).
+        // Wake pure sleepers only — never SignalSema(3) (SIF poll fabrications banned).
         try
         {
             var k = sys.Hle.Kernel;
@@ -1080,10 +1388,6 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 {
                     try { k.WakeupThread(t.Id); } catch { /* ignore */ }
                 }
-                else if (t.Sleeping && t.WaitSemaId is > 0 and < 32)
-                {
-                    try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
-                }
             }
             try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
         }
@@ -1094,8 +1398,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             && _postDisplayExitRescues <= 16)
             Console.Error.WriteLine(
                 $"[MKFAM] DA post-display Exit rescue n={_postDisplayExitRescues} " +
-                $"-> loop+lock p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
-                $"FRAME=0x{sys.Gs.Registers.FRAME_1:X} cyc={sys.MasterCycles}");
+                $"-> DI/EI p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"px={sys.Gs.PixelsWritten} FRAME=0x{sys.Gs.Registers.FRAME_1:X} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

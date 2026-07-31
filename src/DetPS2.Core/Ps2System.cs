@@ -477,10 +477,11 @@ public sealed class Ps2System
                     or (>= 0x00123E00UL and <= 0x00124080UL)
                     or (>= 0x002AF800UL and <= 0x002AF994UL)
                     or (>= 0x002B34C0UL and <= 0x002B35D0UL);
-                // Dec post-MSL factory/sys-init fail gates (one-instruction v0 checks) —
+                // Dec post-MSL factory/sys-init + DA post-logo v0 gates (one-instruction checks) —
                 // MidwayFamilyAssist soft-success needs tight slices or the window is missed.
                 bool mkFamHot = ActiveQuirk is MidwayFamilyAssist
-                    && MidwayFamilyAssist.IsDecSysInitHotPc(pcPhys);
+                    && (MidwayFamilyAssist.IsDecSysInitHotPc(pcPhys)
+                        || MidwayFamilyAssist.IsDaPostLogoHotPc(pcPhys));
                 ulong slice = (criHot || gowHot || b3Hot || mkFamHot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never
