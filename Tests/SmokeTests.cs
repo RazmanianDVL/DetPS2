@@ -921,6 +921,7 @@ public static class SmokeTests
 
             // Phase 22
             Irx_LoadMinimal_IntoIopRam();
+            Irx_ExecutesMinimal();
             Irx_RealRelocation_ProducesCorrectAddresses();
             IrxLoader_LinkImports_PatchesRealStubFormat();
             Romdir_ParseAndExtract_HandlesInterEntryPadding();
@@ -4123,6 +4124,62 @@ public static class SmokeTests
         uint w = sys.Memory.Read32(r.Entry);
         if ((w & 0x3F) != 0x08) throw new Exception($"code 0x{w:X}");
         Console.WriteLine($"[Smoke] Irx_LoadMinimal_IntoIopRam OK (entry=0x{r.Entry:X8})");
+    }
+
+    /// <summary>
+    /// WP-08: first real IRX execution — load synthetic <see cref="IrxLoader.BuildMinimalIrx"/>
+    /// (jr ra; nop), arm IOP PC/GP via <see cref="IopModuleHost.StartLoadedModule"/>, step until
+    /// return sentinel. Proves Load+Link is no longer a dead plant: IOP retires module text.
+    /// </summary>
+    public static void Irx_ExecutesMinimal()
+    {
+        var sys = new Ps2System();
+        byte[] irx = IrxLoader.BuildMinimalIrx("MINEXEC");
+        var r = sys.LoadIrx(irx, "MINEXEC");
+        if (!r.Success) throw new Exception(r.Message);
+        if (r.Entry < SystemMemory.IOP_RAM_BASE)
+            throw new Exception($"entry not EE-mapped 0x{r.Entry:X8}");
+
+        int id = sys.IopModules.SearchModuleByName("MINEXEC");
+        if (id < 1) throw new Exception("MINEXEC not in module table");
+        if (!sys.IopModules.TryGetIrx(id, out var rec) || !rec.HasImage)
+            throw new Exception("MINEXEC missing image record");
+        if (rec.Entry == 0) throw new Exception("Entry not recorded");
+        if (rec.LoadBase == 0) throw new Exception("LoadBase not recorded");
+        if (string.IsNullOrEmpty(rec.Name)) throw new Exception("Name not recorded");
+
+        var runnable = sys.IopModules.GetRunnableModules();
+        if (runnable.All(m => m.Id != id))
+            throw new Exception("GetRunnableModules missing MINEXEC");
+
+        ulong iopBefore = sys.Iop.InstructionsExecuted;
+        var run = sys.IopModules.StartLoadedModule(sys, id, maxInstructions: 64);
+        if (!run.Success)
+            throw new Exception($"StartLoadedModule failed: {run.Message}");
+        if (run.InstructionsExecuted < 1)
+            throw new Exception("expected IOP instructions in module entry");
+        if (!run.ReturnedToSentinel)
+            throw new Exception($"expected return to sentinel; finalPc=0x{run.FinalPc:X8} msg={run.Message}");
+        if (run.FinalPc != IopModuleHost.ModuleReturnSentinel)
+            throw new Exception($"finalPc 0x{run.FinalPc:X8} != sentinel");
+        if (sys.Iop.InstructionsExecuted <= iopBefore)
+            throw new Exception("Iop.InstructionsExecuted did not advance");
+        if (!rec.EntryExecuted || rec.LastEntryInstructions < 1)
+            throw new Exception("EntryExecuted / LastEntryInstructions not recorded");
+        if (sys.IopModules.ModuleEntryRuns < 1)
+            throw new Exception("ModuleEntryRuns not incremented");
+
+        // Pending arm path (LITERAL_IRX) is env-gated; PrepareModuleEntry is always testable.
+        if (!sys.IopModules.PrepareModuleEntry(sys.Iop, id))
+            throw new Exception("PrepareModuleEntry failed on second arm");
+        uint expectedPhys = IopModuleHost.ToIopPhys(rec.Entry);
+        if (sys.Iop.PC != expectedPhys)
+            throw new Exception($"PrepareModuleEntry PC 0x{sys.Iop.PC:X8} != 0x{expectedPhys:X8}");
+
+        Console.WriteLine(
+            $"[Smoke] Irx_ExecutesMinimal OK " +
+            $"(insns={run.InstructionsExecuted} entryPc=0x{run.EntryPc:X8} finalPc=0x{run.FinalPc:X8} " +
+            $"iopTotal={sys.Iop.InstructionsExecuted} moduleEntryInsns={sys.IopModules.ModuleEntryInstructions})");
     }
 
     /// <summary>Real MIPS ELF-REL relocation processing, verified against hand-computed expected
