@@ -599,6 +599,7 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["serial"] = serial ?? "",
             ["pc"] = $"0x{smSys.EE.PC:X8}",
             ["px"] = smSys.Gs.PixelsWritten,
+            ["prims"] = smSys.Gs.PrimitivesDrawn,
             ["gifPath3"] = smSys.Gif.Path3Transfers,
             ["dmac"] = smSys.Dmac.TransfersCompleted,
             ["cdvdSectors"] = smSys.Cdvd.SectorsRead,

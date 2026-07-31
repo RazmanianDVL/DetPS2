@@ -233,6 +233,13 @@ public sealed class RealSifRpc
     public string LastIopRpVersionAscii => _lastIopRpVersionAscii;
 
     /// <summary>
+    /// Successful BO2 pack-resident FILEIO/IOPFILE opens (KAIN.IMP / .ETP / ASSETS/…).
+    /// Honest signal that post-RKV entity I/O started — prefer this over faked CODE/MAINMENU
+    /// sector notes when gating title assists or scoreboard post-asset heuristics.
+    /// </summary>
+    public int Bo2PackResidentOpens { get; private set; }
+
+    /// <summary>
     /// Set the LOADFILE/FILEIO GetVersion IOPRP ASCII tag without a full reboot surface clear.
     /// Accepts a 4-char tag (<c>"3000"</c>) or a UDNL/RESET arg containing <c>IOPRPxxx</c>/<c>DNASxxx</c>.
     /// Prefer this over <see cref="OnIopReboot"/> when only the version cell is missing.
@@ -407,7 +414,10 @@ public sealed class RealSifRpc
         _iopFileAcquires = 0;
         _goeArchiveMounted = false;
         _bo2CodeBg2Warmed = false;
-        _bo2MenuBigfilesForced = false;
+        _bo2PackIndexBuilt = false;
+        _bo2PackPathToParent.Clear();
+        _bo2PackBytes.Clear();
+        Bo2PackResidentOpens = 0;
         _goeArchiveFd = -1;
         _goeArchiveSize = 0;
         _goeArchiveDiscByteOffset = 0;
@@ -5801,38 +5811,32 @@ public sealed class RealSifRpc
         // Entity .IMP/.ETP paths resolve here too — factory expects a goefile stream when
         // the path is pack-resident (live: KAIN.IMP → PRECODE). Format thrash inside the
         // EE parser is handled by BloodOmen2SnAssist soft-stub of leaf 0x482F60.
+        //
+        // Do NOT NoteHostReadSectors for unopened CODE.BG2 / MAINMENU.BG2 — that inflated
+        // cdvd to ~1733 while game never Open'd those packs and tripped post-menu assists
+        // before real usebigfile / GOE Open (#17 residual). Prefer Bo2PackResidentOpens.
         if (_bo2PackBytes.TryGetValue(parent, out byte[]? bytes) && bytes is { Length: > 0 })
         {
             size = (uint)bytes.Length;
-            // Credit CODE+MAINMENU once after first pack open so assists see post-menu I/O.
-            ForceBo2MenuBigfileSectorCredit(cdvd);
+            Bo2PackResidentOpens++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] pack-resident open key=\"{key}\" parent=\"{parent}\" size={size} " +
+                    $"n={Bo2PackResidentOpens}");
             return iopModules.FileOpenMemoryStub("bo2pack:" + key, bytes);
         }
 
         int fd = iopModules.FileOpen(parent, 1);
         if (fd < 0)
             fd = TryOpenBo2RealBg2(iopModules, cdvd, parent, countSectors: false);
-        if (fd >= 0 && iopModules.TryGetOpenFileSize(fd, out uint fsz))
-            size = fsz;
+        if (fd >= 0)
+        {
+            Bo2PackResidentOpens++;
+            if (iopModules.TryGetOpenFileSize(fd, out uint fsz))
+                size = fsz;
+        }
         return fd;
-    }
-
-    private bool _bo2MenuBigfilesForced;
-
-    /// <summary>
-    /// After first pack-resident open, credit CODE.BG2 + MAINMENU.BG2 sector traffic once
-    /// (sizes ground-truthed from disc). Note-only — no nested full-file host preload.
-    /// </summary>
-    private void ForceBo2MenuBigfileSectorCredit(Cdvd cdvd)
-    {
-        if (_bo2MenuBigfilesForced) return;
-        _bo2MenuBigfilesForced = true;
-        // CODE.BG2 = 914084 → 447 sectors; MAINMENU.BG2 = 1511408 → 738 sectors.
-        cdvd.NoteHostReadSectors(447 + 738);
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
-            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-            Console.Error.WriteLine(
-                "[BO2] force menu BG2 sector credit CODE+MAINMENU (+1185 sectors)");
     }
 
     private static bool LooksLikeBo2PackResidentPath(string path)

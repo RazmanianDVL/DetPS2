@@ -904,11 +904,55 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             return;
         }
 
-        // Phys interrupt vector = 0x200 (KSEG0 0x80000200)
+        // Phys interrupt vector = 0x200 (KSEG0 0x80000200) or general 0x180 (AdEL/etc.)
         if (pc is not (0x200 or 0x180 or 0x000)) return;
         if ((sys.MasterCycles % 50_000) != 0) return; // cheap throttle
 
-        uint epc = (uint)sys.EE.COP0_EPC;
+        uint epc = (uint)(sys.EE.COP0_EPC & 0x1FFFFFFFUL);
+        // Live MK IRX-era ~50.45M: AdEL with EPC = ASCII "GAMEDATA" (path as code).
+        // Jumping back to that EPC re-faults forever. Only when EPC is clearly data-as-code
+        // (unaligned / past RDRAM / ASCII word), re-home to real EE code. Empty/low EPC keeps
+        // the historical early-out (do not force Midway main — WAD regression).
+        bool epcDataAsCode = (epc & 3) != 0
+            || epc >= (uint)SystemMemory.RDRAM_SIZE
+            || LooksLikeAsciiWord(epc);
+        if (epcDataAsCode)
+        {
+            ulong resume = 0;
+            uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+            if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+            {
+                for (uint off = 0; off <= 0x80; off += 4)
+                {
+                    uint cand = sys.Memory.Read32(sp + off);
+                    if ((cand & 3) == 0 && sys.Memory.IsLikelyEeCode(cand))
+                    {
+                        resume = cand;
+                        break;
+                    }
+                }
+            }
+            uint last = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
+            if (resume == 0 && (last & 3) == 0 && sys.Memory.IsLikelyEeCode(last))
+                resume = last;
+            if (resume == 0 && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0)
+                resume = 0x00212F70;
+            if (resume == 0 && sys.Memory.IsLikelyEeCode(0x0011C200UL))
+                resume = 0x0011C200;
+            if (resume == 0)
+                resume = 0x00100008;
+
+            sys.EE.COP0_Status &= ~(1u << 1);
+            sys.EE.PC = resume;
+            sys.LastGoodEePc = resume;
+            sys.Intc.ClearCpuLatchPending();
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] escape stuck int vector (data-EPC) epc=0x{epc:X8} -> 0x{resume:X8} cyc={sys.MasterCycles}");
+            return;
+        }
+
         if (epc < 0x100000 || epc >= 0x01FD0000) return;
         // Clear EXL and jump back
         sys.EE.COP0_Status &= ~(1u << 1); // clear EXL
@@ -918,6 +962,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine($"[BIOS] escape stuck int vector -> EPC=0x{epc:X8} cyc={sys.MasterCycles}");
+    }
+
+    private static bool LooksLikeAsciiWord(uint word)
+    {
+        int printable = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            byte b = (byte)(word >> (8 * i));
+            if (b is >= 0x20 and <= 0x7E) printable++;
+        }
+        return printable >= 3;
     }
 
     private static void WriteAsciiZ(SystemMemory mem, uint addr, string s, int maxLen)

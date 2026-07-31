@@ -9,12 +9,53 @@
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
-| Agent date | 2026-07-30 |
+| Agent date | 2026-07-31 |
 | ROMDIR gate | **CLOSED** |
+| IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
 
 ---
 
-## Result this session (wave-12)
+## Result this session (wave-13 / IRX Soft-GS GS?)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR?** @100M only — diagnose 20M stays **GS?** (expected pre-spine) |
+| Root cause of 286k px | **Documented** — one Soft-GS clear; not interactive MAINMENU; historical 11.7M px was host FMV inflation (retired) |
+| AdEL “GAMEDATA” wild jump | **Fixed** — data-as-code AdEL re-home (EE + Midway vector escape) |
+| gifP3 @100M | **11** (plateau; second chrome still blocked) |
+| dmac @100M | **88** (was 16 pre-fix) |
+| Stream slots / C1C0 | **Still empty / never binds** (wave-12 residual) |
+| diagnose 20M | PC=`0x47FCF4` px=286720 prims=1 gifP3=5 dmac=7 cdvd=198840 binds=16 calls=252 |
+| 100M host-present | PC=`0x43FAB4` px=573440 prims=2 gifP3=11 dmac=88 cdvd=201400 binds=23 calls=276 |
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
+- PINE: **N** for this wave (pcbreak AdEL + disasm sufficient)
+
+### Change class
+
+- **SHARED** `EmotionEngine.cs`: unaligned fetch → if PC looks like data-as-code (ASCII / past RDRAM), recover like open-bus (not every AdEL)
+- **TITLE_LOCAL** `MidwayBootAssist.cs`: exception-vector escape when EPC is data-as-code
+- **SHARED** `Program.cs`: `scoreboard-metrics` includes `prims`
+- **Not done:** FFmpeg, slot plants, RealSifRpc thrash, force-call 26FBF0/C1C0
+
+### Why 286720 px is not MAINMENU
+
+1. `640×448 = 286720` — single Soft-GS framebuffer clear (`prims=1`).
+2. diagnose 20M is **before** logo-spine restore (~58M) and stream plants (~60M).
+3. Host logo Blit no longer counts as Soft-GS `px` (correctness).
+4. Pad OPEN works (ghost after IOPRP); wall is **empty stream slots**, not pad.
+5. Full writeup: [`out/traces/MK_IRX_GS_ROOT_CAUSE_20260731.md`](../../out/traces/MK_IRX_GS_ROOT_CAUSE_20260731.md)
+
+### Residual wall (wave-13)
+
+1. **gifP3 plateau 11** — FAE8 live; slot0 empty → no second-chrome Path3.
+2. **C1C0 / 26FBF0 never runs** — force resource status does not bind objects.
+3. **Soft-GS prims=2** @100M — almost no UI raster until objects bind.
+4. Next: PCSX2+PINE live stream slots **or** correct path to `FUN_0026FBF0` with real manager (no type5 plants).
+
+## Result prior session (wave-12)
 
 | Goal | Status |
 |------|--------|

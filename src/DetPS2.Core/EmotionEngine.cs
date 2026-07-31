@@ -665,9 +665,20 @@ public sealed class EmotionEngine : ISchedulable
             // whatever bytes happen to sit at an unaligned PC — often unmapped MMIO returning 0
             // (NOP), which just carries the runaway further instead of failing fast where the
             // actual bug is visible.
+            //
+            // Special case (MK SLUS_210.87 live ~50.45M): PC/$ra = ASCII "GAMEDATA…" (path string
+            // as code). DetPS2 has no full BIOS AdEL dispatcher; EnterException alone thrash-
+            // parks at 0x80000180 with a non-code EPC. When the misaligned PC looks like data-
+            // as-code (ASCII / past RDRAM), re-home like open-bus rescue. Do NOT recover every
+            // unaligned fault — that mid-boot re-home regressed WAD cdvd 198k→1.
             if ((PC & 0x3) != 0)
             {
                 _cop0BadVAddr = (uint)PC;
+                if (LooksLikeDataAsCodePc(PC) && TryRecoverDataAsCodeFetch(PC, cyc))
+                {
+                    executed++;
+                    continue;
+                }
                 EnterException(GetExceptionVector(general: true), causeExcCode: 4); // AdEL
                 executed++;
                 continue;
@@ -960,6 +971,78 @@ public sealed class EmotionEngine : ISchedulable
         BootExceptionVectors
             ? (general ? 0xBFC00380UL : 0xBFC00200UL)
             : (general ? 0x80000180UL : 0x80000000UL);
+
+    /// <summary>
+    /// Fetch address is almost certainly data mistaken for code: past RDRAM, or ≥3 printable
+    /// ASCII bytes in the low word (e.g. "GAME" = 0x454D4147 from path "GAMEDATA.WAD").
+    /// </summary>
+    private static bool LooksLikeDataAsCodePc(ulong pc)
+    {
+        uint p = (uint)(pc & 0x1FFFFFFFUL);
+        if (p >= (uint)SystemMemory.RDRAM_SIZE) return true;
+        int printable = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            byte b = (byte)(p >> (8 * i));
+            if (b is >= 0x20 and <= 0x7E) printable++;
+        }
+        return printable >= 3;
+    }
+
+    /// <summary>
+    /// Re-home after AdEL into data-as-code. Mirrors the past-RDRAM open-bus resume policy
+    /// (IsLikelyEeCode stack/$ra, Midway main, CRT0). Does not alter the open-bus path.
+    /// </summary>
+    private bool TryRecoverDataAsCodeFetch(ulong badPc, ulong cyc)
+    {
+        uint pcPhys = (uint)(badPc & 0x1FFFFFFFUL);
+        ulong resumePc = 0;
+
+        if (_hle != null)
+        {
+            int cur = _hle.Kernel.CurrentThreadId;
+            int next = _hle.Kernel.FindNextRunnable(cur);
+            if (next != cur)
+            {
+                var nt = _hle.Kernel.GetThread(next);
+                uint nPhys = nt != null
+                    ? (uint)((nt.SavedPc != 0 ? nt.SavedPc : nt.Entry) & 0x1FFFFFFFUL)
+                    : 0;
+                if (_memory.IsLikelyEeCode(nPhys) && _hle.Kernel.TryYieldToOtherRunnable(this))
+                    return true;
+            }
+        }
+
+        uint spPhys = (uint)(GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (spPhys is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        {
+            for (uint off = 0; off <= 0x80; off += 4)
+            {
+                uint cand = _memory.Read32(spPhys + off);
+                if ((cand & 3) == 0 && _memory.IsLikelyEeCode(cand))
+                {
+                    resumePc = cand;
+                    break;
+                }
+            }
+        }
+        ulong ra = GetGpr(31).Lo;
+        if (resumePc == 0 && (ra & 3) == 0 && _memory.IsLikelyEeCode(ra))
+            resumePc = ra & 0x1FFFFFFFUL;
+        if (resumePc == 0 && _memory.Read32(0x00212F70) == 0x27BDFEE0)
+            resumePc = 0x00212F70UL;
+        if (resumePc == 0 && _memory.IsLikelyEeCode(0x0011C200UL))
+            resumePc = 0x0011C200UL;
+        if (resumePc == 0)
+            resumePc = 0x00100008UL;
+
+        COP0_Status &= ~0x6u;
+        PC = resumePc;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] EE AdEL-data rescue 0x{pcPhys:X8} -> 0x{(uint)(resumePc & 0x1FFFFFFFUL):X8} cyc={cyc}");
+        return true;
+    }
 
     private void EnterException(ulong vector, uint causeExcCode)
     {

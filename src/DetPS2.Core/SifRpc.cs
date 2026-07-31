@@ -651,6 +651,12 @@ public sealed class IopModuleHost
         else if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
             system.Memory.IopWrite32(0xBF801450, 0);
 
+        // EE MSFLAG SIFINIT before SIFMAN/SIFCMD/SIFINIT _start so GetMsFlag poll completes.
+        if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(m.Name, "SIFCMD", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(m.Name, "SIFINIT", StringComparison.OrdinalIgnoreCase))
+            system.Sif.PresentEeSifHandshake();
+
         if (!PrepareModuleEntry(iop, id, system.Memory))
             return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
 

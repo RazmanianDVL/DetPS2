@@ -310,18 +310,20 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (sys.Cdvd.SectorsRead >= 350 && sys.Gs.PixelsWritten < 50_000)
             SoftStubBadVtCall(sys);
 
-        // Post-KAIN: soft-stub SN printf so Dest Database storm cannot monopolize 100M.
-        // Gate at cdvd>=500 so Manager State still opens KAIN.IMP first.
-        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 100_000)
+        // Post-KAIN pack-resident open (honest RealSifRpc.Bo2PackResidentOpens) — not faked
+        // CODE/MAINMENU sector credit. Soft-stub SN printf so Dest Database cannot monopolize.
+        // Keep cdvd>=500 as legacy fallback if pack opens were served without the counter.
+        bool postPackAsset = HasBo2PackAssetIo(sys);
+        if (postPackAsset && sys.Gs.PixelsWritten < 100_000)
             SoftStubSnPrintf(sys);
 
         // Post-KAIN goefile token thrash @0x4830xx - unwind frame toward CODE/MAINMENU.
-        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 50_000)
+        if (postPackAsset && sys.Gs.PixelsWritten < 50_000)
             MaybeEscapeGoeFileTokenThrash(sys, c);
 
         // Post-KAIN: suppress entity Dest-Database printf glue (format+SN) so cycles leave
         // mid-wrapper park @0x480500. Do NOT soft-stub game printf 0x2B99B8 (host AV).
-        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 100_000)
+        if (postPackAsset && sys.Gs.PixelsWritten < 100_000)
             SoftStubEntityPrintfChain(sys);
 
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
@@ -356,9 +358,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             {
                 SoftStubBadVtCall(sys);
                 // Prefer return-from-jalr (ra=0x16642C) after vt plant. Never cold-enter
-                // 0x48BCD0 (re-thrash). Soft-stub SN only after asset I/O (cdvd≥500) so
+                // 0x48BCD0 (re-thrash). Soft-stub SN only after pack-resident asset I/O so
                 // Manager State CallRpc storm can still complete and open KAIN.IMP.
-                if (sys.Cdvd.SectorsRead >= 500)
+                if (HasBo2PackAssetIo(sys))
                     SoftStubSnPrintf(sys);
                 uint raDump = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
                 uint spDump = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
@@ -443,9 +445,19 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // Cache-flush leaf after RKV token (cdvd≈380). HLE has no real cache.
         if (sys.Cdvd.SectorsRead >= 350)
             MaybeSkipCacheFlush(sys, c);
-        // Menu-draw kick once real asset I/O has pushed past RKV (ENGLISH.DIR / PRECODE).
-        if (sys.Cdvd.SectorsRead >= 500 && sys.Gs.PixelsWritten < 10_000)
+        // Menu-draw kick once pack-resident / post-RKV asset I/O is live (not faked cdvd).
+        if (HasBo2PackAssetIo(sys) && sys.Gs.PixelsWritten < 10_000)
             MaybeKickMenuDraw(sys, c);
+    }
+
+    /// <summary>
+    /// True after first BO2 pack-resident open (KAIN.IMP etc.) or legacy cdvd≥500 fallback.
+    /// Prefer <see cref="RealSifRpc.Bo2PackResidentOpens"/> over inflated CODE/MAINMENU notes.
+    /// </summary>
+    private static bool HasBo2PackAssetIo(Ps2System sys)
+    {
+        int packOpens = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
+        return packOpens > 0 || sys.Cdvd.SectorsRead >= 500;
     }
 
     private bool _snPrintfStubbed;
@@ -479,8 +491,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
-        // Permanent leaf stub once past RKV/entity I/O — prevents re-entry thrash.
-        if (!_fmtScanStubbed && sys.Cdvd.SectorsRead >= 500)
+        // Permanent leaf stub once past pack-resident entity I/O — prevents re-entry thrash.
+        if (!_fmtScanStubbed && HasBo2PackAssetIo(sys))
         {
             uint head = sys.Memory.Read32(0x00482F60);
             if (head != 0 && head != 0x03E00008u)
@@ -495,7 +507,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         }
 
         // Soft-stub format-wrapper entry @0x4804E8 (live park PC=0x480500 mid-prologue).
-        if (!_fmtWrapperStubbed && sys.Cdvd.SectorsRead >= 500)
+        if (!_fmtWrapperStubbed && HasBo2PackAssetIo(sys))
         {
             uint headW = sys.Memory.Read32(0x004804E8);
             if (headW != 0 && headW != 0x03E00008u)

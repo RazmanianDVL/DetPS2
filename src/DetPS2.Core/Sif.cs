@@ -221,7 +221,21 @@ public sealed class Sif : ISchedulable
         if ((SmFlag & SifStatSifInit) != 0)
             return false;
         SmFlag |= SifStatSifInit;
+        // EE side of the same handshake: SIFMAN sceSifInit polls MSFLAG bit 0x10000
+        // (SIF_STAT_SIFINIT on the EE→IOP mailbox). Without this, sequential
+        // StartLoadedModule parks forever in GetMsFlag (WP-10 residual).
+        PresentEeSifHandshake();
         return true;
+    }
+
+    /// <summary>
+    /// Plant EE→IOP MSFLAG SIFINIT so retail SIFMAN <c>sceSifInit</c> can leave its
+    /// <c>while (!(GetMsFlag() &amp; 0x10000))</c> poll during cold IRX start (no live EE
+    /// SifSetReg yet). Safe/idempotent.
+    /// </summary>
+    public void PresentEeSifHandshake()
+    {
+        MsFlag |= SifStatSifInit;
     }
 
     /// <summary>
