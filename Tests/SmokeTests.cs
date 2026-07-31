@@ -1444,6 +1444,10 @@ press 3000 Circle 100
             Vif_FeedData_Direct_MidQwPad_Path2Frame();
             Gif_Path2_MultiPacket_EopContinuesInTransfer();
             Gif_Path2_DoesNotAbort_Path3Sticky();
+            // G2 IMAGE delivery Path2/3
+            Gif_Path3_MultiDma_Image_CompletesToGs();
+            Gif_Path2_HeldDuring_Path3Image_DrainsAfter();
+            Gif_Path2_Image_QwSliced_CompletesNoAbort();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -6022,6 +6026,200 @@ press 3000 Circle 100
             $"[Smoke] Gif_Path2_DoesNotAbort_Path3Sticky OK " +
             $"(abort={sys.Gif.PacketsAborted} completed={sys.Gif.PacketsCompleted} " +
             $"FRAME=0x{sys.Gs.Registers.FRAME_1:X})");
+    }
+
+    /// <summary>
+    /// G2: Path3 Host→Local IMAGE spanning two DMA segments (DA pattern: setup+tag then body)
+    /// must complete to Soft-GS (imgBytes) with no sticky left and no abort.
+    /// </summary>
+    public static void Gif_Path3_MultiDma_Image_CompletesToGs()
+    {
+        var sys = new Ps2System();
+        // Segment A @0x8000: PACKED A+D×4 (BITBLT setup) EOP=0 + IMAGE tag nloop=4
+        // Mirrors DA: tag#3 nloop=4 setup + tag#4 IMAGE then separate body DMA.
+        const uint segA = 0x8000;
+        // GIFtag PACKED NLOOP=4 EOP=0 NREG=1 REGS=A+D
+        sys.Memory.Write32(segA + 0, 0x00000004u);
+        sys.Memory.Write32(segA + 4, 0x10000000u);
+        sys.Memory.Write32(segA + 8, 0x0000000Eu);
+        sys.Memory.Write32(segA + 12, 0);
+        uint d = segA + 16;
+        void Ad(uint reg, ulong val)
+        {
+            sys.Memory.Write32(d + 0, (uint)val);
+            sys.Memory.Write32(d + 4, (uint)(val >> 32));
+            sys.Memory.Write32(d + 8, reg);
+            sys.Memory.Write32(d + 12, 0);
+            d += 16;
+        }
+        // BITBLTBUF: DBP=0 DBW=1 (64px) DPSM=PSMCT32
+        Ad(0x50, (0UL << 32) | (1UL << 48) | (0UL << 56));
+        Ad(0x51, 0); // TRXPOS
+        Ad(0x52, 4UL | (1UL << 32)); // TRXREG 4×1
+        Ad(0x53, 0); // TRXDIR Host→Local
+        // IMAGE tag: NLOOP=4 EOP=1 FLG=2 (bits 58-59)
+        ulong imgTagLo = 0x8004UL | (2UL << 58);
+        sys.Memory.Write32(d + 0, (uint)imgTagLo);
+        sys.Memory.Write32(d + 4, (uint)(imgTagLo >> 32));
+        sys.Memory.Write32(d + 8, 0);
+        sys.Memory.Write32(d + 12, 0);
+        uint segAQwc = (d + 16 - segA) / 16; // 1 + 4 + 1 = 6
+
+        sys.Gif.ReceivePath3Data(segA, segAQwc);
+        if (!sys.Gif.PacketInFlight || sys.Gif.PacketFlg != 2)
+            throw new Exception(
+                $"expected Path3 IMAGE sticky after setup+tag: inflight={sys.Gif.PacketInFlight} " +
+                $"flg={sys.Gif.PacketFlg} path={sys.Gif.PacketPath} completed={sys.Gif.PacketsCompleted}");
+        if (sys.Gif.TagsCompletedImage != 0)
+            throw new Exception("IMAGE must not complete before body DMA");
+
+        // Segment B: 4 QWs of IMAGE body (4 pixels × 4 bytes PSMCT32 = 1 QW each... 4 pixels = 16 bytes = 1 QW;
+        // nloop=4 means 4 QWs = 16 pixels for 4×1 TRX? TRX is 4×1 = 4 px = 16 bytes = 1 QW.
+        // Use nloop=1 body for exact TRX, but sticky was nloop=4 — feed 4 QWs of pattern data.
+        const uint segB = 0x9000;
+        for (uint i = 0; i < 4; i++)
+        {
+            uint a = segB + i * 16;
+            sys.Memory.Write32(a + 0, 0xFF0000FFu | (i << 8));
+            sys.Memory.Write32(a + 4, 0xFF00FF00u);
+            sys.Memory.Write32(a + 8, 0xFFFF0000u);
+            sys.Memory.Write32(a + 12, 0xFF00FFFFu);
+        }
+        long imgBefore = sys.Gs.ImageBytesWritten;
+        sys.Gif.ReceivePath3Data(segB, 4);
+
+        if (sys.Gif.PacketInFlight)
+            throw new Exception(
+                $"IMAGE sticky stuck after body: progress={sys.Gif.PacketProgress}/{sys.Gif.PacketNloop}");
+        if (sys.Gif.TagsCompletedImage < 1)
+            throw new Exception($"IMAGE never completed: imageTags={sys.Gif.TagsCompletedImage}");
+        if (sys.Gif.PacketsAborted != 0)
+            throw new Exception($"unexpected abort={sys.Gif.PacketsAborted} last={sys.Gif.LastAbortReason}");
+        if (sys.Gs.ImageBytesWritten <= imgBefore)
+            throw new Exception(
+                $"Host→Local IMAGE did not reach GS: imgBytes={sys.Gs.ImageBytesWritten} before={imgBefore}");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path3_MultiDma_Image_CompletesToGs OK " +
+            $"(imgBytes={sys.Gs.ImageBytesWritten} imageTags={sys.Gif.TagsCompletedImage} " +
+            $"completed={sys.Gif.PacketsCompleted} abort={sys.Gif.PacketsAborted})");
+    }
+
+    /// <summary>
+    /// G2: Path2 during Path3 IMAGE sticky must be held (not dropped) and drain after IMAGE
+    /// completes — prevents Midway/DA Path2 desync/abort storms.
+    /// </summary>
+    public static void Gif_Path2_HeldDuring_Path3Image_DrainsAfter()
+    {
+        var sys = new Ps2System();
+        // Path3 IMAGE sticky: tag only (nloop=2), no body yet.
+        const uint p3 = 0xA000;
+        ulong imgTagLo = 0x8002UL | (2UL << 58); // NLOOP=2 EOP IMAGE
+        sys.Memory.Write32(p3 + 0, (uint)imgTagLo);
+        sys.Memory.Write32(p3 + 4, (uint)(imgTagLo >> 32));
+        sys.Memory.Write32(p3 + 8, 0);
+        sys.Memory.Write32(p3 + 12, 0);
+        sys.Gif.ReceivePath3Data(p3, 1);
+        if (!sys.Gif.PacketInFlight || sys.Gif.PacketPath != 3 || sys.Gif.PacketFlg != 2)
+            throw new Exception("expected Path3 IMAGE sticky");
+
+        // Path2 PACKED FRAME while Path3 IMAGE sticky — must HOLD not drop.
+        const uint p2 = 0xB000;
+        sys.Memory.Write32(p2 + 0, 0x00008001u);
+        sys.Memory.Write32(p2 + 4, 0x10000000u);
+        sys.Memory.Write32(p2 + 8, 0x0000000Eu);
+        sys.Memory.Write32(p2 + 12, 0);
+        const ulong frameVal = 0xABu;
+        sys.Memory.Write32(p2 + 16, (uint)frameVal);
+        sys.Memory.Write32(p2 + 20, 0);
+        sys.Memory.Write32(p2 + 24, 0x4Cu);
+        sys.Memory.Write32(p2 + 28, 0);
+        sys.Gif.ReceivePath2Data(p2, 2);
+
+        if (sys.Gs.Registers.FRAME_1 == frameVal)
+            throw new Exception("Path2 must not apply while Path3 IMAGE sticky (should hold)");
+        if (sys.Gif.Path2StalledByPath3 < 1 || sys.Gif.Path2HeldSubmits < 1)
+            throw new Exception(
+                $"expected Path2 hold: stalled={sys.Gif.Path2StalledByPath3} " +
+                $"heldSubmits={sys.Gif.Path2HeldSubmits} heldN={sys.Gif.HeldPath2Entries}");
+        if (sys.Gif.PacketsAborted != 0)
+            throw new Exception($"abort during hold: {sys.Gif.PacketsAborted}");
+
+        // Finish Path3 IMAGE body (2 QWs)
+        const uint p3b = 0xC000;
+        for (uint i = 0; i < 2; i++)
+        {
+            uint a = p3b + i * 16;
+            sys.Memory.Write32(a + 0, 0x11223344u);
+            sys.Memory.Write32(a + 4, 0x55667788u);
+            sys.Memory.Write32(a + 8, 0x99AABBCCu);
+            sys.Memory.Write32(a + 12, 0xDDEEF00Fu);
+        }
+        sys.Gif.ReceivePath3Data(p3b, 2);
+
+        if (sys.Gif.PacketInFlight)
+            throw new Exception("Path3 IMAGE still sticky after body");
+        if (sys.Gif.TagsCompletedImage < 1)
+            throw new Exception("IMAGE did not complete");
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"Path2 hold did not drain after IMAGE: FRAME=0x{sys.Gs.Registers.FRAME_1:X} want 0x{frameVal:X} " +
+                $"heldN={sys.Gif.HeldPath2Entries} p2held={sys.Gif.Path2HeldSubmits}");
+        if (sys.Gif.PacketsAborted != 0)
+            throw new Exception($"abort after drain: {sys.Gif.PacketsAborted} last={sys.Gif.LastAbortReason}");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path2_HeldDuring_Path3Image_DrainsAfter OK " +
+            $"(FRAME=0x{frameVal:X} imageTags={sys.Gif.TagsCompletedImage} " +
+            $"heldSubmits={sys.Gif.Path2HeldSubmits} stalled={sys.Gif.Path2StalledByPath3})");
+    }
+
+    /// <summary>
+    /// G2: Path2 IMAGE fed QW-sliced (sticky) completes with no DIRECT-end abort when
+    /// the full nloop body arrives — Host→Local IMAGE tags reach GS on Path2 too.
+    /// </summary>
+    public static void Gif_Path2_Image_QwSliced_CompletesNoAbort()
+    {
+        var sys = new Ps2System();
+        // Program TRX Host→Local 2×1 PSMCT32
+        sys.Gs.WriteGsRegister(0x50, (0UL << 32) | (1UL << 48)); // BITBLTBUF DBW=1
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 2UL | (1UL << 32)); // 2×1
+        sys.Gs.WriteGsRegister(0x53, 0); // Host→Local
+
+        const uint baseAddr = 0xD000;
+        // IMAGE tag NLOOP=2 EOP
+        ulong imgTagLo = 0x8002UL | (2UL << 58);
+        sys.Memory.Write32(baseAddr + 0, (uint)imgTagLo);
+        sys.Memory.Write32(baseAddr + 4, (uint)(imgTagLo >> 32));
+        sys.Memory.Write32(baseAddr + 8, 0);
+        sys.Memory.Write32(baseAddr + 12, 0);
+        for (uint i = 0; i < 2; i++)
+        {
+            uint a = baseAddr + 16 + i * 16;
+            sys.Memory.Write32(a + 0, 0xFF010203u + i);
+            sys.Memory.Write32(a + 4, 0xFF040506u);
+            sys.Memory.Write32(a + 8, 0xFF070809u);
+            sys.Memory.Write32(a + 12, 0xFF0A0B0Cu);
+        }
+        // QW-slice: tag, then body one QW at a time (VIF1 residual class)
+        sys.Gif.ReceivePath2Data(baseAddr, 1);
+        if (!sys.Gif.PacketInFlight || sys.Gif.PacketFlg != 2)
+            throw new Exception(
+                $"expected Path2 IMAGE sticky after tag: inflight={sys.Gif.PacketInFlight} flg={sys.Gif.PacketFlg}");
+        sys.Gif.ReceivePath2Data(baseAddr + 16, 1);
+        sys.Gif.ReceivePath2Data(baseAddr + 32, 1);
+
+        if (sys.Gif.PacketInFlight)
+            throw new Exception("Path2 IMAGE sticky stuck after full body");
+        if (sys.Gif.TagsCompletedImage < 1)
+            throw new Exception("Path2 IMAGE never completed");
+        if (sys.Gif.PacketsAborted != 0)
+            throw new Exception($"Path2 IMAGE aborted: {sys.Gif.PacketsAborted} last={sys.Gif.LastAbortReason}");
+        if (sys.Gs.ImageBytesWritten <= 0)
+            throw new Exception("Path2 IMAGE wrote no imgBytes");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path2_Image_QwSliced_CompletesNoAbort OK " +
+            $"(imgBytes={sys.Gs.ImageBytesWritten} spanned={sys.Gif.PacketsSpannedCalls} " +
+            $"imageTags={sys.Gif.TagsCompletedImage})");
     }
 
     public static void Timer_GateAndClockSelect()

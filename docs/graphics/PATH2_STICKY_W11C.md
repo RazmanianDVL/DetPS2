@@ -61,6 +61,8 @@ VIF1 often feeds Path2 as **one QW per** `ReceivePath2Data` (or mid-DIRECT pad).
 | DIRECT IMM=0 → 65536 QWs (not empty) | `Vif` (hold) | `Vif_Direct_Imm0_Means65536_NotEmpty` |
 | FIFO `FeedData` mid-QW pad + 4-word QW assembly → `ReceivePath2Quadword` | `Vif.FeedData` + `Gif` | `Vif_FeedData_Direct_MidQwPad_Path2Frame` |
 
+**G2 IMAGE (landed):** Path2 hold queue while Path3 owns sticky (multi-DMA Host→Local IMAGE); drain after IMAGE completes; `new-DIRECT` clears Path2 hold only; Path3 hold drain refuses Path2 clobber. Smokes: `Gif_Path3_MultiDma_Image_CompletesToGs`, `Gif_Path2_HeldDuring_Path3Image_DrainsAfter`, `Gif_Path2_Image_QwSliced_CompletesNoAbort`.
+
 **Not done (still deferred):** auto-abort huge nloop mid-DIRECT; abort-on-FLUSH; inventing PATH3 packets; wholesale `Path3MaskedByVif` clear.
 
 ---

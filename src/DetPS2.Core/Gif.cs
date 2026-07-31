@@ -43,6 +43,8 @@ public sealed class Gif : ISchedulable
     private ulong _abortOther;
     private ulong _path2StalledByPath3; // Path2 xfer while Path3 owned sticky
     private ulong _path3StalledByPath2; // Path3 xfer while Path2 owned sticky
+    private ulong _path2HeldSubmits;    // Path2 enqueued under Path3 sticky (G2)
+    private ulong _path2HoldDrops;      // Path2 hold overflow drops
     private string _lastAbortReason = "";
     private uint _lastTagFlg;
     private uint _lastTagNloop;
@@ -93,6 +95,19 @@ public sealed class Gif : ISchedulable
     private int _heldPath3Count;
     private uint _heldPath3TotalQwc;
 
+    // G2: Path2 held while Path3 owns sticky (esp. multi-DMA Host→Local IMAGE).
+    // Prior HLE dropped Path2 QWs → VIF already debited DIRECT → desync → abort storms
+    // on Midway/DA Path2 paint after Path3 IMAGE setup. Hold + drain when Path3 frees.
+    private const int HeldPath2QueueCap = 32;
+    private readonly uint[] _heldPath2AddrQ = new uint[HeldPath2QueueCap];
+    private readonly uint[] _heldPath2QwcQ = new uint[HeldPath2QueueCap];
+    private int _heldPath2Count;
+    private uint _heldPath2TotalQwc;
+    // Inline Path2 QWs (FIFO DIRECT) held under Path3 sticky — small ring of 4-word slots.
+    private const int HeldPath2InlineCap = 16;
+    private readonly uint[] _heldPath2Inline = new uint[HeldPath2InlineCap * 4];
+    private int _heldPath2InlineCount;
+
     public ulong Path3Transfers => _path3Transfers;
     public ulong Path2Transfers => _path2Transfers;
     public ulong Path1Transfers => _path1Transfers;
@@ -131,10 +146,16 @@ public sealed class Gif : ISchedulable
     public int TraceRingCount => _traceRingCount;
     /// <summary>Path (1/2/3) that owns the in-flight sticky packet; 0 if idle.</summary>
     public uint PacketPath => _pktActive ? _pktPath : 0;
-    /// <summary>Path2 Receive* rejected because Path3 owned sticky (Play!-style arbitration).</summary>
+    /// <summary>Path2 Receive* held/stalled because Path3 owned sticky (Play!-style arbitration).</summary>
     public ulong Path2StalledByPath3 => _path2StalledByPath3;
     /// <summary>Path3 Receive* held/stalled because Path2 owned sticky.</summary>
     public ulong Path3StalledByPath2 => _path3StalledByPath2;
+    /// <summary>Path2 submits enqueued under Path3 sticky (G2 hold; not dropped).</summary>
+    public ulong Path2HeldSubmits => _path2HeldSubmits;
+    /// <summary>Path2 hold overflow drops (should stay 0 on commercial MENU claims).</summary>
+    public ulong Path2HoldDrops => _path2HoldDrops;
+    public int HeldPath2Entries => _heldPath2Count + _heldPath2InlineCount;
+    public uint HeldPath2Qwc => _heldPath2TotalQwc + (uint)_heldPath2InlineCount;
 
     /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
     public bool Path3MaskedByVif => _m3p;
@@ -177,6 +198,7 @@ public sealed class Gif : ISchedulable
         _pktAborted = 0;
         _abortNewDirect = _abortDirectTruncate = _abortOther = 0;
         _path2StalledByPath3 = _path3StalledByPath2 = 0;
+        _path2HeldSubmits = _path2HoldDrops = 0;
         _lastAbortReason = "";
         _lastTagFlg = _lastTagNloop = _lastTagNreg = 0;
         _lastTagRegs = 0;
@@ -192,6 +214,9 @@ public sealed class Gif : ISchedulable
         _apath = 0;
         _heldPath3Count = 0;
         _heldPath3TotalQwc = 0;
+        _heldPath2Count = 0;
+        _heldPath2TotalQwc = 0;
+        _heldPath2InlineCount = 0;
     }
 
     private void ClearPacketState()
@@ -244,9 +269,16 @@ public sealed class Gif : ISchedulable
     /// Each commercial DIRECT is typically a self-contained Path2 unit (EOP packets sized
     /// to IMM); multi-DIRECT continuous IMAGE is Path3's job.
     /// GX-010: VIF DIRECT boundaries must not abort Path3-owned sticky (Play! path arb).
+    /// G2: new-DIRECT still drops Path2 hold (cancelled DIRECT payload must not drain later).
     /// </summary>
     public void AbortIncompletePacket(string reason = "")
     {
+        // G2: superseding DIRECT cancels any Path2 QWs held under Path3 sticky from the
+        // prior DIRECT (VIF already zeroed _directRemaining). DIRECT-end-truncate keeps
+        // holds — those QWs were legitimately paid for by the finished IMM.
+        if (reason == "new-DIRECT")
+            ClearHeldPath2();
+
         if (!_pktActive) return;
         // Reduce harmful aborts: VIF DIRECT supersede/truncate is Path2-scoped.
         // Do not clear Path3-owned sticky (Play! path arbitration).
@@ -267,6 +299,7 @@ public sealed class Gif : ISchedulable
         else if (reason == "DIRECT-end-truncate") _abortDirectTruncate++;
         else _abortOther++;
         byte path = (byte)(_pktPath != 0 ? _pktPath : (_apath != 0 ? _apath : 2));
+        uint abortedPath = _pktPath;
         RingPush(3, path, (byte)_pktFlg, 0, 0, _pktNloop);
         if (TraceGifEnabled)
         {
@@ -275,6 +308,19 @@ public sealed class Gif : ISchedulable
                 $"reason={reason} n={_pktAborted} completed={_pktCompleted}");
         }
         ClearPacketState();
+        // G2: Path3 IMAGE sticky abort (assist / RST / other) must release held Path2.
+        if (abortedPath == 3 && (_heldPath2Count > 0 || _heldPath2InlineCount > 0))
+            DrainHeldPath2();
+        // Path2 abort may free the path for held Path3 (M3P still gates).
+        if (abortedPath == 2 && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
+    }
+
+    private void ClearHeldPath2()
+    {
+        _heldPath2Count = 0;
+        _heldPath2TotalQwc = 0;
+        _heldPath2InlineCount = 0;
     }
 
     /// <summary>
@@ -295,19 +341,41 @@ public sealed class Gif : ISchedulable
     private void DrainHeldPath3()
     {
         if (_heldPath3Count == 0) return;
+        // G2: never clobber Path2-owned sticky with held Path3 body (Play! path arb).
+        // Path2 completion path will re-call DrainHeldPath3 when sticky clears.
+        if (_pktActive && _pktPath == 2)
+            return;
         _fifoR = _fifoW = _fifoCount = 0;
+        // Snapshot queue so re-enqueue mid-drain cannot alias the live arrays.
         int n = _heldPath3Count;
+        Span<uint> addrs = stackalloc uint[n];
+        Span<uint> qwcs = stackalloc uint[n];
+        for (int i = 0; i < n; i++)
+        {
+            addrs[i] = _heldPath3AddrQ[i];
+            qwcs[i] = _heldPath3QwcQ[i];
+        }
         _heldPath3Count = 0;
         _heldPath3TotalQwc = 0;
         _apath = 3;
         for (int i = 0; i < n; i++)
         {
-            uint addr = _heldPath3AddrQ[i];
-            uint qwc = _heldPath3QwcQ[i];
+            // Mid-loop Path2 sticky (nested DIRECT) — re-enqueue rest and stop.
+            if (_pktActive && _pktPath == 2)
+            {
+                for (int j = i; j < n; j++)
+                    EnqueueHeldPath3(addrs[j], qwcs[j]);
+                break;
+            }
+            uint addr = addrs[i];
+            uint qwc = qwcs[i];
             if (qwc != 0)
                 ProcessTransfer(addr, qwc);
         }
         _apath = 0;
+        // Path3 IMAGE may have completed; release any Path2 held under Path3 sticky.
+        if (!_pktActive && (_heldPath2Count > 0 || _heldPath2InlineCount > 0))
+            DrainHeldPath2();
     }
 
     private void EnqueueHeldPath3(uint address, uint qwc)
@@ -315,7 +383,8 @@ public sealed class Gif : ISchedulable
         if (qwc == 0) return;
         if (_heldPath3Count >= HeldPath3QueueCap)
         {
-            // Process oldest now so multi-kick under long M3P is not discarded.
+            // Process oldest now so multi-kick under long M3P is not discarded —
+            // but never while Path2 owns sticky (would feed Path3 QWs as Path2 body).
             uint oldA = _heldPath3AddrQ[0];
             uint oldQ = _heldPath3QwcQ[0];
             Array.Copy(_heldPath3AddrQ, 1, _heldPath3AddrQ, 0, HeldPath3QueueCap - 1);
@@ -323,12 +392,13 @@ public sealed class Gif : ISchedulable
             _heldPath3Count = HeldPath3QueueCap - 1;
             if (_heldPath3TotalQwc >= oldQ) _heldPath3TotalQwc -= oldQ;
             else _heldPath3TotalQwc = 0;
-            if (oldQ != 0)
+            if (oldQ != 0 && !(_pktActive && _pktPath == 2))
             {
                 _apath = 3;
                 ProcessTransfer(oldA, oldQ);
                 _apath = 0;
             }
+            // else: drop oldest under Path2 sticky (prefer not corrupting DIRECT reassembly)
         }
         _heldPath3AddrQ[_heldPath3Count] = address;
         _heldPath3QwcQ[_heldPath3Count] = qwc;
@@ -338,6 +408,136 @@ public sealed class Gif : ISchedulable
         _fifoCount = Math.Min(words, _fifo.Length);
         _fifoR = 0;
         _fifoW = _fifoCount;
+    }
+
+    /// <summary>
+    /// G2: drain Path2 held while Path3 owned sticky (multi-DMA IMAGE → Path2 paint).
+    /// Only when Path3 sticky is idle; M3P does not gate Path2.
+    /// </summary>
+    private void DrainHeldPath2()
+    {
+        if (_heldPath2Count == 0 && _heldPath2InlineCount == 0) return;
+        if (_pktActive && _pktPath == 3)
+            return; // still owned by Path3 IMAGE/PACKED sticky
+
+        // Snapshot so re-hold cannot alias live queues.
+        int n = _heldPath2Count;
+        uint[]? addrSnap = null;
+        uint[]? qwcSnap = null;
+        if (n > 0)
+        {
+            addrSnap = new uint[n];
+            qwcSnap = new uint[n];
+            Array.Copy(_heldPath2AddrQ, addrSnap, n);
+            Array.Copy(_heldPath2QwcQ, qwcSnap, n);
+        }
+        _heldPath2Count = 0;
+        _heldPath2TotalQwc = 0;
+
+        int ni = _heldPath2InlineCount;
+        uint[]? inlineSnap = null;
+        if (ni > 0)
+        {
+            inlineSnap = new uint[ni * 4];
+            Array.Copy(_heldPath2Inline, inlineSnap, ni * 4);
+        }
+        _heldPath2InlineCount = 0;
+
+        for (int i = 0; i < n; i++)
+        {
+            if (_pktActive && _pktPath == 3)
+            {
+                for (int j = i; j < n; j++)
+                    EnqueueHeldPath2(addrSnap![j], qwcSnap![j]);
+                if (inlineSnap != null)
+                {
+                    for (int j = 0; j < ni; j++)
+                    {
+                        int b = j * 4;
+                        EnqueueHeldPath2Inline(
+                            inlineSnap[b], inlineSnap[b + 1], inlineSnap[b + 2], inlineSnap[b + 3]);
+                    }
+                }
+                return;
+            }
+            uint addr = addrSnap![i];
+            uint qwc = qwcSnap![i];
+            if (qwc != 0)
+            {
+                _path2Transfers++;
+                _path2Qws += qwc;
+                _apath = 2;
+                ProcessTransfer(addr, qwc);
+                _apath = 0;
+            }
+        }
+
+        for (int i = 0; i < ni; i++)
+        {
+            if (_pktActive && _pktPath == 3)
+            {
+                for (int j = i; j < ni; j++)
+                {
+                    int b = j * 4;
+                    EnqueueHeldPath2Inline(
+                        inlineSnap![b], inlineSnap[b + 1], inlineSnap[b + 2], inlineSnap[b + 3]);
+                }
+                return;
+            }
+            int basei = i * 4;
+            _path2Transfers++;
+            _path2Qws += 1;
+            _apath = 2;
+            _inlineQw[0] = inlineSnap![basei];
+            _inlineQw[1] = inlineSnap[basei + 1];
+            _inlineQw[2] = inlineSnap[basei + 2];
+            _inlineQw[3] = inlineSnap[basei + 3];
+            _inlineActive = true;
+            try { ProcessTransfer(0, 1); }
+            finally { _inlineActive = false; _apath = 0; }
+        }
+
+        // Path2 finished — Path3 held under path2-stall can drain (if unmasked).
+        if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
+    }
+
+    private void EnqueueHeldPath2(uint address, uint qwc)
+    {
+        if (qwc == 0) return;
+        if (_heldPath2Count >= HeldPath2QueueCap)
+        {
+            _path2HoldDrops++;
+            // Drop newest under overflow (keep older Path2 order intact).
+            if (TraceGifEnabled)
+            {
+                Console.Error.WriteLine(
+                    $"[GIF] Path2 HOLD overflow drop addr=0x{address:X8} qwc={qwc} " +
+                    $"heldN={_heldPath2Count} drops={_path2HoldDrops}");
+            }
+            return;
+        }
+        _heldPath2AddrQ[_heldPath2Count] = address;
+        _heldPath2QwcQ[_heldPath2Count] = qwc;
+        _heldPath2Count++;
+        _heldPath2TotalQwc += qwc;
+        _path2HeldSubmits++;
+    }
+
+    private void EnqueueHeldPath2Inline(uint w0, uint w1, uint w2, uint w3)
+    {
+        if (_heldPath2InlineCount >= HeldPath2InlineCap)
+        {
+            _path2HoldDrops++;
+            return;
+        }
+        int b = _heldPath2InlineCount * 4;
+        _heldPath2Inline[b] = w0;
+        _heldPath2Inline[b + 1] = w1;
+        _heldPath2Inline[b + 2] = w2;
+        _heldPath2Inline[b + 3] = w3;
+        _heldPath2InlineCount++;
+        _path2HeldSubmits++;
     }
 
     /// <summary>
@@ -396,6 +596,9 @@ public sealed class Gif : ISchedulable
                     _apath = 0;
                     _heldPath3Count = 0;
                     _heldPath3TotalQwc = 0;
+                    _heldPath2Count = 0;
+                    _heldPath2TotalQwc = 0;
+                    _heldPath2InlineCount = 0;
                     // GX-010: RST must drop sticky mid-packet so next path is not
                     // swallowed as body data (Play! / PCSX2 clear path state on RST).
                     ClearPacketState();
@@ -492,6 +695,9 @@ public sealed class Gif : ISchedulable
         }
         ProcessTransfer(address, qwc);
         _apath = 0;
+        // G2: Path3 multi-DMA IMAGE just completed — drain Path2 held under Path3 sticky.
+        if (!_pktActive && (_heldPath2Count > 0 || _heldPath2InlineCount > 0))
+            DrainHeldPath2();
         // Path2 sticky finished during this call — drain any Path3 held for path2-stall.
         if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
             DrainHeldPath3();
@@ -501,15 +707,20 @@ public sealed class Gif : ISchedulable
     public void ReceivePath2Data(uint address, uint qwc)
     {
         if (qwc == 0) return; // match Path3: do not inflate transfer counts on empty feeds
-        // GX-010: Path3-owned sticky — do not feed Path2 QWs as Path3 body (Play! stalls Path2).
+        // GX-010/G2: Path3-owned sticky — hold Path2 (do not drop). Multi-DMA Host→Local
+        // IMAGE leaves sticky between GIF DMA segments; dropping Path2 desynced VIF DIRECT
+        // debit vs GIF → Midway/DA abort storms on subsequent paint.
         if (_pktActive && _pktPath == 3)
         {
             _path2StalledByPath3++;
+            EnqueueHeldPath2(address, qwc);
+            RingPush(0, 2, 0xFF, 0x01, address, qwc);
             if (TraceGifEnabled)
             {
                 Console.Error.WriteLine(
-                    $"[GIF] Path2 STALL(path3-sticky) addr=0x{address:X8} qwc={qwc} " +
-                    $"stalled={_path2StalledByPath3} progress={_pktLoop}/{_pktNloop}");
+                    $"[GIF] Path2 HOLD(path3-sticky) addr=0x{address:X8} qwc={qwc} " +
+                    $"heldN={_heldPath2Count} stalled={_path2StalledByPath3} " +
+                    $"progress={_pktLoop}/{_pktNloop} flg={_pktFlg}");
             }
             return;
         }
@@ -541,6 +752,7 @@ public sealed class Gif : ISchedulable
         if (_pktActive && _pktPath == 3)
         {
             _path2StalledByPath3++;
+            EnqueueHeldPath2Inline(w0, w1, w2, w3);
             return;
         }
         _path2Transfers++;

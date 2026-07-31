@@ -43,8 +43,8 @@ Statuses from title-port claims / assists as of 2026-07-31. **Natural** = game V
 | **Burnout 3** | SLUS_210.50 | high (hundreds–1k+) | Yes early path-sync | **Assist sticky** when `M3P && px==0 && gifP3≥30` (`Burnout3Assist`) | PATH3 IMAGE / flip; Soft-GS merge composite | **Soak only** — early global unmask regresses path-sync |
 | **Blood Omen 2** | SLUS_200.24 | low (~2) | Can stick post-English | **Assist** unmask in list-stub / draw kick path | Dual list + Path2 title surface | Title-local only; no core default |
 | **MK Shaolin Monks** | SLUS_210.87 | ~18 | Assist / Midway can clear on second chrome | **MidwayBootAssist** `SetMskPath3(false)` near PATH3 plant | Logo + second-chrome PATH3 | Do not remove plant without G4 natural PATH3 |
-| **MK Deception** | SLUS_208.81 | Path2-heavy | Midway family | Midway clears on keep-alive paths | Path2 idle pump + display | Same as SM |
-| **MK Deadly Alliance** | SLUS_204.23 | Path2-heavy | Midway family | Midway clears | Path2 display chains | Same as SM |
+| **MK Deception** | SLUS_208.81 | Path2-heavy | Midway family | Midway clears on keep-alive paths | Path2 idle pump + early Path3 IMAGE (imgBytes floor) | Same as SM; G2 holds Path2 under Path3 IMAGE sticky |
+| **MK Deadly Alliance** | SLUS_204.23 | Path2-heavy (gifP3≈6) | Midway family | Midway clears | Path2 display + early Path3 Host→Local IMAGE (nloop=6144 multi-DMA) | Same as SM; do not drop Path2 during IMAGE sticky |
 | **Haven** | SLUS_205.17 | ~68 | Unclear / often drained | Prefer natural | PATH3 logo clear | No core sticky clear |
 | **Vexx** | SLUS_203.83 | low / Path2 | Usually off | Natural | Title-surface Path2 | Leave |
 | **Whiplash** | SLUS_206.84 | Path2 title | Usually off | Natural | Path2 firstscreen | Leave |
@@ -80,7 +80,7 @@ Ordered **least → most invasive**. Each needs **multi-title soak** (≥5, incl
 Always on blocker-trace:
 
 ```text
-gif-path: p1=… p1qws=… p2=… p2qws=… p3=… p3qws=… m3p=True|False heldP3n=… heldP3qwc=… heldSubmits=… mskPath3=…
+gif-path: p1=… p1qws=… p2=… p2qws=… p3=… p3qws=… m3p=True|False heldP3n=… heldP3qwc=… heldSubmits=… heldP2n=… p2HeldSubmits=… p2HoldDrops=… p2StallP3=… mskPath3=…
 gif-pkts: completed=… aborted=… spannedCalls=… inFlight=… tags=… p2qws=…
 gif-tags: packed=… reglist=… image=… disable=… abortNewDir=… abortTrunc=… abortOther=… lastAbort=…
 ```
@@ -90,6 +90,8 @@ With `DETPS2_TRACE_GIF=1`: stderr Path1/2/3 xfer + tag lines + claim `gif-trace-
 **Diagnose stuck PATH3 under mask:** `m3p=True` + `heldP3n>0` + `p3` climbing + `prims/px` flat → unmask missing (H1/H3), not Soft-GS raster.
 
 **Diagnose GoW shell:** `m3p=False` + `p3=0` + Path2 `completed/aborted` healthy → not an M3P wall; stream/PATH3 submit residual.
+
+**Diagnose Path3 IMAGE vs Path2 (G2):** multi-DMA Host→Local IMAGE leaves Path3 sticky between GIF segments (`flg=2` in-flight). Path2 must **hold** (`p2HeldSubmits`↑, `p2HoldDrops=0`) and drain after IMAGE completes — not drop (pre-G2 drop desynced VIF DIRECT debit → Midway/DA abort storms). `image=` on gif-tags must rise with `imgBytes`.
 
 ---
 
@@ -101,5 +103,15 @@ With `DETPS2_TRACE_GIF=1`: stderr Path1/2/3 xfer + tag lines + claim `gif-trace-
 | No invent PATH3 packets for chrome | S8 + title seats |
 | Raster / ofx expand | S9 (not this doc) |
 | Claim scrape of new gif-path lines | S10 tools optional |
+
+### G2 Path2 hold under Path3 sticky (not an M3P clear)
+
+| Rule | Behavior |
+|------|----------|
+| Path3 owns sticky (IMAGE/PACKED mid-packet) | Path2 `Receive*` **enqueues** (hold), does not drop |
+| Path3 sticky completes / aborts (non-boundary) | `DrainHeldPath2` → Path2 tags reach GS |
+| `new-DIRECT` supersede | Clears Path2 hold (cancelled DIRECT); **does not** abort Path3 sticky |
+| `DrainHeldPath3` / M3P unmask | Refuses to clobber Path2-owned sticky; re-tries after Path2 frees |
+| Wholesale `Path3MaskedByVif` clear | **Still forbidden** without soak (this matrix §4) |
 
 **Next WPs:** GX-015 (clear conditions) · GX-050 (dynamic unmask) · title seats report natural `gifP3` with `m3p` history.
