@@ -11,3 +11,4 @@ Append-only. When pad/menu advances and Soft-GS shows a **new** wall, add a row.
 | 2026-07-31 | (fleet) | expandHits telemetry | ofx title-strip expand still MENU crutch (G-GFX-6 demote later) | S9 | GX-004 |
 | 2026-07-31 | fleet | S0+G0 merge train | 10 seats landed; expandHits+gif metrics on main | T0 | S0/G0 |
 | 2026-07-31 | BO2 | title-FB pad opens=2 inject≈1536; gifP2=54 prims=1 | pad DMA live; no sel-idx; IMAGE multi-prim residual | S5 | PL-015 |
+| 2026-07-31 | GoW/Whip | XYOFFSET 12.4 pure map + expandHits accuracy | illegal retail-ofx natural-h expand killed; MENU collapse strips still expand (expandHits=2/1 @20M) | S9 | GX-018/021 |
