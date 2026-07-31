@@ -8,16 +8,54 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w5` |
-| Agent date | 2026-07-31 (wave-5) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w6` |
+| Agent date | 2026-07-31 (wave-6) |
 | ROMDIR gate | **CLOSED** |
-| IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
-| Branch | `agent/menu-sm-w5` tip main@9657852 |
+| Branch | `agent/menu-sm-w6` |
 
 ---
 
+## Result this session (wave-6 / C1C0 chrome bind)
 
-## Result this session (wave-5 / SearchFile gate + 43AB88 object residual)
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — Soft-GS gifP3=**11** px=**573440** prims=2; C1C0 bind path complete; **not MENU YES** |
+| 26FBF0 ESCAPE | **Fixed** — force BFC0 directly (skip 2C6878/4154E0 nop sled); protect force from HLE-scratch yank of trampoline |
+| C1C0 | **HIT** (pcbreak a0=slot a1=mini-desc a2=scratch); soft-complete after 600k (deep body thrash @0x474xxx) |
+| Slot0+obj | **Held** through 100M; re-seal + D770 sticky +0x44 re-arm; FAE8 work flag fires (wk=1) |
+| Object type | **type=1** at +0x48 (not type5); method table for 452678 → mini-descriptor |
+| 43AB88 | Temporary force patch returns arena obj so 43B670 success tail runs; restored on resume |
+| Selection | D-pad moves 0x54E610/620/5E0; not proven as stable menu index |
+| Second chrome Path3 | **Open** — gifP3 stuck 11; need real texture/draw body beyond skeleton object |
+
+### Soft-GS scoreboard (wave-6)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Wave-5 residual** | FAE8 | 573440 | 2 | **11** | 106 | 26FBF0 ESCAPE; slot0+obj plant |
+| **Wave-6 100M claim** | FAE8 `0x43FCxx` | **573440** | 2 | **11** | 30–34 | C1C0 soft-complete; slot held; no ESCAPE |
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - Force **BFC0** (not 26FBF0) with mini-descriptor out-buf
+  - `EnrichResourceObjectForBind` type=1 + method stub @`0x01FE0140` + mini-desc @`0x01FE0180`
+  - Patch `43AB88` → return arena obj during force 43B670; restore on resume
+  - C1C0 soft-complete after 600k phase-3; slot re-seal + D770 +0x44 re-arm
+  - Gate nop-sled / ADX / lock / post-spine / HLE-scratch during resource force
+  - Escape budget 1.5M; timeout 4M
+- **Rejected**: multi-slot plant (corrupted menu BSS); type5; sm+0x28 capacity plant
+
+### Residual wall (wave-6)
+
+1. **gifP3 plateau 11** — FAE8 walks live slot+obj (wk fires) but no second-chrome Path3 (skeleton object lacks real texture/draw body from resource load).
+2. **Selection index** still binary/toggle under D-pad — not proven as stable 0..N menu row.
+3. **C1C0 deep body** never returns cleanly — soft-complete seals bind without full chrome setup.
+4. Next: real resource body into desc arena (CRI/WAD member) **or** PCSX2+PINE live object dump for D770 type-1 path.
+
+---
+
+## Result prior session (wave-5 / SearchFile gate + 43AB88 object residual)
 
 | Goal | Status |
 |------|--------|
