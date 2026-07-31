@@ -34,7 +34,7 @@ namespace DetPS2.Core;
 /// </para>
 ///
 /// <para>
-/// <b>Haven residual (#21 — first FILEIO / game-data open):</b> after the IRX stack the EE
+/// <b>Haven residual (#21 — title surface / FILEIO·DLL.DAT):</b> after the IRX stack the EE
 /// enters a sin/cos LUT fill at <c>0x0010CCD8</c> —
 /// <c>for (i=0..N) table[i] = (float)sin((double)(i * k))</c> with <c>k≈π/16384</c>
 /// (<c>0x39490FDB</c>). Each iteration calls soft-double f32→f64 (<c>0x00353A28</c>),
@@ -46,8 +46,11 @@ namespace DetPS2.Core;
 /// (<c>*(0x39C0C4)</c>) when the wait at <c>0x188AE0</c> spins while CHCR.STR is clear /
 /// channel idle, and credit VIF1 DMA IRQ so the real handler can advance; NUSOUND2
 /// (sid <c>0x00012345</c>, not Midway MSL.IRX) bulk fno=0 is handled in
-/// <see cref="RealSifRpc"/>. Haven-only still: VBlankStart sticky + poll-base repair.
-/// Disc first assets: root <c>DLL.DAT</c> (~1.1 MiB), <c>DATA/</c>.
+/// <see cref="RealSifRpc"/>. Wave-4: NUSOUND bulk partial recv echo + <b>real-bind</b>
+/// root <c>DLL.DAT</c> (~1.1 MiB SN module image) into RDRAM at <c>0x00800000</c>
+/// (live residual <c>$ra=0x8925CC</c> / PC high band matched file+base); Soft-GS already
+/// paints logo clear (px≈286720 gifP3=68) — next is chrome beyond clear / title surface.
+/// Haven-only still: VBlankStart sticky + poll-base repair. Disc: <c>DLL.DAT</c>, <c>DATA/</c>.
 /// </para>
 ///
 /// <para>

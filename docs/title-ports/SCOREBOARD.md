@@ -16,7 +16,7 @@
 | **MK Deadly Alliance** | SLUS_204.23 | **No** | **gameart open** cdvd=771 | px=0 post-open |
 | **Vexx** | SLUS_203.83 | **No** | **cdvd 0→4** GAME.TXT | WaitSema / more assets |
 | **Whiplash** | SLUS_206.84 | **No** | cdvd=256 RKV warm | MOD_LOAD path="" |
-| **Haven** | SLUS_205.17 | **No** | px=3 gifP3=68 cdvd=606 fioOps>0 | w3: SoftFloatBridge + VIF1 busy clear + NUSOUND bulk; DLL.DAT warm; Exit(8) cleared; still no MENU |
+| **Haven** | SLUS_205.17 | **No** (LIKELY-NEAR) | px=286720 gifP3=68 cdvd=923 fioOps≥8 | w4: DLL.DAT real bind @0x800000 (1.17MiB); NUSOUND partial echo; Soft-GS logo clear only; WaitSema residual |
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 
