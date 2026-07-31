@@ -639,11 +639,31 @@ public sealed class Gs : ISchedulable
         float u0 = a.U, v0 = a.V, u1 = b.U, v1 = b.V;
         int w = Math.Max(1, maxX - minX);
         int h = Math.Max(1, maxY - minY);
+        // Clip to Soft-GS FB before raster (triangle path already clips). Unclipped
+        // off-FB sprites inflated rejBounds (Whiplash: prims=1 rejBounds=2049 px=0).
+        int x0 = Math.Max(0, minX);
+        int x1 = Math.Min(FB_WIDTH - 1, maxX);
+        int y0 = Math.Max(0, minY);
+        int y1 = Math.Min(FB_HEIGHT - 1, maxY);
+        if (x0 > x1 || y0 > y1)
+        {
+            // Commercial rescue: sprite fully off Soft-GS FB after XYOFFSET — clamp onto
+            // FB origin (Whiplash title-surface with ofx/ofy=0x8000 lands off-FB; one prim
+            // was ~64² fragments all rejected). Cap to FB size so huge wrong-space rects
+            // still produce a Soft-GS surface instead of pure rejBounds.
+            int sw = Math.Clamp(w, 1, FB_WIDTH);
+            int sh = Math.Clamp(h, 1, FB_HEIGHT);
+            minX = 0; minY = 0;
+            maxX = sw; maxY = sh;
+            x0 = 0; y0 = 0;
+            x1 = sw - 1; y1 = sh - 1;
+            w = sw; h = sh;
+        }
 
-        for (int y = minY; y <= maxY; y++)
+        for (int y = y0; y <= y1; y++)
         {
             float tv = v0 + (v1 - v0) * ((y - minY) / (float)h);
-            for (int x = minX; x <= maxX; x++)
+            for (int x = x0; x <= x1; x++)
             {
                 float tu = u0 + (u1 - u0) * ((x - minX) / (float)w);
                 WriteFragment(x, y, z, col, tu, tv, a.Fog);

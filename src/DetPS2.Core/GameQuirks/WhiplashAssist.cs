@@ -42,6 +42,8 @@ namespace DetPS2.Core;
 /// Wave-2: WaitSema V3 + stream-table recv preserve + firstscreen/frontend RKV warm.
 /// Wave-3: bridge stream-table → GOE Open+Start (RKV title surface into stream slots) +
 /// sid 0x40 control workspace init; Soft-GS residual still EE-driven.
+/// Wave-4: real firstscreen/Code/frontend sizes (format-B id≠size; hudscripts sentinel) +
+/// multi-chunk Start (≤256 KiB) so title-surface Soft-GS can grow past px=3.
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule

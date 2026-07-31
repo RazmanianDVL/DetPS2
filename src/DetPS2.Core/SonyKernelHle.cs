@@ -1124,15 +1124,17 @@ public sealed class SonyKernelHle
                         }
                         else if (_system.ActiveQuirk is WhiplashAssist)
                         {
-                            // WHIP only: always soft-signal SN seq WaitSema (multi-thread GAME.INI path).
-                            // Must NOT apply to all titles — that starved GoW/Dec SIF-cmd WaitSema(3)
-                            // (fabricate thrash, binds=0 / DEVCTL storm). agent/menu-gow-w2 + dec-w2.
+                            // WHIP_SEMA_FIX_V3: soft-signal SN seq WaitSema + force timeslice end.
+                            // V2 without RequestImmediatePreempt burned ~333k WaitSema/Wakeup pairs
+                            // (stream-init / title Open) while main starved — px 3→0, syscalls~670k.
+                            // Must NOT apply fabricate+preempt to all titles (GoW/Dec residual).
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V3)");
                             if (_kernel.ThreadCount < 2)
                                 _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
+                            _kernel.RequestImmediatePreempt();
                         }
                         else if (!_kernel.TryYieldToOtherRunnable(ee))
                         {
