@@ -544,6 +544,10 @@ public sealed class RealSifRpc
         _whipOpenStartBridged = false;
         _whipControlInited = false;
         _whipTitleBytesStarted = 0;
+        _whipStreamTableFullyPainted = false;
+        _whipRingServiceStream = 0;
+        _whipRingBytesServed = 0;
+        _whipRingStreamPos.Clear();
         WhipGameTitleOpens = 0;
         _bo2PackIndexBuilt = false;
         _bo2PackMembers.Clear();
@@ -5598,20 +5602,45 @@ public sealed class RealSifRpc
                 // mark index w2. Stride 16 B (4096/256) covers the full 0xFF ring seen live.
                 // WAVE-3: fill full GOE reply layout per slot (status/bufSize/handle/iStream)
                 // so EE sees non-zero capacity — ready-only left filesize=0 and never Open'd.
+                // WAVE-6: after title bridge, paint the entire table (not just w1) so the EE
+                // stops the infinite per-index walk (w2 climbed past 0x200 @100M with no
+                // further Open); also service ring buffer at send+0x1C for title payload.
                 if (recvBuf != 0 && recvSize >= 16)
                 {
                     const uint Stride = 16;
+                    uint maxSlots = recvSize / Stride;
                     if (w1 is >= 8 and <= 256)
                     {
-                        uint n = Math.Min(w1, recvSize / Stride);
+                        uint n = Math.Min(w1, maxSlots);
                         for (uint i = 0; i < n; i++)
                             PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, i, w0);
                     }
                     else if (w1 == 0)
                     {
                         uint idx = w2;
-                        if (idx < recvSize / Stride)
+                        if (idx < maxSlots)
                             PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, idx, w0);
+                        else if (_whipOpenStartBridged && maxSlots > 0)
+                        {
+                            // Staging reply: index past table capacity — paint slot 0 as the
+                            // single-slot status the client copies out, keep handle/iStream.
+                            PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, 0, w0);
+                            mem.Write32(recvBuf + 12, w2);
+                        }
+                    }
+
+                    // WAVE-6: once title surfaces are Open+Started, force-fill every table
+                    // slot so the registration walk can observe a complete ready set.
+                    if (_whipOpenStartBridged && _whipTitleBytesStarted >= 64 * 1024
+                        && !_whipStreamTableFullyPainted)
+                    {
+                        for (uint i = 0; i < maxSlots; i++)
+                            PaintWhipStreamSlot(mem, recvBuf, recvSize, Stride, i, w0);
+                        _whipStreamTableFullyPainted = true;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                            Console.Error.WriteLine(
+                                $"[IOPFILE] whip stream-table FULL paint n={maxSlots} " +
+                                $"after title bridge bytes={_whipTitleBytesStarted}");
                     }
                 }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -5625,6 +5654,10 @@ public sealed class RealSifRpc
                 // Bulk or late ring index (≥0x3F) is enough surface to arm title streams.
                 if ((w1 is >= 8 and <= 256) || (w1 == 0 && w2 >= 0x3F))
                     BridgeWhipGoeOpenStart(mem, iopModules, cdvd, recvBuf, recvSize, w0);
+                // WAVE-6 full texture path: progressive ring fill from bridged title members
+                // into the EE ring pointer carried in the setup packet (live 0x45BC94).
+                if (_whipOpenStartBridged)
+                    ServiceWhipTitleRing(mem, iopModules, cdvd, argBuf, sendSize, w0);
                 return 1;
             }
 
@@ -5716,9 +5749,17 @@ public sealed class RealSifRpc
     private bool _whipOpenStartBridged;
     private bool _whipControlInited;
     private long _whipTitleBytesStarted;
+    private bool _whipStreamTableFullyPainted;
+    private int _whipRingServiceStream;
+    private long _whipRingBytesServed;
+    /// <summary>Per-stream ring-service read cursor (independent of Start dump pos).</summary>
+    private readonly Dictionary<int, long> _whipRingStreamPos = new();
 
     /// <summary>Game-bridged Whiplash title Open count (Code/firstscreen/frontend).</summary>
     public int WhipGameTitleOpens { get; private set; }
+
+    /// <summary>WAVE-6 progressive ring-fill bytes into EE title ring (0x45BC94-class).</summary>
+    public long WhipRingBytesServed => _whipRingBytesServed;
 
     /// <summary>
     /// Fill one 16-byte EE stream-table slot: status / bufferSize / handle / iStream.
@@ -5768,18 +5809,20 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// WAVE-3/4/5 bridge: after stream-table bulk/ring arm, Open RKV title surfaces into GOE
+    /// WAVE-3/4/5/6 bridge: after stream-table bulk/ring arm, Open RKV title surfaces into GOE
     /// stream slots and Start payload into EE memory so Soft-GS path can drain.
     /// Honest RKV payload via <see cref="TryOpenFromRkv"/> + FileRead — no synthetic pixels.
     /// WAVE-4: real title sizes (firstscreen ~180 KiB) + Code-first order.
     /// WAVE-5: full-member Start (≤256 KiB) not ring-only; retry until ≥64 KiB streamed.
+    /// WAVE-6: full Code/frontend Start (≤1.5 MiB) + ring service path for texture drain.
     /// </summary>
     private void BridgeWhipGoeOpenStart(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
         uint streamTable, uint streamTableSize, uint bufferSize)
     {
         // Allow a single retry when a prior bridge only streamed collapsed TOC sizes (<4 KiB).
         // WAVE-5: retry until we have streamed a real firstscreen-class payload (~64 KiB+).
-        if (_whipOpenStartBridged && _whipTitleBytesStarted >= 64 * 1024)
+        // WAVE-6: retry until frontend-class (≥512 KiB total) so Code+firstscreen+frontend land.
+        if (_whipOpenStartBridged && _whipTitleBytesStarted >= 512 * 1024)
             return;
         bool retry = _whipOpenStartBridged;
         _whipOpenStartBridged = true;
@@ -5795,12 +5838,12 @@ public sealed class RealSifRpc
         // Resolve title-surface names from TOC (format-B may use paths / case variants).
         string[] names = ResolveWhipTitleNames();
         uint ring = bufferSize is >= 0x100 and <= 0x10000 ? bufferSize : 0xFF4u;
-        // WAVE-5: stream full title members (firstscreen ~180 KiB) not just one ring.
-        // Ring still paints into EE stream-table word1 (avoids multi-ring WaitSema storm);
-        // Start payload uses MaxStart so Soft-GS path has real chrome bytes in EE.
-        const uint MaxStart = 256u * 1024;
-        const uint SlotStride = MaxStart;
-        uint destBase = 0x01E00000u;
+        // WAVE-6: stream full title members (frontend ~1.2 MiB, Code ~574 KiB, firstscreen
+        // ~180 KiB). WAVE-5 MaxStart=256 KiB truncated Code/frontend. Slot stride packs
+        // three members under high RDRAM without clobbering the stream table @0x44FBC0.
+        const uint MaxStart = 1536u * 1024;
+        const uint SlotStride = 640u * 1024; // firstscreen fits; Code/frontend cap MaxStart
+        uint destBase = 0x01C00000u;
         if (destBase + SlotStride * 4u > SystemMemory.RDRAM_SIZE)
             destBase = 0x01A00000u;
 
@@ -5969,6 +6012,81 @@ public sealed class RealSifRpc
             {
                 try { iopModules.FileClose(fd); } catch { /* ignore */ }
             }
+        }
+    }
+
+    /// <summary>
+    /// WAVE-6 full texture/asset path: on each stream-table service after title Open+Start,
+    /// push the next ring-sized chunk of a bridged title member into the EE ring buffer
+    /// pointer from the setup packet (live: 0x45BC94). Prefer firstscreen then frontend
+    /// so Soft-GS / EE title parse sees progressive payload beyond the high-RDRAM Start dump.
+    /// Honest FileRead from the RKV host fd — no synthetic pixels.
+    /// </summary>
+    private void ServiceWhipTitleRing(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        uint argBuf, uint sendSize, uint bufferSize)
+    {
+        if (!_whipOpenStartBridged || _whipTitleBytesStarted < 64 * 1024)
+            return;
+        // Cap services so we don't burn the whole claim budget on ring DMA; enough to
+        // drain firstscreen (180 KiB / 0xFF4 ≈ 46 rings) + a frontend head.
+        if (_whipRingBytesServed >= 512 * 1024)
+            return;
+
+        uint ring = bufferSize is >= 0x100 and <= 0x10000 ? bufferSize : 0xFF4u;
+        // Live packet: +0x1C = first ring pointer (0x45BC94). Fall back to scan.
+        uint ringPtr = 0;
+        if (argBuf != 0 && sendSize >= 0x20)
+        {
+            uint cand = mem.Read32(argBuf + 0x1C) & 0x1FFFFFFFu;
+            if (cand is >= 0x00100000 and < SystemMemory.RDRAM_SIZE - 0x100)
+                ringPtr = cand;
+        }
+        if (ringPtr == 0 && argBuf != 0 && sendSize >= 16)
+        {
+            for (uint off = 16; off + 4 <= sendSize; off += 4)
+            {
+                uint cand = mem.Read32(argBuf + off) & 0x1FFFFFFFu;
+                if (cand is >= 0x00400000 and <= 0x00480000)
+                {
+                    ringPtr = cand;
+                    break;
+                }
+            }
+        }
+        if (ringPtr == 0 || ringPtr + ring > SystemMemory.RDRAM_SIZE)
+            return;
+
+        // Prefer firstscreen (stream 1) then frontend (2) then Code (0) for ring fill —
+        // title chrome texture path first. Cursor is independent of high-RDRAM Start dump.
+        int[] order = { 1, 2, 0 };
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            int iStream = order[(_whipRingServiceStream + attempt) % 3];
+            if (!_iopFileStreamToFd.TryGetValue(iStream, out int fd) || fd < 0)
+                continue;
+            uint sz = _iopFileStreamSize.TryGetValue(iStream, out uint s) ? s : 0;
+            long pos = _whipRingStreamPos.TryGetValue(iStream, out long p) ? p : 0;
+            if (sz == 0 || pos >= sz)
+                continue;
+
+            uint want = (uint)Math.Min((long)ring, sz - pos);
+            if (want == 0) continue;
+            try { iopModules.FileSeek(fd, (int)pos, 0); } catch { /* ignore */ }
+            int n = iopModules.FileRead(mem, fd, ringPtr, want);
+            if (n <= 0) continue;
+
+            _whipRingStreamPos[iStream] = pos + n;
+            _whipRingBytesServed += n;
+            _whipRingServiceStream = (Array.IndexOf(order, iStream) + 1) % 3;
+            cdvd.NoteHostReadSectors((n + 2047) / 2048);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                && (_whipRingBytesServed <= ring * 2 || _whipRingBytesServed % (ring * 8) < ring))
+            {
+                Console.Error.WriteLine(
+                    $"[IOPFILE] whip ring service iStream={iStream} dest=0x{ringPtr:X8} n={n} " +
+                    $"pos={pos + n}/{sz} ringTotal={_whipRingBytesServed} cdvd={cdvd.SectorsRead}");
+            }
+            return; // one ring per setup call — matches EE poll cadence
         }
     }
 

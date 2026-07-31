@@ -435,6 +435,11 @@ public sealed class Gs : ISchedulable
 
         // Off-FB rescue when XYOFFSET is programmed but verts still land outside Soft-GS
         // FB (B3: ofx=0x6C00 ofy=0x7200 → prims↑ rejBounds=prims fragTest=0 without this).
+        // WAVE-6: Whiplash title sprite raw Y=0 with ofy=0x8000 → y=-2048. Prefer Y=raw/16
+        // (top of FB) while keeping ofx-based X so the sprite clamp expands a full-width
+        // title surface instead of pure rejBounds.
+        if (ofy == 0x8000 && yRaw < 0x1000 && (y < -64 || y >= FB_HEIGHT + 64))
+            y = yRaw >> 4;
         if (x < -64 || y < -64 || x >= FB_WIDTH + 64 || y >= FB_HEIGHT + 64)
         {
             int ax = (xRaw - 0x8000) >> 4;
@@ -446,6 +451,8 @@ public sealed class Gs : ISchedulable
             else
             {
                 int px = xRaw >> 4, py = yRaw >> 4;
+                if (ofy == 0x8000 && yRaw < 0x1000)
+                    py = yRaw >> 4;
                 if (px >= -64 && py >= -64 && px < FB_WIDTH + 64 && py < FB_HEIGHT + 64)
                 {
                     x = px; y = py;
@@ -650,25 +657,35 @@ public sealed class Gs : ISchedulable
         int x1 = Math.Min(FB_WIDTH - 1, maxX);
         int y0 = Math.Max(0, minY);
         int y1 = Math.Min(FB_HEIGHT - 1, maxY);
+        Registers.GetXyOffset(out int ofxR, out int ofyR);
+        // WAVE-5/6: retail ofx/ofy=0x8000 full-width strip collapses to h=1 (Whiplash
+        // title sprite raw Y=0 both corners). Expand to a full Soft-GS title surface so
+        // menuKind title-surface is MENU-class chrome — color/UV still from the prim.
+        bool titleStrip = ofxR == 0x8000 && ofyR == 0x8000
+            && w >= FB_WIDTH / 2 && h < 8;
         if (x0 > x1 || y0 > y1)
         {
             // Commercial rescue: sprite fully off Soft-GS FB after XYOFFSET — clamp onto
-            // FB origin (Whiplash title-surface with ofx/ofy=0x8000 lands off-FB; one prim
-            // was ~64² fragments all rejected). Cap to FB size so huge wrong-space rects
-            // still produce a Soft-GS surface instead of pure rejBounds.
+            // FB origin. Cap to FB size so huge wrong-space rects still produce a Soft-GS
+            // surface instead of pure rejBounds.
             int sw = Math.Clamp(w, 1, FB_WIDTH);
             int sh = Math.Clamp(h, 1, FB_HEIGHT);
-            // WAVE-5: retail ofx/ofy=0x8000 full-width strip often collapses to h=1 after
-            // transform (tip: px=640 one-row). Expand to a title band so Soft-GS title-
-            // surface is richer than a single scanline — color/UV still from the prim.
-            Registers.GetXyOffset(out int ofxR, out int ofyR);
-            if (ofxR == 0x8000 && ofyR == 0x8000 && sw >= FB_WIDTH / 2 && sh < 8)
-                sh = Math.Min(FB_HEIGHT, 112);
+            if (titleStrip)
+                sh = FB_HEIGHT;
             minX = 0; minY = 0;
             maxX = sw; maxY = sh;
             x0 = 0; y0 = 0;
             x1 = sw - 1; y1 = sh - 1;
             w = sw; h = sh;
+        }
+        else if (titleStrip)
+        {
+            // Partially on-FB one-row (WAVE-6 Y=0 rescue): still expand to full title FB.
+            minX = 0; minY = 0;
+            maxX = FB_WIDTH; maxY = FB_HEIGHT;
+            x0 = 0; y0 = 0;
+            x1 = FB_WIDTH - 1; y1 = FB_HEIGHT - 1;
+            w = FB_WIDTH; h = FB_HEIGHT;
         }
 
         for (int y = y0; y <= y1; y++)
