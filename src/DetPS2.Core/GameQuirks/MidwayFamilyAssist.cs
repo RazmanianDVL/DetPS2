@@ -48,6 +48,17 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     // Scratch status word used when wait is entered with s0==null (no job object).
     private const uint WaitReadyScratch = 0x0007FF00;
 
+    // Dec SLUS_208.81 post-MSL main abort (live 2026-07-30, 200M host-present):
+    //   main@0x1235B0 → 0x127900 → 0x126CE0 → 0x1D8120 → jal 0x1D9620
+    //   0x1D9620 (type/factory register for ids 0x509/0x50E/0x510/0x1F) returns 0
+    //   → 0x1D8120 fails → 0x126CE0 fails → 0x127900 fails → main epilogue@0x1238E0
+    //   → CRT Exit(0) @ ~188M BEFORE any EE CallRpc member .ssf open.
+    // Soft-success fail-tails so main can leave CRT Exit and reach game loop @0x1237F0
+    // without force-completing DA wait status=4. TITLE_LOCAL Dec only.
+    // Root poison: type id 0x510 factory 0x1D5270→0x1AB810 returns -1 @0x1D97D4.
+    private const uint DecSysInitBandLo = 0x001D8120;
+    private const uint DecSysInitBandHi = 0x001D8290;
+
     private uint _walkLastV1;
     private int _walkSameV1Hits;
     private int _walkBandHits;
@@ -56,6 +67,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _waitReadyHits;
     private int _waitReadyEscapes;
     private int _mslRingSeeds;
+    private int _decSysInitEscapes;
+    private bool _decSysInitPlanted;
 
     public MidwayFamilyAssist(string serial, string displayName)
     {
@@ -77,7 +90,23 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _waitReadyEscapes = 0;
         _mslRingSeeds = 0;
         _mslFilePumps = 0;
+        _decSysInitEscapes = 0;
+        _decSysInitPlanted = false;
     }
+
+    /// <summary>True when this assist is bound to Deception (SLUS_208.81).</summary>
+    public bool IsDeception =>
+        _serial.Equals("SLUS_208.81", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Dec sys-init fail band that aborts main→Exit after MSL. Exposed so
+    /// <see cref="Ps2System"/> can tighten the EE slice and catch one-instruction gates.
+    /// </summary>
+    public static bool IsDecSysInitHotPc(ulong pcPhys) =>
+        pcPhys is >= DecSysInitBandLo and <= DecSysInitBandHi
+            or (>= 0x00126CE0UL and <= 0x00126F60UL)
+            or (>= 0x00127900UL and <= 0x00127A00UL)
+            or (>= 0x001D9620UL and <= 0x001D9900UL);
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
 
@@ -104,6 +133,123 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (sys.Memory.Read32(0x0040B44C) != 0)
             TryEscapeWaitReady(sys);
         TryBreakHeapTreeCycle(sys);
+        // TITLE_LOCAL Dec: soft-success post-MSL factory/sys-init so main does not Exit(0)
+        // before member .ssf CallRpc (see DecSysInit* constants).
+        if (IsDeception)
+            TryEscapeDecSysInitFail(sys);
+    }
+
+    /// <summary>
+    /// Deception only: rewrite fail-tails so post-MSL subsystem init returning 0 does not
+    /// abort main→CRT Exit(0) before the game loop / member .ssf path.
+    ///
+    /// Live chain (200M): 0x1D9620→0x1D8120→0x126CE0→0x127900→main@0x1238E0→Exit.
+    /// Plants:
+    /// <list type="bullet">
+    /// <item>0x1D8120 fail tails (factory register 0x1D9620 / 0x1D3F10 / 0x1E1340)</item>
+    /// <item>0x127900 fail tails after 0x126CE0 and sibling inits (covers later 0x126CE0 gates)</item>
+    /// </list>
+    /// One-shot RDRAM plant — Step cannot catch single-instruction gates across slices.
+    /// Does not plant wait status=4 (DA Exit lesson).
+    /// </summary>
+    private void TryEscapeDecSysInitFail(Ps2System sys)
+    {
+        if (_decSysInitPlanted) return;
+        // EE code resident after PT_LOAD; plant once early so it's live before MSL (~180M).
+        if (sys.MasterCycles < 5_000_000) return;
+
+        int plants = 0;
+
+        // --- 0x1D8120 fail tails (inner factory/sys register) ---
+        // 0x1D8250: b fail → b success@0x1D8258; delay v0=1
+        if (sys.Memory.Read32(0x001D8250) == 0x1000000Bu)
+        {
+            sys.Memory.Write32(0x001D8250, 0x10000001u);
+            sys.Memory.Write32(0x001D8254, 0x24020001u);
+            plants++;
+        }
+        if (sys.Memory.Read32(0x001D8268) == 0x10000005u)
+        {
+            sys.Memory.Write32(0x001D8268, 0x10000001u);
+            sys.Memory.Write32(0x001D826C, 0x24020001u);
+            plants++;
+        }
+        if (sys.Memory.Read32(0x001D8278) == 0x0002102Bu)
+        {
+            sys.Memory.Write32(0x001D8278, 0x24020001u); // addiu v0, zero, 1
+            plants++;
+        }
+
+        // --- 0x127900 fail tails (main's direct gate; covers all 0x126CE0 failures) ---
+        // Pattern: bne v0,success; b fail; move v0,zero  →  b success; addiu v0,1
+        // After 0x1AFDA0 @0x127928 (imm 0x32 → 0x1279F4)
+        if (sys.Memory.Read32(0x00127928) == 0x10000032u)
+        {
+            sys.Memory.Write32(0x00127928, 0x10000001u); // → 0x127930
+            sys.Memory.Write32(0x0012792C, 0x24020001u);
+            plants++;
+        }
+        // After 0x126CE0 @0x127950 (imm 0x28 → 0x1279F4) — live Exit path
+        if (sys.Memory.Read32(0x00127950) == 0x10000028u)
+        {
+            sys.Memory.Write32(0x00127950, 0x10000001u); // → 0x127958
+            sys.Memory.Write32(0x00127954, 0x24020001u);
+            plants++;
+        }
+        // After 0x227A00 @0x127978 (imm 0x1E → 0x1279F4)
+        if (sys.Memory.Read32(0x00127978) == 0x1000001Eu)
+        {
+            sys.Memory.Write32(0x00127978, 0x10000005u); // → 0x127990
+            sys.Memory.Write32(0x0012797C, 0x24020001u);
+            plants++;
+        }
+        // After 0x1AFC00-null path @0x127988 (imm 0x1A → 0x1279F4)
+        if (sys.Memory.Read32(0x00127988) == 0x1000001Au)
+        {
+            sys.Memory.Write32(0x00127988, 0x10000001u); // → 0x127990
+            sys.Memory.Write32(0x0012798C, 0x24020001u);
+            plants++;
+        }
+        // After 0x1AFAF0 @0x1279B8 (imm 0x0E → 0x1279F4)
+        if (sys.Memory.Read32(0x001279B8) == 0x1000000Eu)
+        {
+            sys.Memory.Write32(0x001279B8, 0x10000001u); // → 0x1279C0
+            sys.Memory.Write32(0x001279BC, 0x24020001u);
+            plants++;
+        }
+
+        // Also force 0x126CE0 fail epilogue to return success (v0=1) if any printf path hit.
+        // 0x126F5C: daddu v0,zero,zero before jr → addiu v0,1
+        if (sys.Memory.Read32(0x00126F5C) == 0x0000102Du)
+        {
+            sys.Memory.Write32(0x00126F5C, 0x24020001u);
+            plants++;
+        }
+
+        // 0x1D9620: type id 0x510 register via 0x1D5270 returns -1 (live), then
+        // `or s0,s0,v0` at 0x1D97D8 poisons s0 → bgez fails → return 0.
+        // Nop the poison OR so earlier successful registrations keep s0>=0; then
+        // 0x1DA0F0 (stub returns 1) completes the function successfully.
+        if (sys.Memory.Read32(0x001D97D8) == 0x02028025u) // or s0, s0, v0
+        {
+            sys.Memory.Write32(0x001D97D8, 0x00000000u); // nop
+            plants++;
+        }
+        // Belt-and-suspenders: if s0 still negative, force success path to 0x1DA0F0.
+        // 0x1D98E4: b fail@0x1D9900 → b 0x1D98F0
+        if (sys.Memory.Read32(0x001D98E4) == 0x10000006u)
+        {
+            sys.Memory.Write32(0x001D98E4, 0x10000002u); // → 0x1D98F0
+            sys.Memory.Write32(0x001D98E8, 0x24020001u);
+            plants++;
+        }
+
+        if (plants == 0) return;
+        _decSysInitPlanted = true;
+        _decSysInitEscapes = plants;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec post-MSL Exit redirect plants={plants} cyc={sys.MasterCycles}");
     }
 
     private int _mslFilePumps;
