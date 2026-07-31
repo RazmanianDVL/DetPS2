@@ -376,17 +376,28 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // Data/heap as PC (live 0x57xxxx after object-dispatch poison). Hard-cap resume
         // below 0x2C0000 for GoW .text. CRT0 BSS band is in IsDeathBand (never re-home TO
-        // it) but is not force-escaped here — aggressive CRT0 leave regressed RPC (81 vs 153).
+        // it). Wave-2: also force-leave CRT0/BSS re-entry after IRX progress — AdEL rescue
+        // to 0x00100008 then spin at 0x00100140 froze claim metrics (gifPath3 path lost).
+        // Gate on cdvd progress so early boot CRT0 is not skipped (RPC 81 vs 153).
         uint pcPhysEarly = pc & 0x1FFFFFFFu;
+        bool crt0Reentry = pcPhysEarly is >= 0x00100000 and <= 0x00100200
+            && (sys.Cdvd.SectorsRead > 0 || c >= 40_000_000);
         bool dataPc = pcPhysEarly >= 0x002C0000u
             || pc is >= 0x80000180 and <= 0x80000200
-            || pcPhysEarly < 0x00100000;
+            || pcPhysEarly < 0x00100000
+            || crt0Reentry;
         if (c >= 35_000_000 && sys.Gs.PixelsWritten == 0 && dataPc)
         {
-            uint resume = PickSafeResume(sys, 0x0026C0EC);
+            uint resume = PickSafeResume(sys,
+                sys.Cdvd.SectorsRead > 0 ? 0x0027CC08u : 0x0026C0ECu);
             sys.Memory.Write32(0x002A1338, 0);
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            {
+                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+            });
             sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
+            if (crt0Reentry)
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
             sys.EE.PC = resume;
             sys.EE.COP0_Status &= ~0x6u;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
@@ -1346,29 +1357,31 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // Rescue if world kick landed in unknown-opcode data (0x2A0xxx), mid-function
         // 0x229xxx, or CRT0 re-entry. Always leave for a safe epilogue — never re-CRT0.
+        // Wave-2: AdEL-data rescue after empty-reboot soft-return often lands at 0x00100008
+        // then runs to 0x00100140 (live claim100: metrics frozen binds=16 gifPath3=0). Prior
+        // check only matched exact entry PC — broaden to full CRT0/BSS band after progress.
+        bool crt0Band = pc is >= 0x00100000 and <= 0x00100200;
         bool badBand = pc is (>= 0x002A0000 and <= 0x002B0000)
             or (>= 0x00229000 and <= 0x0022A000)
-            || pc == 0x00100008u;
-        if (badBand && sys.Gs.PixelsWritten == 0)
+            || crt0Band;
+        if (badBand && sys.Gs.PixelsWritten == 0
+            && (!crt0Band || sys.Cdvd.SectorsRead > 0 || c >= 40_000_000))
         {
-            // Prefer stream-ready poll continue (0x26C0EC) or post-FreezeCache — not empty
-            // tag epilogue which re-enters and $ra's into 0x2A0xxx again (live menu17).
-            uint resume = 0x0026C0EC;
-            if (!sys.Memory.IsLikelyEeCode(resume))
-                resume = 0x00185FAC;
-            uint lg = (uint)(sys.LastGoodEePc & 0x1FFFFFFFUL);
-            if (lg is >= 0x00100000 and < 0x00280000
-                && lg != 0x00100008
-                && lg is not (>= 0x002A0000 and <= 0x002B0000)
-                && lg is not (>= 0x00229000 and <= 0x0022A000)
-                && lg is not (>= 0x00170BB0 and <= 0x00170C20))
-                resume = lg;
+            // Prefer worker dispatch (gifPath3 residual path @0x27CC) after IRX.
+            uint resume = PickSafeResume(sys,
+                sys.Cdvd.SectorsRead > 0 && sys.Memory.IsLikelyEeCode(0x0027CC08UL)
+                    ? 0x0027CC08u
+                    : 0x0026C0ECu);
             sys.Memory.Write32(0x002A1338, 0); // stream ready
-            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+            {
+                Lo = resume == 0x00185FAC ? 0x00330000UL : 1UL
+            });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
             sys.EE.PC = resume;
             sys.EE.COP0_Status &= ~0x6u;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (_worldKickPulses % 16) == 0)
+                && (_worldKickPulses % 8) == 0)
                 Console.Error.WriteLine(
                     $"[GOW] rescue bad band pc=0x{pc:X8} -> 0x{resume:X8} n={_worldKickPulses} cyc={c}");
         }
@@ -1769,7 +1782,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     left = true;
                 }
             }
-            // Null / poison $ra residual (live 0x299328): try stack slot then FreezeCache.
+            // Null / poison $ra residual (live 0x299328): try stack slot then worker /
+            // post-FreezeCache. Prefer 0x27CC08 over bare 0x185FAC after IRX — live wave-2
+            // null-ra → 0x185FAC → AdEL 0x06207265 → CRT0 death (gifPath3 lost).
             if (!left && (ra == 0 || !sys.Memory.IsLikelyEeCode(ra)
                           || ra is (>= 0x00299300 and <= 0x00299480)
                           || ra is (>= 0x00293C00 and <= 0x00293C80))
@@ -1783,11 +1798,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     if (sys.Memory.IsLikelyEeCode(stacked) && stacked is >= 0x00100000 and < 0x002C0000
                         && stacked is not (>= 0x00299300 and <= 0x00299480)
                         && stacked is not (>= 0x00293C00 and <= 0x00293C80)
-                        && stacked is not (>= 0x0026C0E0 and <= 0x0026C600))
+                        && stacked is not (>= 0x0026C0E0 and <= 0x0026C600)
+                        && stacked is not (>= 0x00100000 and <= 0x00100200))
                         resume = stacked;
                 }
                 if (resume == 0)
-                    resume = 0x00185FAC;
+                    resume = PickSafeResume(sys, 0x0027CC08);
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128
                 {
                     Lo = resume == 0x00185FAC ? 0x00330000UL : 3UL

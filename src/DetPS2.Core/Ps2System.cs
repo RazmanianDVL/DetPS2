@@ -452,6 +452,7 @@ public sealed class Ps2System
                     or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
                     or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
+                    or (>= 0x00100000UL and <= 0x00100200UL)  // CRT0 re-entry after AdEL (wave-2)
                     or (>= 0x00183880UL and <= 0x001838D0UL)
                     or (>= 0x0017A1D0UL and <= 0x0017A298UL)  // soft-tick wait leaf (*0x29C7D4)
                     or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait

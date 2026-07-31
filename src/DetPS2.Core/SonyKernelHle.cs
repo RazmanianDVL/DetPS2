@@ -1122,14 +1122,27 @@ public sealed class SonyKernelHle
                                 Console.Error.WriteLine($"[RPC] WaitSema STALLING for real completion sema=0x{a0:X} pc=0x{ee.PC:X8}");
                             ee.RequestSemaStall();
                         }
-                        else
+                        else if (_system.ActiveQuirk is WhiplashAssist)
                         {
-                            // WHIP_SEMA_FIX_V2: non-RPC soft-signal (Whiplash SN seq + SIF worker).
-                            // No yield-without-wake; VBlank park only when ThreadCount < 2.
+                            // WHIP_SEMA_FIX_V2 (title-local): multi-thread soft-signal for SN seq
+                            // + SIF worker. Global always-fabricate (wave-1 whip merge) starved
+                            // GoW SIF-cmd WaitSema(3) — 0.5M fabricate thrash @20M with binds=0
+                            // and blocked MOD_LOAD/cdvd (agent/menu-gow-w2, tip 3748553).
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                                 Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
                             if (_kernel.ThreadCount < 2)
                                 _kernel.WaitSemaVblank();
+                            _kernel.SignalSema((int)a0);
+                            _kernel.WakeupThread(_kernel.CurrentThreadId);
+                        }
+                        else if (!_kernel.TryYieldToOtherRunnable(ee))
+                        {
+                            // SHARED (pre-WHIP): yield to peer when possible; only if alone and
+                            // no matching SIF RPC pending — park on VBlank then soft-signal.
+                            // Restores GoW DualInfo/MOD_LOAD path past empty SIF poll thrash.
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (no matching RPC / no runnable thread)");
+                            _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
                         }
