@@ -195,7 +195,8 @@ public sealed class PresentPipeline
 
     public void PresentFromGs(Gs gs)
     {
-        // Prefer host present span (FMV/boot overlay) so black clears do not blank the display
+        // Soft-GS truth: GetPresentSpan composites natural DISPFB (or FRAME residual) when
+        // local IMAGE is present (GX-041). No DISPFB plant — only software-programmed regs.
         var span = gs.GetPresentSpan();
         int w = gs.FramebufferWidth;
         int h = gs.FramebufferHeight;

@@ -73,12 +73,21 @@ public sealed class Gs : ISchedulable
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
     /// <summary>
-    /// GX-040: pixels composited from a software-programmed DISPFB (not FRAME/FBP0 fallback).
-    /// Zero when present is residual composite-only (common B3 residual until GX-041).
+    /// GX-040/041: pixels composited from a software-programmed DISPFB (not FRAME/FBP0 fallback).
+    /// Zero when present is residual composite-only (B3-class: DISPFB1=0 → FRAME path).
     /// </summary>
     public long NaturalDispfbPixels { get; private set; }
+    /// <summary>
+    /// GX-041: residual composite pixels (FRAME + FBP0 synthetic) — dispfbPx − naturalDispfbPx.
+    /// Honest B3 residual when software never programs DISPFB.
+    /// </summary>
+    public long ResidualDispfbPixels { get; private set; }
+    /// <summary>GX-041: last composite source class (NaturalDispfb / Frame / SyntheticFbp0).</summary>
+    public GsCompositeSource LastCompositeSource { get; private set; }
     /// <summary>Last preferred PCRTC circuit (0/1/2) seen during composite.</summary>
     public int LastDisplayCircuit { get; private set; }
+    /// <summary>Generation of privileged DISPFB/DISPLAY/PMODE writes (invalidates composite skip).</summary>
+    public int DisplayCircuitGeneration { get; private set; }
     /// <summary>
     /// Soft-GS title-strip expand events (temporary MENU chrome; G-GFX-6 demotes later).
     /// Increments only when DrawSprite actually expands a legal collapsed strip.
@@ -151,7 +160,12 @@ public sealed class Gs : ISchedulable
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
         NaturalDispfbPixels = 0;
+        ResidualDispfbPixels = 0;
+        LastCompositeSource = GsCompositeSource.None;
         LastDisplayCircuit = 0;
+        DisplayCircuitGeneration = 0;
+        _lastCompositeImageBytes = 0;
+        _lastCompositeCircuitGen = -1;
         ExpandHits = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
@@ -1573,6 +1587,7 @@ public sealed class Gs : ISchedulable
     }
 
     private long _lastCompositeImageBytes;
+    private int _lastCompositeCircuitGen = -1;
 
     /// <summary>GX-040: snapshot of privileged DISPFB/DISPLAY/PMODE circuit state.</summary>
     public GsDisplayCircuitInfo GetDisplayCircuitInfo() =>
@@ -1582,8 +1597,8 @@ public sealed class Gs : ISchedulable
     /// Copy DISPFB1/2 (else FRAME_1, else FBP=0 IMAGE) local VRAM into the software present FB.
     /// When raster <see cref="PixelsWritten"/> is already &gt;0, only fills black Soft-GS
     /// pixels (merge) so sparse AFAIL prims no longer block commercial logo IMAGE chrome.
-    /// GX-040: prefers PMODE-selected circuit DISPFB when software programmed it; does not plant DISPFB.
-    /// FRAME/FBP0 fallback remains for residual composite-only titles (B3 — GX-041 tightens later).
+    /// GX-040/041: prefers software-programmed DISPFB (even when PMODE EN=0); does not plant DISPFB.
+    /// FRAME/FBP0 fallback remains for residual composite-only titles (B3 DISPFB1=0 residual).
     /// </summary>
     public long CompositeDispfbToFramebuffer()
     {
@@ -1591,9 +1606,11 @@ public sealed class Gs : ISchedulable
 
         bool mergeMode = PixelsWritten > 0;
         // Avoid re-scanning every host-present once a full merge already ran and IMAGE
-        // has not grown (1M-slice OnHostPresent).
+        // has not grown (1M-slice OnHostPresent). Invalidate when DISPFB/DISPLAY/PMODE
+        // generation advances so natural DISPFB programmed after residual still binds (GX-041).
         if (mergeMode && DispfbPixelsComposited > 0
-            && ImageBytesWritten <= _lastCompositeImageBytes)
+            && ImageBytesWritten <= _lastCompositeImageBytes
+            && DisplayCircuitGeneration == _lastCompositeCircuitGen)
             return 0;
 
         var circuit = GetDisplayCircuitInfo();
@@ -1602,25 +1619,25 @@ public sealed class Gs : ISchedulable
         bool fromDispfb = false;
         ulong fb = 0;
         bool natural = false;
-        // Natural path: software programmed DISPFB on an enabled circuit (or raw DISPFB set
-        // even if PMODE EN bits are still 0 — many titles write DISPFB before EN).
+        GsCompositeSource source = GsCompositeSource.None;
+
+        // Natural path (GX-041): any software-written DISPFB raw — PMODE EN optional.
         if (circuit.HasNaturalDispfb)
         {
             fb = circuit.PreferredDispfbRaw;
+            // Prefer non-zero raw even if PreferredCircuit collapsed oddly.
+            if (fb == 0)
+                fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1 : Registers.DISPFB2;
             fromDispfb = true;
             natural = true;
-        }
-        else if (Registers.DISPFB1 != 0 || Registers.DISPFB2 != 0)
-        {
-            // PMODE EN=0 but DISPFB non-zero: still treat as natural source (honest read).
-            fb = Registers.DISPFB1 != 0 ? Registers.DISPFB1 : Registers.DISPFB2;
-            fromDispfb = true;
-            natural = true;
-            LastDisplayCircuit = Registers.DISPFB1 != 0 ? 1 : 2;
+            source = GsCompositeSource.NaturalDispfb;
+            if (LastDisplayCircuit == 0)
+                LastDisplayCircuit = Registers.DISPFB1 != 0 ? 1 : 2;
         }
         else
         {
             fb = Registers.FRAME_1;
+            source = GsCompositeSource.Frame;
         }
 
         bool syntheticFb = false;
@@ -1630,29 +1647,50 @@ public sealed class Gs : ISchedulable
             fromDispfb = false;
             natural = false;
             syntheticFb = true;
+            source = GsCompositeSource.SyntheticFbp0;
         }
 
         // When DISPLAY is programmed with a sensible rect, limit composite size (natural CRT).
+        // Use preferred circuit's DISPLAY (not DISPFB1-only) so dual-circuit EN2 binds correctly.
         DisplayRect? outRect = null;
         if (fromDispfb)
         {
-            DisplayDecoded disp = Registers.DISPFB1 != 0
-                ? DisplayDecoded.From(Registers.DISPLAY1)
-                : DisplayDecoded.From(Registers.DISPLAY2);
+            DisplayDecoded disp = circuit.PreferredCircuit == 2
+                ? circuit.Display2
+                : (circuit.PreferredCircuit == 1
+                    ? circuit.Display1
+                    : (Registers.DISPFB1 != 0 ? circuit.Display1 : circuit.Display2));
+            // If preferred DISPLAY is empty but the sibling has a rect, fall back.
             var r = disp.GetOutputRect();
+            if (!r.IsSensible)
+            {
+                var alt = circuit.Display1.GetOutputRect().IsSensible
+                    ? circuit.Display1.GetOutputRect()
+                    : circuit.Display2.GetOutputRect();
+                if (alt.IsSensible) r = alt;
+            }
             if (r.IsSensible)
                 outRect = r;
         }
 
         long written = CompositeLocalToFb(fb, fromDispfb, syntheticFb, mergeMode, outRect);
+        long residualExtra = 0;
 
         // When DISPFB unset and FRAME is a high FBP (draw target), also try FBP=0 IMAGE
         // page — commercial logo BITBLT often lands at page 0 while FRAME holds sparse UI.
+        // This is residual (not natural) — B3-class DISPFB1=0 path.
         if (!fromDispfb && !syntheticFb && ImageBytesWritten > 0
             && (Registers.FRAME_1 & 0x1FF) != 0)
         {
-            written += CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true, mergeMode: true, outRect: null);
+            residualExtra = CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true, mergeMode: true, outRect: null);
+            written += residualExtra;
+            if (residualExtra > 0 && written == residualExtra)
+                source = GsCompositeSource.SyntheticFbp0;
         }
+
+        // Always stamp circuit gen so a no-op scan after DISPFB bind does not thrash every present.
+        _lastCompositeImageBytes = ImageBytesWritten;
+        _lastCompositeCircuitGen = DisplayCircuitGeneration;
 
         if (written > 0)
         {
@@ -1661,7 +1699,9 @@ public sealed class Gs : ISchedulable
             DispfbPixelsComposited += written;
             if (natural)
                 NaturalDispfbPixels += written;
-            _lastCompositeImageBytes = ImageBytesWritten;
+            else
+                ResidualDispfbPixels += written;
+            LastCompositeSource = source;
         }
         return written;
     }
@@ -1920,7 +1960,8 @@ public sealed class Gs : ISchedulable
 
     private void SetPrivilegedDisplay(uint which, ulong value)
     {
-        // Write through to GsRegisters display fields used by present helpers
+        // Write through to GsRegisters display fields used by present helpers.
+        // Bump circuit generation so CompositeDispfbToFramebuffer rebinds after DISPFB/DISPLAY (GX-041).
         switch (which)
         {
             case 0x0000: Registers.SetPmode(value); break;
@@ -1929,6 +1970,8 @@ public sealed class Gs : ISchedulable
             case 0x0080: Registers.SetDisplay1(value); break;
             case 0x0090: Registers.SetDispfb2(value); break;
             case 0x00A0: Registers.SetDisplay2(value); break;
+            default: return;
         }
+        DisplayCircuitGeneration++;
     }
 }

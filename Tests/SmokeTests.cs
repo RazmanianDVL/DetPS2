@@ -406,10 +406,120 @@ public static class SmokeTests
             throw new Exception("NaturalDispfbPixels must be >0 when DISPFB programmed");
         if (sys.Gs.DispfbPixelsComposited < sys.Gs.NaturalDispfbPixels)
             throw new Exception("dispfbPx must cover naturalDispfbPx");
+        if (sys.Gs.LastCompositeSource != GsCompositeSource.NaturalDispfb)
+            throw new Exception($"expected NaturalDispfb source, got {sys.Gs.LastCompositeSource}");
         uint p = sys.Gs.GetPixel(8, 8);
         if ((p & 0xFFFFFF) != 0x00FF00)
             throw new Exception($"expected green from DISPFB composite, got 0x{p:X8}");
         Console.WriteLine($"[Smoke] Gs_NaturalDispfb_CompositeUsesCircuit OK (written={written} natural={sys.Gs.NaturalDispfbPixels})");
+    }
+
+    /// <summary>
+    /// GX-041: residual FRAME/FBP0 composite when DISPFB stays 0 (B3-class honest path).
+    /// naturalDispfbPx must remain 0; residualDispfbPx / dispfbPx &gt; 0.
+    /// </summary>
+    public static void Gs_ResidualFrame_CompositeHonestWhenDispfbZero()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.WriteGsRegister(0x50, (10UL << 16) | (10UL << 48));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 32UL | (32UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var blob = new byte[32 * 32 * 4];
+        for (int i = 0; i < 32 * 32; i++)
+        {
+            blob[i * 4] = 0x40;
+            blob[i * 4 + 1] = 0x40;
+            blob[i * 4 + 2] = 0xC0;
+            blob[i * 4 + 3] = 0xFF;
+        }
+        sys.Gs.WriteImageData(blob, 0);
+
+        // No DISPFB write — residual only. FRAME_1 FBP=0 FBW=10 PSM=0.
+        sys.Gs.WriteGsRegister(0x4C, (10UL << 16) | 0UL);
+
+        long written = sys.Gs.CompositeDispfbToFramebuffer();
+        if (written <= 0) throw new Exception("expected residual FRAME composite px");
+        if (sys.Gs.NaturalDispfbPixels != 0)
+            throw new Exception($"natural must stay 0 when DISPFB unset, got {sys.Gs.NaturalDispfbPixels}");
+        if (sys.Gs.ResidualDispfbPixels <= 0)
+            throw new Exception("residualDispfbPx must be >0");
+        if (sys.Gs.DispfbPixelsComposited <= 0)
+            throw new Exception("dispfbPx residual must be >0");
+        if (sys.Gs.LastCompositeSource is not (GsCompositeSource.Frame or GsCompositeSource.SyntheticFbp0))
+            throw new Exception($"expected residual source, got {sys.Gs.LastCompositeSource}");
+        if (sys.Gs.GetDisplayCircuitInfo().HasNaturalDispfb)
+            throw new Exception("HasNaturalDispfb must be false when DISPFB raw=0");
+        Console.WriteLine(
+            $"[Smoke] Gs_ResidualFrame_CompositeHonestWhenDispfbZero OK " +
+            $"(written={written} residual={sys.Gs.ResidualDispfbPixels} src={sys.Gs.LastCompositeSource})");
+    }
+
+    /// <summary>
+    /// GX-041: residual composite first, then software programs DISPFB — must rebind natural
+    /// (circuit-gen invalidates merge skip). PMODE EN may stay 0.
+    /// </summary>
+    public static void Gs_NaturalDispfb_RebindAfterResidual()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.WriteGsRegister(0x50, (10UL << 16) | (10UL << 48));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 32UL | (32UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var blob = new byte[32 * 32 * 4];
+        for (int i = 0; i < 32 * 32; i++)
+        {
+            blob[i * 4] = 0x00;
+            blob[i * 4 + 1] = 0x80;
+            blob[i * 4 + 2] = 0xFF;
+            blob[i * 4 + 3] = 0xFF;
+        }
+        sys.Gs.WriteImageData(blob, 0);
+
+        // Residual pass (DISPFB=0).
+        long residual = sys.Gs.CompositeDispfbToFramebuffer();
+        if (residual <= 0) throw new Exception("expected residual first pass");
+        if (sys.Gs.NaturalDispfbPixels != 0)
+            throw new Exception("natural must be 0 before DISPFB write");
+
+        // Software programs DISPFB without PMODE EN (common retail order).
+        var dispfb = new DispfbDecoded { Fbp = 0, FbwUnits = 10, Psm = 0, Dbx = 0, Dby = 0 };
+        var display = new DisplayDecoded { Dx = 0, Dy = 0, MagH = 0, MagV = 0, Dw = 639, Dh = 447 };
+        // PMODE EN=0 intentionally
+        sys.Gs.WritePrivileged64(0x12000070, dispfb.Pack());
+        sys.Gs.WritePrivileged64(0x12000080, display.Pack());
+
+        var info = sys.Gs.GetDisplayCircuitInfo();
+        if (!info.HasNaturalDispfb)
+            throw new Exception("HasNaturalDispfb must be true after DISPFB write (EN optional)");
+        if (info.PreferredCircuit != 1)
+            throw new Exception($"expected circuit 1 with EN=0+DISPFB1, got {info.PreferredCircuit}");
+
+        // Clear FB black so merge can accept natural fill again on black pixels only —
+        // residual already filled chrome; rebind still runs when circuit gen advances.
+        long naturalBefore = sys.Gs.NaturalDispfbPixels;
+        long again = sys.Gs.CompositeDispfbToFramebuffer();
+        // Merge may write 0 if FB already filled non-black; natural path still selected.
+        if (sys.Gs.LastCompositeSource != GsCompositeSource.NaturalDispfb && again > 0)
+            throw new Exception($"expected NaturalDispfb after rebind, got {sys.Gs.LastCompositeSource}");
+        // Force a clean natural count path: clear FB and recompose.
+        sys.Gs.Clear(0xFF000000);
+        // Clearing does not reset composite metrics — call composite again after gen bump.
+        sys.Gs.WritePrivileged64(0x12000070, dispfb.Pack()); // bump gen
+        long forced = sys.Gs.CompositeDispfbToFramebuffer();
+        if (forced <= 0) throw new Exception("expected natural composite after clear+DISPFB");
+        if (sys.Gs.NaturalDispfbPixels <= naturalBefore)
+            throw new Exception("NaturalDispfbPixels must increase after DISPFB rebind");
+        if (sys.Gs.LastCompositeSource != GsCompositeSource.NaturalDispfb)
+            throw new Exception($"forced natural source fail: {sys.Gs.LastCompositeSource}");
+        uint p = sys.Gs.GetPixel(4, 4);
+        if ((p & 0xFFFFFF) != 0xFF8000)
+            throw new Exception($"expected orange-ish from natural DISPFB, got 0x{p:X8}");
+        Console.WriteLine(
+            $"[Smoke] Gs_NaturalDispfb_RebindAfterResidual OK " +
+            $"(residual={residual} forced={forced} natural={sys.Gs.NaturalDispfbPixels})");
     }
 
     /// <summary>PL-002: pad-script parse + ApplyAt press/release.</summary>
@@ -1118,6 +1228,8 @@ press 3000 Circle 100
             Gs_MergeComposite_AfterSparsePrims();
             Gs_DisplayCircuit_DispfbDisplayDecode();
             Gs_NaturalDispfb_CompositeUsesCircuit();
+            Gs_ResidualFrame_CompositeHonestWhenDispfbZero();
+            Gs_NaturalDispfb_RebindAfterResidual();
             PadScript_ParseAndApply();
             Gs_DepthDisabled_AllowsOverdraw();
             Gs_AlphaBlend_Mixes();

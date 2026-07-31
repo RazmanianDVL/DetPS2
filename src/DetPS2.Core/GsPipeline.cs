@@ -44,11 +44,25 @@ public sealed class GsPipeline
 
     public void Present(string? ppmPath = null)
     {
+        // GX-041: ensure DISPFB→FB (natural or residual FRAME) before PCRTC present/dump.
+        _gs.CompositeDispfbToFramebuffer();
         if (ppmPath != null)
             _pcrtc.Present(ppmPath);
         else
             _pcrtc.PresentFrame();
         FramesPresented++;
+    }
+
+    /// <summary>GX-041 present helper: composite then optional Soft-GS PPM when px&gt;0.</summary>
+    public long PresentDispfbCircuit(string? ppmPath = null)
+    {
+        long written = _gs.CompositeDispfbToFramebuffer();
+        if (ppmPath != null)
+            DumpSoftGsIfDrawn(ppmPath);
+        else
+            _pcrtc.PresentFrame();
+        FramesPresented++;
+        return written;
     }
 
     /// <summary>

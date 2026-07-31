@@ -99,6 +99,7 @@ function Get-TierSet {
         [long]$prims = 0,
         [long]$imgBytes = 0,
         [long]$dispfbPx = 0,
+        [long]$naturalDispfbPx = 0,
         [long]$expandHits = 0,
         [ulong]$gifP1 = 0,
         [ulong]$gifP2 = 0,
@@ -133,7 +134,10 @@ function Get-TierSet {
         } else { "N" }
     }
     $g2 = if ($null -ne $G2 -and "$G2" -ne "") { "$G2" } else { if ($imgBytes -gt 0) { "Y" } else { "N" } }
-    $g3 = if ($null -ne $G3 -and "$G3" -ne "") { "$G3" } else { if ($dispfbPx -gt 0) { "Y" } else { "N" } }
+    # GX-041 G3: natural DISPFB → Y; residual FRAME/FBP0 composite only → Y?; none → N
+    $g3 = if ($null -ne $G3 -and "$G3" -ne "") { "$G3" } else {
+        if ($naturalDispfbPx -gt 0) { "Y" } elseif ($dispfbPx -gt 0) { "Y?" } else { "N" }
+    }
     $g4 = if ($null -ne $G4 -and "$G4" -ne "") { "$G4" } else {
         if ($px -le 0) { "?" } elseif ($expandHits -eq 0) { "Y?" } else { "N" }
     }
@@ -215,11 +219,15 @@ foreach ($t in $selected) {
             $prims = To-Long $m.prims
             $imgBytes = To-Long $m.imgBytes
             $dispfbPx = To-Long $m.dispfbPx
+            $naturalDispfbPx = To-Long $m.naturalDispfbPx
+            $residualDispfbPx = To-Long $m.residualDispfbPx
+            $compositeSource = if ($null -ne $m.compositeSource) { [string]$m.compositeSource } else { "" }
             $expandHits = To-Long $m.expandHits
             $gifCompleted = To-ULong $m.gifCompleted
             $gifAborted = To-ULong $m.gifAborted
             $exitReq = [bool]$m.exitRequested
             $tiers = Get-TierSet -px ([long]$pxN) -prims $prims -imgBytes $imgBytes -dispfbPx $dispfbPx `
+                -naturalDispfbPx $naturalDispfbPx `
                 -expandHits $expandHits -gifP1 $gifP1 -gifP2 $gifP2 -gifP3 $gifP3 `
                 -gifCompleted $gifCompleted -gifAborted $gifAborted -exitRequested $exitReq `
                 -T0 $m.T0 -T1 $m.T1 -T2 $m.T2 -T3 $m.T3 -T4 $m.T4 -T5 $m.T5 -T6 $m.T6 -T7 $m.T7 `
@@ -232,7 +240,10 @@ foreach ($t in $selected) {
                 pc = $m.pc; px = $m.px; prims = $prims
                 gifPath1 = $gifP1; gifPath2 = $gifP2; gifPath3 = $gifP3
                 gifP1 = $gifP1; gifP2 = $gifP2; gifP3 = $gifP3
-                imgBytes = $imgBytes; dispfbPx = $dispfbPx; expandHits = $expandHits
+                imgBytes = $imgBytes; dispfbPx = $dispfbPx
+                naturalDispfbPx = $naturalDispfbPx; residualDispfbPx = $residualDispfbPx
+                compositeSource = $compositeSource
+                expandHits = $expandHits
                 gifCompleted = $gifCompleted; gifAborted = $gifAborted
                 dmac = $m.dmac
                 cdvd = $m.cdvdSectors; syscalls = $m.syscalls
@@ -259,11 +270,14 @@ foreach ($t in $selected) {
         $prims = To-Long $r.prims
         $imgBytes = To-Long $r.imgBytes
         $dispfbPx = To-Long $r.dispfbPx
+        $naturalDispfbPx = To-Long $r.naturalDispfbPx
+        $residualDispfbPx = To-Long $r.residualDispfbPx
         $expandHits = To-Long $r.expandHits
         $gifCompleted = To-ULong $r.gifCompleted
         $gifAborted = To-ULong $r.gifAborted
         $exitReq = ("$($r.exitReq)" -match 'True')
         $tiers = Get-TierSet -px ([long]$pxN) -prims $prims -imgBytes $imgBytes -dispfbPx $dispfbPx `
+            -naturalDispfbPx $naturalDispfbPx `
             -expandHits $expandHits -gifP1 $gifP1 -gifP2 $gifP2 -gifP3 $gifP3 `
             -gifCompleted $gifCompleted -gifAborted $gifAborted -exitRequested $exitReq
         $results += [pscustomobject]@{
@@ -284,6 +298,9 @@ foreach ($t in $selected) {
             gifP3          = $gifP3
             imgBytes       = $imgBytes
             dispfbPx       = $dispfbPx
+            naturalDispfbPx = $naturalDispfbPx
+            residualDispfbPx = $residualDispfbPx
+            compositeSource = ""
             expandHits     = $expandHits
             gifCompleted   = $gifCompleted
             gifAborted     = $gifAborted
@@ -316,10 +333,12 @@ $md += "- **NativeMetrics:** $NativeMetrics"
 $md += "- **Policy:** Soft-GS metrics only (no dGPU required). MENU YES is manual/claim, not this heuristic."
 $md += "- **Schema:** ``tools/SCOREBOARD_SCHEMA.md`` (T0–T7 + G1–G4)"
 $md += ""
-$md += "| Title | Serial | Heur | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7 | G1 | G2 | G3 | G4 | PC | px | prims | gifP1 | gifP2 | gifP3 | img | dispfb | expand | dmac | cdvd | sec |"
-$md += "|-------|--------|------|----|----|----|----|----|----|----|----|----|----|----|----|----|----|-------|-------|-------|-------|-----|--------|--------|------|------|-----|"
+$md += "| Title | Serial | Heur | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7 | G1 | G2 | G3 | G4 | PC | px | prims | gifP1 | gifP2 | gifP3 | img | dispfb | natDispfb | src | expand | dmac | cdvd | sec |"
+$md += "|-------|--------|------|----|----|----|----|----|----|----|----|----|----|----|----|----|----|-------|-------|-------|-------|-----|--------|-----------|-----|--------|------|------|-----|"
 foreach ($r in $results) {
-    $md += "| $($r.name) | $($r.serial) | **$($r.menuHeuristic)** | $($r.T0) | $($r.T1) | $($r.T2) | $($r.T3) | $($r.T4) | $($r.T5) | $($r.T6) | $($r.T7) | $($r.G1) | $($r.G2) | $($r.G3) | $($r.G4) | $($r.pc) | $($r.px) | $($r.prims) | $($r.gifP1) | $($r.gifP2) | $($r.gifP3) | $($r.imgBytes) | $($r.dispfbPx) | $($r.expandHits) | $($r.dmac) | $($r.cdvd) | $($r.elapsedSec) |"
+    $nat = if ($null -ne $r.naturalDispfbPx) { $r.naturalDispfbPx } else { 0 }
+    $src = if ($r.compositeSource) { $r.compositeSource } else { "-" }
+    $md += "| $($r.name) | $($r.serial) | **$($r.menuHeuristic)** | $($r.T0) | $($r.T1) | $($r.T2) | $($r.T3) | $($r.T4) | $($r.T5) | $($r.T6) | $($r.T7) | $($r.G1) | $($r.G2) | $($r.G3) | $($r.G4) | $($r.pc) | $($r.px) | $($r.prims) | $($r.gifP1) | $($r.gifP2) | $($r.gifP3) | $($r.imgBytes) | $($r.dispfbPx) | $nat | $src | $($r.expandHits) | $($r.dmac) | $($r.cdvd) | $($r.elapsedSec) |"
 }
 $md += ""
 $md += "## Tier legend (heuristic — not formal claims)"
@@ -334,8 +353,9 @@ $md += "| T4 Natural | expandHits==0 |"
 $md += "| T5–T7 | stubs until gameplay/IRX seasons |"
 $md += "| G1 Path | gif completed / path counts |"
 $md += "| G2 Tex | imgBytes>0 |"
-$md += "| G3 Present | dispfbPx>0 |"
+$md += "| G3 Present | naturalDispfbPx>0 → Y; residual FRAME/FBP0 dispfbPx only → Y? (B3-class); else N |"
 $md += "| G4 Expand off | expandHits==0 |"
+$md += "| natDispfb / src | GX-041 natural DISPFB px + compositeSource (NaturalDispfb|Frame|SyntheticFbp0) |"
 $md += ""
 $md += "## Menu evidence bar (manual)"
 $md += ""

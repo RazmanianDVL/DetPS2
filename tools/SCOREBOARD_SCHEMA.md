@@ -24,10 +24,13 @@
 | `gifPath3` / `gifP3` | ulong | GIF Path3 transfers (DMAC GIF) |
 | `imgBytes` | long | Host→local IMAGE/BITBLT bytes |
 | `dispfbPx` | long | Pixels composited from DISPFB/FRAME local VRAM |
-| `naturalDispfbPx` | long | Subset of `dispfbPx` from software-programmed DISPFB only (GX-040; not FRAME/FBP0 fallback) |
+| `naturalDispfbPx` | long | Subset of `dispfbPx` from software-programmed DISPFB only (GX-040/041; not FRAME/FBP0 fallback) |
+| `residualDispfbPx` | long | FRAME + FBP0 synthetic residual composite (GX-041; B3-class when DISPFB1=0) |
+| `compositeSource` | string | `None` / `NaturalDispfb` / `Frame` / `SyntheticFbp0` (last composite class) |
 | `display1` / `display2` / `pmode` | string hex | Privileged CRT regs (GX-040 telemetry) |
 | `circuit` | int | Preferred PCRTC circuit 0/1/2 |
-| `naturalDispfb` | bool | Preferred circuit has non-zero DISPFB raw |
+| `naturalDispfb` | bool | Any software DISPFB raw non-zero (PMODE EN optional) |
+| `enNaturalDispfb` | bool | PMODE EN + preferred DISPFB non-zero |
 | `padScriptEvents` / `padScriptFires` | int | PL-002 pad-script schedule / applied press+release count |
 | `expandHits` | long | Title-strip ofx expand rescues (G4/T4 demotion target) |
 | `gifCompleted` | ulong | Fully drained GIFtag packets (`Gif.PacketsCompleted`) |
@@ -74,7 +77,7 @@ Heuristic codes emitted as strings. **`Y` / `Y?` / `NEAR?` / `N` / `?` / `WARN`*
 |------|------|---------------------|------|
 | **G1** | Path fidelity | any path or gifCompleted>0; WARN if aborted ≫ completed | G-GFX-1 |
 | **G2** | Texture/IMAGE | imgBytes>0 → `Y` | G-GFX-3 |
-| **G3** | DISPFB present | naturalDispfbPx>0 → `Y`; residual composite dispfbPx>0 only → `Y?` | G-GFX-5 |
+| **G3** | DISPFB present | naturalDispfbPx>0 → `Y`; residual FRAME/FBP0 `dispfbPx` only → `Y?` (B3 honest); else `N` | G-GFX-5 / GX-041 |
 | **G4** | Expand demotion | expandHits==0 and px>0 → `Y?` | G-GFX-6 |
 
 ---
@@ -98,16 +101,16 @@ detps2 blocker-trace <media> --cycles=N --dump-softgs=out/traces/softgs.ppm
 Always printed (scrapers / agents):
 
 ```text
-claim: px=… prims=… gifP1=… gifP2=… gifP3=… imgBytes=… dispfbPx=… expandHits=… gifCompleted=… gifAborted=…
+claim: px=… prims=… gifP1=… gifP2=… gifP3=… imgBytes=… dispfbPx=… naturalDispfbPx=… residualDispfbPx=… expandHits=… gifCompleted=… gifAborted=…
 ```
 
-Also: `softgs: … expandHits=…` and `gif-pkts: completed=… aborted=…`.
+Also: `softgs: … naturalDispfbPx=… residualDispfbPx=… compositeSource=…` and `gif-pkts: completed=… aborted=…`.
 
 ---
 
 ## 6. scoreboard.ps1 markdown columns
 
-| Title | Serial | Heur | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7 | G1 | G2 | G3 | G4 | PC | px | prims | gifP1 | gifP2 | gifP3 | img | dispfb | expand | dmac | cdvd | sec |
+| Title | Serial | Heur | T0… | G1 | G2 | G3 | G4 | PC | px | prims | gifP* | img | dispfb | natDispfb | src | expand | dmac | cdvd | sec |
 
 When using `-NativeMetrics`, tiers come from Core JSON.  
 Fallback log-parse fills metrics it can find and recomputes the same heuristics in PowerShell.

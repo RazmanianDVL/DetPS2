@@ -9,6 +9,7 @@
   },
   "metrics": [
     "px", "prims", "gifP1", "gifP2", "gifP3", "imgBytes", "dispfbPx",
+    "naturalDispfbPx", "residualDispfbPx", "compositeSource",
     "expandHits", "gifCompleted", "gifAborted", "dmac", "cdvdSectors"
   ],
   "defaultCycles": {
