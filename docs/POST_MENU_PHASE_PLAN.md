@@ -254,11 +254,12 @@ Extend `tools/scoreboard-fleet.json` + `scoreboard.ps1`:
 | BO2 | S5 | YES | Multi-prim IMAGE; list soft-stubs | BloodOmen2SnAssist |
 | GoW | S6 | YES | Fedo decode→PRIM; IRX-only cdvd class; ofx expand | GodOfWarAssist |
 | Vexx | S7 | YES | TRE members incomplete; richer frontend | VexxAssist |
-| Whip | S8 | YES | Texture ring; WHIP WaitSema fabricate | WhiplashAssist |
-| Haven | S9 | YES | IMAGE residual; CallRpc SP fragility | TeamIcoAssist |
+| Whip | S7 secondary | YES | Texture ring; WHIP WaitSema fabricate | WhiplashAssist |
+| Haven | S6/S7 overflow | YES | IMAGE residual; CallRpc SP fragility | TeamIcoAssist |
 | SotC | free-ride | NO | KERNEL.XFF residual historically | none preferred |
 
-**Shared residual (S10):** Path2 garbage DIRECT abort; ofx expand policy; PATH3 unmask matrix; SearchFile dual gate (SM+Vexx); FILEIO IRX; disc IOPRP demotion.
+**Shared residual (S8–S10 GFX):** Path2 DIRECT abort; ofx expand; PATH3 mask; DISPFB; PSM/CLUT.  
+**Shared residual (title/IRX):** SearchFile dual gate; FILEIO IRX; disc IOPRP demotion.
 
 ---
 
@@ -312,7 +313,7 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-010** | S10-PAD | S0 | Shared pad density policy (no title invent) | doc + PadInput helpers | 1d |
+| **PL-010** | S1 (shared pad helpers via handoff) | S0 | Shared pad density policy doc + `PadInput` helpers if needed | doc; no invent per-title | 1d |
 | **PL-011** | S1 | PL-010 | SM sel-idx stable + accept path | T2 SM @100M | 2–3d |
 | **PL-012** | S2 | PL-010 | Dec pad on idle-pump menu | T2 Dec | 2d |
 | **PL-013** | S3 | PL-010 | DA pad selection keep-alive | T2 DA | 2d |
@@ -320,9 +321,9 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 | **PL-015** | S5 | PL-010 | BO2 pad past title FB | T2 BO2 | 2d |
 | **PL-016** | S6 | PL-010 | GoW pad after Soft-GS px | T2 GoW | 2d |
 | **PL-017** | S7 | PL-010 | Vexx pad title-surface | T2 Vexx | 1–2d |
-| **PL-018** | S8 | PL-010 | Whip pad title; WHIP WaitSema only | T2 Whip | 1–2d |
-| **PL-019** | S9 | PL-010 | Haven pad; no JREXIT | T2 Haven | 2d |
-| **PL-020** | S10-EE | PL-010 | Kernel pad RPC / sticky pad without thrash | soak 3 titles | 1d |
+| **PL-018** | S7 | PL-010 | Whip pad title; WHIP WaitSema only | T2 Whip | 1–2d |
+| **PL-019** | S6 | PL-010 | Haven pad; no JREXIT (overflow queue) | T2 Haven | 2d |
+| **PL-020** | S3 | PL-010 | Kernel pad RPC soak notes (title reports; EE fixes via T0 handoff) | soak 3 titles | 1d |
 | **PL-021** | S1 | PL-011 | SM dual-chrome selection UI | T2 hold + prims≥ | 2d |
 | **PL-022** | S4 | PL-014 | B3 START/CROSS scripted | pad-script claim | 1d |
 | **PL-023** | S6 | PL-016 | GoW thrash PC band escape without killing DMA tags | T2 hold | 2d |
@@ -337,20 +338,20 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-025** | S10-GS | P1 | DISPFB natural bind investigation | design note + smoke | 2d |
+| **PL-025** | S10 (GFX-DISPLAY) | P1 | DISPFB natural bind (also GX-040/041) | design + smoke | 2d |
 | **PL-026** | S4 | PL-025 | B3 DISPFB or documented composite-only | T3 B3 | 2d |
 | **PL-027** | S5 | PL-025 | BO2 multi-prim IMAGE | T3 BO2 imgBytes>0 | 3d |
-| **PL-028** | S9 | PL-025 | Haven IMAGE chrome | T3 Haven imgBytes>0 | 3d |
+| **PL-028** | S6 | PL-025 | Haven IMAGE chrome (overflow) | T3 Haven imgBytes>0 | 3d |
 | **PL-029** | S2 | P1 | Dec gameart → GIF IMAGE | T3 Dec textures | 3–4d |
 | **PL-030** | S3 | P1 | DA textured chrome | T3 DA | 2–3d |
 | **PL-031** | S1 | P1 | SM natural texture DMA (reduce assist PATH3) | T3 SM | 3–4d |
 | **PL-032** | S7 | P1 | Vexx TRE member completeness | T3 Vexx prims↑ | 3d |
-| **PL-033** | S8 | P1 | Whip full texture ring path | T3 Whip | 2–3d |
+| **PL-033** | S7 | P1 | Whip full texture ring path | T3 Whip | 2–3d |
 | **PL-034** | S6 | P1 | GoW richer Soft-GS (more PRIM after Path2 sticky) | T3 GoW px↑ | 3d |
-| **PL-035** | S10-GIF | P1 | Path2 garbage DIRECT residual reduce | aborted≤1 hold; smokes | 2d |
-| **PL-036** | S10-SIF | P1 | SearchFile single gate (SM+Vexx) | both MENU+T2 hold | 2d |
-| **PL-037** | S10-CDVD | P1 | Pack path audit (Fedo/TRE/SSF/WAD) | matrix doc | 2d |
-| **PL-038** | S1–S9 | PL-025… | Frontend claim wave | T3 count report | 2d |
+| **PL-035** | S8 | P1 | Path2 garbage DIRECT residual (GX-010/011) | aborted≤1; smokes | 2d |
+| **PL-036** | S1+S7 | P1 | SearchFile single gate (SM+Vexx) handoff | both MENU+T2 hold | 2d |
+| **PL-037** | S5+S7 | P1 | Pack path audit notes (Fedo/TRE/SSF/WAD) | matrix doc | 2d |
+| **PL-038** | S1–S7 | PL-025… | Frontend claim wave | T3 count report | 2d |
 | **PL-039** | T0 | PL-038 | **P2 assert** FRONTEND 9/9 | scoreboard | 0.5d |
 
 **S2 exit = P2 + G-GFX-3/4 progress.** Parallel: **G2 GX-025…039** on S8–S10 (IMAGE/TEX). Title FRONTEND WPs must call out imgBytes/dispfb — not only expand px.
@@ -361,15 +362,15 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-040** | S10-GS | P2 | Expand-hit demotion when XYOFFSET retail armed | expandHits↓ | 2d |
+| **PL-040** | S9 | P2 | Expand-hit demotion when XYOFFSET retail armed (GX-043) | expandHits↓ | 2d |
 | **PL-041** | S6 | PL-040 | GoW drop ofx expand if retail ofx set | T4 GoW or documented fail | 2d |
-| **PL-042** | S8 | PL-040 | Whip expand demotion | T4 Whip attempt | 2d |
+| **PL-042** | S7 | PL-040 | Whip expand demotion | T4 Whip attempt | 2d |
 | **PL-043** | S5 | PL-040 | BO2 expand demotion | T4 BO2 attempt | 2d |
 | **PL-044** | S1 | P2 | SM remove assist PATH3 when natural FBB0 draws | T4 SM attempt | 3d |
 | **PL-045** | S2/S3 | P2 | Midway fail-tail plant reduction | T1+T2 hold; LOC↓ | 3d |
-| **PL-046** | S10-GIF | P2 | PATH3 unmask policy matrix (safe clear conditions) | soak 9 titles | 3d |
+| **PL-046** | S8 | P2 | PATH3 unmask policy matrix (GX-050) | soak 9 titles | 3d |
 | **PL-047** | S4 | P2 | B3 natural FRONTEND dest bind | plant↓ | 2d |
-| **PL-048** | S10-DEBT | PL-044… | Soft-success call-site inventory | CSV | 1d |
+| **PL-048** | S4 | PL-044… | Soft-success call-site inventory (titles contribute) | CSV | 1d |
 | **PL-049** | T0 | PL-040… | **P3 assert** NATURAL ≥6/9 | scoreboard | 0.5d |
 
 **S3 exit = P3 + G-GFX-5/6.** Parallel: **G3 GX-040…049** (DISPFB + expand demotion). NATURAL is meaningless if expandHits still carry menus.
@@ -388,10 +389,10 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 | **PL-051** | S4 | PL-050 | B3 New Game / event load Soft-GS scene | T5 B3 | 4–5d |
 | **PL-052** | S3 | PL-050 | DA select fighter → match surface | T5 DA | 4–5d |
 | **PL-053** | S7 | PL-050 | Vexx title→game first level | T5 Vexx | 4–5d |
-| **PL-054** | S10-SIF | PL-050 | Stream open helpers shared (no plant sectors) | used by 051–053 | 2d |
-| **PL-055** | S10-CDVD | PL-050 | Async CDVD pressure under gameplay | no Exit | 2d |
-| **PL-056** | S1,S2,S5,S6,S8,S9 | P2 | Soak claims hold T1–T3 | matrix green | 2d |
-| **PL-057** | S10-EE | PL-051… | Thread/WaitSema health under load | thrash counters | 2d |
+| **PL-054** | S5 | PL-050 | Stream open notes / shared helper handoff (no plant sectors) | used by 051–053 | 2d |
+| **PL-055** | S4 | PL-050 | Async CDVD pressure under gameplay notes | no Exit | 2d |
+| **PL-056** | S1,S2,S5,S6,S7 | P2 | Soak claims hold T1–T3 | matrix green | 2d |
+| **PL-057** | S3 | PL-051… | Thread/WaitSema health under load notes | thrash counters | 2d |
 | **PL-058** | S4,S3,S7 | PL-051… | Deep 500M stability | no Exit | 2d |
 | **PL-059** | T0 | PL-051…053 | **P4 assert** GAMEPLAY ≥3 | scoreboard | 0.5d |
 
@@ -407,13 +408,13 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 |----|------|---------|-------------|-----------|-----|
 | **PL-060** | T0 | P4 | Charters Dec/Whip/BO2 | docs | 0.5d |
 | **PL-061** | S2 | PL-060 | Dec mode select → fight | T5 Dec | 4–5d |
-| **PL-062** | S8 | PL-060 | Whip start run | T5 Whip | 4–5d |
+| **PL-062** | S7 | PL-060 | Whip start run | T5 Whip | 4–5d |
 | **PL-063** | S5 | PL-060 | BO2 new game room | T5 BO2 | 4–5d |
 | **PL-064** | S1 | P4 | SM optional gameplay spike | T5 SM or residual | 4d |
 | **PL-065** | S6 | P4 | GoW shell→first interactive beyond title | T5 GoW attempt | 5d |
-| **PL-066** | S9 | P4 | Haven first area attempt | T5 Haven attempt | 4d |
-| **PL-067** | S10-* | P4 | Shared blockers from 061–066 | global fixes | 3d |
-| **PL-068** | S1–S9 | PL-061… | Hold matrix | T1–T4 hold | 2d |
+| **PL-066** | S6 | P4 | Haven first area attempt (overflow) | T5 Haven attempt | 4d |
+| **PL-067** | S8–S10 | P4 | GFX blockers from 061–066 (draw graphs) | GX WPs | 3d |
+| **PL-068** | S1–S7 | PL-061… | Hold matrix | T1–T4 hold | 2d |
 | **PL-069** | T0 | PL-061…063 | **P5 assert** GAMEPLAY ≥6 | scoreboard | 0.5d |
 
 ---
@@ -424,8 +425,8 @@ Each WP: **ID · Seat(s) · Depends · Deliverable · Exit test · Est**
 |----|------|---------|-------------|-----------|-----|
 | **PL-070** | T0 | P4 | Pick 1–2 titles for 60s playable slice | charter | 0.25d |
 | **PL-071** | best seat | PL-070 | Deep soak Soft-GS alive + in-game pad | T6 @ deep | 5–7d |
-| **PL-072** | S10-PAD | PL-071 | Analog/digital fidelity for slice | pad soak | 2d |
-| **PL-073** | S10-GS | PL-071 | Frame pacing / present optional | no desync det | 2d |
+| **PL-072** | S3 | PL-071 | Analog/digital fidelity for slice | pad soak | 2d |
+| **PL-073** | S10 | PL-071 | Frame pacing / present optional | no desync det | 2d |
 | **PL-074** | T0 | PL-071 | **P6 assert** | video/log artifact | 0.5d |
 
 Other 8 seats: continuous **MENU hold + natural plant demotion** (S3 backlog).
@@ -438,18 +439,18 @@ Couples [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md) Blocks D–E.
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-075** | S10-IOP | P2 | Disc IOPRP exec residual matrix | G2 list | 3d |
-| **PL-076** | S10-SIF | PL-075 | FILEIO IRX pilot title #1 | **P7 partial** | 5d |
-| **PL-077** | title pilot | PL-076 | Second FILEIO IRX title | P7 partial | 4d |
-| **PL-078** | title pilot | PL-076 | Third FILEIO IRX title | **P7** | 4d |
-| **PL-079** | S10-PAD | PL-075 | PADMAN IRX pilot | **P8 partial** | 5d |
-| **PL-080** | title | PL-079 | Second PAD IRX | **P8** | 3d |
-| **PL-081** | S10-DEBT | PL-076 | Demote FILEIO soft-success when IRX owns | LOC↓ | 2d |
-| **PL-082** | S1–S9 | PL-076 | Fleet soak under LITERAL_IRX | T1 hold | 2d |
-| **PL-083** | S10-IOP | PL-075 | MOD_LOAD non-empty commercial paths | Whip-class | 2d |
+| **PL-075** | S4 (IOP handoff) | P2+G-GFX-3 | Disc IOPRP exec residual matrix | G2 list | 3d |
+| **PL-076** | S5 pilot | PL-075 | FILEIO IRX pilot title #1 | **P7 partial** | 5d |
+| **PL-077** | S2 pilot | PL-076 | Second FILEIO IRX title | P7 partial | 4d |
+| **PL-078** | S7 pilot | PL-076 | Third FILEIO IRX title | **P7** | 4d |
+| **PL-079** | S3 pilot | PL-075 | PADMAN IRX pilot | **P8 partial** | 5d |
+| **PL-080** | S1 | PL-079 | Second PAD IRX | **P8** | 3d |
+| **PL-081** | S5 | PL-076 | Demote FILEIO soft-success when IRX owns | LOC↓ | 2d |
+| **PL-082** | S1–S7 | PL-076 | Fleet soak under LITERAL_IRX | T1 hold | 2d |
+| **PL-083** | S7 | PL-075 | MOD_LOAD non-empty commercial paths | Whip-class | 2d |
 | **PL-084** | T0 | PL-078,080 | **P7+P8 assert** | #12 | 0.5d |
 
-**Seat mapping in S7:** S10 on IOP/SIF/PAD lanes; 3 title pilots rotate; remaining seats soak.
+**Seat mapping in S7:** title pilots for IRX; **S8–S10 stay on GFX hold** unless G-GFX-3 green and T0 reassigns S8 to SIF for one wave.
 
 ---
 
@@ -457,12 +458,12 @@ Couples [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md) Blocks D–E.
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-085** | S10-DEBT | P4 | LOC report vs baseline | CSV | 1d |
+| **PL-085** | S1 | P4 | LOC report vs baseline | CSV | 1d |
 | **PL-086** | S1 | PL-085 | Delete dead SM plants | MENU+T2 hold | 2d |
 | **PL-087** | S2/S3 | PL-085 | Midway plant delete pass | hold | 2d |
-| **PL-088** | S4–S9 | PL-085 | Per-title plant delete pass | hold | 2d each |
-| **PL-089** | S10-SIF | PL-085 | RealSifRpc dead soft-success purge | soak | 3d |
-| **PL-090** | S10-EE | PL-085 | Kernel soft-success inventory | doc | 2d |
+| **PL-088** | S4–S7 | PL-085 | Per-title plant delete pass | hold | 2d each |
+| **PL-089** | S5 | PL-085 | RealSifRpc dead soft-success purge notes | soak | 3d |
+| **PL-090** | S3 | PL-085 | Kernel soft-success inventory | doc | 2d |
 | **PL-091** | T0 | PL-086… | **P9 assert** LOC ↓ ≥40% | report | 0.5d |
 
 ---
@@ -471,11 +472,11 @@ Couples [IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md) Blocks D–E.
 
 | ID | Seat | Depends | Deliverable | Exit test | Est |
 |----|------|---------|-------------|-----------|-----|
-| **PL-092** | S10-TOOL | P1 | Tape record/replay harness commercial | tool | 2d |
-| **PL-093** | S1,S3,S4,S7,S8 | PL-092 | 5-title hash stable @100M | **P10** | 3d |
-| **PL-094** | free-ride seat | P3 | SotC INTERACTIVE no new GameQuirk | **P11 partial** | 5–7d |
-| **PL-095** | free-ride seat | PL-094 | Second free-ride serial | **P11** | 5–7d |
-| **PL-096** | S10-TOOL | P5 | Full fleet matrix artifact archive | `out/traces/release/` | 1d |
+| **PL-092** | S10 | P1 | Tape record/replay harness commercial | tool | 2d |
+| **PL-093** | S1,S3,S4,S6,S7 | PL-092 | 5-title hash stable @100M | **P10** | 3d |
+| **PL-094** | S7 free-ride | P3+G-GFX-3 | SotC INTERACTIVE no new GameQuirk | **P11 partial** | 5–7d |
+| **PL-095** | S6 free-ride | PL-094 | Second free-ride serial | **P11** | 5–7d |
+| **PL-096** | S10 | P5 | Full fleet matrix artifact archive | `out/traces/release/` | 1d |
 | **PL-097** | T0 | P6+P10 | RELEASE_NOTES v0.2.0 | file | 0.5d |
 | **PL-098** | T0 | PL-097 | COMPATIBILITY + wiki Commercial-Titles refresh | published | 0.5d |
 | **PL-099** | T0 | PL-091…098 | **P12 close-out** #12 | gates table green | 0.5d |
@@ -508,27 +509,27 @@ S9 DET / FREE-RIDE / REL (P10–P12)
 | Day | T0 | Seats |
 |-----|----|-------|
 | Mon | Merge weekend; assign WP | All 10 start WP |
-| Tue–Wed | Conflict triage; mid-merge shared | Continue; S10 shared land first |
-| Thu | Fleet spot-claim 3 titles | Title verify 50M |
-| Fri | Full merge train; #12; matrix sample | Push branches; residual notes |
+| Tue–Wed | Conflict triage; **merge S8–S10 first** | Titles continue; GFX land |
+| Thu | Fleet spot-claim 3 titles (+1 expand-class) | Title verify 50M |
+| Fri | Full merge train; #12; DISCOVERY_LOG | Push branches; residual notes |
 | Sat–Sun | Optional deep claims | Long 100M/500M |
 
 ### 9.2 Merge train order (risk-aware)
 
-1. **S10 platform** (Gs/Gif/Vif/Dmac/Sif/Kernel) — always first  
+1. **S8 GFX-PATH** → **S9 GFX-RASTER** → **S10 GFX-DISPLAY**  
 2. **S1 SM** if SearchFile/shared Midway  
 3. **S2 Dec → S3 DA** (serialize MidwayFamilyAssist)  
-4. **S4 B3 → S5 BO2 → S6 GoW → S7 Vexx → S8 Whip → S9 Haven**  
+4. **S4 B3 → S5 BO2 → S6 GoW → S7 Vexx/Whip**  
 5. Docs/scoreboard last  
 
 ### 9.3 Keeping 10 busy when blocked
 
 | Block type | Idle seat does |
 |------------|----------------|
-| Waiting merge | Oracle: Play!/PCSX2 notes in title doc |
-| Waiting S10 | Diagnose 20M wall map; no code |
+| Waiting merge | Oracle: Play!/PCSX2 FRAME/TEX dump notes |
+| Waiting S8–S10 | Title diagnose 20M draw graph; no Gs/Gif edit |
 | WP exit met | Next WP in season backlog or soak |
-| Season complete | Next season charter draft |
+| Season complete | Next season charter / DISCOVERY_LOG |
 
 ---
 
