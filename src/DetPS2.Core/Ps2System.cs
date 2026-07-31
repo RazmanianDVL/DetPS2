@@ -449,6 +449,8 @@ public sealed class Ps2System
                     or (>= 0x00293C00UL and <= 0x00293C80UL)  // WaitSema empty SIF poll
                     or (>= 0x00294800UL and <= 0x002948A0UL)  // SIF-cmd poll caller (loops WaitSema)
                     or (>= 0x0027CC00UL and <= 0x0027CE90UL)  // worker entry/dispatch (WaitSema 0x20)
+                    or (>= 0x0027DF00UL and <= 0x00282000UL)  // worker cmd handlers (type=2 → 0x2803C0)
+                    or (>= 0x0026BF50UL and <= 0x0026C200UL)  // post-worker copy/hang + 989snd (wave-4)
                     or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
                     or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
