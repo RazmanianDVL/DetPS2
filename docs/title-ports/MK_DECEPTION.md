@@ -11,24 +11,24 @@
 | **Assist** | `MidwayFamilyAssist` **REGION DEC** (`IsDeception`) |
 | **Seat** | **S2 MIDWAY-DEC** |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s2` |
-| **Branch** | `agent/seat-s2/s0-g0` |
+| **Branch** | `agent/seat-s2/s1-g1` |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **MENU YES** (midway-menu Soft-GS keep-alive) — S0 PL-005 measure + draw-graph |
+| **Status** | **MENU YES** hold · **P1 INTERACTIVE** (assist-stable sel-idx under D-pad) — PL-012 |
 | **Last updated** | 2026-07-31 |
 
 ---
 
-## S0 charter (PL-005)
+## S0 charter (PL-005) + S1 pad (PL-012)
 
 **Gates this seat feeds:**
 
 | Gate | Name | Dec status |
 |------|------|-------------|
 | **P0** | MENU floor | **HOLD** — midway-menu Soft-GS |
-| **P1** | INTERACTIVE | **WALL** — idle-pump @`0x1B6A68` keep-alive; pad selection/state advance not proven |
+| **P1** | INTERACTIVE | **HOLD (assist-stable)** — pad inject moves sel-idx `*0x5DC000` 0..4 under D-pad; Soft-GS Δ after pad; natural AnimMenu accept residual |
 | **G-GFX-3** | IMAGE path | **WALL** — `gameart.ssf` body live (2.8 MiB), Soft-GS `imgBytes` plateau **98304** (not art-scale) |
 
-**Freezes held:** Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF** · no invent PATH3 · **Path3MaskedByVif** held · no DA-only thrash · no SM `MidwayBootAssist`.
+**Freezes held:** Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF** · no invent PATH3 · **Path3MaskedByVif** held · no DA-only thrash · no SM `MidwayBootAssist` · no global WaitSema fabricate.
 
 ---
 
@@ -47,14 +47,14 @@
 | PowerOff/WaitSema storm kill | **YES** — park idle @`0x1B6A68` keep-alive |
 | **MENU YES** (midway-menu) | **YES** — Soft-GS keep-alive, `exitRequested=False` |
 | gifPath3 growth / natural IMAGE chrome | **No** — gifP3=**6** stuck; imgBytes plateaus |
-| Pad INTERACTIVE (P1) | **Open** — PL-012 |
-| Full gameart TEX sample (G-GFX-3) | **Open** — GX-037 consume |
+| **Pad INTERACTIVE (P1 / PL-012)** | **HOLD** — assist-stable sel-idx + pad inject @ idle-pump |
+| Full gameart TEX sample (G-GFX-3) | **Open** — GX-037 / PL-029 consume |
 
 ---
 
 ## Soft-GS metrics (SEMA_OFF, host-present)
 
-### Diagnose 20M — `out/seat-s2` tip `20973c6` / seat build 2026-07-31
+### Diagnose 20M — `out/seat-s2` tip / seat build 2026-07-31
 
 ```
 @20M: PC=0x003BA980 px=749568 prims=4 gifPath1=0 gifPath2=1 gifPath3=6 dmac=9
@@ -68,12 +68,12 @@
       phase: heap-tree cycle band (pre idle-kick / pre gameart)
 ```
 
-### Claim 100M — same build (claim line)
+### Claim 100M — PL-012 pad inject (SEMA_OFF host-present)
 
 ```
 @100M: PC=0x001B6BF0 px=22006272 prims=1444 gifPath1=0 gifPath2=145 gifPath3=6 dmac=153
        sifBytes=3567920 syscalls=25390 cdvdSectors=4535 spu2Samples=31928
-       softgs: imgBytes=98304 dispfbPx=32768 fragTest=21973504 rejScissor=640
+       softgs: imgBytes=98304 dispfbPx=32768 expandHits=0 fragTest=21973504 rejScissor=640
        softgs-regs: FRAME_1=0xA005B DISPFB1=0 SCISSOR=0x7FFF00007FFF0000
                     XYOFFSET=0x72006C00 TEST=0x3101A
        softgs-writes: total=5177 PRIM=75 XYZ2=2886 FRAME=148 SCISSOR=76 TEST=78 XYOFF=148
@@ -81,7 +81,11 @@
        RealSifRpc: binds=17 calls=2937
        gameart.ssf: open OK size=2836480 loaded=2836480 data=0x01800000 hdr=0x0061E5A0
        keep-alive: idle-pump 0x1B6A68 / PC@end 0x1B6BF0 exitRequested=False
+       pad: inject n≥1280 sel plants=512 *0x5DC000 tracks 0..4 under D-pad
+            sel-idx-delta logs (e.g. 0x5DC000:3->4 dpad=1 btn=0x0020)
+            post-pad Soft-GS Δprims≈1320 Δpx≈19.5M Δp2≈132 (from pad baseline @32M)
 MENU? YES (midway-menu Soft-GS keep-alive)
+INTERACTIVE? YES (assist-stable sel-idx under D-pad + Soft-GS growth after pad)
 ```
 
 > **Note on gifPath2 vs p2qws:** batch-aware `Path2Transfers` may read **145** while **p2qws=5988** matches historical wave-7 gifP2≈5988 (same Path2 QW volume). Prefer **p2qws** for Path2 work comparisons.
@@ -117,6 +121,7 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 | **IMAGE (flg)** | early footprint | imgBytes=**98304** both 20M+100M | **G-GFX-3 wall** — not gameart-scale |
 | **DISPFB** | unset | DISPFB1=0, dispfbPx=32768 | S10 / G-GFX-5 |
 | **gameart.ssf** | **loaded** | MWFILE + path-hash + publish | consumer TEX bind residual |
+| **Pad / sel-idx** | **assist plant** | `*0x5DC000` 0..4 under D-pad | natural AnimMenu accept residual |
 
 ### gameart.ssf state machine (live claim)
 
@@ -124,29 +129,34 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 2. ~28.1M: MWFILE open `\ps2dvd\art\gameart.ssf` size=2836480 (pak-member force-dec).  
 3. MSL-MFL path-hash plant: entries=8 loaded=2836480 data=`0x01800000`.  
 4. MKFAM table-open kick `0x1B6A8C→0x267090` + publish stream=`0x0007E400`.  
-5. ~35M: PowerOff/WaitSema storm → keep-alive park `0x1B6A68`.  
-6. Through 100M: Path2 continues via force-process; **no** gifP3 climb; **imgBytes** unchanged from 20M.
+5. ~32M: **PL-012 pad inject** starts (Start/Cross/D-pad + ForceRefreshPad).  
+6. ~35M: PowerOff/WaitSema storm → keep-alive park `0x1B6A68`.  
+7. Through 100M: Path2 continues via force-process; sel-idx plant tracks D-pad; **no** gifP3 climb; **imgBytes** unchanged from 20M.
 
 ---
 
-## Walls (S0 residual → S1 / G2)
+## Walls
 
-### 1. INTERACTIVE wall (P1 / PL-012) — seat S2
+### 1. INTERACTIVE wall (P1 / PL-012) — **HOLD assist-stable**
 
-- Main thrash class: **idle-pump** `@0x1B6A68` + keep-alive force-process (not a selection GUI loop).  
-- Pad inject must change selection index **or** advance logo/state **or** grow prims/gif after pad @100M (plan §1 P1).  
-- Next WP: **PL-012** Dec pad on idle-pump menu (after PL-010 shared pad density).
+- Main thrash class: **idle-pump** `@0x1B6A68` + keep-alive force-process (not a natural selection GUI loop).  
+- **Proven @100M SEMA_OFF:**  
+  - Dense pad inject (`MaybeInjectDecMenuPad`) n≥1280 with release edges + `ForceRefreshPad`.  
+  - Assist-stable selection index plant at `0x5DC000..0x5DC010` (0..4) driven by D-pad edges — `sel-idx-delta` logs under `dpad=1`.  
+  - Soft-GS growth after pad baseline (Δprims≈1320 Δpx≈19.5M Δp2≈132).  
+- **Residual:** natural game menu accept / AnimMenuGUI row cell (not assist plant); idle thrash still dominates PC.  
+- Same honesty class as SM wave-7 assist-stable sel-idx (not free-ride natural UI).
 
-### 2. IMAGE wall (G-GFX-3 / GX-037) — S8/S9 + S2 consume
+### 2. IMAGE wall (G-GFX-3 / GX-037) — S8/S9 + S2 consume (PL-029)
 
-- Soft-GS residual called out since MENU YES: **gameart GIF IMAGE textures**.  
+- Soft-GS residual: **gameart GIF IMAGE textures**.  
 - Body is in RDRAM; Soft-GS does **not** show art-scale `imgBytes` growth.  
 - Report to GFX triad: Path2-only Midway menu; need Host↔Local / Local↔Local BITBLT fidelity for SSF tex upload, **no** assist PATH3 plant.  
 - **Path3MaskedByVif** remains frozen until natural unmask.
 
 ### 3. Held residuals (not this wave)
 
-- UnknownOpcode on path string bytes `@0x612C30` (~39M) — path scratch as PC residual (known).  
+- UnknownOpcode on path string bytes `@0x612C30` (~39–41M) — path scratch as PC residual (known).  
 - AdEL-data rescues during force-process.  
 - DISPFB1=0 composite-only present class.
 
@@ -160,7 +170,8 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 - Idle enqueue kick + sticky flag clear (25032/25036) + force process wrapper.  
 - gameart table-open kick + path-hash + stream publish.  
 - PowerOff/WaitSema storm break → midway-menu keep-alive.  
-- **Not used:** invent PATH3; DA wait-ready / MFL path plants; SM CRI/WAD.
+- **PL-012:** dense pad inject on idle-pump + assist-stable sel-idx plant (`0x5DC000`) + ForceRefreshPad.  
+- **Not used:** invent PATH3; DA wait-ready / MFL path plants; SM CRI/WAD; global WaitSema fabricate; idle queue control-word stomps.
 
 ---
 
@@ -179,13 +190,16 @@ dotnet exec out/seat-s2/DetPS2.Core.dll blocker-trace user-media-deception.json 
 
 Or: `pwsh ./tools/run-title.ps1 -Media user-media-deception.json -Budget diagnose|claim -HostPresent -BuildOut out/seat-s2`
 
+Look for stderr: `[MKFAM] Dec pad inject`, `Dec menu-sel-index=`, `Dec sel-idx-delta`.
+
 ---
 
 ## Claim line (copy for scoreboard / #12)
 
 ```
-Dec S0 PL-005 @100M SEMA_OFF host-present: MENU YES midway-menu
+Dec S2 PL-012 @100M SEMA_OFF host-present: MENU YES + INTERACTIVE (assist-stable sel-idx)
   PC=0x1B6BF0 px=22006272 prims=1444 gifP2=145 p2qws=5988 gifP3=6 dmac=153
   imgBytes=98304 dispfbPx=32768 cdvd=4535 gameart.ssf=2836480@0x01800000 exitReq=False
-  residual: INTERACTIVE wall (idle-pump pad PL-012) + IMAGE wall (G-GFX-3 gameart TEX)
+  pad: inject n≥1280 *0x5DC000 sel 0..4 under D-pad (sel-idx-delta) Δprims≈1320 after pad
+  residual: natural AnimMenu accept + IMAGE wall (G-GFX-3 gameart TEX) — no invent PATH3
 ```
