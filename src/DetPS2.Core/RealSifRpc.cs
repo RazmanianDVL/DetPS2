@@ -1037,7 +1037,7 @@ public sealed class RealSifRpc
         // CD SearchFile (sid=0x80000597) — FUN_000002f0 "search file name %s".
         if (sid == SidCdSearchFile)
         {
-            int sf = HandleCdSearchFile(mem, cdvd, argBuf, recvBuf);
+            int sf = HandleCdSearchFile(mem, cdvd, argBuf, recvBuf, sendSize);
             if (recvBuf != 0) mem.Write32(recvBuf, unchecked((uint)sf));
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
@@ -3099,7 +3099,7 @@ public sealed class RealSifRpc
                 return HandleCdInit(cdvd, argBuf, mem);
 
             case SidCdSearchFile:
-                return HandleCdSearchFile(mem, cdvd, argBuf, recvBuf);
+                return HandleCdSearchFile(mem, cdvd, argBuf, recvBuf, sendSize: 0);
 
             case SidCdDiskReady:
             case SidCdDiskReady2:
@@ -6483,25 +6483,32 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// CDVDFSV SearchFile (sid=0x80000597 / FUN_000002f0). Arg buffer is an in/out
-    /// <c>sceCdlFILE</c>-shaped region with the path string at offset +0x20 (decomp:
-    /// <c>param_2 + 0x20</c>). On success writes lsn/size into the struct head and returns 1.
+    /// <c>sceCdlFILE</c>-shaped region. Path offset follows Play! <c>Iop_Cdvdfsv::SearchFile</c>:
+    /// 0x124 → +0x20, 0x128/0x12C → +0x24 (Vexx STREE0.TRE uses 0x128). On success writes
+    /// lsn/size into the struct head and returns 1.
     /// </summary>
-    private static int HandleCdSearchFile(SystemMemory mem, Cdvd cdvd, uint argBuf, uint recvBuf)
+    private static int HandleCdSearchFile(SystemMemory mem, Cdvd cdvd, uint argBuf, uint recvBuf, uint sendSize = 0)
     {
         if (argBuf == 0) return 0;
-        // Path lives at +0x20 in the sceCdlFILE / search packet (decomp FUN_000002f0).
-        string name = ReadCString(mem, argBuf + 0x20, 256);
-        if (string.IsNullOrEmpty(name))
-            name = ReadCString(mem, argBuf, 256);
-        name = name.Trim();
-        if (name.Length == 0) return 0;
-
-        // Strip device / version suffix: "\\SYSTEM.CNF;1" / "cdrom0:\\FOO.ELF;1"
-        int colon = name.IndexOf(':');
-        if (colon >= 0) name = name[(colon + 1)..];
-        name = name.TrimStart('\\', '/');
-        int semi = name.IndexOf(';');
-        if (semi >= 0) name = name[..semi];
+        // Play! pathOffset: 0x124→0x20, 0x128/0x12C→0x24. Also sniff +0x24 when it looks like a
+        // path even if sendSize is unknown (HLE Dispatch / quirks call without size).
+        string at20 = ReadCString(mem, argBuf + 0x20, 256);
+        string at24 = ReadCString(mem, argBuf + 0x24, 256);
+        // Candidate order: Play! size first, then path-sniff, then opposite offset fallback.
+        var candidates = new System.Collections.Generic.List<string>(3);
+        void AddCand(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return;
+            s = s.Trim();
+            if (!candidates.Contains(s)) candidates.Add(s);
+        }
+        if (sendSize is 0x128 or 0x12C) { AddCand(at24); AddCand(at20); }
+        else if (sendSize == 0x124) { AddCand(at20); AddCand(at24); }
+        else if (LooksLikeCdSearchPath(at24) && (!LooksLikeCdSearchPath(at20) || at24 != at20))
+        { AddCand(at24); AddCand(at20); }
+        else { AddCand(at20); AddCand(at24); }
+        AddCand(ReadCString(mem, argBuf, 256));
+        if (candidates.Count == 0) return 0;
 
         string? path = cdvd.MountedPath;
         if (string.IsNullOrEmpty(path))
@@ -6515,10 +6522,21 @@ public sealed class RealSifRpc
         {
             var vol = Iso9660.OpenFile(path);
             if (vol == null) return 0;
-            var entry = Iso9660.FindFile(vol, name);
-            // Also try bare leaf
-            if (entry == null)
-                entry = Iso9660.FindFile(vol, System.IO.Path.GetFileName(name));
+            Iso9660.FileEntry? entry = null;
+            string name = "";
+            foreach (string raw in candidates)
+            {
+                name = raw;
+                int colon = name.IndexOf(':');
+                if (colon >= 0) name = name[(colon + 1)..];
+                name = name.TrimStart('\\', '/');
+                int semi = name.IndexOf(';');
+                if (semi >= 0) name = name[..semi];
+                if (name.Length == 0) continue;
+                entry = Iso9660.FindFile(vol, name)
+                    ?? Iso9660.FindFile(vol, System.IO.Path.GetFileName(name));
+                if (entry != null) break;
+            }
             if (entry == null)
             {
                 // Dispose volume's disc if OpenFile created a new FileDiscImage — OpenFile
@@ -6536,6 +6554,10 @@ public sealed class RealSifRpc
             for (int i = 0; i < 16; i++)
                 mem.Write8(argBuf + 8 + (uint)i, i < leaf.Length ? (byte)leaf[i] : (byte)0);
 
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] SearchFile ok \"{name}\" lsn={entry.ExtentLba} size={entry.Size} send={sendSize} arg=0x{argBuf:X}");
+
             try { vol.Disc?.Dispose(); } catch { /* ignore */ }
             return 1;
         }
@@ -6543,6 +6565,24 @@ public sealed class RealSifRpc
         {
             return 0;
         }
+    }
+
+    /// <summary>Heuristic: printable path-ish string for sceCdSearchFile path sniffing.</summary>
+    private static bool LooksLikeCdSearchPath(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length is < 3 or > 192) return false;
+        char c0 = s[0];
+        if (c0 is not ('\\' or '/' or '$' or (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9')))
+            return false;
+        int alnum = 0;
+        for (int k = 0; k < s.Length; k++)
+        {
+            char c = s[k];
+            if (c is < (char)0x20 or >= (char)0x7F) return false;
+            if (char.IsAsciiLetterOrDigit(c)) alnum++;
+        }
+        // Reject junk paths that are not real disc leaves.
+        return alnum >= 3;
     }
 
     /// <summary>
