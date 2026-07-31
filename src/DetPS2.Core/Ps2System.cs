@@ -180,6 +180,7 @@ public sealed class Ps2System
         Pcrtc = new Pcrtc(Gs);
         Iop = new Iop(Intc, Memory);
         Cdvd = new Cdvd();
+        Memory.AttachCdvd(Cdvd);
         Sif = new Sif(Memory, Intc);
         Memory.AttachSif(Sif);
         IopModules.BindMemCard(MemCard);

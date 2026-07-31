@@ -4,13 +4,28 @@ using System.IO;
 namespace DetPS2.Core;
 
 /// <summary>
-/// CDVD (Phases 8/16/24): sector reads, async IRQ, dual-layer stub, stream scheduling.
-/// Drive state / error codes ground-truthed against ps2sdk <c>libcdvd-common.h</c> and the
-/// decompiled CDVDFSV.IRX mechacon-status checks (ready when <c>(status &amp; 0xc0) == 0x40</c>).
+/// CDVD (Phases 8/16/24 + WP-18): sector reads, async IRQ, dual-layer stub, stream scheduling,
+/// and IOP MMIO window <c>0x1F402000</c> (KSEG1 <c>0xBF402000</c>) that real CDVDMAN pokes.
+/// Drive state / error codes ground-truthed against ps2sdk <c>libcdvd-common.h</c>, PCSX2 CDVD
+/// register map, and decompiled CDVDFSV.IRX mechacon-status checks
+/// (ready when <c>(DAT_bf402005 &amp; 0xc0) == 0x40</c>).
 /// </summary>
 public sealed class Cdvd : ISchedulable
 {
     public const int SectorSize = 2048;
+
+    /// <summary>IOP physical base for CDVD registers (SSBUSC device 5 default).</summary>
+    public const uint PhysBase = 0x1F402000;
+    /// <summary>Register page size; hardware mirrors across lower 8 bits of the address.</summary>
+    public const uint PhysSize = 0x100;
+
+    // Ready register (0x05) sticky bits — PCSX2 always ORs MECHA_INIT|DEV9 into Ready.
+    public const byte ReadyBitError = 0x01;
+    public const byte ReadyBitDev9 = 0x04;
+    public const byte ReadyBitMechaInit = 0x08;
+    public const byte ReadyBitReady = 0x40;
+    public const byte ReadyBitBusy = 0x80;
+    public const byte ReadyStickyBits = ReadyBitDev9 | ReadyBitMechaInit; // 0x0C
 
     // SCECdvdErrorCode (ps2sdk libcdvd-common.h)
     public const int ErNO = 0x00;
@@ -74,6 +89,22 @@ public sealed class Cdvd : ISchedulable
     public uint StreamBankSectors { get; private set; }
     public uint StreamBanks { get; private set; }
 
+    // ── IOP MMIO register state (WP-18) ──────────────────────────────────────
+    /// <summary>Last N-command written to 0x04.</summary>
+    public byte NCommand { get; private set; }
+    /// <summary>Interrupt reason register 0x08 (W1C). Bit0 = command complete.</summary>
+    public byte IntrStat { get; private set; }
+    /// <summary>Sticky status (0x0B) — accumulates Status bits; tray SCMD resets open bit.</summary>
+    public byte StatusSticky { get; private set; }
+    /// <summary>S-command written to 0x16.</summary>
+    public byte SCommand { get; private set; }
+    /// <summary>S-data-in ready flag (0x17). Bit6 set = no pending SCMD result bytes.</summary>
+    public byte SDataIn { get; private set; } = 0x40;
+    /// <summary>Count of unknown MMIO accesses (telemetry / hang diagnosis).</summary>
+    public ulong UnknownMmioAccesses { get; private set; }
+    /// <summary>Count of MMIO NCMD / SCMD issues (telemetry).</summary>
+    public ulong MmioCommands { get; private set; }
+
     private IDiscImage? _disc;
     private readonly byte[] _sectorBuffer = new byte[SectorSize];
     private Intc? _intc;
@@ -88,6 +119,19 @@ public sealed class Cdvd : ISchedulable
     private KernelState? _kernelForComplete;
     private uint _streamBufMax;
     private uint _streamIopBuf;
+
+    // MMIO param / result FIFOs (hardware NDATAIN / SDATAIN / SDATAOUT)
+    private readonly byte[] _ncmdParams = new byte[16];
+    private int _ncmdParamPos;
+    private int _ncmdParamCnt;
+    private readonly byte[] _scmdParams = new byte[16];
+    private int _scmdParamPos;
+    private int _scmdParamCnt;
+    private readonly byte[] _scmdResult = new byte[16];
+    private int _scmdResultPos;
+    private int _scmdResultCnt;
+    private byte _mmioError; // latched error cleared on reg 0x06 read
+    private bool _abortRequested;
 
     public uint TocTracks { get; private set; } = 1;
     public uint TocLeadOutSector { get; private set; } = 100_000;
@@ -125,7 +169,22 @@ public sealed class Cdvd : ISchedulable
         MechaconStatus = 0x40;
         LastError = ErNO;
         DriveState = StatSpin;
+        NCommand = 0;
+        IntrStat = 0;
+        StatusSticky = 0;
+        SCommand = 0;
+        SDataIn = 0x40;
+        UnknownMmioAccesses = 0;
+        MmioCommands = 0;
+        _ncmdParamPos = _ncmdParamCnt = 0;
+        _scmdParamPos = _scmdParamCnt = 0;
+        _scmdResultPos = _scmdResultCnt = 0;
+        _mmioError = 0;
+        _abortRequested = false;
         Array.Clear(_sectorBuffer);
+        Array.Clear(_ncmdParams);
+        Array.Clear(_scmdParams);
+        Array.Clear(_scmdResult);
         // Do not dispose disc on soft reset mid-boot; use Unmount for full clear
     }
 
@@ -644,7 +703,30 @@ public sealed class Cdvd : ISchedulable
     private void SetReadySpin()
     {
         DriveState = StatSpin;
-        MechaconStatus = 0x40;
+        MechaconStatus = ReadyBitReady;
+        NoteStatusSticky();
+    }
+
+    private void NoteStatusSticky()
+    {
+        StatusSticky = (byte)(StatusSticky | (byte)DriveState);
+    }
+
+    /// <summary>
+    /// IOP Ready register (0x05 / <c>DAT_bf402005</c>) value exposed to CDVDMAN.
+    /// Ready when <c>(ComposeReady() &amp; 0xc0) == 0x40</c>. Always includes MECHA_INIT|DEV9
+    /// sticky bits (PCSX2 <c>cdvdUpdateReady</c> / Cold Fear).
+    /// </summary>
+    public byte ComposeReady()
+    {
+        byte core = (byte)(MechaconStatus & (ReadyBitReady | ReadyBitBusy | ReadyBitError));
+        if (ReadPending)
+            core = (byte)((core & ~ReadyBitReady) | ReadyBitBusy);
+        else if (TrayOpen)
+            core = (byte)(core & ~(ReadyBitReady | ReadyBitBusy));
+        else if ((core & ReadyBitBusy) == 0)
+            core = (byte)((core & ~ReadyBitBusy) | ReadyBitReady);
+        return (byte)(core | ReadyStickyBits);
     }
 
     /// <summary>Count host-side ISO reads (CRI HLE etc.) toward <see cref="SectorsRead"/> telemetry.</summary>
@@ -671,6 +753,343 @@ public sealed class Cdvd : ISchedulable
         buf[off + 3] = (byte)(v >> 24);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // IOP MMIO window 0x1F4020xx (WP-18) — surface real CDVDMAN expects
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>True if physical IOP address hits the CDVD register window.</summary>
+    public static bool IsMmioAddress(uint paddr)
+    {
+        paddr &= 0x1FFFFFFFu;
+        return paddr >= PhysBase && paddr < PhysBase + PhysSize;
+    }
+
+    /// <summary>8-bit read of CDVD MMIO (lower 8 bits of address select the register).</summary>
+    public byte ReadMmio8(uint address)
+    {
+        byte reg = (byte)(address & 0xFF);
+        switch (reg)
+        {
+            case 0x04: // NCOMMAND
+                return NCommand;
+            case 0x05: // N-READY / Ready (DAT_bf402005) — DiskReady polls this
+                return ComposeReady();
+            case 0x06: // ERROR — clear-on-read (hardware)
+            {
+                byte e = _mmioError;
+                _mmioError = 0;
+                return e;
+            }
+            case 0x07: // BREAK (read returns 0)
+                return 0;
+            case 0x08: // INTR_STAT
+                return IntrStat;
+            case 0x0A: // STATUS (SCECdStat* / DriveState)
+                return (byte)DriveState;
+            case 0x0B: // STATUS STICKY
+                return StatusSticky;
+            case 0x0C: // CRT MINUTE (BCD MSF of LastSector — CD mode)
+                return Ittob((byte)(LastSector / (60u * 75u)));
+            case 0x0D: // CRT SECOND
+                return Ittob((byte)((LastSector / 75u) % 60u + 2u));
+            case 0x0E: // CRT FRAME
+                return Ittob((byte)(LastSector % 75u));
+            case 0x0F: // TYPE (DAT_bf40200f) — disc type
+                return TrayOpen ? (byte)0 : (byte)DiscType;
+            case 0x13: // SPEED — report a stable DVD x4 class value when spinning
+                if (TrayOpen || DriveState == StatStop) return 0;
+                return DiscType is 0x14 or 0xFE ? (byte)(3 + 0xF) : (byte)4;
+            case 0x15: // RSV
+                return 0;
+            case 0x16: // SCOMMAND
+                return SCommand;
+            case 0x17: // SREADY / sDataIn
+                return SDataIn;
+            case 0x18: // SDATAOUT
+                return ReadScmdDataOut();
+            case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+            case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C:
+            case 0x30: case 0x31: case 0x32: case 0x33: case 0x34:
+            case 0x38: case 0x39: case 0x3A:
+                // Key / decrypt registers — return 0 (no MG payload yet)
+                return 0;
+            default:
+                LogUnknownMmio(reg, isWrite: false, value: 0);
+                // PCSX2 returns 0xFF on unknown CDVD regs — not silent 0.
+                return 0xFF;
+        }
+    }
+
+    /// <summary>8-bit write of CDVD MMIO.</summary>
+    public void WriteMmio8(uint address, byte value)
+    {
+        byte reg = (byte)(address & 0xFF);
+        switch (reg)
+        {
+            case 0x04: // NCOMMAND — issue NCMD after params written to 0x05
+                IssueNCommand(value);
+                break;
+            case 0x05: // NDATAIN — NCMD parameter FIFO
+                if (_ncmdParamPos >= _ncmdParams.Length)
+                {
+                    _ncmdParamPos = 0;
+                    _ncmdParamCnt = 0;
+                }
+                _ncmdParams[_ncmdParamPos++] = value;
+                _ncmdParamCnt++;
+                break;
+            case 0x06: // HOWTO (write ignored / stored nothing useful for IRX boot)
+                break;
+            case 0x07: // BREAK
+                if ((ComposeReady() & ReadyBitBusy) != 0)
+                {
+                    _abortRequested = true;
+                    CancelAsync();
+                    SetReadySpin();
+                    RaiseCommandCompleteIrq();
+                }
+                break;
+            case 0x08: // INTR_STAT — W1C
+                IntrStat = (byte)(IntrStat & ~value);
+                break;
+            case 0x09: // where_select (MSF mode) — ignore non-zero with log
+                if (value != 0)
+                    LogUnknownMmio(reg, isWrite: true, value);
+                break;
+            case 0x0A: // STATUS write — NOP on HW
+            case 0x0F: // TYPE write — logged on HW, ignore
+                break;
+            case 0x16: // SCOMMAND
+                IssueSCommand(value);
+                break;
+            case 0x17: // SDATAIN — SCMD parameter FIFO
+                if (_scmdParamPos >= _scmdParams.Length)
+                {
+                    _scmdParamPos = 0;
+                    _scmdParamCnt = 0;
+                }
+                _scmdParams[_scmdParamPos++] = value;
+                _scmdParamCnt++;
+                break;
+            case 0x18: // SDATAOUT write — no-op
+            case 0x3A: // DEC_SET — accept, no decrypt yet
+                break;
+            default:
+                LogUnknownMmio(reg, isWrite: true, value);
+                break;
+        }
+    }
+
+    private void IssueNCommand(byte cmd)
+    {
+        MmioCommands++;
+        NCommand = cmd;
+        _abortRequested = false;
+
+        // Drive must be ready (not busy) to accept NCMD (except break path).
+        if ((ComposeReady() & ReadyBitBusy) != 0)
+        {
+            _mmioError = (byte)ErNORDY;
+            LastError = ErNORDY;
+            MechaconStatus = (uint)(ReadyBitReady | ReadyBitError);
+            RaiseCommandCompleteIrq();
+            ClearNcmdParams();
+            return;
+        }
+
+        switch (cmd)
+        {
+            case 0x00: // CdNop
+                SetReadySpin();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x01: // CdReset
+                CancelAsyncInternal(keepError: false);
+                DriveState = StatStop;
+                MechaconStatus = ReadyBitReady;
+                NoteStatusSticky();
+                SDataIn = 0x40;
+                _scmdResultCnt = _scmdResultPos = 0;
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x02: // CdStandby
+                Standby();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x03: // CdStop
+                Stop();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x04: // CdPause
+                Pause();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x05: // CdSeek — LSN little-endian in params[0..3]
+            {
+                uint lsn = ReadParamU32(0);
+                SeekTo(lsn);
+                RaiseCommandCompleteIrq();
+                break;
+            }
+            case 0x06: // CdRead
+            case 0x07: // CdReadCDDA
+            case 0x08: // DvdRead
+            {
+                // Params: lsn[0..3], nsectors[4..7], retry, spindle, mode…
+                // Without IOP DMA3 we cannot push sectors into a caller buffer.
+                // Start an internal async read so Ready goes busy→ready and IRQ fires;
+                // log the gap so IRX hang diagnosis is not silent.
+                uint lsn = ReadParamU32(0);
+                uint nsec = ReadParamU32(4);
+                if (nsec == 0) nsec = 1;
+                if (BeginAsyncReadN(lsn, Math.Min(nsec, 64u)) == 0)
+                {
+                    _mmioError = (byte)LastError;
+                    MechaconStatus = (uint)(ReadyBitReady | ReadyBitError);
+                    RaiseCommandCompleteIrq();
+                }
+                // else: Step() will complete and call SetReadySpin; raise IRQ on complete
+                // (see Step).
+                break;
+            }
+            case 0x09: // CdGetToc — accept, complete (TOC DMA not modeled on IOP path)
+                SetReadySpin();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x0C: // CdReadKey
+                SetReadySpin();
+                RaiseCommandCompleteIrq();
+                break;
+            case 0x0F: // CdChgSpdlCtrl
+                SetReadySpin();
+                RaiseCommandCompleteIrq();
+                break;
+            default:
+                Console.Error.WriteLine(
+                    $"[Cdvd.MMIO] unknown NCMD 0x{cmd:X2} (params={_ncmdParamCnt}) — accepting as NOP");
+                UnknownMmioAccesses++;
+                SetReadySpin();
+                RaiseCommandCompleteIrq();
+                break;
+        }
+
+        ClearNcmdParams();
+    }
+
+    private void IssueSCommand(byte cmd)
+    {
+        MmioCommands++;
+        SCommand = cmd;
+
+        // Minimal SCMD result shapes so CDVDMAN can poll SREADY / drain SDATAOUT.
+        switch (cmd)
+        {
+            case 0x01: // GetDiscType (ps2tek / PCSX2 name table)
+                SetScmdResult(new byte[] { (byte)(TrayOpen ? 0 : DiscType) });
+                break;
+            case 0x02: // CdReadSubQ
+                SetScmdResult(new byte[11]); // zeros + ok shape
+                break;
+            case 0x03: // Mecacon subcommands — return mecha version for sub=0
+                if (_scmdParamCnt > 0 && _scmdParams[0] == 0)
+                    SetScmdResult(new byte[] { 0x00, 0x01, 0x01, 0x02, 0x00 }); // result + ver LE
+                else
+                    SetScmdResult(new byte[] { 0x00 });
+                break;
+            case 0x05: // CdTrayReqState — sticky open bit
+                StatusSticky = (byte)(DriveState & StatShellOpen);
+                SetScmdResult(new byte[] { 0x00 });
+                break;
+            case 0x06: // CdTrayCtrl
+            {
+                int mode = _scmdParamCnt > 0 ? _scmdParams[0] : 0;
+                TrayRequest(mode == 0 ? TrayReqOpen : TrayReqClose);
+                SetScmdResult(new byte[] { 0x00 });
+                break;
+            }
+            case 0x08: // CdReadRTC
+                SetScmdResult(new byte[] { 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01, 0x24 });
+                break;
+            case 0x15: // ForbidDVDP
+                SetScmdResult(new byte[] { 0x05 });
+                break;
+            case 0x16: // AutoAdjust
+                SetScmdResult(new byte[] { 0x00 });
+                break;
+            case 0x1A: // BootCertify
+                SetScmdResult(new byte[] { 0x01 });
+                break;
+            default:
+                // Unknown SCMD: return success 0 so init loops do not hard-fail.
+                // Log once-style via counter; console for first diagnosis.
+                Console.Error.WriteLine(
+                    $"[Cdvd.MMIO] SCMD 0x{cmd:X2} stubbed (params={_scmdParamCnt})");
+                UnknownMmioAccesses++;
+                SetScmdResult(new byte[] { 0x00 });
+                break;
+        }
+
+        _scmdParamPos = _scmdParamCnt = 0;
+    }
+
+    private void SetScmdResult(byte[] result)
+    {
+        int n = Math.Min(result.Length, _scmdResult.Length);
+        Array.Clear(_scmdResult);
+        Buffer.BlockCopy(result, 0, _scmdResult, 0, n);
+        _scmdResultCnt = n;
+        _scmdResultPos = 0;
+        // Bit6 clear while result bytes remain (PCSX2 SetSCMDResultSize).
+        if (n > 0)
+            SDataIn = (byte)(SDataIn & ~0x40);
+        else
+            SDataIn = (byte)(SDataIn | 0x40);
+    }
+
+    private byte ReadScmdDataOut()
+    {
+        if ((SDataIn & 0x40) != 0 || _scmdResultPos >= _scmdResultCnt)
+            return 0;
+        byte b = _scmdResult[_scmdResultPos++];
+        if (_scmdResultPos >= _scmdResultCnt)
+            SDataIn = (byte)(SDataIn | 0x40);
+        return b;
+    }
+
+    private void RaiseCommandCompleteIrq()
+    {
+        IntrStat = (byte)(IntrStat | 0x01); // Irq_CommandComplete
+        // IOP INTC cause 2 is CDVD on real HW; raise SIF as shared notify for now
+        // (same stand-in used by ReadSector completion). Full IOP INTC is a T1 gap.
+        _intc?.Raise(Intc.InterruptSource.Sif);
+    }
+
+    private void ClearNcmdParams()
+    {
+        _ncmdParamPos = 0;
+        _ncmdParamCnt = 0;
+    }
+
+    private uint ReadParamU32(int off)
+    {
+        if (off + 3 >= _ncmdParams.Length) return 0;
+        return (uint)(_ncmdParams[off]
+            | (_ncmdParams[off + 1] << 8)
+            | (_ncmdParams[off + 2] << 16)
+            | (_ncmdParams[off + 3] << 24));
+    }
+
+    private void LogUnknownMmio(byte reg, bool isWrite, byte value)
+    {
+        UnknownMmioAccesses++;
+        if (isWrite)
+            Console.Error.WriteLine($"[Cdvd.MMIO] unknown write 0x1F4020{reg:X2} = 0x{value:X2}");
+        else
+            Console.Error.WriteLine($"[Cdvd.MMIO] unknown read  0x1F4020{reg:X2} → 0xFF");
+    }
+
+    private static byte Ittob(byte i) => (byte)(((i / 10) << 4) + (i % 10));
+
     public int Step(ulong maxCycles)
     {
         if (!ReadPending || maxCycles == 0) return 0;
@@ -682,6 +1101,23 @@ public sealed class Cdvd : ISchedulable
         ulong used = _readCyclesLeft;
         _readCyclesLeft = 0;
         ReadPending = false;
+
+        if (_abortRequested)
+        {
+            _abortRequested = false;
+            LastError = ErABRT;
+            _mmioError = (byte)ErABRT;
+            SetReadySpin();
+            MechaconStatus = ReadyBitReady | ReadyBitError;
+            if (NCommand is 0x06 or 0x07 or 0x08)
+                RaiseCommandCompleteIrq();
+            _pendingDest = 0;
+            _memForAsync = null;
+            _kernelForComplete = null;
+            _completionEfId = 0;
+            return (int)used;
+        }
+
         // Complete all pending sectors; DMA out when dest was set by BeginAsyncReadTo.
         for (uint i = 0; i < _pendingCount; i++)
         {
@@ -690,6 +1126,9 @@ public sealed class Cdvd : ISchedulable
                 CopySectorToMemory(_memForAsync, _pendingDest + i * (uint)SectorSize);
         }
         SetReadySpin();
+        // MMIO NCMD read path: signal command-complete so CDVDMAN leaves its poll.
+        if (NCommand is 0x06 or 0x07 or 0x08)
+            RaiseCommandCompleteIrq();
         if (_completionEfId != 0 && _kernelForComplete != null)
             _kernelForComplete.SetEventFlag(_completionEfId, 1u);
         _pendingDest = 0;

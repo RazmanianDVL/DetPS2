@@ -82,12 +82,15 @@ public sealed class SystemMemory
     private MmioBus? _mmio;
     private Spu2? _spu2;
     private Sif? _sif;
+    private Cdvd? _cdvd;
     /// <summary>When true, refuse writes to exception vector page (0x0–0x2FF) so memset cannot wipe handlers.</summary>
     public bool ProtectKernelVectors { get; set; }
 
     public void AttachMmio(MmioBus bus) => _mmio = bus ?? throw new ArgumentNullException(nameof(bus));
     public void AttachSpu2(Spu2 spu2) => _spu2 = spu2;
     public void AttachSif(Sif sif) => _sif = sif;
+    /// <summary>IOP CDVD register window at <see cref="Cdvd.PhysBase"/> (WP-18).</summary>
+    public void AttachCdvd(Cdvd cdvd) => _cdvd = cdvd;
 
     /// <summary>Real IOP-side SIF mailbox window (ps2tek: IOP sees these at 0x1D000000, the EE
     /// sees the SAME shared hardware mailbox at 0x1000F200 via MmioBus/Sif.ReadRegister/
@@ -252,6 +255,8 @@ public sealed class SystemMemory
         if (paddr < (uint)IOP_RAM_SIZE) return _iopRam[paddr];
         if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return (byte)(_sif.ReadRegister(paddr) >> (int)((paddr & 3) * 8));
+        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+            return _cdvd.ReadMmio8(paddr);
         if (paddr >= BIOS_BASE && paddr < BIOS_BASE + (uint)BIOS_SIZE) return _bios[paddr - BIOS_BASE];
         return 0;
     }
@@ -266,6 +271,11 @@ public sealed class SystemMemory
             _sif.WriteRegister(paddr, value);
             return;
         }
+        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        {
+            _cdvd.WriteMmio8(paddr, value);
+            return;
+        }
         // BIOS ROM / unmapped — ignore writes, matching the EE-side Write8 policy.
     }
 
@@ -276,6 +286,14 @@ public sealed class SystemMemory
         if (paddr + 3 < (uint)IOP_RAM_SIZE) return Unsafe.ReadUnaligned<uint>(ref _iopRam[paddr]);
         if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return _sif.ReadRegister(paddr);
+        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        {
+            // Byte-lane assemble (CDVD is an 8-bit register window; LB/LBU is the common path).
+            return (uint)(_cdvd.ReadMmio8(paddr)
+                | (_cdvd.ReadMmio8(paddr + 1) << 8)
+                | (_cdvd.ReadMmio8(paddr + 2) << 16)
+                | (_cdvd.ReadMmio8(paddr + 3) << 24));
+        }
         if (paddr >= BIOS_BASE && paddr + 3 < BIOS_BASE + (uint)BIOS_SIZE)
             return Unsafe.ReadUnaligned<uint>(ref _bios[paddr - BIOS_BASE]);
         return 0;
@@ -289,6 +307,14 @@ public sealed class SystemMemory
         if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
             _sif.WriteRegister(paddr, value);
+            return;
+        }
+        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        {
+            _cdvd.WriteMmio8(paddr, (byte)value);
+            _cdvd.WriteMmio8(paddr + 1, (byte)(value >> 8));
+            _cdvd.WriteMmio8(paddr + 2, (byte)(value >> 16));
+            _cdvd.WriteMmio8(paddr + 3, (byte)(value >> 24));
             return;
         }
         // BIOS ROM / unmapped — ignore writes.
