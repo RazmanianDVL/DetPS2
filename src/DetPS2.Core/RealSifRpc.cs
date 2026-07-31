@@ -486,6 +486,7 @@ public sealed class RealSifRpc
         _mwFileNextHandle = 1;
         _mwFileInited = false;
         _havenRootWarmed = false;
+        _havenDllBoundBytes = 0;
         _nextSlot = 0;
         ResetIopHeap();
         Binds = Calls = RdataOps = FileIoOps = SysmemOps = UnknownServiceCalls = UnknownBindSids = 0;
@@ -4012,8 +4013,9 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// NUSOUND2 / sid 0x12345 bulk fno=0 (Haven SLUS_205.17 live: send=4096, recv @ 0x4F5000).
-    /// Soft-success with path scan + DLL.DAT warm so the title leaves the Exit(8) assert
-    /// island and can reach first FILEIO of root game data.
+    /// Soft-success with path scan + real DLL.DAT image bind so the title leaves the Exit(8)
+    /// assert island. Wave-4: partial recv echo (send=4096&gt;recv=2048) + load SN DLL.DAT at
+    /// <c>0x00800000</c> (live residual $ra=0x8925CC / PC=0x8C3338 land in that image).
     /// </summary>
     private int HandleNuSoundBulk(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
         uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
@@ -4023,14 +4025,21 @@ public sealed class RealSifRpc
             ? ScanSendBufferForPath(mem, argBuf, sendSize)
             : "";
 
-        // Warm Haven root assets (always — path scan may miss pointer-indirect names).
-        WarmHavenRootAssets(iopModules, cdvd);
+        // Warm + real-bind Haven root assets (DLL.DAT image into RDRAM).
+        WarmHavenRootAssets(mem, iopModules, cdvd);
 
         if (!string.IsNullOrEmpty(path))
         {
             int fd = iopModules.FileOpen(path, 1);
             if (fd < 0 && path.IndexOf("DLL", StringComparison.OrdinalIgnoreCase) >= 0)
                 fd = iopModules.FileOpen(@"cdrom0:\DLL.DAT;1", 1);
+            if (fd < 0 && !path.StartsWith("cdrom", StringComparison.OrdinalIgnoreCase))
+            {
+                string norm = path.Replace('/', '\\').TrimStart('\\');
+                fd = iopModules.FileOpen(@"cdrom0:\" + norm + ";1", 1);
+                if (fd < 0)
+                    fd = iopModules.FileOpen(@"cdrom0:\DATA\" + norm + ";1", 1);
+            }
             if (fd >= 0)
             {
                 if (iopModules.TryGetOpenFileSize(fd, out uint sz) && sz > 0)
@@ -4046,47 +4055,64 @@ public sealed class RealSifRpc
             }
         }
 
-        // Multi-word OK: +0 status=0, +4 version-ish, rest left alone unless recv==send echo.
+        // Multi-word OK: +0 status=0, +4 version-ish.
+        // Haven live: send=4096 recv=2048 — copy min(send,recv) head so bank descriptors
+        // round-trip (full-size match was never true on this title).
         if (recvBuf != 0)
         {
             uint lim = recvSize != 0 ? recvSize : Math.Min(sendSize, 64u);
-            if (lim >= 4) mem.Write32(recvBuf, 0);
-            if (lim >= 8) mem.Write32(recvBuf + 4, 1);
-            // Echo head of send into recv when sizes match (bank round-trip clients).
-            if (argBuf != 0 && sendSize > 0 && recvSize >= sendSize && sendSize <= 0x4000)
+            if (argBuf != 0 && sendSize > 0 && lim > 0 && sendSize <= 0x4000)
             {
-                uint n = Math.Min(sendSize, 0x1000u);
+                uint n = Math.Min(sendSize, lim);
                 for (uint i = 0; i < n; i++)
                     mem.Write8(recvBuf + i, mem.Read8(argBuf + i));
-                if (n >= 4) mem.Write32(recvBuf, 0); // keep status OK after echo
             }
+            if (lim >= 4) mem.Write32(recvBuf, 0);
+            if (lim >= 8) mem.Write32(recvBuf + 4, 1);
         }
 
         if (trace)
             Console.Error.WriteLine(
                 $"[NUSOUND] fno=0 bulk send={sendSize} recv=0x{recvBuf:X8}/{recvSize} " +
-                $"arg=0x{argBuf:X8} path=\"{path}\"");
+                $"arg=0x{argBuf:X8} path=\"{path}\" dllBound={_havenDllBoundBytes}");
         return 0;
     }
 
-    /// <summary>Idempotent Haven root warm (DLL.DAT first; skip multi-hundred-MiB stream files).</summary>
+    /// <summary>Idempotent Haven root warm + DLL.DAT image bind.</summary>
     private bool _havenRootWarmed;
+    /// <summary>Bytes of DLL.DAT written into EE RDRAM (0 if not bound this boot).</summary>
+    private int _havenDllBoundBytes;
+    /// <summary>
+    /// SN / Traveller's Tales DLL.DAT load base observed on Haven residual: code at
+    /// <c>file+0x925CC</c> matches live <c>$ra=0x008925CC</c> when base=<c>0x00800000</c>.
+    /// </summary>
+    private const uint HavenDllImageBase = 0x00800000u;
 
     /// <summary>
-    /// Haven root disc assets (no MKDA.PAK). Opens DLL.DAT so FILEIO/cdvd metrics move and
-    /// subsequent sceOpen of the same leaf is warm. Once per boot.
+    /// Haven root disc assets (no MKDA.PAK). Wave-3: open/close warm for metrics.
+    /// Wave-4: real-bind <c>DLL.DAT</c> (~1.1 MiB SN module image) into RDRAM at
+    /// <see cref="HavenDllImageBase"/> via host FILEIO read — residual post-NUSOUND jumped
+    /// into that band while the image was still zero/garbage (no FILEIO string, no bind).
+    /// Skip RWLDS.DAT (~460 MiB stream). Once per boot.
     /// </summary>
-    private void WarmHavenRootAssets(IopModuleHost iopModules, Cdvd cdvd)
+    private void WarmHavenRootAssets(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd)
     {
         if (_havenRootWarmed) return;
         _havenRootWarmed = true;
-        // Prefer first-game-data DLL.DAT; skip RWLDS.DAT (~460 MiB stream blob).
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1";
+
+        // Real-bind DLL.DAT first (SN modules the EE calls into after NUSOUND bulk).
+        _havenDllBoundBytes = TryBindHavenDllDat(mem, iopModules, cdvd, trace);
+
+        // Secondary roots: open/stat only (large/stream; not mapped wholesale).
         string[] warm =
         {
-            @"cdrom0:\DLL.DAT",
-            @"cdrom0:\DLL.DAT;1",
             @"cdrom0:\MKSPACE.DAT",
+            @"cdrom0:\MKSPACE.DAT;1",
             @"cdrom0:\CUBE.BIN",
+            @"cdrom0:\CUBE.BIN;1",
+            @"cdrom0:\DATA\CUBE.BIN;1",
+            @"cdrom0:\DATA\MKSPACE.DAT;1",
         };
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string p in warm)
@@ -4100,9 +4126,55 @@ public sealed class RealSifRpc
                 cdvd.NoteHostReadSectors(Math.Min(64, (int)((sz + 2047) / 2048)));
             try { iopModules.FileClose(fd); } catch { /* ignore */ }
             FileIoOps++;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            if (trace)
                 Console.Error.WriteLine($"[NUSOUND] warm root \"{p}\" size={sz}");
         }
+    }
+
+    /// <summary>
+    /// Open+read <c>DLL.DAT</c> into <see cref="HavenDllImageBase"/>. Returns bytes written.
+    /// </summary>
+    private int TryBindHavenDllDat(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd, bool trace)
+    {
+        if (mem == null) return 0;
+        string[] paths =
+        {
+            @"cdrom0:\DLL.DAT;1",
+            @"cdrom0:\DLL.DAT",
+        };
+        foreach (string p in paths)
+        {
+            int fd = iopModules.FileOpen(p, 1);
+            if (fd < 0) continue;
+            if (!iopModules.TryGetOpenFileSize(fd, out uint sz) || sz == 0 || sz > 0x00400000u)
+            {
+                try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                continue;
+            }
+            // Refuse to clobber low EE .text / IOP shared — base is high commercial DLL band.
+            if (HavenDllImageBase < 0x00600000u
+                || HavenDllImageBase + sz > (uint)SystemMemory.RDRAM_SIZE)
+            {
+                try { iopModules.FileClose(fd); } catch { /* ignore */ }
+                continue;
+            }
+
+            iopModules.FileSeek(fd, 0, 0);
+            int n = iopModules.FileRead(mem, fd, HavenDllImageBase, sz);
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            if (n <= 0) continue;
+
+            FileIoOps++;
+            // Honest sector credit for the full image (cap still applies for huge files).
+            cdvd.NoteHostReadSectors((int)Math.Min((n + 2047) / 2048, 2048));
+            if (trace)
+                Console.Error.WriteLine(
+                    $"[NUSOUND] DLL.DAT real bind base=0x{HavenDllImageBase:X8} bytes={n} path=\"{p}\"");
+            return n;
+        }
+        if (trace)
+            Console.Error.WriteLine("[NUSOUND] DLL.DAT real bind FAILED (open/read)");
+        return 0;
     }
 
     /// <summary>
