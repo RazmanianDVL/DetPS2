@@ -46,6 +46,9 @@ namespace DetPS2.Core;
 /// multi-chunk Start (≤256 KiB) so title-surface Soft-GS can grow past px=3.
 /// Wave-5: GIF END ADDR=0 inline (restore tip Soft-GS after B3 high-TADR gate) + full
 /// firstscreen Start + Soft-GS ofx=0x8000 title-band clamp for richer title surface.
+/// Wave-6: full Code/frontend Start (≤1.5 MiB) + stream-table full paint (end infinite
+/// w2 walk) + progressive ring fill into EE 0x45BC94 + Soft-GS full-FB title surface
+/// (ofx=0x8000 degenerate Y=0 sprite → 640×448) for title-surface MENU YES.
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
