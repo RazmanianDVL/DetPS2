@@ -143,7 +143,7 @@ public sealed class RealSifRpc
     // SCE SDRDRV 2.0.0 (Whiplash BIN/SDRDRV.IRX, "SDR driver version 2.0.0 (C)SCEI") also
     // registers 0x80000701 plus sibling 0x80000704 (live bind after LIBSD/SDRDRV/IOPSND).
     public const uint SidSdReg = 0x80000701;
-    /// <summary>SCE SDRDRV secondary RPC (Whiplash / LIBSD stack). Soft 0-for-success.</summary>
+    /// <summary>SCE SDRDRV secondary RPC (Whiplash BIN/SDRDRV.IRX: 0x80000701 + 0x80000704). Soft 0-for-success.</summary>
     public const uint SidSdReg2 = 0x80000704;
     // EE iopheap RPC fnos (ps2sdk ee/kernel/src/iopheap.c + iopheap-common.h).
     // IOP-side backend is SYSMEM AllocSysMemory/FreeSysMemory (sysmem.h / SYSMEM.bin
@@ -767,7 +767,8 @@ public sealed class RealSifRpc
             && sid != SidPadOld1 && sid != SidPadOld2
             && sid != SidMcServ && sid != SidCdBase && sid != SidCdSearchFile && sid != SidCdDiskReady
             && sid != SidCdDiskReady2
-            && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx && sid != SidSdReg
+            && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx
+            && sid != SidSdReg && sid != SidSdReg2
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
             && sid != SidMsl && sid != SidMslMfl
@@ -3155,7 +3156,8 @@ public sealed class RealSifRpc
                 }
 
             case SidSdReg:
-                return 0; // see SidSdReg's declaration comment
+            case SidSdReg2:
+                return 0; // SCE/Midway SDRDRV — 0-for-success
 
             case SidSfsv:
                 return 0; // see SidSfsv's declaration comment
@@ -4995,6 +4997,55 @@ public sealed class RealSifRpc
         // the status buffer; EE treats status!=0 / non-error as "server ready".
         if (op == 0)
         {
+            // Whiplash GOE v2 stream-table setup (sid=0x31 live 2026-07-31): fno=0 send=64..128
+            // with w0=bufferSize (0xFF4) and w1=slotCount (0x40) or stream index @+8; recv is a
+            // 4 KiB live EE stream table. Painting GOE status over that table wiped slots.
+            if (LooksLikeWhipStreamTableSetup(mem, argBuf, sendSize, recvSize))
+            {
+                uint w0 = argBuf != 0 && sendSize >= 4 ? mem.Read32(argBuf) : 0;
+                uint w1 = argBuf != 0 && sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
+                uint w2 = argBuf != 0 && sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+                // Paint ready markers into the EE stream table without wiping floats/pointers
+                // the client already wrote. Bulk (w1=slotCount): mark each slot. Per-slot:
+                // mark index w2. Stride 16 B (4096/256) covers the full 0xFF ring seen live.
+                if (recvBuf != 0 && recvSize >= 16)
+                {
+                    const uint Stride = 16;
+                    if (w1 is >= 8 and <= 256)
+                    {
+                        uint n = Math.Min(w1, recvSize / Stride);
+                        for (uint i = 0; i < n; i++)
+                        {
+                            uint baseOff = recvBuf + i * Stride;
+                            // word0 ready/status=1 if zero; leave non-zero client state intact
+                            if (mem.Read32(baseOff) == 0)
+                                mem.Write32(baseOff, 1);
+                        }
+                    }
+                    else if (w1 == 0)
+                    {
+                        uint idx = w2;
+                        if (idx < recvSize / Stride)
+                        {
+                            uint baseOff = recvBuf + idx * Stride;
+                            if (mem.Read32(baseOff) == 0)
+                                mem.Write32(baseOff, 1);
+                        }
+                    }
+                }
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                {
+                    Console.Error.WriteLine(
+                        $"[IOPFILE] stream-table setup sid=0x{sid:X} w0=0x{w0:X} w1=0x{w1:X} w2=0x{w2:X} " +
+                        $"recv=0x{recvBuf:X8}/{recvSize} (ready-mark)");
+                }
+                EnsureGoeArchiveMounted(iopModules, cdvd);
+                // After first bulk, warm title surface members for later Open/Start.
+                if (w1 is >= 8 and <= 256)
+                    WarmWhipTitleSurface(iopModules, cdvd);
+                return 1;
+            }
+
             // status=1 (ready). Paint a larger recv so 192-byte clients see a full reply.
             WriteGoeReply(mem, recvBuf, recvSize, status: 1, filesize: 0, scefd: 0, iStream: 0);
             if (recvBuf != 0 && recvSize > 16)
@@ -5002,12 +5053,9 @@ public sealed class RealSifRpc
                 for (uint off = 16; off + 4 <= Math.Min(recvSize, 192u); off += 4)
                     mem.Write32(recvBuf + off, 0);
             }
-            // First successful GOE init: open PS2.RKV so archive streaming is hot and
-            // cdvdSectors reflects the bigfile (token sectors; full stream on Open/Start).
             EnsureGoeArchiveMounted(iopModules, cdvd);
-            // Warm real PRECODE.BG2 / CODE.BG2 so "usebigfile" / title path sees disc payloads
-            // (token sector notes only; full stream on Open).
             WarmBo2CodeBg2(iopModules, cdvd);
+            WarmWhipTitleSurface(iopModules, cdvd);
             return 1;
         }
 
@@ -5061,6 +5109,47 @@ public sealed class RealSifRpc
         // Also paint a generous tail so large recv sizes still look complete.
         for (uint off = 16; off + 4 <= Math.Min(recvSize, 64u); off += 4)
             mem.Write32(recvBuf + off, 0);
+    }
+
+    /// <summary>
+    /// Whiplash GOE v2 stream-table / slot setup on sid 0x31 (live 2026-07-31).
+    /// </summary>
+    private static bool LooksLikeWhipStreamTableSetup(SystemMemory mem, uint argBuf, uint sendSize, uint recvSize)
+    {
+        if (recvSize < 256 || sendSize < 16 || argBuf == 0) return false;
+        uint w0 = mem.Read32(argBuf);
+        // Live: w0=0xFF4 buffer size; bulk w1=0x40; per-slot w1=0 and w2=stream index
+        // (indices climb past 128 to 0xFF at 50M — must not fall through to WriteGoeReply wipe).
+        if (w0 is < 0x100 or > 0x10000) return false;
+        uint w1 = mem.Read32(argBuf + 4);
+        uint w2 = sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+        if (w1 is >= 8 and <= 256) return true;
+        if (w1 == 0 && w2 <= 512) return true;
+        // Also: sendSize 64/128 with buffer-size w0 alone is enough for this title.
+        if (sendSize is 64 or 128) return true;
+        return false;
+    }
+
+    private bool _whipTitleWarmed;
+
+    private void WarmWhipTitleSurface(IopModuleHost iopModules, Cdvd cdvd)
+    {
+        if (_whipTitleWarmed) return;
+        _whipTitleWarmed = true;
+        EnsureGoeArchiveMounted(iopModules, cdvd);
+        if (_rkvTocCount == 0) return;
+        foreach (string name in new[] { "firstscreen", "frontend", "Code", "code" })
+        {
+            int fd = TryOpenFromRkv(iopModules, name, out uint sz);
+            if (fd < 0) continue;
+            int token = sz > 0 ? (int)Math.Min((sz + 2047u) / 2048u, 64u) : 4;
+            if (token < 4) token = 4;
+            cdvd.NoteHostReadSectors(token);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[IOPFILE] warm whip surface \"{name}\" size={sz} token={token} cdvd={cdvd.SectorsRead}");
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+        }
     }
 
     private int HandleGoeOpen(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,

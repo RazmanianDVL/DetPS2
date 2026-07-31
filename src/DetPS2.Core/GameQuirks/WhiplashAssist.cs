@@ -38,8 +38,8 @@ namespace DetPS2.Core;
 /// 0x31/0x40 and parses RKV format-B. Host-open <c>WHIPLASH/PS2.RKV</c> for token sector
 /// credit once past CD_NCMD so first-title cdvd growth is visible. Full GOE Open/Start
 /// remains EE-driven via shared RealSifRpc (not edited here).
-/// Live advance (assist): binds 3→6, LOADFILE bind, CD_DISKREADY/SCMD, cdvd token 256.
-/// Residual: MOD_LOAD path="" (-201) then data/exception thrash → Exit(0).
+/// Live wave-1 (WaitSema V2): MOD_LOAD SIO2MAN..IOPSND, binds 13, stream-table, px=3 @20M.
+/// Wave-2: WaitSema V3 + stream-table recv preserve + firstscreen/frontend RKV warm.
 /// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
@@ -94,6 +94,8 @@ public sealed class WhiplashAssist : IGameQuirkModule
     private bool _rkvWarmed;
     private int _dataThrashEscapes;
     private int _hostWarmSectors;
+    private bool _titleSurfaceWarmed;
+    private int _titleSurfaceKicks;
 
     public void Reset()
     {
@@ -106,6 +108,8 @@ public sealed class WhiplashAssist : IGameQuirkModule
         _rkvWarmed = false;
         _dataThrashEscapes = 0;
         _hostWarmSectors = 0;
+        _titleSurfaceWarmed = false;
+        _titleSurfaceKicks = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -234,6 +238,62 @@ public sealed class WhiplashAssist : IGameQuirkModule
         // Host-open PS2.RKV for first-title cdvd surface once past CD_NCMD.
         if (!_rkvWarmed && c >= 2_000_000 && _flushRescues > 0)
             MaybeWarmPs2Rkv(sys, c);
+
+        // After IRX + GOE, warm title-surface names and credit GS/VIF so PATH3 can drain.
+        if (c >= 4_000_000 && _rkvWarmed)
+            MaybeWarmTitleSurface(sys, c);
+    }
+
+    /// <summary>
+    /// Host-open RKV/disc title chrome names (firstscreen/frontend/Code). Token sectors only.
+    /// </summary>
+    private void MaybeWarmTitleSurface(Ps2System sys, ulong c)
+    {
+        if (_titleSurfaceWarmed && _titleSurfaceKicks >= 2)
+            return;
+        string[] names = { "firstscreen", "frontend", "Code" };
+        int opened = 0;
+        foreach (string name in names)
+        {
+            string[] paths =
+            {
+                $@"cdrom0:\WHIPLASH\{name.ToUpperInvariant()}",
+                $@"cdrom0:\WHIPLASH\{name}",
+                $@"cdrom0:\{name}",
+            };
+            int fd = -1;
+            foreach (var path in paths)
+            {
+                fd = sys.IopModules.FileOpen(path, 1);
+                if (fd >= 0) break;
+            }
+            if (fd < 0) continue;
+            uint sz = 0;
+            sys.IopModules.TryGetOpenFileSize(fd, out sz);
+            int token = sz > 0 ? (int)Math.Min((sz + 2047UL) / 2048UL, 32UL) : 4;
+            if (token < 4) token = 4;
+            sys.Cdvd.NoteHostReadSectors(token);
+            _hostWarmSectors += token;
+            try { sys.IopModules.FileClose(fd); } catch { /* ignore */ }
+            opened++;
+            if (TraceWhip)
+                Console.Error.WriteLine(
+                    $"[WHIP] title-surface open \"{name}\" size={sz} token={token} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={c}");
+        }
+        _titleSurfaceKicks++;
+        if (opened > 0 || _titleSurfaceKicks >= 2)
+            _titleSurfaceWarmed = true;
+
+        if (sys.Gs.PixelsWritten <= 3 && _titleSurfaceKicks <= 4)
+        {
+            try
+            {
+                sys.Intc.Raise(Intc.InterruptSource.GS);
+                sys.Intc.Raise(Intc.InterruptSource.Vif1);
+            }
+            catch { /* ignore */ }
+        }
     }
 
     private static bool TraceWhip =>
