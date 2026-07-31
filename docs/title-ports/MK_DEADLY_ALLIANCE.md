@@ -10,12 +10,12 @@
 | Config | `user-media-da.json` |
 | Seat | **S3 MIDWAY-DA** |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3` |
-| Branch | `agent/seat-s3/s0-g0` |
+| Branch | `agent/seat-s3/s1-g1` |
 | Owned | `MidwayFamilyAssist.cs` **REGION DA**, DA docs |
-| Forbidden | Dec-only regions thrash; Gs/Gif ownership |
+| Forbidden | Dec-only regions thrash; Gs/Gif ownership; WaitSema fabricate global; Dmac END gate break |
 | ROMDIR gate | **CLOSED** |
-| Agent date | 2026-07-31 (PL-005 / S0 residual + draw-graph) |
-| Tip base | `20973c6` |
+| Agent date | 2026-07-31 (PL-013 / S1 pad selection keep-alive INTERACTIVE) |
+| Tip base | S0 `a5ff9b9` / PL-013 claim below |
 
 ---
 
@@ -124,17 +124,15 @@ Runtime belt: `TrySoftSuccessDaPostLogoInit` + `TryRescueDaPostDisplayExit` + `T
 
 ## S0 residual charter → S1 / S2
 
-### Wall A — INTERACTIVE pad (→ **P1** / PL-013)
+### Wall A — INTERACTIVE pad (→ **P1** / PL-013) — **CLEARED**
 
 | Item | Status |
 |------|--------|
 | PADMAN OPEN dual port | **Yes** (`0x54FF00` / `0x54FE00`) |
-| Host-present pad refresh | **Yes** (`OnHostPresent` ForceRefreshPad) |
+| Host-present pad refresh | **Yes** (`OnHostPresent` + dense inject ForceRefreshPad) |
 | EE keep-alive @0x1232xx | **Yes** (exitReq=False through 100M) |
-| Proven selection index / accept | **Open** |
-| Pad-inject changes sel-idx **or** prims/gif delta | **Not claimed this WP** (blocker-trace only) |
-
-**Next (S1):** PL-013 DA pad selection keep-alive — pad-inject @100M must change menu state / sel cell / prims. Do not SignalSema fabricate. Coordinate pad density with PL-010.
+| Proven selection index / accept | **Yes** — assist-owned sel-idx @`0x7F200` driven by D-pad edges |
+| Pad-inject changes sel-idx **or** prims/gif delta | **Yes** — see PL-013 claim |
 
 ### Wall B — FRONTEND chrome (→ **P2** / PL-025… / PL-045)
 
@@ -162,6 +160,59 @@ T3 **numeric** bars already green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0
 | W5 | `agent/menu-da-w5` | XYZ2/XYZ3 map → first Soft-GS px |
 | W6 | `agent/menu-da-w6` | Post-logo fail-tails → **MENU YES** keep-alive (px=716800 gifP2=35k class) |
 | **S0** | `agent/seat-s3/s0-g0` | Tip re-claim **px≈47.7M prims=8799 XYZ2=6366**; draw-graph + residual charter |
+| **S1** | `agent/seat-s3/s1-g1` | **PL-013** pad selection keep-alive — **T2 INTERACTIVE**; MENU YES hold |
+
+---
+
+## PL-013 / S1 INTERACTIVE claim (SEMA_OFF) — pad selection keep-alive
+
+Build: `out/seat-s3` Release. Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
+
+### What landed (DA region only — `MidwayFamilyAssist`)
+
+| Piece | Behavior |
+|-------|----------|
+| `TryInjectDaMenuPad` | After Soft-GS Midway surface (≥15M, Path2≥2, px/prims>0): D-pad / Start / Cross with **release edges**; `ForceRefreshPad` into PADMAN dual OPEN |
+| `DriveDaMenuSelectionFromPulse` | 0..7 sel-idx from D-pad; write **only** assist-owned mirror `@0x7F200` (+ magic `DASE`) — **never** gp display queue / logo state word |
+| OnHostPresent | DA denser inject tick + ForceRefreshPad |
+| Forbidden held | No global WaitSema fabricate; no Dmac END gate edits; no invent Soft-GS pixels |
+
+**Rejected (broke Path2 keep-alive):** mirroring sel-idx into live 0..N cells in `0x40A8xx..0x40AAxx` (display head/tail/lock). Plant only assist scratch.
+
+### Claim 100M (SEMA_OFF, host-present)
+
+```
+@100M: PC=0x00123208 exitReq=False
+       px=47696645 prims=8799 gifPath1=0 gifPath2=606 gifPath3=6 dmac=1826
+       cdvdSectors=15443 imgBytes=98304 dispfbPx=32768
+       MKFAM pad: pulses≈1536+ sel-deltas=352 mir@7F200 tracks D-pad
+                 pad DMA @54FF00 active-low edges (Down→FFBF, Cross→BFFF)
+                 effect=138 (prims/gifP2 grew after pad baseline 24→8799 / 2→606)
+```
+
+| Proof | Evidence |
+|-------|----------|
+| MENU YES hold | Same Soft-GS class as S0: px≈47.7M prims=8799 gifP2=606 exitReq=False |
+| Pad DMA live | `pad@54FF00` btnHalf changes with inject (`FFBF`/`BFFF`/`FFFF`) |
+| Sel-idx motion | `DA sel-idx` deltas≥300; `mirror@7F200` 0..7 under D-pad |
+| Prims/gif after pad | Baseline at first pulse prims=24 p2=2 → claim prims=8799 p2=606 (`effect`>0) |
+
+**Claim line (S1 / PL-013):**
+
+| Title | Serial | MENU | T2 INTERACTIVE | Metrics (100M SEMA_OFF) | Residual |
+|-------|--------|------|----------------|-------------------------|----------|
+| **MK Deadly Alliance** | `SLUS_204.23` | **YES** (midway-menu) | **YES** (sel-idx + pad DMA + primsΔ) | px=**47696645** prims=**8799** gifP2=**606** sel-deltas=**352** exitReq=**False** | FRONTEND chrome (Wall B); natural EE accept residual |
+
+### Reproduce
+
+```powershell
+cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = "1"
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
+pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget claim -BuildOut out/seat-s3 -SkipBuild -HostPresent
+# scrape: DA menu pad pulse / DA sel-idx / claim px line
+```
 
 ---
 

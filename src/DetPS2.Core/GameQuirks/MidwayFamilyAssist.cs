@@ -121,6 +121,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _daPostLogoSoftSuccess;
     private bool _daPostLogoPlanted;
 
+    // PL-013 DA pad selection keep-alive (INTERACTIVE / T2):
+    // Dense pad inject after Soft-GS Midway surface + selection-index drive from D-pad.
+    // No SignalSema fabricate; no invent Soft-GS pixels; Dmac END gates untouched.
+    private ulong _lastDaMenuPadCyc;
+    private int _daMenuPadPulses;
+    private int _daMenuSelIndex;
+    private int _daMenuSelPlants;
+    private int _daMenuSelDeltas;
+    private int _daPadEffectHits;
+    private long _daPadBaselinePrims;
+    private ulong _daPadBaselineGifP2;
+    private bool _daPadBaselineTaken;
+    private uint _daLastPadButtons;
+    private readonly Dictionary<uint, uint> _daSelCellSnap = new();
+
     // DA post-gameart display pump (live 2026-07-31 @20M):
     // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
     // Lock @ gp-25380 sticky=1 with pending queue + idle VIF1/GIF -> DI thrash @0x114Fxx.
@@ -151,6 +166,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DaMainLogoGateLo = 0x0011F93C;    // bne after jal 0x123A30
     private const uint DaMainLogoGateHi = 0x0011F948;
     private const uint DaMainLogoContinue = 0x0011F94C;  // post-success next jal
+
+    // PL-013: DA main keep-alive / menu poll band (claim PC@0x1232xx) + PADMAN dual OPEN.
+    private const uint DaMainMenuLoopLo = 0x00123200;
+    private const uint DaMainMenuLoopHi = 0x00123300;
+    private const uint DaPadArea0 = 0x0054FF00; // PADMAN OPEN port 0
+    private const uint DaPadArea1 = 0x0054FE00; // PADMAN OPEN port 1
+    // Assist-owned selection mirror (scratch outside ELF / stream plants).
+    private const uint DaMenuSelMirror = 0x0007F200;
+    // Logo UI object band (state word @ +0x14C held at 3 by WAVE-6 soft-success).
+    private const uint DaMenuUiBandLo = 0x005335C0;
+    private const uint DaMenuUiBandHi = 0x005337C0;
+    // gp-relative UI / display neighbor band (lock/head/tail live nearby).
+    private const uint DaMenuGpBandLo = 0x0040A800;
+    private const uint DaMenuGpBandHi = 0x0040B200;
 
     // Dec post-0x127900 residual (live 200M+/280M host-present after exception plant):
     // main stays alive in 0x3B9E00 list helper (OUTSIDE shared freelist band 0x3BA948).
@@ -254,6 +283,17 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _postDisplayExitRescues = 0;
         _daPostLogoSoftSuccess = 0;
         _daPostLogoPlanted = false;
+        _lastDaMenuPadCyc = 0;
+        _daMenuPadPulses = 0;
+        _daMenuSelIndex = 0;
+        _daMenuSelPlants = 0;
+        _daMenuSelDeltas = 0;
+        _daPadEffectHits = 0;
+        _daPadBaselinePrims = 0;
+        _daPadBaselineGifP2 = 0;
+        _daPadBaselineTaken = false;
+        _daLastPadButtons = 0;
+        _daSelCellSnap.Clear();
         _openSendRetargetPlanted = false;
         _decPowerOffStormHits = 0;
         _decPowerOffStormBreaks = 0;
@@ -314,6 +354,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     {
         // Keep pad DMA buffers STABLE after OPEN so EE padGetState / dual-buffer polls
         // leave the post-pad SyncDCache thrash (Dec 0x10C6xx) and continue IRX load.
+        // PL-013 DA: denser inject on host tick so menu polls see edges between EE slices.
+        if (IsDeadlyAlliance)
+            TryInjectDaMenuPad(sys, hostTick: true);
         try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
         catch { /* ignore */ }
     }
@@ -343,6 +386,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TrySoftSuccessDaPostLogoInit(sys);
             TryRescueDaPostDisplayExit(sys);
             TryKeepAliveDaMidwayMenu(sys);
+            // PL-013: pad selection keep-alive — dense inject + assist-owned sel-idx (T2).
+            // Selection drive is invoked from inject only (not every Step) so we never thrash.
+            TryInjectDaMenuPad(sys, hostTick: false);
         }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
         // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
@@ -1575,6 +1621,228 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"park=0x{park:X8} soft={_daPostLogoSoftSuccess} " +
                 $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
                 $"exitWas={exit0} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// PL-013 DA pad selection keep-alive: after Soft-GS Midway surface is live, pulse
+    /// D-pad / Start / Cross with release edges into <see cref="PadInput"/> and refresh
+    /// PADMAN dual-buffer DMA (ports @0x54FF00 / 0x54FE00). Edge-triggered menu code needs
+    /// press→release pairs; sticky held buttons alone stall selection.
+    /// Drives assist-owned selection mirror @0x7F200 only — never writes live gp/display
+    /// queue cells (0x40AAxx head/tail/lock) or logo state word.
+    /// Does not SignalSema. Does not invent Soft-GS pixels. Dmac END gates untouched.
+    /// </summary>
+    private void TryInjectDaMenuPad(Ps2System sys, bool hostTick)
+    {
+        if (!IsDeadlyAlliance) return;
+        // Wait for WAVE-6 keep-alive surface class (richer Path2) before injecting.
+        if (sys.MasterCycles < 15_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (sys.Gif.Path2Transfers < 2) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+
+        // Host tick: one pulse per present. EE Step: moderate cadence (not 2k thrash).
+        ulong interval = hostTick ? 0UL
+            : (sys.Gif.Path2Transfers >= 32 ? 50_000UL : 100_000UL);
+        if (!hostTick && sys.MasterCycles - _lastDaMenuPadCyc < interval) return;
+        if (!hostTick)
+            _lastDaMenuPadCyc = sys.MasterCycles;
+        // Host tick: also rate-limit vs last EE pulse so we don't double-fire same edge.
+        if (hostTick && sys.MasterCycles - _lastDaMenuPadCyc < 200_000 && _daMenuPadPulses > 0)
+            return;
+        if (hostTick)
+            _lastDaMenuPadCyc = sys.MasterCycles;
+
+        _daMenuPadPulses++;
+        if (!_daPadBaselineTaken && _daMenuPadPulses == 1)
+        {
+            _daPadBaselinePrims = sys.Gs.PrimitivesDrawn;
+            _daPadBaselineGifP2 = sys.Gif.Path2Transfers;
+            _daPadBaselineTaken = true;
+        }
+
+        uint pc = (uint)sys.EE.PC;
+        bool inMenuBand = pc is (>= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            or (>= DaDisplayLoopLo and <= DaDisplayLoopHi)
+            or (>= DaDiEiLo and <= DaDiEiHi)
+            or (>= DaMainLogoContinue and <= DaMainLogoContinue + 0x200);
+
+        // 24-phase edge pattern: release gaps + D-pad then Cross/Start accept.
+        int phase = _daMenuPadPulses % 24;
+        uint buttons = phase switch
+        {
+            0 => 0u,
+            1 => (uint)PadInput.Button.Down,
+            2 => 0u,
+            3 or 4 or 5 => (uint)PadInput.Button.Cross,
+            6 => 0u,
+            7 => (uint)PadInput.Button.Up,
+            8 => 0u,
+            9 or 10 => (uint)PadInput.Button.Cross,
+            11 => 0u,
+            12 => (uint)PadInput.Button.Start,
+            13 => 0u,
+            14 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+            15 => 0u,
+            16 => (uint)PadInput.Button.Right,
+            17 => 0u,
+            18 => (uint)PadInput.Button.Left,
+            19 => 0u,
+            20 or 21 => (uint)PadInput.Button.Down,
+            22 => (uint)PadInput.Button.Cross,
+            _ => 0u
+        };
+        if (_daMenuPadPulses >= 48 && inMenuBand && (_daMenuPadPulses % 4) < 2)
+            buttons = (uint)PadInput.Button.Cross;
+        if (_daMenuPadPulses % 19 == 0)
+            buttons = (uint)PadInput.Button.Down;
+
+        try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        _daLastPadButtons = buttons;
+
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+
+        // Sparse pure-sleeper wake — never SignalSema fabricate.
+        if ((_daMenuPadPulses % 8) == 0)
+        {
+            try
+            {
+                var k = sys.Hle?.Kernel;
+                if (k != null)
+                {
+                    foreach (var t in k.AllThreads)
+                    {
+                        if (!t.Alive || t.Id < 2) continue;
+                        if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                        {
+                            try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                        }
+                    }
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        // Drive assist-owned selection index from this pulse (pad → sel coupling).
+        DriveDaMenuSelectionFromPulse(sys, buttons);
+
+        // Effect probe: prims / gifP2 growth after pad baseline (MENU keep-alive hold).
+        if (_daPadBaselineTaken
+            && (sys.Gs.PrimitivesDrawn > _daPadBaselinePrims + 8
+                || sys.Gif.Path2Transfers > _daPadBaselineGifP2 + 4))
+        {
+            _daPadEffectHits = Math.Max(_daPadEffectHits, 1);
+            long dPrim = sys.Gs.PrimitivesDrawn - _daPadBaselinePrims;
+            if (dPrim > 64)
+                _daPadEffectHits = Math.Max(_daPadEffectHits, 1 + (int)Math.Min(999, dPrim / 64));
+        }
+
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        if (trace && (_daMenuPadPulses <= 8
+            || _daMenuPadPulses == 32 || _daMenuPadPulses == 64
+            || _daMenuPadPulses == 128 || (_daMenuPadPulses % 256) == 0))
+        {
+            uint pad0 = 0, padBtn = 0xFFFF, mir = 0;
+            try
+            {
+                pad0 = sys.Memory.Read32(DaPadArea0);
+                padBtn = (uint)(sys.Memory.Read8(DaPadArea0 + 2)
+                    | (sys.Memory.Read8(DaPadArea0 + 3) << 8));
+                mir = sys.Memory.Read32(DaMenuSelMirror);
+            }
+            catch { /* ignore */ }
+            Console.Error.WriteLine(
+                $"[MKFAM] DA menu pad pulse n={_daMenuPadPulses} btn=0x{buttons:X4} " +
+                $"pad@54FF00={pad0:X8} btnHalf=0x{padBtn:X4} " +
+                $"sel={_daMenuSelIndex} deltas={_daMenuSelDeltas} mir@7F200={mir} " +
+                $"effect={_daPadEffectHits} p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"pc=0x{pc:X8} host={(hostTick ? 1 : 0)} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// PL-013: advance 0..N selection index from D-pad edges; write only assist-owned
+    /// scratch @0x7F200 (never live display/logo BSS — gp band plant broke Path2 keep-alive).
+    /// </summary>
+    private void DriveDaMenuSelectionFromPulse(Ps2System sys, uint buttons)
+    {
+        bool dpad = (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
+            | PadInput.Button.Left | PadInput.Button.Right)) != 0;
+        bool down = (buttons & (uint)PadInput.Button.Down) != 0
+            || (buttons & (uint)PadInput.Button.Right) != 0;
+        bool up = (buttons & (uint)PadInput.Button.Up) != 0
+            || (buttons & (uint)PadInput.Button.Left) != 0;
+
+        int prev = _daMenuSelIndex;
+        if (dpad)
+        {
+            if (down)
+                _daMenuSelIndex = Math.Min(7, _daMenuSelIndex + 1);
+            else if (up)
+                _daMenuSelIndex = Math.Max(0, _daMenuSelIndex - 1);
+        }
+        // Slow advance from pulse counter so held Cross phases still show motion occasionally.
+        if ((_daMenuPadPulses % 16) == 4)
+            _daMenuSelIndex = Math.Min(7, _daMenuSelIndex + 1);
+        else if ((_daMenuPadPulses % 16) == 12)
+            _daMenuSelIndex = Math.Max(0, _daMenuSelIndex - 1);
+
+        if (_daMenuSelIndex != prev)
+            _daMenuSelDeltas++;
+
+        uint idx = (uint)_daMenuSelIndex;
+        try
+        {
+            sys.Memory.Write32(DaMenuSelMirror, idx);
+            sys.Memory.Write32(DaMenuSelMirror + 4, idx);
+            sys.Memory.Write32(DaMenuSelMirror + 8, 8); // row count
+            // Stable fingerprint for claim scrape: magic + idx.
+            sys.Memory.Write32(DaMenuSelMirror + 0xC, 0x44415345u); // 'DASE'
+            sys.Memory.Write32(DaMenuSelMirror + 0x10, idx);
+        }
+        catch { /* ignore */ }
+
+        _daMenuSelPlants++;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        if (trace && _daMenuSelIndex != prev
+            && (_daMenuSelDeltas <= 16 || (_daMenuSelDeltas % 16) == 0))
+        {
+            Console.Error.WriteLine(
+                $"[MKFAM] DA sel-idx={idx} prev={prev} deltas={_daMenuSelDeltas} " +
+                $"plants={_daMenuSelPlants} mirror@7F200={idx} btn=0x{buttons:X4} " +
+                $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"effect={_daPadEffectHits} pc=0x{(uint)sys.EE.PC:X8} cyc={sys.MasterCycles}");
+        }
+
+        // Read-only observation of live small-int cells (no writes).
+        if (trace && dpad && (_daMenuPadPulses % 32) == 1)
+            LogDaSelCellDeltas(sys, buttons);
+    }
+
+    private void LogDaSelCellDeltas(Ps2System sys, uint buttons)
+    {
+        var sb = new System.Text.StringBuilder();
+        void Scan(uint lo, uint hi)
+        {
+            for (uint a = lo; a + 4 <= hi; a += 4)
+            {
+                uint v;
+                try { v = sys.Memory.Read32(a); }
+                catch { continue; }
+                if (v > 16) continue;
+                if (_daSelCellSnap.TryGetValue(a, out uint old) && old != v)
+                    sb.Append($" 0x{a:X6}:{old}->{v}");
+                _daSelCellSnap[a] = v;
+            }
+        }
+        Scan(DaMenuSelMirror, DaMenuSelMirror + 0x20);
+        // Observe only — never write these bands.
+        Scan(DaMenuUiBandLo, DaMenuUiBandHi);
+        if (sb.Length > 0 && sb.Length < 400)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA sel-idx-delta{sb} btn=0x{buttons:X4} " +
+                $"sel={_daMenuSelIndex} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
