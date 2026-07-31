@@ -50,18 +50,34 @@ VIF1 often feeds Path2 as **one QW per** `ReceivePath2Data` (or mid-DIRECT pad).
 
 ---
 
-## 5. Deferred (needs crash/regress-clear proof)
+## 5. Safe hardens landed (G1 / GX-010 + GX-011)
+
+| Fix | Location | Smoke |
+|-----|----------|-------|
+| Path-owned sticky (`_pktPath`); VIF DIRECT boundary **does not abort Path3 sticky** | `Gif.AbortIncompletePacket` | `Gif_Path2_DoesNotAbort_Path3Sticky` |
+| Path2↔Path3 stall (Play! arb): Path2 stalls on Path3 sticky; Path3 held on Path2 sticky + drain | `ReceivePath2/3Data` | same + hold |
+| EOP multi-packet continue in same transfer (Play! ProcessMultiplePackets) | `Gif.ProcessTransfer` | `Gif_Path2_MultiPacket_EopContinuesInTransfer` |
+| GIF_CTRL RST clears sticky mid-packet | `Gif.WriteRegister` | (covered by Reset/CTRL) |
+| DIRECT IMM=0 → 65536 QWs (not empty) | `Vif` (hold) | `Vif_Direct_Imm0_Means65536_NotEmpty` |
+| FIFO `FeedData` mid-QW pad + 4-word QW assembly → `ReceivePath2Quadword` | `Vif.FeedData` + `Gif` | `Vif_FeedData_Direct_MidQwPad_Path2Frame` |
+
+**Not done (still deferred):** auto-abort huge nloop mid-DIRECT; abort-on-FLUSH; inventing PATH3 packets; wholesale `Path3MaskedByVif` clear.
+
+---
+
+## 6. Deferred (needs crash/regress-clear proof)
 
 | Idea | Why deferred |
 |------|----------------|
 | Auto-abort Path2 mid-DIRECT when nloop huge | Can clip legitimate large IMAGE DIRECT |
 | Abort sticky on FLUSH/FLUSHA | HW waits for GIF idle; abort ≠ flush |
-| Path2 abort of Path3 mid-packet | Path arbitration; needs exclusive APATH model |
+| Full APATH exclusive model + stall queues | Partial arb landed; deeper stall/resume later |
 
 ---
 
-## 6. Exit for GX-010 full
+## 7. Exit for GX-010/011 full
 
-- Smokes above green  
+- Smokes above green (W11C suite + G1 four)  
 - GoW claim: `aborted` only from garbage DIRECT class (`abortNewDir`, not random trunc storms)  
-- No MENU px regress on Path2 titles (GoW, BO2, Dec/DA Path2 pumps)
+- No MENU px regress on Path2 titles (GoW, BO2, Dec/DA Path2 pumps)  
+- `abortTrunc` / `abortOther` storms = 0 on diagnose claims

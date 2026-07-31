@@ -1319,6 +1319,11 @@ press 3000 Circle 100
             Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurface();
             Gs_RetailOfx_NaturalHeight_DoesNotExpand();
             Gs_Ofx8000_CollapsedStrip_StillExpands();
+            // GX-010/011 Path2 sticky harden
+            Vif_Direct_Imm0_Means65536_NotEmpty();
+            Vif_FeedData_Direct_MidQwPad_Path2Frame();
+            Gif_Path2_MultiPacket_EopContinuesInTransfer();
+            Gif_Path2_DoesNotAbort_Path3Sticky();
             Timer_GateAndClockSelect();
             BusContention_Configurable();
 
@@ -5478,6 +5483,179 @@ press 3000 Circle 100
         Console.WriteLine(
             $"[Smoke] Gs_Ofx8000_CollapsedStrip_StillExpands OK " +
             $"(px={px} expandHits={expandHits} titleFloor={titleFloor})");
+    }
+
+    /// <summary>
+    /// GX-011: DIRECT IMM=0 means 65536 QWs (not empty). After a small PACKED transfer the
+    /// remaining count stays huge until a superseding DIRECT or end — never treated as idle.
+    /// </summary>
+    public static void Vif_Direct_Imm0_Means65536_NotEmpty()
+    {
+        var sys = new Ps2System();
+        // DIRECT IMM=0 + 2 QWs PACKED A+D FRAME via ProcessStream (QW-aligned).
+        const uint baseAddr = 0x5000;
+        sys.Memory.Write32(baseAddr + 0, 0x50000000u); // DIRECT IMM=0 → 65536
+        sys.Memory.Write32(baseAddr + 4, 0);
+        sys.Memory.Write32(baseAddr + 8, 0);
+        sys.Memory.Write32(baseAddr + 12, 0);
+        // GIFtag PACKED NLOOP=1 EOP NREG=1 REGS=A+D
+        sys.Memory.Write32(baseAddr + 16, 0x00008001u);
+        sys.Memory.Write32(baseAddr + 20, 0x10000000u);
+        sys.Memory.Write32(baseAddr + 24, 0x0000000Eu);
+        sys.Memory.Write32(baseAddr + 28, 0);
+        const ulong frameVal = 0x77UL;
+        sys.Memory.Write32(baseAddr + 32, (uint)frameVal);
+        sys.Memory.Write32(baseAddr + 36, 0);
+        sys.Memory.Write32(baseAddr + 40, 0x4Cu);
+        sys.Memory.Write32(baseAddr + 44, 0);
+
+        sys.Vif.ProcessStream(baseAddr, 3 * 4); // DIRECT QW + 2 data QWs
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"IMM=0 DIRECT did not apply FRAME: got 0x{sys.Gs.Registers.FRAME_1:X}");
+        // After 2 data QWs of 65536, remaining must still be huge (not 0 / not empty-IMM bug).
+        if (sys.Vif.DirectRemaining == 0 || sys.Vif.DirectRemaining > 65536u)
+            throw new Exception(
+                $"IMM=0 remaining wrong: rem={sys.Vif.DirectRemaining} (want 65534-ish)");
+        if (sys.Vif.DirectRemaining != 65536u - 2u)
+            throw new Exception(
+                $"IMM=0 debit wrong: rem={sys.Vif.DirectRemaining} want={65536u - 2u}");
+        Console.WriteLine(
+            $"[Smoke] Vif_Direct_Imm0_Means65536_NotEmpty OK " +
+            $"(FRAME=0x{frameVal:X} rem={sys.Vif.DirectRemaining})");
+    }
+
+    /// <summary>
+    /// GX-011: FIFO FeedData path — DIRECT mid-QW pad + 4-word QW assembly to Path2
+    /// (Play! m_directQwordBuffer). Without pad/assembly, GIFtag is misaligned garbage.
+    /// </summary>
+    public static void Vif_FeedData_Direct_MidQwPad_Path2Frame()
+    {
+        var sys = new Ps2System();
+        // word0=NOP, word1=DIRECT IMM=2, word2-3=pad, then 2 QWs GIFtag+FRAME
+        sys.Vif.FeedData(0x00000000u);       // NOP
+        sys.Vif.FeedData(0x50000002u);       // DIRECT IMM=2
+        sys.Vif.FeedData(0xDEADBEEFu);       // pad
+        sys.Vif.FeedData(0xCAFEBABEu);       // pad
+        // GIFtag
+        sys.Vif.FeedData(0x00008001u);
+        sys.Vif.FeedData(0x10000000u);
+        sys.Vif.FeedData(0x0000000Eu);
+        sys.Vif.FeedData(0);
+        const ulong frameVal = 0x42UL;
+        sys.Vif.FeedData((uint)frameVal);
+        sys.Vif.FeedData(0);
+        sys.Vif.FeedData(0x4Cu);
+        sys.Vif.FeedData(0);
+
+        if (sys.Gs.Registers.FRAME_1 != frameVal)
+            throw new Exception(
+                $"FeedData mid-QW DIRECT FRAME lost: got 0x{sys.Gs.Registers.FRAME_1:X} " +
+                $"tags={sys.Gif.TagsSeen} flg={sys.Gif.LastTagFlg} nloop={sys.Gif.LastTagNloop} " +
+                $"inflight={sys.Gif.PacketInFlight} rem={sys.Vif.DirectRemaining}");
+        if (sys.Vif.DirectRemaining != 0)
+            throw new Exception($"DIRECT not exhausted rem={sys.Vif.DirectRemaining}");
+        if (sys.Gif.PacketInFlight)
+            throw new Exception("GIF still mid-packet after complete DIRECT");
+        Console.WriteLine(
+            $"[Smoke] Vif_FeedData_Direct_MidQwPad_Path2Frame OK " +
+            $"(FRAME=0x{frameVal:X} p2qws={sys.Gif.Path2Qws})");
+    }
+
+    /// <summary>
+    /// GX-010: after EOP packet completes, remaining QWs in the same Path2 transfer start a
+    /// new tag (Play! ProcessMultiplePackets) — do not drop the second packet.
+    /// </summary>
+    public static void Gif_Path2_MultiPacket_EopContinuesInTransfer()
+    {
+        var sys = new Ps2System();
+        const uint baseAddr = 0x6000;
+        // Packet A: PACKED A+D NLOOP=1 EOP FRAME=0x11
+        sys.Memory.Write32(baseAddr + 0, 0x00008001u);
+        sys.Memory.Write32(baseAddr + 4, 0x10000000u);
+        sys.Memory.Write32(baseAddr + 8, 0x0000000Eu);
+        sys.Memory.Write32(baseAddr + 12, 0);
+        sys.Memory.Write32(baseAddr + 16, 0x11u);
+        sys.Memory.Write32(baseAddr + 20, 0);
+        sys.Memory.Write32(baseAddr + 24, 0x4Cu);
+        sys.Memory.Write32(baseAddr + 28, 0);
+        // Packet B: PACKED A+D NLOOP=1 EOP SCISSOR-ish via FRAME=0x22 (same A+D path)
+        sys.Memory.Write32(baseAddr + 32, 0x00008001u);
+        sys.Memory.Write32(baseAddr + 36, 0x10000000u);
+        sys.Memory.Write32(baseAddr + 40, 0x0000000Eu);
+        sys.Memory.Write32(baseAddr + 44, 0);
+        sys.Memory.Write32(baseAddr + 48, 0x22u);
+        sys.Memory.Write32(baseAddr + 52, 0);
+        sys.Memory.Write32(baseAddr + 56, 0x4Cu);
+        sys.Memory.Write32(baseAddr + 60, 0);
+
+        sys.Gif.ReceivePath2Data(baseAddr, 4); // 2 tags × (1 tag QW + 1 data QW)
+        if (sys.Gif.PacketsCompleted < 2)
+            throw new Exception(
+                $"EOP multi-packet not both completed: done={sys.Gif.PacketsCompleted} " +
+                $"tags={sys.Gif.TagsSeen} FRAME=0x{sys.Gs.Registers.FRAME_1:X}");
+        if (sys.Gs.Registers.FRAME_1 != 0x22UL)
+            throw new Exception(
+                $"second EOP packet lost: FRAME=0x{sys.Gs.Registers.FRAME_1:X} want 0x22");
+        if (sys.Gif.PacketsAborted != 0)
+            throw new Exception($"unexpected abort={sys.Gif.PacketsAborted}");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path2_MultiPacket_EopContinuesInTransfer OK " +
+            $"(completed={sys.Gif.PacketsCompleted} FRAME=0x{sys.Gs.Registers.FRAME_1:X})");
+    }
+
+    /// <summary>
+    /// GX-010: VIF new-DIRECT must not abort Path3-owned sticky mid-packet (reduce harmful
+    /// aborts). Path2 stalls until Path3 drains; Path3 FRAME/body is preserved.
+    /// </summary>
+    public static void Gif_Path2_DoesNotAbort_Path3Sticky()
+    {
+        var sys = new Ps2System();
+        // Path3: PACKED NLOOP=3 EOP — feed only tag+1 data QW so sticky remains mid-packet.
+        const uint p3 = 0x7000;
+        sys.Memory.Write32(p3 + 0, 0x00008003u); // NLOOP=3 EOP
+        sys.Memory.Write32(p3 + 4, 0x10000000u);
+        sys.Memory.Write32(p3 + 8, 0x0000000Eu);
+        sys.Memory.Write32(p3 + 12, 0);
+        // first A+D only (need 2 more)
+        sys.Memory.Write32(p3 + 16, 0x55u);
+        sys.Memory.Write32(p3 + 20, 0);
+        sys.Memory.Write32(p3 + 24, 0x4Cu);
+        sys.Memory.Write32(p3 + 28, 0);
+        sys.Gif.ReceivePath3Data(p3, 2); // tag + 1 body → still need 2
+        if (!sys.Gif.PacketInFlight || sys.Gif.PacketPath != 3)
+            throw new Exception(
+                $"expected Path3 sticky: inflight={sys.Gif.PacketInFlight} path={sys.Gif.PacketPath}");
+
+        ulong abortBefore = sys.Gif.PacketsAborted;
+        // VIF new-DIRECT while Path3 sticky — must NOT abort Path3.
+        sys.Vif.ProcessVifCode(0x50000001u); // DIRECT IMM=1
+        if (sys.Gif.PacketsAborted != abortBefore)
+            throw new Exception(
+                $"Path2 DIRECT aborted Path3 sticky: abort={sys.Gif.PacketsAborted} " +
+                $"(was {abortBefore}) last={sys.Gif.LastAbortReason}");
+        if (!sys.Gif.PacketInFlight || sys.Gif.PacketPath != 3)
+            throw new Exception("Path3 sticky was cleared by Path2 DIRECT boundary");
+
+        // Finish Path3 with remaining 2 body QWs
+        const uint p3b = 0x7100;
+        for (int n = 0; n < 2; n++)
+        {
+            uint a = p3b + (uint)n * 16;
+            sys.Memory.Write32(a + 0, 0x66u + (uint)n);
+            sys.Memory.Write32(a + 4, 0);
+            sys.Memory.Write32(a + 8, 0x4Cu);
+            sys.Memory.Write32(a + 12, 0);
+        }
+        sys.Gif.ReceivePath3Data(p3b, 2);
+        if (sys.Gif.PacketInFlight)
+            throw new Exception("Path3 still in-flight after body complete");
+        if (sys.Gif.PacketsCompleted < 1)
+            throw new Exception("Path3 packet never completed");
+        Console.WriteLine(
+            $"[Smoke] Gif_Path2_DoesNotAbort_Path3Sticky OK " +
+            $"(abort={sys.Gif.PacketsAborted} completed={sys.Gif.PacketsCompleted} " +
+            $"FRAME=0x{sys.Gs.Registers.FRAME_1:X})");
     }
 
     public static void Timer_GateAndClockSelect()
