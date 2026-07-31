@@ -15,6 +15,9 @@ public sealed class Gif : ISchedulable
     private ulong _path3Transfers;
     private ulong _path2Transfers;
     private ulong _path1Transfers;
+    private ulong _path1Qws;
+    private ulong _path3Qws;
+    private ulong _path3HeldSubmits; // Path3 submits while M3P|M3R (not yet drained)
 
     // REGS field from last tag (up to 16 regs × 4 bits)
     private ulong _regs;
@@ -33,12 +36,28 @@ public sealed class Gif : ISchedulable
     private bool _pktEop;        // stop after this packet completes
     private ulong _pktPartialQws; // telemetry: times a packet spanned Receive* calls
     private ulong _pktCompleted;
+    private ulong _pktAborted;
+    private ulong _abortNewDirect;
+    private ulong _abortDirectTruncate;
+    private ulong _abortOther;
+    private string _lastAbortReason = "";
     private uint _lastTagFlg;
     private uint _lastTagNloop;
     private uint _lastTagNreg;
     private ulong _lastTagRegs;
     private ulong _tagsSeen;
     private ulong _path2Qws; // total Path2 QWs delivered (vs transfer count)
+    private ulong _tagsCompletedPacked;
+    private ulong _tagsCompletedReglist;
+    private ulong _tagsCompletedImage;
+    private ulong _tagsCompletedDisable;
+
+    // GX-003: DETPS2_TRACE_GIF=1 transfer/tag ring (Path1/2/3 + sticky state)
+    private const int TraceRingCap = 48;
+    private readonly GifTraceSlot[] _traceRing = new GifTraceSlot[TraceRingCap];
+    private int _traceRingW;
+    private int _traceRingCount;
+    private bool? _traceGifCached;
 
     // GIF I/O (0x10003000)
     private uint _ctrl;
@@ -70,6 +89,10 @@ public sealed class Gif : ISchedulable
     public ulong Path3Transfers => _path3Transfers;
     public ulong Path2Transfers => _path2Transfers;
     public ulong Path1Transfers => _path1Transfers;
+    public ulong Path1Qws => _path1Qws;
+    public ulong Path3Qws => _path3Qws;
+    /// <summary>Path3 submits that were held under M3P|M3R (incremented on enqueue).</summary>
+    public ulong Path3HeldSubmits => _path3HeldSubmits;
     public uint HeldPath3Qwc => _heldPath3TotalQwc;
     public int HeldPath3Entries => _heldPath3Count;
     /// <summary>Completed GIFtag packets (PACKED/REGLIST/IMAGE/DISABLE) that fully drained.</summary>
@@ -89,9 +112,38 @@ public sealed class Gif : ISchedulable
     public uint PacketProgress => _pktLoop;
     public uint PacketNloop => _pktActive ? _pktNloop : 0;
     public uint PacketFlg => _pktActive ? _pktFlg : 0;
+    public ulong PacketsAborted => _pktAborted;
+    public ulong AbortNewDirect => _abortNewDirect;
+    public ulong AbortDirectTruncate => _abortDirectTruncate;
+    public ulong AbortOther => _abortOther;
+    public string LastAbortReason => _lastAbortReason;
+    public ulong TagsCompletedPacked => _tagsCompletedPacked;
+    public ulong TagsCompletedReglist => _tagsCompletedReglist;
+    public ulong TagsCompletedImage => _tagsCompletedImage;
+    public ulong TagsCompletedDisable => _tagsCompletedDisable;
+    public int TraceRingCount => _traceRingCount;
 
     /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
     public bool Path3MaskedByVif => _m3p;
+
+    /// <summary>One DETPS2_TRACE_GIF ring slot (Path1/2/3 xfer or tag/abort).</summary>
+    public readonly struct GifTraceSlot
+    {
+        public readonly byte Kind;  // 0=xfer 1=tag 2=complete 3=abort
+        public readonly byte Path;  // 1/2/3 (APATH)
+        public readonly byte Flg;   // GIFtag FLG or 0xFF
+        public readonly byte Flags; // bit0=held bit1=inFlightAfter
+        public readonly uint Addr;
+        public readonly uint QwcOrNloop;
+        public readonly ulong Completed;
+        public readonly ulong Aborted;
+
+        public GifTraceSlot(byte kind, byte path, byte flg, byte flags, uint addr, uint qwcOrNloop, ulong completed, ulong aborted)
+        {
+            Kind = kind; Path = path; Flg = flg; Flags = flags;
+            Addr = addr; QwcOrNloop = qwcOrNloop; Completed = completed; Aborted = aborted;
+        }
+    }
 
     public Gif(Gs gs)
     {
@@ -102,16 +154,24 @@ public sealed class Gif : ISchedulable
     {
         _lastQwcProcessed = 0;
         _path1Transfers = _path2Transfers = _path3Transfers = 0;
+        _path1Qws = _path3Qws = 0;
+        _path3HeldSubmits = 0;
         _regs = 0;
         _nreg = 0;
         ClearPacketState();
         _pktPartialQws = 0;
         _pktCompleted = 0;
         _pktAborted = 0;
+        _abortNewDirect = _abortDirectTruncate = _abortOther = 0;
+        _lastAbortReason = "";
         _lastTagFlg = _lastTagNloop = _lastTagNreg = 0;
         _lastTagRegs = 0;
         _tagsSeen = 0;
         _path2Qws = 0;
+        _tagsCompletedPacked = _tagsCompletedReglist = _tagsCompletedImage = _tagsCompletedDisable = 0;
+        _traceRingW = 0;
+        _traceRingCount = 0;
+        _traceGifCached = null;
         _ctrl = _mode = 0;
         _fifoR = _fifoW = _fifoCount = 0;
         _m3p = false;
@@ -130,10 +190,36 @@ public sealed class Gif : ISchedulable
         _pktEop = false;
     }
 
-    private ulong _pktAborted;
+    private bool TraceGifEnabled
+    {
+        get
+        {
+            if (_traceGifCached is bool b) return b;
+            b = Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1";
+            _traceGifCached = b;
+            return b;
+        }
+    }
 
-    /// <summary>Count of incomplete GIFtag packets aborted (new DIRECT / truncated stream).</summary>
-    public ulong PacketsAborted => _pktAborted;
+    private void RingPush(byte kind, byte path, byte flg, byte flags, uint addr, uint qwcOrNloop)
+    {
+        if (!TraceGifEnabled) return;
+        _traceRing[_traceRingW] = new GifTraceSlot(
+            kind, path, flg, flags, addr, qwcOrNloop, _pktCompleted, _pktAborted);
+        _traceRingW = (_traceRingW + 1) % TraceRingCap;
+        if (_traceRingCount < TraceRingCap) _traceRingCount++;
+    }
+
+    /// <summary>Copy recent DETPS2_TRACE_GIF ring entries (oldest→newest) into dest; returns count.</summary>
+    public int CopyTraceRing(Span<GifTraceSlot> dest)
+    {
+        int n = Math.Min(dest.Length, _traceRingCount);
+        if (n == 0) return 0;
+        int start = (_traceRingW - _traceRingCount + TraceRingCap) % TraceRingCap;
+        for (int i = 0; i < n; i++)
+            dest[i] = _traceRing[(start + i) % TraceRingCap];
+        return n;
+    }
 
     /// <summary>
     /// Drop an in-flight GIFtag so the next Path2 QW is parsed as a fresh tag.
@@ -147,11 +233,17 @@ public sealed class Gif : ISchedulable
     {
         if (!_pktActive) return;
         _pktAborted++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1")
+        _lastAbortReason = reason ?? "";
+        if (reason == "new-DIRECT") _abortNewDirect++;
+        else if (reason == "DIRECT-end-truncated") _abortDirectTruncate++;
+        else _abortOther++;
+        byte path = (byte)(_apath != 0 ? _apath : 2);
+        RingPush(3, path, (byte)_pktFlg, 0, 0, _pktNloop);
+        if (TraceGifEnabled)
         {
             Console.Error.WriteLine(
                 $"[GIF] abort in-flight flg={_pktFlg} progress={_pktLoop}/{_pktNloop} " +
-                $"reason={reason} n={_pktAborted}");
+                $"reason={reason} n={_pktAborted} completed={_pktCompleted}");
         }
         ClearPacketState();
     }
@@ -322,18 +414,34 @@ public sealed class Gif : ISchedulable
     {
         if (qwc == 0) return;
         _path3Transfers++;
+        _path3Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path3->GS", address, 0, qwc * 16);
 
         if (Path3Masked)
         {
             // Hold in FIFO queue: raise FQC so path-sync loops that poll STAT.FQC can proceed.
             // Queue (not last-only) so multi-kick IMAGE/PACKED under long M3P still reaches GS.
+            _path3HeldSubmits++;
             EnqueueHeldPath3(address, qwc);
+            RingPush(0, 3, 0xFF, 0x01, address, qwc); // held
+            if (TraceGifEnabled)
+            {
+                Console.Error.WriteLine(
+                    $"[GIF] Path3 HOLD addr=0x{address:X8} qwc={qwc} heldN={_heldPath3Count} " +
+                    $"heldQwc={_heldPath3TotalQwc} m3p={_m3p} completed={_pktCompleted} aborted={_pktAborted}");
+            }
             return;
         }
 
         // Unmasked: process immediately (instant HLE).
         _apath = 3;
+        RingPush(0, 3, 0xFF, (byte)(_pktActive ? 2 : 0), address, qwc);
+        if (TraceGifEnabled)
+        {
+            Console.Error.WriteLine(
+                $"[GIF] Path3 xfer addr=0x{address:X8} qwc={qwc} n={_path3Transfers} " +
+                $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
+        }
         ProcessTransfer(address, qwc);
         _apath = 0;
     }
@@ -341,10 +449,19 @@ public sealed class Gif : ISchedulable
     /// <summary>Path2 — from VIF1 DIRECT/HL. Sticky mid-packet across QW-sliced DMA.</summary>
     public void ReceivePath2Data(uint address, uint qwc)
     {
+        if (qwc == 0) return; // match Path3: do not inflate transfer counts on empty feeds
         _path2Transfers++;
         _path2Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
         _apath = 2;
+        byte flags = (byte)(_pktActive ? 2 : 0);
+        RingPush(0, 2, 0xFF, flags, address, qwc);
+        if (TraceGifEnabled)
+        {
+            Console.Error.WriteLine(
+                $"[GIF] Path2 xfer addr=0x{address:X8} qwc={qwc} n={_path2Transfers} p2qws={_path2Qws} " +
+                $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
+        }
         ProcessTransfer(address, qwc);
         _apath = 0;
     }
@@ -352,9 +469,20 @@ public sealed class Gif : ISchedulable
     /// <summary>Path1 — VU1 XGKICK style: process tags from memory.</summary>
     public void ReceivePath1Data(uint address, uint qwc)
     {
+        if (qwc == 0) return;
         _path1Transfers++;
+        _path1Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path1->GS", address, 0, qwc * 16);
+        _apath = 1;
+        RingPush(0, 1, 0xFF, (byte)(_pktActive ? 2 : 0), address, qwc);
+        if (TraceGifEnabled)
+        {
+            Console.Error.WriteLine(
+                $"[GIF] Path1 xfer addr=0x{address:X8} qwc={qwc} n={_path1Transfers} " +
+                $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
+        }
         ProcessTransfer(address, qwc);
+        _apath = 0;
     }
 
     /// <summary>
@@ -405,12 +533,19 @@ public sealed class Gif : ISchedulable
                 _lastTagNloop = nloop;
                 _lastTagNreg = nreg;
                 _lastTagRegs = _regs;
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1"
-                    && _tagsSeen <= 24)
+                byte path = (byte)(_apath != 0 ? _apath : 0);
+                RingPush(1, path, (byte)flg, 0, currentAddr - 16, nloop);
+                // GX-010 inventory: Path2 non-PACKED with huge nloop often means garbage DIRECT
+                // (GoW IMM=0xBF0 REGLIST nloop=12301). Telemetry only — do not invent abort here;
+                // new-DIRECT / DIRECT-end-truncated already drop sticky so real PACKED A+D lands.
+                bool path2Huge =
+                    path == 2 && flg is 1 or 2 && nloop > 4096;
+                if (TraceGifEnabled && (_tagsSeen <= 48 || path2Huge))
                 {
                     Console.Error.WriteLine(
                         $"[GIF] tag#{_tagsSeen} flg={flg} nloop={nloop} nreg={nreg} eop={eop} " +
-                        $"pre={pre} regs=0x{_regs:X16} apath={_apath} addr=0x{currentAddr - 16:X8}");
+                        $"pre={pre} regs=0x{_regs:X16} apath={_apath} addr=0x{currentAddr - 16:X8}" +
+                        (path2Huge ? " WARN=path2-huge-nloop" : ""));
                 }
 
                 // Empty NLOOP or DISABLE with nothing to skip: packet complete immediately.
@@ -429,7 +564,7 @@ public sealed class Gif : ISchedulable
                     }
                     else
                     {
-                        _pktCompleted++;
+                        NotePacketCompleted(3);
                         if (eop) break;
                     }
                     continue;
@@ -437,7 +572,7 @@ public sealed class Gif : ISchedulable
 
                 if (nloop == 0)
                 {
-                    _pktCompleted++;
+                    NotePacketCompleted(flg);
                     if (eop) break;
                     continue;
                 }
@@ -451,6 +586,7 @@ public sealed class Gif : ISchedulable
             }
 
             // Drain active packet body with available QWs.
+            uint flgBefore = _pktFlg;
             remaining = _pktFlg switch
             {
                 0 => DrainPacked(ref currentAddr, remaining),
@@ -468,9 +604,23 @@ public sealed class Gif : ISchedulable
                 break;
             }
 
-            _pktCompleted++;
+            NotePacketCompleted(flgBefore);
             if (_pktEop) break;
         }
+    }
+
+    private void NotePacketCompleted(uint flg)
+    {
+        _pktCompleted++;
+        switch (flg)
+        {
+            case 0: _tagsCompletedPacked++; break;
+            case 1: _tagsCompletedReglist++; break;
+            case 2: _tagsCompletedImage++; break;
+            default: _tagsCompletedDisable++; break;
+        }
+        byte path = (byte)(_apath != 0 ? _apath : 0);
+        RingPush(2, path, (byte)flg, 0, 0, 0);
     }
 
     /// <summary>PACKED: each loop writes nreg registers; each register is one QW.</summary>
