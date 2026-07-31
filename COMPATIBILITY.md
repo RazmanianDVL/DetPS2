@@ -1,9 +1,9 @@
 # DetPS2 Compatibility Tracker
 
-**Last updated**: 2026-07-27 (real commercial bring-up in progress — see `docs/DEVELOPER_GUIDE.md`;
-full per-title status and cross-title triage on the [GitHub wiki](https://github.com/RazmanianDVL/DetPS2/wiki))
+**Last updated**: 2026-07-31 (MENU YES **9/9** Soft-GS campaign — see `docs/title-ports/SCOREBOARD.md` and `docs/POST_MENU_PHASE_PLAN.md`;
+full per-title status on the [GitHub wiki](https://github.com/RazmanianDVL/DetPS2/wiki))
 
-This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships engineering tooling for dumps and netplay; **no commercial title has reached its main menu yet**. Most entries below describe automated tests and synthetic fixtures only (no copyrighted dumps) — the one real-dump attempt in progress is called out explicitly.
+This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships engineering tooling for dumps and netplay. **Commercial Soft-GS MENU YES is 9/9** on tip (scoreboard `menuKind` bars) — **not** fully playable; residuals and next gates live in **`docs/POST_MENU_PHASE_PLAN.md`**. Synthetic fixtures remain the automated CI path (no copyrighted dumps in-repo).
 
 ## Legend
 
@@ -27,16 +27,16 @@ This document tracks boot/runtime compatibility. DetPS2 **v0.1.0** ships enginee
 | In-memory netplay lockstep | Netplay | **Pass** | `Netplay_InMemory_LockstepSync` |
 | Real PS2 BIOS dump | BIOS | **Partial** | Load path + expanded HLE; verified against a real user-supplied dump |
 | Public domain / ps2dev homebrew | Homebrew | **Partial** | Loader + HLE + more ISA; title-dependent |
-| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **In progress** | Four fixes so far: `Exit(1)` crash, the `0x00212DD0` boot-assist stall, and — the big one — a real interrupt-dispatch register-corruption bug (`TryDispatchRegisteredIntcHandler` only saved `$ra`, not the full GPR file, so a handler firing mid-syscall could silently corrupt the syscall's own return value) that was permanently halting the game at cyc≈1.5M behind what looked like real logo/FMV progress. Fixed, plus two small follow-on syscall gaps it exposed (`iReferThreadStatus`=0x31, `iWakeupThread`=0x34). `px` now reaches ~77M and plateaus by cyc=200-500M — a new, real resting point, not yet investigated. See `docs/DEVELOPER_GUIDE.md` §7.10-7.16 (§7.16 corrects §7.15's earlier wrong "missing SIF command queue" conclusion) |
-| Vexx (`SLUS_203.83`) | Retail | **In progress** | Most active title tested — 274K+ syscalls, 5.8MB real SIF traffic (entirely from *general* fixes, no Vexx-specific work) before stalling ~100M-200M cycles |
-| Blood Omen 2 (`SLUS_200.24`) | Retail | **In progress** | Real `Exit(1)` crash before 20M cycles (confirmed distinct from Shaolin Monks' now-fixed mechanism), untraced |
-| Burnout 3: Takedown (`SLUS_210.50`) | Retail | **In progress** | Stalls ~20M cycles on a shared SN Systems ProDG SDK wait-flag routine — same bug also affects MK: Deadly Alliance and MK: Deception |
-| God of War (`SCUS_973.99`) | Retail | **In progress** | Stalls ~20M cycles on one identified, unimplemented MMI instruction — likely the cheapest fix of any title tested |
-| Haven: Call of the King (`SLUS_205.17`) | Retail | **In progress** | Real progress to 100M cycles, then stalls, untraced |
-| Mortal Kombat: Deadly Alliance (`SLUS_204.23`) | Retail | **In progress** | Same shared SDK wait-flag bug as Burnout 3 |
-| Mortal Kombat: Deception (`SLUS_208.81`) | Retail | **In progress** | Same shared SDK wait-flag bug as Burnout 3 |
-| Whiplash (`SLUS_206.84`) | Retail | **In progress** | Stalls ~20M cycles, no rendering activity, untraced |
-| Other commercial game ISOs | Retail | **Untested** | Fixes found via Shaolin Monks are general (kernel/HLE), so likely to help broadly |
+| Mortal Kombat: Shaolin Monks (`SLUS_210.87`) | Retail | **MENU YES** | Soft-GS mk-mainmenu (gifP3=18 px≈966k). Residual: natural texture DMA / pad accept. See scoreboard + post-menu plan. |
+| Vexx (`SLUS_203.83`) | Retail | **MENU YES** | Soft-GS title-surface (STREE0 VFS). Residual: richer frontend TRE members. |
+| Blood Omen 2 (`SLUS_200.24`) | Retail | **MENU YES** | Soft-GS title-surface. Residual: multi-prim IMAGE/DISPFB chrome. |
+| Burnout 3: Takedown (`SLUS_210.50`) | Retail | **MENU YES** | Soft-GS logo-frontend (px multi-M). Residual: DISPFB + pad main-menu advance. |
+| God of War (`SCUS_973.99`) | Retail | **MENU YES** | Soft-GS first-gs (Path2 sticky + ofx expand). Residual: Fedo shell decode, IRX-only stream class. |
+| Haven: Call of the King (`SLUS_205.17`) | Retail | **MENU YES** | Soft-GS title-surface + NUSOUND. Residual: IMAGE chrome. |
+| Mortal Kombat: Deadly Alliance (`SLUS_204.23`) | Retail | **MENU YES** | Soft-GS midway-menu keep-alive. Residual: fail-tail plants / richer chrome. |
+| Mortal Kombat: Deception (`SLUS_208.81`) | Retail | **MENU YES** | Soft-GS midway-menu. Residual: gameart GIF IMAGE textures. |
+| Whiplash (`SLUS_206.84`) | Retail | **MENU YES** | Soft-GS title-surface. Residual: full texture path; WHIP WaitSema fabricate. |
+| Other commercial game ISOs | Retail | **Untested / free-ride** | Next free-ride target e.g. SotC — post-menu plan P7. |
 
 ## Subsystems
 
