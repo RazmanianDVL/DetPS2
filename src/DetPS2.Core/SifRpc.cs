@@ -257,8 +257,19 @@ public sealed class IopModuleHost
     /// <summary>Return address planted in <c>$ra</c> so <c>jr ra</c> from module entry is detectable.</summary>
     public const uint ModuleReturnSentinel = 0x0000BEE0u;
 
-    /// <summary>Default IOP stack top for module entry (below 2 MiB IOP RAM end).</summary>
-    public const uint DefaultModuleStack = 0x001FF000u;
+    /// <summary>
+    /// Default IOP stack top for module entry. Keep below 2 MiB RAM end and above typical
+    /// module load range (0x10000+ grows up). Stack grows down from here.
+    /// </summary>
+    public const uint DefaultModuleStack = 0x001F0000u;
+
+    /// <summary>
+    /// Boot-parameter block for IRX <c>_start</c>. LOADCORE (and siblings) do
+    /// <c>lw v0,0(a0); sll sp,v0,20</c> — <c>a0</c> is <b>not</b> argc; it is a pointer to a
+    /// boot info word whose low bits select the stack base in megabytes of IOP space.
+    /// Value <c>1</c> → <c>sp = 0x00100000</c> (1 MiB), safe for 2 MiB IOP RAM.
+    /// </summary>
+    public const uint ModuleBootParamPhys = 0x001EF000u;
 
     private int _pendingLiteralId = -1;
     private uint _pendingLiteralEntryPhys;
@@ -313,15 +324,17 @@ public sealed class IopModuleHost
     }
 
     /// <summary>
-    /// Convert EE-mapped IOP RAM (0x1Cxxxxxx) or already-physical IOP address to IOP-bus physical
-    /// for <see cref="Iop.PC"/> / GPR setup. <see cref="SystemMemory.IopRead32"/> only sees the
-    /// low 2 MiB window — feeding EE-mapped addresses fetches zeros.
+    /// Convert EE-mapped IOP RAM (0x1Cxxxxxx), KSEG0/KSEG1 (0x8…/0xA…), or already-physical
+    /// IOP address to IOP-bus physical for <see cref="Iop.PC"/> / GPR setup.
+    /// Must strip KSEG before comparing to <see cref="SystemMemory.IOP_RAM_BASE"/> — otherwise
+    /// <c>0x800001BC</c> is misread as EE-window (0x800001BC ≥ 0x1C000000) and becomes garbage.
     /// </summary>
     public static uint ToIopPhys(uint eeOrPhys)
     {
-        if (eeOrPhys >= SystemMemory.IOP_RAM_BASE)
-            return eeOrPhys - SystemMemory.IOP_RAM_BASE;
-        return eeOrPhys & 0x1FFFFFu;
+        uint p = eeOrPhys & 0x1FFFFFFFu; // collapse KSEG0/KSEG1 / kuseg
+        if (p >= SystemMemory.IOP_RAM_BASE && p < SystemMemory.IOP_RAM_BASE + (uint)SystemMemory.IOP_RAM_SIZE)
+            return p - SystemMemory.IOP_RAM_BASE;
+        return p & 0x1FFFFFu;
     }
 
     /// <summary>
@@ -581,12 +594,18 @@ public sealed class IopModuleHost
                 uint ee = SystemMemory.IOP_RAM_BASE + phys;
                 mem.Write32(ee, 0);
             }
+            // LOADCORE-style boot param: *a0 = megabytes for initial sp (sll 20).
+            mem.Write32(SystemMemory.IOP_RAM_BASE + ModuleBootParamPhys, 1u);
+            // Clear a few following words (version/path slots some modules read).
+            for (uint i = 1; i < 16; i++)
+                mem.Write32(SystemMemory.IOP_RAM_BASE + ModuleBootParamPhys + i * 4, 0);
         }
-        iop.SetGpr(29, sp); // $sp
+        iop.SetGpr(29, sp); // $sp (overwritten by modules that rebuild sp from *a0)
         iop.SetGpr(30, sp); // $fp
         iop.SetGpr(31, ModuleReturnSentinel); // $ra
-        iop.SetGpr(4, 0); // a0 argc
-        iop.SetGpr(5, 0); // a1 argv
+        // a0 = boot param pointer (NOT argc=0 — that made LOADCORE set sp=0-64 and die)
+        iop.SetGpr(4, ModuleBootParamPhys);
+        iop.SetGpr(5, 0); // a1
         iop.SetGpr(2, 0); // v0 clear before start
         return true;
     }
@@ -679,15 +698,63 @@ public sealed class IopModuleHost
         if (_pendingLiteralId == id)
             ClearPendingLiteralEntry();
 
-        bool ok = insns > 0 && (returned || budget);
+        // LOADCORE deliberately never returns from _start — parks in a tight branch after
+        // installing the module manager (`sb status; j that; nop`). Only treat as resident
+        // success when the loop is **inside this module's own image** (not EXCEPMAN's default
+        // fatal handler at ~0x18638 which is also `beq zero,zero,self`).
+        bool residentSpin = false;
+        if (budget && !returned && insns > 256)
+        {
+            uint pc = ToIopPhys(iop.PC);
+            uint modPhys = ToIopPhys(m.LoadBase);
+            uint modEnd = modPhys + Math.Max(m.Size, 0x1000u);
+            if (pc >= modPhys && pc < modEnd)
+            {
+                uint op = system.Memory.IopRead32(pc);
+                uint opc = op >> 26;
+                if (opc == 2) // j
+                {
+                    uint tgt = ((pc + 4) & 0xF0000000u) | ((op & 0x03FFFFFFu) << 2);
+                    tgt = ToIopPhys(tgt);
+                    int delta = (int)pc - (int)tgt;
+                    if (delta >= 0 && delta <= 32) residentSpin = true;
+                }
+                else if (opc == 4 && ((op >> 16) & 0x3FFu) == 0) // beq zero,zero
+                {
+                    short off = (short)(op & 0xFFFF);
+                    if (off == -1 || off == 0) residentSpin = true;
+                }
+                else
+                {
+                    // Parked on the store half of `sb; j store` — look ahead one insn for the j.
+                    uint op2 = system.Memory.IopRead32(pc + 4);
+                    if ((op2 >> 26) == 2)
+                    {
+                        uint tgt = ((pc + 8) & 0xF0000000u) | ((op2 & 0x03FFFFFFu) << 2);
+                        tgt = ToIopPhys(tgt);
+                        if (tgt == pc || (tgt < pc && pc - tgt <= 32))
+                            residentSpin = true;
+                    }
+                }
+            }
+            if (residentSpin)
+            {
+                returned = true;
+                budget = false;
+            }
+        }
+
+        bool ok = insns > 0 && (returned || budget || residentSpin);
         return new ModuleRunResult
         {
             Success = ok,
-            Message = returned
-                ? $"returned to sentinel after {insns} insn"
-                : budget
-                    ? $"hit budget {maxInstructions} after {insns} insn"
-                    : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
+            Message = returned && residentSpin
+                ? $"resident spin at pc=0x{iop.PC:X8} after {insns} insn"
+                : returned
+                    ? $"returned to sentinel after {insns} insn"
+                    : budget
+                        ? $"hit budget {maxInstructions} after {insns} insn"
+                        : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
             ModuleId = id,
             Name = m.Name,
             EntryPc = entryPhys,

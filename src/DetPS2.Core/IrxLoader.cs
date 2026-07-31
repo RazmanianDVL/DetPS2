@@ -195,7 +195,6 @@ public static class IrxLoader
 
     private static void ApplyRelRelocations(byte[] elf, SystemMemory memory, Section relSec, Section targetSec, uint iopLoadBase)
     {
-        uint destBase = SystemMemory.IOP_RAM_BASE + iopLoadBase + targetSec.Addr;
         // Two different "base to add" values are needed depending on relocation kind:
         //  - R_MIPS_26 (J/JAL) only ever encodes the low 28 bits of the target — real MIPS
         //    hardware reconstructs the full address at execution time as
@@ -214,8 +213,14 @@ public static class IrxLoader
         // Runtime base for *address values* must be **IOP physical** (iopLoadBase), not the EE
         // window (0x1C000000+). IRX executes on the R3000 with PC in phys/KSEG; R_MIPS_26 takes
         // the top nibble from PC, so encoding EE 0x1C… produces jumps to 0x0C… when PC is phys.
-        // Bytes are still written via destBase (EE map → same IOP RAM). EE reads the same chip
-        // at 0x1C000000+phys (see SystemMemory.NormalizeIopBusAddr).
+        // Bytes are still written via the EE map (same IOP RAM chip).
+        //
+        // r_offset is **module-relative** (offset from load base), NOT section-relative.
+        // Sony IOP IRX .rel.rodata entries for e.g. DMACMAN's channel jump table use
+        // r_offset=0x15D8 matching the image layout address (.rodata sh_addr=0x15D0, so a
+        // section-relative encoding would be 0x8). Using targetSec.Addr + rOffset double-added
+        // the section base and patched empty memory past the module, leaving .rodata tables
+        // as raw file offsets — jr to 0x24 → exception → EXCEPMAN default spin.
         uint fullBase = iopLoadBase;
         uint low28Base = fullBase & 0x0FFFFFFFu;
         int count = (int)(relSec.Size / 8); // Elf32_Rel = 8 bytes: r_offset, r_info
@@ -232,7 +237,7 @@ public static class IrxLoader
             // observed always use the null symbol for these, with the loader's own base
             // substituting for what would otherwise be a symbol-table lookup.
 
-            uint instrAddr = destBase + rOffset;
+            uint instrAddr = SystemMemory.IOP_RAM_BASE + iopLoadBase + rOffset;
             uint instr = memory.Read32(instrAddr);
 
             switch (rType)

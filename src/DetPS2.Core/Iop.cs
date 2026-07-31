@@ -484,6 +484,11 @@ public sealed class Iop : ISchedulable
         12 => Cop0Status,
         13 => Cop0Cause,
         14 => Cop0Epc,
+        // PRId — R3000A identity. SIFMAN _start does `mfc0 v0,$15; slti v0,v0,16; bne early_exit`
+        // and skips all SIF hardware init when PRId < 16. Returning 0 made SIFMAN a no-op
+        // (modres=1 after 11 insns) so SIFCMD/SIFINIT hung waiting for an uninitialised SIF.
+        // 0x1F matches common IOP R3000A PRId values used by PCSX2-class cores (≥16 → full init).
+        15 => 0x0000001Fu,
         _ => 0
     };
 
@@ -500,6 +505,15 @@ public sealed class Iop : ISchedulable
     private uint EffectiveAddress(uint opcode) => _gprs[Rs(opcode)] + (uint)Imm16(opcode);
 
     /// <summary>
+    /// COP0 Status bit 16 (IsC) — Isolate Cache. When set, load/store touch only the data
+    /// cache, not main memory. LOADCORE's <c>FlushDcache</c> (and siblings) set IsC then
+    /// store-zero through the low 4 KiB to invalidate dcache lines; without honouring IsC
+    /// those stores wipe the R3000 exception vectors at 0x80 and every subsequent SYSCALL
+    /// falls into a nop sled (INTRMANP/THREADMAN/FILEIO budget-storm root cause).
+    /// </summary>
+    private bool CacheIsolated => (Cop0Status & (1u << 16)) != 0;
+
+    /// <summary>
     /// IOP bus regions currently backed by SystemMemory.Iop*: RAM, BIOS window, SIF mailbox.
     /// Everything else is "unknown MMIO" for WP-05 diagnostics (real peripherals land here later).
     /// </summary>
@@ -508,6 +522,8 @@ public sealed class Iop : ISchedulable
         uint p = addr & 0x1FFFFFFFu;
         if (p < (uint)SystemMemory.IOP_RAM_SIZE) return true;
         if (p >= SystemMemory.IOP_SIF_BASE && p < SystemMemory.IOP_SIF_BASE + SystemMemory.IOP_SIF_SIZE)
+            return true;
+        if (p >= SystemMemory.IOP_IO_BASE && p < SystemMemory.IOP_IO_BASE + SystemMemory.IOP_IO_SIZE)
             return true;
         if (p >= SystemMemory.BIOS_BASE && p < SystemMemory.BIOS_BASE + (uint)SystemMemory.BIOS_SIZE)
             return true;
@@ -524,24 +540,31 @@ public sealed class Iop : ISchedulable
 
     private uint MemRead32(uint addr)
     {
+        // Isolated cache: real R3000 returns dcache contents; we have no dcache model, so 0.
+        // Instruction fetch still uses IopRead32(PC) directly — only load ops go through here.
+        if (CacheIsolated) return 0;
         if (!IsKnownIopMap(addr)) TraceUnknownMmio("R32", addr);
         return _memory.IopRead32(addr);
     }
 
     private void MemWrite32(uint addr, uint value)
     {
+        // Isolated cache: discard store (FlushDcache invalidation must not touch IOP RAM).
+        if (CacheIsolated) return;
         if (!IsKnownIopMap(addr)) TraceUnknownMmio("W32", addr, value);
         _memory.IopWrite32(addr, value);
     }
 
     private byte MemRead8(uint addr)
     {
+        if (CacheIsolated) return 0;
         if (!IsKnownIopMap(addr)) TraceUnknownMmio("R8", addr);
         return _memory.IopRead8(addr);
     }
 
     private void MemWrite8(uint addr, byte value)
     {
+        if (CacheIsolated) return;
         if (!IsKnownIopMap(addr)) TraceUnknownMmio("W8", addr, value);
         _memory.IopWrite8(addr, value);
     }

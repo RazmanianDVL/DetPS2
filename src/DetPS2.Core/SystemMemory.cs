@@ -78,6 +78,8 @@ public sealed class SystemMemory
     private readonly byte[] _scratchpad = new byte[SPR_SIZE];
     private readonly byte[] _iopRam = new byte[IOP_RAM_SIZE];
     private readonly byte[] _bios = new byte[BIOS_SIZE];
+    /// <summary>IOP I/O ports at phys 0x1F801000 (word-indexed). See <see cref="IOP_IO_BASE"/>.</summary>
+    private readonly uint[] _iopIo = new uint[IOP_IO_SIZE / 4];
 
     private MmioBus? _mmio;
     private Spu2? _spu2;
@@ -92,12 +94,57 @@ public sealed class SystemMemory
     /// <summary>IOP CDVD register window at <see cref="Cdvd.PhysBase"/> (WP-18).</summary>
     public void AttachCdvd(Cdvd cdvd) => _cdvd = cdvd;
 
+    /// <summary>Reset IOP I/O port scratchpad to power-on defaults (INTRMAN config bit, etc.).</summary>
+    public void ResetIopIoPorts()
+    {
+        Array.Clear(_iopIo);
+        // Indices are offsets from IOP_IO_BASE (0x1F801000).
+        // 0x1F801450 — INTRMANP PS2-mode / board-ID bit 3 must be set for full init.
+        _iopIo[0x450 / 4] = IopIoIntrmanConfigDefault;
+        // Common DMAC master-enable / DPCR-ish defaults so DMACMAN/SIFMAN stores stick.
+        _iopIo[0x0F0 / 4] = 0x07777777u;
+        _iopIo[0x570 / 4] = 0x07777777u;
+        _iopIo[0x578 / 4] = 1u;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsIopIoPort(uint rawPhys) =>
+        rawPhys >= IOP_IO_BASE && rawPhys < IOP_IO_BASE + IOP_IO_SIZE;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private uint ReadIopIo32(uint rawPhys)
+    {
+        uint off = rawPhys - IOP_IO_BASE;
+        return _iopIo[off / 4];
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void WriteIopIo32(uint rawPhys, uint value)
+    {
+        uint off = rawPhys - IOP_IO_BASE;
+        _iopIo[off / 4] = value;
+    }
+
     /// <summary>Real IOP-side SIF mailbox window (ps2tek: IOP sees these at 0x1D000000, the EE
     /// sees the SAME shared hardware mailbox at 0x1000F200 via MmioBus/Sif.ReadRegister/
     /// WriteRegister — same register offsets, 0x00=MSCOM/0x10=SMCOM/0x20=MSFLAG/0x30=SMFLAG/
     /// 0x40=STAT). Only needed on the Iop*() accessor family below.</summary>
     public const uint IOP_SIF_BASE = 0x1D000000;
     public const uint IOP_SIF_SIZE = 0x100;
+
+    /// <summary>
+    /// PS1/IOP I/O port window (KSEG1 <c>0xBF801000</c> → phys <c>0x1F801000</c>).
+    /// DMAC, INTC, timers, SSBUS, etc. Scratchpad of 4 KiB word slots so IRX can
+    /// program DPCR/CHCR and probe config bits without open-bus zeros.
+    /// </summary>
+    public const uint IOP_IO_BASE = 0x1F801000;
+    public const uint IOP_IO_SIZE = 0x1000;
+
+    /// <summary>
+    /// INTRMANP (PRId ≥ 16 path) reads <c>0xBF801450</c> and requires bit 3 set or it
+    /// early-returns without installing handlers. Default power-on value for PS2 IOP.
+    /// </summary>
+    public const uint IopIoIntrmanConfigDefault = 0x00000008;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ulong TranslateAddress(ulong virtualAddress) => virtualAddress & 0x1FFFFFFFUL;
@@ -273,6 +320,8 @@ public sealed class SystemMemory
         uint raw = addr & 0x1FFFFFFFu;
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return (byte)(_sif.ReadRegister(raw) >> (int)((raw & 3) * 8));
+        if (IsIopIoPort(raw))
+            return (byte)(ReadIopIo32(raw & ~3u) >> (int)((raw & 3) * 8));
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
             return _cdvd.ReadMmio8(raw);
         if (raw >= BIOS_BASE && raw < BIOS_BASE + (uint)BIOS_SIZE) return _bios[raw - BIOS_BASE];
@@ -288,6 +337,14 @@ public sealed class SystemMemory
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
             _sif.WriteRegister(raw, value);
+            return;
+        }
+        if (IsIopIoPort(raw))
+        {
+            uint aligned = raw & ~3u;
+            int shift = (int)((raw & 3) * 8);
+            uint cur = ReadIopIo32(aligned);
+            WriteIopIo32(aligned, (cur & ~(0xFFu << shift)) | ((uint)value << shift));
             return;
         }
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
@@ -306,6 +363,8 @@ public sealed class SystemMemory
         uint raw = addr & 0x1FFFFFFFu;
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return _sif.ReadRegister(raw);
+        if (IsIopIoPort(raw))
+            return ReadIopIo32(raw);
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
         {
             // Byte-lane assemble (CDVD is an 8-bit register window; LB/LBU is the common path).
@@ -328,6 +387,11 @@ public sealed class SystemMemory
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
             _sif.WriteRegister(raw, value);
+            return;
+        }
+        if (IsIopIoPort(raw))
+        {
+            WriteIopIo32(raw, value);
             return;
         }
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
@@ -477,8 +541,17 @@ public sealed class SystemMemory
     public byte[] GetIopRamCopy() => (byte[])_iopRam.Clone();
     public byte[] GetScratchpadCopy() => (byte[])_scratchpad.Clone();
 
-    public void ClearIopRam() => Array.Clear(_iopRam);
+    public void ClearIopRam()
+    {
+        Array.Clear(_iopRam);
+        ResetIopIoPorts();
+    }
     public void ClearScratchpad() => Array.Clear(_scratchpad);
+
+    public SystemMemory()
+    {
+        ResetIopIoPorts();
+    }
 
     public ReadOnlySpan<byte> GetRDRAMSpan() => _rdram;
     public Span<byte> GetIopRamSpan() => _iopRam;
