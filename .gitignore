@@ -39,19 +39,29 @@ tools/bios-extract/
 # Scratch blocker-trace/investigation output logs (should live outside the repo, but in case
 # they land here, never commit them)
 mk-*.txt
+mkt*.txt
+mk[0-9]*.txt
 d[0-9]*.txt
 out/
 out/traces/
 # Root-level one-off investigation logs (use out/traces/ instead)
 b3-*.txt
+b3t.txt
+b3d*.txt
 bo2-*.txt
+bo2t.txt
+bo2[0-9]*.txt
 gow-*.txt
+gowt.txt
+gow[0-9]*.txt
 sm-*.txt
 dec-*.txt
 *-err.txt
 *-out.txt
 v2-*.txt
 snap-*.txt
+smoke-*.txt
+build-*.txt
 *-final*.txt
 *-score*.txt
 *-menu*.txt

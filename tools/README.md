@@ -68,7 +68,15 @@ pwsh ./tools/regression-matrix.ps1 -Budget verify -BaselineJson out/traces/score
 | verify | 50M | Confirm fix |
 | claim | 100M | MENU / first-GS claim only |
 
-Traces → **`out/traces/`** (gitignored). Do not litter repo root with `b3-*.txt`.
+Traces → **`out/traces/`** (gitignored). Do not litter repo root with `b3-*.txt` / `bo2t.txt` / `*-err.txt`.
+
+```powershell
+pwsh ./tools/clean-traces.ps1           # move root noise → out/traces/archive-YYYYMMDD/
+pwsh ./tools/clean-traces.ps1 -DryRun
+pwsh ./tools/clean-traces.ps1 -ReportSize
+```
+
+HLE→IRX SID debt matrix: **`docs/irx/HLE_TO_IRX_MATRIX.md`**.
 
 ---
 

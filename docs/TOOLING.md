@@ -13,8 +13,10 @@ Master map of bring-up tools, budgets, oracles, and media policy.
 | **`scoreboard.ps1`** | Multi-title Soft-GS metrics table → `out/traces/scoreboard-*.md/json` |
 | **`play-lookup.ps1`** | Play! GameConfig + wall→source map (**required before new HLE**) |
 | **`media-map.ps1`** | Inventory `user-media*.json` + `burnout-only.json` (ISO/BIOS present?) |
-| **`clean-traces.ps1`** | Move root `b3-/bo2-/gow-/sm-/*.txt` noise into `out/traces/archive-YYYYMMDD/` |
+| **`clean-traces.ps1`** | Move root investigation `*.txt` noise into `out/traces/archive-YYYYMMDD/` (`-ReportSize` for worktree breakdown) |
 | **`scoreboard-fleet.json`** | Default fleet ids, serials, media paths, menu kinds |
+
+IRX debt matrix: **`docs/irx/HLE_TO_IRX_MATRIX.md`** (every RealSifRpc SID → target IRX / DEBT).
 
 ```powershell
 # From repo root (detps2/)
@@ -27,6 +29,7 @@ pwsh ./tools/scoreboard.ps1 -Budget verify -Titles mk-shaolin-monks,burnout-3,go
 pwsh ./tools/media-map.ps1 -WriteReport
 pwsh ./tools/clean-traces.ps1          # move only
 pwsh ./tools/clean-traces.ps1 -DryRun
+pwsh ./tools/clean-traces.ps1 -ReportSize
 ```
 
 Optional / if present in tree (not required for every wave):
