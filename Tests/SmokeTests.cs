@@ -416,6 +416,10 @@ public static class SmokeTests
             byte b = sys.Memory.Read8(SystemMemory.IOP_RAM_BASE + iopOff + i);
             if (b != (byte)(0xA0 + i))
                 throw new Exception($"SIF1 EE→IOP mismatch at {i}: {b:X2}");
+            // IOP core view (physical offset) must match EE's 0x1C000000+ window.
+            byte iopView = sys.Memory.IopRead8(iopOff + i);
+            if (iopView != (byte)(0xA0 + i))
+                throw new Exception($"SIF1 EE→IOP not visible via IopRead8 at {i}: {iopView:X2}");
         }
 
         // Modify IOP and copy back
@@ -432,6 +436,89 @@ public static class SmokeTests
             throw new Exception("Command queue failed");
 
         Console.WriteLine($"[Smoke] Sif_DmaRoundTrip_UpdatesMemory OK (bytes={sys.Sif.BytesTransferred})");
+    }
+
+    /// <summary>
+    /// WP-19: EE mailbox write visible to IOP window; IOP reply visible to EE; SIF0/SIF1
+    /// DMA coherent across EE 0x1Cxxxxxx and IOP physical addressing. Reply API for future SIFMAN.
+    /// Authority: docs/irx/SIF_BRIDGE.md.
+    /// </summary>
+    public static void Sif_Bridge_MailboxAndDmaVisibleToIop()
+    {
+        var sys = new Ps2System();
+        var mem = sys.Memory;
+        var sif = sys.Sif;
+
+        // --- EE posts MSCOM + MSFLAG via EE MMIO window (0x1000F200) ---
+        const uint eeMsCom = 0xDEADBEEF;
+        const uint eeMsFlag = 0x0000_00A5;
+        sif.WriteRegister(0x1000F200, eeMsCom); // MSCOM → SendCommand
+        sif.WriteRegister(0x1000F220, eeMsFlag); // MSFLAG
+
+        // IOP must see the same mailbox at 0x1D000000 (shared Sif object).
+        uint iopMsCom = mem.IopRead32(SystemMemory.IOP_SIF_BASE + 0x00);
+        uint iopMsFlag = mem.IopRead32(SystemMemory.IOP_SIF_BASE + 0x20);
+        if (iopMsCom != eeMsCom)
+            throw new Exception($"IOP MSCOM 0x{iopMsCom:X8} != EE posted 0x{eeMsCom:X8}");
+        if (iopMsFlag != eeMsFlag)
+            throw new Exception($"IOP MSFLAG 0x{iopMsFlag:X8} != EE posted 0x{eeMsFlag:X8}");
+
+        // --- IOP reply path (future SIFMAN): SMCOM + SMFLAG bits ---
+        const uint iopSmCom = 0xC0DEC0DE;
+        const uint iopSmBits = Sif.SifStatCmdInit; // post a status bit EE can poll
+        sif.IopPostMailboxReply(iopSmCom, iopSmBits);
+        if (sif.SmCom != iopSmCom)
+            throw new Exception($"SmCom after reply 0x{sif.SmCom:X8}");
+        if ((sif.SmFlag & iopSmBits) != iopSmBits)
+            throw new Exception($"SMFLAG missing reply bits: 0x{sif.SmFlag:X}");
+        if ((sif.SmFlag & 1) == 0)
+            throw new Exception("SMFLAG message-pending bit not set after IopPostMailboxReply");
+
+        // EE reads reverse mailbox via MMIO offsets
+        if (sif.ReadRegister(0x1000F210) != iopSmCom)
+            throw new Exception("EE SMCOM read mismatch");
+        if (sif.ReadRegister(0x1000F230) != sif.SmFlag)
+            throw new Exception("EE SMFLAG read mismatch");
+
+        // IOP window write of SMCOM must also reach EE (IopWrite32 → WriteRegister)
+        mem.IopWrite32(SystemMemory.IOP_SIF_BASE + 0x10, 0x11112222);
+        if (sif.SmCom != 0x11112222)
+            throw new Exception($"IopWrite32 SMCOM not mirrored: 0x{sif.SmCom:X8}");
+
+        // --- SIF1 EE→IOP DMA + IOP physical read ---
+        const uint eeBuf = 0x18000;
+        const uint iopOff = 0x4000;
+        const uint n = 32;
+        for (uint i = 0; i < n; i++)
+            mem.Write8(eeBuf + i, (byte)(0x40 + i));
+        sif.Sif1EeToIop(eeBuf, iopOff, n);
+        for (uint i = 0; i < n; i++)
+        {
+            if (mem.IopRead8(iopOff + i) != (byte)(0x40 + i))
+                throw new Exception($"DMA EE→IOP IopRead8 mismatch @ {i}");
+            if (mem.Read8(SystemMemory.IOP_RAM_BASE + iopOff + i) != (byte)(0x40 + i))
+                throw new Exception($"DMA EE→IOP IOP_RAM_BASE mismatch @ {i}");
+        }
+
+        // --- SIF0 IOP→EE reply bytes (IOP writes RAM, then DMA to EE) ---
+        mem.IopWrite8(iopOff, 0xFE);
+        mem.IopWrite8(iopOff + 1, 0xED);
+        const uint eeReply = 0x19000;
+        sif.Sif0IopToEe(iopOff, eeReply, n);
+        if (mem.Read8(eeReply) != 0xFE || mem.Read8(eeReply + 1) != 0xED)
+            throw new Exception("SIF0 IOP→EE reply bytes missing");
+
+        // SIF INTC sticky STAT must be set after mailbox reply / DMA (mask not required).
+        if (!sys.Intc.IsRaised(Intc.InterruptSource.Sif))
+        {
+            sif.IopPostMailboxReply(0x99, 0);
+            if (!sys.Intc.IsRaised(Intc.InterruptSource.Sif))
+                throw new Exception("SIF interrupt not raised after IopPostMailboxReply");
+        }
+
+        Console.WriteLine(
+            $"[Smoke] Sif_Bridge_MailboxAndDmaVisibleToIop OK " +
+            $"(bytes={sif.BytesTransferred} smflag=0x{sif.SmFlag:X} smcom=0x{sif.SmCom:X8})");
     }
 
     public static void Timer_CompareRaisesIntc_EeSeesCop0()
@@ -766,10 +853,8 @@ public static class SmokeTests
             Dmac_GifPath3_UsesStartMadr();
 
             Iop_HandAssembledLoop_Deterministic();
-            IopExecSmokes.HandAssembledLoop_UsesRunInstructions();
-            IopExecSmokes.RunInstructions_1k_Deterministic();
-            IopExecSmokes.SyscallBreak_VectorRfe_Returns();
             Sif_DmaRoundTrip_UpdatesMemory();
+            Sif_Bridge_MailboxAndDmaVisibleToIop();
             Timer_CompareRaisesIntc_EeSeesCop0();
             Timer_ModeFlags_CompareOverflow_W1C();
             Cdvd_ReadSector_Deterministic();

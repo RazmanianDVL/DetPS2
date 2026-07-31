@@ -17,8 +17,8 @@ namespace DetPS2.Core;
 /// split 32-bit address), R_MIPS_LO16 (type 6, lower half). The previous version of this loader
 /// only ever copied PT_LOAD segment bytes verbatim with zero relocation processing — every
 /// address-bearing instruction in a real module would have been wrong the moment it was actually
-/// executed (this was never caught because nothing ever executed loaded IOP module code — see
-/// DEVELOPER_GUIDE.md's IRX execution write-up).
+/// executed. Historically nothing ran loaded module text; WP-08 wires entry via
+/// <see cref="IopModuleHost.StartLoadedModule"/> (see docs/irx/MODULE_RUNTIME.md).
 ///
 /// Every real relocation entry observed had r_sym==0 (the reserved null symbol) — NOT because
 /// nothing needs relocating, but because Sony's toolchain uses symbol index 0 uniformly for

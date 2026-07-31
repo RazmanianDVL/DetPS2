@@ -57,15 +57,16 @@ public readonly struct SifRpcPacket
     };
 }
 
-/// <summary>MODLOAD/LOADCORE module lifecycle (contract-level HLE). Real ModuleInfo_t lives on
-/// LOADCORE's image_info list; DetPS2 tracks the same states without executing IRX _start.</summary>
+/// <summary>MODLOAD/LOADCORE module lifecycle. Real ModuleInfo_t lives on LOADCORE's image_info
+/// list; DetPS2 tracks the same states. HLE <see cref="IopModuleHost.StartModule"/> marks
+/// Started without R3000; <see cref="IopModuleHost.StartLoadedModule"/> runs real entry code.</summary>
 public enum IopModuleState
 {
     /// <summary>Name registered, no image (HLE stub / pending).</summary>
     Registered = 0,
-    /// <summary>IRX image relocated into IOP RAM; <c>_start</c> not yet run.</summary>
+    /// <summary>IRX image relocated into IOP RAM; <c>_start</c> not yet run on R3000.</summary>
     Loaded = 1,
-    /// <summary><c>_start</c> completed (or HLE boot module presented as already up).</summary>
+    /// <summary><c>_start</c> completed (HLE soft-start and/or real R3000 entry returned).</summary>
     Started = 2,
     /// <summary>Stopped after a prior start; eligible for unload when non-resident.</summary>
     Stopped = 3,
@@ -73,13 +74,18 @@ public enum IopModuleState
 
 /// <summary>
 /// One IOP module table entry — HLE mirror of LOADCORE <c>ModuleInfo_t</c> fields games care about
-/// (id / name / entry / text_start / size / start order) plus MODLOAD start/stop state.
+/// (id / name / entry / gp / text_start / size / start order) plus MODLOAD start/stop state and
+/// runnable context for literal IRX execution (WP-07).
 /// </summary>
 public sealed class LoadedIrx
 {
     public int Id { get; set; }
     public string Name { get; set; } = "";
+    /// <summary>EE-mapped entry (0x1Cxxxxxx). Convert via <see cref="IopModuleHost.ToIopPhys"/> for <see cref="Iop.PC"/>.</summary>
     public uint Entry { get; set; }
+    /// <summary>GP value from .iopmod (0 if unknown / PT_LOAD fixture).</summary>
+    public uint Gp { get; set; }
+    /// <summary>EE-mapped load base (0x1Cxxxxxx).</summary>
     public uint LoadBase { get; set; }
     public int Segments { get; set; }
     /// <summary>Real loaded extent (0 if name-only HLE registration).</summary>
@@ -93,6 +99,27 @@ public sealed class LoadedIrx
     public bool HasImage { get; set; }
     /// <summary>Boot/default HLE modules that must not be unloaded (InitDefaults / system).</summary>
     public bool SystemResident { get; set; }
+    /// <summary>True after at least one successful <see cref="IopModuleHost.StartLoadedModule"/> run returned.</summary>
+    public bool EntryExecuted { get; set; }
+    /// <summary>IOP instructions retired during the last <see cref="IopModuleHost.StartLoadedModule"/> call.</summary>
+    public ulong LastEntryInstructions { get; set; }
+}
+
+/// <summary>Result of running a loaded module's entry on the R3000 IOP core.</summary>
+public sealed class ModuleRunResult
+{
+    public bool Success { get; init; }
+    public string Message { get; init; } = "";
+    public int ModuleId { get; init; }
+    public string Name { get; init; } = "";
+    /// <summary>IOP-physical PC set at entry (not EE-mapped).</summary>
+    public uint EntryPc { get; init; }
+    public uint FinalPc { get; init; }
+    public ulong InstructionsExecuted { get; init; }
+    /// <summary>v0 after return (MODULE_*_END when _start returns conventionally).</summary>
+    public int ModRes { get; init; }
+    public bool ReturnedToSentinel { get; init; }
+    public bool HitInstructionBudget { get; init; }
 }
 
 /// <summary>
@@ -199,6 +226,35 @@ public sealed class IopModuleHost
     public ulong ModuleStarts { get; private set; }
     public ulong ModuleStops { get; private set; }
     public ulong ModuleUnloads { get; private set; }
+    /// <summary>IOP instructions retired across all <see cref="StartLoadedModule"/> calls.</summary>
+    public ulong ModuleEntryInstructions { get; private set; }
+    /// <summary>Successful R3000 module entry runs (returned to sentinel or exhausted budget with progress).</summary>
+    public ulong ModuleEntryRuns { get; private set; }
+
+    /// <summary>
+    /// When <c>DETPS2_LITERAL_IRX=1</c>, <see cref="LoadIrx"/> records the last loaded module so
+    /// <see cref="TryArmPendingLiteralEntry"/> can set <see cref="Iop.PC"/> for T0/Ps2System quanta
+    /// (WP-11). <see cref="StartLoadedModule"/> is the explicit smoke/exec API (always available).
+    /// </summary>
+    public static bool IsLiteralIrxEnabled =>
+        string.Equals(Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX"), "1", StringComparison.Ordinal);
+
+    /// <summary>Return address planted in <c>$ra</c> so <c>jr ra</c> from module entry is detectable.</summary>
+    public const uint ModuleReturnSentinel = 0x0000BEE0u;
+
+    /// <summary>Default IOP stack top for module entry (below 2 MiB IOP RAM end).</summary>
+    public const uint DefaultModuleStack = 0x001FF000u;
+
+    private int _pendingLiteralId = -1;
+    private uint _pendingLiteralEntryPhys;
+    private uint _pendingLiteralGp;
+    private string _pendingLiteralName = "";
+
+    /// <summary>True when a LoadIrx under LITERAL_IRX left an entry ready to arm on the IOP.</summary>
+    public bool HasPendingLiteralEntry => _pendingLiteralId >= 0;
+
+    /// <summary>Module id of the pending literal entry, or -1.</summary>
+    public int PendingLiteralModuleId => _pendingLiteralId;
 
     /// <summary>Share system memory card instance (Phase 31).</summary>
     public void BindMemCard(MemoryCard card) => _memcard = card ?? new MemoryCard();
@@ -222,11 +278,35 @@ public sealed class IopModuleHost
         ModuleStarts = 0;
         ModuleStops = 0;
         ModuleUnloads = 0;
+        ModuleEntryInstructions = 0;
+        ModuleEntryRuns = 0;
         ImportsResolved = 0;
         ImportsUnresolved = 0;
         _exportRegistry.Clear();
+        ClearPendingLiteralEntry();
         // keep disc volume + ROM bios binding + bound card
         _memcard.Format();
+    }
+
+    /// <summary>Clear the optional post-LoadIrx literal entry arming state.</summary>
+    public void ClearPendingLiteralEntry()
+    {
+        _pendingLiteralId = -1;
+        _pendingLiteralEntryPhys = 0;
+        _pendingLiteralGp = 0;
+        _pendingLiteralName = "";
+    }
+
+    /// <summary>
+    /// Convert EE-mapped IOP RAM (0x1Cxxxxxx) or already-physical IOP address to IOP-bus physical
+    /// for <see cref="Iop.PC"/> / GPR setup. <see cref="SystemMemory.IopRead32"/> only sees the
+    /// low 2 MiB window — feeding EE-mapped addresses fetches zeros.
+    /// </summary>
+    public static uint ToIopPhys(uint eeOrPhys)
+    {
+        if (eeOrPhys >= SystemMemory.IOP_RAM_BASE)
+            return eeOrPhys - SystemMemory.IOP_RAM_BASE;
+        return eeOrPhys & 0x1FFFFFu;
     }
 
     /// <summary>
@@ -420,9 +500,26 @@ public sealed class IopModuleHost
     }
 
     /// <summary>
+    /// Modules with a real IRX image and non-zero entry — candidates for
+    /// <see cref="StartLoadedModule"/> / literal R3000 start (WP-07).
+    /// </summary>
+    public IReadOnlyList<LoadedIrx> GetRunnableModules()
+    {
+        var list = new List<LoadedIrx>();
+        foreach (var kv in _irxById.OrderBy(k => k.Key))
+        {
+            var m = kv.Value;
+            if (m.HasImage && m.Entry != 0)
+                list.Add(m);
+        }
+        return list;
+    }
+
+    /// <summary>
     /// MODLOAD StartModule(id) — decomp FUN_00000358 / FUN_000005a0 case 2.
     /// Returns module id on success, <see cref="ModloadErrNotFound"/> if id unknown.
     /// <paramref name="modres"/> is the HLE _start return (MODULE_*_END).
+    /// Does <b>not</b> run R3000 code — use <see cref="StartLoadedModule"/> for literal entry.
     /// </summary>
     public int StartModule(int id, out int modres)
     {
@@ -441,6 +538,137 @@ public sealed class IopModuleHost
         modres = m.LastModRes;
         ModuleStarts++;
         return id;
+    }
+
+    /// <summary>
+    /// Arm IOP GPRs/PC for a loaded module's <c>_start</c> without stepping.
+    /// Sets PC = entry (IOP phys), <c>$gp</c>, <c>$ra</c> = <see cref="ModuleReturnSentinel"/>,
+    /// <c>$sp</c> = <see cref="DefaultModuleStack"/>, a0/a1 = 0 (argc/argv).
+    /// Hook for T0: call from Ps2System when scheduling IOP quanta under LITERAL_IRX.
+    /// </summary>
+    public bool PrepareModuleEntry(Iop iop, int id)
+    {
+        if (iop == null) return false;
+        if (!_irxById.TryGetValue(id, out var m) || !m.HasImage || m.Entry == 0)
+            return false;
+        uint entryPhys = ToIopPhys(m.Entry);
+        iop.PC = entryPhys;
+        if (m.Gp != 0)
+            iop.SetGpr(28, m.Gp); // $gp
+        iop.SetGpr(29, DefaultModuleStack); // $sp
+        iop.SetGpr(31, ModuleReturnSentinel); // $ra
+        iop.SetGpr(4, 0); // a0 argc
+        iop.SetGpr(5, 0); // a1 argv
+        iop.SetGpr(2, 0); // v0 clear before start
+        return true;
+    }
+
+    /// <summary>
+    /// If <see cref="LoadIrx"/> recorded a pending literal entry (<c>DETPS2_LITERAL_IRX=1</c>),
+    /// set <see cref="Iop.PC"/> (and GP) so the next IOP Step quantum executes module text.
+    /// Does not clear the pending record (idempotent re-arm). Returns false if none pending.
+    /// <b>T0 handoff:</b> wire from <c>Ps2System.RunFor</c> when LITERAL_IRX=1 (WP-11).
+    /// </summary>
+    public bool TryArmPendingLiteralEntry(Iop iop)
+    {
+        if (iop == null || _pendingLiteralId < 0) return false;
+        if (!PrepareModuleEntry(iop, _pendingLiteralId))
+            return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Run a loaded module's entry on the R3000 until <c>jr ra</c> hits
+    /// <see cref="ModuleReturnSentinel"/> or <paramref name="maxInstructions"/> is reached.
+    /// Records <see cref="LoadedIrx.LastModRes"/> from v0 on return. Always available (not gated
+    /// on env); preferred smoke/exec path for WP-08.
+    /// </summary>
+    public ModuleRunResult StartLoadedModule(Ps2System system, int id, ulong maxInstructions = 100_000)
+    {
+        if (system == null)
+            return new ModuleRunResult { Success = false, Message = "system is null", ModuleId = id };
+        if (!_irxById.TryGetValue(id, out var m) || !m.HasImage || m.Entry == 0)
+            return new ModuleRunResult
+            {
+                Success = false,
+                Message = "module not runnable (missing image or entry)",
+                ModuleId = id,
+                Name = m?.Name ?? ""
+            };
+
+        var iop = system.Iop;
+        if (!PrepareModuleEntry(iop, id))
+            return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
+
+        uint entryPhys = ToIopPhys(m.Entry);
+        ulong before = iop.InstructionsExecuted;
+        bool returned = false;
+        bool budget = false;
+
+        // Step one outer Iop.Step(1) at a time so we stop as soon as PC lands on the
+        // return sentinel. (A large Step(N) would keep fetching past $ra after jr ra.)
+        // Note: Iop.Step(1) may retire 2 insns when the instruction is a branch (delay slot).
+        while (true)
+        {
+            ulong done = iop.InstructionsExecuted - before;
+            if (done >= maxInstructions)
+            {
+                budget = true;
+                break;
+            }
+            if (iop.PC == ModuleReturnSentinel)
+            {
+                returned = true;
+                break;
+            }
+            if (!iop.Running)
+                break;
+
+            iop.Step(1);
+
+            if (iop.PC == ModuleReturnSentinel)
+            {
+                returned = true;
+                break;
+            }
+        }
+
+        ulong insns = iop.InstructionsExecuted - before;
+        int modres = (int)iop.GetGpr(2);
+        m.LastModRes = modres;
+        m.LastEntryInstructions = insns;
+        m.EntryExecuted = insns > 0;
+        if (m.State != IopModuleState.Started)
+        {
+            m.State = IopModuleState.Started;
+            m.StartOrder = _nextStartOrder++;
+            ModuleStarts++;
+        }
+        ModuleEntryInstructions += insns;
+        if (insns > 0)
+            ModuleEntryRuns++;
+
+        if (_pendingLiteralId == id)
+            ClearPendingLiteralEntry();
+
+        bool ok = insns > 0 && (returned || budget);
+        return new ModuleRunResult
+        {
+            Success = ok,
+            Message = returned
+                ? $"returned to sentinel after {insns} insn"
+                : budget
+                    ? $"hit budget {maxInstructions} after {insns} insn"
+                    : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
+            ModuleId = id,
+            Name = m.Name,
+            EntryPc = entryPhys,
+            FinalPc = iop.PC,
+            InstructionsExecuted = insns,
+            ModRes = modres,
+            ReturnedToSentinel = returned,
+            HitInstructionBudget = budget && !returned,
+        };
     }
 
     /// <summary>
@@ -584,11 +812,14 @@ public sealed class IopModuleHost
         {
             // Upgrade existing name registration with a real image (keep id).
             prior.Entry = result.Entry;
+            prior.Gp = result.Gp;
             prior.LoadBase = result.LoadBase;
             prior.Segments = result.Segments;
             prior.Size = moduleSize;
             prior.HasImage = true;
             prior.State = IopModuleState.Loaded;
+            prior.EntryExecuted = false;
+            prior.LastEntryInstructions = 0;
         }
         else
         {
@@ -599,6 +830,7 @@ public sealed class IopModuleHost
                 Id = id,
                 Name = name,
                 Entry = result.Entry,
+                Gp = result.Gp,
                 LoadBase = result.LoadBase,
                 Segments = result.Segments,
                 Size = moduleSize,
@@ -616,9 +848,18 @@ public sealed class IopModuleHost
         ImportsResolved += (ulong)resolved;
         ImportsUnresolved += (ulong)unresolved;
 
-        // MODLOAD LoadStartModule: call _start after load. HLE has no R3000 exec — mark Started
-        // with MODULE_RESIDENT_END (0), the return value almost every BIOS IRX uses.
+        // MODLOAD LoadStartModule: after load, real hardware runs _start. DetPS2 still soft-marks
+        // Started for registry/LOADFILE compatibility (games probes must see the module as up).
+        // Literal R3000 execution is opt-in via StartLoadedModule or DETPS2_LITERAL_IRX arming.
         StartModule(id, out _);
+
+        if (IsLiteralIrxEnabled && result.Entry != 0)
+        {
+            _pendingLiteralId = id;
+            _pendingLiteralEntryPhys = ToIopPhys(result.Entry);
+            _pendingLiteralGp = result.Gp;
+            _pendingLiteralName = name;
+        }
 
         // Advance base for next load, rounded up to a 16KB boundary past this module's real
         // extent — previously a fixed +0x4000 regardless of real size, which silently let a
