@@ -499,17 +499,15 @@ public sealed class BiosBootHost
     }
 
     /// <summary>
-    /// WP-15/WP-16 prep: walk IOPBTCONF order and <b>LoadIrx</b> every extractable ELF from the
-    /// bound BIOS (real extract+load — no invented HLE plants). Name-only when no ELF exists.
-    /// <para>
-    /// When <see cref="IsLiteralIrxEnabled"/> is true, attempts module start after load.
-    /// <see cref="IopModuleHost.LoadIrx"/> already HLE-marks Started; real R3000 <c>_start</c>
-    /// execution is TODO for T1/T2 (<c>IopModuleHost</c> / IOP step API) — see stub below.
-    /// </para>
-    /// Does <b>not</b> replace <see cref="StartCommercialIop"/> HLE surface; callers may invoke
-    /// this after bind for literal IRX bring-up experiments.
+    /// Walk IOPBTCONF: LoadIrx every extractable ELF, then <b>run R3000 <c>_start</c></b> via
+    /// <see cref="IopModuleHost.StartLoadedModule"/> (WP-14/16). Name-only when no ELF.
+    /// Optional <paramref name="maxModulesToExec"/> limits sequential exec (0 = all loaded).
+    /// <paramref name="maxInsnPerModule"/> budget per <c>_start</c> (default 50k).
     /// </summary>
-    public LiteralIopBtConfBootResult BootIopBtConfLiteral(Ps2System sys)
+    public LiteralIopBtConfBootResult BootIopBtConfLiteral(
+        Ps2System sys,
+        int maxModulesToExec = 0,
+        ulong maxInsnPerModule = 50_000)
     {
         var result = new LiteralIopBtConfBootResult();
         if (sys == null)
@@ -529,6 +527,12 @@ public sealed class BiosBootHost
         result.Order.AddRange(order);
         result.LiteralIrxEnv = IsLiteralIrxEnabled();
         sys.IopModules.BindRomBios(_biosImage);
+
+        // Minimal IOP exception trampoline so SYSCALL/BREAK in early IRX do not halt forever.
+        sys.Iop.Cop0Status = 0; // BEV=0 → RAM vector
+        sys.Iop.InstallMinimalExceptionStub();
+
+        int execBudgetLeft = maxModulesToExec <= 0 ? int.MaxValue : maxModulesToExec;
 
         foreach (string name in order)
         {
@@ -554,7 +558,6 @@ public sealed class BiosBootHost
 
             if (!isElf)
             {
-                // Prefer real extract+load; text/meta entries (or missing IRX) stay name-only.
                 Register(sys, name);
                 result.NameOnlyRegistered++;
                 result.Steps.Add(new LiteralIopBtConfStep
@@ -586,34 +589,35 @@ public sealed class BiosBootHost
                 ServicesInstalled++;
                 bool started = false;
                 string startNote = "load-only";
+                ulong execInsns = 0;
 
-                if (result.LiteralIrxEnv)
+                if (result.LiteralIrxEnv &&
+                    execBudgetLeft > 0 &&
+                    sys.IopModules.TryGetModule(name, out int mid) &&
+                    sys.IopModules.TryGetIrx(mid, out var irx) &&
+                    irx.HasImage && irx.Entry != 0)
                 {
-                    // LoadIrx already calls IopModuleHost.StartModule (HLE mark Started /
-                    // MODULE_RESIDENT_END). Real R3000 _start execution is not wired yet:
-                    //
-                    // TODO(WP-16 / T1+T2): call into IopModuleHost (or sibling) to set IOP PC
-                    // to lr.Entry, gp=lr.Gp, and run until module returns — see plan WP-08/14.
-                    // Prefer IopModuleHost over inventing HLE plants here.
-                    if (sys.IopModules.TryGetModule(name, out int mid) &&
-                        sys.IopModules.TryGetIrx(mid, out var irx) &&
-                        irx.HasImage)
+                    var run = sys.IopModules.StartLoadedModule(sys, mid, maxInsnPerModule);
+                    execInsns = run.InstructionsExecuted;
+                    started = run.Success && run.InstructionsExecuted > 0;
+                    if (started)
                     {
-                        int rc = sys.IopModules.StartModule(mid, out _);
-                        started = rc == mid && irx.State == IopModuleState.Started;
-                        startNote = started
-                            ? "start-hle-mark (TODO real R3000 _start via IopModuleHost)"
-                            : "start-failed rc=" + rc;
-                        if (started) result.ModulesStarted++;
+                        result.ModulesStarted++;
+                        result.ModulesExecutedR3000++;
+                        result.TotalR3000Instructions += run.InstructionsExecuted;
+                        execBudgetLeft--;
                     }
-                    else
-                    {
-                        startNote = "start-skipped (no module table entry)";
-                    }
+                    startNote = started
+                        ? $"r3000-exec insns={run.InstructionsExecuted} {run.Message}"
+                        : $"r3000-fail {run.Message}";
                 }
-                else
+                else if (!result.LiteralIrxEnv)
                 {
-                    startNote = "load-ok (DETPS2_LITERAL_IRX!=1; start deferred)";
+                    startNote = "load-ok (HLE bisect; no R3000 start)";
+                }
+                else if (execBudgetLeft <= 0)
+                {
+                    startNote = "load-ok (exec budget exhausted; later modules load-only)";
                 }
 
                 result.Steps.Add(new LiteralIopBtConfStep
@@ -625,6 +629,7 @@ public sealed class BiosBootHost
                     Bytes = mod!.Length,
                     Entry = lr.Entry,
                     LoadBase = lr.LoadBase,
+                    ExecInstructions = execInsns,
                 });
             }
             catch (Exception ex)
@@ -645,6 +650,7 @@ public sealed class BiosBootHost
             Console.Error.WriteLine(
                 $"[BIOS] BootIopBtConfLiteral order={result.Order.Count} " +
                 $"elfExtractable={result.ElfsExtractable} loaded={result.ElfsLoaded} " +
+                $"r3000exec={result.ModulesExecutedR3000} r3000insns={result.TotalR3000Instructions} " +
                 $"started={result.ModulesStarted} nameOnly={result.NameOnlyRegistered} " +
                 $"fail={result.LoadFailures} literalEnv={result.LiteralIrxEnv}");
 
@@ -662,9 +668,11 @@ public sealed class BiosBootHost
         public int Bytes { get; init; }
         public uint Entry { get; init; }
         public uint LoadBase { get; init; }
+        /// <summary>R3000 instructions retired during <see cref="IopModuleHost.StartLoadedModule"/>.</summary>
+        public ulong ExecInstructions { get; init; }
     }
 
-    /// <summary>Aggregate result of <see cref="BootIopBtConfLiteral"/> (WP-15 inventory + WP-16 prep).</summary>
+    /// <summary>Aggregate result of <see cref="BootIopBtConfLiteral"/> (load + R3000 exec).</summary>
     public sealed class LiteralIopBtConfBootResult
     {
         public List<string> Order { get; } = new();
@@ -673,12 +681,16 @@ public sealed class BiosBootHost
         public int ElfsExtractable { get; set; }
         public int ElfsLoaded { get; set; }
         public int ModulesStarted { get; set; }
+        /// <summary>Modules that retired ≥1 R3000 insn in <c>_start</c>.</summary>
+        public int ModulesExecutedR3000 { get; set; }
+        public ulong TotalR3000Instructions { get; set; }
         public int NameOnlyRegistered { get; set; }
         public int LoadFailures { get; set; }
         public bool LiteralIrxEnv { get; set; }
 
         public override string ToString() =>
             $"order={Order.Count} extractable={ElfsExtractable} loaded={ElfsLoaded} " +
+            $"r3000exec={ModulesExecutedR3000} r3000insns={TotalR3000Instructions} " +
             $"started={ModulesStarted} nameOnly={NameOnlyRegistered} fail={LoadFailures} " +
             $"literal={LiteralIrxEnv}";
     }

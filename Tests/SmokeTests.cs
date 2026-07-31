@@ -1007,6 +1007,7 @@ public static class SmokeTests
             // Phase 22
             Irx_LoadMinimal_IntoIopRam();
             Irx_ExecutesMinimal();
+            Irx_ExecutesBiosIopBtConfPrefix();
             Irx_RealRelocation_ProducesCorrectAddresses();
             IrxLoader_LinkImports_PatchesRealStubFormat();
             Romdir_ParseAndExtract_HandlesInterEntryPadding();
@@ -3101,38 +3102,75 @@ public static class SmokeTests
         if (sys.BiosBoot.IopBtConfNames.Count != extracted.Count)
             throw new Exception("BindBios did not cache IOPBTCONF names");
 
-        // Literal boot: LoadIrx extractable ELFs; with LITERAL_IRX=1 attempt StartModule
-        string? prevLit = Environment.GetEnvironmentVariable("DETPS2_LITERAL_IRX");
-        try
-        {
-            Environment.SetEnvironmentVariable("DETPS2_LITERAL_IRX", "1");
-            var boot = sys.BiosBoot.BootIopBtConfLiteral(sys);
-            if (boot.Order.Count != BiosBootHost.Scph70008IopBtConfOrder.Length)
-                throw new Exception($"literal order {boot.Order.Count}");
-            if (boot.ElfsExtractable < 2)
-                throw new Exception($"literal extractable {boot.ElfsExtractable}");
-            if (boot.ElfsLoaded < 2)
-                throw new Exception($"literal loaded {boot.ElfsLoaded}");
-            if (boot.NameOnlyRegistered < 20)
-                throw new Exception($"expected many name-only registrations, got {boot.NameOnlyRegistered}");
-            if (!sys.IopModules.IsModuleLoaded("SYSMEM") || !sys.IopModules.IsModuleLoaded("FILEIO"))
-                throw new Exception("SYSMEM/FILEIO not in module table after literal boot");
-            if (!sys.IopModules.TryGetModule("SYSMEM", out int sid) ||
-                !sys.IopModules.TryGetIrx(sid, out var sirx) || !sirx.HasImage)
-                throw new Exception("SYSMEM should have real image after LoadIrx");
-            if (boot.ModulesStarted < 2)
-                throw new Exception($"LITERAL_IRX=1 should start loaded modules, got {boot.ModulesStarted}");
-            if (sys.BiosBoot.LastLiteralBoot == null)
-                throw new Exception("LastLiteralBoot not set");
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("DETPS2_LITERAL_IRX", prevLit);
-        }
+        // Literal boot: LoadIrx + R3000 StartLoadedModule on synthetic minimal ELFs
+        var boot = sys.BiosBoot.BootIopBtConfLiteral(sys, maxModulesToExec: 0, maxInsnPerModule: 64);
+        if (boot.Order.Count != BiosBootHost.Scph70008IopBtConfOrder.Length)
+            throw new Exception($"literal order {boot.Order.Count}");
+        if (boot.ElfsExtractable < 2)
+            throw new Exception($"literal extractable {boot.ElfsExtractable}");
+        if (boot.ElfsLoaded < 2)
+            throw new Exception($"literal loaded {boot.ElfsLoaded}");
+        if (boot.NameOnlyRegistered < 20)
+            throw new Exception($"expected many name-only registrations, got {boot.NameOnlyRegistered}");
+        if (!sys.IopModules.IsModuleLoaded("SYSMEM") || !sys.IopModules.IsModuleLoaded("FILEIO"))
+            throw new Exception("SYSMEM/FILEIO not in module table after literal boot");
+        if (!sys.IopModules.TryGetModule("SYSMEM", out int sid) ||
+            !sys.IopModules.TryGetIrx(sid, out var sirx) || !sirx.HasImage)
+            throw new Exception("SYSMEM should have real image after LoadIrx");
+        if (boot.ModulesExecutedR3000 < 2)
+            throw new Exception($"expected R3000 exec of ≥2 minimal IRX, got {boot.ModulesExecutedR3000}");
+        if (boot.TotalR3000Instructions < 2)
+            throw new Exception($"expected R3000 insns ≥2, got {boot.TotalR3000Instructions}");
+        if (sys.BiosBoot.LastLiteralBoot == null)
+            throw new Exception("LastLiteralBoot not set");
 
         Console.WriteLine(
             $"[Smoke] BiosBootHost_IopBtConfParseAndLiteralBoot OK " +
-            $"(order={BiosBootHost.Scph70008IopBtConfOrder.Length} extractable={extractable})");
+            $"(order={BiosBootHost.Scph70008IopBtConfOrder.Length} extractable={extractable} " +
+            $"r3000exec={boot.ModulesExecutedR3000} r3000insns={boot.TotalR3000Instructions})");
+    }
+
+    /// <summary>
+    /// WP-14/16: operator SCPH70008 BIOS — LoadIrx + R3000 exec first modules in IOPBTCONF.
+    /// Skips if bios path missing (CI without dumps).
+    /// </summary>
+    public static void Irx_ExecutesBiosIopBtConfPrefix()
+    {
+        string? biosPath = Environment.GetEnvironmentVariable("DETPS2_BIOS_PATH");
+        if (string.IsNullOrWhiteSpace(biosPath) || !File.Exists(biosPath))
+        {
+            // Default operator path used by this worktree's user-media.json
+            biosPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "PCSX2", "bios",
+                "Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin");
+        }
+        if (!File.Exists(biosPath))
+        {
+            Console.WriteLine("[Smoke] Irx_ExecutesBiosIopBtConfPrefix SKIP (no operator BIOS)");
+            return;
+        }
+
+        byte[] bios = File.ReadAllBytes(biosPath);
+        var sys = new Ps2System();
+        sys.BiosBoot.BindBios(biosPath, bios);
+        // First 5 modules: SYSMEM, LOADCORE, EXCEPMAN, INTRMANP, INTRMANI typically
+        var boot = sys.BiosBoot.BootIopBtConfLiteral(sys, maxModulesToExec: 5, maxInsnPerModule: 200_000);
+        if (boot.ElfsLoaded < 1)
+            throw new Exception($"expected ≥1 ELF loaded from retail BIOS, got {boot.ElfsLoaded}");
+        if (boot.ModulesExecutedR3000 < 1)
+            throw new Exception(
+                $"expected ≥1 R3000 module _start with insns>0, got {boot.ModulesExecutedR3000}; " +
+                string.Join(" | ", boot.Steps.Take(8).Select(s => s.Name + ":" + s.Action)));
+        if (boot.TotalR3000Instructions < 1)
+            throw new Exception("TotalR3000Instructions == 0");
+
+        Console.WriteLine(
+            $"[Smoke] Irx_ExecutesBiosIopBtConfPrefix OK " +
+            $"(loaded={boot.ElfsLoaded} r3000exec={boot.ModulesExecutedR3000} " +
+            $"r3000insns={boot.TotalR3000Instructions} bios={Path.GetFileName(biosPath)})");
+        foreach (var s in boot.Steps.Where(x => x.Loaded).Take(5))
+            Console.WriteLine($"  {s.Name}: {s.Action}");
     }
 
     /// <summary>
