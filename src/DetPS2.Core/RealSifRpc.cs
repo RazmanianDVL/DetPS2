@@ -252,6 +252,12 @@ public sealed class RealSifRpc
     public int Bo2GameBg2Opens { get; private set; }
 
     /// <summary>
+    /// WAVE-4: total bytes FileRead into EE after force-game BG2 Open (CODE/MAINMENU stream).
+    /// Open alone never feeds Soft-GS; stream bytes are the honest draw prerequisite.
+    /// </summary>
+    public long Bo2GameBg2StreamedBytes { get; private set; }
+
+    /// <summary>
     /// WAVE-3: issue a game-initiated PRECODE/CODE/MAINMENU .BG2 open (countSectors:true)
     /// when the EE usebigfile path is blocked post-InMap. Uses the same TryOpenBo2RealBg2
     /// path as IOPFILE/FILEIO — not a fake stub, real disc bytes + honest sector credit.
@@ -266,6 +272,74 @@ public sealed class RealSifRpc
             Console.Error.WriteLine(
                 $"[BO2] force-game BG2 open token=\"{token}\" fd={fd} gameOpens={Bo2GameBg2Opens}");
         return fd;
+    }
+
+    /// <summary>
+    /// WAVE-4: Open CODE/MAINMENU with sector credit, register a GOE stream slot, and
+    /// FileRead the goefile into EE RDRAM (same class as natural StartBigFile / GOE Start).
+    /// Destinations are high-heap plants past PRECODE load @0xA242A0 so factory parsers can
+    /// see real goefile bytes. Does not invent Soft-GS pixels — EE draw path must consume.
+    /// </summary>
+    /// <returns>Bytes streamed into EE, or -1 on open failure.</returns>
+    public int ForceBo2GameBg2Stream(SystemMemory mem, IopModuleHost iopModules, Cdvd cdvd,
+        string token, uint eeDest)
+    {
+        if (string.IsNullOrEmpty(token) || mem == null || iopModules == null || cdvd == null)
+            return -1;
+        eeDest &= 0x1FFFFFFFu;
+        if (eeDest is < 0x00100000 or >= (uint)SystemMemory.RDRAM_SIZE - 0x1000)
+            return -1;
+
+        int fd = TryOpenBo2RealBg2(iopModules, cdvd, token, countSectors: true);
+        if (fd < 0) return -1;
+
+        if (!iopModules.TryGetOpenFileSize(fd, out uint fsz) || fsz == 0)
+        {
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            return -1;
+        }
+
+        // Cap stream to pack size (CODE ~914 KiB, MAINMENU ~1.5 MiB) and remaining RDRAM.
+        uint maxWant = Math.Min(fsz, 2u * 1024 * 1024);
+        uint room = (uint)SystemMemory.RDRAM_SIZE - eeDest;
+        uint want = Math.Min(maxWant, room);
+        if (want < 16)
+        {
+            try { iopModules.FileClose(fd); } catch { /* ignore */ }
+            return -1;
+        }
+
+        // Register GOE stream so a later EE Start on this iStream can continue/seek.
+        int iStream = token.Contains("MAINMENU", StringComparison.OrdinalIgnoreCase) ? 2
+            : token.Contains("PRECODE", StringComparison.OrdinalIgnoreCase) ? 0
+            : 1; // CODE
+        if (_iopFileStreamToFd.TryGetValue(iStream, out int oldFd) && oldFd != fd)
+        {
+            try { iopModules.FileClose(oldFd); } catch { /* ignore */ }
+            _iopFileFds.Remove(oldFd);
+        }
+        _iopFileStreamToFd[iStream] = fd;
+        _iopFileStreamSize[iStream] = fsz;
+        _iopFileStreamPos[iStream] = 0;
+        _iopFileFds[fd] = token;
+
+        int n = iopModules.FileRead(mem, fd, eeDest, want);
+        if (n > 0)
+        {
+            // Open already credited full-pack sectors; note stream transfer as additional
+            // disc activity only when Open path did not (defensive — prefer honest growth).
+            Bo2GameBg2StreamedBytes += n;
+            if (_iopFileStreamPos.TryGetValue(iStream, out long pos))
+                _iopFileStreamPos[iStream] = pos + n;
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BO2] force-game BG2 stream token=\"{token}\" fd={fd} iStream={iStream} " +
+                $"dest=0x{eeDest:X8} want={want} n={n} fsz={fsz} gameOpens={Bo2GameBg2Opens} " +
+                $"streamedTotal={Bo2GameBg2StreamedBytes}");
+        return n;
     }
 
 
@@ -463,6 +537,7 @@ public sealed class RealSifRpc
         _bo2PackBytes.Clear();
         Bo2PackResidentOpens = 0;
         Bo2GameBg2Opens = 0;
+        Bo2GameBg2StreamedBytes = 0;
         _goeArchiveFd = -1;
         _goeArchiveSize = 0;
         _goeArchiveDiscByteOffset = 0;
@@ -1514,8 +1589,34 @@ public sealed class RealSifRpc
                 }
                 bool streamed = iopModules.OpenFileIsStreamed(fd);
                 int nRead = iopModules.FileRead(mem, fd, buf, size);
+                // WAVE-4 BO2 residual: after dual SEEK_END (size probe) some clients issue
+                // full-file read without SEEK_SET — position is at EOF → n=0. Live LIST.TXT
+                // / ENGLISH.DIR after Creating-main-layer: open+SEEK_END×2+read(size)=0.
+                // Rewind once when request looks like a full-file transfer from EOF.
+                if (nRead == 0 && size > 0 && fd >= 0
+                    && iopModules.TryGetOpenFileSize(fd, out uint eofSz) && eofSz > 0
+                    && size >= Math.Min(eofSz, 16u))
+                {
+                    int cur = iopModules.FileSeek(fd, 0, 1); // SEEK_CUR
+                    if (cur >= (int)eofSz)
+                    {
+                        iopModules.FileSeek(fd, 0, 0); // SEEK_SET
+                        nRead = iopModules.FileRead(mem, fd, buf, size);
+                        if (nRead > 0
+                            && (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"))
+                            Console.Error.WriteLine(
+                                $"[FILEIO] read EOF-rewind fd={fd} size={size} n={nRead} fsz={eofSz}");
+                    }
+                }
                 if (nRead > 0 && streamed)
                     cdvd.NoteHostReadSectors((nRead + 2047) / 2048);
+                else if (nRead > 0 && !streamed
+                         && iopModules.TryGetOpenFileSize(fd, out uint rsz) && rsz > 4096)
+                {
+                    // Credit sectors for large disc-backed full reads (LIST.TXT / ENGLISH.DIR).
+                    cdvd.NoteHostReadSectors((nRead + 2047) / 2048);
+                }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
                         $"[FILEIO] read fd={fd} buf=0x{buf:X8} size={size} result={nRead} send={sendSize} fio2200={read2200}");
