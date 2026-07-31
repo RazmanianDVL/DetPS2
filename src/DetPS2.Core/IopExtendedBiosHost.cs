@@ -17,6 +17,8 @@ namespace DetPS2.Core;
 /// <para><b>What this is:</b> functional service contracts so name probes, export linking,
 /// CLEARSPU soft-reset, UDNL IOPRP/DNAS image apply (ROMDIR + IOPBTCONF + optional LoadIrx),
 /// and SECRMAN plain-ELF passthrough succeed without title-local plants.
+/// Under <c>DETPS2_LITERAL_IRX=1</c>, commercial UDNL handoff LoadIrx’s extractable ELFs and
+/// records Entry/LoadBase for IOP exec (see <c>docs/irx/UDNL_IOPRP.md</c>).
 /// <b>Not</b> MagicGate crypto, full mechacon auth, or cycle-accurate R3000 IRX execution.</para>
 /// </summary>
 public sealed class IopExtendedBiosHost
@@ -41,6 +43,19 @@ public sealed class IopExtendedBiosHost
     /// <summary>Null/empty path or missing file bytes for Secr*BootFile.</summary>
     public const int SecrErrNoFile = -2;
 
+    /// <summary>
+    /// One extractable ELF successfully <see cref="IopModuleHost.LoadIrx"/>'d from an IOPRP/DNAS
+    /// image. <see cref="Entry"/> / <see cref="LoadBase"/> are ready for IOP R3000 exec (WP-25+).
+    /// </summary>
+    public readonly struct IopRpLoadedEntry
+    {
+        public string Name { get; init; }
+        public uint Entry { get; init; }
+        public uint LoadBase { get; init; }
+        public uint Size { get; init; }
+        public int ModuleId { get; init; }
+    }
+
     private bool _installed;
     private ulong _clearSpuRuns;
     private ulong _udnlApplies;
@@ -49,12 +64,16 @@ public sealed class IopExtendedBiosHost
     private ulong _iopRpImagesApplied;
     private int _lastIopRpModulesRegistered;
     private int _lastIopRpElfsLoaded;
-    /// <summary>When true, next ApplyIopRpImageCore skips LoadIrx (UDNL commercial handoff).</summary>
+    /// <summary>
+    /// When true, next ApplyIopRpImageCore prefers name-only RegisterModule (legacy HLE commercial
+    /// handoff). Overridden when <c>DETPS2_LITERAL_IRX=1</c> so retail images still LoadIrx.
+    /// </summary>
     private bool _iopRpNameOnlyApply;
     private string _lastUdnlArg = "";
     private string _lastUdnlVersion = "";
     private string _lastIopRpSource = "";
     private readonly List<string> _lastIopRpModuleNames = new();
+    private readonly List<IopRpLoadedEntry> _lastIopRpLoadedEntries = new();
 
     public bool Installed => _installed;
     public ulong ClearSpuRuns => _clearSpuRuns;
@@ -68,6 +87,8 @@ public sealed class IopExtendedBiosHost
     public string LastUdnlVersion => _lastUdnlVersion;
     public string LastIopRpSource => _lastIopRpSource;
     public IReadOnlyList<string> LastIopRpModuleNames => _lastIopRpModuleNames;
+    /// <summary>ELFs LoadIrx'd on the last image apply (entry/loadBase for WP-25 exec).</summary>
+    public IReadOnlyList<IopRpLoadedEntry> LastIopRpLoadedEntries => _lastIopRpLoadedEntries;
 
     public void Reset()
     {
@@ -79,11 +100,28 @@ public sealed class IopExtendedBiosHost
         _iopRpImagesApplied = 0;
         _lastIopRpModulesRegistered = 0;
         _lastIopRpElfsLoaded = 0;
+        _iopRpNameOnlyApply = false;
         _lastUdnlArg = "";
         _lastUdnlVersion = "";
         _lastIopRpSource = "";
         _lastIopRpModuleNames.Clear();
+        _lastIopRpLoadedEntries.Clear();
     }
+
+    /// <summary>
+    /// <c>DETPS2_LITERAL_IRX=1</c> — load+prepare real disc/BIOS IRX for IOP exec (IRX-first plan).
+    /// When unset or <c>0</c>, commercial UDNL handoff stays name-only (legacy HLE-first bisect).
+    /// Delegates to <see cref="IopModuleHost.IsLiteralIrxEnabled"/> (single env contract).
+    /// </summary>
+    public static bool IsLiteralIrxEnabled() => IopModuleHost.IsLiteralIrxEnabled;
+
+    /// <summary>
+    /// <c>DETPS2_IOPRP_NAME_ONLY=1</c> forces name-only RegisterModule for all ApplyIopRp* paths
+    /// (emergency bisect; overrides literal LoadIrx).
+    /// </summary>
+    public static bool IsIopRpNameOnlyForced() =>
+        string.Equals(Environment.GetEnvironmentVariable("DETPS2_IOPRP_NAME_ONLY"), "1",
+            StringComparison.Ordinal);
 
     /// <summary>
     /// Install export tables + soft-register every extended ROMDIR service name.
@@ -159,6 +197,8 @@ public sealed class IopExtendedBiosHost
     /// Real UDNL opens the image, walks IOPBTCONF inside it (or ROMDIR module list), and
     /// loads listed IRX. HLE: parse version tag, try resolve/parse IOPRP/DNAS image bytes
     /// from disc when available, re-register common modules, CLEARSPU, SECRMAN present.
+    /// With <c>DETPS2_LITERAL_IRX=1</c>, extractable image ELFs are LoadIrx’d and entries
+    /// recorded (<see cref="LastIopRpLoadedEntries"/>); otherwise commercial apply is name-only.
     /// LOADFILE GetVersion ASCII is set via <see cref="RealSifRpc.OnIopReboot"/>.
     /// </summary>
     public void ApplyUdnlHandoff(Ps2System sys, string? rebootArg)
@@ -202,13 +242,17 @@ public sealed class IopExtendedBiosHost
         }
 
         // Prefer real IOPRP/DNAS container when path is resolvable via FILEIO/ISO.
-        // Name-only: HLE already provides FILEIO/PADMAN/CDVD/… — do not LoadIrx retail
-        // IRX bodies that upgrade name registrations (mission: ignore literal IRX exec).
+        //
+        // Default (LITERAL_IRX off): name-only RegisterModule — HLE already provides
+        // FILEIO/PADMAN/CDVD/… without upgrading those names with retail IRX bodies.
+        // DETPS2_LITERAL_IRX=1: LoadIrx extractable ELFs + record Entry/LoadBase for IOP exec
+        // (WP-25). DETPS2_IOPRP_NAME_ONLY=1 still forces name-only for bisect.
         byte[]? image = TryResolveUdnlImageBytes(sys, _lastUdnlArg);
         if (image != null && image.Length >= 32)
         {
             string src = ExtractUdnlImagePath(_lastUdnlArg) ?? "udnl-image";
-            _iopRpNameOnlyApply = true;
+            // Name-only only when NOT on the literal-IRX path (unless NAME_ONLY forced inside core).
+            _iopRpNameOnlyApply = !IsLiteralIrxEnabled();
             try { ApplyIopRpImage(sys, image, src); }
             finally { _iopRpNameOnlyApply = false; }
         }
@@ -232,8 +276,16 @@ public sealed class IopExtendedBiosHost
     /// Parse a retail IOPRP/DNAS ROMDIR-in-IMG container and register module names.
     /// Common layout: <c>RESET</c> entry at offset 0, cumulative naive payloads, optional
     /// <c>IOPBTCONF</c> text listing load order (else all non-meta ROMDIR names).
-    /// Direct callers (smokes) LoadIrx extractable ELFs. UDNL commercial handoff uses
-    /// name-only via <see cref="_iopRpNameOnlyApply"/> (or <c>DETPS2_IOPRP_NAME_ONLY=1</c>).
+    /// <para>
+    /// Load policy (see <c>docs/irx/UDNL_IOPRP.md</c>):
+    /// <list type="bullet">
+    /// <item>Direct callers / smokes: <see cref="IopModuleHost.LoadIrx"/> extractable ELFs.</item>
+    /// <item>UDNL commercial handoff: name-only unless <c>DETPS2_LITERAL_IRX=1</c>.</item>
+    /// <item><c>DETPS2_IOPRP_NAME_ONLY=1</c>: force name-only for all callers (bisect).</item>
+    /// </list>
+    /// When LoadIrx succeeds, entries are recorded on <see cref="LastIopRpLoadedEntries"/>
+    /// (Entry/LoadBase for future IOP R3000 exec).
+    /// </para>
     /// </summary>
     /// <returns>Number of module names registered from the image.</returns>
     public int ApplyIopRpImage(Ps2System sys, byte[] image, string? sourceName = null)
@@ -245,7 +297,8 @@ public sealed class IopExtendedBiosHost
 
     /// <summary>
     /// Static entry for LOADFILE / callers without <see cref="Ps2System"/>: parse image and
-    /// register modules (LoadIrx when ELF extractable). Does not update host counters.
+    /// register modules (LoadIrx when ELF extractable and not name-only). Does not update
+    /// host counters on a live instance.
     /// </summary>
     public static int ApplyIopRpImageBytes(IopModuleHost modules, SystemMemory mem, byte[] image,
         string? sourceName, out int elfsLoaded)
@@ -283,12 +336,15 @@ public sealed class IopExtendedBiosHost
         int registered = 0;
         int elfs = 0;
         var names = new List<string>();
-        // Direct ApplyIopRpImage (smokes): LoadIrx extractable ELFs.
-        // UDNL commercial handoff sets _iopRpNameOnlyApply (HLE services already present).
-        // DETPS2_IOPRP_NAME_ONLY=1 forces name-only for all callers.
-        bool loadElfs = !_iopRpNameOnlyApply
-            && !string.Equals(Environment.GetEnvironmentVariable("DETPS2_IOPRP_NAME_ONLY"), "1",
-                StringComparison.Ordinal);
+        var loaded = new List<IopRpLoadedEntry>();
+        // Load policy:
+        //   DETPS2_IOPRP_NAME_ONLY=1  → never LoadIrx (bisect override).
+        //   DETPS2_LITERAL_IRX=1      → always LoadIrx extractable ELFs (retail + handoff).
+        //   else                      → LoadIrx unless commercial handoff set name-only.
+        // Historically commercial UDNL set name-only always; under LITERAL_IRX we must not
+        // skip LoadIrx for retail IOPRP/DNAS images (WP-25 prep).
+        bool loadElfs = !IsIopRpNameOnlyForced()
+            && (IsLiteralIrxEnabled() || !_iopRpNameOnlyApply);
         foreach (string modName in loadList)
         {
             if (string.IsNullOrWhiteSpace(modName)) continue;
@@ -300,15 +356,24 @@ public sealed class IopExtendedBiosHost
 
             if (!loadElfs) continue;
 
-            // Load ELF into IOP RAM when extractable from the image.
+            // Load ELF into IOP RAM when extractable from the image; record entry for exec.
             byte[]? elf = ExtractEntryElf(image, entries, key);
             if (elf == null || elf.Length < 52) continue;
             if (!LooksLikePlainElf(elf)) continue;
             try
             {
                 var lr = modules.LoadIrx(elf, mem, key);
-                if (lr.Success)
-                    elfs++;
+                if (!lr.Success) continue;
+                elfs++;
+                int mid = modules.SearchModuleByName(lr.ModuleName ?? key);
+                loaded.Add(new IopRpLoadedEntry
+                {
+                    Name = lr.ModuleName ?? key,
+                    Entry = lr.Entry,
+                    LoadBase = lr.LoadBase,
+                    Size = lr.Size,
+                    ModuleId = mid,
+                });
             }
             catch
             {
@@ -335,19 +400,29 @@ public sealed class IopExtendedBiosHost
             _lastIopRpSource = sourceName ?? "";
             _lastIopRpModuleNames.Clear();
             _lastIopRpModuleNames.AddRange(names);
+            _lastIopRpLoadedEntries.Clear();
+            _lastIopRpLoadedEntries.AddRange(loaded);
             _iopRpImagesApplied++;
         }
         else
         {
             _lastIopRpModulesRegistered = registered;
             _lastIopRpElfsLoaded = elfs;
+            _lastIopRpLoadedEntries.Clear();
+            _lastIopRpLoadedEntries.AddRange(loaded);
         }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        {
             Console.Error.WriteLine(
                 $"[BIOS] IOPRP apply src=\"{sourceName}\" entries={entries.Count} " +
                 $"btconf={btconf.Count} reg={registered} elfs={elfs}" +
-                (loadElfs ? "" : " (name-only)"));
+                (loadElfs ? (IsLiteralIrxEnabled() ? " (literal)" : "") : " (name-only)"));
+            foreach (var le in loaded)
+                Console.Error.WriteLine(
+                    $"[BIOS] IOPRP elf name={le.Name} id={le.ModuleId} " +
+                    $"entry=0x{le.Entry:X8} base=0x{le.LoadBase:X8} size=0x{le.Size:X}");
+        }
 
         return registered;
     }
