@@ -1046,6 +1046,13 @@ public sealed class KernelState
     private uint _preemptQuantum = 0x10000; // ~65536 EE cycles per timeslice
     private ulong _cyclesSinceLastPreempt;
 
+    /// <summary>
+    /// Force the next <see cref="MaybePreempt"/> tick to rotate (Whiplash WaitSema soft-signal
+    /// empty SIF poll — without this the worker re-enters WaitSema every ~60 cycles and never
+    /// reaches the 64k quantum while main is mid stream-init / GOE Open).
+    /// </summary>
+    public void RequestImmediatePreempt() => _cyclesSinceLastPreempt = _preemptQuantum;
+
     /// <summary>Drop HasFullSave on the current thread (after eret restored user GPRs into EE).</summary>
     public void ClearFullSaveIfCurrent()
     {

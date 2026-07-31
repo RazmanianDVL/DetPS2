@@ -140,6 +140,8 @@ public sealed class RealSifRpc
     // Compiler" per both modules' .comment sections) — 0 for success is that toolchain's
     // convention here too, confirmed independently for SNDF's fno=0x1300 handler.
     public const uint SidSdReg = 0x80000701;
+    /// <summary>SCE SDRDRV secondary RPC (Whiplash BIN/SDRDRV.IRX: 0x80000701 + 0x80000704).</summary>
+    public const uint SidSdReg2 = 0x80000704;
     // EE iopheap RPC fnos (ps2sdk ee/kernel/src/iopheap.c + iopheap-common.h).
     // IOP-side backend is SYSMEM AllocSysMemory/FreeSysMemory (sysmem.h / SYSMEM.bin
     // export table sysmem v1.1). Not the same as SIFCMD CID 0x80000003 (RESET_CMD).
@@ -753,7 +755,8 @@ public sealed class RealSifRpc
             && sid != SidPadOld1 && sid != SidPadOld2
             && sid != SidMcServ && sid != SidCdBase && sid != SidCdSearchFile && sid != SidCdDiskReady
             && sid != SidCdDiskReady2
-            && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx && sid != SidSdReg
+            && sid != SidSysmem && sid != SidSndf && sid != SidSnProdg && sid != SidCriAdx
+            && sid != SidSdReg && sid != SidSdReg2
             && sid != SidLoadFile && sid != SidSfsv && sid != SidFileIo
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
             && sid != SidMsl && sid != SidMslMfl
@@ -3029,7 +3032,8 @@ public sealed class RealSifRpc
                 }
 
             case SidSdReg:
-                return 0; // see SidSdReg's declaration comment
+            case SidSdReg2:
+                return 0; // SCE/Midway SDRDRV — 0-for-success
 
             case SidSfsv:
                 return 0; // see SidSfsv's declaration comment
@@ -4869,6 +4873,24 @@ public sealed class RealSifRpc
         // the status buffer; EE treats status!=0 / non-error as "server ready".
         if (op == 0)
         {
+            // Whiplash GOE v2 stream-table setup (sid=0x31 live 2026-07-31): fno=0 send=64..128
+            // with w0=bufferSize (0xFF4) and w1=slotCount (0x40) or stream index @+8; recv is a
+            // 4 KiB live EE stream table. Painting GOE status over that table wiped slots.
+            if (LooksLikeWhipStreamTableSetup(mem, argBuf, sendSize, recvSize))
+            {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                {
+                    uint w0 = argBuf != 0 && sendSize >= 4 ? mem.Read32(argBuf) : 0;
+                    uint w1 = argBuf != 0 && sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
+                    uint w2 = argBuf != 0 && sendSize >= 12 ? mem.Read32(argBuf + 8) : 0;
+                    Console.Error.WriteLine(
+                        $"[IOPFILE] stream-table setup sid=0x{sid:X} w0=0x{w0:X} w1=0x{w1:X} w2=0x{w2:X} " +
+                        $"recv=0x{recvBuf:X8}/{recvSize} (recv preserved)");
+                }
+                EnsureGoeArchiveMounted(iopModules, cdvd);
+                return 1;
+            }
+
             // status=1 (ready). Paint a larger recv so 192-byte clients see a full reply.
             WriteGoeReply(mem, recvBuf, recvSize, status: 1, filesize: 0, scefd: 0, iStream: 0);
             if (recvBuf != 0 && recvSize > 16)
@@ -4876,12 +4898,9 @@ public sealed class RealSifRpc
                 for (uint off = 16; off + 4 <= Math.Min(recvSize, 192u); off += 4)
                     mem.Write32(recvBuf + off, 0);
             }
-            // First successful GOE init: open PS2.RKV so archive streaming is hot and
-            // cdvdSectors reflects the bigfile (token sectors; full stream on Open/Start).
             EnsureGoeArchiveMounted(iopModules, cdvd);
-            // Warm real PRECODE.BG2 / CODE.BG2 so "usebigfile" / title path sees disc payloads
-            // (token sector notes only; full stream on Open).
             WarmBo2CodeBg2(iopModules, cdvd);
+            WarmWhipTitleSurface(iopModules, cdvd);
             return 1;
         }
 

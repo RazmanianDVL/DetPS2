@@ -1124,14 +1124,19 @@ public sealed class SonyKernelHle
                         }
                         else
                         {
-                            // WHIP_SEMA_FIX_V2: non-RPC soft-signal (Whiplash SN seq + SIF worker).
-                            // No yield-without-wake; VBlank park only when ThreadCount < 2.
+                            // WHIP_SEMA_FIX_V3: soft-signal for SN ProDG WaitSema(id)==id and
+                            // empty SIF-cmd poll mutex. V2 never rotated the ready queue, so the
+                            // SIF worker burned ~333k WaitSema/Wakeup pairs mid stream-init
+                            // (Whiplash 0x31, 56/64 slots) while main starved. Keep soft-signal
+                            // (yield-without-wake deadlocks empty poll), force timeslice end.
                             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V2)");
+                                Console.Error.WriteLine($"[RPC] WaitSema FABRICATING signal for sema=0x{a0:X} (WHIP_SEMA_FIX_V3)");
                             if (_kernel.ThreadCount < 2)
                                 _kernel.WaitSemaVblank();
                             _kernel.SignalSema((int)a0);
                             _kernel.WakeupThread(_kernel.CurrentThreadId);
+                            if (_kernel.ThreadCount >= 2)
+                                _kernel.RequestImmediatePreempt();
                         }
                         // On block (and on later wake): return the sema id as the success token
                         // so SN ProDG `WaitSema(id) == id` checks pass. Same rationale as SignalSema.
