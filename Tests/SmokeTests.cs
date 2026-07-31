@@ -4327,23 +4327,23 @@ public static class SmokeTests
         var rawResult = IrxLoader.Load(irx, new SystemMemory());
         if (rawResult.ModuleName != "testmod") throw new Exception($".iopmod name parse failed: {rawResult.ModuleName}");
 
-        uint iopLoadBase = r.LoadBase; // full runtime address (IOP_RAM_BASE + local base)
-        uint low28Base = iopLoadBase & 0x0FFFFFFF;
+        // Reloc addend is IOP physical (for R3000 exec); module image is readable at EE window.
+        uint physBase = IopModuleHost.ToIopPhys(r.LoadBase);
+        uint low28Base = physBase & 0x0FFFFFFF;
 
         uint jalWord = sys.Memory.Read32(r.LoadBase + 0);
         uint expectedJalField = ((jalTarget + low28Base) >> 2) & 0x03FFFFFF;
         uint expectedJalWord = (3u << 26) | expectedJalField;
         if (jalWord != expectedJalWord)
             throw new Exception($"R_MIPS_26: got 0x{jalWord:X8} expected 0x{expectedJalWord:X8}");
-        // The reconstructed full jump target (top 4 bits from the PC, matching real MIPS J-type
-        // semantics) must land inside the module's own loaded window, not some unrelated address.
-        uint reconstructedTarget = (r.LoadBase & 0xF0000000) | (expectedJalField << 2);
-        if (reconstructedTarget != iopLoadBase + jalTarget)
-            throw new Exception($"reconstructed jal target 0x{reconstructedTarget:X8} != expected 0x{iopLoadBase + jalTarget:X8}");
+        // Reconstruct as if PC is in phys region (how StartLoadedModule runs the module).
+        uint reconstructedTarget = (physBase & 0xF0000000) | (expectedJalField << 2);
+        if (reconstructedTarget != physBase + jalTarget)
+            throw new Exception($"reconstructed jal target 0x{reconstructedTarget:X8} != expected 0x{physBase + jalTarget:X8}");
 
         uint luiWord = sys.Memory.Read32(r.LoadBase + 4);
         uint addiuWord = sys.Memory.Read32(r.LoadBase + 8);
-        uint expectedAddr = hiLoTarget + iopLoadBase;
+        uint expectedAddr = hiLoTarget + physBase;
         uint expectedHi = (expectedAddr + 0x8000u) >> 16;
         uint expectedLo = expectedAddr & 0xFFFF;
         if ((luiWord & 0xFFFF) != (expectedHi & 0xFFFF))

@@ -248,32 +248,51 @@ public sealed class SystemMemory
     /// BOOTEND bits for how the EE-visible *effects* of a completed IOP boot are represented
     /// instead of simulating the boot itself).
     /// </summary>
+    /// <summary>
+    /// Normalize IOP CPU virtual address to a bus/phys form.
+    /// KSEG0/KSEG1 (0x8…/0xA…) collapse via <c>&amp; 0x1FFFFFFF</c>.
+    /// EE window <see cref="IOP_RAM_BASE"/> (0x1C000000) is aliased to phys 0 — IrxLoader
+    /// relocates modules for the EE map, so IRX text contains 0x1C… absolute addresses that
+    /// must hit the same IOP RAM chip when executed on the R3000.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static uint NormalizeIopBusAddr(uint addr)
+    {
+        uint p = addr & 0x1FFFFFFFu;
+        if (p >= IOP_RAM_BASE && p < IOP_RAM_BASE + (uint)IOP_RAM_SIZE)
+            return p - IOP_RAM_BASE;
+        return p;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public byte IopRead8(uint addr)
     {
-        uint paddr = addr & 0x1FFFFFFFu;
+        uint paddr = NormalizeIopBusAddr(addr);
         if (paddr < (uint)IOP_RAM_SIZE) return _iopRam[paddr];
-        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
-            return (byte)(_sif.ReadRegister(paddr) >> (int)((paddr & 3) * 8));
-        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
-            return _cdvd.ReadMmio8(paddr);
-        if (paddr >= BIOS_BASE && paddr < BIOS_BASE + (uint)BIOS_SIZE) return _bios[paddr - BIOS_BASE];
+        // SIF/CDVD use full phys including high bits before strip of EE window only
+        uint raw = addr & 0x1FFFFFFFu;
+        if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+            return (byte)(_sif.ReadRegister(raw) >> (int)((raw & 3) * 8));
+        if (_cdvd != null && Cdvd.IsMmioAddress(raw))
+            return _cdvd.ReadMmio8(raw);
+        if (raw >= BIOS_BASE && raw < BIOS_BASE + (uint)BIOS_SIZE) return _bios[raw - BIOS_BASE];
         return 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void IopWrite8(uint addr, byte value)
     {
-        uint paddr = addr & 0x1FFFFFFFu;
+        uint paddr = NormalizeIopBusAddr(addr);
         if (paddr < (uint)IOP_RAM_SIZE) { _iopRam[paddr] = value; return; }
-        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+        uint raw = addr & 0x1FFFFFFFu;
+        if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
-            _sif.WriteRegister(paddr, value);
+            _sif.WriteRegister(raw, value);
             return;
         }
-        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        if (_cdvd != null && Cdvd.IsMmioAddress(raw))
         {
-            _cdvd.WriteMmio8(paddr, value);
+            _cdvd.WriteMmio8(raw, value);
             return;
         }
         // BIOS ROM / unmapped — ignore writes, matching the EE-side Write8 policy.
@@ -282,39 +301,41 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public uint IopRead32(uint addr)
     {
-        uint paddr = addr & 0x1FFFFFFFu;
+        uint paddr = NormalizeIopBusAddr(addr);
         if (paddr + 3 < (uint)IOP_RAM_SIZE) return Unsafe.ReadUnaligned<uint>(ref _iopRam[paddr]);
-        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
-            return _sif.ReadRegister(paddr);
-        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        uint raw = addr & 0x1FFFFFFFu;
+        if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+            return _sif.ReadRegister(raw);
+        if (_cdvd != null && Cdvd.IsMmioAddress(raw))
         {
             // Byte-lane assemble (CDVD is an 8-bit register window; LB/LBU is the common path).
-            return (uint)(_cdvd.ReadMmio8(paddr)
-                | (_cdvd.ReadMmio8(paddr + 1) << 8)
-                | (_cdvd.ReadMmio8(paddr + 2) << 16)
-                | (_cdvd.ReadMmio8(paddr + 3) << 24));
+            return (uint)(_cdvd.ReadMmio8(raw)
+                | (_cdvd.ReadMmio8(raw + 1) << 8)
+                | (_cdvd.ReadMmio8(raw + 2) << 16)
+                | (_cdvd.ReadMmio8(raw + 3) << 24));
         }
-        if (paddr >= BIOS_BASE && paddr + 3 < BIOS_BASE + (uint)BIOS_SIZE)
-            return Unsafe.ReadUnaligned<uint>(ref _bios[paddr - BIOS_BASE]);
+        if (raw >= BIOS_BASE && raw + 3 < BIOS_BASE + (uint)BIOS_SIZE)
+            return Unsafe.ReadUnaligned<uint>(ref _bios[raw - BIOS_BASE]);
         return 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void IopWrite32(uint addr, uint value)
     {
-        uint paddr = addr & 0x1FFFFFFFu;
+        uint paddr = NormalizeIopBusAddr(addr);
         if (paddr + 3 < (uint)IOP_RAM_SIZE) { Unsafe.WriteUnaligned(ref _iopRam[paddr], value); return; }
-        if (paddr >= IOP_SIF_BASE && paddr < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
+        uint raw = addr & 0x1FFFFFFFu;
+        if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
-            _sif.WriteRegister(paddr, value);
+            _sif.WriteRegister(raw, value);
             return;
         }
-        if (_cdvd != null && Cdvd.IsMmioAddress(paddr))
+        if (_cdvd != null && Cdvd.IsMmioAddress(raw))
         {
-            _cdvd.WriteMmio8(paddr, (byte)value);
-            _cdvd.WriteMmio8(paddr + 1, (byte)(value >> 8));
-            _cdvd.WriteMmio8(paddr + 2, (byte)(value >> 16));
-            _cdvd.WriteMmio8(paddr + 3, (byte)(value >> 24));
+            _cdvd.WriteMmio8(raw, (byte)value);
+            _cdvd.WriteMmio8(raw + 1, (byte)(value >> 8));
+            _cdvd.WriteMmio8(raw + 2, (byte)(value >> 16));
+            _cdvd.WriteMmio8(raw + 3, (byte)(value >> 24));
             return;
         }
         // BIOS ROM / unmapped — ignore writes.

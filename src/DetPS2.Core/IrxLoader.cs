@@ -210,7 +210,13 @@ public static class IrxLoader
         //    (IOP/CDVDSTM.IRX).
         //  - R_MIPS_HI16/LO16 (lui+addiu pairs) encode a complete, independent 32-bit address
         //    with no implicit PC-relative segment trick, so they need the FULL runtime address.
-        uint fullBase = SystemMemory.IOP_RAM_BASE + iopLoadBase;
+        //
+        // Runtime base for *address values* must be **IOP physical** (iopLoadBase), not the EE
+        // window (0x1C000000+). IRX executes on the R3000 with PC in phys/KSEG; R_MIPS_26 takes
+        // the top nibble from PC, so encoding EE 0x1C… produces jumps to 0x0C… when PC is phys.
+        // Bytes are still written via destBase (EE map → same IOP RAM). EE reads the same chip
+        // at 0x1C000000+phys (see SystemMemory.NormalizeIopBusAddr).
+        uint fullBase = iopLoadBase;
         uint low28Base = fullBase & 0x0FFFFFFFu;
         int count = (int)(relSec.Size / 8); // Elf32_Rel = 8 bytes: r_offset, r_info
         var pendingHi16 = new List<uint>(); // IOP RAM addresses of unpatched HI16 instructions
