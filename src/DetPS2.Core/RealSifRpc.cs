@@ -846,9 +846,9 @@ public sealed class RealSifRpc
             uint endParam = mem.Read32(cdPtr + 32);
             if (endFunc != 0)
             {
-                // Fast path: common "*(int*)end_param = 1" done-flag (end_param may be 0).
-                if (endParam != 0 && endParam < SystemMemory.RDRAM_SIZE - 4)
-                    mem.Write32(endParam, 1);
+                // Do NOT unconditionally write *end_param=1. Simple done-flag
+                // end_functions still plant 1 via TryHleSimpleEndFunction.
+                // CDVDFSV-style treat end_param as transfer descriptor (Vexx CdRead).
                 _pendingEndFuncs.Enqueue((endFunc, endParam));
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine($"[RPC] end_function=0x{endFunc:X8} end_param=0x{endParam:X8}");
@@ -1971,6 +1971,21 @@ public sealed class RealSifRpc
         uint w1 = sendSize >= 8 ? mem.Read32(argBuf + 4) : 0;
         mode = (int)w0;
 
+        // SN ProDG wrapper: { seq, eeReply*, 4, mode, …, path@+0x14 }.
+        // Word0 is a sequence cookie (often 0x2D…), NOT FIO open mode — Whiplash GAME.INI
+        // live: seq=0x2D, mode@+0xC=1 (O_RDONLY), path@+0x14 = cdrom0:\WHIPLASH\GAME.INI;1.
+        if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 16)
+        {
+            mode = (int)mem.Read32(argBuf + 12);
+            string snPath = ReadCString(mem, argBuf + 0x14, 256);
+            if (LooksLikeFsPath(snPath))
+            {
+                path = snPath;
+                return;
+            }
+            // Fall through to scanners if path not at +0x14.
+        }
+
         // 1) Canonical inline name @+4.
         if (sendSize >= 8)
         {
@@ -2006,6 +2021,9 @@ public sealed class RealSifRpc
                 path = s;
                 // mode stays w0 unless w0 itself looked like a path start
                 if (off == 0) mode = 0;
+                // SN wrapper: prefer real mode @+0xC over seq cookie in w0
+                if (LooksLikeSnFioWrapper(mem, argBuf, sendSize) && sendSize >= 16)
+                    mode = (int)mem.Read32(argBuf + 12);
                 return;
             }
         }
@@ -6966,6 +6984,16 @@ public sealed class RealSifRpc
         }
     }
 
+    // Play! Iop_PadMan.h PADDATAEX sizeof=0x80; dual-buffer total 0x100 (EE SyncDCache
+    // range for Midway libpad is padArea..padArea+0xFF). Stride was wrongly 256, so the
+    // second slot at +0x80 (frame@+0xD8) never received STABLE/mode — Dec thrash at
+    // SyncDCache 0x10C6xx after PADMAN OPEN (diagnose wall px=0 gif4 dmac4 cdvd137).
+    private const uint PadDataExStride = 0x80;
+    private const uint PadDataExAreaBytes = 0x100; // dual buffer
+    // Play! PAD_MODE_DUALSHOCK=7; modeCurId stores mode in high nibble (7<<4=0x70).
+    private const byte PadModeDualShock = 7;
+    private const byte PadModeCurIdDualShock = PadModeDualShock << 4;
+
     private void InitPadArea(SystemMemory mem, PadInput pad, uint padArea, bool oldStyle)
     {
         if (oldStyle)
@@ -6976,8 +7004,9 @@ public sealed class RealSifRpc
         }
         else
         {
+            // PADDATAEX dual buffer at +0 / +0x80 (Play! / Midway libpad sll 7 select).
             WritePadDataNew(mem, pad, padArea, preferHigherFrame: false);
-            WritePadDataNew(mem, pad, padArea + 256, preferHigherFrame: true);
+            WritePadDataNew(mem, pad, padArea + PadDataExStride, preferHigherFrame: true);
         }
     }
 
@@ -7004,10 +7033,11 @@ public sealed class RealSifRpc
     }
 
     /// <summary>
-    /// pad_data_new offsets (ps2sdk libpad.c) — double-buffered, 256B stride per SyncDCache.
-    /// data[32]@0, actDir@0x20, actAlign@0x28, actData@0x30, modeTable@0x50,
-    /// frame@0x58, findPadRetries@0x5C, length@0x60, modeConfig@0x64, modeCurId@0x65,
-    /// model@0x66, buttonDataReady@0x67, state@0x70, reqState@0x71, currentTask@0x72.
+    /// pad_data_new / Play! <c>PADDATAEX</c> (128 B per slot, dual-buffer total 256 B).
+    /// data[32]@0, reserved/act@0x20.., modeTable u16[4]@0x50, frame@0x58, length@0x60,
+    /// modeOk@0x64, modeCurId@0x65, model@0x66, nrOfModes@0x68, modeCurOffset@0x69,
+    /// state@0x70, reqState@0x71, ok@0x72. EE selects slot via frame@+0x58 vs frame@+0xD8
+    /// (offset 0x80) — Midway <c>sll 7</c> dual-buffer pick (Dec <c>0x1187B4</c>).
     /// </summary>
     private void WritePadDataNew(SystemMemory mem, PadInput pad, uint baseP, bool preferHigherFrame)
     {
@@ -7017,34 +7047,40 @@ public sealed class RealSifRpc
             mem.Write8(baseP + o, 0xFF);
         WritePadButtonData(mem, pad, baseP);
 
-        // DualShock actuator/mode table defaults (generic; not a full SIO2 config FSM).
+        // DualShock actuator/mode table defaults (Play! PDF_InitializeStruct1).
         mem.Write8(baseP + 0x30, 0); // act0 type
         mem.Write8(baseP + 0x34, 1); // act1 type (large motor)
-        mem.Write8(baseP + 0x50, 0x00); // modeTable[0] lo
-        mem.Write8(baseP + 0x51, 0x07); // modeTable[0] hi dualshock-ish
+        // modeTable[0] = PAD_MODE_DUALSHOCK (u16 LE) — was mis-encoded as 0x0700.
+        mem.Write8(baseP + 0x50, PadModeDualShock);
+        mem.Write8(baseP + 0x51, 0);
         mem.Write8(baseP + 0x6A, 2); // nrOfActuators
 
         mem.Write32(baseP + 0x58, frame);
         mem.Write32(baseP + 0x5C, 0); // findPadRetries
         mem.Write32(baseP + 0x60, 32); // length
-        mem.Write8(baseP + 0x64, 2); // modeConfig (config done)
-        mem.Write8(baseP + 0x65, 0x07); // modeCurId dualshock
-        mem.Write8(baseP + 0x66, 3); // model
-        mem.Write8(baseP + 0x67, 1); // buttonDataReady
-        mem.Write8(baseP + 0x68, 1); // nrOfModes
+        mem.Write8(baseP + 0x64, 2); // modeOk / modeConfig (config done)
+        // modeCurId: mode in high nibble (Play! SetModeCurId(PAD_MODE_DUALSHOCK<<4)).
+        mem.Write8(baseP + 0x65, PadModeCurIdDualShock);
+        mem.Write8(baseP + 0x66, 3); // model DualShock
+        mem.Write8(baseP + 0x67, 1); // buttonDataReady (reserved in EX; keep 1)
+        mem.Write8(baseP + 0x68, 4); // nrOfModes (Play! PDF_InitializeStruct1)
+        mem.Write8(baseP + 0x69, 0); // modeCurOffset
         mem.Write8(baseP + 0x70, (byte)PadStateStable);
         mem.Write8(baseP + 0x71, (byte)PadRstatComplete);
-        mem.Write8(baseP + 0x72, 1); // currentTask = 1 (ready)
-        mem.Write8(baseP + 0x73, 0); // runTask
+        mem.Write8(baseP + 0x72, 1); // ok (Play! nOk; EE also treats as currentTask==1)
+        mem.Write8(baseP + 0x73, 0);
     }
 
     /// <summary>
     /// Standard padButtonStatus bytes: ok, mode, btns (u16 active-low), rjoy, ljoy.
+    /// Default dualshock-shaped (0x79) so mode-set waits do not thrash on digital 0x41
+    /// when AnalogMode has not been host-toggled yet (commercial padPortOpen path).
     /// </summary>
     private static void WritePadButtonData(SystemMemory mem, PadInput pad, uint dataBase)
     {
         mem.Write8(dataBase + 0, 0x00); // ok
-        mem.Write8(dataBase + 1, pad.AnalogMode ? (byte)0x79 : (byte)0x41);
+        // Prefer DualShock type byte unless host explicitly left digital-only.
+        mem.Write8(dataBase + 1, (byte)0x79);
         ushort btns = (ushort)(~pad.Buttons & 0xFFFF); // hardware/libpad: active-low
         mem.Write8(dataBase + 2, (byte)(btns & 0xFF));
         mem.Write8(dataBase + 3, (byte)(btns >> 8));
@@ -7069,9 +7105,10 @@ public sealed class RealSifRpc
             }
             else
             {
-                if (padArea >= SystemMemory.RDRAM_SIZE - 0x200) continue;
+                // Need room for dual PADDATAEX (0x100 total).
+                if (padArea >= SystemMemory.RDRAM_SIZE - PadDataExAreaBytes) continue;
                 WritePadDataNew(mem, pad, padArea, preferHigherFrame: false);
-                WritePadDataNew(mem, pad, padArea + 256, preferHigherFrame: true);
+                WritePadDataNew(mem, pad, padArea + PadDataExStride, preferHigherFrame: true);
             }
         }
     }
