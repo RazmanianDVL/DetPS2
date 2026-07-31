@@ -24,12 +24,25 @@ public sealed class Gs : ISchedulable
     private readonly byte[] _localMem = new byte[4 * 1024 * 1024];
 
     /// <summary>
-    /// Host-side present overlay (FMV HLE / boot assist). When set, <see cref="GetPresentSpan"/>
-    /// returns this instead of the software raster FB so game black-clears do not hide the overlay.
-    /// Deterministic: same overlay bytes → same on-screen pixels. Not a game-specific port.
+    /// Legacy host present overlay (retired boot-FMV path). Kept only so older assist code that
+    /// still calls <see cref="SetHostOverlay"/> / <see cref="ClearHostOverlay"/> compiles and is
+    /// a no-op for Soft-GS truth: IRX-era presentation must come from the software raster FB
+    /// (GIF → GS prims / honest IPU), never host-decoded logos. See docs/irx/SOFTGS_IRX_ERA.md.
     /// </summary>
     private uint[]? _hostOverlay;
     private bool _hostOverlayActive;
+
+    // Host→local IMAGE transfer (BITBLTBUF/TRXPOS/TRXREG/TRXDIR). Commercial GIF PATH3 IMAGE
+    // streams land here; linear dest=0 uploads were swizzle-inconsistent with SampleTexel.
+    private bool _trxActive;
+    private int _trxX, _trxY;
+    private int _trxW, _trxH;
+    private int _trxDsaX, _trxDsaY;
+    private uint _trxDbpBytes;
+    private int _trxDbwPx;
+    private int _trxDpsm;
+    private int _trxPending; // leftover bytes when packing multi-byte pixels across QWs
+    private uint _trxPartial;
 
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
@@ -79,6 +92,14 @@ public sealed class Gs : ISchedulable
         Array.Clear(_localMem);
         _hostOverlay = null;
         _hostOverlayActive = false;
+        _trxActive = false;
+        _trxX = _trxY = _trxW = _trxH = 0;
+        _trxDsaX = _trxDsaY = 0;
+        _trxDbpBytes = 0;
+        _trxDbwPx = 64;
+        _trxDpsm = 0;
+        _trxPending = 0;
+        _trxPartial = 0;
         _currentPrim = 0;
         _currentRgbaq = 0xFFFFFFFF;
         _lastU = _lastV = 0;
@@ -272,7 +293,47 @@ public sealed class Gs : ISchedulable
             case 0x05: // XYZ3 — no kick (strip build)
                 AddVertexFromXyz(value, kick: false);
                 break;
+            case 0x53: // TRXDIR — start host↔local transfer after BITBLTBUF/TRXPOS/TRXREG
+                BeginTrxFromDir(value);
+                break;
         }
+    }
+
+    /// <summary>
+    /// TRXDIR.XDIR: 0 = Host→Local (GIF IMAGE), 1 = Local→Host, 2 = Local→Local, 3 = deactivate.
+    /// Soft-GS implements Host→Local for commercial texture/FB uploads; other dirs clear active.
+    /// </summary>
+    private void BeginTrxFromDir(ulong trxdir)
+    {
+        int xdir = (int)(trxdir & 0x3);
+        _trxPending = 0;
+        _trxPartial = 0;
+        if (xdir != 0)
+        {
+            _trxActive = false;
+            return;
+        }
+
+        ulong blt = Registers.BITBLTBUF;
+        ulong pos = Registers.TRXPOS;
+        ulong reg = Registers.TRXREG;
+
+        // DBP bits 32-45 (64-byte units), DBW bits 48-53 (64-pixel units), DPSM bits 56-61
+        _trxDbpBytes = (uint)((blt >> 32) & 0x3FFF) * 64u;
+        int dbwUnits = (int)((blt >> 48) & 0x3F);
+        _trxDbwPx = Math.Max(64, dbwUnits * 64);
+        _trxDpsm = (int)((blt >> 56) & 0x3F);
+        // DSAX bits 32-42, DSAY bits 48-58
+        _trxDsaX = (int)((pos >> 32) & 0x7FF);
+        _trxDsaY = (int)((pos >> 48) & 0x7FF);
+        // RRW bits 0-11, RRH bits 32-43
+        _trxW = (int)(reg & 0xFFF);
+        _trxH = (int)((reg >> 32) & 0xFFF);
+        _trxX = 0;
+        _trxY = 0;
+        _trxActive = _trxW > 0 && _trxH > 0;
+        if (_trxActive)
+            _useProceduralTexture = false;
     }
 
     private void ApplyTex0(ulong tex0)
@@ -946,22 +1007,83 @@ public sealed class Gs : ISchedulable
         }
     }
 
-    /// <summary>IMAGE path: write raw QW data into local mem at current BITBLT position
-    /// (simplified linear — NOT yet swizzle-aware). This is the real path commercial games
-    /// use for every texture/framebuffer upload (BITBLTBUF/TRXPOS/TRXREG/TRXDIR-driven
-    /// transfer, now correctly stored at their real register addresses — see
-    /// GsRegisters.WriteRegister64 — but this method still writes a contiguous linear byte
-    /// run rather than tracking a real per-pixel (x,y) cursor through SwizzleOffset32/8, so
-    /// data arriving through here doesn't land where SampleTexel now expects it. Only the
-    /// synthetic UploadTexture/UploadTexture8 test helpers are swizzle-consistent today.
-    /// Making this path correct needs real TRXPOS/TRXREG-driven cursor tracking, not just
-    /// a formula change — left as flagged, scoped-out future work.</summary>
+    /// <summary>
+    /// IMAGE path (GIF FLG=2): host→local VRAM fill.
+    /// When a Host→Local transfer is active (TRXDIR.XDIR=0 after BITBLTBUF/TRXPOS/TRXREG),
+    /// bytes are written through the per-pixel TRX cursor with PSMCT32/PSMT8 swizzle so
+    /// SampleTexel sees the same layout as <see cref="UploadTexture"/> / <see cref="UploadTexture8"/>.
+    /// Without an active transfer, falls back to a linear write at <paramref name="destByteOffset"/>
+    /// (legacy / synthetic packets that never programmed BITBLT).
+    /// </summary>
     public void WriteImageData(ReadOnlySpan<byte> data, int destByteOffset)
     {
+        if (_trxActive)
+        {
+            WriteImageTransfer(data);
+            return;
+        }
+
         int n = Math.Min(data.Length, _localMem.Length - destByteOffset);
         if (n <= 0) return;
         data.Slice(0, n).CopyTo(_localMem.AsSpan(destByteOffset));
         _useProceduralTexture = false;
+    }
+
+    /// <summary>Stream host IMAGE bytes into local mem using BITBLT/TRX cursor.</summary>
+    private void WriteImageTransfer(ReadOnlySpan<byte> data)
+    {
+        int bpp = TrxBytesPerPixel(_trxDpsm);
+        if (bpp <= 0) bpp = 4;
+
+        for (int i = 0; i < data.Length && _trxActive; i++)
+        {
+            _trxPartial |= (uint)data[i] << (8 * _trxPending);
+            _trxPending++;
+            if (_trxPending < bpp) continue;
+
+            uint pixel = _trxPartial;
+            _trxPartial = 0;
+            _trxPending = 0;
+            StoreTrxPixel(pixel, bpp);
+
+            _trxX++;
+            if (_trxX >= _trxW)
+            {
+                _trxX = 0;
+                _trxY++;
+                if (_trxY >= _trxH)
+                    _trxActive = false;
+            }
+        }
+    }
+
+    private static int TrxBytesPerPixel(int psm) => psm switch
+    {
+        0x00 => 4, // PSMCT32
+        0x01 => 3, // PSMCT24
+        0x02 => 2, // PSMCT16
+        0x0A => 2, // PSMCT16S
+        0x13 => 1, // PSMT8
+        0x1B => 1, // PSMT8H
+        _ => 4
+    };
+
+    private void StoreTrxPixel(uint pixel, int bpp)
+    {
+        int px = _trxDsaX + _trxX;
+        int py = _trxDsaY + _trxY;
+        int bi;
+        if (_trxDpsm == 0x13 || _trxDpsm == 0x1B)
+            bi = (int)SwizzleOffset8(_trxDbpBytes, px, py, _trxDbwPx);
+        else if (_trxDpsm == 0x00 || _trxDpsm == 0x01)
+            bi = (int)SwizzleOffset32(_trxDbpBytes, px, py, _trxDbwPx);
+        else
+            // PSMCT16 family: SampleTexel still uses linear — match it
+            bi = (int)_trxDbpBytes + (py * _trxDbwPx + px) * bpp;
+
+        if (bi < 0 || bi >= _localMem.Length) return;
+        for (int b = 0; b < bpp && bi + b < _localMem.Length; b++)
+            _localMem[bi + b] = (byte)(pixel >> (8 * b));
     }
 
     private static int Log2(int v)
@@ -1158,19 +1280,19 @@ public sealed class Gs : ISchedulable
     }
 
     /// <summary>
-    /// What the host should show: host FMV/boot overlay if active, else software FB.
-    /// Desktop and PresentPipeline should use this for display.
+    /// What the host should show for Soft-GS truth: the software raster framebuffer only.
+    /// Host FMV/boot overlay is retired (IRX era) — never preferred over Soft-GS, even if a
+    /// legacy assist still toggled <see cref="HostOverlayActive"/>.
+    /// Desktop and PresentPipeline should use this for display / PPM.
     /// </summary>
-    public ReadOnlySpan<uint> GetPresentSpan()
-    {
-        if (_hostOverlayActive && _hostOverlay != null && _hostOverlay.Length >= FB_WIDTH * FB_HEIGHT)
-            return _hostOverlay;
-        return _framebuffer;
-    }
+    public ReadOnlySpan<uint> GetPresentSpan() => _framebuffer;
 
     public bool HostOverlayActive => _hostOverlayActive;
 
-    /// <summary>Install or clear a full-frame ARGB8888 host overlay (640×448).</summary>
+    /// <summary>
+    /// Legacy API: store overlay bytes but do <b>not</b> affect present or <see cref="PixelsWritten"/>.
+    /// Boot FMV must not use this (host FFmpeg path removed). IRX-era Soft-GS present ignores overlay.
+    /// </summary>
     public void SetHostOverlay(ReadOnlySpan<uint> argb, bool active = true)
     {
         if (!active || argb.Length < FB_WIDTH * FB_HEIGHT)
@@ -1181,9 +1303,9 @@ public sealed class Gs : ISchedulable
         if (_hostOverlay == null || _hostOverlay.Length != FB_WIDTH * FB_HEIGHT)
             _hostOverlay = new uint[FB_WIDTH * FB_HEIGHT];
         argb.Slice(0, FB_WIDTH * FB_HEIGHT).CopyTo(_hostOverlay);
-        _hostOverlayActive = true;
-        // Count as display activity so UI hides "no video" overlay
-        PixelsWritten += FB_WIDTH * FB_HEIGHT;
+        // Accept the call for ABI stability with MidwayBootAssist dead paths, but never mark
+        // active for present/metrics — Soft-GS FB is the only truth (SOFTGS_IRX_ERA).
+        _hostOverlayActive = false;
     }
 
     public void ClearHostOverlay()
@@ -1204,8 +1326,8 @@ public sealed class Gs : ISchedulable
     }
 
     /// <summary>
-    /// Host-side blit of ARGB8888 pixels into the software framebuffer (boot logo HLE).
-    /// Counts as real pixels written so present/desktop paths pick the frame up.
+    /// Host-side blit of ARGB8888 pixels into the software framebuffer only.
+    /// Does <b>not</b> install a host overlay (boot FMV must not re-enter via this path).
     /// </summary>
     public void BlitArgb8888(ReadOnlySpan<uint> argb, int width, int height)
     {
@@ -1223,9 +1345,6 @@ public sealed class Gs : ISchedulable
             }
         }
         PrimitivesDrawn++;
-        // Also drive host present overlay so subsequent game black-clears cannot hide FMV HLE
-        if (width >= FB_WIDTH && height >= FB_HEIGHT && argb.Length >= FB_WIDTH * FB_HEIGHT)
-            SetHostOverlay(argb.Slice(0, FB_WIDTH * FB_HEIGHT), active: true);
     }
 
     public void Clear(uint color, float depth = float.MaxValue)

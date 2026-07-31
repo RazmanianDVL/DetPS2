@@ -375,7 +375,9 @@ public sealed class Gif : ISchedulable
 
     private uint ProcessImage(ref uint addr, uint remaining, uint nloop)
     {
-        // IMAGE: nloop QWs of raw data into local GS mem (linear upload for Phase 7)
+        // IMAGE: nloop QWs of raw host→local data. Gs owns BITBLT/TRX cursor (TRXDIR=0);
+        // when no transfer is active WriteImageData falls back to linear at dest.
+        // dest offset is only used by that legacy fallback (commercial path ignores it).
         int dest = 0;
         uint count = Math.Min(nloop, remaining);
         Span<byte> qw = stackalloc byte[16];
