@@ -16,7 +16,7 @@
 | **MK Deadly Alliance** | SLUS_204.23 | **YES** (midway-menu) | px=716800 gifP2=35109 exitReq=False | wave-6 post-logo keep-alive |
 | **Vexx** | SLUS_203.83 | **YES** (title-surface) | px=581954 prims=4 cdvd=318 members=17 | wave-6 STREE0 VFS |
 | **Whiplash** | SLUS_206.84 | **YES** (title-surface) | px=286720 frontend Start full | wave-6 full title path |
-| **Haven** | SLUS_205.17 | **No** | LIKELY-NEAR prior | WaitSema / IMAGE residual |
+| **Haven** | SLUS_205.17 | **YES** (title-surface) | px=286720 gifP3=68 cdvd=7004 TITLES_VAG | wave-6 JREXIT/SP frame + NUSOUND; IMAGE residual |
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
 

@@ -153,8 +153,17 @@ public sealed class SonyKernelHle
     }
 
     /// <summary>
-    /// Run EE <c>void end_function(void *end_param)</c> briefly. Saves/restores PC/a0/ra.
+    /// Run EE <c>void end_function(void *end_param)</c> briefly. Saves/restores PC/a0/ra/<b>sp</b>
+    /// and callee-saved s0–s7/fp.
     /// Fast path already wrote <c>*end_param=1</c> when param is in RDRAM.
+    /// <para>
+    /// Haven SLUS_205.17 live (WAVE-6): NUSOUND bulk end_function <c>0x211878</c> jals into a
+    /// multi-thousand-insn body at <c>0x208818</c>. The 2048-step cap left the nested run
+    /// mid-frame with a depressed <c>$sp</c>; only PC/a0/ra were restored, so the interrupted
+    /// <c>sceSifCallRpc</c> epilogue did <c>ld ra,176(sp)</c> against the wrong frame → ra=0 →
+    /// JREXIT → main Started=false. Always restore SP + s-regs so a truncated nested invoke
+    /// cannot corrupt the caller's stack geometry.
+    /// </para>
     /// </summary>
     private void InvokeRpcEndFunction(uint func, uint param)
     {
@@ -167,9 +176,36 @@ public sealed class SonyKernelHle
         if (TryHleSimpleEndFunction(func, param))
             return;
 
+        // Haven NUSOUND bulk: end_function @0x211878 is a thin wrapper that jals into a
+        // multi-kinsn game body @0x208818 (state machine / bank bind). Nested Step of that
+        // body either truncates (SP clobber — fixed below) or runs so long it starves the
+        // CallRpc waiter and leaves main in a VIF helper leaf. Soft-success: the bulk
+        // path already painted recv + bound DLL.DAT; let main continue past WaitSema.
+        if (func == 0x00211878u || func == 0x211878u)
+        {
+            if (param != 0 && param < SystemMemory.RDRAM_SIZE)
+            {
+                try { _system.Memory.Write32(param, 1); } catch { /* ignore */ }
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine($"[RPC] end_function=0x{func:X8} Haven NUSOUND soft-OK (skip heavy body)");
+            return;
+        }
+
         ulong savedPc = ee.PC;
         var savedA0 = ee.GetGpr(4);
         var savedRa = ee.GetGpr(31);
+        var savedSp = ee.GetGpr(29);
+        // Callee-saved may be dirtied by a truncated nested body (Haven 0x208818).
+        var savedS0 = ee.GetGpr(16);
+        var savedS1 = ee.GetGpr(17);
+        var savedS2 = ee.GetGpr(18);
+        var savedS3 = ee.GetGpr(19);
+        var savedS4 = ee.GetGpr(20);
+        var savedS5 = ee.GetGpr(21);
+        var savedS6 = ee.GetGpr(22);
+        var savedS7 = ee.GetGpr(23);
+        var savedFp = ee.GetGpr(30);
         const uint SentinelRa = 0xFFFFFFFC; // unmapped; jr ra stops the mini-run
 
         ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = param });
@@ -184,7 +220,9 @@ public sealed class SonyKernelHle
         _inRpcEndFuncInvoke = true;
         try
         {
-            for (int i = 0; i < 2048; i++)
+            // Haven NUSOUND end_function body is large; 16k steps still bounded.
+            int limit = func is >= 0x00210000 and < 0x00220000 ? 16384 : 2048;
+            for (int i = 0; i < limit; i++)
             {
                 uint pc = (uint)(ee.PC & 0x1FFFFFFF);
                 if (pc == (SentinelRa & 0x1FFFFFFF) || pc == 0) break;
@@ -198,6 +236,16 @@ public sealed class SonyKernelHle
             ee.PC = savedPc;
             ee.SetGpr(4, savedA0);
             ee.SetGpr(31, savedRa);
+            ee.SetGpr(29, savedSp);
+            ee.SetGpr(16, savedS0);
+            ee.SetGpr(17, savedS1);
+            ee.SetGpr(18, savedS2);
+            ee.SetGpr(19, savedS3);
+            ee.SetGpr(20, savedS4);
+            ee.SetGpr(21, savedS5);
+            ee.SetGpr(22, savedS6);
+            ee.SetGpr(23, savedS7);
+            ee.SetGpr(30, savedFp);
         }
     }
 
