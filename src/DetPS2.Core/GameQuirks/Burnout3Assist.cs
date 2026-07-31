@@ -507,16 +507,71 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
 
-        // PADMAN open areas (if any). B3 uses libdbc/DBCMAN — ForceRefresh is best-effort.
-        // DBC work buffer is refreshed by RealSifRpc when SetWorkAddr was captured.
-        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+        // B3 uses libdbc/DBCMAN+DS2O — no PADMAN OPEN. ForceRefreshPad now also paints
+        // the captured DBC work buffer (SetWorkAddr/create) so EE pad2Read sees buttons
+        // between poll RPCs (pad path is EE-side DMA, same class as PADMAN TickPadDma).
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        try
+        {
+            rpc?.ForceRefreshPad(sys.Memory, sys.Pad);
+            // Explicit DBC refresh even if PADMAN map empty (ForceRefresh covers both).
+            rpc?.ForceRefreshDbcPad(sys.Memory, sys.Pad);
+        }
+        catch { /* ignore */ }
+
+        // PL-014 residual: if DBC work still unset after create thrash, probe EE client
+        // scratch near live B3 recvBuf 0x00679840 / bind cds for a SetWorkAddr pointer.
+        if (rpc != null && rpc.DbcWorkAddr == 0 && _logoPadAdvances is >= 4 and <= 32)
+            TryDiscoverDbcWorkNearClient(sys, rpc);
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
             && (_logoPadAdvances <= 8 || _logoPadAdvances % 64 == 0))
+        {
+            uint work = rpc?.DbcWorkAddr ?? 0;
+            int paints = rpc?.DbcPadPaintCount ?? 0;
             Console.Error.WriteLine(
                 $"[B3] PL-014 logo-pad edge n={_logoPadAdvances} btn=0x{buttons:X4} " +
                 $"present={fromPresent} px={sys.Gs.PixelsWritten} cdvd={sys.Cdvd.SectorsRead} " +
+                $"dbcWork=0x{work:X8} paints={paints} " +
                 $"pc=0x{(uint)(sys.EE.PC & 0x1FFFFFFFUL):X8} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// Scan B3 libdbc client region for an EE work-buffer pointer if RPC capture missed it.
+    /// Live: bind cds @0x6797C8/F0/818, recv scratch @0x679840. Only adopts 64-align
+    /// RDRAM pointers outside flip-queue / stack. No DISPFB plant.
+    /// </summary>
+    private static void TryDiscoverDbcWorkNearClient(Ps2System sys, RealSifRpc rpc)
+    {
+        if (rpc.DbcWorkAddr != 0) return;
+        // Probe a few fixed B3 client / socket neighborhoods observed under TRACE_RPC.
+        ReadOnlySpan<uint> bases = stackalloc uint[]
+        {
+            0x006797C0u, 0x00679840u, 0x00679880u, 0x00679900u,
+            0x0067A000u, 0x004E4000u, 0x004E6000u, 0x01C00000u
+        };
+        foreach (uint b in bases)
+        {
+            for (uint off = 0; off < 0x100; off += 4)
+            {
+                uint cand = sys.Memory.Read32(b + off) & 0x1FFFFFFFu;
+                if (cand is < 0x00400000u or >= 0x01F00000u) continue;
+                if ((cand & 0x3Fu) != 0) continue;
+                if (cand is >= 0x004E2800u and < 0x004E2A00u) continue;
+                if (cand is >= 0x00679000u and < 0x0067B000u) continue; // self-ref client
+                if (sys.Memory.IsLikelyEeCode(cand)) continue;
+                if (rpc.TryRegisterDbcWorkAddr(cand))
+                {
+                    rpc.ForceRefreshDbcPad(sys.Memory, sys.Pad);
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                        Console.Error.WriteLine(
+                            $"[B3] PL-014 DBC work discovered via client scan " +
+                            $"base=0x{b:X8}+{off:X} work=0x{cand:X8} paints={rpc.DbcPadPaintCount}");
+                    return;
+                }
+            }
+        }
     }
 
     private static void PlantWakeFlags(Ps2System sys, uint baseP)
