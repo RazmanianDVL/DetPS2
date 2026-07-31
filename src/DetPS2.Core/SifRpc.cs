@@ -644,6 +644,13 @@ public sealed class IopModuleHost
             };
 
         var iop = system.Iop;
+        // INTRMANP (PRId≥16 path) requires 0xBF801450 bit3; SIFMAN requires it clear.
+        // Apply at start so every caller (probe, BootIopBtConfLiteral, LoadStart) gets both.
+        if (string.Equals(m.Name, "INTRMANP", StringComparison.OrdinalIgnoreCase))
+            system.Memory.IopWrite32(0xBF801450, SystemMemory.IopIoIntrmanConfigDefault);
+        else if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
+            system.Memory.IopWrite32(0xBF801450, 0);
+
         if (!PrepareModuleEntry(iop, id, system.Memory))
             return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
 
@@ -698,6 +705,18 @@ public sealed class IopModuleHost
         if (_pendingLiteralId == id)
             ClearPendingLiteralEntry();
 
+        // After SIFMAN/SIFCMD/_start, present EE-visible SMFLAG bits those modules would post
+        // once SIF DMA is fully live. Without this, sibling IRX and EE pollers wait forever
+        // when the literal path finishes _start without a visible SMFLAG store.
+        if (insns > 0)
+        {
+            if (string.Equals(m.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
+                system.Sif.ApplySifInit();
+            else if (string.Equals(m.Name, "SIFCMD", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(m.Name, "SIFINIT", StringComparison.OrdinalIgnoreCase))
+                system.Sif.ApplyCmdInit();
+        }
+
         // LOADCORE deliberately never returns from _start — parks in a tight branch after
         // installing the module manager (`sb status; j that; nop`). Only treat as resident
         // success when the loop is **inside this module's own image** (not EXCEPMAN's default
@@ -744,17 +763,34 @@ public sealed class IopModuleHost
             }
         }
 
-        bool ok = insns > 0 && (returned || budget || residentSpin);
+        // SIFCMD/SIFINIT _start can park in WaitSema / SIF-poll paths that need a live IOP
+        // interrupt schedule (other threads + IRQs). Under sequential BootIopBtConfLiteral we
+        // never deliver those IRQs, so the wait never completes. After a substantial quanta
+        // with exports already linked, treat budget as resident success — the module image is
+        // up; remaining waits belong to the runtime scheduler (WP-10/11), not cold start.
+        bool bootQuantaResident = false;
+        if (budget && !returned && insns >= 10_000 &&
+            (string.Equals(m.Name, "SIFCMD", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(m.Name, "SIFINIT", StringComparison.OrdinalIgnoreCase)))
+        {
+            returned = true;
+            budget = false;
+            bootQuantaResident = true;
+        }
+
+        bool ok = insns > 0 && (returned || budget || residentSpin || bootQuantaResident);
         return new ModuleRunResult
         {
             Success = ok,
-            Message = returned && residentSpin
-                ? $"resident spin at pc=0x{iop.PC:X8} after {insns} insn"
-                : returned
-                    ? $"returned to sentinel after {insns} insn"
-                    : budget
-                        ? $"hit budget {maxInstructions} after {insns} insn"
-                        : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
+            Message = bootQuantaResident
+                ? $"boot quanta resident (IRQ wait) pc=0x{iop.PC:X8} after {insns} insn"
+                : returned && residentSpin
+                    ? $"resident spin at pc=0x{iop.PC:X8} after {insns} insn"
+                    : returned
+                        ? $"returned to sentinel after {insns} insn"
+                        : budget
+                            ? $"hit budget {maxInstructions} after {insns} insn"
+                            : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
             ModuleId = id,
             Name = m.Name,
             EntryPc = entryPhys,

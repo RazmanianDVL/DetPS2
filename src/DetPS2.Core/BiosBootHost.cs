@@ -597,6 +597,14 @@ public sealed class BiosBootHost
                     sys.IopModules.TryGetIrx(mid, out var irx) &&
                     irx.HasImage && irx.Entry != 0)
                 {
+                    // INTRMANP (PRId≥16) needs 0x1F801450 bit3 set; SIFMAN needs it clear.
+                    // Retail ROM/SSBUS leaves bit3 set through interrupt bring-up then SIF
+                    // sees the post-intrman clear. Mirror that between these two modules.
+                    if (string.Equals(name, "INTRMANP", StringComparison.OrdinalIgnoreCase))
+                        sys.Memory.IopWrite32(0xBF801450, SystemMemory.IopIoIntrmanConfigDefault);
+                    else if (string.Equals(name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
+                        sys.Memory.IopWrite32(0xBF801450, 0);
+
                     var run = sys.IopModules.StartLoadedModule(sys, mid, maxInsnPerModule);
                     execInsns = run.InstructionsExecuted;
                     started = run.Success && run.InstructionsExecuted > 0;

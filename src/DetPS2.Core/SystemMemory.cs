@@ -101,6 +101,9 @@ public sealed class SystemMemory
         // Indices are offsets from IOP_IO_BASE (0x1F801000).
         // 0x1F801450 — INTRMANP PS2-mode / board-ID bit 3 must be set for full init.
         _iopIo[0x450 / 4] = IopIoIntrmanConfigDefault;
+        // 0x1F801078 — INTRMAN ICTRL/status. Query paths return KE_CPUDI (-102) when 0;
+        // non-zero = "interrupts not globally disabled" so SIFCMD init does not spin.
+        _iopIo[0x078 / 4] = 0x00000400u;
         // Common DMAC master-enable / DPCR-ish defaults so DMACMAN/SIFMAN stores stick.
         _iopIo[0x0F0 / 4] = 0x07777777u;
         _iopIo[0x570 / 4] = 0x07777777u;
