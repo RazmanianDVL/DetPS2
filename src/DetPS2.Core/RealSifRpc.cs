@@ -258,6 +258,16 @@ public sealed class RealSifRpc
     public long Bo2GameBg2StreamedBytes { get; private set; }
 
     /// <summary>
+    /// WAVE-5: honest FILEIO bytes read for BO2 LIST.TXT (entity type list after Creating main layer).
+    /// </summary>
+    public long Bo2ListTxtBytesRead { get; private set; }
+
+    /// <summary>
+    /// WAVE-5: honest FILEIO bytes read for BO2 ENGLISH.DIR (locale after LIST).
+    /// </summary>
+    public long Bo2EnglishDirBytesRead { get; private set; }
+
+    /// <summary>
     /// WAVE-3: issue a game-initiated PRECODE/CODE/MAINMENU .BG2 open (countSectors:true)
     /// when the EE usebigfile path is blocked post-InMap. Uses the same TryOpenBo2RealBg2
     /// path as IOPFILE/FILEIO — not a fake stub, real disc bytes + honest sector credit.
@@ -461,6 +471,9 @@ public sealed class RealSifRpc
     private readonly Dictionary<uint, byte[]> _fioEeArgSnap = new();
     /// <summary>Last successful FILEIO open fd (SN wrapper omits fd on lseek/write/read).</summary>
     private int _fioLastFd = -1;
+    /// <summary>WAVE-5: last FILEIO fd for BO2 LIST.TXT / ENGLISH.DIR (path-matched).</summary>
+    private int _bo2ListTxtFd = -1;
+    private int _bo2EnglishDirFd = -1;
     /// <summary>
     /// FILEIO module ≥2200 (IOPRP2.2+/Play! <c>CFileIoHandler2200</c>): EE result buffer
     /// pointers registered by fno=255 Init. Replies are written here and the command
@@ -538,6 +551,8 @@ public sealed class RealSifRpc
         Bo2PackResidentOpens = 0;
         Bo2GameBg2Opens = 0;
         Bo2GameBg2StreamedBytes = 0;
+        Bo2ListTxtBytesRead = 0;
+        Bo2EnglishDirBytesRead = 0;
         _goeArchiveFd = -1;
         _goeArchiveSize = 0;
         _goeArchiveDiscByteOffset = 0;
@@ -554,6 +569,8 @@ public sealed class RealSifRpc
         _argBufToEeSend.Clear();
         _fioEeArgSnap.Clear();
         _fioLastFd = -1;
+        _bo2ListTxtFd = -1;
+        _bo2EnglishDirFd = -1;
         _fio2200ResultPtr0 = 0;
         _fio2200ResultPtr1 = 0;
         _fio2200Armed = false;
@@ -1448,7 +1465,21 @@ public sealed class RealSifRpc
                         Console.Error.WriteLine($"[FILEIO] open STUB path=\"{path}\" fd={openRes}");
                 }
                 if (openRes >= 0)
+                {
                     _fioLastFd = openRes;
+                    // WAVE-5: track LIST.TXT / ENGLISH.DIR FDs for Soft-GS residual gating.
+                    // Clear stale fd when recycled (LIST close then ENGLISH reuses same fd#).
+                    if (_bo2ListTxtFd == openRes
+                        && !path.Contains("LIST.TXT", StringComparison.OrdinalIgnoreCase))
+                        _bo2ListTxtFd = -1;
+                    if (_bo2EnglishDirFd == openRes
+                        && !path.Contains("ENGLISH.DIR", StringComparison.OrdinalIgnoreCase))
+                        _bo2EnglishDirFd = -1;
+                    if (path.Contains("LIST.TXT", StringComparison.OrdinalIgnoreCase))
+                        _bo2ListTxtFd = openRes;
+                    if (path.Contains("ENGLISH.DIR", StringComparison.OrdinalIgnoreCase))
+                        _bo2EnglishDirFd = openRes;
+                }
                 // Preload of disc-backed open (FileOpen may load ≤16MiB into host memory) is real
                 // ISO traffic; count once at open so blocker-trace sees cdvdSectors before first read.
                 uint openedSz = 0;
@@ -1617,9 +1648,19 @@ public sealed class RealSifRpc
                     // Credit sectors for large disc-backed full reads (LIST.TXT / ENGLISH.DIR).
                     cdvd.NoteHostReadSectors((nRead + 2047) / 2048);
                 }
+                // WAVE-5: honest LIST.TXT / ENGLISH.DIR stream counters (mainmenu-bg2 residual).
+                if (nRead > 0)
+                {
+                    if (fd == _bo2ListTxtFd)
+                        Bo2ListTxtBytesRead += nRead;
+                    if (fd == _bo2EnglishDirFd)
+                        Bo2EnglishDirBytesRead += nRead;
+                }
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                     Console.Error.WriteLine(
-                        $"[FILEIO] read fd={fd} buf=0x{buf:X8} size={size} result={nRead} send={sendSize} fio2200={read2200}");
+                        $"[FILEIO] read fd={fd} buf=0x{buf:X8} size={size} result={nRead} send={sendSize} fio2200={read2200}"
+                        + (fd == _bo2ListTxtFd && nRead > 0 ? $" LIST.TXT total={Bo2ListTxtBytesRead}" : "")
+                        + (fd == _bo2EnglishDirFd && nRead > 0 ? $" ENGLISH.DIR total={Bo2EnglishDirBytesRead}" : ""));
                 // Play! delays READ reply one frame (SotC relies on EE reschedule).
                 if (read2200)
                 {
