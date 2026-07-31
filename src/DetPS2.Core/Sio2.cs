@@ -4,25 +4,37 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// SIO2 bus HLE (pad / multitap / memory card) — contract surface that retail
-/// <c>rom0:SIO2MAN</c> + <c>PADMAN</c> / <c>MCSERV</c> drive.
+/// <c>rom0:SIO2MAN</c> + <c>PADMAN</c> / <c>MCSERV</c> drive when IRX runs on the IOP.
 ///
 /// <para><b>Not</b> cycle-accurate IOP R3000 of SIO2MAN.IRX. Models the transfer/ctrl
 /// contracts those modules expect: SPI device framing (addr + cmd), DualShock config FSM,
-/// memcard probe/specs stubs, CTRL start + STAT ready, port/slot select.</para>
+/// memcard probe/specs stubs, CTRL start + STAT ready, SEND3 command queue, port/slot select,
+/// and transfer-complete iStat (IOP INTC line 17).</para>
 ///
-/// <para>MMIO base <see cref="MmioBase"/> is a DetPS2 EE/test alias of IOP
-/// <c>0x1F808200</c> (PCSX2 <c>Sio2</c>). Compact offsets keep Phase-31 smokes working;
-/// real-relative aliases (+0x60 DATA_IN, +0x64 DATA_OUT, +0x68 CTRL, +0x6C CMD_STAT) are
-/// also accepted. See <c>docs/bios-ports/SIO2MAN.md</c>.</para>
+/// <para>Two address windows:</para>
+/// <list type="bullet">
+/// <item><see cref="IopPhysBase"/> <c>0x1F808200</c> — real IOP map (SEND3 @ +0x00…3C, DATA_IN @ +0x60).
+///   PADMAN/SIO2MAN IRX program this via KSEG1 <c>0xBF808200</c> (phys after mask).</item>
+/// <item><see cref="MmioBase"/> <c>0x1000F600</c> — DetPS2 EE/test compact alias (Phase-31 smokes);
+///   +0x00 DATA, +0x04 STAT/CTRL, +0x08 port/slot; real-relative aliases also accepted at +0x60+.</item>
+/// </list>
+/// See <c>docs/irx/SIO2_PAD_DEVICE.md</c> and <c>docs/bios-ports/SIO2MAN.md</c>.
 /// </summary>
 public sealed class Sio2
 {
-    /// <summary>DetPS2 EE/test MMIO base (IOP real = 0x1F808200).</summary>
+    /// <summary>DetPS2 EE/test MMIO base (compact alias of IOP hardware).</summary>
     public const uint MmioBase = 0x1000F600;
+
+    /// <summary>Real IOP SIO2 physical base (PCSX2 <c>Sio2</c> / SIO2MAN).</summary>
+    public const uint IopPhysBase = 0x1F808200;
+
+    /// <summary>IOP INTC IRQ line raised on transfer complete (PCSX2 <c>iopIntcIrq(17)</c>).</summary>
+    public const int IopTransferIrqLine = 17;
 
     // Device addresses (first TX byte) — BlueRetro / PCSX2 SioMode
     public const byte AddrPad = 0x01;
     public const byte AddrMultitap = 0x21;
+    public const byte AddrInfrared = 0x61;
     public const byte AddrMemcard = 0x81;
 
     // Pad commands
@@ -55,12 +67,21 @@ public sealed class Sio2
     // CTRL / STAT bits (Sio2Ctrl / simplified ready)
     public const uint CtrlStartTransfer = 0x1;
     public const uint CtrlReset = 0xC;
+    public const uint CtrlSio2manReset = 0x000003BC;
     public const uint StatTxReady = 0x1000;
     public const uint StatRxReady = 0x2000;
     public const uint CmdStatConnected = 0x1100;
     public const uint CmdStatDisconnected = 0x1D100;
     public const uint CmdStatNoDevicesMissing = 0x1000;
     public const uint CmdStatOnePortOpen = 0x100;
+    public const uint CmdStatTwoPortsOpen = 0x200;
+    public const uint CmdStatPort1Missing = 0x1D000;
+    public const uint CmdStatPort2Missing = 0x2D000;
+
+    // SEND3 command descriptor (Sio2Cmd)
+    public const uint Send3PortMask = 0x1;
+    public const uint Send3LengthMask = 0x3FF;
+    public const int Send3LengthShift = 8;
 
     private readonly byte[] _inFifo = new byte[256];
     private readonly byte[] _outFifo = new byte[256];
@@ -74,14 +95,23 @@ public sealed class Sio2
     // Per-port DualShock config FSM (PADMAN open path: find → config → mode → act → exit)
     private readonly PadWireState[] _wire = new PadWireState[2];
 
-    private uint _ctrl = 0x000003BC; // Sio2Ctrl::SIO2MAN_RESET
+    private uint _ctrl = CtrlSio2manReset;
     private uint _cmdStat = CmdStatDisconnected;
     private uint _portStat = 0xF;
     private uint _fifoStat;
+    private uint _iStat; // bit0 = transfer complete IRQ sticky (PCSX2 iStat)
     private readonly uint[] _send3 = new uint[16];
     private readonly uint[] _portCtrl0 = new uint[4];
     private readonly uint[] _portCtrl1 = new uint[4];
     private byte _mcTerminator = 0x55;
+
+    // SEND3 queue state (PCSX2 Sio2 SoftReset/Write model, batch-friendly)
+    private int _queuePosition;
+    private int _commandLength;
+    private bool _queueComplete;
+
+    /// <summary>True when SEND3[0] length was 0 (queue complete / no more descriptors).</summary>
+    public bool Send3QueueComplete => _queueComplete;
 
     public ulong Transfers { get; private set; }
     public ulong Commands { get; private set; }
@@ -94,6 +124,21 @@ public sealed class Sio2
     public uint CmdStat => _cmdStat;
 
     public uint Ctrl => _ctrl;
+
+    /// <summary>iStat after last transfer (bit0 set = IRQ pending until cleared).</summary>
+    public uint IStat => _iStat;
+
+    /// <summary>True when transfer-complete bit is set (IOP INTC line <see cref="IopTransferIrqLine"/>).</summary>
+    public bool TransferIrqPending => (_iStat & 1u) != 0;
+
+    /// <summary>
+    /// Optional hook when a transfer completes with iStat bit0 set.
+    /// Wire to IOP INTC raise(17) when that surface exists (T1/T2 handoff).
+    /// </summary>
+    public Action? OnTransferComplete { get; set; }
+
+    /// <summary>Last programmed SEND3[0] command length (bytes), or 0 if unused.</summary>
+    public int LastSend3CommandLength => _commandLength;
 
     public Sio2()
     {
@@ -120,12 +165,14 @@ public sealed class Sio2
         _port = _slot = 0;
         Array.Clear(_inFifo);
         Array.Clear(_outFifo);
-        _ctrl = 0x000003BC;
+        _ctrl = CtrlSio2manReset;
         _cmdStat = CmdStatDisconnected;
         _portStat = 0xF;
         _fifoStat = 0;
+        _iStat = 0;
         _mcTerminator = 0x55;
         LastTransferConnected = false;
+        SoftResetQueue();
         for (int i = 0; i < _wire.Length; i++)
             _wire[i].Reset();
         Array.Clear(_send3);
@@ -146,8 +193,46 @@ public sealed class Sio2
         return w.ModeId;
     }
 
+    /// <summary>
+    /// Map a physical or KSEG-mapped IOP address onto a SIO2 real-map offset.
+    /// <c>0xBF808200</c> and <c>0x1F808200</c> both resolve (mask to 0x1FFFFFFF).
+    /// </summary>
+    public static bool TryGetIopOffset(uint address, out uint offset)
+    {
+        uint p = address & 0x1FFFFFFFu;
+        if (p >= IopPhysBase && p < IopPhysBase + 0x100)
+        {
+            offset = p - IopPhysBase;
+            return true;
+        }
+        offset = 0;
+        return false;
+    }
+
+    /// <summary>True if <paramref name="address"/> targets the real IOP SIO2 window.</summary>
+    public static bool IsIopAddress(uint address) => TryGetIopOffset(address, out _);
+
+    /// <summary>
+    /// Encode a SEND3 descriptor: port in bit0, length in bits 8..17 (0x3FF).
+    /// </summary>
+    public static uint EncodeSend3(int port, int length) =>
+        ((uint)(port & 1)) | (((uint)length & Send3LengthMask) << Send3LengthShift);
+
+    /// <summary>Program SEND3[index] and, for index 0, soft the command queue (PCSX2 SetCmd).</summary>
+    public void ProgramSend3(int index, int port, int length)
+    {
+        if ((uint)index >= 16) return;
+        WriteSend3(index, EncodeSend3(port, length));
+    }
+
+    /// <summary>Clear transfer-complete iStat bit (software ack before next packet).</summary>
+    public void ClearTransferIrq() => _iStat = 0;
+
     public uint ReadRegister(uint address)
     {
+        if (TryGetIopOffset(address, out uint ioff))
+            return ReadReal(ioff);
+
         uint off = address - MmioBase;
         return off switch
         {
@@ -156,8 +241,7 @@ public sealed class Sio2
             0x04 => ReadStatCompact(),
             0x08 => MultitapEnabled ? 1u : 0u,
 
-            // Real-relative SEND3 queue (0x00-0x3C) — already covered at 0 for DATA;
-            // queue entries only via +0x04.. when not conflicting: expose via 0x10+ for tests
+            // Partial SEND3 aliases on compact base (legacy tests / older smokes)
             0x10 => _send3[0],
             0x14 => _send3[1],
             0x18 => _send3[2],
@@ -172,7 +256,7 @@ public sealed class Sio2
             0x58 => _portCtrl1[2],
             0x5C => _portCtrl1[3],
 
-            // Real-relative DATA_OUT / CTRL / STAT
+            // Real-relative aliases on compact base (pre-WP-21 smokes)
             0x60 => 0, // DATA_IN write-only
             0x64 => ReadDataOut(),
             0x68 => _ctrl,
@@ -181,23 +265,29 @@ public sealed class Sio2
             0x74 => _fifoStat,
             0x78 => (uint)_outPos,
             0x7C => (uint)_outLen,
+            0x80 => _iStat,
             _ => 0
         };
     }
 
     public void WriteRegister(uint address, uint value)
     {
+        if (TryGetIopOffset(address, out uint ioff))
+        {
+            WriteReal(ioff, value);
+            return;
+        }
+
         uint off = address - MmioBase;
         switch (off)
         {
             case 0x00: // DATA in (compact)
-            case 0x60: // DATA_IN (real)
-                if (_inLen < _inFifo.Length)
-                    _inFifo[_inLen++] = (byte)value;
+            case 0x60: // DATA_IN (real-relative on compact base)
+                PushDataIn((byte)value);
                 break;
 
             case 0x04: // CTRL compact / start
-            case 0x68: // CTRL real
+            case 0x68: // CTRL real-relative
                 WriteCtrl(value);
                 break;
 
@@ -210,7 +300,7 @@ public sealed class Sio2
             case 0x14:
             case 0x18:
             case 0x1C:
-                _send3[(off - 0x10) / 4] = value;
+                WriteSend3((int)((off - 0x10) / 4), value);
                 break;
 
             case 0x40:
@@ -233,7 +323,109 @@ public sealed class Sio2
             case 0x6C:
                 _cmdStat = value;
                 break;
+
+            case 0x80:
+                // Write-1-clear style for bit0 (also accept full zero clear)
+                _iStat &= ~value;
+                break;
         }
+    }
+
+    /// <summary>Real IOP register map (offsets from <see cref="IopPhysBase"/>).</summary>
+    private uint ReadReal(uint off)
+    {
+        if (off <= 0x3C && (off & 3) == 0)
+            return _send3[off / 4];
+        return off switch
+        {
+            0x40 => _portCtrl0[0],
+            0x44 => _portCtrl0[1],
+            0x48 => _portCtrl0[2],
+            0x4C => _portCtrl0[3],
+            0x50 => _portCtrl1[0],
+            0x54 => _portCtrl1[1],
+            0x58 => _portCtrl1[2],
+            0x5C => _portCtrl1[3],
+            0x60 => 0, // DATA_IN write-only
+            0x64 => ReadDataOut(),
+            0x68 => _ctrl,
+            0x6C => _cmdStat,
+            0x70 => _portStat,
+            0x74 => _fifoStat,
+            0x78 => (uint)_outPos,
+            0x7C => (uint)Math.Max(0, _outLen - _outPos),
+            0x80 => _iStat,
+            _ => 0
+        };
+    }
+
+    private void WriteReal(uint off, uint value)
+    {
+        if (off <= 0x3C && (off & 3) == 0)
+        {
+            WriteSend3((int)(off / 4), value);
+            return;
+        }
+
+        switch (off)
+        {
+            case 0x40:
+            case 0x44:
+            case 0x48:
+            case 0x4C:
+                _portCtrl0[(off - 0x40) / 4] = value;
+                if (off == 0x40)
+                    _port = (int)(value & 1);
+                break;
+            case 0x50:
+            case 0x54:
+            case 0x58:
+            case 0x5C:
+                _portCtrl1[(off - 0x50) / 4] = value;
+                break;
+            case 0x60:
+                PushDataIn((byte)value);
+                break;
+            case 0x68:
+                WriteCtrl(value);
+                break;
+            case 0x6C:
+                _cmdStat = value;
+                break;
+            case 0x80:
+                _iStat &= ~value;
+                break;
+        }
+    }
+
+    private void WriteSend3(int index, uint value)
+    {
+        if ((uint)index >= 16) return;
+        _send3[index] = value;
+        // PCSX2: writing SEND3[0] soft-resets the command queue for the next packet.
+        if (index == 0)
+        {
+            SoftResetQueue();
+            _port = (int)(value & Send3PortMask);
+            _commandLength = (int)((value >> Send3LengthShift) & Send3LengthMask);
+            if (_commandLength == 0)
+                _queueComplete = true;
+        }
+    }
+
+    private void SoftResetQueue()
+    {
+        _queuePosition = 0;
+        _commandLength = 0;
+        _queueComplete = false;
+        // Leftover TX from a prior packet is discarded (PCSX2 SoftReset clears g_Sio2FifoIn).
+        // Do not clear RX here — DMA12 may still be draining.
+    }
+
+    private void PushDataIn(byte value)
+    {
+        if (_inLen < _inFifo.Length)
+            _inFifo[_inLen++] = value;
     }
 
     private void WriteCtrl(uint value)
@@ -243,7 +435,8 @@ public sealed class Sio2
             _inLen = _outLen = _outPos = 0;
             Array.Clear(_inFifo);
             Array.Clear(_outFifo);
-            _ctrl = 0x000003BC;
+            _ctrl = CtrlSio2manReset;
+            SoftResetQueue();
             return;
         }
 
@@ -276,7 +469,22 @@ public sealed class Sio2
         {
             _cmdStat = CmdStatDisconnected;
             LastTransferConnected = false;
+            SignalTransferComplete();
             return;
+        }
+
+        // Apply SEND3[0] port/length when programmed (SIO2MAN always does this).
+        if (_send3[0] != 0)
+        {
+            _port = (int)(_send3[0] & Send3PortMask);
+            int len = (int)((_send3[0] >> Send3LengthShift) & Send3LengthMask);
+            if (len > 0)
+            {
+                _commandLength = len;
+                // Clamp TX to declared command length (DMA block may be larger / padded).
+                if (_inLen > len)
+                    _inLen = len;
+            }
         }
 
         Commands++;
@@ -293,6 +501,13 @@ public sealed class Sio2
             case AddrMultitap: // 0x21
                 ProcessMultitapTransfer();
                 break;
+            case AddrInfrared: // 0x61 — no device; silent bus
+                EmitByte(0xFF);
+                while (_outLen < _inLen)
+                    EmitByte(0xFF);
+                _cmdStat = CmdStatDisconnected;
+                LastTransferConnected = false;
+                break;
             case AddrMemcard:
                 ProcessMemcardTransfer();
                 break;
@@ -307,6 +522,25 @@ public sealed class Sio2
         _inLen = 0;
         // Clear START bit after transfer (hardware auto-clears)
         _ctrl &= ~CtrlStartTransfer;
+        // Advance SEND3 queue position (single-descriptor HLE; multi-slot drain residual)
+        if (_send3[0] != 0)
+            _queuePosition = Math.Min(15, _queuePosition + 1);
+        SignalTransferComplete();
+    }
+
+    private void SignalTransferComplete()
+    {
+        // PCSX2: Interrupt() on START_TRANSFER if iStat was clear.
+        if (_iStat == 0)
+        {
+            _iStat = 1;
+            OnTransferComplete?.Invoke();
+        }
+        else
+        {
+            // Already pending — still set bit; avoid double-callback storm.
+            _iStat |= 1;
+        }
     }
 
     private void ProcessPadTransfer(bool hasAddressByte)
@@ -320,7 +554,8 @@ public sealed class Sio2
             // Missing pad: entire response high-Z
             for (int i = 0; i < Math.Max(1, _inLen); i++)
                 EmitByte(0xFF);
-            _cmdStat = CmdStatDisconnected | CmdStatOnePortOpen;
+            _cmdStat = CmdStatDisconnected | CmdStatOnePortOpen
+                       | (portIdx == 0 ? CmdStatPort1Missing : CmdStatPort2Missing);
             LastTransferConnected = false;
             return;
         }
@@ -664,7 +899,7 @@ public sealed class Sio2
         }
         _cmdStat = MultitapEnabled
             ? CmdStatConnected | CmdStatNoDevicesMissing | CmdStatOnePortOpen
-            : CmdStatDisconnected;
+            : CmdStatDisconnected | CmdStatPort1Missing;
         LastTransferConnected = MultitapEnabled;
     }
 
@@ -706,18 +941,21 @@ public sealed class Sio2
                 _fifoStat = 0x8B;
                 break;
             case CmdMcGetSpecs: // 0x26
-                // Specs: page size 512, block size stub, pages, etc.
-                EmitByte(0x2B);
-                EmitByte(0x00);
-                EmitByte(0x02); // page size lo (512)
-                EmitByte(0x00); // page size hi
-                EmitByte(0x00);
-                EmitByte(0x20); // pages lo (8192 pages ~4MB class stub)
-                EmitByte(0x00);
-                EmitByte(0x00);
-                EmitByte(0x00);
-                EmitByte(_mcTerminator);
-                _fifoStat = 0x83;
+                // Specs: page size 512, pages — align with MemoryCard.DefaultPages when possible
+                {
+                    int pages = MemoryCard.DefaultPages;
+                    EmitByte(0x2B);
+                    EmitByte(0x00);
+                    EmitByte(0x02); // page size lo (512)
+                    EmitByte(0x00); // page size hi
+                    EmitByte((byte)(pages & 0xFF));
+                    EmitByte((byte)((pages >> 8) & 0xFF));
+                    EmitByte((byte)((pages >> 16) & 0xFF));
+                    EmitByte(0x00);
+                    EmitByte(0x00);
+                    EmitByte(_mcTerminator);
+                    _fifoStat = 0x83;
+                }
                 break;
             case CmdMcSetTerminator: // 0x27
                 if (_inLen > 2)
@@ -763,6 +1001,15 @@ public sealed class Sio2
         // Port 1 with multitap array: use index 1 if available and no multitap
         if (!MultitapEnabled && _port == 1 && _multitapPads != null && _multitapPads.Length > 1)
             return _multitapPads[1];
+        // Port 1 without second pad: only port 0 has the primary attach
+        if (_port == 1 && (_multitapPads == null || _multitapPads.Length < 2))
+        {
+            // Still return primary pad for single-controller HLE if only one attached —
+            // real hardware would be empty; SIO2MAN find-pad on port1 gets disconnect.
+            // Prefer accurate missing when no multitap array was provided as dual pads.
+            if (_multitapPads == null)
+                return null;
+        }
         return _pad;
     }
 
@@ -780,6 +1027,31 @@ public sealed class Sio2
         ProcessTransfer();
         byte[] r = new byte[_outLen];
         Buffer.BlockCopy(_outFifo, 0, r, 0, _outLen);
+        return r;
+    }
+
+    /// <summary>
+    /// PADMAN/SIO2MAN-shaped transfer via real SEND3 descriptor + IOP register window.
+    /// Programs SEND3[0] = (port | length&lt;&lt;8), pushes TX into DATA_IN, pulses CTRL start,
+    /// drains DATA_OUT. Exercises the path IRX will use once SystemMemory wires 0x1F808200.
+    /// </summary>
+    public byte[] TransactIop(int port, ReadOnlySpan<byte> cmd)
+    {
+        ClearTransferIrq();
+        ProgramSend3(0, port, cmd.Length);
+        // Terminator entry so multi-command queue drain stops
+        if (_send3.Length > 1)
+            _send3[1] = 0;
+
+        foreach (byte b in cmd)
+            WriteRegister(IopPhysBase + 0x60, b);
+
+        WriteRegister(IopPhysBase + 0x68, CtrlStartTransfer);
+
+        int n = Math.Max(_outLen, cmd.Length);
+        byte[] r = new byte[n];
+        for (int i = 0; i < n; i++)
+            r[i] = (byte)ReadRegister(IopPhysBase + 0x64);
         return r;
     }
 
@@ -808,6 +1080,12 @@ public sealed class Sio2
         // Exit config
         Transact(new byte[] { 0x01, 0x43, 0x00, 0x00, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A });
     }
+
+    /// <summary>
+    /// Snapshot of active-low button word as PADMAN DMA <c>padButtonStatus.btns</c> expects.
+    /// </summary>
+    public static ushort ActiveLowButtons(PadInput pad) =>
+        (ushort)(~pad.Buttons & 0xFFFF);
 
     private sealed class PadWireState
     {

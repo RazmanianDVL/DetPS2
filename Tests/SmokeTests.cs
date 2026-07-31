@@ -766,6 +766,9 @@ public static class SmokeTests
             Dmac_GifPath3_UsesStartMadr();
 
             Iop_HandAssembledLoop_Deterministic();
+            IopExecSmokes.HandAssembledLoop_UsesRunInstructions();
+            IopExecSmokes.RunInstructions_1k_Deterministic();
+            IopExecSmokes.SyscallBreak_VectorRfe_Returns();
             Sif_DmaRoundTrip_UpdatesMemory();
             Timer_CompareRaisesIntc_EeSeesCop0();
             Timer_ModeFlags_CompareOverflow_W1C();
