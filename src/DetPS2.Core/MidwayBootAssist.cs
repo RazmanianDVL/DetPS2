@@ -742,19 +742,23 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_500_000) return;
         if (sys.Gif.Path3Transfers >= 11) return;
         if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
-        // Group-6 multi already filled: stay in pump/pad; main re-entry only harms pad ghosts.
-        if (sys.Memory.Read32(0x0075E950) == 0x0043F920u) return;
+        // Group-6 multi already filled: stay in pump/pad once spine is moving.
+        if (sys.Memory.Read32(0x0075E950) == 0x0043F920u
+            && sys.Gif.Path3Transfers >= 8) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
-        // Productive post-WAD bands — NEVER kick (live regression → title-hash / open-bus).
-        // pad-poll multi 0x4275xx, frame-cb dispatch 0x4156xx, stream tick 0x43F9xx.
-        if (pc is (>= 0x00427500 and <= 0x004276A0)
+        // Productive post-WAD bands — NEVER kick once Path3 left logo clear.
+        // Wave-14: when gifP3<=5 those bands are not productive logo spine — allow one main kick.
+        bool productiveBand = pc is (>= 0x00427500 and <= 0x004276A0)
             or (>= 0x00415600 and <= 0x00415780)
             or (>= 0x0043F800 and <= 0x0043FC00)
-            or (>= 0x0043CB00 and <= 0x0043CD00)) return;
+            or (>= 0x0043CB00 and <= 0x0043CD00);
+        bool allowSpineKickFromProductive = sys.Gif.Path3Transfers <= 5 && _logoSpineKicks == 0
+            && sys.Cdvd.SectorsRead >= 180_000;
+        if (productiveBand && !allowSpineKickFromProductive) return;
         // True residual thrash only: empty ADX lock-wait / pump entry, syscall stub table.
-        // Exclude productive ADX title 0x4148xx..0x414Axx and frame path above.
-        bool inPostWadThrash = pc is (>= 0x00414480 and <= 0x00414550) // lock-wait
+        bool inPostWadThrash = (productiveBand && allowSpineKickFromProductive)
+            || pc is (>= 0x00414480 and <= 0x00414550) // lock-wait
             or (>= 0x00414980 and <= 0x00414A80) // ReferThreadStatus thrash
             or (>= 0x0047FD00 and <= 0x0047FF80)
             or (>= 0x00418000 and <= 0x00419000);
@@ -763,10 +767,22 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // After bulk WAD, prefer ADX pump / pad-poll over Midway main — main re-entry
         // storms IOPRP gen≥2 and outer-list thrash (live: kick@59.9M → 0x474Cxx).
         // Prefer natural stack return into main body only when still pre-WAD-cold.
+        //
+        // Wave-14: when Soft-GS is still logo-clear (gifP3<=5) after full WAD, tip no longer
+        // hits the accidental AdEL GAMEDATA wild jump that re-homed to Midway main and
+        // lifted Path3 5->8->11. One deliberate main re-entry (cdvd>=180k) mirrors that
+        // rescue; further kicks still prefer pump.
         uint resume = 0;
         uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
         bool bulkWad = sys.Cdvd.SectorsRead >= 100_000;
-        if (!bulkWad && sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
+        bool needMainForSpine = sys.Gif.Path3Transfers <= 5 && _logoSpineKicks == 0
+            && sys.Cdvd.SectorsRead >= 180_000
+            && sys.Memory.Read32(0x00212F70) == 0x27BDFEE0;
+        if (needMainForSpine)
+        {
+            resume = 0x00212F70;
+        }
+        else if (!bulkWad && sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE)
         {
             for (uint off = 0; off <= 0x80; off += 4)
             {
@@ -913,9 +929,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Jumping back to that EPC re-faults forever. Only when EPC is clearly data-as-code
         // (unaligned / past RDRAM / ASCII word), re-home to real EE code. Empty/low EPC keeps
         // the historical early-out (do not force Midway main — WAD regression).
+        // Wave-14 CRITICAL: do NOT use LooksLikeAsciiWord on aligned EPC — many real
+        // EE code PCs match >=3 printable bytes (0x00414A30='0JA') and that re-home
+        // mid-WAD collapsed cdvd 198840->1. Data-as-code = unaligned or past RDRAM only.
         bool epcDataAsCode = (epc & 3) != 0
-            || epc >= (uint)SystemMemory.RDRAM_SIZE
-            || LooksLikeAsciiWord(epc);
+            || epc >= (uint)SystemMemory.RDRAM_SIZE;
         if (epcDataAsCode)
         {
             ulong resume = 0;
@@ -962,17 +980,6 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         Assists++;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine($"[BIOS] escape stuck int vector -> EPC=0x{epc:X8} cyc={sys.MasterCycles}");
-    }
-
-    private static bool LooksLikeAsciiWord(uint word)
-    {
-        int printable = 0;
-        for (int i = 0; i < 4; i++)
-        {
-            byte b = (byte)(word >> (8 * i));
-            if (b is >= 0x20 and <= 0x7E) printable++;
-        }
-        return printable >= 3;
     }
 
     private static void WriteAsciiZ(SystemMemory mem, uint addr, string s, int maxLen)
@@ -1328,8 +1335,11 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Post-merge path parks in ADX/pad bands (0x414xxx/0x4275xx/0x429Cxx) at gifP3=5
         // without ever re-entering format/list-walk. After bulk WAD, force the same main
         // re-home menu6 used after format stall so logo spine can advance (gifP3 5→12).
-        if (c >= 58_000_000 && sys.Cdvd.SectorsRead >= 100_000
-            && sys.Gif.Path3Transfers < 11)
+        // Wave-14: also at ~50.5M when gifP3<=5 and WAD-scale CDVD done (historical AdEL
+        // timing). Require >=180k sectors so main re-entry cannot truncate GAMEDATA.
+        if (sys.Cdvd.SectorsRead >= 180_000 && sys.Gif.Path3Transfers < 11
+            && (c >= 58_000_000
+                || (c >= 50_500_000 && sys.Gif.Path3Transfers <= 5)))
             MaybeKickMainForLogoSpine(sys);
         // Pad inject START/CROSS after bulk WAD so title/menu can observe input.
         // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
@@ -1353,24 +1363,31 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeKickMainFromPumpThrash(sys);
         // Mirror FUN_0043ccf8 group-6 multi-slot registration (stream tick @ 0x43F920).
         // Live wall: *0x75E950 empty → pump is pure no-op while menu tick 0x54E600 climbs.
-        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        // Wave-14: wait for logo spine gifP3>=8 (or 72M fallback) so mid-spine main kick
+        // is not blocked by group-6 fill at gifP3=6.
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeFillGroup6MultiSlot(sys);
         // ADX init FUN_00414d40 @ cyc≈2.76M does `sw zero,0(0x75BDD8)` and never re-arms.
         // Pump path (0x414688/0x4148D8) jal 0x4156E0 → jalr *0x75BDD8; null = skip frame work.
         // Do NOT re-arm at 3M (empty group-6 thrash starved spine: gifP3 stuck 6). Wait for
         // bulk WAD + group-6 multi plant so the frame path has real work to dispatch.
-        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeRearmFrameCb(sys);
         // Stream work gate *0x55E1EC must stay 1 so FUN_0043FAE8 does not early-out.
         // Hold after multi+frame-cb plant (resource gate plants once; scrub re-opens).
-        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeHoldStreamWorkGate(sys);
         // Wave-8: minimal stream cookie *0x5BB860=1 (FUN_0043ccf8 arg / slot-style active).
-        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeInitStreamCookie(sys);
         // Wave-11: FUN_0043CD58 stream-manager defaults / one-shot force-call so FAE8 sees a
         // post-init header (ready *base+0x38=1). Slots still need FUN_0043C1C0 object bind.
-        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeInitStreamManager(sys);
         // Wave-12 REJECTED: synthetic stream slot0 plant (flag=1 + type5 stub @0x01FD5000 +
         // D6F8[0]) → EE death at 0x8000018x by ~80M (baseline FAE8@0x43FB40 healthy). Do not
