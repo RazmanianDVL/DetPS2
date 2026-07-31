@@ -758,6 +758,10 @@ public sealed class SonyKernelHle
                 result = 0;
                 break;
             case 0x04: // Exit / KExit
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[EE] Exit({a0}) pc=0x{ee.PC:X8} ra=0x{(uint)ee.GetGpr(31).Lo:X8} " +
+                        $"cyc={_system.MasterCycles}");
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1")
                     Console.Error.WriteLine($"[EXIT-SYSCALL] code={a0} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} tid={_kernel.CurrentThreadId} cyc={_system.MasterCycles}");
                 _system.Hle.RequestExit((int)a0);

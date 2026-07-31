@@ -111,6 +111,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _decPostMslHits;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
+    private int _postDisplayExitRescues;
 
     // DA post-gameart display pump (live 2026-07-31 @20M):
     // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
@@ -184,6 +185,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decPostMslHits = 0;
         _lastDisplayHead = 0;
         _displayHeadMoves = 0;
+        _postDisplayExitRescues = 0;
         _openSendRetargetPlanted = false;
     }
 
@@ -234,6 +236,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryBridgeDaMflCallRpcArg(sys);
             TryKickDaPostWait(sys);
             TryEscapeDaDisplayQueueLock(sys);
+            TryRescueDaPostDisplayExit(sys);
         }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
         // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
@@ -635,9 +638,11 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// head/tail RDRAM with cmds 0x88000501 / 0x00000501 (type-1 VIF1 chain).
     /// Wave-1: clear lock so process can run (STFM + RDRAM queue ptrs).
     /// Wave-2: VIF1/GIF IRQ credit (no head plant — Exit). Head stuck on CHCR high-bit.
-    /// Wave-3: SHARED Dmac END ADDR=0 → inline DIRECT Path2; CHCR.TAG latch rejected
-    /// (honest 0xF000000B → IRQ success → Exit before chrome). Log head moves only.
-    /// Does not force wait status=4 (Exit). Does not invent Soft-GS pixels.
+    /// Wave-3: SHARED Dmac END ADDR=0 → inline DIRECT Path2; TAG latch deferred.
+    /// Wave-4: SHARED CHCR.nTAG latch (Play!) + high-RDRAM TTE drain so real IRQ
+    /// @0x1B261C can succeed. Do NOT plant head/done-bit (Exit). Do NOT thrash CIS
+    /// credits once TAG is honest (double-fire Exit residual). Sticky lock clear only.
+    /// Does not force wait status=4. Does not invent Soft-GS pixels.
     /// </summary>
     private void TryEscapeDaDisplayQueueLock(Ps2System sys)
     {
@@ -661,9 +666,14 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         {
             _displayHeadMoves++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _displayHeadMoves <= 16)
+            {
+                uint chcr = 0;
+                try { chcr = sys.Dmac.ReadRegister(0x10009000u); } catch { /* ignore */ }
                 Console.Error.WriteLine(
                     $"[MKFAM] DA display head move n={_displayHeadMoves} 0x{_lastDisplayHead:X8}->0x{head:X8} tail=0x{tail:X8} " +
-                    $"lock={lockVal} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                    $"lock={lockVal} vif1chcr=0x{chcr:X8} p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                    $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+            }
         }
         if (head != 0) _lastDisplayHead = head;
         if (head == tail
@@ -685,17 +695,25 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 _displayLockHits = 0;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && _displayLockEscapes <= 16)
+                {
+                    uint cmd0 = sys.Memory.Read32(head);
+                    uint cmd1 = (head + 8 <= tail) ? sys.Memory.Read32(head + 8) : 0;
+                    uint chcr = 0;
+                    try { chcr = sys.Dmac.ReadRegister(0x10009000u); } catch { /* ignore */ }
                     Console.Error.WriteLine(
                         $"[MKFAM] DA display-lock clear n={_displayLockEscapes} " +
-                        $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                        $"head=0x{head:X8} tail=0x{tail:X8} cmd0=0x{cmd0:X8} cmd1=0x{cmd1:X8} " +
+                        $"vif1chcr=0x{chcr:X8} p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                        $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                }
             }
-            lockVal = 0;
+            return;
         }
 
-        // Wave-2: after lock thrash with pending type-1 (0x88000501), credit VIF1/GIF
-        // CIS so the real DMA IRQ path @0x1B2588 can clear lock + advance head.
-        // Do NOT plant done-bit or advance head here — that caused Exit @0x80000200.
-        if (_displayCmdCompletes >= 32) return;
+        // Wave-4: CHCR.nTAG is latched honestly. Real DMA completion raises CIS once.
+        // Extra CreditOwedHandlerCall double-fires the handler and Exit'd before chrome
+        // (wave-2 invent class). Only enable channel IRQ masks if still masked — no credit.
+        if (_displayCmdCompletes >= 4) return;
         if (_displayLockEscapes < 1) return;
         if (sys.Dmac.IsActive(Dmac.Channel.VIF1) || sys.Dmac.IsActive(Dmac.Channel.GIF))
             return;
@@ -706,28 +724,116 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (cmdType != 1 && cmdType is not (0x80 or 0x81 or 0x82 or 0x83 or 0x8F or 0xFF))
             return;
 
-        // Throttle credits: every 2 lock clears once DMA idle.
-        if ((_displayLockEscapes - _displayCmdCompletes) < 1) return;
-
+        // One-shot: arm VIF1/GIF CIS mask so FinishChannel can deliver the real handler.
+        // No CreditOwedHandlerCall — that invented completions without TAG and Exit'd.
+        if (_displayCmdCompletes > 0) return;
         try
         {
-            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
-            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 2);
-            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
-            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 1);
+            if (!sys.Dmac.IsChannelIrqEnabled((int)Dmac.Channel.VIF1))
+                sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+            if (!sys.Dmac.IsChannelIrqEnabled((int)Dmac.Channel.GIF))
+                sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
         }
         catch { /* ignore */ }
 
-        // Ensure lock clear so process/IRQ handler can re-enter.
-        sys.Memory.Write32(DaDisplayLock, 0);
         _displayCmdCompletes++;
         _displayLockHits = 0;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _displayCmdCompletes <= 16)
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        {
+            uint chcr = 0;
+            try { chcr = sys.Dmac.ReadRegister(0x10009000u); } catch { /* ignore */ }
             Console.Error.WriteLine(
-                $"[MKFAM] DA display VIF1/GIF IRQ credit n={_displayCmdCompletes} " +
-                $"cmd=0x{cmd:X8} head=0x{head:X8} tail=0x{tail:X8} " +
+                $"[MKFAM] DA display IRQ arm n={_displayCmdCompletes} " +
+                $"cmd=0x{cmd:X8} head=0x{head:X8} tail=0x{tail:X8} vif1chcr=0x{chcr:X8} " +
+                $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
                 $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// DA WAVE-4: after CHCR.nTAG lets the real display IRQ drain head→tail (Path2 setup
+    /// applied: FRAME/SCISSOR/XYOFFSET live), main returns to CRT Exit(0) @0x10C044 before
+    /// Soft-GS chrome. Same class as wave-2 head plant → Exit. Clear Exit(0) only after
+    /// Path2 evidence + STFM/gameart host; park in DI/EI wait (0x114F20) — NOT the display
+    /// outer loop (head==tail falls through → Exit thrash). Wake workers for further enqueue.
+    /// Does not invent Soft-GS pixels. Caps rescues.
+    /// </summary>
+    private void TryRescueDaPostDisplayExit(Ps2System sys)
+    {
+        if (sys.Gs.PixelsWritten > 0) return; // real surface — leave Exit alone
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return; // gameart host not live
+        // Only after VIF1 END Path2 actually delivered (WAVE-3/4 display chain).
+        if (sys.Gif.Path2Transfers == 0) return;
+        if (_postDisplayExitRescues >= 32) return;
+        if (sys.MasterCycles < 7_000_000) return;
+
+        bool exit0 = sys.Hle.ExitRequested && sys.Hle.ExitCode == 0;
+        uint pc = (uint)sys.EE.PC;
+        bool inCrtExitStub = pc is >= 0x0010C040 and <= 0x0010C050; // Exit syscall stub only
+        bool inDiEi = pc is >= DaDiEiLo and <= DaDiEiHi;
+        if (!exit0 && !inCrtExitStub) return;
+        // Already parked in DI/EI with Exit clear — just refresh workers periodically.
+        if (!exit0 && inDiEi && (_postDisplayExitRescues & 7) != 0) return;
+
+        if (exit0)
+            sys.Hle.ClearExitRequest();
+
+        // Park at DI/EI wait band with $ra = self so jr ra re-enters (closed spin).
+        // Display outer loop with head==tail falls through → CRT Exit thrash.
+        // CRITICAL: $ra must not stay 0x1000AC (CRT after main) — any jr ra → Exit again.
+        sys.EE.PC = DaDiEiLo;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DaGp }); // $gp
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = DaDiEiLo }); // $ra → self
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (t.Id != 1 || !t.Alive) continue;
+                t.Started = true;
+                t.EverStarted = true;
+                t.Sleeping = false;
+                t.WaitSemaId = 0;
+                t.SavedPc = DaDiEiLo;
+                break;
+            }
+        }
+        catch { /* ignore */ }
+
+        // Wake workers so they can enqueue more display/draw work (incl. WaitSema 3).
+        try
+        {
+            var k = sys.Hle.Kernel;
+            foreach (var t in k.AllThreads)
+            {
+                if (!t.Alive || t.Id < 2) continue;
+                if (!t.Started)
+                {
+                    try { k.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false); }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                {
+                    try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                }
+                else if (t.Sleeping && t.WaitSemaId is > 0 and < 32)
+                {
+                    try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+                }
+            }
+            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+        }
+        catch { /* ignore */ }
+
+        _postDisplayExitRescues++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _postDisplayExitRescues <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA post-display Exit rescue n={_postDisplayExitRescues} " +
+                $"-> loop+lock p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"FRAME=0x{sys.Gs.Registers.FRAME_1:X} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

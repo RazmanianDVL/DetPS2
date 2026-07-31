@@ -508,24 +508,25 @@ public sealed class Dmac : ISchedulable
         uint tagId = (tagLow >> 28) & 0x7;
         bool tagIrq = ((tagLow >> 31) & 1) != 0;
 
-        // CHCR.TAG: VIF1 terminal tags with IRQ in high RDRAM (DA display chains @0x01FBxxxx).
-        // Handler @0x1B261C wants high nibble 0x8/0xF. Honest tag bits only.
-        if (channel == Channel.VIF1 && tagIrq && (tagId == 0 || tagId == 7)
-            && ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u)
+        // Play! / ps2tek: CHCR bits 16–31 latch the high 16 bits of the DMAtag word0
+        // (nTAG = tagLow >> 16). DA IRQ @0x1B261C checks CHCR&0xF0000000 ∈ {0x8,0xF}
+        // for REFE/END+IRQ (0x8xxx / 0xFxxx). Preserve DIR/MOD/ASP/TTE/TIE; STR cleared
+        // on FinishChannel. Do NOT invent TAG — only honest bits from the live tag.
+        ch.CHCR = (ch.CHCR & 0x0000FFFFu) | ((tagLow >> 16) << 16);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && channel == Channel.VIF1 && tagIrq && (tagId == 0 || tagId == 7)
+            && (ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u))
         {
             // Live DA display END 0xF000000B @0x01FB2A80: TTE w3=DIRECT IMM=QWC, ADDR=0,
-            // payload inline after tag (see case END). CHCR.TAG latch (high nibble 0xF) makes
-            // IRQ @0x1B261C succeed and Exit before chrome — do not invent/latch here (wave-3).
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-            {
-                uint addr = tagHigh & 0x7FFFFFFFu;
-                uint qwc = tagLow & 0xFFFF;
-                uint dataAddr = addr != 0 ? addr : (ch.TADR + 16);
-                Console.Error.WriteLine(
-                    $"[DMAC] VIF1 END/REFE+IRQ tag=0x{tagLow:X8} chcr=0x{ch.CHCR:X8} tadr=0x{ch.TADR:X8} " +
-                    $"data=0x{dataAddr:X8} qwc={qwc} w2=0x{tagW2:X8} w3=0x{tagW3:X8} " +
-                    $"(no CHCR.TAG latch — Exit residual)");
-            }
+            // payload inline after tag (case END). WAVE-4: nTAG latched so handler can succeed.
+            uint addr = tagHigh & 0x7FFFFFFFu;
+            uint qwc = tagLow & 0xFFFF;
+            uint dataAddr = addr != 0 ? addr : (ch.TADR + 16);
+            Console.Error.WriteLine(
+                $"[DMAC] VIF1 END/REFE+IRQ tag=0x{tagLow:X8} chcr=0x{ch.CHCR:X8} tadr=0x{ch.TADR:X8} " +
+                $"data=0x{dataAddr:X8} qwc={qwc} w2=0x{tagW2:X8} w3=0x{tagW3:X8} " +
+                $"(CHCR.nTAG latched)");
         }
 
         // Source-chain tag IDs (ps2tek / PCSX2)
@@ -574,12 +575,10 @@ public sealed class Dmac : ISchedulable
                 break;
         }
 
-        if (tagIrq)
-        {
-            DStat |= 1u << (int)channel;
-            if ((DMask & (1u << (int)channel)) != 0)
-                _intc?.Raise(Intc.InterruptSource.DmaController);
-        }
+        // CIS is raised in FinishChannel/ClearSTR (Play!), not at tag-fetch. Early CIS
+        // before data delivery made DA IRQ handlers observe incomplete STR/TAG state.
+        // TIE+IRQ early-stop for non-terminal tags is handled after segment when TADR!=0.
+        _ = tagIrq;
     }
 
     public uint ReadRegister(uint address)
@@ -655,17 +654,33 @@ public sealed class Dmac : ISchedulable
         switch (reg)
         {
             case 0x0: // CHCR
+                // Play!: while STR is set, only STR may change (suspend/clear); nTAG and
+                // control bits stay so IRQ handlers still see the last DMAtag high half.
+                if ((ch.CHCR & 0x100u) != 0)
+                {
+                    if ((value & 0x100u) == 0)
+                    {
+                        ch.CHCR &= ~0x100u;
+                        ch.Active = false;
+                    }
+                    // else: write with STR still 1 while running — ignore (Play!)
+                    break;
+                }
                 ch.CHCR = value;
                 if ((value & 0x100) != 0)
                 {
                     StartTransfer((Channel)channel);
-                    // Path-sync (B3 @ 0x001F1A4C) / display-pump (DA type-1): kick VIF1/GIF
-                    // and expect STR clear + CIS while PATH3 is held. Drain ONLY while
-                    // Path3MaskedByVif — unconditional VIF/GIF drain on every STR (menu DA/B3
-                    // wave-2 tip) starves GoW early boot: stack corruption → nop-sled
-                    // 0x2200F0→heap 0x13D9C8 → binds=0/cdvd=0 (agent/menu-gow-w3).
-                    // Not a global force-finish (MK WAD is sensitive to that).
-                    if (_gif != null && _gif.Path3MaskedByVif &&
+                    // Path-sync (B3 @ 0x001F1A4C) drains while PATH3 is masked.
+                    // DA display type-1 kicks VIF1 TTE chain (CHCR=0x145) with TADR in high
+                    // RDRAM (0x01FBxxxx) without M3P — must drain or STR sticks + queue lock.
+                    // Unconditional VIF/GIF drain starves GoW early boot (agent/menu-gow-w3).
+                    bool path3Hold = _gif != null && _gif.Path3MaskedByVif;
+                    bool daDisplayVif =
+                        (channel == (int)Channel.VIF1 || channel == (int)Channel.VIF0)
+                        && (value & 0x40u) != 0 // TTE
+                        && ((ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u)
+                            || (ch.TADR >= 0x001F0000u && ch.TADR < 0x00200000u));
+                    if ((path3Hold || daDisplayVif) &&
                         (channel == (int)Channel.VIF1 || channel == (int)Channel.GIF ||
                          channel == (int)Channel.VIF0))
                     {
