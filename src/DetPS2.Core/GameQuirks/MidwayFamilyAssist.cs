@@ -109,6 +109,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _displayCmdCompletes;
     private int _decPostMslKicks;
     private int _decPostMslHits;
+    private uint _lastDisplayHead;
+    private int _displayHeadMoves;
 
     // DA post-gameart display pump (live 2026-07-31 @20M):
     // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
@@ -180,6 +182,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _displayCmdCompletes = 0;
         _decPostMslKicks = 0;
         _decPostMslHits = 0;
+        _lastDisplayHead = 0;
+        _displayHeadMoves = 0;
         _openSendRetargetPlanted = false;
     }
 
@@ -630,8 +634,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// only DI/EI (0x114Fxx) and never re-enters process@0x1B3BB0. Live 20M: lock=1,
     /// head/tail RDRAM with cmds 0x88000501 / 0x00000501 (type-1 VIF1 chain).
     /// Wave-1: clear lock so process can run (STFM + RDRAM queue ptrs).
-    /// Wave-2: when VIF1 idle after type-1 left lock sticky, apply IRQ success side-effects
-    /// at 0x1B2830 — mark cmd done-bit 0x40000000, head+=8, clear lock, credit VIF1 CIS.
+    /// Wave-2: VIF1/GIF IRQ credit (no head plant — Exit). Head stuck on CHCR high-bit.
+    /// Wave-3: SHARED Dmac END ADDR=0 → inline DIRECT Path2; CHCR.TAG latch rejected
+    /// (honest 0xF000000B → IRQ success → Exit before chrome). Log head moves only.
     /// Does not force wait status=4 (Exit). Does not invent Soft-GS pixels.
     /// </summary>
     private void TryEscapeDaDisplayQueueLock(Ps2System sys)
@@ -652,6 +657,15 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         uint lockVal = sys.Memory.Read32(DaDisplayLock);
         uint head = sys.Memory.Read32(DaDisplayHead);
         uint tail = sys.Memory.Read32(DaDisplayTail);
+        if (_lastDisplayHead != 0 && head != _lastDisplayHead)
+        {
+            _displayHeadMoves++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" && _displayHeadMoves <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] DA display head move n={_displayHeadMoves} 0x{_lastDisplayHead:X8}->0x{head:X8} tail=0x{tail:X8} " +
+                    $"lock={lockVal} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+        }
+        if (head != 0) _lastDisplayHead = head;
         if (head == tail
             || head < 0x00100000 || head >= 0x02000000
             || tail < 0x00100000 || tail >= 0x02000000)

@@ -508,6 +508,26 @@ public sealed class Dmac : ISchedulable
         uint tagId = (tagLow >> 28) & 0x7;
         bool tagIrq = ((tagLow >> 31) & 1) != 0;
 
+        // CHCR.TAG: VIF1 terminal tags with IRQ in high RDRAM (DA display chains @0x01FBxxxx).
+        // Handler @0x1B261C wants high nibble 0x8/0xF. Honest tag bits only.
+        if (channel == Channel.VIF1 && tagIrq && (tagId == 0 || tagId == 7)
+            && ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u)
+        {
+            // Live DA display END 0xF000000B @0x01FB2A80: TTE w3=DIRECT IMM=QWC, ADDR=0,
+            // payload inline after tag (see case END). CHCR.TAG latch (high nibble 0xF) makes
+            // IRQ @0x1B261C succeed and Exit before chrome — do not invent/latch here (wave-3).
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                uint addr = tagHigh & 0x7FFFFFFFu;
+                uint qwc = tagLow & 0xFFFF;
+                uint dataAddr = addr != 0 ? addr : (ch.TADR + 16);
+                Console.Error.WriteLine(
+                    $"[DMAC] VIF1 END/REFE+IRQ tag=0x{tagLow:X8} chcr=0x{ch.CHCR:X8} tadr=0x{ch.TADR:X8} " +
+                    $"data=0x{dataAddr:X8} qwc={qwc} w2=0x{tagW2:X8} w3=0x{tagW3:X8} " +
+                    $"(no CHCR.TAG latch — Exit residual)");
+            }
+        }
+
         // Source-chain tag IDs (ps2tek / PCSX2)
         switch (tagId)
         {
@@ -538,6 +558,15 @@ public sealed class Dmac : ISchedulable
                 ch.TADR += 16;
                 break;
             case 7: // END — data at ADDR (if QWC), stop after
+                // DA display chain: END+IRQ 0xF000000B @0x01FB2A80 with ADDR=0, QWC=11,
+                // TTE DIRECT IMM=0xB. Real payload is the 11 QWs *following the tag*
+                // (CNT-style), not physical address 0. When ADDR==0 and QWC>0, treat as
+                // inline data after the DMAtag so DIRECT Path2 can reach Soft-GS.
+                if (ch.QWC > 0 && ch.MADR == 0)
+                {
+                    ch.MADR = ch.TADR + 16;
+                    ch.StartMADR = ch.MADR;
+                }
                 ch.TADR = 0;
                 break;
             default:
