@@ -73,8 +73,8 @@ public sealed class Gs : ISchedulable
     /// <summary>Pixels last composited from DISPFB/FRAME local VRAM into the software FB.</summary>
     public long DispfbPixelsComposited { get; private set; }
     /// <summary>
-    /// Soft-GS title-strip expand rescues (ofx/thin-sprite → full FB). Metric for G4/T4 demotion
-    /// (PL-003 / GX-004 refine legal conditions; S10 surfaces the counter for claims).
+    /// Soft-GS title-strip expand events (temporary MENU chrome; G-GFX-6 demotes later).
+    /// See docs/graphics/EXPAND_POLICY.md. Legal ofx: 0/0, 0x8000/0x8000, or [0x6000,0x9000] band.
     /// </summary>
     public long ExpandHits { get; private set; }
     /// <summary>Fragments rejected for FB bounds (before scissor).</summary>
@@ -99,12 +99,6 @@ public sealed class Gs : ISchedulable
     public long RegWritesTest { get; private set; }
     /// <summary>XYOFFSET_1 (0x18) writes.</summary>
     public long RegWritesXyoffset { get; private set; }
-    /// <summary>
-    /// Soft-GS title-strip expand events (temporary MENU chrome crutch; G-GFX-6 demotes later).
-    /// Incremented once per SPRITE that matches legal ofx expand conditions and is expanded
-    /// to full Soft-GS FB. See docs/graphics/EXPAND_POLICY.md.
-    /// </summary>
-    public long ExpandHits { get; private set; }
     private bool _localMemHasImage;
 
     public struct Vertex
@@ -145,7 +139,6 @@ public sealed class Gs : ISchedulable
         FragmentsRejectedScissor = 0;
         RegWritesTotal = RegWritesPrim = RegWritesXyz2 = RegWritesXyz3 = RegWritesXyzf2 = 0;
         RegWritesFrame = RegWritesScissor = RegWritesTest = RegWritesXyoffset = 0;
-        ExpandHits = 0;
         _lastCompositeImageBytes = 0;
         _localMemHasImage = false;
         _currentPrim = 0;
