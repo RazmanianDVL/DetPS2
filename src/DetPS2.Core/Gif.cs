@@ -40,13 +40,18 @@ public sealed class Gif : ISchedulable
     // PATH3 held while M3P/M3R masks — real HW fills the GIF FIFO (FQC rises) until unmasked.
     // Burnout 3 path-sync @ 0x001F1A28 spins on GIF_STAT.FQC (bits 24–28) after starting a
     // masked PATH3 DMA; instant-drain left FQC=0 forever.
-    private uint _heldPath3Addr;
-    private uint _heldPath3Qwc;
-    private bool _path3Held;
+    // Multi-kick under long mask: queue (not last-only) so unmask drains all held transfers.
+    private const int HeldPath3QueueCap = 48;
+    private readonly uint[] _heldPath3AddrQ = new uint[HeldPath3QueueCap];
+    private readonly uint[] _heldPath3QwcQ = new uint[HeldPath3QueueCap];
+    private int _heldPath3Count;
+    private uint _heldPath3TotalQwc;
 
     public ulong Path3Transfers => _path3Transfers;
     public ulong Path2Transfers => _path2Transfers;
     public ulong Path1Transfers => _path1Transfers;
+    public uint HeldPath3Qwc => _heldPath3TotalQwc;
+    public int HeldPath3Entries => _heldPath3Count;
 
     /// <summary>GIF_STAT M3P — PATH3 masked by VIF1 MSKPATH3.</summary>
     public bool Path3MaskedByVif => _m3p;
@@ -66,8 +71,8 @@ public sealed class Gif : ISchedulable
         _fifoR = _fifoW = _fifoCount = 0;
         _m3p = false;
         _apath = 0;
-        _heldPath3Addr = _heldPath3Qwc = 0;
-        _path3Held = false;
+        _heldPath3Count = 0;
+        _heldPath3TotalQwc = 0;
     }
 
     /// <summary>
@@ -87,16 +92,50 @@ public sealed class Gif : ISchedulable
 
     private void DrainHeldPath3()
     {
-        if (!_path3Held) return;
-        _path3Held = false;
+        if (_heldPath3Count == 0) return;
         _fifoR = _fifoW = _fifoCount = 0;
-        uint addr = _heldPath3Addr;
-        uint qwc = _heldPath3Qwc;
-        _heldPath3Addr = _heldPath3Qwc = 0;
-        if (qwc == 0) return;
+        int n = _heldPath3Count;
+        _heldPath3Count = 0;
+        _heldPath3TotalQwc = 0;
         _apath = 3;
-        ProcessTransfer(addr, qwc);
+        for (int i = 0; i < n; i++)
+        {
+            uint addr = _heldPath3AddrQ[i];
+            uint qwc = _heldPath3QwcQ[i];
+            if (qwc != 0)
+                ProcessTransfer(addr, qwc);
+        }
         _apath = 0;
+    }
+
+    private void EnqueueHeldPath3(uint address, uint qwc)
+    {
+        if (qwc == 0) return;
+        if (_heldPath3Count >= HeldPath3QueueCap)
+        {
+            // Process oldest now so multi-kick under long M3P is not discarded.
+            uint oldA = _heldPath3AddrQ[0];
+            uint oldQ = _heldPath3QwcQ[0];
+            Array.Copy(_heldPath3AddrQ, 1, _heldPath3AddrQ, 0, HeldPath3QueueCap - 1);
+            Array.Copy(_heldPath3QwcQ, 1, _heldPath3QwcQ, 0, HeldPath3QueueCap - 1);
+            _heldPath3Count = HeldPath3QueueCap - 1;
+            if (_heldPath3TotalQwc >= oldQ) _heldPath3TotalQwc -= oldQ;
+            else _heldPath3TotalQwc = 0;
+            if (oldQ != 0)
+            {
+                _apath = 3;
+                ProcessTransfer(oldA, oldQ);
+                _apath = 0;
+            }
+        }
+        _heldPath3AddrQ[_heldPath3Count] = address;
+        _heldPath3QwcQ[_heldPath3Count] = qwc;
+        _heldPath3Count++;
+        _heldPath3TotalQwc += qwc;
+        int words = (int)Math.Min(_heldPath3TotalQwc, 16u) * 4;
+        _fifoCount = Math.Min(words, _fifo.Length);
+        _fifoR = 0;
+        _fifoW = _fifoCount;
     }
 
     /// <summary>
@@ -153,8 +192,8 @@ public sealed class Gif : ISchedulable
                     _fifoR = _fifoW = _fifoCount = 0;
                     _m3p = false;
                     _apath = 0;
-                    _path3Held = false;
-                    _heldPath3Addr = _heldPath3Qwc = 0;
+                    _heldPath3Count = 0;
+                    _heldPath3TotalQwc = 0;
                 }
                 break;
             case 0x3010: // GIF_MODE
@@ -206,17 +245,9 @@ public sealed class Gif : ISchedulable
 
         if (Path3Masked)
         {
-            // Hold in FIFO: raise FQC so path-sync loops that poll STAT.FQC can proceed.
-            // ps2tek: masked PATH3 data resides in the FIFO until the mask is lifted.
-            _heldPath3Addr = address;
-            _heldPath3Qwc = qwc;
-            _path3Held = true;
-            // FQC is words/4 capped at 16; report min(qwc,16) QWs pending.
-            int words = (int)Math.Min(qwc, 16u) * 4;
-            _fifoCount = Math.Min(words, _fifo.Length);
-            _fifoR = 0;
-            _fifoW = _fifoCount;
-            // P3Q / OPH: path queued while masked (bit 6 of STAT via oph when fifo non-empty)
+            // Hold in FIFO queue: raise FQC so path-sync loops that poll STAT.FQC can proceed.
+            // Queue (not last-only) so multi-kick IMAGE/PACKED under long M3P still reaches GS.
+            EnqueueHeldPath3(address, qwc);
             return;
         }
 

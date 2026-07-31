@@ -116,3 +116,15 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | Rejected | VBlank poll sticky stub @25.9M → UnknownOpcode `0x4E3BD0` + STG loss; generic CallRpc soft-complete → DBC thrash abort |
 | MENU / px | **No / 0** — PATH3 unmask fires; prims still 0 (IMAGE/hold or no real PRIM path) |
 | Next | natural FRONTEND fno=5 dest bind (SHARED GTFS) + sane prim submit; no invented Soft-GS clear |
+
+## Wave-IRX / Soft-GS (2026-07-31) — branch agent/menu-b3
+
+| Field | Value |
+|-------|-------|
+| Tip wall (main c423c4f) | gifP3=25 dmac=22 cdvd=425 px=0 PC=0x123E20; GTFSCDVD/LGDEVW StartLoadedModule hit budget |
+| Shared Soft-GS | PATH3 M3P hold queue; DISPFB/FRAME local to FB composite; retail XYZ 0x8000 center when XYOFFSET=0 |
+| B3 assist | STAGEHED plant residual n>=1; post-LGDEV flag plant + re-home |
+| Peak this session | STG+full TXD+FRONTEND cdvd=6584 gifP3~1100-1980 prims=2389 binds=13 — still px=0 |
+| Branch claim 50-100M | often cdvd=609 (STAGEHED plant only) when residual-STG flaky |
+| MENU / px | No / 0 — not claiming logo-frontend |
+| Next | stabilize residual-STG under IRX always-on; prims to px; pad after Soft-GS non-black |
