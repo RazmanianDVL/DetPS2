@@ -102,9 +102,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// <summary>Empty-SIF soft-return to SIF-cmd poll caller 0x2948xx count (wave-3).</summary>
     private int _emptySifPollLoops;
     private int _sifPollCallerEscapes;
-    /// <summary>Wave-4: explicit SwitchTo worker after SignalSema (pending cmd / dead main).</summary>
+    /// <summary>Wave-4/5: explicit SwitchTo worker after SignalSema (pending cmd / dead main).</summary>
     private int _workerYields;
+    private int _workerFrameRepairs;
     private ulong _lastWorkerYieldCyc;
+    /// <summary>Last cmd type we force-dispatched — never rewind the same cmd (type-2 body is multi-M).</summary>
+    private uint _armedWorkerCmd;
     private ulong _lastWorldKickCyc;
     private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
@@ -230,7 +233,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _emptySifPollLoops = 0;
         _sifPollCallerEscapes = 0;
         _workerYields = 0;
+        _workerFrameRepairs = 0;
         _lastWorkerYieldCyc = 0;
+        _armedWorkerCmd = 0;
         _postWorkerCopyEscapes = 0;
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
@@ -242,8 +247,17 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint WorkerThreadEntry = 0x0027CBD0;
     /// <summary>Worker post-WaitSema body (load cmd type) — only valid on the worker thread.</summary>
     public const uint WorkerPostWait = 0x0027CC08;
+    /// <summary>Worker idle epilogue (status check + SignalSema + branch back to WaitSema).</summary>
+    public const uint WorkerIdleLo = 0x0027CE50;
+    public const uint WorkerIdleHi = 0x0027CE90;
     /// <summary>Worker cmd type word at <c>*(0x310380+4)</c> (s1+0x380+4 with s1=0x310000).</summary>
     public const uint WorkerCmdTypePtr = 0x00310384;
+    /// <summary>Worker base pointers planted by entry prologue (<c>lui s1/s3,0x31</c> / <c>lui s4,0x2C</c>).</summary>
+    public const uint WorkerBaseS1 = 0x00310000;
+    public const uint WorkerBaseS4 = 0x002C0000;
+    /// <summary>CreateThread stack for worker (live lastCreatedThread.sp); post-prologue = Stack-608.</summary>
+    public const uint WorkerStackTop = 0x0031C8C0;
+    public const uint WorkerStackAfterPrologue = WorkerStackTop - 608; // 0x0031C660
 
     public void OnDiscMounted(Ps2System sys)
     {
@@ -654,14 +668,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                     Console.Error.WriteLine($"[GOW] plant cache-wb stub @ 0x002944F0 cyc={c}");
             }
-            if (pc is >= 0x00294400 and <= 0x00294580)  // include pre-stub residual 0x294420 (claim100d)
+            // Wave-5: include 0x2943D8 pre-stub residual (post type-2 claim49M).
+            if (pc is >= 0x002943C0 and <= 0x00294580)
             {
                 uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
                 sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0x1000 }); // a2 = 4096 done
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
                 // Prefer live $ra when it is real code; else leaf jr.
                 if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x00290000
-                    && ra is not (>= 0x002944F0 and <= 0x00294580))
+                    && ra is not (>= 0x002943C0 and <= 0x00294580))
                     sys.EE.PC = ra;
                 else
                     sys.EE.PC = 0x00294584; // jr ra
@@ -669,6 +684,34 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && (c % 5_000_000) < 50_000)
                     Console.Error.WriteLine($"[GOW] skip cache-wb loop pc=0x{pc:X8} -> 0x{(uint)sys.EE.PC:X8} cyc={c}");
+            }
+        }
+
+        // Wave-5 post-type-2: 0x26B9F4 jalr a2 with poison a2 (live 0xD40) falls into data
+        // at 0x26B9FC (UnknownSpecial funct=0x39 thrash → metrics freeze ~48M). Soft-return.
+        if (c >= 45_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+            && pc is >= 0x0026B9B0 and <= 0x0026BA20)
+        {
+            uint a2 = (uint)sys.EE.GetGpr(6).Lo;
+            uint a2p = a2 & 0x1FFFFFFFu;
+            bool badTarget = a2p < 0x00100000u || a2p >= 0x002C0000u
+                || !sys.Memory.IsLikelyEeCode(a2);
+            if (badTarget || pc is >= 0x0026B9FC and <= 0x0026BA10)
+            {
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint resume = PickSafeResume(sys, 0x0026C0EC);
+                if (sys.Memory.IsLikelyEeCode(ra) && ra is >= 0x00100000 and < 0x002C0000
+                    && ra is not (>= 0x0026B9B0 and <= 0x0026BA40)
+                    && ra is not (>= 0x0026C0E0 and <= 0x0026C0E8))
+                    resume = ra;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 }); // v0 = fail/skip
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // clear poison a2
+                sys.EE.PC = resume;
+                sys.EE.COP0_Status &= ~0x6u;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (c % 2_000_000) < 50_000)
+                    Console.Error.WriteLine(
+                        $"[GOW] escape bad jalr-stream pc=0x{pc:X8} a2=0x{a2:X8} -> 0x{resume:X8} cyc={c}");
             }
         }
 
@@ -1244,6 +1287,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             or (>= 0x0023E7C0 and <= 0x0023E7F0)  // align-zero poison a0 thrash
             or (>= 0x0013FE00 and <= 0x00140000)  // post-align UnknownOpcode storm
             or (>= 0x00100000 and <= 0x00100200)  // CRT0 / BSS-clear re-entry (wipes heap)
+            // Wave-5: worker .text + WaitSema leaf are NOT safe foreign resumes — soft-return
+            // onto them from main poisons SP/s1 and thrash-rewinds type-2 (w5c/w5d).
+            or (>= 0x0027CBD0 and <= 0x00282000)
+            or (>= 0x00293C00 and <= 0x00293C90)
+            or (>= 0x0026B9B0 and <= 0x0026BA20)  // post-type-2 jalr data thrash
             || p == 0x00100008u;
 
         static bool IsSafeCode(Ps2System s, uint p) =>
@@ -1333,22 +1381,28 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// Wave-4: run the 0x27CBD0 worker on its own thread when a command is queued.
-    /// Live residual (agent/menu-gow-w3 claim100): <c>*0x310384 == 2</c> (valid cmd after
-    /// <c>type-2</c> index 0 → jal 0x2803C0) while worker Sleeps WaitSema(32) and current
-    /// EE is zombie main (Started=false) or empty-SIF poll. Soft-return to <c>0x27CC08</c>
-    /// on the wrong thread poisons SP and never takes the jump table. SignalSema only clears
-    /// Sleeping — must <see cref="KernelState.RestoreContext"/> the worker.
+    /// Wave-4/5: run the 0x27CBD0 worker on its own thread when a command is queued.
+    /// Live residual: <c>*0x310384 == 2</c> (type-2 → table[0]=0x27CC34 → jal 0x27DF30).
+    /// Wave-4 SignalSema + <see cref="KernelState.TryYieldToOtherRunnable"/> landed on the
+    /// WaitSema trampoline of a peer (toPc=0x293C64) while main kept executing worker .text
+    /// with poison <c>s1=0 / sp=OOB</c> (live 50M: tid=1 PC=0x27CE60, cmd stuck at 2 forever
+    /// because <c>lw v0,4(s1+0x380)</c> never sees 0x310384). Soft-return to 0x27CC08 on the
+    /// wrong thread is the same poison class.
+    /// Wave-5: <see cref="KernelState.RestoreContext"/> the worker tid only; re-seed s1/s3/s4/sp
+    /// when the frame is poison; re-enter <see cref="WorkerPostWait"/> for idle thrash with a
+    /// pending cmd. Do not invent PATH3 packets — real type-2 dispatch owns the stream/WAD path.
     /// </summary>
     private bool TryYieldToPendingWorker(Ps2System sys, uint pc, ulong c)
     {
         var k = sys.Hle?.Kernel;
         if (k == null) return false;
-        if (_workerYields >= 128) return false;
+        if (_workerYields >= 256) return false;
 
         uint cmdType = sys.Memory.Read32(WorkerCmdTypePtr);
         // Worker: v0 = *type; v0 -= 2; if (v0 >= 99) idle. Valid service: type in [2, 100].
         bool cmdPending = cmdType is >= 2 and <= 100;
+        if (!cmdPending)
+            _armedWorkerCmd = 0;
 
         KernelState.Thread? worker = null;
         foreach (var t in k.AllThreads)
@@ -1359,49 +1413,257 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 break;
             }
         }
-        if (worker == null) return false;
+        if (worker == null || !worker.Started) return false;
 
-        // Already on worker body/handlers: never force a context switch.
-        if (k.CurrentThreadId == worker.Id)
+        bool currentIsWorker = k.CurrentThreadId == worker.Id;
+        bool onWorkerText = pc is >= 0x0027CBD0 and <= 0x00282000;
+        bool poisonFrame = IsWorkerFramePoison(sys);
+        bool onIdle = pc is >= WorkerIdleLo and <= WorkerIdleHi;
+
+        // On worker with healthy frame mid-handler: only SignalSema if parked — never rewind.
+        if (currentIsWorker && onWorkerText && !onIdle && !poisonFrame)
         {
-            if (worker.Sleeping && worker.WaitSemaId is > 0 and <= 256)
+            if (worker.Sleeping && worker.WaitSemaId is > 0 and <= 256 && cmdPending)
             {
                 try { k.SignalSema(worker.WaitSemaId); } catch { /* ignore */ }
             }
             return false;
         }
 
-        // Mid-dispatch on any tid: leave it alone (rewinding via RestoreContext kills progress).
-        if (pc is >= 0x0027CBD0 and <= 0x00282000)
-            return false;
-
-        if (!cmdPending || !worker.Started || !worker.Sleeping)
-            return false;
-        if (worker.WaitSemaId is < 1 or > 256)
-            return false;
-        if (c - _lastWorkerYieldCyc < 500_000UL)
-            return false;
-
-        try
+        // On worker idle / poison / WaitSema leaf with pending cmd: repair + redispatch.
+        if (currentIsWorker && cmdPending && (poisonFrame || onIdle
+            || pc is >= 0x00293C00 and <= 0x00293C90))
         {
-            int sid = worker.WaitSemaId;
-            k.SignalSema(sid);
-            // Cooperative yield only — RestoreContext rewinds SavedPc to WaitSema and
-            // re-enters with partial s1/s3/s4 (cmd stuck at type=2 forever). Let the next
-            // WaitSema/SwitchToNext on the current thread hand off naturally.
-            bool yielded = k.TryYieldToOtherRunnable(sys.EE);
+            if (c - _lastWorkerYieldCyc < 200_000UL) return false;
+            if (poisonFrame)
+                RepairWorkerCalleeSaved(sys, worker);
+            if (worker.Sleeping && worker.WaitSemaId is >= 1 and <= 256)
+            {
+                try { k.SignalSema(worker.WaitSemaId); } catch { /* ignore */ }
+            }
+            sys.EE.PC = WorkerPostWait;
+            sys.EE.COP0_Status &= ~0x6u;
+            _armedWorkerCmd = cmdType;
             _workerYields++;
             _lastWorkerYieldCyc = c;
+            if (poisonFrame) _workerFrameRepairs++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && _workerYields <= 32)
                 Console.Error.WriteLine(
-                    $"[GOW] signal-worker tid={worker.Id} cmd={cmdType} sema={sid} " +
-                    $"yielded={yielded} fromPc=0x{pc:X8} toPc=0x{(uint)sys.EE.PC:X8} " +
-                    $"n={_workerYields} cyc={c}");
-            return yielded;
+                    $"[GOW] worker-redispatch tid={worker.Id} cmd={cmdType} " +
+                    $"pc=0x{pc:X8} poison={poisonFrame} n={_workerYields} cyc={c}");
+            return true;
         }
-        catch { /* ignore */ }
+
+        if (currentIsWorker)
+            return false;
+
+        // Foreign thread on worker .text: park main at post-FreezeCache, SwitchTo worker.
+        // (claim55: force PostWait clears type=2; main must not keep executing worker body.)
+        if (onWorkerText && cmdPending)
+        {
+            if (c - _lastWorkerYieldCyc < 200_000UL) return false;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000UL });
+            sys.EE.PC = 0x00185FAC;
+            sys.EE.COP0_Status &= ~0x6u;
+            _armedWorkerCmd = cmdType;
+            return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "wrong-tid-text",
+                forceDispatch: true);
+        }
+
+        // Pending cmd + sleeping worker (w5b sleep-cmd from flag-spin 0x17A32C).
+        if (cmdPending && worker.Sleeping && worker.WaitSemaId is >= 1 and <= 256)
+        {
+            if (c - _lastWorkerYieldCyc < 200_000UL) return false;
+            _armedWorkerCmd = cmdType;
+            return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "sleep-cmd",
+                forceDispatch: true);
+        }
+
+        // Runnable worker with pending cmd — steal timeslice without force-rewind when possible.
+        if (cmdPending && !worker.Sleeping && worker.SuspendCount == 0)
+        {
+            if (c - _lastWorkerYieldCyc < 500_000UL) return false;
+            // If SavedPc is already mid type-2 body, do not force PostWait.
+            bool midBody = (worker.SavedPc & 0x1FFFFFFFUL) is >= 0x0027CC30 and <= 0x00282000;
+            return SwitchToWorkerThread(sys, k, worker, cmdType, pc, c, "runnable-cmd",
+                forceDispatch: !midBody, signalSema: false);
+        }
+
         return false;
+    }
+
+    /// <summary>
+    /// True when worker SavedPc is WaitSema trampoline / idle / post-wait gate — safe to
+    /// force <see cref="WorkerPostWait"/>. Mid-handler (e.g. type-2 body 0x27DF30) must keep SavedPc.
+    /// </summary>
+    private static bool WorkerSavedAtDispatchGate(KernelState.Thread worker)
+    {
+        uint spc = (uint)(worker.SavedPc & 0x1FFFFFFFUL);
+        if (spc == 0 || spc == WorkerThreadEntry || spc == WorkerPostWait)
+            return true;
+        if (spc is >= 0x00293C00 and <= 0x00293C90) return true; // WaitSema leaf
+        if (spc is >= WorkerIdleLo and <= WorkerIdleHi) return true;
+        if (spc is >= 0x0027CC00 and <= 0x0027CC30) return true; // type load / table
+        // Fresh park before first run
+        if (!worker.EverStarted) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Leave worker .text when the current thread is not the worker — repair PC/ra so a later
+    /// SaveCurrentContext does not park main at 0x27CCxx (w5c wrong-tid thrash).
+    /// Always land at post-FreezeCache (0x185FAC) — never $ra / freelist / worker bounce.
+    /// </summary>
+    private void RehomeWrongThreadOffWorkerText(Ps2System sys, uint pc, ulong c)
+    {
+        const uint resume = 0x00185FAC;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0x00330000UL });
+        // Clear poison ra pointing into worker body so epilogues don't bounce back.
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        if (ra is >= 0x0027CBD0 and <= 0x00282000
+            || ra is >= 0x00293C00 and <= 0x00293C90
+            || ra == 0 || !sys.Memory.IsLikelyEeCode(ra))
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_workerYields < 8 || (c % 5_000_000) < 50_000))
+            Console.Error.WriteLine(
+                $"[GOW] rehome wrong-tid off worker pc=0x{pc:X8} -> 0x{resume:X8} cyc={c}");
+    }
+
+    /// <summary>True when s1/s3/sp cannot be the retail worker frame (live poison sp=0xFFFFF3A0).</summary>
+    private static bool IsWorkerFramePoison(Ps2System sys)
+    {
+        uint s1 = (uint)sys.EE.GetGpr(17).Lo;
+        uint s3 = (uint)sys.EE.GetGpr(19).Lo;
+        uint spPhys = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        if (s1 != WorkerBaseS1 && (s1 & 0x1FFFFFFFu) != WorkerBaseS1)
+            return true;
+        if (s3 != WorkerBaseS1 && (s3 & 0x1FFFFFFFu) != WorkerBaseS1)
+            return true;
+        if (spPhys < 0x00100000u || spPhys >= (uint)SystemMemory.RDRAM_SIZE)
+            return true;
+        // Retail worker stack is CreateThread top 0x31C8C0 (post-prologue ~0x31C660).
+        // Frames far below the worker BSS/cmd block are foreign (wrong-thread thrash).
+        if (spPhys < 0x00310000u)
+            return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Re-seed worker callee-saved set from entry prologue constants.
+    /// Entry: s1=s3=0x310000, s4=0x2C0000, sp=StackTop-608, s2=sp+64.
+    /// </summary>
+    private static void RepairWorkerCalleeSaved(Ps2System sys, KernelState.Thread worker)
+    {
+        uint stackTop = worker.Stack != 0 ? worker.Stack : WorkerStackTop;
+        // Prologue does addiu sp,sp,-608 once; keep a sane mid-frame sp if already in range.
+        uint spPhys = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+        uint sp = spPhys is >= 0x00318000 and <= 0x0031C8C0
+            ? spPhys
+            : stackTop - 608u;
+        sys.EE.SetGpr(17, new EmotionEngine.Gpr128 { Lo = WorkerBaseS1 }); // s1
+        sys.EE.SetGpr(19, new EmotionEngine.Gpr128 { Lo = WorkerBaseS1 }); // s3
+        sys.EE.SetGpr(20, new EmotionEngine.Gpr128 { Lo = WorkerBaseS4 }); // s4
+        sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = sp + 64u });     // s2
+        sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp });           // sp
+        // Keep ra in worker text when already there; else post-wait loop.
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        if (ra is < 0x0027CBD0 or > 0x00282000)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = WorkerPostWait });
+    }
+
+    /// <summary>
+    /// Save current EE, restore the worker thread, optionally force dispatch PC after repair.
+    /// Always targets <paramref name="worker"/>.Id — never FindNextRunnable peer thrash.
+    /// </summary>
+    private bool SwitchToWorkerThread(
+        Ps2System sys,
+        KernelState k,
+        KernelState.Thread worker,
+        uint cmdType,
+        uint fromPc,
+        ulong c,
+        string reason,
+        bool forceDispatch,
+        bool signalSema = true)
+    {
+        try
+        {
+            if (signalSema && worker.WaitSemaId is >= 1 and <= 256)
+            {
+                try { k.SignalSema(worker.WaitSemaId); } catch { /* ignore */ }
+            }
+
+            // Always seed worker callee-saved + PostWait when force-dispatching so full restore
+            // lands with s1=0x310000 and PC at the type-load gate (not mid-WaitSema).
+            uint stackTop = worker.Stack != 0 ? worker.Stack : WorkerStackTop;
+            uint sp = stackTop - 608u;
+            bool savedPoison = (worker.SavedS1 & 0x1FFFFFFFu) != WorkerBaseS1
+                || (worker.SavedSp & 0x1FFFFFFFu) < 0x00310000u
+                || (worker.SavedSp & 0x1FFFFFFFu) >= (uint)SystemMemory.RDRAM_SIZE;
+            if (forceDispatch || savedPoison)
+            {
+                worker.SavedS1 = WorkerBaseS1;
+                worker.SavedS3 = WorkerBaseS1;
+                worker.SavedS4 = WorkerBaseS4;
+                worker.SavedS2 = sp + 64u;
+                worker.SavedSp = sp;
+                if (forceDispatch)
+                    worker.SavedPc = WorkerPostWait;
+                if (worker.HasFullSave && worker.SavedGprFull != null
+                    && worker.SavedGprFull.Length >= 32)
+                {
+                    worker.SavedGprFull[17] = WorkerBaseS1;
+                    worker.SavedGprFull[18] = sp + 64u;
+                    worker.SavedGprFull[19] = WorkerBaseS1;
+                    worker.SavedGprFull[20] = WorkerBaseS4;
+                    worker.SavedGprFull[29] = sp;
+                    if (forceDispatch)
+                        worker.SavedPc = WorkerPostWait;
+                }
+                if (savedPoison)
+                    _workerFrameRepairs++;
+            }
+
+            if (k.CurrentThreadId != worker.Id)
+            {
+                k.SaveCurrentContext(sys.EE, fromSyscall: false);
+                if (!k.RestoreContext(sys.EE, worker.Id, fromSyscall: false))
+                    return false;
+            }
+
+            // Post-restore: always re-seed live frame when forcing dispatch (full-save may
+            // still carry a stale WaitSema $ra).
+            if (forceDispatch || IsWorkerFramePoison(sys))
+            {
+                RepairWorkerCalleeSaved(sys, worker);
+                sys.EE.PC = WorkerPostWait;
+                sys.EE.COP0_Status &= ~0x6u;
+            }
+
+            worker.Sleeping = false;
+            // Only clear WaitSemaId when we actually SignalSema'd a park.
+            if (signalSema && worker.WaitSemaId != 0)
+                worker.WaitSemaId = 0;
+
+            _workerYields++;
+            _lastWorkerYieldCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && _workerYields <= 48)
+                Console.Error.WriteLine(
+                    $"[GOW] switch-worker tid={worker.Id} cmd={cmdType} reason={reason} " +
+                    $"fromPc=0x{fromPc:X8} toPc=0x{(uint)sys.EE.PC:X8} " +
+                    $"s1=0x{(uint)sys.EE.GetGpr(17).Lo:X8} sp=0x{(uint)sys.EE.GetGpr(29).Lo:X8} " +
+                    $"n={_workerYields} cyc={c}");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
