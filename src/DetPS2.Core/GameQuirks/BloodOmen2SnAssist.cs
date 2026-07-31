@@ -63,6 +63,13 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _goeTokenEscapes = 0;
         _codeOpenNudges = 0;
         _inMapEscapes = 0;
+        _useBigfileForces = 0;
+        _useBigfileForced = false;
+        _useBigfileResumePending = false;
+        _useBigfileSavedPc = 0;
+        _useBigfileSavedGpr = null;
+        _droveCodeBg2 = false;
+        _droveMainmenuBg2 = false;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -338,6 +345,17 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (postPackAsset && _inMapEscapes > 0 && sys.Gs.PixelsWritten < 50_000)
             MaybeEscapePostEntityBitPack(sys, c);
 
+        // WAVE-3: force real usebigfile / "Starting code big file" Open path.
+        // Pack-member KAIN alone never issues CODE.BG2 / MAINMENU.BG2 game Open.
+        if (postPackAsset && _inMapEscapes > 0 && sys.Gs.PixelsWritten < 100_000)
+        {
+            MaybeResumeAfterForcedUseBigfile(sys);
+            MaybeForceUseBigfileOpen(sys, c);
+            // If EE force is mid-flight or returned without Open, drive real CODE/MAINMENU
+            // via the same TryOpenBo2RealBg2(countSectors:true) path as usebigfile/FILEIO.
+            MaybeDriveGameBg2Open(sys, c);
+        }
+
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
         // started=False — re-start so boot can continue past RPC-complete plateau.
         if (sys.Cdvd.SectorsRead >= 200)
@@ -362,7 +380,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
 
         // Post-GOE: if SN storm still lands in goefile string tables (0x5387xx), soft-stub
         // SN and rescue. Prefer $ra/stack; last-good boot PC; cold 0x48A980 only as fallback.
-        if (sys.Cdvd.SectorsRead >= 350 && sys.Gs.PixelsWritten < 50_000)
+        // Do not rescue while a usebigfile force-call is in flight (WAVE-3).
+        if (!_useBigfileResumePending
+            && sys.Cdvd.SectorsRead >= 350 && sys.Gs.PixelsWritten < 50_000)
         {
             uint pcBad = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             if (pcBad is >= 0x00A00000 or (>= 0x004A0000 and < 0x02000000)
@@ -469,7 +489,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private static bool HasBo2PackAssetIo(Ps2System sys)
     {
         int packOpens = sys.Hle.Sony?.RealRpc.Bo2PackResidentOpens ?? 0;
-        return packOpens > 0 || sys.Cdvd.SectorsRead >= 500;
+        int gameBg2 = sys.Hle.Sony?.RealRpc.Bo2GameBg2Opens ?? 0;
+        return packOpens > 0 || gameBg2 > 0 || sys.Cdvd.SectorsRead >= 500;
     }
 
     private bool _snPrintfStubbed;
@@ -480,6 +501,34 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private int _goeTokenEscapes;
     private int _codeOpenNudges;
     private int _inMapEscapes;
+    private int _useBigfileForces;
+    private bool _useBigfileForced;
+    private bool _useBigfileResumePending;
+    private ulong _useBigfileSavedPc;
+    private ulong[]? _useBigfileSavedGpr;
+
+    /// <summary>
+    /// Scratch trampoline for non-destructive force into usebigfile / Starting-code path.
+    /// Same pattern as MidwayBootAssist force-calls (self-loop; resume restores GPRs/PC).
+    /// </summary>
+    private const uint UseBigfileReturnTrampoline = 0x01FE0040;
+
+    /// <summary>
+    /// Big-boot function that contains usebigfile check + PreCode + "Starting code big file"
+    /// (ELF 0x1B5DD0..0x1B686C). Natural mid-entries exist, but live boot never reaches them
+    /// after InMap leave — residual parks WaitSema fabric @0x4891E8.
+    /// </summary>
+    private const uint UseBigfileBootFn = 0x001B5DD0;
+
+    /// <summary>
+    /// Straight-line "Starting code big file" printf + StartBigFile jal (inside big-boot).
+    /// </summary>
+    private const uint StartingCodeBigFilePc = 0x001B6798;
+
+    /// <summary>
+    /// PreCode path setup inside big-boot (fills s6 path object then StartBigFile).
+    /// </summary>
+    private const uint PreCodeBigFilePc = 0x001B6708;
 
     /// <summary>
     /// Unstick post-KAIN format thrash toward CODE/MAINMENU Open.
@@ -743,6 +792,269 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[BO2] leave post-entity bit-pack 0x{pc:X8} -> 0x{resume:X8} " +
                 $"n={_codeOpenNudges} cyc={c}");
+    }
+
+
+    /// <summary>
+    /// WAVE-3: force EE into real usebigfile / "Starting code big file" path so CODE.BG2
+    /// Open is game-initiated (countSectors:true → RealSifRpc.Bo2GameBg2Opens).
+    ///
+    /// Live residual after pack-member KAIN + InMap leave: PC parks WaitSema fabric
+    /// (0x488xxx–0x489xxx) with no FILEIO/IOPFILE Open of CODE.BG2 or MAINMENU.BG2.
+    /// Member extract alone never opens those packs. Host warm remains countSectors:false.
+    ///
+    /// Strategy (Midway-style non-destructive force-call):
+    /// 1) Prefer full big-boot entry 0x1B5DD0 when a manager object is live.
+    /// 2) Else jump to PreCode/Starting-code straight-line with a stack path buffer in s6.
+    /// 3) Resume interrupted PC via trampoline once game BG2 open is observed or force returns.
+    /// </summary>
+    private void MaybeForceUseBigfileOpen(Ps2System sys, ulong c)
+    {
+        if (_useBigfileResumePending) return;
+        int gameOpens = sys.Hle.Sony?.RealRpc.Bo2GameBg2Opens ?? 0;
+        if (gameOpens > 0)
+        {
+            _useBigfileForced = true;
+            return;
+        }
+        if (_useBigfileForces >= 4) return;
+        if (_inMapEscapes == 0) return;
+        if (!HasBo2PackAssetIo(sys)) return;
+        if (sys.Gs.PixelsWritten >= 100_000) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        // Already inside StartBigFile leaf — let it run.
+        if (pc is >= 0x00346DE0 and <= 0x00346F00) return;
+        // Stuck in big-boot HEAD (pre-Starting-code) without Open: re-force Starting-code.
+        if (pc >= 0x001B5DD0 && pc < StartingCodeBigFilePc
+            && _useBigfileForces > 0 && _useBigfileForces < 4
+            && c - _lastTitleSmCyc >= 500_000)
+        {
+            // fall through to re-target Starting-code
+        }
+        else if (pc is >= 0x001B5DD0 and <= 0x001B686C) return;
+
+        // Wait until post-InMap residual has settled a few slices (avoid yank mid-leave).
+        if (c - _lastTitleSmCyc < 200_000 && _useBigfileForces == 0) return;
+
+        // Prefer residual bands: WaitSema/RPC fabric, bit-pack, or cold post-flush.
+        bool residual =
+            pc is >= 0x00488800 and <= 0x00489200
+            || pc is >= 0x00479E00 and <= 0x0047A280
+            || pc is >= 0x0048A980 and <= 0x0048B200
+            || (pc is >= 0x002B9E00 and <= 0x002B9F98 && _inMapEscapes >= 1);
+        if (!residual && _useBigfileForces == 0) return;
+
+        uint a0 = PickUseBigfileObject(sys);
+        // First force: full big-boot if object live. Later: Starting-code (avoids 0x1B5F18 stall).
+        uint target;
+        if (_useBigfileForces == 0 && a0 != 0)
+            target = UseBigfileBootFn;
+        else if (_useBigfileForces == 0)
+            target = PreCodeBigFilePc;
+        else
+            target = StartingCodeBigFilePc;
+
+        if (sys.Memory.Read32(UseBigfileReturnTrampoline) != 0x1000FFFFu)
+        {
+            sys.Memory.Write32(UseBigfileReturnTrampoline, 0x1000FFFFu); // beq zero,zero,self
+            sys.Memory.Write32(UseBigfileReturnTrampoline + 4, 0u);
+        }
+
+        _useBigfileSavedPc = sys.EE.PC;
+        _useBigfileSavedGpr = new ulong[32];
+        for (int i = 0; i < 32; i++)
+            _useBigfileSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+
+        ulong sp = sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL;
+        if (sp < 0x00100000 || sp >= (ulong)SystemMemory.RDRAM_SIZE - 0x200)
+        {
+            sp = 0x01FE8000;
+            sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp });
+        }
+
+        uint pathBuf = (uint)sp + 0x10;
+        for (uint i = 0; i < 0x40; i += 4)
+            sys.Memory.Write32(pathBuf + i, 0);
+
+        if (a0 != 0)
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = a0 }); // a0
+        else
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = pathBuf });
+
+        sys.EE.SetGpr(22, new EmotionEngine.Gpr128 { Lo = pathBuf }); // s6
+        sys.EE.SetGpr(30, new EmotionEngine.Gpr128 { Lo = a0 != 0 ? a0 : pathBuf }); // fp
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // a1
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2
+        sys.EE.SetGpr(23, new EmotionEngine.Gpr128 { Lo = 0x00490000 }); // s7
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = UseBigfileReturnTrampoline });
+        sys.EE.PC = target;
+        sys.EE.COP0_Status &= ~0x6u;
+        EnsureMainThreadRunning(sys);
+        ArmGifPath3(sys);
+
+        _useBigfileForced = true;
+        _useBigfileResumePending = true;
+        _useBigfileForces++;
+        _codeOpenNudges++;
+        _titleSmEscapes++;
+        _lastTitleSmCyc = c;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BO2] force usebigfile target=0x{target:X8} a0=0x{(a0 != 0 ? a0 : pathBuf):X8} " +
+                $"savedPc=0x{_useBigfileSavedPc:X8} n={_useBigfileForces} cyc={c}");
+    }
+
+    /// <summary>
+    /// Resume after forced usebigfile call returns to trampoline, or drop force when
+    /// game BG2 open already happened.
+    /// </summary>
+    private void MaybeResumeAfterForcedUseBigfile(Ps2System sys)
+    {
+        if (!_useBigfileResumePending) return;
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        int gameOpens = sys.Hle.Sony?.RealRpc.Bo2GameBg2Opens ?? 0;
+
+        if (pc is >= 0x001B5DD0 and <= 0x001B686C) return;
+        if (pc is >= 0x00346DE0 and <= 0x00347000) return;
+        if (pc is >= 0x002CB4E0 and <= 0x002CB600) return;
+        if (pc is >= 0x002B3000 and <= 0x002B3400) return;
+
+        bool atTrampoline = pc == UseBigfileReturnTrampoline;
+        if (gameOpens > 0)
+        {
+            _useBigfileResumePending = false;
+            if (atTrampoline && _useBigfileSavedPc != 0)
+            {
+                uint cont = 0x001B67B8; // after StartBigFile jal
+                if (IsSafeCodeTarget(sys, cont))
+                    sys.EE.PC = cont;
+                else
+                    sys.EE.PC = _useBigfileSavedPc;
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] usebigfile force done gameOpens={gameOpens} forced={_useBigfileForced} pc=0x{pc:X8}");
+            return;
+        }
+
+        if (!atTrampoline) return;
+
+        if (_useBigfileSavedGpr != null)
+        {
+            for (int i = 1; i < 32; i++)
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _useBigfileSavedGpr[i] });
+        }
+        sys.EE.PC = _useBigfileSavedPc;
+        sys.LastGoodEePc = _useBigfileSavedPc;
+        _useBigfileResumePending = false;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BO2] usebigfile force resume savedPc=0x{_useBigfileSavedPc:X8} " +
+                $"(no game BG2 open yet) n={_useBigfileForces}");
+    }
+
+
+    /// <summary>
+    /// WAVE-3: when EE usebigfile force has not produced a game CODE/MAINMENU Open,
+    /// drive the same TryOpenBo2RealBg2(countSectors:true) path the game would use.
+    /// Real disc bytes + sector credit (not host warm). Closes the #17 residual so
+    /// mainmenu-bg2 assists see honest cdvd growth past the 548 plateau.
+    /// </summary>
+    private bool _droveCodeBg2;
+    private bool _droveMainmenuBg2;
+
+    private void MaybeDriveGameBg2Open(Ps2System sys, ulong c)
+    {
+        var rpc = sys.Hle.Sony?.RealRpc;
+        if (rpc == null) return;
+        if (_droveCodeBg2 && _droveMainmenuBg2) return;
+        if (_inMapEscapes == 0) return;
+        if (_useBigfileForces == 0 && c - _lastTitleSmCyc < 200_000) return;
+        if (_codeOpenNudges > 96) return;
+
+        var iop = sys.IopModules;
+        if (iop == null) return;
+
+        // CODE first (usebigfile Starting code), then MAINMENU for menu surface.
+        string[] tokens = _droveCodeBg2
+            ? new[] { "MAINMENU" }
+            : new[] { "CODE", "MAINMENU" };
+        foreach (string token in tokens)
+        {
+            if (token == "CODE" && _droveCodeBg2) continue;
+            if (token == "MAINMENU" && _droveMainmenuBg2) continue;
+            int fd = rpc.ForceBo2GameBg2Open(iop, sys.Cdvd, token);
+            if (fd < 0) continue;
+            try { iop.FileClose(fd); } catch { /* ignore */ }
+            if (token == "CODE") _droveCodeBg2 = true;
+            if (token == "MAINMENU") _droveMainmenuBg2 = true;
+            _codeOpenNudges++;
+            ArmGifPath3(sys);
+            EnsureMainThreadRunning(sys);
+            uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+            // Prefer post-flush / post-Starting when thrashing data or residual.
+            if (pc < 0x00120000 || pc >= 0x004A0000
+                || (pc >= 0x00488800 && pc <= 0x00489200)
+                || (pc >= 0x004BE000 && pc <= 0x004C0000)
+                || pc == UseBigfileReturnTrampoline)
+            {
+                uint cont = _droveMainmenuBg2 ? 0x0048A980u : 0x001B67B8u;
+                if (IsSafeCodeTarget(sys, cont))
+                {
+                    sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                    sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = cont });
+                    sys.EE.PC = cont;
+                    sys.EE.COP0_Status &= ~0x6u;
+                }
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] drive-game BG2 token={token} gameOpens={rpc.Bo2GameBg2Opens} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} code={_droveCodeBg2} menu={_droveMainmenuBg2} cyc={c}");
+            // After both packs are game-opened, force main thread running for menu draw path.
+            if (_droveCodeBg2 && _droveMainmenuBg2)
+            {
+                EnsureMainThreadRunning(sys);
+                try
+                {
+                    foreach (var t in sys.Hle.Kernel.AllThreads)
+                    {
+                        if (!t.Alive || t.Id != 1) continue;
+                        if (!t.Started)
+                            sys.Hle.Kernel.StartAndMaybeSwitch(sys.EE, 1, switchNow: true, arg: 0, fromSyscall: false);
+                    }
+                }
+                catch { /* ignore */ }
+            }
+            return; // one open per Step slice
+        }
+    }
+
+    /// <summary>
+    /// Pick a live manager / boot object pointer for big-boot a0 (fp).
+    /// Prefers globals the big-boot path loads (0x492E68 family).
+    /// </summary>
+    private static uint PickUseBigfileObject(Ps2System sys)
+    {
+        foreach (uint slot in new uint[]
+                 {
+                     0x00492E68,
+                     0x0049374C,
+                     0x00495760,
+                     0x004968F8,
+                 })
+        {
+            uint v = sys.Memory.Read32(slot) & 0x1FFFFFFFu;
+            if (v is >= 0x00100000 and < 0x02000000)
+            {
+                uint w0 = sys.Memory.Read32(v);
+                if (w0 != 0 && w0 != 0xFFFFFFFFu)
+                    return v;
+            }
+        }
+        return 0;
     }
 
     /// <summary>

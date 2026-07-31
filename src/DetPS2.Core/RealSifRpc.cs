@@ -245,6 +245,31 @@ public sealed class RealSifRpc
     public int Bo2PackResidentOpens { get; private set; }
 
     /// <summary>
+    /// Game-initiated PRECODE/CODE/MAINMENU .BG2 opens with sector credit
+    /// (TryOpenBo2RealBg2 countSectors:true). Host warm probes do not count.
+    /// Wave-3 usebigfile residual: pack-member KAIN OK but this stays 0 until StartBigFile runs.
+    /// </summary>
+    public int Bo2GameBg2Opens { get; private set; }
+
+    /// <summary>
+    /// WAVE-3: issue a game-initiated PRECODE/CODE/MAINMENU .BG2 open (countSectors:true)
+    /// when the EE usebigfile path is blocked post-InMap. Uses the same TryOpenBo2RealBg2
+    /// path as IOPFILE/FILEIO — not a fake stub, real disc bytes + honest sector credit.
+    /// </summary>
+    public int ForceBo2GameBg2Open(IopModuleHost iopModules, Cdvd cdvd, string token)
+    {
+        if (string.IsNullOrEmpty(token) || iopModules == null || cdvd == null) return -1;
+        int fd = TryOpenBo2RealBg2(iopModules, cdvd, token, countSectors: true);
+        if (fd >= 0
+            && (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"))
+            Console.Error.WriteLine(
+                $"[BO2] force-game BG2 open token=\"{token}\" fd={fd} gameOpens={Bo2GameBg2Opens}");
+        return fd;
+    }
+
+
+    /// <summary>
     /// Set the LOADFILE/FILEIO GetVersion IOPRP ASCII tag without a full reboot surface clear.
     /// Accepts a 4-char tag (<c>"3000"</c>) or a UDNL/RESET arg containing <c>IOPRPxxx</c>/<c>DNASxxx</c>.
     /// Prefer this over <see cref="OnIopReboot"/> when only the version cell is missing.
@@ -435,6 +460,7 @@ public sealed class RealSifRpc
         _bo2PackMembers.Clear();
         _bo2PackBytes.Clear();
         Bo2PackResidentOpens = 0;
+        Bo2GameBg2Opens = 0;
         _goeArchiveFd = -1;
         _goeArchiveSize = 0;
         _goeArchiveDiscByteOffset = 0;
@@ -6817,10 +6843,15 @@ public sealed class RealSifRpc
                     ? (int)((fsz + 2047) / 2048)
                     : 1;
                 cdvd.NoteHostReadSectors(sectors);
+                // Honest game Open signal (not host warm). CODE/MAINMENU drive mainmenu-bg2.
+                if (LooksLikeBo2GameBg2Path(c) || LooksLikeBo2GameBg2Path(path))
+                    Bo2GameBg2Opens++;
             }
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || (countSectors && Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"))
                 Console.Error.WriteLine(
-                    $"[BO2] real BG2 open path=\"{c}\" fd={fd} countSectors={countSectors}");
+                    $"[BO2] real BG2 open path=\"{c}\" fd={fd} countSectors={countSectors}" +
+                    (countSectors ? $" gameOpens={Bo2GameBg2Opens}" : ""));
             return fd;
         }
         return -1;
