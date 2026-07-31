@@ -630,17 +630,17 @@ public sealed class Dmac : ISchedulable
                 if ((value & 0x100) != 0)
                 {
                     StartTransfer((Channel)channel);
-                    // Path-sync (Burnout 3 @ 0x001F1A4C after FQC wait) kicks VIF1/GIF chain
-                    // with CHCR=0x145 and immediately expects completion side-effects (MSKPATH3
-                    // unmask, flip-queue advance via AddDmacHandler). A full EE.Step quantum
-                    // of GIF_STAT polling can run before the scheduler hits DMAC, leaving
-                    // M3P sticky + busy flag set forever. Drain ONLY VIF1/GIF while PATH3 is
-                    // masked — not a global force-finish (MK WAD is sensitive to that).
-                    if (_gif != null && _gif.Path3MaskedByVif &&
-                        (channel == (int)Channel.VIF1 || channel == (int)Channel.GIF ||
-                         channel == (int)Channel.VIF0))
+                    // Path-sync / display-pump (B3 @ 0x001F1A4C; DA type-1 @ 0x1B3E54) kick
+                    // VIF1/GIF chain (often CHCR=0x145/0x1C5, QWC=0) and immediately expect
+                    // STR clear + CIS/IRQ side-effects. A full EE.Step quantum of CHCR/GIF_STAT
+                    // polling can run before the scheduler hits DMAC, leaving STR sticky and
+                    // Midway display-queue lock held forever (cmd 0x88000501).
+                    // Drain VIF0/VIF1/GIF on STR set. Not a global force-finish of all channels
+                    // (MK WAD is sensitive to that).
+                    if (channel == (int)Channel.VIF1 || channel == (int)Channel.GIF ||
+                        channel == (int)Channel.VIF0)
                     {
-                        for (int i = 0; i < 256 && _channels[channel].Active; i++)
+                        for (int i = 0; i < 512 && _channels[channel].Active; i++)
                             Step(256);
                     }
                 }

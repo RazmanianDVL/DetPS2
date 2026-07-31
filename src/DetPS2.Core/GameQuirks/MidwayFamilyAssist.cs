@@ -106,10 +106,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _pathSrcRewrites;
     private int _displayLockEscapes;
     private int _displayLockHits;
+    private int _displayCmdCompletes;
 
     // DA post-gameart display pump (live 2026-07-31 @20M):
     // Outer loop @0x1B3960: while (head!=tail) { if (lock) DI/EI; else process@0x1B3BB0 }.
     // Lock @ gp-25380 sticky=1 with pending queue + idle VIF1/GIF -> DI thrash @0x114Fxx.
+    // process type-1 (cmd low byte==1, live cmd 0x88000501): set lock, kick VIF1 chain
+    // CHCR~0x1C5 TADR=ptr QWC=0; IRQ @0x1B2830 clears lock + advances head.
     private const uint DaGp = 0x00410D70;
     private const uint DaDisplayLock = DaGp - 25380;   // 0x40AA4C
     private const uint DaDisplayHead = DaGp - 25412;   // 0x40AA2C
@@ -118,6 +121,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DaDisplayLoopHi = 0x001B3A10;
     private const uint DaDiEiLo = 0x00114F20;
     private const uint DaDiEiHi = 0x00114F80;
+    private const uint DaDisplayCmdDoneBit = 0x40000000u;
 
     // Dec post-0x127900 residual (live 200M+/280M host-present after exception plant):
     // main stays alive in 0x3B9E00 list helper (OUTSIDE shared freelist band 0x3BA948).
@@ -159,6 +163,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _pathSrcRewrites = 0;
         _displayLockEscapes = 0;
         _displayLockHits = 0;
+        _displayCmdCompletes = 0;
         _openSendRetargetPlanted = false;
     }
 
@@ -465,8 +470,11 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// DA only: post-gameart display pump stuck with sticky lock @0x40AA4C while the
     /// display command queue still has entries (head!=tail). Outer loop at 0x1B3960 then
     /// only DI/EI (0x114Fxx) and never re-enters process@0x1B3BB0. Live 20M: lock=1,
-    /// head/tail RDRAM with 2 cmds, VIF1/GIF STR idle. Clear lock so process can run.
-    /// Gated on STFM stream + RDRAM queue ptrs. Does NOT advance head (that caused Exit).
+    /// head/tail RDRAM with cmds 0x88000501 / 0x00000501 (type-1 VIF1 chain).
+    /// Wave-1: clear lock so process can run (STFM + RDRAM queue ptrs).
+    /// Wave-2: when VIF1 idle after type-1 left lock sticky, apply IRQ success side-effects
+    /// at 0x1B2830 — mark cmd done-bit 0x40000000, head+=8, clear lock, credit VIF1 CIS.
+    /// Does not force wait status=4 (Exit). Does not invent Soft-GS pixels.
     /// </summary>
     private void TryEscapeDaDisplayQueueLock(Ps2System sys)
     {
@@ -476,7 +484,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         uint pc = (uint)sys.EE.PC;
         bool inLoop = pc is >= DaDisplayLoopLo and <= DaDisplayLoopHi;
         bool inDiEi = pc is >= DaDiEiLo and <= DaDiEiHi;
-        if (!inLoop && !inDiEi)
+        bool inProcessEpi = pc is >= 0x001B41E0 and <= 0x001B4240;
+        if (!inLoop && !inDiEi && !inProcessEpi)
         {
             _displayLockHits = 0;
             return;
@@ -485,7 +494,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         uint lockVal = sys.Memory.Read32(DaDisplayLock);
         uint head = sys.Memory.Read32(DaDisplayHead);
         uint tail = sys.Memory.Read32(DaDisplayTail);
-        if (lockVal == 0 || head == tail
+        if (head == tail
             || head < 0x00100000 || head >= 0x02000000
             || tail < 0x00100000 || tail >= 0x02000000)
         {
@@ -493,18 +502,60 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             return;
         }
 
-        _displayLockHits++;
-        if (_displayLockHits < 64) return;
-        if (_displayLockEscapes >= 32) return;
+        if (lockVal != 0)
+        {
+            _displayLockHits++;
+            if (_displayLockHits < 64) return;
+            if (_displayLockEscapes < 64)
+            {
+                sys.Memory.Write32(DaDisplayLock, 0);
+                _displayLockEscapes++;
+                _displayLockHits = 0;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _displayLockEscapes <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] DA display-lock clear n={_displayLockEscapes} " +
+                        $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+            }
+            lockVal = 0;
+        }
 
+        // Wave-2: after lock thrash with pending type-1 (0x88000501), credit VIF1/GIF
+        // CIS so the real DMA IRQ path @0x1B2588 can clear lock + advance head.
+        // Do NOT plant done-bit or advance head here — that caused Exit @0x80000200.
+        if (_displayCmdCompletes >= 32) return;
+        if (_displayLockEscapes < 1) return;
+        if (sys.Dmac.IsActive(Dmac.Channel.VIF1) || sys.Dmac.IsActive(Dmac.Channel.GIF))
+            return;
+
+        uint cmd = sys.Memory.Read32(head);
+        if ((cmd & DaDisplayCmdDoneBit) != 0) return;
+        uint cmdType = cmd & 0xFF;
+        if (cmdType != 1 && cmdType is not (0x80 or 0x81 or 0x82 or 0x83 or 0x8F or 0xFF))
+            return;
+
+        // Throttle credits: every 2 lock clears once DMA idle.
+        if ((_displayLockEscapes - _displayCmdCompletes) < 1) return;
+
+        try
+        {
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.VIF1);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 2);
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 1);
+        }
+        catch { /* ignore */ }
+
+        // Ensure lock clear so process/IRQ handler can re-enter.
         sys.Memory.Write32(DaDisplayLock, 0);
-        _displayLockEscapes++;
+        _displayCmdCompletes++;
         _displayLockHits = 0;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _displayLockEscapes <= 16)
+            && _displayCmdCompletes <= 16)
             Console.Error.WriteLine(
-                $"[MKFAM] DA display-lock clear n={_displayLockEscapes} " +
-                $"head=0x{head:X8} tail=0x{tail:X8} pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                $"[MKFAM] DA display VIF1/GIF IRQ credit n={_displayCmdCompletes} " +
+                $"cmd=0x{cmd:X8} head=0x{head:X8} tail=0x{tail:X8} " +
+                $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
