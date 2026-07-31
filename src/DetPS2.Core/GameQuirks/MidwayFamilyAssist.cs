@@ -98,10 +98,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _mslRingSeeds;
     private int _decSysInitEscapes;
     private bool _decSysInitPlanted;
+    private int _decPostInitListHits;
+    private int _decPostInitListEscapes;
     private int _mflArgBridges;
     private int _mflPathPlants;
     private int _postWaitKicks;
     private int _pathSrcRewrites;
+
+    // Dec post-0x127900 residual (live 200M+/280M host-present after exception plant):
+    // main stays alive in 0x3B9E00 list helper (OUTSIDE shared freelist band 0x3BA948).
+    // Outer: s1 = *(s0+8); loop jal 0x3BDE60; walk v1=+0x24 via +0x28; s1=*(s1+4).
+    // Live thrash @0x3B9E34 (outer) / 0x3B9E64 (inner). Inner +0x28 plant alone leaves
+    // outer s1+4 cycle. Force outer exit → 0x3B9EE0 (done).
+    private const uint DecPostInitListLo = 0x003B9E20;
+    private const uint DecPostInitListHi = 0x003B9E84;
+    private const uint DecPostInitListExit = 0x003B9EE0; // post-outer done
     private bool _openSendRetargetPlanted;
 
     public MidwayFamilyAssist(string serial, string displayName)
@@ -126,6 +137,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _mslFilePumps = 0;
         _decSysInitEscapes = 0;
         _decSysInitPlanted = false;
+        _decPostInitListHits = 0;
+        _decPostInitListEscapes = 0;
         _mflArgBridges = 0;
         _mflPathPlants = 0;
         _postWaitKicks = 0;
@@ -188,7 +201,80 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // TITLE_LOCAL Dec: soft-success post-MSL factory/sys-init so main does not Exit(0)
         // before member .ssf CallRpc (see DecSysInit* constants).
         if (IsDeception)
+        {
             TryEscapeDecSysInitFail(sys);
+            TryEscapeDecPostInitListWalk(sys);
+        }
+    }
+
+    /// <summary>
+    /// Deception only: break/escape the post-0x127900 list helper at
+    /// <c>0x3B9E20..0x3B9E84</c> (live PC <c>0x3B9E34</c>/<c>0x3B9E64</c> @200M+). Outside
+    /// the shared freelist band. Outer walks <c>s1=*(s1+4)</c>; inner walks <c>+0x28</c>.
+    /// Prefer RDRAM cycle cut on v1; also cut s1+4 back-edge; fallback force-exit to
+    /// <c>0x3B9EE0</c> (function done path).
+    /// </summary>
+    private void TryEscapeDecPostInitListWalk(Ps2System sys)
+    {
+        uint pc = (uint)sys.EE.PC;
+        if (pc < DecPostInitListLo || pc > DecPostInitListHi)
+        {
+            _decPostInitListHits = 0;
+            return;
+        }
+
+        _decPostInitListHits++;
+        if (_decPostInitListHits < 32) return;
+
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        ulong cyc = sys.MasterCycles;
+        uint v1 = (uint)sys.EE.GetGpr(3).Lo; // inner walker
+        uint s1 = (uint)sys.EE.GetGpr(17).Lo; // outer list node
+
+        // Prefer structural repair of a +0x28 cycle (same helper as shared freelist band).
+        if (v1 >= 0x00100000 && v1 < 0x02000000
+            && BreakRightChildCycle(sys, v1, out uint cutAt, out uint cutTo))
+        {
+            _decPostInitListEscapes++;
+            _decPostInitListHits = 0;
+            if (trace && _decPostInitListEscapes <= 16)
+                Console.Error.WriteLine(
+                    $"[MKFAM] Dec post-init list cycle break node=0x{cutAt:X8} +0x28 was 0x{cutTo:X8} " +
+                    $"pc=0x{pc:X8} n={_decPostInitListEscapes} cyc={cyc}");
+            return;
+        }
+
+        // Outer s1 = *(s1+4) cycle — null the back-edge when sticky.
+        if (s1 >= 0x00100000 && s1 < 0x02000000 && _decPostInitListHits >= 48)
+        {
+            uint next = sys.Memory.Read32(s1 + 4);
+            if (next == s1 || (next >= 0x00100000 && next < 0x02000000
+                && sys.Memory.Read32(next + 4) == s1))
+            {
+                sys.Memory.Write32(s1 + 4, 0);
+                _decPostInitListEscapes++;
+                _decPostInitListHits = 0;
+                if (trace && _decPostInitListEscapes <= 16)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] Dec post-init outer s1+4 cut node=0x{s1:X8} was 0x{next:X8} " +
+                        $"pc=0x{pc:X8} n={_decPostInitListEscapes} cyc={cyc}");
+                return;
+            }
+        }
+
+        if (_decPostInitListHits < 80) return;
+
+        // Force done path (skip residual outer thrash).
+        sys.EE.SetGpr(17, new EmotionEngine.Gpr128 { Lo = 0 }); // s1 null
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 }); // a1
+        sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 0 }); // v1
+        sys.EE.PC = DecPostInitListExit;
+        _decPostInitListEscapes++;
+        _decPostInitListHits = 0;
+        if (trace && _decPostInitListEscapes <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec post-init list force-exit pc=0x{pc:X8}→0x{DecPostInitListExit:X8} " +
+                $"s1=0x{s1:X8} v1=0x{v1:X8} n={_decPostInitListEscapes} cyc={cyc}");
     }
 
     /// <summary>
@@ -472,16 +558,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
     /// <summary>
     /// Deception only: rewrite fail-tails so post-MSL subsystem init returning 0 does not
-    /// abort main→CRT Exit(0) before the game loop / member .ssf path.
+    /// abort main→CRT Exit(0) / ExitThread before the game loop / member .ssf path.
     ///
     /// Live chain (200M): 0x1D9620→0x1D8120→0x126CE0→0x127900→main@0x1238E0→Exit.
+    /// Post-0x510-honest residual (190M): main past 0x127900 → 0x18D740 → 0x1AAD90 list
+    /// walk on garbage node → EE exception @0x80000180 → ExitThread; still no member .ssf.
     /// Plants:
     /// <list type="bullet">
     /// <item>0x1D8120 fail tails (factory register 0x1D9620 / 0x1D3F10 / 0x1E1340)</item>
-    /// <item>0x127900 fail tails after 0x126CE0 and sibling inits (covers later 0x126CE0 gates)</item>
+    /// <item>0x127900 fail tails after 0x126CE0 and sibling inits</item>
+    /// <item>main@0x1235B0 pre/post-0x127900 fail branches (0x1236D8..0x123788)</item>
+    /// <item>0x1AAD90 empty-list force + nop jal from 0x18D740 (corrupt list exception)</item>
     /// </list>
     /// One-shot RDRAM plant — Step cannot catch single-instruction gates across slices.
-    /// Does not plant wait status=4 (DA Exit lesson).
+    /// Does not plant wait status=4 (DA Exit lesson). DA paths untouched.
     /// </summary>
     private void TryEscapeDecSysInitFail(Ps2System sys)
     {
@@ -572,6 +662,72 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         {
             sys.Memory.Write32(0x001D98E4, 0x10000002u); // → 0x1D98F0
             sys.Memory.Write32(0x001D98E8, 0x24020001u);
+            plants++;
+        }
+
+        // --- main@0x1235B0 pre-0x127900 fail branches (b → epilogue@0x1238E0) ---
+        // Live residual after type-0x510 install is honest: main can still abort via
+        // 0x227A20 / 0x223860 / 0x178040 returning 0 before ever calling 0x127900.
+        // Soft-success the four main-side fail tails (same shape as 0x127900 plants).
+        // 0x1236D8 after 0x227A20 (imm 0x81 → 0x1238E0)
+        if (sys.Memory.Read32(0x001236D8) == 0x10000081u)
+        {
+            sys.Memory.Write32(0x001236D8, 0x10000001u); // → 0x1236E0
+            sys.Memory.Write32(0x001236DC, 0x24020001u);
+            plants++;
+        }
+        // 0x123700 after 0x223860 (imm 0x77 → 0x1238E0)
+        if (sys.Memory.Read32(0x00123700) == 0x10000077u)
+        {
+            sys.Memory.Write32(0x00123700, 0x10000001u); // → 0x123708
+            sys.Memory.Write32(0x00123704, 0x24020001u);
+            plants++;
+        }
+        // 0x123718 after 0x178040 (imm 0x71 → 0x1238E0)
+        if (sys.Memory.Read32(0x00123718) == 0x10000071u)
+        {
+            sys.Memory.Write32(0x00123718, 0x10000001u); // → 0x123720
+            sys.Memory.Write32(0x0012371C, 0x24020001u);
+            plants++;
+        }
+        // 0x123788 after 0x127900 (imm 0x55 → 0x1238E0) — covers residual return 0
+        if (sys.Memory.Read32(0x00123788) == 0x10000055u)
+        {
+            sys.Memory.Write32(0x00123788, 0x10000001u); // → 0x123790
+            sys.Memory.Write32(0x0012378C, 0x24020001u);
+            plants++;
+        }
+
+        // --- post-0x127900 list walk exception (live 190M host-present) ---
+        // main continues past 0x127900 (plants + honest 0x510) into 0x18D740 → jal 0x1AAD90.
+        // 0x1AAD90 walks a linked list; live node s1=0x401A6800 (non-RDRAM) faults at
+        // `lw v0,16(s1)` @0x1AAE00 → EE exception vector 0x80000180 → later ExitThread.
+        // Force empty-list branch (beq s3,s2,done → b done) so the walk never touches
+        // garbage nodes. Belt-and-suspenders: nop the jal from 0x18D740.
+        // Does not plant wait status=4. TITLE_LOCAL Dec only.
+        if (sys.Memory.Read32(0x001AADD4) == 0x12720028u) // beq s3, s2, 0x1AAE78
+        {
+            sys.Memory.Write32(0x001AADD4, 0x10000028u); // b 0x1AAE78
+            plants++;
+        }
+        if (sys.Memory.Read32(0x0018D868) == 0x0C06AB64u) // jal 0x1AAD90
+        {
+            sys.Memory.Write32(0x0018D868, 0x00000000u); // nop
+            plants++;
+        }
+
+        // --- post-init list helper @0x3B9E00 (live 200M+ thrash after exception plant) ---
+        // Inner: lw v1,40(v1) cycle → force next=null.
+        // Outer: bne s1,zero,loop @0x3B9E80 — nop so one s1 pass falls to done @0x3B9EE0.
+        // Runtime TryEscapeDecPostInitListWalk remains as belt-and-suspenders.
+        if (sys.Memory.Read32(0x003B9E60) == 0x8C630028u) // lw v1, 40(v1)
+        {
+            sys.Memory.Write32(0x003B9E60, 0x0000182Du); // daddu v1, zero, zero
+            plants++;
+        }
+        if (sys.Memory.Read32(0x003B9E80) == 0x1620FFEAu) // bne s1, zero, 0x3B9E2C
+        {
+            sys.Memory.Write32(0x003B9E80, 0x00000000u); // nop — exit outer after first s1
             plants++;
         }
 
