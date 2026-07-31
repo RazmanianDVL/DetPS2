@@ -13,8 +13,14 @@ public sealed class GsRegisters
     public ulong RGBAQ { get; private set; }
     public ulong ST { get; private set; }
     public ulong UV { get; private set; }
+    /// <summary>GS 0x05 XYZ2 (drawing kick). Not 0x04 — that is XYZF2.</summary>
     public ulong XYZ2 { get; private set; }
+    /// <summary>GS 0x0D XYZ3 (no kick).</summary>
     public ulong XYZ3 { get; private set; }
+    /// <summary>GS 0x04 XYZF2 (kick + fog).</summary>
+    public ulong XYZF2 { get; private set; }
+    /// <summary>GS 0x0C XYZF3 (no kick + fog).</summary>
+    public ulong XYZF3 { get; private set; }
     public ulong FOG { get; private set; }
     public ulong FOGCOL { get; private set; }
     public ulong PRMODECONT { get; private set; }
@@ -79,7 +85,7 @@ public sealed class GsRegisters
     {
         PRIM = 0;
         RGBAQ = 0xFFFFFFFFUL;
-        ST = UV = XYZ2 = XYZ3 = FOG = FOGCOL = 0;
+        ST = UV = XYZ2 = XYZ3 = XYZF2 = XYZF3 = FOG = FOGCOL = 0;
         PRMODECONT = 1;
         PRMODE = 0;
 
@@ -158,8 +164,10 @@ public sealed class GsRegisters
             case 0x01: RGBAQ = value; break;
             case 0x02: ST = value; break;
             case 0x03: UV = value; break;
-            case 0x04: XYZ2 = value; break;
-            case 0x05: XYZ3 = value; break;
+            case 0x04: XYZF2 = value; break; // Sony: XYZF2 kick+fog
+            case 0x05: XYZ2 = value; break;  // Sony: XYZ2 kick
+            case 0x0C: XYZF3 = value; break; // Sony: XYZF3 no-kick+fog
+            case 0x0D: XYZ3 = value; break;  // Sony: XYZ3 no-kick
             case 0x0A: FOG = value; break;
             case 0x3D: FOGCOL = value; break;
             case 0x1C: TEXCLUT = value; break;
@@ -209,8 +217,10 @@ public sealed class GsRegisters
             0x01 => RGBAQ,
             0x02 => ST,
             0x03 => UV,
-            0x04 => XYZ2,
-            0x05 => XYZ3,
+            0x04 => XYZF2,
+            0x05 => XYZ2,
+            0x0C => XYZF3,
+            0x0D => XYZ3,
             0x06 => TEX0_1,
             0x07 => TEX0_2,
             0x08 => CLAMP_1,

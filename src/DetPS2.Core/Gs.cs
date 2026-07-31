@@ -301,18 +301,22 @@ public sealed class Gs : ISchedulable
             case 0x06: // TEX0_1
                 ApplyTex0(value);
                 break;
-            case 0x04: // XYZ2 — kick draw
+            // GS register map (Sony / Play! GSHandler.h):
+            //   0x04 XYZF2 kick+fog, 0x05 XYZ2 kick, 0x0C XYZF3 no-kick+fog, 0x0D XYZ3 no-kick.
+            // An earlier map had XYZ2/XYZ3 swapped with XYZF2/XYZF3, so commercial XYZ2
+            // (reg 0x05) never kicked — MK Deadly Alliance Midway sprite prims=0 residual.
+            case 0x04: // XYZF2 — XYZ + fog, kick
+                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
                 AddVertexFromXyz(value, kick: true);
                 break;
-            case 0x05: // XYZ3 — no kick (strip build)
+            case 0x05: // XYZ2 — kick draw
+                AddVertexFromXyz(value, kick: true);
+                break;
+            case 0x0C: // XYZF3 — XYZ + fog, no kick
+                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
                 AddVertexFromXyz(value, kick: false);
                 break;
-            case 0x0C: // XYZF2 — XYZ + fog, kick
-                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
-                AddVertexFromXyz(value, kick: true);
-                break;
-            case 0x0D: // XYZF3 — XYZ + fog, no kick
-                _lastFog = ((value >> 56) & 0xFF) / 255.0f;
+            case 0x0D: // XYZ3 — no kick (strip build)
                 AddVertexFromXyz(value, kick: false);
                 break;
             case 0x53: // TRXDIR — start host↔local transfer after BITBLTBUF/TRXPOS/TRXREG
@@ -371,9 +375,9 @@ public sealed class Gs : ISchedulable
     public void SetPrim(uint prim) => WriteGsRegister(0x00, prim);
     public void SetRGBAQ(uint rgbaq) => WriteGsRegister(0x01, rgbaq);
 
-    public void DrawVertex(uint xyz) => WriteGsRegister(0x04, xyz);
+    public void DrawVertex(uint xyz) => WriteGsRegister(0x05, xyz); // GS_REG_XYZ2
 
-    public void DrawVertex64(ulong xyz2) => WriteGsRegister(0x04, xyz2);
+    public void DrawVertex64(ulong xyz2) => WriteGsRegister(0x05, xyz2); // GS_REG_XYZ2
 
     // ===================== Vertex / primitives =====================
 
