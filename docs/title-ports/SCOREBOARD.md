@@ -14,8 +14,8 @@
 | **God of War** | SCUS_973.99 | **YES** (first-gs Soft-GS) | px=573440 prims=2 FRAME set gifP2=19 | wave-12b ofx=0 title-strip expand |
 | **MK Deception** | SLUS_208.81 | **YES** (midway-menu) | px=822k gifP2=5988 idle-pump | wave-7 PowerOff storm kill |
 | **MK Deadly Alliance** | SLUS_204.23 | **YES** (midway-menu) | px=716800 gifP2=35109 exitReq=False | wave-6 post-logo keep-alive |
-| **Vexx** | SLUS_203.83 | **YES** (title-surface) | px=581954 prims=4 cdvd=318 members=17 | wave-6 STREE0 VFS |
-| **Whiplash** | SLUS_206.84 | **YES** (title-surface) | px=286720 frontend Start full | wave-6 full title path |
+| **Vexx** | SLUS_203.83 | **YES** (title-surface) | px=877186 prims=24 gifP2=12 img=5120 cdvd=318 members=17 | S7 seat-s7 claim100; TRE VFS residual ([VEXX.md](VEXX.md)) |
+| **Whiplash** | SLUS_206.84 | **YES** (title-surface) | px=286720 prims=1 ofx=0x8000 cdvd=1904 gifP3=2 | S7 seat-s7 claim100; ring+ofx residual ([WHIPLASH.md](WHIPLASH.md)) |
 | **Haven** | SLUS_205.17 | **YES** (title-surface) | px=286720 gifP3=68 cdvd=7004 TITLES_VAG | wave-6 JREXIT/SP frame + NUSOUND; IMAGE residual |
 
 \*GoW gate is first real GS + pad-interactive, not MK MAINMENU.
