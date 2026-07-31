@@ -6,6 +6,13 @@ If a change makes a title *look* better or *get further* by lying about what the
 
 ---
 
+## Platform strategy (2026-07-30)
+
+**Default path to playability:** execute **real BIOS and disc IRX** on a deterministic IOP
+(see [`IRX_EXECUTION_PHASE_PLAN.md`](IRX_EXECUTION_PHASE_PLAN.md)).  
+C# owns EE, Soft-GS, devices, and scheduler — **not** a second invented IOP OS.  
+HLE service clones and title thrash plants are debt, not the product.
+
 ## North star
 
 DetPS2 is a **pure C#** PS2 emulator. Success is:

@@ -19,12 +19,10 @@ tooling — all verified only against synthetic fixtures and homebrew, not real 
 **What is not done**: any commercial title reaching its main menu, let alone being playable.
 **Authoritative list**: **[COMPLETENESS.md](COMPLETENESS.md)**.
 
-**Active work**: real commercial bring-up against user-supplied dumps, using Mortal Kombat: Shaolin
-Monks (`SLUS_210.87`) as the case study for finding general emulation/HLE bugs — see
-**[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** for the dated investigation log, and
-[GitHub Issues](https://github.com/RazmanianDVL/DetPS2/issues) for current blockers and priority
-order. Also added: a virtual HDD (APA + PFS) and a `pad-inject` CLI tool for scripted
-controller-input testing.
+**Active work (pivot 2026-07-30)**: **literal BIOS/disc IRX execution** on the IOP — same model as
+other PS2 emulators — not endless C# HLE trial-and-error. Phase plan:
+**[docs/IRX_EXECUTION_PHASE_PLAN.md](docs/IRX_EXECUTION_PHASE_PLAN.md)** · pointer [NEXT_PLAN.md](NEXT_PLAN.md).
+EE/Soft-GS stay C#; IOP modules should **run**. Epic: GitHub **#12**.
 
 ```bash
 dotnet run --project src/DetPS2.Core -c Release -- dump-spine

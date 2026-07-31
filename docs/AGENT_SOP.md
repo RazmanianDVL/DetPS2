@@ -1,16 +1,16 @@
 # DetPS2 agent SOP — commercial bring-up (mandatory)
 
 **Audience:** human operators and AI subagents.  
-**Goal:** faster, less wrong HLE — not more blind 150M runs.  
-**Doctrine:** **[CORRECTNESS.md](CORRECTNESS.md)** — we optimize for **correct**, not for “working.”
+**Goal:** playable commercial software via **IRX-first** IOP + honest Soft-GS — not plant waves.  
+**Doctrine:** **[CORRECTNESS.md](CORRECTNESS.md)** · **Plan:** **[IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)**.
 
 ---
 
 ## 0. Non-negotiables
 
 0. **Correct over working.** No host cheats that fake PS2 video/UI/I/O (no FFmpeg logos, no synthetic branded overlays, no force-complete waits that skip real RPC). A black Soft-GS frame with honest residuals beats a pretty lie. Full list: **[CORRECTNESS.md](CORRECTNESS.md)**.  
-1. **BIOS G0 is closed.** Prefer deepening **shared** HLE over inventing title plants.  
-2. **No literal IRX execution required** for menu work (Phase L / #12 ignored unless asked).  
+1. **IRX-first pivot (active).** Prefer **literal BIOS/disc IRX execution** on IOP over new C# service clones or GameQuirk plants. Plan: **[IRX_EXECUTION_PHASE_PLAN.md](IRX_EXECUTION_PHASE_PLAN.md)**. Do not start multi-title plant waves.  
+2. **BIOS G0 HLE is a floor/fallback**, not “platform complete.” Deepen **devices + IOP exec**; shared HLE only when IRX cannot run.  
 3. **Do not guess** boot flow, RPC shapes, FILEIO layouts, or menu type.  
 4. **Soft-GS metrics are ground truth for DetPS2** (CPU Soft-GS). Host GPU is only for optional present/PCSX2 UI — this machine has **no iGPU**; use dGPU if a window is required, else stay headless.  
 5. **DETPS2_SEMA_STALL_YIELD** must stay **OFF** unless a documented experiment.  
