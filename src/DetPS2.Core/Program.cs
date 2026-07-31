@@ -424,9 +424,26 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
         Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
         Console.WriteLine($"  softgs-writes: total={traceSys.Gs.RegWritesTotal} PRIM={traceSys.Gs.RegWritesPrim} XYZ2={traceSys.Gs.RegWritesXyz2} XYZ3={traceSys.Gs.RegWritesXyz3} XYZF2={traceSys.Gs.RegWritesXyzf2} FRAME={traceSys.Gs.RegWritesFrame} SCISSOR={traceSys.Gs.RegWritesScissor} TEST={traceSys.Gs.RegWritesTest} XYOFF={traceSys.Gs.RegWritesXyoffset}");
+        // GX-001/GX-003: path fidelity claim lines — always present for scoreboard / G0 inventory
         Console.WriteLine($"  gif-pkts: completed={traceSys.Gif.PacketsCompleted} aborted={traceSys.Gif.PacketsAborted} spannedCalls={traceSys.Gif.PacketsSpannedCalls} inFlight={traceSys.Gif.PacketInFlight} tags={traceSys.Gif.TagsSeen} p2qws={traceSys.Gif.Path2Qws}");
+        Console.WriteLine($"  gif-path: p1={traceSys.Gif.Path1Transfers} p1qws={traceSys.Gif.Path1Qws} p2={traceSys.Gif.Path2Transfers} p2qws={traceSys.Gif.Path2Qws} p3={traceSys.Gif.Path3Transfers} p3qws={traceSys.Gif.Path3Qws} m3p={traceSys.Gif.Path3MaskedByVif} heldP3n={traceSys.Gif.HeldPath3Entries} heldP3qwc={traceSys.Gif.HeldPath3Qwc} heldSubmits={traceSys.Gif.Path3HeldSubmits} mskPath3={traceSys.Vif.MskPath3Count}");
+        Console.WriteLine($"  gif-tags: packed={traceSys.Gif.TagsCompletedPacked} reglist={traceSys.Gif.TagsCompletedReglist} image={traceSys.Gif.TagsCompletedImage} disable={traceSys.Gif.TagsCompletedDisable} abortNewDir={traceSys.Gif.AbortNewDirect} abortTrunc={traceSys.Gif.AbortDirectTruncate} abortOther={traceSys.Gif.AbortOther} lastAbort={traceSys.Gif.LastAbortReason}");
         if (traceSys.Gif.PacketInFlight || traceSys.Gif.TagsSeen > 0)
             Console.WriteLine($"  gif-last: flg={traceSys.Gif.LastTagFlg} nloop={traceSys.Gif.LastTagNloop} nreg={traceSys.Gif.LastTagNreg} regs=0x{traceSys.Gif.LastTagRegs:X16} inflightFlg={traceSys.Gif.PacketFlg} progress={traceSys.Gif.PacketProgress}/{traceSys.Gif.PacketNloop}");
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1" && traceSys.Gif.TraceRingCount > 0)
+        {
+            var ring = new Gif.GifTraceSlot[Math.Min(traceSys.Gif.TraceRingCount, 24)];
+            int rn = traceSys.Gif.CopyTraceRing(ring);
+            Console.WriteLine($"  gif-trace-ring: {rn} event(s) (DETPS2_TRACE_GIF=1; kind 0=xfer 1=tag 2=done 3=abort)");
+            for (int ri = 0; ri < rn; ri++)
+            {
+                var e = ring[ri];
+                string kn = e.Kind switch { 0 => "xfer", 1 => "tag", 2 => "done", 3 => "abort", _ => "?" };
+                Console.WriteLine(
+                    $"    [{ri}] {kn} path={e.Path} flg={e.Flg} flags=0x{e.Flags:X2} addr=0x{e.Addr:X8} " +
+                    $"qwc/nloop={e.QwcOrNloop} completed={e.Completed} aborted={e.Aborted}");
+            }
+        }
         Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
         if (traceSys.Hle.Sony != null)
         {

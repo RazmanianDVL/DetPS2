@@ -84,11 +84,39 @@ Smokes: prior WAVE-11C Path2 suite + `Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurfac
 3. Path3MaskedByVif held unless game unmasks with real GIF PATH3.
 4. **aborted=1** residual is intentional (garbage DIRECT IMM=0xBF0) — leave.
 
+### S8 G0 path-fidelity claim (agent/seat-s8/s0-g0) — metrics inventory
+
+SEMA_STALL_YIELD **OFF**. Soft-GS ground truth. New claim lines always present (`gif-path` / `gif-tags`); ring dump with `DETPS2_TRACE_GIF=1`.
+
+#### @20M
+
+```
+px=573440 prims=2 gifPath1=0 gifPath2=6 gifPath3=0 dmac=1 cdvdSectors=142
+gif-pkts: completed=5 aborted=1 spannedCalls=1 inFlight=False tags=6 p2qws=887
+gif-path: p1=0 p1qws=0 p2=6 p2qws=887 p3=0 p3qws=0 m3p=False heldP3n=0 heldP3qwc=0 heldSubmits=0 mskPath3=8
+gif-tags: packed=5 reglist=0 image=0 disable=0 abortNewDir=1 abortTrunc=0 abortOther=0 lastAbort=new-DIRECT
+```
+
+TRACE_GIF ring: garbage Path2 DIRECT IMM=0xBF0 → REGLIST nloop=12301 `WARN=path2-huge-nloop` → `abort new-DIRECT` → real PACKED A+D tags #2–6.
+
+#### @100M
+
+```
+PC=0x0013F5F8 px=573440 prims=2 gifPath1=0 gifPath2=19 gifPath3=0 dmac=28 cdvdSectors=142
+softgs-regs: FRAME_1=0x80000 XYOFFSET=0x730000007000
+gif-pkts: completed=18 aborted=1 spannedCalls=1 inFlight=False tags=19 p2qws=1082
+gif-path: p1=0 p1qws=0 p2=19 p2qws=1082 p3=0 p3qws=0 m3p=False heldP3n=0 heldP3qwc=0 heldSubmits=0 mskPath3=8
+gif-tags: packed=18 reglist=0 image=0 disable=0 abortNewDir=1 abortTrunc=0 abortOther=0 lastAbort=new-DIRECT
+```
+
+**Hold:** MENU title-surface Soft-GS · Path3MaskedByVif held (m3p=False; gifP3=0 natural residual) · aborted only garbage DIRECT class. Docs: `docs/graphics/PATH3_MASK_MATRIX.md`, `PATH2_STICKY_W11C.md`.
+
 ### Reproduce
 
 ```powershell
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow-w12b
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s8
 $env:DETPS2_TRACE_BIOS='1'
-dotnet exec out/game-gow-w12b/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
+# optional ring: $env:DETPS2_TRACE_GIF='1'
+dotnet exec out/seat-s8/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
 ```
