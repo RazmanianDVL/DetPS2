@@ -8,12 +8,12 @@
 | **ISO** | `user-media-whiplash.json` → operator ISO (never commit path) |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-whiplash.json` |
-| **Seat / branch** | **S7 STREAM** (secondary queue) · `agent/seat-s7/s0-g0` |
+| **Seat / branch** | **S7 STREAM** (secondary queue) · `agent/seat-s7/s1-g1` |
 | **Build** | `out/seat-s7` |
 | **Assist** | `WhiplashAssist.cs` (owned) + shared GOE in `RealSifRpc.cs` |
-| **Status** | **MENU YES** (title-surface Soft-GS) — GOE Open+Start + ofx expand full FB |
+| **Status** | **MENU YES** + **pad inject live** (PL-018) — T2 INTERACTIVE residual (no state/prim advance @100M) |
 | **Last updated** | 2026-07-31 |
-| **WP** | PL-005 residual + draw-graph; residual focus **texture ring + ofx expand** |
+| **WP** | PL-018 pad title-surface → T2; residual **texture ring + ofx expand** |
 
 ### MENU gate
 
@@ -22,7 +22,7 @@ Not MK MAINMENU language.
 
 ---
 
-## Claim 100M (SEMA_STALL_YIELD OFF) — 2026-07-31 seat-s7
+## Claim 100M (SEMA_STALL_YIELD OFF) — S1 PL-018 pad · 2026-07-31 seat-s7
 
 ```
 @100M: PC=0x00314F80  px=286720  prims=1  gifPath1=0  gifPath2=0  gifPath3=2  dmac=26
@@ -33,10 +33,15 @@ Not MK MAINMENU language.
        softgs-writes: total=12 PRIM=1 XYZ2=0 XYZ3=0 XYZF2=2 FRAME=1 SCISSOR=1 TEST=1 XYOFF=1
        gif-pkts: completed=3 aborted=0 tags=3 p2qws=0
        RealSifRpc: binds=13 calls=571 unknownBindSids=0
+       pad: inject ≥1536 START/CROSS edges + ForceRefreshPad post PADMAN OPEN
        spine: UsingCD + IOPRP255 retail · GOE IOPFILE 0x31/0x40 · WaitSema WHIP-gated only
 ```
 
-Trace: `out/traces/whiplash-claim100-20260731-085231-{out,err}.txt`  
+**CLAIM LINE (Whip / PL-018):**  
+`Whip SEMA_OFF @100M MENU hold px=286720 prims=1 ofx=0x8000 cdvd=1904 | pad inject live (≥1536) | T2 INTERACTIVE residual (no PC/prim delta vs S0; WaitSema WHIP-only)`
+
+Trace: `out/traces/whiplash-claim100-pad-20260731-090439-{out,err}.txt`  
+S0 baseline (no pad): `out/traces/whiplash-claim100-20260731-085231-{out,err}.txt`  
 Matches wave-6 title-surface class: **px=286720** = 640×448 full Soft-GS FB; ofx/ofy=`0x8000`.
 
 Reproduce:
@@ -64,7 +69,8 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json -
 | Soft-GS title surface | **Yes** (**px=286720** full FB) |
 | Natural Path2 multi-prim / IMAGE tex | **No** (prims=1, imgBytes=0, gifPath2=0) |
 | DISPFB present | **No** (dispfbPx=0) |
-| Pad interactive | **Open** (PL-018; WHIP WaitSema only) |
+| Pad inject START/CROSS (PL-018) | **Yes** (≥1536 pulses @100M; ForceRefreshPad; post PADMAN OPEN) |
+| T2 INTERACTIVE (state/prim delta) | **Residual** (same PC/prims as S0; expand strip + texture ring) |
 
 ---
 
@@ -147,6 +153,7 @@ Backlog: **PL-033** full texture ring path; handoff textured sample to S9 (G-GFX
 - Reboot arg host→cdrom rewrite
 - FlushCache/JREXIT rescue + data-thrash escape
 - Post-reboot WaitSema pulse (title) + PS2.RKV / title-name warm tokens
+- **PL-018** dense START/CROSS/Circle/D-pad inject + `ForceRefreshPad` post-PADMAN (no global WaitSema)
 
 **Shared (`RealSifRpc` / `SonyKernelHle` / `Gs`) — do not edit without ownership:**
 
@@ -156,13 +163,13 @@ Backlog: **PL-033** full texture ring path; handoff textured sample to S9 (G-GFX
 
 ## Debt class
 
-`WhiplashAssist` TITLE · GOE ring shared DEBT · ofx expand shared GFX (S9) · WHIP WaitSema stays WHIP.
+`WhiplashAssist` TITLE · GOE ring shared DEBT · ofx expand shared GFX (S9) · WHIP WaitSema stays WHIP · pad live but frontend not consuming edges yet.
 
 ## Next WPs (seat S7 secondary)
 
 | WP | Goal |
 |----|------|
-| PL-018 | Pad title-surface; WHIP WaitSema only |
+| PL-018 | **Done (pad live)** — T2 state advance residual; WHIP WaitSema only |
 | PL-033 | Full texture ring path |
 | PL-042 | Expand demotion attempt (S9 co-review) |
 | PL-062 | Start run / first gameplay |

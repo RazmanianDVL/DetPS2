@@ -8,12 +8,12 @@
 | **ISO** | `user-media-vexx.json` → operator ISO (never commit path) |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-vexx.json` |
-| **Seat / branch** | **S7 STREAM** · `agent/seat-s7/s0-g0` |
+| **Seat / branch** | **S7 STREAM** · `agent/seat-s7/s1-g1` |
 | **Build** | `out/seat-s7` |
 | **Assist** | `VexxAssist.cs` (owned) |
-| **Status** | **MENU YES** (title-surface Soft-GS) — STREE0 VFS member stream + multi-prim Path2 |
+| **Status** | **MENU YES** + **pad inject live** (PL-017) — T2 INTERACTIVE residual (no state/prim advance @100M) |
 | **Last updated** | 2026-07-31 |
-| **WP** | PL-005 residual + draw-graph; residual focus **TRE VFS** |
+| **WP** | PL-017 pad title-surface → T2; residual **TRE VFS** + host-read BADARGS |
 
 ### MENU gate
 
@@ -22,7 +22,7 @@ Not MK MAINMENU language.
 
 ---
 
-## Claim 100M (SEMA_STALL_YIELD OFF) — 2026-07-31 seat-s7
+## Claim 100M (SEMA_STALL_YIELD OFF) — S1 PL-017 pad · 2026-07-31 seat-s7
 
 ```
 @100M: PC=0x003681D4  px=877186  prims=24  gifPath1=0  gifPath2=12  gifPath3=5  dmac=9
@@ -33,11 +33,15 @@ Not MK MAINMENU language.
        softgs-writes: total=2019 PRIM=1541 XYZ2=48 XYZ3=0 FRAME=6 SCISSOR=3 TEST=3 XYOFF=3
        gif-pkts: completed=176 aborted=2 spannedCalls=3 tags=178 p2qws=2210
        RealSifRpc: binds=10 calls=31 unknownBindSids=0
-       STREE0: stream-map count=11364 indexMembers=7272 host MEMBER opens=17 fails=15
+       pad: inject ≥1536 START/CROSS edges + ForceRefreshPad (DETPS2_TRACE_VEXX)
+       STREE0: MEMBER opens=17; begin.atr open + host-read BADARGS residual
 ```
 
-Trace: `out/traces/vexx-claim100-20260731-085231-{out,err}.txt`  
-SHA tip at claim: `20973c6` (+ this docs commit).
+**CLAIM LINE (Vexx / PL-017):**  
+`Vexx SEMA_OFF @100M MENU hold px=877186 prims=24 gifP2=12 img=5120 cdvd=318 | pad inject live (≥1536) | T2 INTERACTIVE residual (no PC/prim delta vs S0)`
+
+Trace: `out/traces/vexx-claim100-pad-20260731-090251-{out,err}.txt`  
+S0 baseline (no pad): `out/traces/vexx-claim100-20260731-085231-{out,err}.txt`
 
 Reproduce:
 
@@ -63,7 +67,8 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-vexx.json --cyc
 | IMAGE bytes (TEX path residual) | **Partial** (**imgBytes=5120**) |
 | DISPFB present path | **No** (dispfbPx=0) |
 | Full TRE member completeness | **Residual** (15 open fails; nested stree1/patch0/sound) |
-| Pad interactive / frontend deep | **Open** (S1 INTERACTIVE PL-017) |
+| Pad inject START/CROSS (PL-017) | **Yes** (≥1536 pulses @100M; ForceRefreshPad) |
+| T2 INTERACTIVE (state/prim delta) | **Residual** (same PC/prims as S0; begin.atr BADARGS + TRE fails) |
 
 ---
 
@@ -137,17 +142,18 @@ Primary residual class: **STREE0 virtual filesystem incomplete**.
 - Host CD I/O open/read/seek/tell/size/close
 - STREE0 stream-map plant + NameCRC virtual member FS
 - Null stream-map / path-normalize / stack-death escapes
+- **PL-017** dense START/CROSS/Circle/D-pad inject + `ForceRefreshPad` after STREE/Soft-GS surface
 
 ## Debt class
 
-`VexxAssist` TITLE · SearchFile dual-gate handoff with S1 (PL-036) · nested TRE/sound open for T3 frontend.
+`VexxAssist` TITLE · SearchFile dual-gate handoff with S1 (PL-036) · nested TRE/sound open for T3 frontend · begin.atr host-read BADARGS blocks frontend pad path.
 
 ## Next WPs (seat S7)
 
 | WP | Goal |
 |----|------|
-| PL-017 | Pad on title-surface |
-| PL-032 | TRE member completeness (fail list above) |
+| PL-017 | **Done (pad live)** — T2 state advance residual |
+| PL-032 | TRE member completeness (fail list above) + begin.atr read args |
 | GX-062 | First-area textures (post-gameplay charter) |
 | PL-053 | Title→game first level |
 
