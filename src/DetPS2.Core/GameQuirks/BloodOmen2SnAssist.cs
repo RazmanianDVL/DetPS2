@@ -59,6 +59,7 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _snPrintfStubbed = false;
         _vtCallStubbed = false;
         _entityPrintfGlueStubbed = false;
+        _fmtScanStubbed = false;
         _goeTokenEscapes = 0;
         _codeOpenNudges = 0;
         _inMapEscapes = 0;
@@ -468,41 +469,82 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private bool _snPrintfStubbed;
     private bool _vtCallStubbed;
     private bool _entityPrintfGlueStubbed;
+    private bool _fmtScanStubbed;
 
     private int _goeTokenEscapes;
     private int _codeOpenNudges;
     private int _inMapEscapes;
 
     /// <summary>
-    /// Unstick post-KAIN format thrash toward CODE/MAINMENU Open — thrash-only, not a
-    /// permanent format plant.
+    /// Unstick post-KAIN format thrash toward CODE/MAINMENU Open.
     ///
-    /// Live wall (2026-07-31 honest metrics): permanent soft-stub of format leaf
-    /// <c>0x482F60</c> / wrapper <c>0x4804E8</c> / bridge <c>0x482EE8</c> after KAIN
-    /// broke legitimate format consumers — notably <c>0x485318</c> ("Bad Destination
-    /// for InMap %s") and left EE rescue-looping mid <c>0x2B9F34</c> (a1==0 InMap path)
-    /// with no further FILEIO. Entity Dest-Database glue <c>0x2AD8E0</c> is still
-    /// soft-stubbed (that chain feeds binary goefile string tables into format).
-    ///
-    /// Policy: keep format .text intact for rodata format strings (0x4Bxxxx). Reject
-    /// binary a2 at leaf entry; unwind deep '%' scan heat (0x483048/0x486EC0) when
-    /// post-pack dwells — real format strings finish fast.
+    /// Live (2026-07-31): pure thrash-only escape failed — Step is 50k-cycle sliced and
+    /// deep '%' scan (0x483048/0x486EC0) + bulk memcpy (0x4803EC) burn tens of M with
+    /// no reliable stack ra. Permanent soft-stub of the format LEAF only (0x482F60)
+    /// after pack-resident open kills the heat; wrapper/bridge stay intact.
+    /// InMap 0x485318 then completes (leaf returns 0) and MaybeEscapeInMapNullDest
+    /// leaves the a1==0 / bad-jalr wall that previously rescue-looped at 0x2B9F34.
+    /// Entity Dest-Database glue 0x2AD8E0 remains soft-stubbed.
     ///
     /// Residual (#17/#8): still no proven game FILEIO/IOPFILE Open of CODE.BG2 /
     /// MAINMENU.BG2. SHARED goefile member extract for .IMP remains structural.
     /// </summary>
     private void MaybeEscapeGoeFileTokenThrash(Ps2System sys, ulong c)
     {
+        // Permanent format leaf stub after pack open — only path that stops 0x483048 heat
+        // under 50k-cycle Step slices. Wrapper/bridge NOT stubbed (InMap 0x485318).
+        if (!_fmtScanStubbed && HasBo2PackAssetIo(sys))
+        {
+            uint head = sys.Memory.Read32(0x00482F60);
+            if (head != 0 && head != 0x03E00008u)
+            {
+                sys.Memory.Write32(0x00482F60, 0x03E00008u); // jr ra
+                sys.Memory.Write32(0x00482F64, 0x0000102Du); // daddu v0, zero, zero
+                _fmtScanStubbed = true;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        "[BO2] soft-stub format leaf @ 0x482F60 (jr ra; v0=0; wrapper intact)");
+            }
+        }
+
         if (_goeTokenEscapes >= 96) return;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint a2 = (uint)(sys.EE.GetGpr(6).Lo & 0x1FFFFFFFUL);
+
+        // Soft-stubbed leaf is two words — let jr ra complete.
+        if (_fmtScanStubbed && pc is >= 0x00482F60 and <= 0x00482F68)
+            return;
+
+        // Bulk byte-copy thrash near format lib (live final PC 0x4803F4): when remaining
+        // count (a2) is absurd, force return. Real short copies finish in << 50k cycles.
+        if (pc is >= 0x004803E0 and <= 0x00480410)
+        {
+            uint rem = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
+            if (rem > 0x10000u)
+            {
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                if (!IsSafeCodeTarget(sys, ra) || !IsColdSafeResume(sys, ra) || ra == pc)
+                    ra = 0x0048A980;
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+                sys.EE.PC = ra;
+                sys.EE.COP0_Status &= ~0x6u;
+                _goeTokenEscapes++;
+                _titleSmEscapes++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_goeTokenEscapes <= 12 || _goeTokenEscapes % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] abort huge memcpy thrash rem=0x{rem:X8} -> 0x{ra:X8} n={_goeTokenEscapes} cyc={c}");
+                return;
+            }
+        }
 
         // Real format epilogue — never interrupt mid-restore.
         if (pc is >= 0x00484448 and <= 0x00484478)
             return;
 
-        // Entry gate: binary/goefile a2 must not enter the 720-byte '%' scan (live heat
-        // 0x483048/0x486EC0). Legitimate rodata (InMap 0x4BE8F8) falls through.
+        // Entry gate residual (if leaf plant not yet applied this slice).
         if (pc is >= 0x00482F60 and <= 0x00482FA0 && LooksLikeBo2BinaryFmtPtr(a2))
         {
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
