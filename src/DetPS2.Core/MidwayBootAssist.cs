@@ -71,6 +71,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     /// <summary>First of the 2 semaphore-id globals InitLocksFn populates — "has this already
     /// run" guard.</summary>
     private const uint InitLocksGlobalSlot = 0x005640A8;
+    /// <summary>Fourth scratch trampoline for post-WAD resource-stream-slot bind path.</summary>
+    private const uint ResourceBindReturnTrampoline = 0x01FE0030;
+    /// <summary>FUN_0026F918 resource load kickoff; allocates stream slot via 43B670.</summary>
+    private const uint ResourceKickFn = 0x0026F918;
+    /// <summary>FUN_0026FBF0 post-load bind; sole caller of BFC0-C1C0.</summary>
+    private const uint ResourceBindFn = 0x0026FBF0;
+    /// <summary>Static load-handle area for FUN_0026FD80 / FUN_0026FBF0(0x678458).</summary>
+    private const uint ResourceHandleBase = 0x00678458;
 
     private bool _worklistPlanted;
     private bool _sifForced;
@@ -88,6 +96,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private bool _initLocksResumePending;
     private ulong _initLocksSavedPc;
     private ulong[]? _initLocksSavedGpr;
+    private bool _resourceBindKickForced;
+    private bool _resourceBindPollForced;
+    private bool _resourceBindTrampolineWritten;
+    private bool _resourceBindResumePending;
+    private int _resourceBindPhase;
+    private ulong _resourceBindSavedPc;
+    private ulong[]? _resourceBindSavedGpr;
     private bool _logoPrepared;
     private bool _logoActive;
     private bool _midwayDone;
@@ -188,6 +203,13 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _initLocksResumePending = false;
         _initLocksSavedPc = 0;
         _initLocksSavedGpr = null;
+        _resourceBindKickForced = false;
+        _resourceBindPollForced = false;
+        _resourceBindTrampolineWritten = false;
+        _resourceBindResumePending = false;
+        _resourceBindPhase = 0;
+        _resourceBindSavedPc = 0;
+        _resourceBindSavedGpr = null;
         _resourceLoadForced = false;
         _lastListWalkBreakCyc = 0;
         _lastFormatStallCyc = 0;
@@ -1337,7 +1359,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // re-home menu6 used after format stall so logo spine can advance (gifP3 5→12).
         // Wave-14: also at ~50.5M when gifP3<=5 and WAD-scale CDVD done (historical AdEL
         // timing). Require >=180k sectors so main re-entry cannot truncate GAMEDATA.
-        if (sys.Cdvd.SectorsRead >= 180_000 && sys.Gif.Path3Transfers < 11
+        if (!_resourceBindResumePending
+            && sys.Cdvd.SectorsRead >= 180_000 && sys.Gif.Path3Transfers < 11
             && (c >= 58_000_000
                 || (c >= 50_500_000 && sys.Gif.Path3Transfers <= 5)))
             MaybeKickMainForLogoSpine(sys);
@@ -1389,13 +1412,17 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (c >= 60_000_000 && sys.Cdvd.SectorsRead >= 100_000
             && (sys.Gif.Path3Transfers >= 8 || c >= 72_000_000))
             MaybeInitStreamManager(sys);
-        // Wave-12 REJECTED: synthetic stream slot0 plant (flag=1 + type5 stub @0x01FD5000 +
-        // D6F8[0]) → EE death at 0x8000018x by ~80M (baseline FAE8@0x43FB40 healthy). Do not
-        // re-enable. C1C0 never runs under HLE (pcbreak: 26FBF0/43BFC0/43C1C0 = 0 hits @100M;
-        // sole chain 26FC34→43BFC0→C1C0). Need real resource bind or PCSX2 slot dump.
-        // Wave-9: re-arm stream CAS *0x55E248 so FUN_0043FAE8 can re-enter after first pass
-        // (live 120M: cas248 stuck at 1 while gifP3 plateaus 11; skip200 already 0).
-        if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000)
+        // Wave-2: real resource->stream-slot bind (26F918 alloc -> 26FBF0 -> BFC0 -> C1C0).
+        // Resume every Step so trampoline cannot starve. No synthetic type5 plants.
+        MaybeResumeAfterForcedResourceBind(sys);
+        if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 180_000
+            && sys.Gif.Path3Transfers >= 8
+            && !_resourceBindResumePending)
+            MaybeForceResourceSlotBind(sys);
+        // Wave-12 REJECTED: synthetic type5 stream slot plant - do not re-enable.
+        // Wave-9: re-arm stream CAS *0x55E248 so FUN_0043FAE8 can re-enter after first pass.
+        if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 100_000
+            && !_resourceBindResumePending)
             MaybeRearmStreamCas(sys);
         // Wave-9: post-spine sticky park in syscall-68 / worker 0x47FD..0x480B and ADX
         // re-init 0x4143A0 — starve second chrome + pad accept.
@@ -1790,7 +1817,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private void MaybeForceManagerInit(Ps2System sys)
     {
         if (_managerInitForced) return;
-        if (_sifResumePending) return; // never yank while another forced call is in flight
+        if (_sifResumePending || _resourceBindResumePending) return; // never yank while another forced call is in flight
         if (sys.MasterCycles < 3_000_000) return; // safely after KickMidwayMainPath + MaybeForceSifInit have settled
         if (sys.Memory.Read32(ManagerInitGlobalSlot) != 0)
         {
@@ -1874,7 +1901,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private void MaybeForceInitLocks(Ps2System sys)
     {
         if (_initLocksForced) return;
-        if (_sifResumePending || _managerInitResumePending) return; // never yank mid-forced-call
+        if (_sifResumePending || _managerInitResumePending || _resourceBindResumePending) return; // never yank mid-forced-call
         if (sys.MasterCycles < 3_000_000) return; // same safe threshold established for manager-init
         if (sys.Memory.Read32(InitLocksGlobalSlot) != 0)
         {
@@ -4248,6 +4275,176 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             mem.Write32(handle + 0x4C, 0);
         return 1;
     }
+
+    /// <summary>
+    /// Wave-2 MENU: drive the real resource-manager path that binds stream work slots.
+    /// ELF XREF sole chain: 32EA08 -&gt; 26FD80 -&gt; 26F918 (43B670) -&gt; 26FBF0 -&gt; 43BFC0 -&gt; 43C1C0.
+    /// Force-call kick (26F918) then bind poll (26FBF0). Never force 26FD80 (infinite poll).
+    /// No synthetic type5 plants.
+    /// </summary>
+    private void MaybeForceResourceSlotBind(Ps2System sys)
+    {
+        if (_resourceBindPhase >= 4) return;
+        if (_resourceBindResumePending) return;
+        if (_sifResumePending || _managerInitResumePending || _initLocksResumePending) return;
+
+        if (sys.Cdvd.SectorsRead < 180_000) return;
+        if (sys.MasterCycles < 70_000_000) return;
+        if (sys.Gif.Path3Transfers < 8) return;
+
+        bool multiLive = sys.Memory.Read32(0x0075E950) == 0x0043F920u;
+        bool frameCbLive = sys.Memory.Read32(0x0075BDD8) == 0x0043F920u;
+        if (!multiLive && !frameCbLive) return;
+
+        if (sys.Memory.Read32(StreamManagerBase + 0x38) != 1
+            && sys.Memory.Read32(0x0055E1EC) != 1)
+            return;
+
+        uint slot0 = sys.Memory.Read32(0x0055E25C);
+        if (slot0 == 1 && sys.Memory.Read32(0x0055E25C + 0x3C) != 0)
+        {
+            _resourceBindPhase = 4;
+            return;
+        }
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        if (pc is (>= 0x0026F900 and <= 0x0026FD80)
+            or (>= 0x0043B670 and <= 0x0043C400)
+            or (>= 0x0043FAE0 and <= 0x0043FD00))
+            return;
+
+        if (!_resourceBindTrampolineWritten)
+        {
+            sys.Memory.Write32(ResourceBindReturnTrampoline, 0x1000FFFFu);
+            sys.Memory.Write32(ResourceBindReturnTrampoline + 4, 0);
+            _resourceBindTrampolineWritten = true;
+        }
+
+        if (_resourceBindPhase == 0 && !_resourceBindKickForced)
+        {
+            PrepareResourceHandleForKick(sys.Memory);
+
+            _resourceBindSavedPc = sys.EE.PC;
+            _resourceBindSavedGpr = new ulong[32];
+            for (int i = 0; i < 32; i++)
+                _resourceBindSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+
+            for (int i = 4; i <= 11; i++)
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = ResourceHandleBase });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
+            ulong sp = sys.EE.GetGpr(29).Lo;
+            if ((sp & 0x1FFFFFFFUL) < 0x100000 || (sp & 0x1FFFFFFFUL) >= 0x2000000)
+                sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FF0000 });
+            ReHomeSpIfInHleScratch(sys);
+
+            sys.EE.PC = ResourceKickFn;
+            sys.LastGoodEePc = ResourceKickFn;
+            _resourceBindKickForced = true;
+            _resourceBindResumePending = true;
+            _resourceBindPhase = 1;
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] force resource kick FUN_0026F918 a0=0x{ResourceHandleBase:X} " +
+                    $"savedPc=0x{_resourceBindSavedPc:X8} slot0={slot0:X} " +
+                    $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        if (_resourceBindPhase == 2 && !_resourceBindPollForced)
+        {
+            uint handlePtr = sys.Memory.Read32(ResourceHandleBase);
+            if (handlePtr == 0 || handlePtr >= (uint)SystemMemory.RDRAM_SIZE)
+            {
+                _resourceBindPhase = 4;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[BIOS] resource kick left *0x678458=0 - no bind poll " +
+                        $"slot0={sys.Memory.Read32(0x0055E25C):X} cyc={sys.MasterCycles}");
+                return;
+            }
+
+            ForceResourceHandleDone(sys.Memory, handlePtr);
+            ForceResourceHandleDone(sys.Memory, ResourceHandleBase);
+            uint st = sys.Memory.Read32(handlePtr + 0x48);
+            if (st == 0 || (int)st > 0)
+                sys.Memory.Write32(handlePtr + 0x48, unchecked((uint)(-1)));
+
+            _resourceBindSavedPc = sys.EE.PC;
+            _resourceBindSavedGpr = new ulong[32];
+            for (int i = 0; i < 32; i++)
+                _resourceBindSavedGpr[i] = sys.EE.GetGpr(i).Lo;
+
+            for (int i = 4; i <= 11; i++)
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = ResourceHandleBase });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ResourceBindReturnTrampoline });
+            ReHomeSpIfInHleScratch(sys);
+
+            sys.EE.PC = ResourceBindFn;
+            sys.LastGoodEePc = ResourceBindFn;
+            _resourceBindPollForced = true;
+            _resourceBindResumePending = true;
+            _resourceBindPhase = 3;
+            Assists++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BIOS] force resource bind FUN_0026FBF0 a0=0x{ResourceHandleBase:X} " +
+                    $"*handle=0x{handlePtr:X8} slot0={sys.Memory.Read32(0x0055E25C):X} " +
+                    $"obj={sys.Memory.Read32(0x0055E25C + 0x3C):X8} " +
+                    $"gifP3={sys.Gif.Path3Transfers} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// Mirror early FUN_0026FD80 setup before FUN_0026F918: zero handle, live flags.
+    /// </summary>
+    private static void PrepareResourceHandleForKick(SystemMemory mem)
+    {
+        for (uint o = 0; o < 0x208; o += 4)
+            mem.Write32(ResourceHandleBase + o, 0);
+        mem.Write32(ResourceHandleBase + 0x1F0, 1);
+        mem.Write32(ResourceHandleBase + 0x1EC, 0);
+        if (mem.Read32(0x0055E1EC) == 0)
+            mem.Write32(0x0055E1EC, 1);
+        if (mem.Read32(StreamManagerBase + 0x38) == 0)
+            mem.Write32(StreamManagerBase + 0x38, 1);
+        if (mem.Read32(StreamManagerBase + 0x24) == 1)
+            mem.Write32(StreamManagerBase + 0x24, 0);
+    }
+
+    private void MaybeResumeAfterForcedResourceBind(Ps2System sys)
+    {
+        if (!_resourceBindResumePending) return;
+        if ((uint)(sys.EE.PC & 0x1FFFFFFF) != ResourceBindReturnTrampoline) return;
+
+        uint slot0 = sys.Memory.Read32(0x0055E25C);
+        uint slot0obj = sys.Memory.Read32(0x0055E25C + 0x3C);
+        uint handlePtr = sys.Memory.Read32(ResourceHandleBase);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BIOS] resource bind resume phase={_resourceBindPhase} " +
+                $"*0x678458=0x{handlePtr:X8} slot0={slot0:X} obj=0x{slot0obj:X8} " +
+                $"v0=0x{sys.EE.GetGpr(2).Lo:X} gifP3={sys.Gif.Path3Transfers} " +
+                $"cyc={sys.MasterCycles}");
+
+        sys.EE.PC = _resourceBindSavedPc;
+        if (_resourceBindSavedGpr != null)
+            for (int i = 1; i < 32; i++)
+                sys.EE.SetGpr(i, new EmotionEngine.Gpr128 { Lo = _resourceBindSavedGpr[i] });
+        sys.LastGoodEePc = _resourceBindSavedPc;
+        _resourceBindResumePending = false;
+
+        if (_resourceBindPhase == 1)
+            _resourceBindPhase = 2;
+        else if (_resourceBindPhase == 3)
+            _resourceBindPhase = 4;
+
+        Assists++;
+    }
+
 
     private void MaybeStartLogo(Ps2System sys)
     {
