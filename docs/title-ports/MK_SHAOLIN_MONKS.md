@@ -9,14 +9,55 @@
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
-| Agent date | 2026-07-31 (wave-2) |
+| Agent date | 2026-07-31 (wave-3) |
 | ROMDIR gate | **CLOSED** |
 | IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
 | Wave-14 tip | SifRpc MSFLAG plant removed; WAD + gifP3=11 restored |
 
 ---
 
-## Result this session (wave-2 / resource bind path)
+
+## Result this session (wave-3 / reconstruct load request)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR? / GS?** — not claimed. Host tip currently Exit@~22M (baseline A/B same without w3 patch) |
+| Reconstruct 26F918 args | **Landed** — a1/a2 are **display dims** (512x384), not name ptrs; path via FUN_00211148 name table 0x4D3A10[id]+1 into handle+0xEC; t0=heap id from *0x584918 |
+| Heap wall | Midway heap table 0x65E998 **empty** under HLE → full 26F918 hits FUN_0020F058 AdEL. Wave-3 prefers **FUN_0043B670** with prepared descriptor + sm+0x28/+0x2C capacity |
+| Trampoline timeout | 2M-cycle abandon if force path never returns (prevents AdEL hang) |
+| Synthetic type5 | **Not used** |
+| PresentEeSifHandshake in StartLoadedModule | **Not re-added** |
+| Selection index | Still unproven |
+
+### Soft-GS scoreboard
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Wave-2 (healthy boot)** | FAE8 bands | 573k–860k | 2–3 | **8–9** | 12–16 | force 26F918 a1=a2=0 → *0x678458=0 |
+| **Wave-3 mid-session (shared tree)** | hung 0x20243C after AdEL | 860160 | 3 | **11** | 17 | reconstructed dims/path; 26F918 AdEL @0x552023 (dead heap) |
+| **Wave-3 tip A/B (isolated)** | 0x486C10 | 286720 | 1 | **5** | 7 | Exit@22M — **baseline without patch same** |
+
+### Change class
+
+- **TITLE_LOCAL** MidwayBootAssist.cs: reconstruct 32EA08/26FD80 load-request; IsResourceHeapLive → force 43B670 when heaps dead; descriptor builder; path strcpy handle+0xEC; sm+0x28/+0x2C capacity; 2M trampoline timeout.
+- **SHARED**: none. No PresentEeSifHandshake in StartLoadedModule. No type5 plants.
+- **Tool**: 	ools/_patch_sm_w3.py (idempotent).
+
+### Residual wall
+
+1. Midway heaps never init under HLE → cannot run full 26F918 I/O path; 43B670 alone may still fail 43AB88 object create without real resource body.
+2. Host tip Exit@22M (vector thrash) blocks late-force verification this session — not attributed to w3 (baseline match).
+3. Selection index + interactive MAINMENU still unproven.
+4. Next: PCSX2+PINE live *0x678458 / heap table after real menu, or root-cause heap init path under IRX.
+
+### Play! / PINE
+
+- Play! GameConfig.xml: no SLUS_210.87 entry
+- PINE: **N this wave** (ELF XREF + disasm of 26F918/26FD80/32EA08/211148/43B9F8 sufficient for arg reconstruction)
+
+---
+
+## Result prior session (wave-2 / resource bind path)
 
 | Goal | Status |
 |------|--------|
