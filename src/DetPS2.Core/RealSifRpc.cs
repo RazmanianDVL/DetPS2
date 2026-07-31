@@ -1023,7 +1023,7 @@ public sealed class RealSifRpc
         // CD SearchFile (sid=0x80000597) — FUN_000002f0 "search file name %s".
         if (sid == SidCdSearchFile)
         {
-            int sf = HandleCdSearchFile(mem, cdvd, argBuf, recvBuf);
+            int sf = HandleCdSearchFile(mem, cdvd, argBuf, recvBuf, sendSize);
             if (recvBuf != 0) mem.Write32(recvBuf, unchecked((uint)sf));
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
@@ -2973,7 +2973,7 @@ public sealed class RealSifRpc
                 return HandleCdInit(cdvd, argBuf, mem);
 
             case SidCdSearchFile:
-                return HandleCdSearchFile(mem, cdvd, argBuf, recvBuf);
+                return HandleCdSearchFile(mem, cdvd, argBuf, recvBuf, sendSize: 0);
 
             case SidCdDiskReady:
             case SidCdDiskReady2:
@@ -6357,14 +6357,26 @@ public sealed class RealSifRpc
 
     /// <summary>
     /// CDVDFSV SearchFile (sid=0x80000597 / FUN_000002f0). Arg buffer is an in/out
-    /// <c>sceCdlFILE</c>-shaped region with the path string at offset +0x20 (decomp:
-    /// <c>param_2 + 0x20</c>). On success writes lsn/size into the struct head and returns 1.
+    /// <c>sceCdlFILE</c>-shaped region. Path offset follows Play! <c>Iop_Cdvdfsv::SearchFile</c>:
+    /// 0x124 → +0x20, 0x128/0x12C → +0x24 (Vexx STREE0.TRE uses 0x128). On success writes
+    /// lsn/size into the struct head and returns 1.
     /// </summary>
-    private static int HandleCdSearchFile(SystemMemory mem, Cdvd cdvd, uint argBuf, uint recvBuf)
+    private static int HandleCdSearchFile(SystemMemory mem, Cdvd cdvd, uint argBuf, uint recvBuf, uint sendSize = 0)
     {
         if (argBuf == 0) return 0;
-        // Path lives at +0x20 in the sceCdlFILE / search packet (decomp FUN_000002f0).
-        string name = ReadCString(mem, argBuf + 0x20, 256);
+        // Play! pathOffset: 0x124→0x20, 0x128/0x12C→0x24. Also sniff +0x24 when it looks like a
+        // path even if sendSize is unknown (HLE Dispatch / quirks call without size).
+        string at20 = ReadCString(mem, argBuf + 0x20, 256);
+        string at24 = ReadCString(mem, argBuf + 0x24, 256);
+        string name;
+        if (sendSize is 0x128 or 0x12C)
+            name = at24;
+        else if (sendSize == 0x124)
+            name = at20;
+        else if (LooksLikeCdSearchPath(at24) && (!LooksLikeCdSearchPath(at20) || at24 != at20))
+            name = at24; // Vexx 0x128 residual: stale leaf at +0x20, fresh path at +0x24
+        else
+            name = at20;
         if (string.IsNullOrEmpty(name))
             name = ReadCString(mem, argBuf, 256);
         name = name.Trim();
@@ -6410,6 +6422,10 @@ public sealed class RealSifRpc
             for (int i = 0; i < 16; i++)
                 mem.Write8(argBuf + 8 + (uint)i, i < leaf.Length ? (byte)leaf[i] : (byte)0);
 
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] SearchFile ok \"{name}\" lsn={entry.ExtentLba} size={entry.Size} send={sendSize} arg=0x{argBuf:X}");
+
             try { vol.Disc?.Dispose(); } catch { /* ignore */ }
             return 1;
         }
@@ -6417,6 +6433,23 @@ public sealed class RealSifRpc
         {
             return 0;
         }
+    }
+
+    /// <summary>Heuristic: printable path-ish string for sceCdSearchFile path sniffing.</summary>
+    private static bool LooksLikeCdSearchPath(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length > 192) return false;
+        char c0 = s[0];
+        if (c0 is '\\' or '/' or '$' or (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9'))
+        {
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c is < (char)0x20 or >= (char)0x7F) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// <summary>
