@@ -186,16 +186,29 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     // Dec WAVE-5: member .ssf CallRpc residual (live 50M Soft-GS px=73, idle @0x1B6A68).
     // Archive registry head @0x61302C is live after MWFILE MKDA.PAK open, but main's
     // gameart load @0x1A41B0 either raced an empty registry or failed without retry.
-    // 0x1A41B0 → 0x267090(table@0x5A6E20) → 0x222790(entry) builds path @0x612C30 and
+    // 0x1A41B0 → 0x267090(table@0x5A6F30 live) → 0x222790(entry) builds path @0x612C30 and
     // issues MWFILE open for gameart.ssf. Re-enter once registry is non-null.
     private const uint DecArchiveRegHead = 0x0061302C;
-    private const uint DecGameartTable = 0x005A6E20;   // first slot → gameart entry
+    // Live main@0x1A41DC: lui a0,0x5A; addiu a0,28464 → 0x5A6F30 (not 0x5A6E20).
+    private const uint DecGameartTable = 0x005A6F30;
     private const uint DecGameartEntry = 0x0050AD28;   // { name@0x5A6E10 "gameart.ssf", … }
     private const uint DecGameartName = 0x005A6E10;
     private const uint DecPathScratch = 0x00612C30;    // strcat dest in 0x222790/0x222980
     private const uint DecLoadSysartGameart = 0x001A41B0; // main@0x123798 call target
+    private const uint DecPostOpenConsumer = 0x001A44D0; // post-open SSF consume (a0=id,a1=ctx)
     private const uint DecOpenFromTable = 0x00267090;    // table → 0x222790 open
+    private const uint DecMainMenuLoop = 0x001237F0;     // main infinite loop after gameart
+    private const uint DecWaitSemaLeafLo = 0x0010BE20;
+    private const uint DecWaitSemaLeafHi = 0x0010BE30;
+    private const uint DecCallRpcAfterWaitLo = 0x0010FEE0;
+    private const uint DecCallRpcAfterWaitHi = 0x0010FF00;
     private bool _openSendRetargetPlanted;
+    private int _decPowerOffStormHits;
+    private int _decPowerOffStormBreaks;
+    private int _decMenuKeepAlives;
+    private int _decMenuForceProcess;
+    private int _decSsfConsumerKicks;
+    private bool _decSsfConsumerDone;
 
     public MidwayFamilyAssist(string serial, string displayName)
     {
@@ -242,6 +255,12 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _daPostLogoSoftSuccess = 0;
         _daPostLogoPlanted = false;
         _openSendRetargetPlanted = false;
+        _decPowerOffStormHits = 0;
+        _decPowerOffStormBreaks = 0;
+        _decMenuKeepAlives = 0;
+        _decMenuForceProcess = 0;
+        _decSsfConsumerKicks = 0;
+        _decSsfConsumerDone = false;
     }
 
     /// <summary>True when this assist is bound to Deception (SLUS_208.81).</summary>
@@ -273,6 +292,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             or (>= 0x0011F930UL and <= 0x0011F960UL)      // main gate after 0x123A30
             or (>= 0x0010C040UL and <= 0x0010C050UL)      // CRT Exit stub
             or (>= 0x001152F0UL and <= 0x00115318UL);     // CRT exit wrapper
+
+    /// <summary>
+    /// Dec WAVE-7: CallRpc WaitSema leaf + main menu loop + post-open consumer.
+    /// Tight EE slices so keep-alive / PowerOff-storm break can act between instructions.
+    /// </summary>
+    public static bool IsDecMenuHotPc(ulong pcPhys) =>
+        pcPhys is (>= DecWaitSemaLeafLo and <= DecWaitSemaLeafHi)
+            or (>= DecCallRpcAfterWaitLo and <= DecCallRpcAfterWaitHi)
+            or (>= 0x0010F5E0UL and <= 0x0010F620UL) // CallRpc epilogue residual
+            or (>= 0x0010B9E0UL and <= 0x0010BA40UL) // CreateSema/syscall leaf residual
+            or (>= DecMainMenuLoop and <= DecMainMenuLoop + 0x100UL)
+            or (>= DecIdlePcLo and <= DecIdlePcHi)
+            or (>= DecPostOpenConsumer and <= DecPostOpenConsumer + 0x40UL)
+            or (>= 0x0034D000UL and <= 0x0034E000UL) // W7 exception residual thrash
+            or (>= 0x80000180UL and <= 0x80000280UL);
 
     public void OnDiscMounted(Ps2System sys) => ApplyVersionPolicy(sys);
 
@@ -324,6 +358,12 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryKickDecPostMslAssetEnqueue(sys);
             TryKickDecGameartMemberOpen(sys);
             TryPublishDecGameartOpen(sys);
+            // WAVE-7: post-open SSF consumer + break CD_SCMD PowerOff WaitSema storm
+            // so main stays in midway-menu loop with live Path2 (DA-class keep-alive).
+            // SSF consumer re-enter is done once by TryPublishDecGameartOpen (0x1A44D0).
+            // Extra kicks faulted into 0x8034Dxxx — skip TryKickDecSsfPostOpenConsumer.
+            TryBreakDecCdPowerOffStorm(sys);
+            TryKeepAliveDecMidwayMenu(sys);
         }
     }
 
@@ -376,18 +416,16 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 rpc.ForceDecGameartMemberOpen(iop, cdvd);
         }
 
-        // WAVE-6: open result lives at gp-24036 (0x5D69AC). Path-hash multi-entry must
-        // make open@0x21D810 return the planted stream; stop only when that cell is non-null
-        // (or host open live after several kicks).
+        // WAVE-6/7: open result at gp-24036. Stop PC kicks once stream slot is live or
+        // publish ran — further re-entry only via SSF post-open consumer (not re-open).
         const uint DecOpenResultSlot = 0x005D6D8C; // gp(0x5DCB70)-24036 (sw v0 after open)
         uint openResult = sys.Memory.Read32(DecOpenResultSlot);
         bool streamLive = openResult >= 0x00010000 && openResult < 0x02000000;
-        if (streamLive && (rpc?.DecGameartMemberOpens ?? 0) > 0)
+        if (streamLive || _decGameartPublished)
         {
             _decGameartKickDone = true;
             return;
         }
-        // Soft success: path-hash plant + host open without EE store still needs re-kick.
         if (_decGameartKickDone && _decGameartKicks >= 6) return;
 
         // Throttle: first kick after ~32 hits; then every 128 hits up to 6 kicks.
@@ -396,35 +434,33 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (_decGameartKicks >= 1 && (_decGameartHits & 127) != 0) return;
         if (_decGameartKicks >= 6) { _decGameartKickDone = true; return; }
 
-        // Clear sticky idle locks so post-return pump can run after open returns.
+        // WAVE-7: one-shot table open@0x267090 only (stores path-hash stream to gp-24036).
+        // Do NOT kick full 0x1A41B0 — that jal's 0x1A44D0 and faulted from idle frame.
+        WriteCStringIfChanged(sys.Memory, DecPathScratch, "/art/gameart.ssf");
         sys.Memory.Write8(DecIdleFlag25032, 0);
         sys.Memory.Write8(DecIdleFlag25036, 0);
         sys.Memory.Write8(DecIdleFlag25040, 0);
 
-        // Normalize path scratch to EE path-builder form ("/art/gameart.ssf").
-        WriteCStringIfChanged(sys.Memory, DecPathScratch, "/art/gameart.ssf");
-
-        uint resume = inIdle ? pc : 0x001B6A68u;
-        // Prefer full main load sequence (sysart table + gameart); alternate table open.
-        uint target = DecLoadSysartGameart;
-        if ((_decGameartKicks & 1) == 1)
+        if (_decGameartKicks == 0 && inIdle)
         {
-            target = DecOpenFromTable;
-            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = DecGameartTable }); // a0
-            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 });                 // a1
+            uint resume = pc;
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = DecGameartTable });
+            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+            sys.EE.PC = DecOpenFromTable;
+            _decGameartKicks = 1;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[MKFAM] Dec gameart table-open kick pc=0x{pc:X8}→0x{DecOpenFromTable:X8} " +
+                    $"reg=0x{reg:X8} opens={rpc?.DecGameartMemberOpens ?? 0} cyc={sys.MasterCycles}");
+            return;
         }
 
-        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume }); // ra
-        sys.EE.PC = target;
         _decGameartKicks++;
-        // Prefer load@0x1A41B0 first; then table open; alternate thereafter.
-        if (_decGameartKicks >= 6)
-            _decGameartKickDone = true;
-
+        _decGameartKickDone = true;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[MKFAM] Dec gameart member open kick n={_decGameartKicks} " +
-                $"pc=0x{pc:X8}→0x{target:X8} reg=0x{reg:X8} resume=0x{resume:X8} " +
+                $"[MKFAM] Dec gameart plant-done n={_decGameartKicks} pc=0x{pc:X8} " +
                 $"opens={rpc?.DecGameartMemberOpens ?? 0} cyc={sys.MasterCycles}");
     }
 
@@ -458,23 +494,310 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decGameartKickDone = true;
         _decGameartPublished = true;
 
-        // Re-enter post-open consumer @0x1A44D0 (main@0x1A41C8) so SSF is consumed.
-        uint pc = (uint)sys.EE.PC;
-        bool idleish = (pc >= DecIdlePcLo && pc <= DecIdlePcHi)
-            || (pc >= 0x001B8280 && pc <= 0x001B82B8)
-            || (pc >= 0x001BF700 && pc <= 0x001BF800);
-        if (idleish)
-        {
-            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 }); // a0 matches 0x1A41C8
-            sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0x0050AD08UL }); // a1 from 0x1A41D0
-            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = pc });
-            sys.EE.PC = DecLoadSysartGameart; // full load after open result live
-        }
+        // Do NOT re-enter 0x1A44D0 here — live W7: a0=0 registry walk faulted into
+        // 0x8034Dxxx / path-scratch-as-PC thrash. Stream publish alone is enough for
+        // idle process to drain queued GIF work; keep-alive owns Path2 continuity.
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[MKFAM] Dec publish gameart open result stream=0x{Stream:X8} " +
-                $"loaded={rpc.DecGameartBytesLoaded} reenter=0x1A41B0 cyc={sys.MasterCycles}");
+                $"loaded={rpc.DecGameartBytesLoaded} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// <summary>
+    /// WAVE-7: after gameart stream is published, one-shot re-enter post-open consumer
+    /// <c>0x1A44D0</c> so registry walk can enqueue GIF work. Multi-kick of 0x1A44D0 with
+    /// a0=0 was observed to fault into 0x8034Dxxx — keep this to a single attempt.
+    /// Idle-band only. No invent Soft-GS.
+    /// </summary>
+    private void TryKickDecSsfPostOpenConsumer(Ps2System sys)
+    {
+        if (_decSsfConsumerDone || _decSsfConsumerKicks >= 1) return;
+        if (!_decGameartPublished && (sys.Hle?.Sony?.RealRpc?.DecGameartBytesLoaded ?? 0) <= 0)
+            return;
+        if (sys.MasterCycles < 30_000_000) return;
+
+        const uint DecOpenResultSlot = 0x005D6D8C;
+        uint stream = sys.Memory.Read32(DecOpenResultSlot);
+        if (stream < 0x00010000 || stream >= 0x02000000) return;
+
+        uint pc = (uint)sys.EE.PC;
+        bool idleish = pc is >= DecIdlePcLo and <= DecIdlePcHi
+            or (>= 0x001B8280 and <= 0x001B82B8)
+            or (>= 0x001B6AA8 and <= 0x001B6AE8);
+        if (!idleish) return;
+
+        // Ensure table slot names live gameart table (0x1A41DC uses 0x5A6F30).
+        const uint DecOpenTableSlot = 0x005D6D88;
+        if (sys.Memory.Read32(DecOpenTableSlot) == 0)
+            sys.Memory.Write32(DecOpenTableSlot, DecGameartTable);
+
+        sys.Memory.Write8(DecIdleFlag25032, 0);
+        sys.Memory.Write8(DecIdleFlag25036, 0);
+        sys.Memory.Write8(DecIdleFlag25040, 0);
+
+        // One-shot only — further SSF work is via idle process drain / natural main loop.
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0x0050AD08UL });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = DecIdlePcLo + 0x28 });
+        sys.EE.PC = DecPostOpenConsumer;
+        _decSsfConsumerKicks = 1;
+        _decSsfConsumerDone = true;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec SSF post-open kick n=1 " +
+                $"pc=0x{pc:X8}→0x{DecPostOpenConsumer:X8} stream=0x{stream:X8} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// WAVE-7: break CD_SCMD PowerOff (fno=0x21) CallRpc WaitSema storm @0x10BE28.
+    /// Live claim 100M: after Midway Path2 paint EE thrash CreateSema+WaitSema on CD
+    /// PowerOff (~645 calls). Soft-complete WaitSema by returning to CallRpc $ra (honest
+    /// leave) — do NOT stomp PC to main@0x1237F0 (that faulted into 0x8034Dxxx with dead
+    /// stack). Cap re-entries by parking main at idle pump after repeated thrash.
+    /// No SignalSema(3). No invent Soft-GS pixels.
+    /// </summary>
+    private void TryBreakDecCdPowerOffStorm(Ps2System sys)
+    {
+        if (sys.MasterCycles < 35_000_000) return;
+        if (sys.Gs.PixelsWritten == 0) return;
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null || rpc.DecGameartBytesLoaded <= 0) return;
+        if (_decPowerOffStormBreaks >= 128) return;
+
+        uint pc = (uint)sys.EE.PC;
+        uint ra = (uint)sys.EE.GetGpr(31).Lo;
+        bool inWaitSema = pc is >= DecWaitSemaLeafLo and <= DecWaitSemaLeafHi;
+        bool raCallRpc = ra is >= DecCallRpcAfterWaitLo and <= DecCallRpcAfterWaitHi
+            or (>= 0x0010F380 and <= 0x0010F3B0)
+            or (>= 0x0010FE00 and <= 0x0010FF20);
+        if (!inWaitSema || !raCallRpc)
+        {
+            _decPowerOffStormHits = 0;
+            return;
+        }
+
+        _decPowerOffStormHits++;
+        // After first abandon, re-home immediately on every WaitSema/CallRpc re-entry.
+        bool alreadyAbandoned = _decPowerOffStormBreaks >= 3;
+        if (!alreadyAbandoned)
+        {
+            if (_decPowerOffStormHits < 4) return;
+            if (_decPowerOffStormBreaks > 0 && (_decPowerOffStormHits & 3) != 0) return;
+        }
+
+        uint a0 = (uint)sys.EE.GetGpr(4).Lo;
+        uint idlePark = DecIdlePcLo + 0x28; // 0x1B6A68
+        // First few: soft-complete WaitSema → CallRpc $ra (honest leave).
+        // After that the PowerOff caller re-enters forever — abandon CallRpc frame and
+        // park idle pump so Path2 can keep draining (DA keep-alive class).
+        bool abandonToIdle = alreadyAbandoned || _decPowerOffStormBreaks >= 3;
+        uint dest = abandonToIdle ? idlePark : ra;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = a0 != 0 ? a0 : 1u });
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+        sys.EE.PC = dest;
+        if (abandonToIdle)
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = idlePark });
+
+        // Clear wait state on current + main threads (no SignalSema(3)).
+        try
+        {
+            var k = sys.Hle?.Kernel;
+            if (k != null)
+            {
+                int cur = k.CurrentThreadId;
+                foreach (var t in k.AllThreads)
+                {
+                    if (!t.Alive) continue;
+                    if (t.Id == cur || t.Id == 1)
+                    {
+                        t.Sleeping = false;
+                        t.WaitSemaId = 0;
+                        if (abandonToIdle || t.Id == 1)
+                            t.SavedPc = idlePark;
+                        else
+                            t.SavedPc = ra;
+                    }
+                    else if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                    {
+                        try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                    }
+                }
+                if (abandonToIdle)
+                    try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+            }
+        }
+        catch { /* ignore */ }
+
+        sys.Memory.Write8(DecIdleFlag25032, 0);
+        sys.Memory.Write8(DecIdleFlag25036, 0);
+        sys.Memory.Write8(DecIdleFlag25040, 0);
+
+        _decPowerOffStormBreaks++;
+        _decPowerOffStormHits = 0;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _decPowerOffStormBreaks <= 32)
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec PowerOff/WaitSema storm break n={_decPowerOffStormBreaks} " +
+                $"→0x{dest:X8} abandon={abandonToIdle} px={sys.Gs.PixelsWritten} " +
+                $"p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// WAVE-7 DA-class keep-alive for Dec midway-menu: after Path2 Midway surface is live
+    /// (Soft-GS px&gt;0, gameart stream loaded), keep idle process draining and recover from
+    /// exception/CRT Exit into the idle pump @0x1B6A68 (live stable park). Do not stomp
+    /// main@0x1237F0 without a live main frame (W7 residual: 0x8034Dxxx thrash).
+    /// No invent Soft-GS pixels. No SignalSema(3).
+    /// </summary>
+    private void TryKeepAliveDecMidwayMenu(Ps2System sys)
+    {
+        if (sys.MasterCycles < 32_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null || rpc.DecGameartBytesLoaded <= 0) return;
+
+        uint pc = (uint)sys.EE.PC;
+        uint pcPhys = pc & 0x1FFFFFFFu;
+        bool exit0 = sys.Hle is { ExitRequested: true, ExitCode: 0 };
+        bool inWaitSema = pc is >= DecWaitSemaLeafLo and <= DecWaitSemaLeafHi;
+        bool inCrtExit = (pc is >= 0x0010C040 and <= 0x0010C050)
+            || (pc is >= 0x001152F0 and <= 0x00115318);
+        // Exception vector + W7 residual thrash (kernel / path-scratch-as-PC / non-.text).
+        bool inException = (pc is >= 0x80000180 and <= 0x80000280)
+            || (pcPhys is >= 0x0034D000 and <= 0x0034D200)
+            || (pc > 0x80000000u && pcPhys is >= 0x0034D000 and <= 0x0034E000)
+            || (pcPhys is >= 0x00600000 and <= 0x00700000) // path scratch / high data as PC
+            || (pcPhys is >= 0x01800000 and < 0x02000000);  // gameart payload as PC
+        bool inMainLoop = pc is >= DecMainMenuLoop and <= DecMainMenuLoop + 0xF0;
+        bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
+        bool inProcess = pc is >= DecProcessWrapper and <= DecProcessWrapper + 0x200;
+        uint idlePark = DecIdlePcLo + 0x28; // 0x1B6A68
+
+        // Idle with pending queue: force drain so Path2 continues (separate budget).
+        if ((inIdle || inProcess) && !exit0 && !inException)
+        {
+            uint head = sys.Memory.Read32(DecIdleQueueHead);
+            uint tail = sys.Memory.Read32(DecIdleQueueTail);
+            // Pointer queue: head chases tail. head>tail without ring is CORRUPT (W7
+            // residual advanced head past tail) — never force-process that.
+            bool pending = head != tail
+                && head >= 0x00100000 && head < 0x02000000
+                && tail >= 0x00100000 && tail < 0x02000000
+                && head < tail
+                && (tail - head) <= 0x10000;
+            if (pending && inIdle && _decMenuForceProcess < 512)
+            {
+                if ((_decMenuForceProcess & 3) != 0) { _decMenuForceProcess++; return; }
+                sys.Memory.Write8(DecIdleFlag25032, 0);
+                sys.Memory.Write8(DecIdleFlag25036, 0);
+                sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFUL });
+                sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = idlePark });
+                sys.EE.PC = DecProcessWrapper;
+                _decMenuForceProcess++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && _decMenuForceProcess <= 64)
+                    Console.Error.WriteLine(
+                        $"[MKFAM] Dec menu keep-alive force-process n={_decMenuForceProcess} " +
+                        $"head=0x{head:X8} tail=0x{tail:X8} p2={sys.Gif.Path2Transfers} " +
+                        $"px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
+                return;
+            }
+            // Corrupt queue: snap head=tail so idle can leave, then recover.
+            if (head != tail
+                && head >= 0x00100000 && head < 0x02000000
+                && tail >= 0x00100000 && tail < 0x02000000
+                && head > tail
+                && _decMenuForceProcess < 16)
+            {
+                sys.Memory.Write32(DecIdleQueueHead, tail);
+                sys.Memory.Write8(DecIdleFlag25032, 0);
+                sys.Memory.Write8(DecIdleFlag25036, 0);
+                _decMenuForceProcess++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[MKFAM] Dec idle queue repair head→tail=0x{tail:X8} " +
+                        $"p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
+                return;
+            }
+            // Healthy idle empty or mid-process — leave alone.
+            if (inMainLoop || inIdle || inProcess) return;
+        }
+
+        // Recover Exit / exception / WaitSema monopolize → idle pump (not main@0x1237F0).
+        // Separate budget from force-process so exception recovery is never starved.
+        if (_decMenuKeepAlives >= 256) return;
+        // CallRpc epi / CreateSema leaf thrash (pad residual 0x10BA08 / claim 0x10F60C).
+        bool inRpcEpi = pc is >= 0x0010F5E0 and <= 0x0010F620
+            or (>= 0x0010B9E0 and <= 0x0010BA40);
+        bool needHome = exit0 || inCrtExit || inException || inRpcEpi
+            || (inWaitSema && _decPowerOffStormBreaks >= 4)
+            || (inWaitSema && sys.MasterCycles > 50_000_000 && sys.Gif.Path2Transfers < 1000);
+        if (!needHome) return;
+        // Always recover exceptions / rpc-epi immediately; throttle others.
+        if (!exit0 && !inException && !inRpcEpi && (_decMenuKeepAlives & 7) != 0) return;
+
+        if (exit0)
+            sys.Hle.ClearExitRequest();
+
+        // Prefer main menu loop when $sp is a live high main frame (idle is called from
+        // main with sp≈0x01FFFExx). CallRpc stacks (0x007xxxxx) must stay at idle park.
+        uint sp = (uint)sys.EE.GetGpr(29).Lo;
+        bool mainStack = sp is >= 0x01FF0000 and < 0x02000000;
+        uint park = (mainStack && !inException) ? DecMainMenuLoop : idlePark;
+
+        sys.EE.PC = park;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = park });
+        sys.Memory.Write8(DecIdleFlag25032, 0);
+        sys.Memory.Write8(DecIdleFlag25036, 0);
+        sys.Memory.Write8(DecIdleFlag25040, 0);
+
+        try
+        {
+            var k = sys.Hle.Kernel;
+            foreach (var t in k.AllThreads)
+            {
+                if (!t.Alive) continue;
+                if (t.Id == 1)
+                {
+                    t.Started = true;
+                    t.EverStarted = true;
+                    t.Sleeping = false;
+                    t.WaitSemaId = 0;
+                    t.SavedPc = park;
+                    continue;
+                }
+                if (!t.Started)
+                {
+                    try { k.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false); }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                {
+                    try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                }
+            }
+            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+        }
+        catch { /* ignore */ }
+
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+
+        _decMenuKeepAlives++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _decMenuKeepAlives <= 48)
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec midway-menu keep-alive n={_decMenuKeepAlives} " +
+                $"park=0x{park:X8} sp=0x{sp:X8} storm={_decPowerOffStormBreaks} " +
+                $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
+                $"exitWas={exit0} exc={inException} cyc={sys.MasterCycles}");
     }
 
     private static bool PathScratchMentionsGameart(SystemMemory mem)
@@ -523,7 +846,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private void TryKickDecPostMslAssetEnqueue(Ps2System sys)
     {
         if (sys.MasterCycles < 20_000_000) return;
-        if (_decPostMslKicks >= 64 && _decProcessForces >= 64) return;
+        // WAVE-7: raise caps so post-gameart Path2 pump can keep draining (DA gifP2 growth).
+        if (_decPostMslKicks >= 128 && _decProcessForces >= 192) return;
 
         uint pc = (uint)sys.EE.PC;
         bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
@@ -570,7 +894,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
         // 1) Wake pure sleepers + high-id SN waiters so producers can refill / complete.
         var k = sys.Hle?.Kernel;
-        if (k != null && _decPostMslKicks < 64)
+        if (k != null && _decPostMslKicks < 128)
         {
             int woke = 0;
             foreach (var th in k.AllThreads)
@@ -659,7 +983,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                     return;
                 }
                 // Idle empty+flag: one honest complete entry then residual clear next tick.
-                if (inIdle && _decProcessForces < 96 && now32 != 0)
+                if (inIdle && _decProcessForces < 192 && now32 != 0)
                 {
                     sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
                     sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = pc });
@@ -677,7 +1001,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         // 3) Force process wrapper (a0=-1): same entry pump@0x1B70AC uses. Wrapper
         //    falls through to 0x1B5D78 when head!=tail and flags clear; runs type 0x01
         //    GIF CHCR setup honestly. Resume idle so s1 can re-evaluate.
-        if (_decProcessForces < 96
+        if (_decProcessForces < 192
             && (_decPostMslKicks >= 1 || _decFlagClears >= 1)
             && inIdle)
         {
@@ -1172,7 +1496,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
         if (_postDisplayExitRescues >= 64) return;
 
-        bool exit0 = sys.Hle.ExitRequested && sys.Hle.ExitCode == 0;
+        bool exit0 = sys.Hle is { ExitRequested: true, ExitCode: 0 };
         uint pc = (uint)sys.EE.PC;
         bool inCrtExit = pc is >= 0x0010C040 and <= 0x0010C050
             or (>= 0x001152F0 and <= 0x00115318)
@@ -1392,7 +1716,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (_postDisplayExitRescues >= 64) return;
         if (sys.MasterCycles < 7_000_000) return;
 
-        bool exit0 = sys.Hle.ExitRequested && sys.Hle.ExitCode == 0;
+        bool exit0 = sys.Hle is { ExitRequested: true, ExitCode: 0 };
         uint pc = (uint)sys.EE.PC;
         bool inCrtExitStub = pc is >= 0x0010C040 and <= 0x0010C050; // Exit syscall stub only
         bool inDiEi = pc is >= DaDiEiLo and <= DaDiEiHi;
