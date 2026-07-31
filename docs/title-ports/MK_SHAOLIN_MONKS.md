@@ -14,7 +14,63 @@
 
 ---
 
-## Result this session (wave-9)
+## Result this session (wave-10)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR** — group-6 entry (`a0=6`) + natural multi countdown; **selection index + gifP3≥12 still unproven** |
+| WAD stream | **Yes** — `cdvd=198840` |
+| gifP3 | **11** (plateau; no second-chrome lift) |
+| dmac | **16** @100M (stream body live; 120M CAS path still needed for dmac climb) |
+| Frame cb | **`*0x75BDD8=0x43F920` held** + arg `0x5BB860` |
+| Group-6 multi | **`*0x75E950=0x43F920` held**; escapes land **`0x427678`** (a0=6) not bare `0x427518` |
+| Stream cookie | **`*0x5BB860=1` planted**; slot0 `*0x55E25C` still zero |
+| Stream work gate | **`*0x55E1EC=1` held**; skip `*0x55E200=0`; CAS re-arm held |
+| Pad | Dense START/CROSS/DOWN/UP; ghost PADMAN; Play! PAD consulted (generic) |
+| Final PC | **`0x43FB40`** (FUN_0043FAE8 work loop) sustained 87–100M — not worker thrash |
+| Accept | Multi + stream leaf live under pad; **selection index + second UI chrome not proven** |
+| Constraints | `DETPS2_SEMA_STALL_YIELD` OFF; **no `*0x75C0D0` plant** |
+| diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 (baseline hold) |
+| verify 50M | PC=`0x41D608` px=28.9M gifP3=5 dmac=7 cdvd=198840 exitReq=False |
+
+### Play! / PINE
+
+- Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
+- Play! PAD: `Iop_PadMan.cpp` (0x80000100) — ghost DMA + ForceRefreshPad already ported SHARED
+- Play! TITLE/SIF: generic modules only
+- PINE: **N** (disasm of multi `0x427518` / group-6 entry `0x427678` / FAE8 sufficient)
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - `PickMenuDispatchResume` / `ApplyMenuDispatchResume` — prefer **`0x427678`** (sets a0=6) over bare multi; only heal *dead* $ra (never retarget worker→pump — that caused `PC=0x8000018C`)
+  - `MaybeBreakMenuCallbackCountdown` — **no sticky break on natural s2=0..5** (only absurd s2≥64 / extreme sticky)
+  - Post-spine + lock-wrapper escapes use menu-dispatch helper; ADX lock→menu kick after spine
+  - Wider menu-sel telemetry (stream slot0 + pad DMA + extra BSS bands)
+- **SHARED**: none this wave
+
+### pad-inject @ 100M (host-present, wave-10)
+
+```
+  58200000  logo-spine kick → ADX pump gifP3=5
+  60000000  group-6 + frame-cb + cookie=1 + stream gateEc=1
+  73200000  re-arm stream CAS; gifP3 climbs 6→8→11
+  75000000  CROSS; gifP3=11; memset + VU escape
+  77000000  post-spine 0x47FEA8 → 0x427678 (group-6 a0=6)
+  82000000  DOWN @ multi loop 0x427570
+  84800000  CROSS → stream slot 0x43FBB0
+  87000000+ sustained FAE8 body 0x43FB40 / 0x43FC14 / frame-cb 0x4156E4
+ 100000000  final PC=0x43FB40 gifP3=11 dmac=16 syscalls~914k cdvd=198840
+```
+
+### Residual wall (wave-10)
+
+1. **gifP3 plateau 11** — stream FAE8 loop live but Path3 not 12–14; stream work **slot0 empty** (`*0x55E25C=0`) so FBB0 has nothing to draw.
+2. **Selection index location still unknown** — D-pad moves multi busy flags `*54E610/*54E618` only; no stable 0..N cell under pad.
+3. **Hard accept-to-submenu unproven** — no new UI string set after CROSS.
+4. Next: PCSX2+PINE dump of live menu object / stream-manager slots under real pad; or force `FUN_0043CD58` stream-manager init if registration path never ran.
+
+## Result prior session (wave-9)
 
 | Goal | Status |
 |------|--------|
@@ -34,13 +90,13 @@
 | Smokes | **ALL PASSED** |
 | diagnose 20M | PC=`0x47FCF0` px=11.7M gifP3=5 dmac=7 cdvd=198840 binds=16 calls=241 (baseline hold) |
 
-### Play! / PINE
+### Play! / PINE (wave-9)
 
 - Play! `GameConfig.xml`: **no SLUS_210.87 entry** (generic IOP HLE)
 - Play! PAD: `Iop_PadMan.cpp` (0x80000100) — ghost DMA + ForceRefreshPad already ported SHARED
 - PINE: **N** (not used this wave; disasm of FAE8/F920 sufficient for CAS wall)
 
-### Change class
+### Change class (wave-9)
 
 - **TITLE** `MidwayBootAssist.cs`: `MaybeRearmStreamCas`, `MaybeEscapePostSpineWorkerThrash`, skip-flag hold, prefer group-6/stream over ADX for post-spine lock escape
 - **SHARED**: none this wave
