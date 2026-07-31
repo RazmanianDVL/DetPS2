@@ -328,28 +328,63 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         }
 
         // After repeated kicks head still stuck: main never reaches process@0x1B5D78
-        // (idle callback null). Type 0x41 handler (0x1B6228) only sets flags + head+=8 —
-        // apply the same RDRAM side-effects so idle can leave the busy-wait and workers
-        // can enqueue asset opens. Live cmd @head: type=0x41 ptr=0x617AC0.
+        // (idle callback null / non-draining). Drain simple process types with the same
+        // RDRAM side-effects as 0x1B5D78 handlers so the queue can advance and asset
+        // enqueue can run. Live residual: 0x41 then 0x01+0x40 chains.
         if (!pending || _decPostMslKicks < 2) return;
-        uint headNow = sys.Memory.Read32(DecIdleQueueHead);
-        uint tailNow = sys.Memory.Read32(DecIdleQueueTail);
-        if (headNow == tailNow) return;
-        if (headNow < 0x00100000 || headNow + 8 > 0x02000000) return;
-        uint cmd = sys.Memory.Read32(headNow);
-        if ((cmd & 0xFF) != 0x41) return;
-        uint arg = sys.Memory.Read32(headNow + 4);
-        // Match 0x1B6228: flags @gp-25040/-25036 = 1; slot @gp-25044 = arg; head += 8.
-        sys.Memory.Write8(DecGp - 25040, 1);
-        sys.Memory.Write8(DecGp - 25036, 1);
-        sys.Memory.Write32(DecGp - 25044, arg);
-        sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+        int drained = 0;
+        for (int n = 0; n < 8; n++)
+        {
+            uint headNow = sys.Memory.Read32(DecIdleQueueHead);
+            uint tailNow = sys.Memory.Read32(DecIdleQueueTail);
+            if (headNow == tailNow) break;
+            if (headNow < 0x00100000 || headNow + 8 > 0x02000000) break;
+            uint cmd = sys.Memory.Read32(headNow);
+            uint typ = cmd & 0xFF;
+            uint arg = sys.Memory.Read32(headNow + 4);
+            if (typ == 0x41)
+            {
+                // 0x1B6228: flags 25040/25036=1; slot 25044=arg; head+=8
+                sys.Memory.Write8(DecGp - 25040, 1);
+                sys.Memory.Write8(DecGp - 25036, 1);
+                sys.Memory.Write32(DecGp - 25044, arg);
+                sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+            }
+            else if (typ == 0x40)
+            {
+                // 0x1B6200: flag 25036=1, 25040=0; slot 25044=arg; head+=8
+                sys.Memory.Write8(DecGp - 25036, 1);
+                sys.Memory.Write8(DecGp - 25040, 0);
+                sys.Memory.Write32(DecGp - 25044, arg);
+                sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+            }
+            else if (typ == 0x7F)
+            {
+                // 0x1B61A8: head = arg (absolute)
+                if (arg >= 0x00100000 && arg < 0x02000000)
+                    sys.Memory.Write32(DecIdleQueueHead, arg);
+                else
+                    break;
+            }
+            else if (typ is 0x01 or 0x02 or 0x21 or 0x42 or 0x43 or 0x4F)
+            {
+                // Complex types (display/VIF/callback). Soft-advance head so the idle
+                // busy-wait cannot pin forever; real PATH3/VIF work remains for later.
+                sys.Memory.Write32(DecIdleQueueHead, headNow + 8);
+            }
+            else
+                break;
+            drained++;
+        }
+        if (drained == 0) return;
         // Clear sticky idle flag so s1 can fall to DI path when queue empties.
         sys.Memory.Write8(DecGp - 25032, 0);
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _decPostMslKicks <= 24)
             Console.Error.WriteLine(
-                $"[MKFAM] Dec idle type-0x41 consume head=0x{headNow:X8}->0x{headNow + 8:X8} " +
-                $"arg=0x{arg:X8} cyc={sys.MasterCycles}");
+                $"[MKFAM] Dec idle queue drain n={drained} kicks={_decPostMslKicks} " +
+                $"head=0x{sys.Memory.Read32(DecIdleQueueHead):X8} " +
+                $"tail=0x{sys.Memory.Read32(DecIdleQueueTail):X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
