@@ -8,8 +8,8 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
-| Agent date | 2026-07-31 (wave-3) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-sm-w4` |
+| Agent date | 2026-07-31 (wave-4) |
 | ROMDIR gate | **CLOSED** |
 | IRX tip | `6deaa0e` always-on; 27/27 IOPBTCONF |
 | Wave-14 tip | SifRpc MSFLAG plant removed; WAD + gifP3=11 restored |
@@ -17,7 +17,54 @@
 ---
 
 
-## Result this session (wave-3 / reconstruct load request)
+## Result this session (wave-4 / sm+0x28 jalr poison + arena)
+
+| Goal | Status |
+|------|--------|
+| **MAIN MENU** | **NEAR?** — Soft-GS gifP3=**11** px=**573440** PC FAE8 body; **not MENU YES** |
+| Root cause of force TIMEOUT | **Fixed** — wave-3 planted `sm+0x28/+0x2C=0x100000` as "capacity"; those fields are **allocator fn ptrs** (`FUN_0043BE08`/`43BE98` `jalr`). Live AdEL @0x1FFFFFFF → TIMEOUT |
+| Arena + EE bump stub | **Landed** — stub @`0x01FE0100`, ctx @`0x01FE0200`, arena `0x00C00000`..+8MiB; desc buf 6MiB |
+| Force 43B670 | **Completes cleanly** (~300k cyc → trampoline); finds free slot `0x55E25C`; type-1 object path entered |
+| 43AB88 object | **Still fails** (v0=0) — residual inside type-1 construction after `43A4F8` / `0x56xxxx` tables |
+| C1C0 / 26FBF0 | **Still never binds** (no successful slot object) |
+| Synthetic type5 | **Not used** |
+| Selection index | Still unproven |
+
+### Soft-GS scoreboard (wave-4)
+
+| | PC | px | prims | gifP3 | dmac | notes |
+|--|-----|-----|-------|-------|------|-------|
+| **Claim tip (pre-w4)** | varies | **573440** | 2 | **11** | ~142 | NEAR plateau |
+| **Wave-3 force** | thrash / TIMEOUT | — | — | 11 then death | — | jalr poison |
+| **Wave-4 100M pad** | **`0x43FBE8`** FAE8 | **573440** | 2 | **11** | 30 | force returns; slot0 empty; spine held |
+| **Wave-4 scoreboard-metrics** | `0x43FBE8` | **573440** | 2 | **11** | 30 | cdvd=201914 exit=false |
+
+### Change class
+
+- **TITLE_LOCAL** `MidwayBootAssist.cs`:
+  - Remove sm+0x28/+0x2C `0x100000` capacity plant (jalr poison)
+  - Install EE bump-alloc stub + stream-manager allocator pointers
+  - Prefill descriptor +0x18/+0x1C (6MiB) so `43BA48`→`43BDD0` used instead of `43BE08`
+  - Seed Midway heap table for natural `20F058`; force always uses `43B670`
+  - Early ESCAPE resume when force PC leaves bands (250k) + scrub bogus `*0x678458<0x100000`
+- **SHARED**: none
+- **Tool**: `tools/_patch_sm_w4.py`
+
+### Residual wall (wave-4)
+
+1. **`FUN_0043AB88` returns null** on type-1 object body after arena alloc succeeds (pcbreak: slot `0x55E25C`, buffers live, path reaches `0x43AEB0` then fails deeper in `0x56xxxx` table work). Need PCSX2+PINE live object / table dump **or** deeper decompile of post-`43A4F8` type-1 path.
+2. **C1C0 never runs** until slot+0x3C object is non-null.
+3. **Selection index** still unproven under D-pad.
+4. **Do not** re-plant sm+0x28 as raw size; **do not** re-enable type5 slot plants.
+
+### Play! / PINE
+
+- Play! GameConfig.xml: no SLUS_210.87 entry
+- PINE: **N this wave** (pcbreak + disasm of 43BE08/43AB88/43A410 sufficient for jalr poison + object residual)
+
+---
+
+## Result prior session (wave-3 / reconstruct load request)
 
 | Goal | Status |
 |------|--------|
