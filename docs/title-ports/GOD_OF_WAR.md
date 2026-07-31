@@ -9,10 +9,10 @@
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s6` |
-| **Branch** | `agent/seat-s6/s1-g1` |
-| **Seat** | **S6 GOW** (PL-016 INTERACTIVE pad; owned `GodOfWarAssist.cs` + this doc) |
+| **Branch** | `agent/seat-s6/s2-g2` |
+| **Seat** | **S6 GOW** (PL-016 pad + **PL-023** thrash leave; owned `GodOfWarAssist.cs` + this doc) |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **MENU YES hold + PL-016 pad-after-px:** Soft-GS title-surface **px=573440 prims=2** (expand strips). Pad inject **gated on Soft-GS px>0** + densified START/CROSS/D-pad + `ForceRefreshPad`. Residual: PADMAN **open=0**, thrash `0x13F5F8`, selection-index not claim-green. |
+| **Status** | **MENU YES hold + PL-023 thrash leave:** Soft-GS title-surface **px=573440 prims=2** (expand). Sticky GIF DMA tag finish at `0x13F5F8` (END `0x70000000`, no .text kill) → final **PC=0x1837D0**, gifP2 **31**, dmac **50**. Pad densified after Soft-GS; residual PADMAN **open=0**, selection-index not claim-green. |
 | **Last updated** | 2026-07-31 |
 
 ### MENU gate
@@ -49,7 +49,7 @@ VIF1 DIRECT ──► GIF Path2 (PACKED A+D + SPRITE)
 
 | Path | MENU role | Live @100M | Notes |
 |------|-----------|------------|-------|
-| **Path2** | **Primary** title surface | gifPath2=**19** · p2qws=**1082** · tags=19 | Real SPRITE + reg A+D; sticky GIF |
+| **Path2** | **Primary** title surface | gifPath2=**31** · p2qws=**1262** · tags=31 | Real SPRITE + reg A+D; sticky GIF; PL-023 leave grew Path2 |
 | **Path3** | Shell IMAGE / richer chrome | gifPath3=**0** · imgBytes=**0** | Do **not** invent PATH3; wait Fedo unmask |
 | **Path1** | VU1 → GIF (gameplay/3D) | gifPath1=**0** | Post-menu / first-room target; natural only |
 | **DISPFB** | Present composite | dispfbPx=**0** | S10 G-GFX-5/6; claim uses Soft-GS FB pixels |
@@ -65,16 +65,17 @@ VIF1 DIRECT ──► GIF Path2 (PACKED A+D + SPRITE)
 | NATURAL bar (P3 / G-GFX-6) | retail XYOFFSET armed **before** kick **or** expand_hits=0; PL-041 owns demote attempt |
 | S6 duty | Keep Path2 sticky + Fedo consumer path; report walls to S8/S9; **demote expand is G-GFX, not S6 invent** |
 
-### INTERACTIVE pad charter (PL-016 / P1)
+### INTERACTIVE pad charter (PL-016 / PL-023 / P1)
 
 | Item | Plan |
 |------|------|
 | Gate P1 | Pad inject changes selection/state **or** prims/gif increase after pad @100M |
 | **PL-016 landed** | Pad inject **only after Soft-GS `px>0`** (`MaybeInjectPadAfterSoftGs`); dense START/CROSS/D-pad/Circle edges @~50k; `ForceRefreshPad` + `OnHostPresent` refresh |
-| Evidence @100M | pad n≈1664 after first Soft-GS; softGsΔ concurrent gifP2 6→19 in pad window; stateΔ≥1 (flip/cmd); **PADMAN open=0 ghost=0** |
-| Residual | Selection-index not claim-green (no PAD OPEN / thrash `0x13F5F8`); softGsΔ is concurrent Path2 not proven pad-causal |
-| Next WP | **PL-023** thrash PC band escape without killing DMA tags; natural PADMAN OPEN so padRead sees edges |
-| Freezes | No global WaitSema; classic StartThread PC+4; SEMA_OFF claims; no invent PATH3 |
+| **PL-023 landed** | Sticky DMA tag finish at `0x13F5xx` (W10 protect: never rehome as thrash). Write END `0x70000000`, advance `*0x32F168`, leave via `$ra` / post-FreezeCache; optional worker yield under Soft-GS |
+| Evidence @100M | pad n≈1664; softGsΔ gifP2 6→**31**; stateΔ≥3; **PL-023 n=1** leave `0x13F5F8` → final PC=`0x1837D0`; **PADMAN open=0 ghost=0** |
+| Residual | Selection-index not claim-green (no PAD OPEN); softGsΔ concurrent Path2 not proven pad-causal |
+| Next WP | Natural PADMAN OPEN so padRead dual-buffer sees START/CROSS; Fedo past IRX-only |
+| Freezes | No global WaitSema; classic StartThread PC+4; SEMA_OFF claims; no invent PATH3; **no kill DMA tag .text** |
 
 ### Fedo / Path1 / Path3 natural charter
 
@@ -90,8 +91,8 @@ VIF1 DIRECT ──► GIF Path2 (PACKED A+D + SPRITE)
 1. **Expand dependency** — MENU px is expand-class; NATURAL needs ofx-armed-before-draw or strip fidelity (S9 GX-021 / PL-041).  
 2. **gifPath3=0 / imgBytes=0** — no shell IMAGE texture path yet (G-GFX-3).  
 3. **aborted=1** — intentional garbage first DIRECT IMM=0xBF0; leave.  
-4. **PC thrash** — residual often `0x13F5F8` / rescue bands; escape without DMA-tag kill.  
-5. **Pad INTERACTIVE partial (PL-016)** — pad-after-px densified; PAD OPEN=0 + thrash block selection prove.
+4. **PC thrash `0x13F5F8`** — **PL-023 cleared** (finish END; final PC left band). Do not rehome as thrash.  
+5. **Pad INTERACTIVE partial** — pad-after-px densified; **PAD OPEN=0** residual blocks selection prove.
 
 ### Overflow note (Haven)
 
@@ -115,26 +116,28 @@ Traces: `out/traces/seat-s6/gow-20m.txt`, `gow-100m.txt`
        expand-class: title-surface px already at 20M (2× full Soft-GS FB from Path2 strips)
 ```
 
-### Claim 100M (SEMA_STALL_YIELD OFF) — PL-016
+### Claim 100M (SEMA_STALL_YIELD OFF) — PL-023
 
 ```
-@100M: PC=0x0013F5F8 px=573440 prims=2 gifPath1=0 gifPath2=19 gifPath3=0 dmac=28
+@100M: PC=0x001837D0 px=573440 prims=2 gifPath1=0 gifPath2=31 gifPath3=0 dmac=50
        softgs: imgBytes=0 dispfbPx=0 expandHits=2 fragTest=573440 rejBounds=0 rejScissor=0 rejDepth=0 rejAlpha=0
-       softgs-regs: FRAME_1=0x80000 DISPFB1=0x800005090D0 SCISSOR=0x019F000001FF0000
+       softgs-regs: FRAME_1=0x80000 DISPFB1=0 SCISSOR=0x019F000001FF0000
                     XYOFFSET=0x730000007000 TEST=0x50000
-       softgs-writes: total=1924 PRIM=1230 XYZ2=4 XYZ3=245 FRAME=13 SCISSOR=13 TEST=13 XYOFF=13
-       gif-pkts: completed=18 aborted=1 spannedCalls=1 inFlight=False tags=19 p2qws=1082
+       softgs-writes: total=2092 PRIM=1230 XYZ2=4 XYZ3=245 FRAME=25 SCISSOR=25 TEST=25 XYOFF=25
+       gif-pkts: completed=30 aborted=1 spannedCalls=1 inFlight=False tags=31 p2qws=1262
        Path2: 2 real SPRITE packs expanded to 2× full Soft-GS FB (no PATH3 invent)
        cdvdSectors=142 (IRX-only stream residual; separate from title-surface Soft-GS)
+       PL-023: finish DMA tag n=1 @0x13F5F8 cursorBad (slot=0x01CFD000 END) → leave
+               switch-worker sleep-cmd tid=3; final PC left 0x13F5xx band
        PL-016 pad: after Soft-GS only; n≈1664 @~50k edges; open=0 ghost=0
-                   softGsΔ concurrent gifP2 6→19 in pad window; stateΔ≥1
-       RealSifRpc: binds=10 calls=56 unknownServiceCalls=0
+                   softGsΔ concurrent gifP2 6→31 in pad window; stateΔ≥3
+       RealSifRpc: binds=10 calls=66 unknownServiceCalls=0
 ```
 
 **Claim line (scoreboard):**
 
 ```
-GoW SCUS_973.99 | S6 seat-s6 | MENU YES hold | SEMA_OFF | @100M px=573440 prims=2 gifP1=0 gifP2=19 gifP3=0 FRAME=0x80000 completed=18 aborted=1 cdvd=142 expandHits=2 | PL-016 pad-after-px densified (open=0 residual) | NATURAL=no (expand)
+GoW SCUS_973.99 | S6 seat-s6 | MENU YES hold | SEMA_OFF | @100M px=573440 prims=2 gifP1=0 gifP2=31 gifP3=0 FRAME=0x80000 completed=30 aborted=1 cdvd=142 expandHits=2 | PL-023 leave 0x13F5F8 (END finish, no tag kill) PC=0x1837D0 | PL-016 pad densified (open=0 residual) | NATURAL=no (expand)
 ```
 
 ---
@@ -180,29 +183,37 @@ Smokes: prior WAVE-11C Path2 suite + `Gs_Path2_Ofx0_Y0_Sprite_ExpandsTitleSurfac
 | Soft-GS **px>0** | **Yes** (**px=573440** title-surface) |
 | first-gs-interactive MENU | **YES** (title-surface Soft-GS + pad inject) |
 | PL-016 pad-after-px | **YES** (gated Soft-GS; densified; ForceRefreshPad) |
-| INTERACTIVE (P1 selection/state) | **Partial** — pad surface live; PAD OPEN=0 + thrash residual |
+| PL-023 thrash leave `0x13F5F8` | **YES** (finish END; final PC=`0x1837D0`; no tag .text kill) |
+| INTERACTIVE (P1 selection/state) | **Partial** — pad surface live; **PAD OPEN=0** residual |
 | NATURAL (no expand) | **No** (ofx expand class; G-GFX demote) |
 | gifPath3 / shell IMAGE | **No** (gifPath3=0; imgBytes=0) |
 | Full R_SHELL / type-2 stream | Residual (cdvd=142 IRX-only variance) |
 
 ### Wall / next
 
-1. **PL-023** thrash PC band (`0x13F5F8`) escape without killing DMA tags.  
-2. Natural **PADMAN OPEN** so padRead dual-buffer sees START/CROSS (open=0 residual).  
-3. **G-GFX demote expand** (S9) when retail ofx armed before SPRITE kick — S6 reports only.  
-4. **Shell / PATH3 IMAGE** for richer chrome — do not invent PATH3 packets.  
-5. **Post-type-2 stream** past IRX-only when cdvd stuck 142 (Fedo consumer → more natural PRIM/XYZ).  
-6. Path3MaskedByVif held unless game unmasks with real GIF PATH3.  
-7. **aborted=1** residual is intentional (garbage DIRECT IMM=0xBF0) — leave.
+1. Natural **PADMAN OPEN** so padRead dual-buffer sees START/CROSS (open=0 residual).  
+2. **G-GFX demote expand** (S9) when retail ofx armed before SPRITE kick — S6 reports only.  
+3. **Shell / PATH3 IMAGE** for richer chrome — do not invent PATH3 packets.  
+4. **Post-type-2 stream** past IRX-only when cdvd stuck 142 (Fedo consumer → more natural PRIM/XYZ).  
+5. Path3MaskedByVif held unless game unmasks with real GIF PATH3.  
+6. **aborted=1** residual is intentional (garbage DIRECT IMM=0xBF0) — leave.  
+7. Final PC band `0x1837D0` / flip residual — observe only; do not rehome healthy `0x13F5xx`.
 
-### PL-016 assist notes
+### PL-016 / PL-023 assist notes
 
 `GodOfWarAssist.MaybeInjectPadAfterSoftGs`:
 - Gate: `sys.Gs.PixelsWritten > 0` only (no pre-Soft-GS pad thrash).
 - Cadence: ~50k MasterCycles; phase START / CROSS / Down / Up / Circle / dual / Left / Right / release.
 - `RealSifRpc.ForceRefreshPad` after each edge; `OnHostPresent` refreshes when Soft-GS live.
 - Tracks softGsΔ (prims/gifP2/gifP3) and stateΔ (flip `*0x2AC7D0` / worker cmd) for claim telemetry.
-- Forbidden: invent PATH3; ofx expand without S9; SEMA_ON; StartThread `$ra` global.
+
+`GodOfWarAssist.TryFinishDmaTagBuilder` (PL-023 / WAVE-11B restore):
+- Band: `0x13F540..0x13F6A8` retail GIF/VIF DMA tag builder (QWC + END).
+- **Never** rehome as residual thrash (W10 CRITICAL — kills FRAME chain).
+- Sticky ≥200k mid-align-pad / poison `*0x32F168` → write END `0x70000000`, advance cursor, leave via `$ra` / `0x185FAC`.
+- Gate: Soft-GS `px>0` **or** type-2 complete (MENU floor path does not need type-2).
+- After leave: credit GIF/VIF1 handlers; optional `TryYieldToPendingWorker` under Soft-GS.
+- Forbidden: invent PATH3; ofx expand without S9; SEMA_ON; StartThread `$ra` global; kill DMA tag builders.
 
 ### Reproduce
 

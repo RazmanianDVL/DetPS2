@@ -100,6 +100,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private uint _padBaselineWorkerCmd;
     private int _padStateDeltas;
     private int _padSoftGsDeltas;
+    /// <summary>PL-023 / WAVE-11B: force-finish sticky GIF DMA tag builders at 0x13F5xx (END/QWC).</summary>
+    private int _dmaTagFinishes;
+    private ulong _dmaTagStickyCyc;
     private int _objDispatchEscapes;
     private int _listCmpEscapes;
     private int _linkSearchEscapes;
@@ -278,6 +281,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _padBaselineWorkerCmd = 0;
         _padStateDeltas = 0;
         _padSoftGsDeltas = 0;
+        _dmaTagFinishes = 0;
+        _dmaTagStickyCyc = 0;
         _objDispatchEscapes = 0;
         _listCmpEscapes = 0;
         _linkSearchEscapes = 0;
@@ -1119,15 +1124,21 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             && pc is >= 0x0026BF50 and <= 0x0026BFC8)
             TryEscapePostWorkerCopy(sys, pc, c);
 
-        // Wave-8/9b: residual thrash after type-2 (MMI / sleep-cmd 0x13F5 / stack-PC /
-        // flip-lock spin) → stream-poll continue so main can post next *0x310384 cmds.
+        // PL-023 / WAVE-11B: do NOT rehome 0x13F540..0x13F6A8 as thrash (W10 CRITICAL —
+        // retail GIF/VIF DMA tag builder QWC+END). When sticky mid-align-pad (live final
+        // PC=0x13F5F8) or poison *0x32F168, force-finish END tag and leave via $ra so
+        // pad/worker can advance. Soft-GS MENU floor may already be live (px>0 expand).
+        if (c >= 18_000_000
+            && (sys.Gs.PixelsWritten > 0 || _type2Completed)
+            && pc is >= 0x0013F540 and <= 0x0013F6A8)
+            TryFinishDmaTagBuilder(sys, pc, c);
+
+        // Wave-8/9b/12B: residual thrash after type-2 (MMI / stack-PC / flip-lock /
+        // host-buffer-as-PC) → stream-poll / post-FreezeCache so main can post cmds.
         // Do NOT invent type-3/4. Do NOT jump mid flip-kick (0x140A04→0x1838A4 spin).
-        // WAVE-12B: live claim parks at 0x13F5F8 with cdvd=142 (IRX-only) after early
-        // Path2 title paint — old gate cdvd>400 && px==0 never fired. Allow after type-2
-        // + any CDVD, and keep escaping after first Soft-GS so shell can grow PRIM/XYZ.
+        // PL-023: 0x13F5xx is handled by TryFinishDmaTagBuilder only — never rehome here.
         if (c >= 40_000_000 && _type2Completed && sys.Cdvd.SectorsRead > 0
             && (pc is >= 0x00289A00 and <= 0x00289C00
-                || pc is >= 0x0013F5E0 and <= 0x0013F620
                 || pc is >= 0x00300000 and <= 0x00320000
                 || pc is >= 0x002A0000 and <= 0x002B0000
                 || pc is >= 0x00183880 and <= 0x001838D0
@@ -1149,8 +1160,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             }
             else
             {
-                // Prefer stream-ready body after type-2 so shell consumers can run.
-                uint resume = _loadWadSeeded ? 0x0026C0ECu : 0x00185FACu;
+                // Alternate stream body / post-FreezeCache so poster path can run.
+                uint resume = (_loadWadSeeded && (_postType2SemaWakes & 1) != 0)
+                    ? 0x0026C0ECu
+                    : 0x00185FACu;
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
                 sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 1 });
                 sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -3175,6 +3188,138 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // PL-016: pad moved to MaybeInjectPadAfterSoftGs (gated on Soft-GS px>0).
         // World-kick still runs list/stream escapes; pad no longer fires pre-px.
+    }
+
+    /// <summary>
+    /// PL-023 / WAVE-11B: finish sticky GIF/VIF DMA tag builders at <c>0x13F540..0x13F6A8</c>.
+    /// W10 forbids rehoming these as thrash (they write QWC + END <c>0x70000000</c>). Live claim
+    /// parks mid-align-pad at <c>0x13F5F8</c> / <c>0x13F670</c> for tens of M cycles with poison
+    /// cursor at <c>*0x32F168</c>, so the FRAME chain never finalizes and main never reaches pad
+    /// poll / worker-cmd posters. Force-align cursor, write END tag, advance <c>*0x32F168</c>,
+    /// return via <c>$ra</c> / post-FreezeCache. Does <b>not</b> kill .text / invent GIF packets.
+    /// Soft-GS MENU floor (px&gt;0) is preserved — only leaves the sticky builder.
+    /// </summary>
+    private void TryFinishDmaTagBuilder(Ps2System sys, uint pc, ulong c)
+    {
+        if (_dmaTagFinishes >= 64) return;
+
+        // Cursor base used by all builders in this band (disasm 0x13F57C / 0x13F64C).
+        const uint CursorPtr = 0x0032F168u;
+        const uint TagBasePtr = 0x00331018u; // last tag start (sw a2, 0x1018(v1) with v1=0x33)
+        const uint TagEndBasePtr = 0x0033101Cu;
+
+        uint cursor = 0;
+        try { cursor = sys.Memory.Read32(CursorPtr); } catch { return; }
+        uint cPhys = cursor & 0x1FFFFFFFu;
+        bool cursorBad = cursor == 0
+            || cPhys < 0x00100000u
+            || cPhys + 0x20u >= (uint)SystemMemory.RDRAM_SIZE
+            || (cPhys & 3) != 0;
+
+        // Sticky: mid-align-pad / END body for ≥200k cycles (PL-016 claim final PC=0x13F5F8).
+        bool midPad = pc is (>= 0x0013F5F4 and <= 0x0013F614)
+            or (>= 0x0013F65C and <= 0x0013F678)
+            or (>= 0x0013F5A4 and <= 0x0013F5C0)
+            or (>= 0x0013F558 and <= 0x0013F570);
+        bool endBody = pc is >= 0x0013F648 and <= 0x0013F6A4;
+        if (_dmaTagStickyCyc == 0 && (midPad || endBody || cursorBad))
+            _dmaTagStickyCyc = c;
+        // Leave sticky band → reset timer so healthy re-entries get a natural slice.
+        if (!midPad && !endBody && !cursorBad)
+        {
+            _dmaTagStickyCyc = 0;
+            return;
+        }
+        bool sticky = _dmaTagStickyCyc != 0 && c >= _dmaTagStickyCyc + 200_000UL;
+
+        // Healthy first-pass: let real builder run. Only force on poison / sticky hang.
+        if (!cursorBad && !sticky && _dmaTagFinishes == 0)
+            return;
+        if (!cursorBad && !sticky && (c % 500_000UL) >= 50_000UL)
+            return;
+
+        // Ensure a writable 16-byte-aligned tag slot in high RDRAM scratch.
+        uint slot = cPhys;
+        if (cursorBad)
+        {
+            slot = 0x01CFD000u; // private tag scratch (below streamObj 0x01CFE000)
+            sys.Memory.Write32(CursorPtr, slot);
+            if (sys.Memory.Read32(TagBasePtr) == 0)
+                sys.Memory.Write32(TagBasePtr, slot);
+            if (sys.Memory.Read32(TagEndBasePtr) == 0)
+                sys.Memory.Write32(TagEndBasePtr, slot);
+        }
+        slot = (slot + 0xFu) & ~0xFu; // force 16-byte align
+        if (slot + 0x10u >= (uint)SystemMemory.RDRAM_SIZE)
+            slot = 0x01CFD000u;
+
+        // Write END DMA tag (disasm 0x13F680..0x13F694): id=END (0x70000000), qwc=0, addr=0.
+        sys.Memory.Write32(slot + 0, 0x70000000u);
+        sys.Memory.Write32(slot + 4, 0u);
+        sys.Memory.Write32(slot + 8, 0u);
+        sys.Memory.Write32(slot + 0xCu, 0u);
+        uint next = slot + 0x10u;
+        sys.Memory.Write32(CursorPtr, next);
+        // Patch QWC on previous tag start if present (disasm 0x13F61C..0x13F638).
+        uint prev = sys.Memory.Read32(TagBasePtr);
+        uint prevP = prev & 0x1FFFFFFFu;
+        if (prev != 0 && prevP >= 0x00100000u && prevP + 4u < (uint)SystemMemory.RDRAM_SIZE
+            && (prevP & 3) == 0 && prevP != slot)
+        {
+            uint word0 = sys.Memory.Read32(prevP);
+            uint qwc = ((slot - prevP) >> 4) & 0xFFFFu;
+            if (qwc > 0 && qwc < 0x1000u)
+                sys.Memory.Write32(prevP, (word0 & 0xFFFF0000u) | qwc);
+        }
+        sys.Memory.Write32(TagBasePtr, slot);
+
+        // Return via $ra when real; else post-FreezeCache so main can reach pad/posters.
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        uint resume = ra;
+        if (!sys.Memory.IsLikelyEeCode(resume) || resume is < 0x00100000 or >= 0x002C0000
+            || resume is (>= 0x0013F540 and <= 0x0013F6B0)
+            || resume is (>= 0x0027CBD0 and <= 0x00282000))
+            resume = 0x00185FACu;
+        if (sys.Memory.Read32(TagEndBasePtr) == 0)
+            sys.Memory.Write32(TagEndBasePtr, slot);
+        RepairCurrentSpIfPoison(sys);
+        // v0 = bytes advanced (disasm subu v0, next, *0x33101C); post-FreezeCache wants 0x330000.
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128
+        {
+            Lo = resume == 0x00185FAC ? 0x00330000UL : (ulong)(next - slot)
+        });
+        sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = slot });
+        sys.EE.SetGpr(5, new EmotionEngine.Gpr128 { Lo = next });
+        sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = next });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+        sys.EE.PC = resume;
+        sys.EE.COP0_Status &= ~0x6u;
+        _dmaTagFinishes++;
+        _dmaTagStickyCyc = 0;
+
+        // Credit GIF so any already-queued chain can drain after END lands.
+        // Soft-GS title pixels already written stay; do not invent PATH3 packets.
+        try
+        {
+            sys.Dmac.EnableChannelIrq((int)Dmac.Channel.GIF);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.GIF, 4);
+            sys.Dmac.CreditOwedHandlerCall((int)Dmac.Channel.VIF1, 4);
+        }
+        catch { /* ignore */ }
+
+        // PL-023: after leaving sticky builder, yield to sleeping worker if cmd pending
+        // so pad/worker surface can advance under Soft-GS MENU floor.
+        if (sys.Gs.PixelsWritten > 0)
+        {
+            try { TryYieldToPendingWorker(sys, resume, c); } catch { /* ignore */ }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _dmaTagFinishes <= 24)
+            Console.Error.WriteLine(
+                $"[GOW] PL-023 finish DMA tag builder n={_dmaTagFinishes} pc=0x{pc:X8} " +
+                $"slot=0x{slot:X8} cursorBad={cursorBad} sticky={sticky} " +
+                $"px={sys.Gs.PixelsWritten} -> 0x{resume:X8} cyc={c}");
     }
 
     /// <summary>
