@@ -8,7 +8,7 @@
 
 | Title | Serial | Menu? | Key tip metric | Wall |
 |-------|--------|-------|----------------|------|
-| **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | C1C0 bind YES gifP3=11 px=573k | second-chrome Path3 / sel-idx |
+| **MK Shaolin Monks** | SLUS_210.87 | **YES** (mk-mainmenu) | gifP3=18 px=966656 prims=9 | wave-7 WAD body + C1C0 + second chrome |
 | **Burnout 3** | SLUS_210.50 | **YES** (logo-frontend) | px=24.4M dispfbPx=2.27M cdvd=6584 gifP2=14526 | wave-6 Soft-GS logo chrome; pad main-menu advance residual |
 | **Blood Omen 2** | SLUS_200.24 | **YES** (mainmenu title-surface) | px=286720 gifP2=106 stream=2.4MB cdvd=6512 | wave-7 dual list-stub + ofx title FB |
 | **God of War** | SCUS_973.99 | **No** | type2 soft-ok gifP2=962 px=0 cdvd=142 | PATH3/WAD FILEIO residual |
