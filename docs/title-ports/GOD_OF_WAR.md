@@ -9,94 +9,82 @@
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
 | **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
+| **Branch** | `agent/menu-gow` (base tip `c423c4f`) |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | CDVD 142 IRX-only; RPC 16/443; dmac=463 sif=95k; post-empty-reboot IOPRP300 handoff; still `px=0` / no FILEIO |
-| **Last updated** | 2026-07-30 |
+| **Status** | first **gifPath3=1**; **px=0**; WaitSema residual after IOP_MOD MOD_LOAD |
+| **Last updated** | 2026-07-31 |
 
-### Bring-up note (agent 2026-07-30)
+### MENU gate
 
-- **Diagnose wall** `PC=0x2849C4` is soft-float decode prologue (jal `0x284618`), not a list hang.
-  Band `0x2847xx` is IEEE754 mantissa rotate — PcProfiler heat is expected. Removing the
-  residual `TryEscapeListCompareWalk` force-exit **regressed** dmac 463→5; keep until a
-  soft-float-aware gate exists.
-- **Claim residual** `PC=0x293C68` = WaitSema trampoline (syscall 0x44); worker empty SIF-cmd
-  poll at `0x294810`. Main often `started=False` at 100M (boot Entry=0 — do **not** invent
-  Entry/`StartThread` at `0x26C0E0`; that caused `exitRequested`).
-- **Hot secondary** flag countdown `0x17A32C` (`*0x29C7D0==1`) and freelist `0x23A978`.
-- **IOP reboot @~63M** arrives with empty `SifIopReset` arg → UDNL ver="". Assist now
-  `SetIopRpVersionAscii("3000")` + `ApplyUdnlHandoff(IOPRP300.IMG)` **after** reboot only.
-  Early GetVersion="3000" (before IRX binds) regressed binds 16→10 / dmac 463→321 — never.
-- **Play!** GameConfig: no SCUS_973.99 entry. Walls FILEIO/LOADFILE/SIF → generic IOP HLE.
-- **First real GS: No** (px=0). Gate is first Soft-GS px>0 non-black, not MK MAINMENU.
-  Disc has `LoadWad` / `WAD_R_*` / `IOPRP300.IMG` — still zero FILEIO/NCMD past IRX.
+**first-gs-interactive** = Soft-GS **px>0 non-black** + pad interactive surface — **not** MK MAINMENU.
 
----
+### Tip evidence @ 100M (host-present, SEMA_STALL_YIELD OFF) — `c423c4f`
 
-## How far
+```
+PC=0x0027CC18  px=0 gifPath3=1 dmac=121 sifBytes=21420 syscalls=2299166
+cdvdSectors=142
+RealSifRpc: binds=10 calls=101
+exitRequested=False
+stream-arms=1
+top syscalls: WaitSema 0x44 x1.14M, SignalSema 0x42 x1.14M
+```
+
+Diagnose @20M (same tip): `PC=0x002849C4` soft-float prologue heat, dmac=2, cdvd=142, binds=10.
+
+### Disc MOD_LOAD (TRACE_RPC, tip)
+
+Post-LOADFILE GetVersion (classic `0x00020000` while PreferIopRp=True but version empty until reboot):
+
+| path | result | StartLoadedModule |
+|------|--------|-------------------|
+| IOP_MOD/sio2man.irx | 4 | (HLE/existing) |
+| IOP_MOD/dbcman.irx | 100 | DBCMAN ok insns=30984 ret=sentinel |
+| IOP_MOD/sio2d.irx | 101 | SIO2D ok |
+| IOP_MOD/mc2_d.irx | 102 | MC2_D hit budget 50k |
+| IOP_MOD/ds2u_d.irx | 103 | DS2U_D hit budget |
+| IOP_MOD/libsd.irx | 7 | existing |
+| IOP_MOD/989nomid.irx | 104 | 989NOMID hit budget v0=1 |
+| IOP_MOD/smpd_iop.irx | 105 | SMPD_IOP hit budget |
+
+989snd HLE answers sid=0x00123456 (fno 0 / 0x4D / 0xA / 0x68) with done-magic. **No FILEIO** RPC. No game NCMD past IRX cdvd=142.
+
+### Play!
+
+No SCUS_973.99 GameConfig entry — generic IOP HLE only.
+
+### What was tried (agent 2026-07-31) and rejected
+
+1. **Early SetIopRpVersionAscii("3000")** at cyc 500k so GetVersion returns ASCII 3000  
+   → regressed **gifPath3 1→0**, metrics froze (dmac≈99, PC 0x1756xx).  
+   Keep: EE plant at 0x2C6D30 + **post-reboot** EnsureIopRpGetVersion only.
+
+2. **Thrash-aware WaitSema soft-return** (prefer soft-return over SignalSema; land on worker 0x27CC)  
+   → when $ra was thrash-band, left=True spun; **gifPath3 1→0 dmac 121→3**, WaitSema 1.9M.
+
+3. Shared StartLoadedModule budget bumps / gowHot expansions — thrash rewrites regressed tip gifPath3.
+
+### How far
 
 | Milestone | Result |
 |-----------|--------|
 | Disc boot + ELF | **Yes** |
 | DualInfo / PollSema-id | **Yes** |
+| Disc MOD_LOAD IOP_MOD (DBCMAN/989…) | **Yes** (StartLoadedModule on tip IRX path) |
 | 989snd sentinel HLE | **Yes** |
 | FreezeCache escape | **Yes** |
 | BST + HERO_HEAP_SIZE | **Yes** |
-| Heap freelist / list walk | **Partial** — soft escapes |
-| Soft-tick wait `0x17A1D0` | **Escaped** — advance `*0x29C7D4`; jr ra without zeroing tick |
-| Global free-search `0x13E1C8` | **Escaped** — plant null-terminated head @ `*0x29BEB0` (in-RDRAM arena) |
-| Tag-list `0x170BBx` | **Escaped** → empty epilogue `0x170BFC` |
-| **CDVD** | **Yes** — `cdvdSectors=142` (IRX-only; no game FILEIO) |
-| GS / px | **No** (`px=0`, `gifPath3=0`) |
-| Interactive title surface | **No** (not MK MAINMENU gate) |
+| freelist / list / table-index / soft-tick | **Partial** — soft escapes |
+| **CDVD** | **Yes** — 142 IRX-only |
+| **gifPath3** | **Yes** — **1** (first PATH3) |
+| GS / px | **No** (`px=0`) |
+| Interactive title surface | **No** |
 
-### Evidence @ 100M (host-present) — post-reboot IOPRP300 + WaitSema residual
+### Wall / next
 
-```
-PC=0x00293C68  px=0 gifPath3=0 dmac=463 sifBytes=95684 syscalls=24799
-cdvdSectors=142
-RealSifRpc: binds=16 calls=443
-[GOW] SetIopRpVersionAscii("3000") reason=reboot-gen=1 cyc=63150000
-[BIOS] UDNL handoff applies=2 ver="3000" img="cdrom0:\IOPRP300.IMG;1" reg=16
-exitRequested=False  main started=False  FILEIO/NCMD=0
-```
-
-### Evidence @ 150M (host-present)
-
-```
-PC=0x00293C68  px=0 gifPath3=0 dmac=463 sifBytes=95684 syscalls=25337
-cdvdSectors=142
-RealSifRpc: binds=16 calls=443  (metrics frozen after ~60M — WaitSema residual)
-```
-
-### Assists
-
-- IOPRP `"3000"` + FreezeCache unlock
-- BST HERO/SLOT/UPGRADE_HEAP_SIZE + freelist bump-arena soft escapes
-- List/flag/parent/link-search soft escapes; cache-wb leaf stub
-- **Soft-tick wait** — `*0x29C7D4` advance + `0x17A1D0` escape (jr ra @ `0x17A294`, no tick zero)
-- **Global free-search plant** — `*0x29BEB0` null-terminated node; arena hard-clamped under 32 MiB RDRAM
-- **Post-empty-reboot IOPRP300** — `RealSifRpc.SetIopRpVersionAscii("3000")` + UDNL handoff (TITLE_LOCAL after gen≥1 only)
-- Flag-spin soft leave then hard-return via stack `$ra` after repeated `0x17A32C` residual
-- World kick after CDVD: list re-escape, peer wake, dense pad, tick advance
-- Policy: no SEMA_STALL_YIELD, PollSema-id, no global DMAC force-finish
-- Prefer shared HLE; title thrash only in `GodOfWarAssist`
-
-## First real GS / interactive?
-
-**First real GS: No** (`px=0`, `gifPath3=0`)  
-**Interactive: No**
-
-Gate is **first real GS** (`px>0` non-black) then pad-interactive — **not** MK-style MAINMENU.
-
-> Past DualInfo, 989snd, FreezeCache, BST, freelist, **CDVD 142**, free-search plant, **tick-wait escape**.  
-> RPC calls **443** / dmac **463** / sif **95k** @100M (was 153/87/46k). Still **px=0** — no GS frame. cdvd IRX-only.
-
-### Next
-
-1. Leave WaitSema residual (`0x293C68`) without inventing main Entry (boot Entry=0).  
-2. FILEIO / NCMD / `LoadWad` past `cdvd=142` (game data, not more IRX) — post-reboot surface is primed.  
-3. Drain residual flag-countdown (`0x17A32C`) / freelist (`0x23A978`) / list-cmp (`0x2847xx`).  
-4. First GS (`px>0` / `gifPath3>0`, non-black Soft-GS) then pad-inject.
+1. Residual empty SIF WaitSema (0x293Cxx / worker 0x27CCxx) after gifPath3=1 — 1M+ fabricate thrash burns claim cycles; need real SIFCMD/FILEIO/LoadWad progress, not more SignalSema.
+2. FILEIO / NCMD / LoadWad past IRX-only cdvd=142 (game WAD data).
+3. First Soft-GS **px>0 non-black**, then pad inject.
+4. Prefer real IOPRP300 GetVersion **after** IRX binds / reboot, never early.
 
 ### Reproduce
 
@@ -105,5 +93,7 @@ Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/game-gow
 $env:DETPS2_TRACE_BIOS='1'
 dotnet exec out/game-gow/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=100000000 --host-present
-dotnet exec out/game-gow/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=150000000 --host-present
+# RPC spine:
+$env:DETPS2_TRACE_RPC='1'
+dotnet exec out/game-gow/DetPS2.Core.dll blocker-trace user-media-god-of-war.json --cycles=50000000 --host-present
 ```
