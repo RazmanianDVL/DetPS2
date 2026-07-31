@@ -32,6 +32,11 @@ public sealed class RealSifRpc
     public const uint CidSifInit = 0x80000000;
     public const uint CidSifSetSreg = 0x80000001;
 
+    /// <summary>Host for LOADFILE MOD_LOAD StartLoadedModule (WP-25/31). Bound from SonyKernelHle.</summary>
+    private Ps2System? _host;
+    /// <summary>Wire host so disc MOD_LOAD can run real IRX _start after LoadIrx.</summary>
+    public void BindHost(Ps2System system) => _host = system;
+
     // Known real service ids (sid) bound by retail libcdvd/libpad/libmc/fileio.
     // CDVDFSV registration ground-truthed against decompiled FUN_000044ac / FUN_0000457c
     // (tools/bios-decomp/CDVDFSV_ALL.txt): 0x592 init, 0x593 SCMD, 0x595 NCMD, 0x597 SearchFile,
@@ -2418,7 +2423,8 @@ public sealed class RealSifRpc
             iopModules.TryGetModule(baseName, out existingId) ||
             iopModules.TryGetModule(modKey, out existingId))
         {
-            modres = 0;
+            // Proprietary disc IRX: try _start if image present (HLE-owned skipped in helper).
+            modres = TryStartLoadedModule(iopModules, existingId);
             return existingId;
         }
 
@@ -2467,14 +2473,14 @@ public sealed class RealSifRpc
                 var lr = iopModules.LoadIrx(discElf, mem, modKey);
                 if (lr.Success && iopModules.TryGetModule(lr.ModuleName, out int mid))
                 {
-                    // HLE does not run module _start; real modres would be start()'s return.
-                    modres = 0;
+                    // WP-25/31: real R3000 _start for proprietary disc IRX (shared).
+                    modres = TryStartLoadedModule(iopModules, mid);
                     return mid;
                 }
                 // Also try by requested key (LoadIrx nameOverride may uppercase).
                 if (lr.Success && iopModules.TryGetModule(modKey, out mid))
                 {
-                    modres = 0;
+                    modres = TryStartLoadedModule(iopModules, mid);
                     return mid;
                 }
                 return LfErrNotIrx;
@@ -2507,6 +2513,67 @@ public sealed class RealSifRpc
 
         return iopModules.RegisterModule(modKey.Length > 0 ? modKey : name);
     }
+
+    /// <summary>
+    /// Stack/SCE modules still answered by C# HLE — incomplete R3000 _start clobbers coexistence.
+    /// Disc proprietary IRX (GTFSCDVD, LGDEVW, PL2303, 989nomid, B3ROUTE, …) still run.
+    /// Force all: DETPS2_LOADFILE_START_ALL=1. Disable all: DETPS2_LOADFILE_START_IRX=0.
+    /// </summary>
+    private static readonly HashSet<string> LoadFileHleOwnedSkipStart = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SYSMEM", "LOADCORE", "HEAPLIB", "EXCEPMAN", "INTRMAN", "INTRMANP", "INTRMANS",
+        "TIMEMAN", "TIMEMANI", "TIMEMANS", "SSBUSC", "EECONF",
+        "THREADMAN", "VBLANK", "VBLANK_A", "VBLANK_B",
+        "IOMAN", "MODLOAD", "ROMDRV", "STDIO", "SYSCLIB", "IGREETING",
+        "SIFMAN", "SIFCMD", "SIFINIT", "EESYNC", "REBOOT",
+        "FILEIO", "LOADFILE", "CDVDMAN", "CDVDFSV",
+        "MCMAN", "MCSERV", "PADMAN", "SIO2MAN", "LIBSD",
+    };
+
+    /// <summary>Run R3000 _start for proprietary disc IRX; return LOADFILE modres (WP-25/31).</summary>
+    private int TryStartLoadedModule(IopModuleHost iopModules, int mid)
+    {
+        if (mid < 0) return 0;
+        if (!iopModules.TryGetIrx(mid, out var irx) || !irx.HasImage || irx.Entry == 0)
+            return irx?.LastModRes ?? 0;
+        if (irx.EntryExecuted && irx.LastEntryInstructions > 0)
+            return irx.LastModRes;
+        if (_host == null || !IopModuleHost.IsLiteralIrxEnabled)
+            return irx.LastModRes;
+        if (string.Equals(Environment.GetEnvironmentVariable("DETPS2_LOADFILE_START_IRX"), "0", StringComparison.Ordinal))
+            return irx.LastModRes;
+        bool startAll = string.Equals(Environment.GetEnvironmentVariable("DETPS2_LOADFILE_START_ALL"), "1", StringComparison.Ordinal);
+        if (!startAll && LoadFileHleOwnedSkipStart.Contains(irx.Name))
+        {
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1")
+                Console.Error.WriteLine($"[LOADFILE] StartLoadedModule SKIP hle-owned name={irx.Name} id={mid}");
+            return irx.LastModRes;
+        }
+        const ulong maxInsn = 50_000;
+        if (string.Equals(irx.Name, "INTRMANP", StringComparison.OrdinalIgnoreCase))
+            _host.Memory.IopWrite32(0xBF801450, SystemMemory.IopIoIntrmanConfigDefault);
+        else if (string.Equals(irx.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
+            _host.Memory.IopWrite32(0xBF801450, 0);
+        var run = iopModules.StartLoadedModule(_host, mid, maxInsn);
+        int replyModres;
+        if (run.ReturnedToSentinel)
+            replyModres = run.ModRes;
+        else if (run.Success)
+        {
+            replyModres = IopModuleHost.ModuleResidentEnd;
+            irx.LastModRes = replyModres;
+        }
+        else
+            replyModres = irx.LastModRes;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1")
+            Console.Error.WriteLine(
+                $"[LOADFILE] StartLoadedModule name={irx.Name} id={mid} ok={run.Success} " +
+                $"insns={run.InstructionsExecuted} modres={replyModres} (v0={run.ModRes} ret={run.ReturnedToSentinel}) msg={run.Message}");
+        return replyModres;
+    }
+
 
     /// <summary>LF_F_ELF_LOAD / LF_F_MG_ELF_LOAD — load EE ELF, return epc/gp (decomp FUN_00000240).</summary>
     /// <summary>

@@ -127,8 +127,10 @@ foreach ($t in $selected) {
             if ($m -is [array]) { $m = $m[0] }
             $pxN = [ulong]0; [void][ulong]::TryParse([string]$m.px, [ref]$pxN)
             $gifN = 0; [void][int]::TryParse([string]$m.gifPath3, [ref]$gifN)
+            # Prefer live metrics serial when fleet entry is empty (Haven historically blank).
+            $serial = if ($t.serial) { $t.serial } elseif ($m.serial) { $m.serial } else { "" }
             $results += [pscustomobject]@{
-                id = $t.id; name = $t.name; serial = $t.serial; menuKind = $t.menuKind
+                id = $t.id; name = $t.name; serial = $serial; menuKind = $t.menuKind
                 status = "RAN"; menuHeuristic = (Get-MenuHeuristic $pxN $gifN)
                 pc = $m.pc; px = $m.px; gifPath3 = $m.gifPath3; dmac = $m.dmac
                 cdvd = $m.cdvdSectors; syscalls = $m.syscalls

@@ -558,6 +558,8 @@ public sealed class SonyKernelHle
     {
         _system = system;
         _kernel = kernel;
+        // WP-25: LOADFILE MOD_LOAD needs host for StartLoadedModule after disc LoadIrx.
+        _realRpc.BindHost(system);
     }
 
     public void Reset()

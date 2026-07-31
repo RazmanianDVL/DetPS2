@@ -288,13 +288,19 @@ public sealed class IopExtendedBiosHost
     {
         if (sys == null || image == null || image.Length < 32)
             return 0;
-        return ApplyIopRpImageCore(sys.IopModules, sys.Memory, image, sourceName, updateHost: true);
+        int reg = ApplyIopRpImageCore(sys.IopModules, sys.Memory, image, sourceName, updateHost: true);
+        // WP-25: StartLoadedModule for non-HLE-owned extractable ELFs only.
+        // HLE stack (FILEIO/LOADFILE/CDVD/SIF*) stays LoadIrx-only — incomplete re-exec
+        // regressed SotC FILEIO-2200 while RealSifRpc still answers.
+        if (IsLiteralIrxEnabled() && _lastIopRpLoadedEntries.Count > 0)
+            StartLoadedIopRpModules(sys);
+        return reg;
     }
 
     /// <summary>
     /// Static entry for LOADFILE / callers without <see cref="Ps2System"/>: parse image and
     /// register modules (LoadIrx when ELF extractable and not name-only). Does not update
-    /// host counters on a live instance.
+    /// host counters. Does <b>not</b> run <c>_start</c> — use <see cref="ApplyIopRpImage"/>.
     /// </summary>
     public static int ApplyIopRpImageBytes(IopModuleHost modules, SystemMemory mem, byte[] image,
         string? sourceName, out int elfsLoaded)
@@ -306,6 +312,105 @@ public sealed class IopExtendedBiosHost
         int reg = tmp.ApplyIopRpImageCore(modules, mem, image, sourceName, updateHost: false);
         elfsLoaded = tmp._lastIopRpElfsLoaded;
         return reg;
+    }
+
+    /// <summary>
+    /// IOP stack modules still answered by C# RealSifRpc. Opt-in full re-exec:
+    /// DETPS2_IOPRP_START_HLE_OWNED=1 once live SIF answers RPC (WP-22+).
+    /// </summary>
+    private static readonly HashSet<string> HleOwnedIopRpSkipStart = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SYSMEM", "LOADCORE", "HEAPLIB", "EXCEPMAN", "INTRMAN", "INTRMANP", "INTRMANS",
+        "TIMEMAN", "TIMEMANI", "TIMEMANS", "SSBUSC", "EECONF",
+        "THREADMAN", "VBLANK", "VBLANK_A", "VBLANK_B",
+        "IOMAN", "MODLOAD", "ROMDRV", "STDIO", "SYSCLIB", "IGREETING",
+        "SIFMAN", "SIFCMD", "SIFINIT", "EESYNC", "REBOOT",
+        "FILEIO", "LOADFILE", "CDVDMAN", "CDVDFSV",
+        "MCMAN", "MCSERV", "PADMAN", "SIO2MAN",
+    };
+
+    /// <summary>
+    /// WP-25: after IOPRP/DNAS LoadIrx, run R3000 _start on non-HLE-owned modules.
+    /// Shared B3 DNAS280 / SotC·GoW IOPRP300 / Haven SYS250.
+    /// </summary>
+    public int StartLoadedIopRpModules(Ps2System sys, ulong maxInsnPerModule = 50_000)
+    {
+        if (sys == null || _lastIopRpLoadedEntries.Count == 0)
+            return 0;
+        if (!IsLiteralIrxEnabled())
+            return 0;
+
+        bool startHleOwned = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_IOPRP_START_HLE_OWNED"), "1",
+            StringComparison.Ordinal);
+
+        int started = 0;
+        int skippedHle = 0;
+        ulong totalInsns = 0;
+        bool stubReady = false;
+
+        foreach (var le in _lastIopRpLoadedEntries)
+        {
+            int mid = le.ModuleId;
+            if (mid < 0 && !string.IsNullOrEmpty(le.Name))
+                mid = sys.IopModules.SearchModuleByName(le.Name);
+            if (mid < 0) continue;
+            if (!sys.IopModules.TryGetIrx(mid, out var irx) || !irx.HasImage || irx.Entry == 0)
+                continue;
+            if (irx.EntryExecuted && irx.LastEntryInstructions > 0)
+                continue;
+
+            if (!startHleOwned && HleOwnedIopRpSkipStart.Contains(irx.Name))
+            {
+                skippedHle++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1")
+                    Console.Error.WriteLine(
+                        $"[BIOS] IOPRP StartLoadedModule SKIP hle-owned name={irx.Name} id={mid}");
+                continue;
+            }
+
+            if (!stubReady)
+            {
+                sys.Iop.InstallMinimalExceptionStub();
+                stubReady = true;
+            }
+
+            if (string.Equals(irx.Name, "INTRMANP", StringComparison.OrdinalIgnoreCase))
+                sys.Memory.IopWrite32(0xBF801450, SystemMemory.IopIoIntrmanConfigDefault);
+            else if (string.Equals(irx.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
+                sys.Memory.IopWrite32(0xBF801450, 0);
+
+            var run = sys.IopModules.StartLoadedModule(sys, mid, maxInsnPerModule);
+            if (run.Success && !run.ReturnedToSentinel &&
+                sys.IopModules.TryGetIrx(mid, out var irxAfter))
+                irxAfter.LastModRes = IopModuleHost.ModuleResidentEnd;
+            if (run.Success && run.InstructionsExecuted > 0)
+            {
+                started++;
+                totalInsns += run.InstructionsExecuted;
+            }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1")
+            {
+                int showMod = run.ReturnedToSentinel ? run.ModRes : IopModuleHost.ModuleResidentEnd;
+                Console.Error.WriteLine(
+                    $"[BIOS] IOPRP StartLoadedModule name={irx.Name} id={mid} " +
+                    $"ok={run.Success} insns={run.InstructionsExecuted} modres={showMod} " +
+                    $"(v0={run.ModRes} ret={run.ReturnedToSentinel}) msg={run.Message}");
+            }
+        }
+
+        if ((started > 0 || skippedHle > 0) &&
+            (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+             || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1"))
+        {
+            Console.Error.WriteLine(
+                $"[BIOS] IOPRP StartLoadedIopRpModules started={started} skipHle={skippedHle}/" +
+                $"{_lastIopRpLoadedEntries.Count} r3000insns={totalInsns} src=\"{_lastIopRpSource}\"");
+        }
+
+        return started;
     }
 
     private int ApplyIopRpImageCore(IopModuleHost modules, SystemMemory mem, byte[] image,
