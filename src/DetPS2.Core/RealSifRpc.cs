@@ -216,12 +216,46 @@ public sealed class RealSifRpc
     /// <summary>
     /// Last IOPRP/DNAS image version tag derived from <c>SifIopReset</c> arg
     /// (e.g. <c>"2430"</c> for <c>IOPRP243.IMG</c>). Empty until a RESET_CMD with an
-    /// image name completes. Used by <c>LF_F_GET_VERSION</c> so SN ProDG / Midway
-    /// LOADFILE clients that strcmp the 4-byte reply against the expected IOPRP
-    /// digits (MK: Deadly Alliance, Deception, Blood Omen 2, Burnout 3) advance past
-    /// the post-reboot gate without per-title plants.
+    /// image name completes, or a title calls <see cref="SetIopRpVersionAscii"/> when
+    /// HLE never captured a UDNL arg (GoW empty <c>SifIopReset</c> left GetVersion at
+    /// classic 0x00020000 while EE still expected <c>"3000"</c>). Used by
+    /// <c>LF_F_GET_VERSION</c> so SN ProDG / Midway LOADFILE clients that strcmp the
+    /// 4-byte reply against the expected IOPRP digits advance past the post-reboot gate.
     /// </summary>
     private string _lastIopRpVersionAscii = "";
+
+    /// <summary>Current IOPRP/DNAS GetVersion ASCII tag (may be empty).</summary>
+    public string LastIopRpVersionAscii => _lastIopRpVersionAscii;
+
+    /// <summary>
+    /// Set the LOADFILE/FILEIO GetVersion IOPRP ASCII tag without a full reboot surface clear.
+    /// Accepts a 4-char tag (<c>"3000"</c>) or a UDNL/RESET arg containing <c>IOPRPxxx</c>/<c>DNASxxx</c>.
+    /// Prefer this over <see cref="OnIopReboot"/> when only the version cell is missing.
+    /// </summary>
+    public void SetIopRpVersionAscii(string fourOrImgArg)
+    {
+        if (string.IsNullOrEmpty(fourOrImgArg)) return;
+        // Bare 3–4 digit tag (e.g. "3000", "2800", "2340").
+        if (fourOrImgArg.Length is >= 3 and <= 4)
+        {
+            bool allDigits = true;
+            for (int i = 0; i < fourOrImgArg.Length; i++)
+            {
+                char c = fourOrImgArg[i];
+                if (c is < '0' or > '9') { allDigits = false; break; }
+            }
+            if (allDigits)
+            {
+                string digits = fourOrImgArg;
+                while (digits.Length < 4) digits += "0";
+                _lastIopRpVersionAscii = digits[..4];
+                return;
+            }
+        }
+        string ver = ExtractIopRpVersionAscii(fourOrImgArg);
+        if (ver.Length > 0)
+            _lastIopRpVersionAscii = ver;
+    }
 
     // IOP heap window for SidSysmem HLE. Sits above IopModuleHost IRX placement
     // (IrxLoader.DefaultLoadBase … ~0x180000) and below bind-scratch (0x1F0000).

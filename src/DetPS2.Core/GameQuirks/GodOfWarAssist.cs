@@ -95,10 +95,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private int _streamArmPulses;
     private int _globalFreeEscapes;
     private int _tickWaitEscapes;
+    private int _flagSpinHardReturns;
     private ulong _lastWorldKickCyc;
+    private ulong _lastIopRebootGenSeen;
     private bool _heapDefaultsPlanted;
     /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
     private uint _arenaBump;
+
+    /// <summary>Retail IOPRP image on disc (ISO strings: IOPRP300.IMG;1).</summary>
+    public const string UdnlIopRp300Arg = "rom0:UDNL cdrom0:\\IOPRP300.IMG;1";
 
     /// <summary>
     /// Scratch for synthetic freelist header + 8-byte config entries (hash,size).
@@ -189,7 +194,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _streamArmPulses = 0;
         _globalFreeEscapes = 0;
         _tickWaitEscapes = 0;
+        _flagSpinHardReturns = 0;
         _lastWorldKickCyc = 0;
+        _lastIopRebootGenSeen = 0;
         _heapDefaultsPlanted = false;
         _arenaBump = HeapArenaBase;
     }
@@ -199,6 +206,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         Reset();
         if (sys.Hle?.Sony?.RealRpc != null)
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+        // EE RAM "3000" plant only at boot — do NOT SetIopRpVersionAscii early:
+        // live claim with GetVersion="3000" from cyc0 regressed binds 16→10 / dmac 463→321
+        // (FILEIO-2200 arming / LOADFILE path skew). Post-empty-reboot handoff below sets it.
         PlantIopRpVersion(sys);
     }
 
@@ -222,6 +232,25 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         }
     }
 
+    /// <summary>
+    /// Ensure LOADFILE/FILEIO GetVersion returns ASCII "3000" (PreferIopRp path).
+    /// Does not clear pad/FILEIO surface (unlike <see cref="RealSifRpc.OnIopReboot"/>).
+    /// </summary>
+    private void EnsureIopRpGetVersion(Ps2System sys, ulong c, string reason)
+    {
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null) return;
+        rpc.PreferIopRpGetVersion = true;
+        if (string.IsNullOrEmpty(rpc.LastIopRpVersionAscii)
+            || !string.Equals(rpc.LastIopRpVersionAscii, "3000", StringComparison.Ordinal))
+        {
+            rpc.SetIopRpVersionAscii("3000");
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] SetIopRpVersionAscii(\"3000\") reason={reason} cyc={c}");
+        }
+    }
+
     public void Step(Ps2System sys)
     {
         ulong c = sys.Scheduler.MasterCycles;
@@ -238,6 +267,32 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             _versionPlanted = true;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                 Console.Error.WriteLine($"[GOW] planted IOPRP version \"3000\" @ 0x{IopVersionPlaceholder:X8} cyc={c}");
+        }
+
+        // Empty SifIopReset (live tip @~61M arg="") leaves UDNL ver="" / GetVersion empty.
+        // Only after a real reboot gen: re-apply IOPRP300 tag + UDNL name handoff.
+        // Never force GetVersion="3000" before reboot (regressed early binds/dmac).
+        ulong rebootGen = sys.Sif.IopRebootGeneration;
+        if (rebootGen > _lastIopRebootGenSeen)
+        {
+            _lastIopRebootGenSeen = rebootGen;
+            string arg = sys.Sif.LastIopRebootArg ?? "";
+            bool missingIopRp = string.IsNullOrEmpty(arg)
+                || arg.IndexOf("IOPRP300", StringComparison.OrdinalIgnoreCase) < 0;
+            PlantIopRpVersion(sys);
+            if (missingIopRp)
+            {
+                EnsureIopRpGetVersion(sys, c, reason: $"reboot-gen={rebootGen}");
+                try
+                {
+                    sys.IopExtendedBios.ApplyUdnlHandoff(sys, UdnlIopRp300Arg);
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                        Console.Error.WriteLine(
+                            $"[GOW] post-reboot UDNL IOPRP300 handoff gen={rebootGen} " +
+                            $"wasArg=\"{arg}\" cyc={c}");
+                }
+                catch { /* ignore */ }
+            }
         }
 
         // Belt-and-suspenders: if freeze flag still holds the version-mismatch error after
@@ -373,8 +428,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (c >= 35_000_000 && pc is >= 0x0017A1D0 and <= 0x0017A294)
             TryEscapeTickWait(sys, pc, c);
 
-        // Software delay + flag poll — *0x29C7D0. Clear flag, advance tick, land at 0x17A360
-        // so jal 0x17A1D0 still runs with tick already satisfied.
+        // Software delay + flag poll — *0x29C7D0. Clear flag, advance tick.
+        // Live residual: PcProfiler #1 at 0x17A32C (20000-trip countdown while flag==1).
+        // Landing at 0x17A360 still jals tick-wait + 0x17A0E0 which often re-sets the flag
+        // → multi-M samples. After a few soft clears, hard-return via stack $ra (0x17A2A0 frame).
         if (c >= 35_000_000
             && (pc is >= 0x0017A320 and <= 0x0017A370
                 || pc is >= 0x00183880 and <= 0x001838C8))
@@ -395,10 +452,44 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                     sys.EE.PC = PickSafeResume(sys, 0x0026C0EC);
                 sys.EE.COP0_Status &= ~0x6u;
             }
+            else if (_flagSpinHardReturns >= 4)
+            {
+                // After several soft leaves, hard-return via 0x17A2A0 frame (sd ra,0(sp)).
+                uint sp = (uint)(sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL);
+                uint resume = 0;
+                if (sp is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16u)
+                {
+                    resume = sys.Memory.Read32(sp) & 0x1FFFFFFFu;
+                    if (sys.Memory.IsLikelyEeCode(resume) && resume is >= 0x00100000 and < 0x002C0000
+                        && resume is not (>= 0x0017A2A0 and <= 0x0017A37C))
+                    {
+                        sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = sp + 16u });
+                        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = resume });
+                        sys.EE.PC = resume;
+                        sys.EE.COP0_Status &= ~0x6u;
+                        _flagSpinHardReturns++;
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                            && _flagSpinHardReturns <= 24)
+                            Console.Error.WriteLine(
+                                $"[GOW] hard-return flag-spin pc=0x{pc:X8} -> 0x{resume:X8} " +
+                                $"flagWas={fl} n={_flagSpinHardReturns} cyc={c}");
+                    }
+                    else
+                        resume = 0;
+                }
+                if (resume == 0)
+                {
+                    sys.EE.PC = 0x0017A360;
+                    sys.EE.COP0_Status &= ~0x6u;
+                    _flagSpinHardReturns++;
+                }
+            }
             else
             {
+                // Soft leave: post-flag jal tick-wait with tick already advanced.
                 sys.EE.PC = 0x0017A360;
                 sys.EE.COP0_Status &= ~0x6u;
+                _flagSpinHardReturns++; // count soft leaves toward hard-return threshold
             }
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (c % 10_000_000) < 50_000)
@@ -1124,7 +1215,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             foreach (var t in k.AllThreads)
             {
                 if (!t.Alive) continue;
-                // Re-start main only (live menu17 peer re-start left garbage WaitSemaIds).
+                // Re-start main only when Entry is a real CreateThread entry (not boot Entry=0).
+                // Planting 0x26C0E0 as Entry and StartThread'd ExitThread'd main → Exit@100M.
                 if (!t.Started && t.Id == 1 && t.Entry != 0 && t.Entry is >= 0x00100000 and < 0x00300000)
                 {
                     try
@@ -1267,8 +1359,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Dormant main after list escapes (live claim: started=False while worker id=2
         // spins WaitSema empty SIF poll at 0x293C68 / 0x294810). Main only —
         // peer re-start historically left garbage WaitSemaIds (menu17).
-        // Gate on CDVD alone. switchNow when EE is on WaitSema trampoline so we leave the
-        // empty-SIF worker; otherwise re-start without steal.
+        // Boot thread Entry=0: do NOT invent Entry (StartThread@0x26C0E0 caused Exit@100M).
+        // Only re-start when CreateThread left a real entry. switchNow on WaitSema trampoline.
         if (sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
             && (_worldKickPulses % 4) == 0)
         {
@@ -2191,6 +2283,7 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         uint s0 = (uint)sys.EE.GetGpr(16).Lo;
         bool onSynthetic = s0 == HeapDefaultNodeBase;
         // Live freelist pointer in low RDRAM that is NOT our plant — leave alone.
+        // (Aggressive mid-walk force on real heaps regressed dmac/binds into UnknownOpcode.)
         if (!onSynthetic && s0 is >= 0x00100000 and < 0x01FD0000)
             return;
         // Outside any plausible freelist — treat as null.

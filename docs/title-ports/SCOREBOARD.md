@@ -12,7 +12,7 @@
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | held path | ~11 | high under stream | ~198k WAD | pad-poll | selection index + second chrome (#7 #3) |
 | **Burnout 3** | SLUS_210.50 | **No** | 0 | high on deliver | high | STG/TXD path flaky | GTFS | presentation after FRONTEND |
 | **Blood Omen 2** | SLUS_200.24 | **No** | ~3 | low | high | pack KAIN path | SN FILEIO | GOE Open / MAINMENU draw (#17 #8) |
-| **God of War** | SCUS_973.99 | **No*** | **0** | 0 | ~463 | ~142 IRX | 16 / ~443 | first real GS + FILEIO (#11) |
+| **God of War** | SCUS_973.99 | **No*** | **0** | 0 | ~463 | ~142 IRX | 16 / ~443 | post-reboot IOPRP300; FILEIO still 0 (#11) |
 
 \*GoW gate is first real GS + pad-interactive title surface, not MK MAINMENU language.
 
