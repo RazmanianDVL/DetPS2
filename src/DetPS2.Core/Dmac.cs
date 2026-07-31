@@ -562,7 +562,14 @@ public sealed class Dmac : ISchedulable
                 // TTE DIRECT IMM=0xB. Real payload is the 11 QWs *following the tag*
                 // (CNT-style), not physical address 0. When ADDR==0 and QWC>0, treat as
                 // inline data after the DMAtag so DIRECT Path2 can reach Soft-GS.
-                if (ch.QWC > 0 && ch.MADR == 0)
+                //
+                // WAVE-4 (B3): gate to high-RDRAM DA display chains only. Ungated
+                // ADDR=0 rewrite (merge agent/menu-da-w3 @1d2348f) remapped Burnout 3
+                // END tags with legitimate ADDR=0 onto TADR+16 garbage → residual stuck
+                // at cdvd=609 (STAGEHED plant only), never STG/Global.txd (cdvd≥2425).
+                // Bisect: 45d8c3c alone OK; merge + Path3Masked gate → tip px=0/cdvd=609.
+                if (ch.QWC > 0 && ch.MADR == 0
+                    && ch.TADR >= 0x01F00000u && ch.TADR < 0x02000000u)
                 {
                     ch.MADR = ch.TADR + 16;
                     ch.StartMADR = ch.MADR;

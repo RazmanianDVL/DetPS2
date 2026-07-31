@@ -9,7 +9,7 @@
 | Title | Serial | Menu? | Key tip metric | Wall |
 |-------|--------|-------|----------------|------|
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | gifP3=11 FAE8 | selection/second chrome; C1C0 never binds |
-| **Burnout 3** | SLUS_210.50 | **No** | gifP3=436 cdvd=6584 | presentation px=0 |
+| **Burnout 3** | SLUS_210.50 | **No** | gifP3=1447 cdvd=6584 **px=3091** | logo-frontend Soft-GS (wave-4); not MENU |
 | **Blood Omen 2** | SLUS_200.24 | **No** | px=3 cdvd=1733 gameOpens=2 | force-game CODE+MAINMENU Open; Soft-GS menu not drawn |
 | **God of War** | SCUS_973.99 | **No*** | **gifP3=1** first | FILEIO/LoadWad; px=0 |
 | **MK Deception** | SLUS_208.81 | **No** | cdvd 287→399 | no member .ssf CallRpc |

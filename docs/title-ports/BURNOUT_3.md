@@ -158,3 +158,17 @@ dotnet exec out/menu4build/DetPS2.Core.dll blocker-trace burnout-only.json --cyc
 | MENU | **No** — Soft-GS non-black logo-frontend pixels only; not claiming interactive menu |
 | Next | pad after non-black Soft-GS; natural DISPFB; improve tex sample so rejAlpha falls |
 
+## Wave-4 (2026-07-31) — agent/menu-b3-w4 residual→STG re-stabilize + Mul80
+
+| Field | Value |
+|-------|-------|
+| Tip wall | `7123e3c` quiet 50–100M: **cdvd=609** (STAGEHED plant only) PC=`0x127464`/`0x12746C` px=0 prims=0 — flaky residual→STG after DA/GoW merges |
+| Isolated w3 | `737f414` 50M: cdvd=**6584** **px=1156** prims=1292 (Mul80 path live) |
+| Bisect | good `d57ab18`/`ec3191a`/`45d8c3c`/`609904e` (cdvd≥2425); **bad** merge `1d2348f` (agent/menu-da-w3) |
+| Root cause | DA `END ADDR=0` rewrite applied to **all** END tags (not just DA high-TADR display). Combined with Path3Masked drain gate, B3 END tags with legitimate ADDR=0 remapped to TADR+16 garbage → residual died before STG/Global.txd |
+| Fix | `Dmac.cs` case END: gate ADDR=0 inline payload to `TADR ∈ [0x01F00000,0x02000000)` (DA display chains only). GoW Path3Masked gate + Mul80 Soft-GS unchanged |
+| Claim 100M ×2 | **identical** STG+TXD+FRONTEND cdvd=**6584** gifP3=**1447** dmac=1238 prims=**3513** **px=3091** binds=13 calls=584 PC=`0x10BE68` fragTest=3091 rejBounds=422 rejAlpha=3091 (AFAIL paints) |
+| Soft-GS | Mul80 path re-confirmed; logo-frontend non-black stable |
+| MENU | **No** — Soft-GS px>0 only; not claiming interactive menu |
+| Next | pad after non-black Soft-GS; natural DISPFB; DA display END remains gated high-TADR |
+
