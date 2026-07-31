@@ -98,16 +98,49 @@ public sealed class SonyKernelHle
     /// EE-side RPC packet pool before the ambient drain ever gets a turn (confirmed live,
     /// 2026-07-28 — Shaolin Monks' CDVD bind, sid=0x80000592, retried literally millions of
     /// times once the queue's answer was delayed by even one tick). See Sif.cs's
-    /// _realRpcQueue doc comment for the full mechanism.</summary>
+    /// _realRpcQueue doc comment for the full mechanism.
+    /// <para>
+    /// <b>WP-22 / LOADFILE:</b> today every dequeued packet is answered by
+    /// <see cref="RealSifRpc.TryHandle"/> (C# HLE), including sid=<c>0x80000006</c>.
+    /// Under <c>DETPS2_LITERAL_IRX=1</c> the EE→IOP DMA still lands the real packet in IOP RAM
+    /// (live path); HLE remains the answerer until IOP LOADFILE.IRX can complete sifrpc.
+    /// Set <see cref="PreferLiveLoadFileRpc"/> only when that live server exists — do not
+    /// enable it for HLE=0 bisect. See <c>docs/irx/EE_LOADFILE.md</c>.
+    /// </para>
+    /// </summary>
     private bool _inRpcEndFuncInvoke;
+
+    /// <summary>
+    /// When true <b>and</b> <c>DETPS2_LITERAL_IRX=1</c>, LOADFILE-related real RPC packets are
+    /// left for live IOP (scaffold for WP-22). Default <c>false</c>: always HLE via
+    /// <see cref="RealSifRpc"/> so smokes and <c>LITERAL_IRX=0</c> bisect stay stable.
+    /// Enabling without a runnable IOP LOADFILE server will starve client semas.
+    /// </summary>
+    public bool PreferLiveLoadFileRpc { get; set; }
 
     public void DrainRealRpcQueue(ulong currentGeneration)
     {
         // Nested Step() during end_function invoke re-enters drain; skip to avoid reentrancy.
         if (_inRpcEndFuncInvoke) return;
 
+        bool literalIrx = IopExtendedBiosHost.IsLiteralIrxEnabled();
+        bool preferLiveLf = literalIrx && PreferLiveLoadFileRpc;
+
         while (_system.Sif.TryDequeueRealRpc(currentGeneration, out uint addr))
         {
+            // WP-22 scaffold: under LITERAL_IRX + PreferLiveLoadFileRpc, skip HLE for packets
+            // that already live in IOP RAM after Sif1EeToIop so a future IOP LOADFILE server
+            // can answer. Without a live server this path must stay off (default).
+            if (preferLiveLf && RealSifRpc.IsRealRpcPacket(_system.Memory, addr))
+            {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[LOADFILE] LITERAL_IRX PreferLiveLoadFileRpc: defer HLE pkt=0x{addr:X8} " +
+                        $"(live IOP path; no C# TryHandle)");
+                // Packet remains in IOP RAM from Sif1EeToIop; do not HLE-complete.
+                continue;
+            }
+
             if (_realRpc.TryHandle(_system.Memory, _kernel, _system.Cdvd, _system.Pad, _system.IopModules, addr))
                 _system.Intc.Raise(Intc.InterruptSource.Sif);
         }
@@ -532,6 +565,7 @@ public sealed class SonyKernelHle
         _intcHandlers.Clear();
         _intcNextIndex.Clear();
         _dmacHandlers.Clear();
+        PreferLiveLoadFileRpc = false;
         Array.Clear(_sifRegs);
         Array.Clear(_sifVirtualRegs);
         _customSyscalls.Clear();
@@ -1493,6 +1527,13 @@ public sealed class SonyKernelHle
     /// Minimal SIFCMD HLE: parse EE-built command packet and synthesize IOP-side
     /// completion so sceSif* / Midway cmd handlers can advance.
     /// Header (16 bytes): +0 sizes, +4 dest, +8 cid, +12 opt.
+    /// <para>
+    /// LOADFILE (sid 0x80000006) never appears as a raw SIFCMD cid here — retail uses
+    /// sifrpc BIND/CALL packets (cid 0x80000009/0x0A) which are queued below and answered
+    /// by <see cref="DrainRealRpcQueue"/> → <see cref="RealSifRpc"/> HLE, or (future WP-22
+    /// under <c>DETPS2_LITERAL_IRX=1</c> + <see cref="PreferLiveLoadFileRpc"/>) by live IOP
+    /// LOADFILE.IRX. EE→IOP DMA already copied the packet; see <c>docs/irx/EE_LOADFILE.md</c>.
+    /// </para>
     /// </summary>
     private void HleSifCmdFromEe(uint eePacket, uint size)
     {
@@ -1502,6 +1543,8 @@ public sealed class SonyKernelHle
         // never within the same instruction that issued the request. Queue it for
         // DrainRealRpcQueue (called once per ambient scheduler tick, see Sif.cs's
         // _realRpcQueue doc comment) instead of handling it here.
+        // Under DETPS2_LITERAL_IRX=1 the same queue is used: HLE answers until PreferLiveLoadFileRpc
+        // is armed for a live IOP LOADFILE server (default off — does not break HLE=0 bisect).
         if (size >= 16 && RealSifRpc.IsRealRpcPacket(_system.Memory, eePacket))
         {
             _system.Sif.SubmitRealRpc(eePacket, _system.SchedulerGeneration);
@@ -1745,7 +1788,22 @@ public sealed class SonyKernelHle
         // PADMAN open-port table dies with the IOP image; clear so post-reboot OPEN works.
         // Pass reboot arg so LOADFILE GetVersion can return the IOPRP ASCII tag
         // (MK:DA "2430", shared SN ProDG gate — see RealSifRpc.ExtractIopRpVersionAscii).
+        // This is UDNL-arg handoff into the HLE GetVersion store — not an EE RAM version plant.
         RealRpc.OnIopReboot(_system.Sif.LastIopRebootArg);
+
+        // WP-22 prep (DETPS2_LITERAL_IRX=1): prefer GetVersion from the real RESET/UDNL arg
+        // when present, so classic 0x00020000 does not fight disc IOPRP version gates.
+        // LITERAL_IRX=0 / unset: leave PreferIopRpGetVersion alone (title assists / smokes).
+        // No GameQuirk plants here — only surface the arg SifIopReset already captured.
+        if (IopExtendedBiosHost.IsLiteralIrxEnabled()
+            && !string.IsNullOrEmpty(RealRpc.LastIopRpVersionAscii))
+        {
+            RealRpc.PreferIopRpGetVersion = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1")
+                Console.Error.WriteLine(
+                    $"[LOADFILE] LITERAL_IRX: PreferIopRpGetVersion=1 ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
+        }
 
         // Wake one WaitSema sleeper if any (EESYNC post → EE SifIopSync consumer).
         foreach (var t in _kernel.AllThreads)
