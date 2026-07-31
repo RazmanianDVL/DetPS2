@@ -10,12 +10,12 @@
 | Config | `user-media-da.json` |
 | Seat | **S3 MIDWAY-DA** |
 | Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3` |
-| Branch | `agent/seat-s3/s1-g1` |
+| Branch | `agent/seat-s3/s2-g2` |
 | Owned | `MidwayFamilyAssist.cs` **REGION DA**, DA docs |
 | Forbidden | Dec-only regions thrash; Gs/Gif ownership; WaitSema fabricate global; Dmac END gate break |
 | ROMDIR gate | **CLOSED** |
-| Agent date | 2026-07-31 (PL-013 / S1 pad selection keep-alive INTERACTIVE) |
-| Tip base | S0 `a5ff9b9` / PL-013 claim below |
+| Agent date | 2026-07-31 (PL-030 / S2 FRONTEND chrome after INTERACTIVE) |
+| Tip base | S1 `0b09a21` / PL-030 claim below |
 
 ---
 
@@ -134,20 +134,20 @@ Runtime belt: `TrySoftSuccessDaPostLogoInit` + `TryRescueDaPostDisplayExit` + `T
 | Proven selection index / accept | **Yes** — assist-owned sel-idx @`0x7F200` driven by D-pad edges |
 | Pad-inject changes sel-idx **or** prims/gif delta | **Yes** — see PL-013 claim |
 
-### Wall B — FRONTEND chrome (→ **P2** / PL-025… / PL-045)
+### Wall B — FRONTEND chrome (→ **P2** / PL-030) — **PARTIAL (S2)**
 
-T3 **numeric** bars already green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0) but residual quality walls remain:
+T3 **numeric** bars green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0). PL-030 title-local chrome:
 
-| Residual | Owner | Why |
-|----------|-------|-----|
-| Fail-tail plant debt (LOC) | S3 (PL-045 w/ S2) | Keep-alive still plant-gated; demote when natural list-dispatch succeeds |
-| gif **aborted≈289** @100M | **S8** Path2 sticky / DIRECT | Spanned Path2 residual; title does not invent GIF |
-| gifP3 only **6** | S8/S9 natural Path3 | Multi-chrome Path3 still sparse |
-| IMAGE / tex depth | **S9** G2 | imgBytes=98k floor; richer gameart textures open |
-| DISPFB only 32k | **S10** | Full present/composite residual |
-| Display-queue sticky lock | S3 assist | One head-move @93.8M; DI thrash rescue path |
+| Residual | Owner | Status after PL-030 |
+|----------|-------|---------------------|
+| Fail-tail plant debt | S3 | **Reduced** — belt 5 demoted @20M; **core 6** remain |
+| gif completed ratio | S3+S8 | **completed 323→2980**; abort n=289 residual (S8 Path2 sticky class) |
+| Display-queue sticky lock | S3 | **Improved** — head moves ≥16 from menu-band (was 1 @93.8M) |
+| imgBytes=98304 floor | S9 G2 / PL-045 | Held; no art-scale gameart TEX yet |
+| gifP3 only **6** | S8/S9 | Sparse; no invent PATH3 |
+| DISPFB 32k / circuit 640×448 | S10 | naturalDispfb=1 out=640x448; composite residual |
 
-**Next (S2):** FRONTEND claim wave — hold T1+T2; reduce fail-tails; report imgBytes/dispfb growth without PATH3 invent.
+**Next:** art-scale IMAGE (GX-037 / S9) + further plant demotion when natural list-dispatch succeeds (PL-045).
 
 ---
 
@@ -161,6 +161,7 @@ T3 **numeric** bars already green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0
 | W6 | `agent/menu-da-w6` | Post-logo fail-tails → **MENU YES** keep-alive (px=716800 gifP2=35k class) |
 | **S0** | `agent/seat-s3/s0-g0` | Tip re-claim **px≈47.7M prims=8799 XYZ2=6366**; draw-graph + residual charter |
 | **S1** | `agent/seat-s3/s1-g1` | **PL-013** pad selection keep-alive — **T2 INTERACTIVE**; MENU YES hold |
+| **S2** | `agent/seat-s3/s2-g2` | **PL-030** FRONTEND chrome — display drain + fail-tail demote; INTERACTIVE hold |
 
 ---
 
@@ -212,6 +213,62 @@ $env:DETPS2_TRACE_BIOS = "1"
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
 pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget claim -BuildOut out/seat-s3 -SkipBuild -HostPresent
 # scrape: DA menu pad pulse / DA sel-idx / claim px line
+```
+
+---
+
+## PL-030 / S2 FRONTEND chrome claim (SEMA_OFF) — display drain + fail-tail demote
+
+Build: `out/seat-s3` Release. Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
+
+### What landed (DA region only — `MidwayFamilyAssist`)
+
+| Piece | Behavior |
+|-------|----------|
+| Menu-band display-lock clear | Sticky lock @`0x40AA4C` cleared while PC in keep-alive `0x1232xx` (was display-loop / DI only) |
+| `TryDrainDaDisplayQueueForChrome` | Force real display outer/process when head≠tail, VIF1/GIF idle, **no** GIF sticky in-flight (title-local abort hygiene) |
+| Fail-tail split | Core 6 permanent; belt 5 @`0x123Axx` demoted after Soft-GS keep-alive @≥20M |
+| Soft-success budget | Plants no longer consume runtime soft-success counter (was exhausted at n=11) |
+| Forbidden held | No WaitSema fabricate; no Dmac END edits; no invent Soft-GS / PATH3 |
+
+### Claim 100M (SEMA_OFF, host-present)
+
+```
+@100M: PC=0x00123208 exitReq=False
+       px=47696645 prims=8799 gifPath1=0 gifPath2=606 gifPath3=6 dmac=1826
+       cdvdSectors=15443 imgBytes=98304 dispfbPx=32768
+       softgs-writes: total=31825 PRIM=10973 XYZ2=6366 FRAME=638 SCISSOR=479 TEST=2043 XYOFF=638
+       softgs-circuit: naturalDispfb=1 out=640x448+159,50 FBW=640
+       gif-pkts: completed=2980 aborted=289 tags=3269 p2qws=35030
+       MKFAM: fail-tail plants n=11 core=6 belt=5; belt demote n=5 remain=6 @20M
+              display head moves ≥16 (lock=0); sel-deltas=352 pad effect=138
+```
+
+| Metric | S1 baseline | PL-030 | Notes |
+|--------|-------------|--------|-------|
+| MENU / T2 | YES / YES | **HOLD** | same px/prims/sel-deltas class |
+| gifCompleted | 323 | **2980** | multi-packet complete ratio ↑ |
+| gifAborted | 289 | 289 | absolute S8 DIRECT residual; ratio far better |
+| fail-tail permanent | 11 | **6** | belt demoted when safe |
+| display head moves | 1 @93.8M | **≥16** | menu-band lock/drain |
+| imgBytes | 98304 | 98304 | floor hold; art-scale TEX residual |
+| SCISSOR / circuit | full 0x7FF | **0x1BF/0x27F · 640×448** | retail-class present window |
+
+**Claim line (S2 / PL-030):**
+
+| Title | Serial | MENU | T2 | T3 FRONTEND | Metrics (100M SEMA_OFF) | Residual |
+|-------|--------|------|----|-------------|-------------------------|----------|
+| **MK Deadly Alliance** | `SLUS_204.23` | **YES** | **YES** | **PARTIAL** (chrome drain + plant↓) | px=**47696645** gifCompleted=**2980** fail-tail=**6** imgBytes=98304 exitReq=**False** | art-scale IMAGE; abort n; core plants |
+
+### Reproduce
+
+```powershell
+cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = "1"
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
+pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget claim -BuildOut out/seat-s3 -SkipBuild -HostPresent
+# scrape: fail-tail belt demote / display head move / gifCompleted / sel-deltas
 ```
 
 ---

@@ -120,7 +120,15 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
     private int _daPostLogoSoftSuccess;
+    private int _daPostLogoPlantCount;
     private bool _daPostLogoPlanted;
+    private bool _daFailTailBeltPlanted;
+    private bool _daFailTailBeltDemoted;
+    private int _daFailTailDemotions;
+    private int _daDisplayForceProcess;
+    private int _daMenuBandLockClears;
+    private long _daChromeBaselineImg;
+    private int _daChromeImgGrowthHits;
 
     // PL-013 DA pad selection keep-alive (INTERACTIVE / T2):
     // Dense pad inject after Soft-GS Midway surface + selection-index drive from D-pad.
@@ -148,9 +156,21 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DaDisplayTail = DaGp - 25416;   // 0x40AA28
     private const uint DaDisplayLoopLo = 0x001B3960;
     private const uint DaDisplayLoopHi = 0x001B3A10;
+    private const uint DaDisplayProcess = 0x001B3BB0;  // process one cmd (type-1 VIF1)
     private const uint DaDiEiLo = 0x00114F20;
     private const uint DaDiEiHi = 0x00114F80;
     private const uint DaDisplayCmdDoneBit = 0x40000000u;
+
+    // WAVE-6 belt fail-tails at 0x123A30 body (v0=0 → v0=1). Off hot path once main
+    // is in menu keep-alive; PL-030 demotes them when Soft-GS surface is proven.
+    private static readonly (uint Addr, uint Orig, uint Plant)[] DaFailTailBeltSites =
+    {
+        (0x00123A60, 0x0000102Du, 0x24020001u), // daddu v0,zero,zero → addiu v0,1
+        (0x00123AA8, 0x0000102Du, 0x24020001u),
+        (0x00123AC0, 0x0000102Du, 0x24020001u),
+        (0x00123AF0, 0x0000102Du, 0x24020001u),
+        (0x00123B24, 0x0000102Du, 0x24020001u),
+    };
 
     // DA WAVE-6 post-logo soft-success (live 2026-07-31 Soft-GS px=716800 then CRT Exit):
     // main@0x11F800 → 0x123A30 → 0x1A8840 → list-dispatch@0x1A4E20.
@@ -298,7 +318,15 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _displayHeadMoves = 0;
         _postDisplayExitRescues = 0;
         _daPostLogoSoftSuccess = 0;
+        _daPostLogoPlantCount = 0;
         _daPostLogoPlanted = false;
+        _daFailTailBeltPlanted = false;
+        _daFailTailBeltDemoted = false;
+        _daFailTailDemotions = 0;
+        _daDisplayForceProcess = 0;
+        _daMenuBandLockClears = 0;
+        _daChromeBaselineImg = 0;
+        _daChromeImgGrowthHits = 0;
         _lastDaMenuPadCyc = 0;
         _daMenuPadPulses = 0;
         _daMenuSelIndex = 0;
@@ -415,6 +443,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TrySoftSuccessDaPostLogoInit(sys);
             TryRescueDaPostDisplayExit(sys);
             TryKeepAliveDaMidwayMenu(sys);
+            // PL-030 FRONTEND chrome: drain sticky display queue from menu band (imgBytes/
+            // multi-cmd Path2) + demote off-path fail-tail belt when Soft-GS keep-alive holds.
+            TryDrainDaDisplayQueueForChrome(sys);
+            TryDemoteDaFailTailBeltWhenSafe(sys);
             // PL-013: pad selection keep-alive — dense inject + assist-owned sel-idx (T2).
             // Selection drive is invoked from inject only (not every Step) so we never thrash.
             TryInjectDaMenuPad(sys, hostTick: false);
@@ -1584,14 +1616,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// DA WAVE-6: permanent Dec-class fail-tail plants so post-Path2 logo init cannot
-    /// abort main→CRT Exit. Plants once after ELF is resident (same timing as Dec plants).
-    /// <list type="bullet">
-    /// <item>0x1A4E58: list-dispatch always continue (not cleanup on v0==0)</item>
-    /// <item>0x1A4E94: fail return v0=1 instead of 0</item>
-    /// <item>0x1A888C: skip 0x1A8840 fail cleanup after 0x1A4E20</item>
-    /// <item>0x11F93C / 0x11F944: main always continues past 0x123A30</item>
-    /// </list>
+    /// DA WAVE-6 / PL-030: permanent Dec-class fail-tail plants so post-Path2 logo init
+    /// cannot abort main→CRT Exit. Core plants stay permanent; 0x123Axx belt is demotable
+    /// once Soft-GS keep-alive is proven (<see cref="TryDemoteDaFailTailBeltWhenSafe"/>).
+    /// Plant count is tracked separately from runtime soft-success budget (PL-030).
     /// Does not invent Soft-GS pixels. Does not force wait status=4.
     /// </summary>
     private void TryPlantDaPostLogoFailTails(Ps2System sys)
@@ -1602,6 +1630,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
         int plants = 0;
 
+        // --- Core (keep permanent — still on re-entry paths) ---
         // list-dispatch@0x1A4E58: bne v0,zero,success(0x1A4E98) → always branch
         // 0x1440000F → 0x1000000F (beq zero,zero,+15)
         if (sys.Memory.Read32(0x001A4E58) == 0x1440000Fu)
@@ -1616,27 +1645,18 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             plants++;
         }
         // 0x1A8840: after jal 0x1A4E20, beq v0,zero,fail@0x1A88C4 → nop (fall into success)
-        // 0x1040000D at 0x1A888C
         if (sys.Memory.Read32(0x001A888C) == 0x1040000Du)
         {
             sys.Memory.Write32(0x001A888C, 0x00000000u);
             plants++;
         }
-        // success tail already does state=3 + v0=1; if we fall through from nop'd beq
-        // with v0==0, force the success store path by also planting the fail epilogue
-        // v0=0 at 0x1A88D8 → v0=1, and state word write at 0x1A88C0 runs only on success.
-        // Plant fail epilogue return as success:
+        // fail epilogue return as success
         if (sys.Memory.Read32(0x001A88D8) == 0x0000102Du)
         {
             sys.Memory.Write32(0x001A88D8, 0x24020001u); // addiu v0, zero, 1
             plants++;
         }
-        // Also force state=3 store on fail cleanup path: 0x1A88C0 is delay of success branch;
-        // on fail path state is not set. Plant at 0x1A88D4 (before v0 clear) is messy.
-        // Rely on main-gate plant below as belt.
-
         // main@0x11F93C: bne v0,zero,continue → always continue
-        // 0x14400003 → 0x10000003
         if (sys.Memory.Read32(0x0011F93C) == 0x14400003u)
         {
             sys.Memory.Write32(0x0011F93C, 0x10000003u);
@@ -1648,29 +1668,19 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             sys.Memory.Write32(0x0011F944, 0x10000001u);
             plants++;
         }
-        // 0x123A30 fail return tails: daddu v0,zero,zero before epilogue branches
-        // 0x123A60 / 0x123AA8 / 0x123AC0 / 0x123AF0 / 0x123B24 area — plant common epilogue
-        // 0x123BBC region: ensure return v0=1
-        // Live fail uses 0x123AEC → 0x123BBC with v0=0 from delay of prior.
-        // Safer: plant 0x123BBC entry if it's move v0,zero.
-        // Disasm earlier: fail paths do `daddu v0,zero,zero` then b 0x123BBC.
-        // Plant those known sites from the 0x123A30 dump:
-        uint[] zeroV0Sites =
+
+        // --- Belt (demotable after MENU keep-alive; logo init not re-run) ---
+        int belt = 0;
+        foreach (var site in DaFailTailBeltSites)
         {
-            0x00123A60, // daddu v0,zero,zero before b epilogue (first fail)
-            0x00123AA8, // after 0x1A8950 fail
-            0x00123AC0, // after 0x23BC00 fail
-            0x00123AF0, // after 0x1A8840 fail (LIVE path)
-            0x00123B24, // later fail
-        };
-        foreach (uint addr in zeroV0Sites)
-        {
-            if (sys.Memory.Read32(addr) == 0x0000102Du)
+            if (sys.Memory.Read32(site.Addr) == site.Orig)
             {
-                sys.Memory.Write32(addr, 0x24020001u);
-                plants++;
+                sys.Memory.Write32(site.Addr, site.Plant);
+                belt++;
             }
         }
+        plants += belt;
+        _daFailTailBeltPlanted = belt > 0;
 
         if (plants == 0)
         {
@@ -1680,15 +1690,63 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         }
 
         _daPostLogoPlanted = true;
-        _daPostLogoSoftSuccess += plants;
+        // PL-030: do NOT spend runtime soft-success budget on permanent plants.
+        _daPostLogoPlantCount = plants;
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
-                $"[MKFAM] DA post-logo fail-tail plants n={plants} cyc={sys.MasterCycles}");
+                $"[MKFAM] DA post-logo fail-tail plants n={plants} core={plants - belt} belt={belt} " +
+                $"cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// PL-030: after Soft-GS Midway keep-alive is proven, restore 0x123Axx belt fail-tails
+    /// (logo-init body is off the hot path). Core plants stay. Reduces permanent plant debt
+    /// without re-opening CRT Exit. Does not invent Soft-GS pixels.
+    /// </summary>
+    private void TryDemoteDaFailTailBeltWhenSafe(Ps2System sys)
+    {
+        if (_daFailTailBeltDemoted || !_daFailTailBeltPlanted) return;
+        if (sys.MasterCycles < 20_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (sys.Gif.Path2Transfers < 4) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        // Must be past logo gate and alive in menu keep-alive (not Exit).
+        if (sys.Hle is { ExitRequested: true }) return;
+        uint pc = (uint)sys.EE.PC;
+        bool inMenu = pc is (>= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            or (>= DaMainLogoContinue and <= DaMainLogoContinue + 0x200)
+            or (>= DaDisplayLoopLo and <= DaDisplayLoopHi)
+            or (>= DaDiEiLo and <= DaDiEiHi);
+        if (!inMenu) return;
+
+        int restored = 0;
+        foreach (var site in DaFailTailBeltSites)
+        {
+            try
+            {
+                if (sys.Memory.Read32(site.Addr) == site.Plant)
+                {
+                    sys.Memory.Write32(site.Addr, site.Orig);
+                    restored++;
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        _daFailTailBeltDemoted = true;
+        _daFailTailDemotions = restored;
+        _daPostLogoPlantCount = Math.Max(0, _daPostLogoPlantCount - restored);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] DA fail-tail belt demote n={restored} remain={_daPostLogoPlantCount} " +
+                $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"img={sys.Gs.ImageBytesWritten} pc=0x{pc:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
     /// DA WAVE-6: runtime soft-success belt if permanent plants miss a residual v0==0 gate.
     /// Force non-zero v0 at the one-instruction checks (Path2 evidence required).
+    /// PL-030: budget is independent of permanent plant count (was exhausted by plant n=11).
     /// Does not invent Soft-GS pixels. Does not force wait status=4. Does not SignalSema(3).
     /// </summary>
     private void TrySoftSuccessDaPostLogoInit(Ps2System sys)
@@ -1697,7 +1755,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (sys.Gif.Path2Transfers == 0) return;
         if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
         if (sys.Memory.Read32(0x0040B44C) == 0) return;
-        if (_daPostLogoSoftSuccess >= 16) return;
+        // PL-030: higher ceiling — plants no longer consume this budget.
+        if (_daPostLogoSoftSuccess >= 32) return;
 
         uint pc = (uint)sys.EE.PC;
         uint v0 = (uint)sys.EE.GetGpr(2).Lo;
@@ -2081,6 +2140,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// Wave-4: SHARED CHCR.nTAG latch (Play!) + high-RDRAM TTE drain so real IRQ
     /// @0x1B261C can succeed. Do NOT plant head/done-bit (Exit). Do NOT thrash CIS
     /// credits once TAG is honest (double-fire Exit residual). Sticky lock clear only.
+    /// PL-030: also clear sticky lock when main is in menu keep-alive band (was only
+    /// display-loop / DI/EI — lock never cleared while parked @0x1232xx).
     /// Does not force wait status=4. Does not invent Soft-GS pixels.
     /// </summary>
     private void TryEscapeDaDisplayQueueLock(Ps2System sys)
@@ -2092,7 +2153,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         bool inLoop = pc is >= DaDisplayLoopLo and <= DaDisplayLoopHi;
         bool inDiEi = pc is >= DaDiEiLo and <= DaDiEiHi;
         bool inProcessEpi = pc is >= 0x001B41E0 and <= 0x001B4240;
-        if (!inLoop && !inDiEi && !inProcessEpi)
+        // PL-030: menu keep-alive band also sees sticky lock while head!=tail (claim:
+        // head move only once @~93.8M because escape never ran from 0x1232xx).
+        bool softGsLive = sys.Gs.PixelsWritten > 0 && sys.Gs.PrimitivesDrawn > 0
+            && sys.Gif.Path2Transfers >= 2;
+        bool inMenuBand = softGsLive && (pc is (>= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            or (>= DaMainLogoContinue and <= DaMainLogoContinue + 0x200));
+        if (!inLoop && !inDiEi && !inProcessEpi && !inMenuBand)
         {
             _displayLockHits = 0;
             return;
@@ -2111,7 +2178,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 Console.Error.WriteLine(
                     $"[MKFAM] DA display head move n={_displayHeadMoves} 0x{_lastDisplayHead:X8}->0x{head:X8} tail=0x{tail:X8} " +
                     $"lock={lockVal} vif1chcr=0x{chcr:X8} p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
-                    $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                    $"img={sys.Gs.ImageBytesWritten} pc=0x{pc:X8} cyc={sys.MasterCycles}");
             }
         }
         if (head != 0) _lastDisplayHead = head;
@@ -2126,14 +2193,17 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (lockVal != 0)
         {
             _displayLockHits++;
-            if (_displayLockHits < 64) return;
-            if (_displayLockEscapes < 64)
+            // Menu-band: sticky lock never cycles the display loop, so clear sooner.
+            int needHits = inMenuBand ? 16 : 64;
+            if (_displayLockHits < needHits) return;
+            if (_displayLockEscapes < 128)
             {
                 sys.Memory.Write32(DaDisplayLock, 0);
                 _displayLockEscapes++;
+                if (inMenuBand) _daMenuBandLockClears++;
                 _displayLockHits = 0;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                    && _displayLockEscapes <= 16)
+                    && _displayLockEscapes <= 24)
                 {
                     uint cmd0 = sys.Memory.Read32(head);
                     uint cmd1 = (head + 8 <= tail) ? sys.Memory.Read32(head + 8) : 0;
@@ -2141,9 +2211,10 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                     try { chcr = sys.Dmac.ReadRegister(0x10009000u); } catch { /* ignore */ }
                     Console.Error.WriteLine(
                         $"[MKFAM] DA display-lock clear n={_displayLockEscapes} " +
-                        $"head=0x{head:X8} tail=0x{tail:X8} cmd0=0x{cmd0:X8} cmd1=0x{cmd1:X8} " +
-                        $"vif1chcr=0x{chcr:X8} p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
-                        $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+                        $"menuBand={_daMenuBandLockClears} head=0x{head:X8} tail=0x{tail:X8} " +
+                        $"cmd0=0x{cmd0:X8} cmd1=0x{cmd1:X8} vif1chcr=0x{chcr:X8} " +
+                        $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                        $"img={sys.Gs.ImageBytesWritten} pc=0x{pc:X8} cyc={sys.MasterCycles}");
                 }
             }
             return;
@@ -2186,6 +2257,107 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"cmd=0x{cmd:X8} head=0x{head:X8} tail=0x{tail:X8} vif1chcr=0x{chcr:X8} " +
                 $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
                 $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// PL-030 DA FRONTEND chrome: after Soft-GS Midway surface + INTERACTIVE keep-alive,
+    /// force the real display process@0x1B3BB0 when the queue has pending cmds, lock is
+    /// clear, and VIF1/GIF are idle. Title-local path only — does not invent PATH3 or
+    /// Soft-GS pixels. Skipping when DMA/GIF sticky is live avoids stacking
+    /// DIRECT-end-truncate aborts (S8 residual when title thrash-restarts chains).
+    /// </summary>
+    private void TryDrainDaDisplayQueueForChrome(Ps2System sys)
+    {
+        if (!IsDeadlyAlliance) return;
+        if (sys.MasterCycles < 16_000_000) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (sys.Gif.Path2Transfers < 2) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+        if (_daDisplayForceProcess >= 256) return;
+        if (sys.Hle is { ExitRequested: true }) return;
+
+        // Title-local abort hygiene: never kick a new chain over in-flight Path2 sticky.
+        if (sys.Gif.PacketInFlight) return;
+        if (sys.Dmac.IsActive(Dmac.Channel.VIF1) || sys.Dmac.IsActive(Dmac.Channel.GIF))
+            return;
+
+        uint pc = (uint)sys.EE.PC;
+        bool inMenu = pc is (>= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            or (>= DaMainLogoContinue and <= DaMainLogoContinue + 0x200)
+            or (>= DaDiEiLo and <= DaDiEiHi)
+            or (>= DaDisplayLoopLo and <= DaDisplayLoopHi);
+        if (!inMenu) return;
+
+        uint lockVal = sys.Memory.Read32(DaDisplayLock);
+        uint head = sys.Memory.Read32(DaDisplayHead);
+        uint tail = sys.Memory.Read32(DaDisplayTail);
+        // Pointer queue: head chases tail. Reject corrupt / empty / huge spans.
+        bool pending = head != tail
+            && head >= 0x00100000 && head < 0x02000000
+            && tail >= 0x00100000 && tail < 0x02000000
+            && head < tail
+            && (tail - head) <= 0x10000;
+        if (!pending) return;
+
+        // Clear sticky lock so process can run (same class as lock-escape; menu-band path).
+        if (lockVal != 0)
+        {
+            sys.Memory.Write32(DaDisplayLock, 0);
+            _displayLockEscapes++;
+            _daMenuBandLockClears++;
+            lockVal = 0;
+        }
+
+        uint cmd = 0;
+        try { cmd = sys.Memory.Read32(head); }
+        catch { return; }
+        if ((cmd & DaDisplayCmdDoneBit) != 0) return;
+        uint cmdType = cmd & 0xFF;
+        // type-1 = VIF1 chain (chrome paint); accept sparse high-byte mode tags too.
+        if (cmdType != 1 && cmdType is not (0x80 or 0x81 or 0x82 or 0x83 or 0x8F or 0xFF)
+            && (cmd & 0xFF) != 0x01)
+            return;
+
+        // Throttle: every 4th eligible Step once Soft-GS is richer (avoid Path2 storm).
+        if ((_daDisplayForceProcess & 3) != 0)
+        {
+            _daDisplayForceProcess++;
+            return;
+        }
+
+        // Re-enter real process with $ra = menu loop so return lands in keep-alive.
+        uint park = (pc is >= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            ? pc
+            : DaMainMenuLoopLo + 8;
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DaGp });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = park });
+        // process@0x1B3BB0 uses s0/s1 context from outer loop — enter outer loop instead
+        // when not already there so head/tail walk stays honest.
+        if (pc is >= DaDisplayLoopLo and <= DaDisplayLoopHi)
+            sys.EE.PC = DaDisplayProcess;
+        else
+            sys.EE.PC = DaDisplayLoopLo;
+
+        if (_daChromeBaselineImg == 0)
+            _daChromeBaselineImg = sys.Gs.ImageBytesWritten;
+        else if (sys.Gs.ImageBytesWritten > _daChromeBaselineImg)
+            _daChromeImgGrowthHits++;
+
+        _daDisplayForceProcess++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_daDisplayForceProcess <= 24
+                || _daDisplayForceProcess == 64
+                || _daDisplayForceProcess == 128
+                || (_daDisplayForceProcess % 64) == 0))
+        {
+            Console.Error.WriteLine(
+                $"[MKFAM] DA chrome display drain n={_daDisplayForceProcess} " +
+                $"head=0x{head:X8} tail=0x{tail:X8} cmd=0x{cmd:X8} lockWas={lockVal} " +
+                $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"img={sys.Gs.ImageBytesWritten} abort={sys.Gif.PacketsAborted} " +
+                $"heads={_displayHeadMoves} pc=0x{pc:X8}→0x{(uint)sys.EE.PC:X8} cyc={sys.MasterCycles}");
         }
     }
 
