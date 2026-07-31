@@ -561,7 +561,7 @@ public sealed class IopModuleHost
     /// <c>$sp</c> = <see cref="DefaultModuleStack"/>, a0/a1 = 0 (argc/argv).
     /// Hook for T0: call from Ps2System when scheduling IOP quanta under LITERAL_IRX.
     /// </summary>
-    public bool PrepareModuleEntry(Iop iop, int id)
+    public bool PrepareModuleEntry(Iop iop, int id, SystemMemory? mem = null)
     {
         if (iop == null) return false;
         if (!_irxById.TryGetValue(id, out var m) || !m.HasImage || m.Entry == 0)
@@ -570,8 +570,20 @@ public sealed class IopModuleHost
         iop.PC = entryPhys;
         if (m.Gp != 0)
             iop.SetGpr(28, m.Gp); // $gp
-        iop.SetGpr(29, DefaultModuleStack); // $sp
-        iop.SetGpr(30, DefaultModuleStack); // $fp — many IRX use frame pointer without prolog if argc path short
+        uint sp = DefaultModuleStack;
+        if (mem != null)
+        {
+            // Zero descending stack so ($fp+N) counters start at 0.
+            const uint stackBytes = 0x2000;
+            for (uint off = 0; off < stackBytes; off += 4)
+            {
+                uint phys = sp - stackBytes + off;
+                uint ee = SystemMemory.IOP_RAM_BASE + phys;
+                mem.Write32(ee, 0);
+            }
+        }
+        iop.SetGpr(29, sp); // $sp
+        iop.SetGpr(30, sp); // $fp
         iop.SetGpr(31, ModuleReturnSentinel); // $ra
         iop.SetGpr(4, 0); // a0 argc
         iop.SetGpr(5, 0); // a1 argv
@@ -613,7 +625,7 @@ public sealed class IopModuleHost
             };
 
         var iop = system.Iop;
-        if (!PrepareModuleEntry(iop, id))
+        if (!PrepareModuleEntry(iop, id, system.Memory))
             return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
 
         uint entryPhys = ToIopPhys(m.Entry);
