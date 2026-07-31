@@ -2560,7 +2560,12 @@ public sealed class RealSifRpc
                 Console.Error.WriteLine($"[LOADFILE] StartLoadedModule SKIP hle-owned name={irx.Name} id={mid}");
             return irx.LastModRes;
         }
-        const ulong maxInsn = 50_000;
+        // 50k left MC2_D/DS2U_D/989NOMID mid-_start on GoW IOP_MOD list. 100k gives more
+        // room without multi-150k host stalls. DETPS2_LOADFILE_START_INSNS overrides.
+        ulong maxInsn = 100_000;
+        string? maxEnv = Environment.GetEnvironmentVariable("DETPS2_LOADFILE_START_INSNS");
+        if (!string.IsNullOrEmpty(maxEnv) && ulong.TryParse(maxEnv, out ulong envMax) && envMax > 0)
+            maxInsn = envMax;
         if (string.Equals(irx.Name, "INTRMANP", StringComparison.OrdinalIgnoreCase))
             _host.Memory.IopWrite32(0xBF801450, SystemMemory.IopIoIntrmanConfigDefault);
         else if (string.Equals(irx.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))

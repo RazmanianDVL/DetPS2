@@ -448,6 +448,7 @@ public sealed class Ps2System
                     or (>= 0x001312C0UL and <= 0x001312F0UL)  // link-search thrash
                     or (>= 0x00293C00UL and <= 0x00293C80UL)  // WaitSema empty SIF poll
                     or (>= 0x00294800UL and <= 0x002948A0UL)  // SIF-cmd poll caller (loops WaitSema)
+                    or (>= 0x0027CC00UL and <= 0x0027CE90UL)  // worker entry/dispatch (WaitSema 0x20)
                     or (>= 0x00239300UL and <= 0x00239810UL)  // secondary freelist thrash
                     or (>= 0x0023A900UL and <= 0x0023AA30UL)  // null freelist thrash
                     or (>= 0x002C0000UL and <= 0x02000000UL)  // data/heap as PC
@@ -455,11 +456,14 @@ public sealed class Ps2System
                     or (>= 0x0017A1D0UL and <= 0x0017A298UL)  // soft-tick wait leaf (*0x29C7D4)
                     or (>= 0x0017A320UL and <= 0x0017A37CUL)  // flag spin + jal tick-wait
                     or (>= 0x00233AD0UL and <= 0x00233B44UL)
-                    or (>= 0x00284780UL and <= 0x002848B0UL)
+                    or (>= 0x00284600UL and <= 0x00284B00UL)  // soft-float + wrappers (0x2849C4 heat)
+                    or (>= 0x00155AB0UL and <= 0x00155B94UL)  // table-index zero-step
+                    or (>= 0x001390F0UL and <= 0x00139114UL)  // huge byte-sum
+                    or (>= 0x0023E7C0UL and <= 0x0023E7F0UL)  // align-zero poison a0
                     or (>= 0x0021FF00UL and <= 0x00220600UL)
                     or (>= 0x0013DED0UL and <= 0x0013DEF8UL)
                     or (>= 0x0013E1C0UL and <= 0x0013E1F4UL)  // global free-search circular
-                    or (>= 0x80000180UL and <= 0x80000200UL);
+                    or (>= 0x80000180UL and <= 0x80020000UL);
                 // Burnout 3 post-TXD GIF flush thrash.
                 bool b3Hot = ActiveQuirk is Burnout3Assist && pcPhys is
                     (>= 0x0021A4F0UL and <= 0x0021A5E8UL)
