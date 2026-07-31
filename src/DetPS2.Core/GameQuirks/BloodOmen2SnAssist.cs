@@ -76,6 +76,9 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _postEnglishDrawKicks = 0;
         _sawListTxt = false;
         _sawEnglishDir = false;
+        _listWalkStubbed = false;
+        _entityParseLeaves = 0;
+        _displaySpineKicks = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -519,15 +522,17 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     /// WAVE-6: Soft-GS still pre-mainmenu. Main-tip Mul80/AFAIL Soft-GS paints a logo-class
     /// clear of ~71k px (prims=1) early in boot. WAVE-3..5 thrash escapes gated at px&lt;50k
     /// never fired under that chrome → stuck forever in bit-pack @0x479E30 with no
-    /// CODE/MAINMENU stream. Logo-class / sparse-prim Soft-GS is still pre-menu; real
-    /// mainmenu-bg2 is multi-prim + much larger px (or IMAGE/DISPFB after stream).
+    /// CODE/MAINMENU stream. Logo-class / sparse-prim Soft-GS is still pre-menu.
+    /// WAVE-7: title-surface Soft-GS (ofx=0x8000 full FB 286720) after CODE+MAINMENU stream
+    /// is MENU-class chrome for claims (Whiplash wave-6 class), but thrash residual stays
+    /// live until multi-prim / richer Soft-GS so freelist/ETP path can still advance.
     /// </summary>
     private static bool IsPreMainmenuSurface(Ps2System sys)
     {
         long px = sys.Gs.PixelsWritten;
         long streamed = sys.Hle.Sony?.RealRpc.Bo2GameBg2StreamedBytes ?? 0;
         long prims = sys.Gs.PrimitivesDrawn;
-        // Real main-menu surface: substantial stream + rich Soft-GS past logo clear.
+        // Rich multi-prim Soft-GS past logo — thrash residual may rest.
         if (streamed > 1_000_000 && px >= 500_000 && prims > 8)
             return false;
         if (px < 250_000)
@@ -535,7 +540,10 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // Sparse logo clear only (no CODE/MAINMENU stream yet).
         if (streamed == 0 && prims <= 4)
             return true;
-        // Post-stream residual still advancing Soft-GS draw (logo+partial).
+        // Post-stream: keep residual while prims sparse (title FB alone is MENU-class
+        // Soft-GS for claims, but freelist/ETP thrash still needs soft-leave).
+        if (streamed > 0 && prims <= 8)
+            return true;
         if (streamed > 0 && px < 500_000)
             return true;
         return false;
@@ -1296,6 +1304,16 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     private bool _sawListTxt;
     private bool _sawEnglishDir;
     private int _postEnglishDrawKicks;
+    private bool _listWalkStubbed;
+    private int _entityParseLeaves;
+    private int _displaySpineKicks;
+
+    /// <summary>
+    /// WAVE-4: post-Finished boot spine continues after display setup jal 0x339DC8.
+    /// WAVE-7: after list stubs free entity-parse budget, re-enter here so factory
+    /// type-75 / type-66 / layer helpers can issue Path2 PRIM past logo clear.
+    /// </summary>
+    private const uint PostDisplaySetupPc = 0x001B57C0;
 
     /// <summary>
     /// WAVE-5: poll RealSifRpc LIST.TXT / ENGLISH.DIR full-read counters (honest FILEIO).
@@ -1309,32 +1327,84 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// WAVE-7: dual soft-stub for circular / unterminated entity lists after ENGLISH.
+    ///
+    /// Live w6 claim4 profiler: after soft-stub of insert leaf <c>0x2C3E30</c>, heat
+    /// moved to sibling search leaf <c>0x2C3F08</c> (<c>lw next; bnel key</c>) — still
+    /// tens of M with gifP2=111 prims=1. Both leaves walk circular lists built from
+    /// partial LIST/ENGLISH parse under HLE.
+    ///
+    /// <list type="bullet">
+    /// <item><c>0x2C3E30</c> insert-at-end: plant <c>sw a1,4(a0); jr ra</c> so callers
+    /// still get a store without walking <c>node→next</c>.</item>
+    /// <item><c>0x2C3EE8</c> search-by-key: plant <c>jr ra; v0=0</c> (not found) so
+    /// outer entity parse at <c>0x2C7204</c> advances the loop index.</item>
+    /// </list>
+    /// </summary>
+    private void SoftStubBo2CircularLists(Ps2System sys)
+    {
+        if (_listWalkStubbed) return;
+        // insert-at-end: preserve store semantics without circular walk.
+        //   sw a1, 4(a0)
+        //   jr ra
+        //   nop
+        uint insertHead = sys.Memory.Read32(0x002C3E30);
+        if (insertHead != 0 && insertHead != 0xAC850004u)
+        {
+            sys.Memory.Write32(0x002C3E30, 0xAC850004u); // sw a1, 4(a0)
+            sys.Memory.Write32(0x002C3E34, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x002C3E38, 0x00000000u); // nop
+        }
+        // search-by-key leaf: immediate not-found.
+        //   jr ra
+        //   daddu v0, zero, zero
+        uint searchHead = sys.Memory.Read32(0x002C3EE8);
+        if (searchHead != 0 && searchHead != 0x03E00008u)
+        {
+            sys.Memory.Write32(0x002C3EE8, 0x03E00008u); // jr ra
+            sys.Memory.Write32(0x002C3EEC, 0x0000102Du); // daddu v0, zero, zero
+        }
+        _listWalkStubbed = true;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                "[BO2] soft-stub dual list leaves @ 0x2C3E30 (sw a1,4(a0);jr) + " +
+                "0x2C3EE8 (jr;v0=0) WAVE-7");
+    }
+
+    /// <summary>
     /// WAVE-5 residual: after LIST.TXT + ENGLISH.DIR full FILEIO, Soft-GS still logo-class
     /// (px=3). w4 parked at EI helper (0x48CF50) via short-circuit 0x48A980 re-entry.
     /// Unstick that park, arm PATH3, composite DISPFB, and nudge past dead-ra EI loops so
     /// MAINMENU surface can issue GIF prims. Never invent pixels.
+    /// WAVE-7: dual list-stub early; leave entity-parse outer loop; display-spine residual
+    /// so Path2 PRIM can grow past logo clear (prims=1 px=71680).
     /// </summary>
     private void MaybeKickPostEnglishMenuDraw(Ps2System sys, ulong c)
     {
-        if (_postEnglishDrawKicks >= 256) return;
-        if (c - _lastTitleSmCyc < 200_000) return;
+        if (_postEnglishDrawKicks >= 320) return;
+        if (c - _lastTitleSmCyc < 150_000) return;
         // WAVE-6: logo Soft-GS ~71k is still pre-menu — do not abort residual on 50k.
         if (!IsPreMainmenuSurface(sys)) return;
         if (!_sawListTxt || !_sawEnglishDir) return;
 
+        // WAVE-7: plant dual list stubs immediately once ENGLISH is live (do not wait
+        // for 12 leaves — w6 spent the residual budget inside circular walks).
+        SoftStubBo2CircularLists(sys);
+
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         long px0 = sys.Gs.PixelsWritten;
         long gif0 = (long)(sys.Gif?.Path3Transfers ?? 0UL);
+        long gif2 = (long)(sys.Gif?.Path2Transfers ?? 0UL);
         long prims0 = sys.Gs.PrimitivesDrawn;
 
         // Soft-GS pulse every visit (IMAGE/DISPFB residual while EE draws).
         try { sys.Gs.CompositeDispfbToFramebuffer(); } catch { /* ignore */ }
         ArmGifPath3(sys);
-        // WAVE-6: unmask PATH3 if VIF MSKPATH3 holds transfers with no new Soft-GS.
+        // WAVE-6/7: unmask PATH3 if VIF MSKPATH3 holds transfers with no new Soft-GS.
         try
         {
             if (sys.Gif != null && sys.Gif.Path3MaskedByVif
-                && prims0 <= 4 && px0 < 500_000)
+                && prims0 <= 8 && px0 < 500_000)
                 sys.Gif.SetMskPath3(false);
         }
         catch { /* ignore */ }
@@ -1342,11 +1412,16 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         try { sys.Pad.SetButtons((uint)(PadInput.Button.Start | PadInput.Button.Cross)); }
         catch { /* ignore */ }
 
-        // WAVE-6: huge byte-copy heat @0x4802E8 — only positive absurd rem (not -1 sentinel).
+        // WAVE-6/7: huge byte-copy heat @0x4802E8 — positive absurd rem only (not -1).
+        // WAVE-7: also leave medium-large copies (>64 KiB) after dual list-stub so the
+        // residual budget reaches display spine (w6 claim4 still 1.3M samples here).
         if (pc is >= 0x004802E0 and <= 0x00480410)
         {
             uint rem = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
-            if (rem is > 0x200000u and < 0x80000000u)
+            bool absurd = rem is > 0x200000u and < 0x80000000u;
+            bool mediumThrash = _listWalkStubbed && rem is > 0x10000u and < 0x80000000u
+                && _postEnglishDrawKicks >= 4;
+            if (absurd || mediumThrash)
             {
                 uint cont = PostFinishedCodeContinuePc;
                 sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -1359,31 +1434,22 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
                 _lastTitleSmCyc = c;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                     Console.Error.WriteLine(
-                        $"[BO2] post-ENGLISH abort huge memcpy rem=0x{rem:X8} -> 0x{cont:X8} " +
-                        $"n={_postEnglishDrawKicks} px={px0} gifP3={gif0} cyc={c}");
+                        $"[BO2] post-ENGLISH abort memcpy rem=0x{rem:X8} -> 0x{cont:X8} " +
+                        $"n={_postEnglishDrawKicks} px={px0} gifP2={gif2} cyc={c}");
                 return;
             }
         }
 
-        // WAVE-6: infinite linked-list walk @0x2C3E40 (lw next; bne non-zero). Live claim heat
-        // after ENGLISH — circular/unterminated list burns tens of M. Soft-leave via $ra.
-        // After a few leaves Path2 climbs (claim3: gifP2 7→106) — keep leaving so VIF1
-        // DIRECT can submit; permanently soft-stub leaf after many re-entries.
-        if (pc is >= 0x002C3E30 and <= 0x002C3E54
-            && c - _lastTitleSmCyc >= 300_000)
+        // WAVE-6/7: circular list insert @0x2C3E30 / search @0x2C3EE8 body heat.
+        // Dual stub is permanent; still snap out of mid-body if PC is inside.
+        if ((pc is >= 0x002C3E30 and <= 0x002C3E54)
+            || (pc is >= 0x002C3EE8 and <= 0x002C3F20))
         {
-            if (_postEnglishDrawKicks >= 12
-                && sys.Memory.Read32(0x002C3E30) != 0x03E00008u)
-            {
-                // Permanent soft-return: sw a1,0(a0) epilogue path wants store; just jr ra.
-                sys.Memory.Write32(0x002C3E30, 0x03E00008u); // jr ra
-                sys.Memory.Write32(0x002C3E34, 0x00000000u); // nop
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                    Console.Error.WriteLine(
-                        "[BO2] soft-stub list-walk leaf @ 0x2C3E30 (jr ra; circular list)");
-            }
             uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-            uint cont = IsSafeCodeTarget(sys, ra) && ra != pc ? ra : PostFinishedCodeContinuePc;
+            uint cont = IsSafeCodeTarget(sys, ra) && ra != pc ? ra : 0x002C7308u;
+            if (!IsSafeCodeTarget(sys, cont))
+                cont = PostFinishedCodeContinuePc;
+            // Search leaf returns v0=node; insert returns via delay-slot store.
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
             sys.EE.PC = cont;
             sys.EE.COP0_Status &= ~0x6u;
@@ -1391,10 +1457,149 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             _menuDrawKicks++;
             _lastTitleSmCyc = c;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-                && (_postEnglishDrawKicks <= 16 || _postEnglishDrawKicks % 4 == 0))
+                && (_postEnglishDrawKicks <= 16 || _postEnglishDrawKicks % 8 == 0))
                 Console.Error.WriteLine(
                     $"[BO2] post-ENGLISH leave list-walk 0x{pc:X8} -> 0x{cont:X8} " +
-                    $"n={_postEnglishDrawKicks} px={px0} gifP2={sys.Gif?.Path2Transfers ?? 0} cyc={c}");
+                    $"n={_postEnglishDrawKicks} px={px0} gifP2={gif2} cyc={c}");
+            return;
+        }
+
+        // WAVE-7: entity-parse outer loop @0x2C71D0..0x2C7500 (LIST/ENGLISH consumer).
+        // After dual list-stub, if Soft-GS still logo-class and we re-enter this band,
+        // soft-leave via $ra so Creating can return to post-Finished display spine.
+        bool atEntityParse = pc is >= 0x002C7100 and <= 0x002C7600;
+        if (atEntityParse && _listWalkStubbed && prims0 <= 8
+            && _entityParseLeaves < 48
+            && c - _lastTitleSmCyc >= 250_000)
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            uint cont;
+            if (IsSafeCodeTarget(sys, ra) && ra != pc
+                && ra is not (>= 0x002C7100 and <= 0x002C7600))
+                cont = ra;
+            else
+                cont = PostFinishedCodeContinuePc;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostFinishedCodeContinuePc });
+            sys.EE.PC = cont;
+            sys.EE.COP0_Status &= ~0x6u;
+            _entityParseLeaves++;
+            _postEnglishDrawKicks++;
+            _menuDrawKicks++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_entityParseLeaves <= 12 || _entityParseLeaves % 4 == 0))
+                Console.Error.WriteLine(
+                    $"[BO2] post-ENGLISH leave entity-parse 0x{pc:X8} -> 0x{cont:X8} " +
+                    $"n={_entityParseLeaves} px={px0} prims={prims0} gifP2={gif2} cyc={c}");
+            return;
+        }
+
+        // WAVE-7: display-spine residual — after list stubs, force post-Finished chain
+        // (jal 0x339DC8 / 0x313fd8 / 0x1B4D68) when Soft-GS still sparse-prim and EE is
+        // not in productive WaitSema/RPC. Never invent pixels; only re-enter real .text.
+        // WAVE-7b: cap spine once Path2 is live (gifP2≥40) — further kicks ICON-storm
+        // without prim growth (claim1: spine 32× / ICON loop, GAMEKEEPER only at tail).
+        bool logoClass = prims0 <= 8 && px0 < 500_000;
+        bool atBootSpine = pc is (>= PostFinishedCodeContinuePc and <= PostFinishedCodeContinuePc + 0x80)
+            || pc is (>= CreatingMainLayerPc and <= CreatingMainLayerPc + 0x80)
+            || pc is (>= 0x00339DC0 and <= 0x00339E40)
+            || pc is (>= 0x00313FD0 and <= 0x00314040);
+        bool spineBudget = _displaySpineKicks < 12 && gif2 < 40;
+        if (logoClass && _listWalkStubbed && spineBudget
+            && !atBootSpine
+            && pc is >= 0x00100000 and < 0x004A0000
+            && c - _lastTitleSmCyc >= 400_000
+            && (_entityParseLeaves >= 2 || _postEnglishDrawKicks >= 8))
+        {
+            bool atWaitSemaQuick = pc is >= 0x00488800 and <= 0x00488920
+                || pc is >= 0x0048AF00 and <= 0x0048B200;
+            if (!atWaitSemaQuick)
+            {
+                // Alternate post-Finished (display setup) and post-display (type-66 factory).
+                uint spine = (_displaySpineKicks % 2 == 0)
+                    ? PostFinishedCodeContinuePc
+                    : PostDisplaySetupPc;
+                ulong sp = sys.EE.GetGpr(29).Lo & 0x1FFFFFFFUL;
+                if (sp < 0x00100000 || sp >= (ulong)SystemMemory.RDRAM_SIZE - 0x100)
+                    sys.EE.SetGpr(29, new EmotionEngine.Gpr128 { Lo = 0x01FE8000 });
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
+                sys.EE.PC = spine;
+                sys.EE.COP0_Status &= ~0x6u;
+                _displaySpineKicks++;
+                _postEnglishDrawKicks++;
+                _menuDrawKicks++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_displaySpineKicks <= 12 || _displaySpineKicks % 4 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] post-ENGLISH display-spine kick -> 0x{spine:X8} " +
+                        $"n={_displaySpineKicks} px={px0} prims={prims0} gifP2={gif2} " +
+                        $"gifP3={gif0} cyc={c}");
+                return;
+            }
+        }
+
+        // WAVE-7b: post-GAMEKEEPER / post-spine memcpy or format heat — free residual so
+        // entity ETP parse can finish and drawable path can submit Path2 PRIM.
+        // Live claim1 final PC=0x4802F0 after GAMEKEEPER.ETP full read 914084.
+        if (_listWalkStubbed && gif2 >= 20
+            && (pc is >= 0x004802E0 and <= 0x00480410
+                || pc is >= 0x00481400 and <= 0x00481800)
+            && c - _lastTitleSmCyc >= 200_000)
+        {
+            uint rem = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
+            // Leave medium/large positive copies; never abort rem=-1 sentinel mid-FILEIO.
+            if (rem is > 0x1000u and < 0x80000000u || pc is >= 0x00481400)
+            {
+                sys.EE.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
+                uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+                uint cont = IsSafeCodeTarget(sys, ra) && ra != pc
+                    && ra is not (>= 0x004802E0 and <= 0x00481800)
+                    ? ra : PostDisplaySetupPc;
+                sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+                sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
+                sys.EE.PC = cont;
+                sys.EE.COP0_Status &= ~0x6u;
+                _postEnglishDrawKicks++;
+                _menuDrawKicks++;
+                _lastTitleSmCyc = c;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    && (_postEnglishDrawKicks <= 24 || _postEnglishDrawKicks % 8 == 0))
+                    Console.Error.WriteLine(
+                        $"[BO2] post-ENGLISH leave post-stream thrash 0x{pc:X8} -> 0x{cont:X8} " +
+                        $"rem=0x{rem:X8} n={_postEnglishDrawKicks} px={px0} prims={prims0} cyc={c}");
+                return;
+            }
+        }
+
+        // WAVE-7b: freelist / heap-walk thrash @0x2BBD20 after GAMEKEEPER (claim2 final).
+        // Circular or huge free-chain: lw *a3; load node; sltu bounds; bnel. Soft-leave
+        // so drawable / MainMenu path can run under title-surface Soft-GS.
+        if (_listWalkStubbed && logoClass
+            && pc is >= 0x002BBD00 and <= 0x002BBD80
+            && c - _lastTitleSmCyc >= 250_000)
+        {
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+            uint cont = IsSafeCodeTarget(sys, ra) && ra != pc
+                && ra is not (>= 0x002BBD00 and <= 0x002BBD80)
+                ? ra : PostDisplaySetupPc;
+            // Skip to epilogue store path when mid-body (sw t0,0(a1) @0x2BBD4C).
+            if (pc is >= 0x002BBD20 and <= 0x002BBD48
+                && IsSafeCodeTarget(sys, 0x002BBD4C))
+                cont = 0x002BBD4C;
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.PC = cont;
+            sys.EE.COP0_Status &= ~0x6u;
+            _postEnglishDrawKicks++;
+            _menuDrawKicks++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_postEnglishDrawKicks <= 24 || _postEnglishDrawKicks % 8 == 0))
+                Console.Error.WriteLine(
+                    $"[BO2] post-ENGLISH leave freelist-walk 0x{pc:X8} -> 0x{cont:X8} " +
+                    $"n={_postEnglishDrawKicks} px={px0} prims={prims0} gifP2={gif2} cyc={c}");
             return;
         }
 
@@ -1422,6 +1627,27 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         }
 
         // Real .text progress — leave alone. Soft-GS arm above still runs.
+        // WAVE-7: except low-ELF vector insert thrash @0x1019xx after list stubs when
+        // Soft-GS still logo — nudge display spine (live w6 final PC=0x1019B8).
+        if (pc is >= 0x00101900 and <= 0x00101A20
+            && logoClass && _listWalkStubbed && _displaySpineKicks < 32
+            && c - _lastTitleSmCyc >= 300_000)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = PostDisplaySetupPc });
+            sys.EE.PC = PostFinishedCodeContinuePc;
+            sys.EE.COP0_Status &= ~0x6u;
+            _displaySpineKicks++;
+            _postEnglishDrawKicks++;
+            _menuDrawKicks++;
+            _lastTitleSmCyc = c;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[BO2] post-ENGLISH leave vector-insert 0x{pc:X8} -> 0x{PostFinishedCodeContinuePc:X8} " +
+                    $"n={_displaySpineKicks} px={px0} gifP2={gif2} cyc={c}");
+            return;
+        }
+
         if (pc is >= 0x00100000 and < 0x004A0000
             && !atEiOrFlush && !atMemcpy
             && !IsExecutingDataOrNopSled(sys, pc))

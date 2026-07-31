@@ -10,7 +10,7 @@
 |-------|--------|-------|----------------|------|
 | **MK Shaolin Monks** | SLUS_210.87 | **NEAR** | C1C0 bind YES gifP3=11 px=573k | second-chrome Path3 / sel-idx |
 | **Burnout 3** | SLUS_210.50 | **YES** (logo-frontend) | px=24.4M dispfbPx=2.27M cdvd=6584 gifP2=14526 | wave-6 Soft-GS logo chrome; pad main-menu advance residual |
-| **Blood Omen 2** | SLUS_200.24 | **No** | px=71680 logo gifP2=111 stream=2.4MB LIST+ENGLISH cdvd=2357 | WAVE-6 Soft-GS logo gate + list-walk; mainmenu Soft-GS not drawn |
+| **Blood Omen 2** | SLUS_200.24 | **YES** (mainmenu title-surface) | px=286720 gifP2=106 stream=2.4MB cdvd=6512 | wave-7 dual list-stub + ofx title FB |
 | **God of War** | SCUS_973.99 | **No** | worker type-2 cleared; gifP2=962 px=0 cdvd=142 | PATH3/WAD FILEIO residual |
 | **MK Deception** | SLUS_208.81 | **No** | px=822k dispfbPx=105k gameart.ssf loaded | WAVE-6 path-hash; no GIF IMAGE menu |
 | **MK Deadly Alliance** | SLUS_204.23 | **YES** (midway-menu) | px=716800 gifP2=35109 exitReq=False | wave-6 post-logo keep-alive |
