@@ -6,20 +6,27 @@
         MinWidth="800" MinHeight="520"
         DragDrop.AllowDrop="True">
 
-    <Grid RowDefinitions="Auto,Auto,*,Auto,Auto">
-        <!-- Menu -->
+    <Grid RowDefinitions="Auto,*,Auto">
+        <!-- Menu: File light; Options for everything else; Emulation for play controls -->
         <Menu Grid.Row="0">
             <MenuItem Header="_File">
-                <MenuItem Header="_Settings…" Click="OnSettingsClick" />
-                <Separator />
                 <MenuItem Header="Load _ISO…" Click="OnLoadIsoClick" HotKey="Ctrl+I" />
                 <MenuItem Header="Load _ELF…" Click="OnLoadElfClick" HotKey="Ctrl+E" />
                 <Separator />
                 <MenuItem Header="_Save State…" Click="OnSaveStateClick" HotKey="Ctrl+S" />
                 <MenuItem Header="_Load State…" Click="OnLoadStateClick" HotKey="Ctrl+L" />
                 <Separator />
-                <MenuItem Header="Open log folder" Click="OnOpenLogFolderClick" />
                 <MenuItem Header="E_xit" Click="OnExitClick" HotKey="Alt+F4" />
+            </MenuItem>
+
+            <MenuItem Header="_Options">
+                <MenuItem Header="_General…" Click="OnOptionsGeneralClick" HotKey="Ctrl+," />
+                <MenuItem Header="G_raphics…" Click="OnOptionsGraphicsClick" />
+                <MenuItem Header="_Controllers…" Click="OnOptionsControllersClick" />
+                <MenuItem Header="_Emulation…" Click="OnOptionsEmulationClick" />
+                <MenuItem Header="_Audio…" Click="OnOptionsAudioClick" />
+                <MenuItem Header="_Metadata…" Click="OnOptionsMetadataClick" />
+                <MenuItem Header="A_dvanced…" Click="OnOptionsAdvancedClick" />
             </MenuItem>
 
             <MenuItem Header="_Emulation">
@@ -31,106 +38,75 @@
                 <MenuItem Header="Show _game window" Click="OnShowGameWindowClick" />
             </MenuItem>
 
-            <MenuItem Header="_Library">
-                <MenuItem Header="Set library _path…" Click="OnSetLibraryPathClick" HotKey="Ctrl+O" />
-                <MenuItem Header="_Rescan" Click="OnRescanLibraryClick" HotKey="F4" />
-            </MenuItem>
-
             <MenuItem Header="_Help">
                 <MenuItem Header="_About…" Click="OnAboutClick" />
             </MenuItem>
         </Menu>
 
-        <!-- Toolbar: library + run only -->
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="12,8">
-            <Button Content="📁 Set library path…" Click="OnSetLibraryPathClick" Padding="12,8" />
-            <Button Content="🔄 Rescan" Click="OnRescanLibraryClick" Padding="12,8" />
-            <Separator Width="1" Margin="4,2" />
-            <Button Content="▶ Boot &amp; play" Click="OnBootSelectedClick" Padding="14,8" FontWeight="SemiBold" />
-            <Button Content="⏸ Pause" Click="OnPauseClick" Padding="12,8" />
-            <Button Content="⏹ Stop" Click="OnStopEmulationClick" Padding="12,8" />
-            <Separator Width="1" Margin="4,2" />
-            <Button Content="⚙ Settings…" Click="OnSettingsClick" Padding="12,8" />
-            <Button Content="📋 Logs" Click="OnOpenLogFolderClick" Padding="12,8" />
-        </StackPanel>
-
-        <!-- Main: library + status side by side (no game framebuffer blotch) -->
-        <Grid Grid.Row="2" ColumnDefinitions="*,280" Margin="8,0">
-            <Border Grid.Column="0" Background="#14141c" BorderBrush="#333" BorderThickness="1" CornerRadius="6" Margin="0,0,6,0"
-                    DragDrop.AllowDrop="True" x:Name="LibraryDropZone">
-                <DockPanel Margin="12">
-                    <StackPanel DockPanel.Dock="Top" Spacing="6">
-                        <TextBlock Text="GAME LIBRARY" FontWeight="Bold" FontSize="15" Foreground="#bbb" />
-                        <TextBlock x:Name="LibraryFolderText" Text="No library path set"
-                                   FontSize="12" Foreground="#8c8" TextWrapping="Wrap" />
-                        <TextBlock Text="Local or network (UNC) path. Double-click a title to boot — video opens in a separate window."
-                                   FontSize="11" Foreground="#666" TextWrapping="Wrap" />
-                        <Separator />
-                    </StackPanel>
-                    <ListBox x:Name="LibraryList"
-                             DoubleTapped="OnLibraryDoubleTapped"
-                             Background="Transparent"
-                             BorderThickness="0"
-                             FontSize="13">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <StackPanel Spacing="2" Margin="4,8">
-                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="14" Foreground="#eee" />
-                                    <TextBlock Text="{Binding Path}" FontSize="11" Foreground="#666" TextTrimming="CharacterEllipsis" />
+        <!-- Content: game library ONLY -->
+        <Border Grid.Row="1" Background="#0e0e14" Margin="0"
+                DragDrop.AllowDrop="True" x:Name="LibraryDropZone">
+            <Panel>
+            <StackPanel x:Name="EmptyLibraryHint" IsVisible="False"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"
+                        Spacing="10" MaxWidth="420">
+                <TextBlock Text="🎮" FontSize="48" HorizontalAlignment="Center" Opacity="0.5" />
+                <TextBlock Text="No games in your library yet" FontSize="16" FontWeight="SemiBold"
+                           Foreground="#ccc" HorizontalAlignment="Center" TextWrapping="Wrap" />
+                <TextBlock Text="Drag &amp; drop a folder or ISO here, or go Options → General → Set library path…"
+                           FontSize="12" Foreground="#888" HorizontalAlignment="Center"
+                           TextWrapping="Wrap" TextAlignment="Center" />
+            </StackPanel>
+            <ListBox x:Name="LibraryList"
+                     DoubleTapped="OnLibraryDoubleTapped"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="16"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                <ListBox.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                </ListBox.ItemsPanel>
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Border Width="160" Height="220" Margin="8" Padding="8"
+                                Background="#1a1a24" BorderBrush="#333" BorderThickness="1"
+                                CornerRadius="8">
+                            <DockPanel>
+                                <Border DockPanel.Dock="Top" Height="140" Background="#0a0a10"
+                                        CornerRadius="4" Margin="0,0,0,8" ClipToBounds="True">
+                                    <Panel>
+                                        <TextBlock Text="🎮" FontSize="36"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   Opacity="0.35"
+                                                   IsVisible="{Binding ShowPlaceholder}" />
+                                        <Image Source="{Binding Cover}"
+                                               Stretch="UniformToFill"
+                                               IsVisible="{Binding HasCover}" />
+                                    </Panel>
+                                </Border>
+                                <StackPanel Spacing="2">
+                                    <TextBlock Text="{Binding DisplayName}"
+                                               FontWeight="SemiBold" FontSize="13"
+                                               Foreground="#eee" TextTrimming="CharacterEllipsis"
+                                               TextWrapping="NoWrap" />
+                                    <TextBlock Text="{Binding Subtitle}"
+                                               FontSize="10" Foreground="#666"
+                                               TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-                </DockPanel>
-            </Border>
-
-            <Border Grid.Column="1" Background="#1a1a22" BorderBrush="#333" BorderThickness="1" CornerRadius="6" Margin="6,0,0,0">
-                <StackPanel Margin="14" Spacing="10">
-                    <TextBlock Text="STATUS" FontWeight="Bold" FontSize="14" Foreground="#aaa" />
-                    <Separator />
-                    <TextBlock Text="State" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="SidebarStatus" Text="Ready" FontSize="16" FontWeight="SemiBold" />
-                    <TextBlock Text="Master cycles" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="SidebarCycles" Text="0" FontSize="15" FontFamily="Consolas,monospace" />
-                    <TextBlock Text="EE PC" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="SidebarPc" Text="—" FontSize="14" FontFamily="Consolas,monospace" />
-                    <TextBlock Text="Last boot" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="SidebarBoot" Text="—" FontSize="12" TextWrapping="Wrap" Foreground="#ccc" />
-                    <TextBlock Text="BIOS" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="LibraryBiosText" Text="not set (Settings)" FontSize="12" TextWrapping="Wrap" Foreground="#ccc" />
-                    <TextBlock Text="Log file" FontSize="11" Foreground="#888" />
-                    <TextBlock x:Name="SidebarLogPath" Text="—" FontSize="10" TextWrapping="Wrap" Foreground="#6a6" />
-                    <Separator />
-                    <TextBlock Text="Gameplay opens in its own window when you Boot or Run."
-                               FontSize="11" Foreground="#777" TextWrapping="Wrap" />
-                    <TextBlock Text="BIOS, controllers, speed, and advanced options are under File → Settings."
-                               FontSize="11" Foreground="#777" TextWrapping="Wrap" />
-                </StackPanel>
-            </Border>
-        </Grid>
-
-        <!-- Log -->
-        <Border Grid.Row="3" Background="#0e0e12" BorderBrush="#333" BorderThickness="1" Margin="8,8,8,4" CornerRadius="4">
-            <Grid RowDefinitions="Auto,*">
-                <DockPanel Margin="8,4">
-                    <TextBlock Text="LOG" FontSize="11" Foreground="#888" VerticalAlignment="Center" />
-                    <TextBlock x:Name="LogHintText" DockPanel.Dock="Right" FontSize="10" Foreground="#555"
-                               Text="Also written to TEMP\DetPS2\" />
-                </DockPanel>
-                <ScrollViewer Grid.Row="1" Height="140" Margin="4">
-                    <TextBox x:Name="LogTextBox" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
-                             Background="Transparent" BorderThickness="0" Foreground="#ccc"
-                             FontFamily="Consolas,monospace" FontSize="12" />
-                </ScrollViewer>
-            </Grid>
+                            </DockPanel>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+            </Panel>
         </Border>
 
-        <Border Grid.Row="4" Padding="10,4" Background="#1a1a22">
-            <StackPanel Orientation="Horizontal" Spacing="20">
-                <TextBlock x:Name="StatusText" Text="Ready" />
-                <TextBlock x:Name="CyclesText" Text="Cycles: 0" />
-                <TextBlock x:Name="FpsText" Text="" />
-            </StackPanel>
+        <!-- Thin status line only (no LOG panel, no sidebar) -->
+        <Border Grid.Row="2" Padding="12,6" Background="#1a1a22">
+            <TextBlock x:Name="StatusText" Text="Ready" Foreground="#aaa" FontSize="12" />
         </Border>
     </Grid>
 </Window>

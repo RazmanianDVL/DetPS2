@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using DetPS2.Core.Input;
 
 namespace DetPS2.Core;
 
@@ -23,6 +24,13 @@ public sealed class GameSettings
     public bool WidescreenPatch { get; set; }
     public string WidescreenPatchPath { get; set; } = "";
     public string Notes { get; set; } = "";
+
+    /// <summary>Normalized disc serial (e.g. SLUS_210.87), if known.</summary>
+    public string? Serial { get; set; }
+    /// <summary>Absolute path to cached/local box art image, if any.</summary>
+    public string? BoxArtPath { get; set; }
+    /// <summary>Optional display title override (library list may prefer this over filename).</summary>
+    public string? TitleOverride { get; set; }
 
     public static GameSettings DefaultFor(string path)
     {
@@ -56,11 +64,27 @@ public sealed class EmulatorConfig
     public string VirtualHddPath { get; set; } = "";
     public int VirtualHddSizeMb { get; set; } = 8192; // 8GB — real "fat" PS2 HDDs ranged 40-160GB, this is a practical default
     public string LastGameId { get; set; } = "";
-    public bool DefaultFrameLimit { get; set; } = true;
+    /// <summary>
+    /// Host frame pacing. Default <c>false</c> so Desktop commercial boots burn EE cycles
+    /// as fast as the host allows (Soft-GS first paint is cycle-budget limited, not wall-FPS).
+    /// Turn on in Options → Graphics for 1× play once the title is on-screen.
+    /// </summary>
+    public bool DefaultFrameLimit { get; set; }
     public int DefaultTargetFps { get; set; } = 60;
+    /// <summary>
+    /// Host display backend: Software | Auto | D3D11 | D3D12 | Vulkan | OpenGL.
+    /// Soft-GS remains emulation truth; this only chooses how frames are shown.
+    /// Default Software = Avalonia WriteableBitmap blit (reliable Soft-GS visibility).
+    /// </summary>
     public string PresentMode { get; set; } = "Software";
     public bool EnableJit { get; set; }
     public bool AutoRunAfterBoot { get; set; } = true;
+    /// <summary>Solo run-ahead frames (Perf only; 0 = off). Same idea as <see cref="GameSettings.RunAheadFrames"/>.</summary>
+    public int RunAheadFrames { get; set; }
+    /// <summary>When false, host may skip OS audio device open/pump (samples still produced by SPU2 into the ring).</summary>
+    public bool EnableHostAudio { get; set; } = true;
+    /// <summary>Host output volume 0–100 (default 100). Applied when the audio sink supports gain.</summary>
+    public int AudioVolume { get; set; } = 100;
     /// <summary>Legacy XInput index (-1 = keyboard). Migrated to Player1DeviceId.</summary>
     public int Player1Gamepad { get; set; } = -1;
     public int Player2Gamepad { get; set; } = -1;
@@ -70,7 +94,24 @@ public sealed class EmulatorConfig
     /// <summary>Standard or GuitarHero mapping profile.</summary>
     public string Player1Profile { get; set; } = "Standard";
     public string Player2Profile { get; set; } = "Standard";
+    /// <summary>
+    /// Optional P1 remaps (JSON list of {Source, Target}). Null/empty = device defaults.
+    /// Old configs without this property still load (property remains null).
+    /// </summary>
+    public List<InputBindingEntry>? Player1Bindings { get; set; }
+    /// <summary>Optional P2 remaps. Null/empty = device defaults.</summary>
+    public List<InputBindingEntry>? Player2Bindings { get; set; }
     public bool VerifyMediaOnBoot { get; set; } = true;
+
+    /// <summary>When true, library may fetch box art online via <see cref="ScraperProvider"/>.</summary>
+    public bool ScrapeBoxArt { get; set; }
+    /// <summary>Box-art provider id: LocalOnly | SerialHttp (see DetPS2.Core.Metadata).</summary>
+    public string ScraperProvider { get; set; } = "LocalOnly";
+    /// <summary>
+    /// Root for metadata cache. Empty = %LocalAppData%\DetPS2\metadata\
+    /// Layout: {MetadataCacheDir}\{serial}\box.jpg
+    /// </summary>
+    public string MetadataCacheDir { get; set; } = "";
 
     public void MigrateGamepadIds()
     {
@@ -92,6 +133,44 @@ public sealed class EmulatorConfig
         string.Equals(s, "GuitarHero", StringComparison.OrdinalIgnoreCase)
             ? ControllerProfile.GuitarHero
             : ControllerProfile.Standard;
+
+    /// <summary>
+    /// Build the effective binding table for a player: device/profile defaults,
+    /// then overlay any saved custom entries.
+    /// </summary>
+    public InputBindingTable GetPlayer1BindingTable(ControllerHardwareKind kind = ControllerHardwareKind.XInput)
+    {
+        var basemap = DefaultInputMaps.Resolve(kind, ParseProfile(Player1Profile));
+        if (Player1Bindings == null || Player1Bindings.Count == 0)
+            return basemap;
+        return InputBindingTable.MergeOver(basemap, Player1Bindings);
+    }
+
+    public InputBindingTable GetPlayer2BindingTable(ControllerHardwareKind kind = ControllerHardwareKind.XInput)
+    {
+        var basemap = DefaultInputMaps.Resolve(kind, ParseProfile(Player2Profile));
+        if (Player2Bindings == null || Player2Bindings.Count == 0)
+            return basemap;
+        return InputBindingTable.MergeOver(basemap, Player2Bindings);
+    }
+
+    /// <summary>Replace P1 custom bindings from a table (null clears custom overrides).</summary>
+    public void SetPlayer1Bindings(InputBindingTable? table)
+    {
+        if (table == null || table.Count == 0)
+            Player1Bindings = null;
+        else
+            Player1Bindings = table.ToEntries();
+    }
+
+    public void SetPlayer2Bindings(InputBindingTable? table)
+    {
+        if (table == null || table.Count == 0)
+            Player2Bindings = null;
+        else
+            Player2Bindings = table.ToEntries();
+    }
+
     public List<GameSettings> Games { get; set; } = new();
 
     public bool HasBiosFile => !string.IsNullOrWhiteSpace(BiosPath) && File.Exists(BiosPath);

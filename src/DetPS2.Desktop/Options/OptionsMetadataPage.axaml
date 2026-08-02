@@ -1,0 +1,40 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsMetadataPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="12" MaxWidth="560">
+            <TextBlock Text="Metadata &amp; box art" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="Disc serial extraction + optional online box-art scrape. Cache lives under LocalAppData by default. See docs/METADATA_SCRAPE.md."
+                       FontSize="12" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <CheckBox x:Name="ScrapeBoxArtCheck" Content="Scrape box art (network)" />
+            <TextBlock Text="When enabled, LibraryMetadataService may fetch covers after serial identify. Off by default."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <TextBlock Text="Scraper provider" FontWeight="SemiBold" />
+            <ComboBox x:Name="ProviderCombo" Width="280" HorizontalAlignment="Left">
+                <ComboBoxItem Content="Local only (cache, no network)" Tag="LocalOnly" />
+                <ComboBoxItem Content="Serial HTTP (community covers)" Tag="SerialHttp" />
+            </ComboBox>
+
+            <Separator />
+
+            <TextBlock Text="Cache directory" FontWeight="SemiBold" />
+            <TextBox x:Name="CacheDirBox" Watermark="%LocalAppData%\DetPS2\metadata\" />
+            <TextBlock x:Name="ResolvedCacheText" FontSize="11" Foreground="#8c8" TextWrapping="Wrap" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Use default" Padding="12,6" Click="OnUseDefaultCacheClick" />
+                <Button Content="Browse…" Padding="12,6" Click="OnBrowseCacheClick" />
+            </StackPanel>
+            <TextBlock Text="Layout: {cache}\{serial}\box.jpg  (serial normalized, e.g. SLUS_210.87)"
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Status" FontWeight="SemiBold" />
+            <TextBlock x:Name="StatusText" Text="—" FontSize="12" Foreground="#ccc" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

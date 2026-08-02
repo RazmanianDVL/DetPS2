@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/DetPS2.Core/DetPS2.Core.csproj" />
     <Project Path="src/DetPS2.Desktop/DetPS2.Desktop.csproj" />
+    <Project Path="src/DetPS2.Present/DetPS2.Present.csproj" />
   </Folder>
   <Folder Name="/Tests/">
     <Project Path="Tests/DetPS2.Tests.csproj" />

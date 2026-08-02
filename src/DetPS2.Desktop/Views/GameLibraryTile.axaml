@@ -1,0 +1,26 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Views.GameLibraryTile"
+             Width="160" Height="220">
+    <Border Padding="8" Background="#1a1a24" BorderBrush="#333" BorderThickness="1" CornerRadius="8">
+        <DockPanel>
+            <!-- Placeholder art slot; bind CoverArtPath when metadata is available -->
+            <Border DockPanel.Dock="Top" Height="140" Background="#0a0a10"
+                    CornerRadius="4" Margin="0,0,0,8" ClipToBounds="True">
+                <Panel>
+                    <TextBlock x:Name="PlaceholderGlyph" Text="🎮" FontSize="36"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               Opacity="0.35" />
+                    <Image x:Name="ArtImage" Stretch="UniformToFill" IsVisible="False" />
+                </Panel>
+            </Border>
+            <StackPanel Spacing="2">
+                <TextBlock x:Name="TitleText" FontWeight="SemiBold" FontSize="13"
+                           Foreground="#eee" TextTrimming="CharacterEllipsis"
+                           TextWrapping="NoWrap" />
+                <TextBlock x:Name="PathText" FontSize="10" Foreground="#666"
+                           TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+        </DockPanel>
+    </Border>
+</UserControl>

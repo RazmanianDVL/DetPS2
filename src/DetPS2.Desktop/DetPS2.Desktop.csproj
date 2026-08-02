@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\DetPS2.Core\DetPS2.Core.csproj" />
+    <ProjectReference Include="..\DetPS2.Present\DetPS2.Present.csproj" />
   </ItemGroup>
 
   <ItemGroup>

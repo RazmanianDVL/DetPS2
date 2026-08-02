@@ -1,0 +1,34 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsAudioPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="12" MaxWidth="560">
+            <TextBlock Text="Audio" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="Host output settings. Emulation audio is produced by SPU2 into a ring buffer; the host device drains it."
+                       FontSize="12" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <CheckBox x:Name="EnableHostAudioCheck" Content="Enable host audio output" />
+            <TextBlock Text="When off, the host may skip OS device open/pump. Core samples are still generated."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Volume" VerticalAlignment="Center" Width="56" />
+                <Slider x:Name="VolumeSlider" Minimum="0" Maximum="100" TickFrequency="1"
+                        IsSnapToTickEnabled="True" Width="280" VerticalAlignment="Center" />
+                <TextBlock x:Name="VolumeValueText" Text="100" VerticalAlignment="Center"
+                           Width="36" FontFamily="Consolas,monospace" />
+            </StackPanel>
+            <TextBlock Text="Stored as 0–100 (default 100). Applied when the audio sink supports gain."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Status" FontWeight="SemiBold" />
+            <TextBlock x:Name="StatusText"
+                       Text="Audio samples when SPU2 produces them"
+                       FontSize="12" Foreground="#9c9" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

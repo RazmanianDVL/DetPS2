@@ -9,22 +9,53 @@ using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using DetPS2.Core;
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 
 namespace DetPS2.Desktop;
 
-public partial class MainWindow : Window
+public partial class MainWindow : Window, IOptionsHost
 {
     private Ps2System? _system;
+    private readonly EmulationWorker _emuWorker = new();
+    private ulong _lastWorkerPolicyMin;
+    private ulong _lastWorkerPolicyMax;
+    private bool _workerPolicySeeded;
     private DispatcherTimer? _renderTimer;
     private bool _isRunning;
-    private ulong _cyclesPerTick = 1_500_000;
-    private string _currentSpeedMode = "Normal";
+    // Default Fast: commercial Soft-GS first paint sooner; Normal (6M) is the calm play default.
+    // Frame limit defaults OFF during bring-up; WaitFrame (if ON) runs on EmulationWorker only —
+    // never on the Avalonia UI thread. Boot race temporarily Unlimited until lit>100 / 200M.
+    private ulong _cyclesPerTick = 25_000_000;
+    private string _currentSpeedMode = "Fast";
     private string _presentModeLabel = "Software";
     private long _lastLoggedAudioSamples;
     private long _detailLogCounter;
+    private long _sidebarTickCounter;
+    // Throughput meter (wall cycles/sec) — logged every ~1s while running after boot.
+    private readonly Stopwatch _throughputSw = new();
+    private ulong _throughputLastCycles;
+    private long _throughputLastMs;
+    private double _lastCyclesPerSec;
+    private bool _loggedFirstSoftGsPx;
+    // Boot race (auto-run only): Unlimited + skip frame wait until lit>100 OR cycles>200M.
+    // Temporary only — never mutates persisted Options (frameLimit / speed / PresentMode).
+    private bool _bootUncappedUntilSoftGs;
+    private string _preBootSpeedMode = "Fast";
+    private ulong _preBootCyclesPerTick = 25_000_000;
+    // When PresentMode is Auto: force Avalonia Software present for first 30s wall so Soft-GS is visible.
+    private bool _bootForceSoftwarePresent;
+    private readonly Stopwatch _bootPresentSw = new();
+    private const int BootSoftwarePresentMs = 30_000;
+    private const int BootLitPixelsDone = 100;
+    private const ulong BootCyclesCap = 200_000_000UL;
+    private const ulong BootUnlimitedQuantum = 50_000_000UL;
+    // Last speed policy pushed to EmulationWorker (avoid stomping adaptive quantum every UI tick).
+    private string _lastWorkerSpeedKey = "";
+    // Latest worker lit (from snapshot present) — boot-race end without racing mid-RunFor GS.
+    private long _lastWorkerLit;
 
     private readonly RingBufferAudioSink _audioSink = new();
     private bool _recordingTape;
@@ -33,7 +64,7 @@ public partial class MainWindow : Window
     private ProductionRollbackPeer? _rollbackPeer;
     private readonly NetGraph _netGraph = new();
     private readonly DesyncDumpWriter _desyncDump = new();
-    private readonly FrameLimiter _frameLimit = new() { Enabled = true, TargetFps = 60 };
+    private readonly FrameLimiter _frameLimit = new() { Enabled = false, TargetFps = 60 };
     private readonly RunAhead _runAhead = new();
     private IHostAudioDevice? _hostAudio;
     private EmulatorConfig _config = new();
@@ -42,10 +73,81 @@ public partial class MainWindow : Window
     private readonly SessionLog _sessionLog = new();
     private GameDisplayWindow? _gameWindow;
     private string? _currentGameTitle;
+    private OptionsWindow? _optionsWindow;
 
     private string ConfigPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "DetPS2", "config.json");
+
+    // --- IOptionsHost (OptionsWindow shell; UI-2 / PAD pages under Options/) ---
+    EmulatorConfig IOptionsHost.Config => _config;
+    FrameLimiter IOptionsHost.FrameLimit => _frameLimit;
+    HostGamepadService IOptionsHost.Gamepads => _gamepads;
+    string IOptionsHost.CurrentSpeedMode
+    {
+        get => _currentSpeedMode;
+        set => _currentSpeedMode = value;
+    }
+    ulong IOptionsHost.CyclesPerTick
+    {
+        get => _cyclesPerTick;
+        set => _cyclesPerTick = value;
+    }
+    string IOptionsHost.SessionLogPath => _sessionLog.LogPath ?? "";
+    string IOptionsHost.SessionLogDir => _sessionLog.TempDir;
+    string IOptionsHost.PresentModeLabel
+    {
+        get => _presentModeLabel;
+        set => _presentModeLabel = value;
+    }
+
+    void IOptionsHost.PersistConfig() => PersistConfig();
+    void IOptionsHost.Log(string message) => Log(message);
+    void IOptionsHost.OnLibraryPathsChanged()
+    {
+        RefreshLibraryList();
+        UpdateLibraryStatusTexts();
+    }
+    void IOptionsHost.LoadBiosPath(string path)
+    {
+        if (!string.IsNullOrWhiteSpace(path))
+            _system?.LoadBios(path);
+        _config.BiosPath = path ?? "";
+    }
+    Task<string?> IOptionsHost.PromptLibraryPathAsync(string initial) => PromptLibraryPathAsync(initial);
+    void IOptionsHost.ApplyFolderScan(string path) => ApplyFolderScan(path);
+    void IOptionsHost.OpenLogFolder() => OnOpenLogFolderClick(null, new RoutedEventArgs());
+    void IOptionsHost.ApplyFrameLimitFromConfig()
+    {
+        // Always mirror the user's permanent Options choice into _frameLimit.
+        // During boot race ShouldSkipFrameWait() still bypasses WaitFrame — do not clear Enabled
+        // (that would permanently wipe DefaultFrameLimit on the next PersistConfig).
+        _frameLimit.Enabled = _config.DefaultFrameLimit;
+        _frameLimit.TargetFps = _config.DefaultTargetFps > 0 ? _config.DefaultTargetFps : 60;
+        SyncWorkerFramePacing();
+        if (_bootUncappedUntilSoftGs && _frameLimit.Enabled)
+            Log("Frame limit kept ON in Options — skipped for boot race only (lit>100 or 200M cycles)");
+    }
+    void IOptionsHost.ApplyPresentModeFromConfig()
+    {
+        string mode = string.IsNullOrWhiteSpace(_config.PresentMode) ? "Software" : _config.PresentMode.Trim();
+        // Legacy alias
+        if (string.Equals(mode, "GPU", StringComparison.OrdinalIgnoreCase))
+            mode = "D3D11";
+        _config.PresentMode = mode;
+        _presentModeLabel = mode;
+        // Core PresentPipeline stays Software for Det hash; host GPU is GameDisplayWindow only.
+        _system?.Present.UseSoftware();
+        // Boot race with Auto: keep Avalonia Soft-GS path for first 30s (GPU exclusive later).
+        string hostMode = EffectiveHostPresentMode();
+        _gameWindow?.SetPresentMode(hostMode);
+        _gamepads.ApplyConfigBindings(_config);
+        string note = _bootForceSoftwarePresent && IsAutoPresentMode(mode)
+            ? " (boot: Software for Soft-GS, Auto resumes after 30s)"
+            : "";
+        Log($"Host renderer: {mode}{note}" +
+            (_gameWindow != null ? $" (game window → {_gameWindow.HostPresentName})" : " (applies when game window opens)"));
+    }
 
     public MainWindow()
     {
@@ -58,17 +160,23 @@ public partial class MainWindow : Window
             KeyUp += OnKeyUp;
             Closed += (_, __) =>
             {
+                _isRunning = false;
+                try
+                {
+                    _emuWorker.Detach();
+                    _emuWorker.Dispose();
+                }
+                catch { /* ignore shutdown races */ }
                 CloseGameWindow();
+                try { _optionsWindow?.Close(); } catch { /* ignore */ }
                 _sessionLog.Dispose();
                 _hostAudio?.Dispose();
             };
             LoadConfigAndLibrary();
-            if (SidebarLogPath != null)
-                SidebarLogPath.Text = _sessionLog.LogPath ?? "—";
             Log($"{VersionInfo.Banner}");
             Log($"Session log: {_sessionLog.LogPath}");
-            Log("Choose a media folder, then Boot a title — gameplay opens in a separate window.");
-            Log("BIOS, controllers, and advanced options: File → Settings…");
+            Log("Double-click a title to boot — gameplay opens in a separate window.");
+            Log("Library path and other settings: Options → General…");
         }
         catch (Exception ex)
         {
@@ -90,28 +198,26 @@ public partial class MainWindow : Window
 
             _config.EnsureMemCardPathDefault();
             ApplyConfigToUi();
+            _gamepads.ApplyConfigBindings(_config);
             RefreshLibraryList();
             UpdateLibraryStatusTexts();
+            EnqueueLibraryMetadataRefresh();
 
             if (_config.HasGamesFolder)
                 Log($"Library path: {_config.GamesFolder} ({_config.Games.Count} items)");
             else
-                Log("No library path yet — click Set library path… (local folder or \\\\server\\share)");
+                Log("No library path yet — Options → General → Set library path…");
 
-            if (_config.HasBiosFile)
+            // Desktop always uses built-in native HLE — no BIOS dump required.
+            try
             {
-                try
-                {
-                    _system?.LoadBios(_config.BiosPath);
-                    Log($"BIOS restored: {Path.GetFileName(_config.BiosPath)}");
-                }
-                catch (Exception ex)
-                {
-                    Log($"BIOS path saved but failed to load: {ex.Message}");
-                }
+                _system?.LoadBiosNative();
+                Log("Native BIOS HLE ready (no BIOS dump required)");
             }
-            else
-                Log("BIOS not set — File → Load BIOS (required for many retail discs)");
+            catch (Exception ex)
+            {
+                Log($"Native BIOS HLE init warning: {ex.Message}");
+            }
 
             if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath) && _system != null)
             {
@@ -130,9 +236,16 @@ public partial class MainWindow : Window
     {
         try
         {
+            // Permanent Options only. Boot race never clears FrameLimit.Enabled, so saving
+            // Enabled here keeps the user's Graphics checkbox (temporary WaitFrame skip only).
             _config.DefaultFrameLimit = _frameLimit.Enabled;
             _config.DefaultTargetFps = _frameLimit.TargetFps;
-            _config.PresentMode = _presentModeLabel;
+            // Prefer config.PresentMode (set by Options → Graphics); never write temporary
+            // boot Software force back into config when user chose Auto.
+            if (string.IsNullOrWhiteSpace(_config.PresentMode))
+                _config.PresentMode = string.IsNullOrWhiteSpace(_presentModeLabel) ? "Software" : _presentModeLabel;
+            else
+                _presentModeLabel = _config.PresentMode;
             _config.EnableJit = _system?.UseJit ?? false;
             _config.Save(ConfigPath);
         }
@@ -146,15 +259,54 @@ public partial class MainWindow : Window
     private void RefreshLibraryList()
     {
         if (LibraryList == null) return;
+        var items = _config.Games.Select(g => new LibraryItemVm(g)).ToList();
         LibraryList.ItemsSource = null;
-        LibraryList.ItemsSource = _config.Games.ToList();
+        LibraryList.ItemsSource = items;
+        if (EmptyLibraryHint != null)
+            EmptyLibraryHint.IsVisible = items.Count == 0;
         if (!string.IsNullOrEmpty(_config.LastGameId))
         {
-            var match = _config.Games.FirstOrDefault(g =>
-                string.Equals(g.GameId, _config.LastGameId, StringComparison.OrdinalIgnoreCase));
+            var match = items.FirstOrDefault(v =>
+                string.Equals(v.Game.GameId, _config.LastGameId, StringComparison.OrdinalIgnoreCase));
             if (match != null)
                 LibraryList.SelectedItem = match;
         }
+    }
+
+    /// <summary>Resolve serials + optional box art without blocking the UI thread.</summary>
+    private void EnqueueLibraryMetadataRefresh()
+    {
+        if (_config.Games.Count == 0) return;
+        var snapshot = _config.Games.ToList();
+        var cfg = _config;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var meta = new DetPS2.Core.Metadata.LibraryMetadataService(cfg);
+                foreach (var g in snapshot)
+                {
+                    try { await meta.EnsureSerialAndEnqueueAsync(g.Path, g).ConfigureAwait(false); }
+                    catch { /* per-title identify failures are non-fatal */ }
+                }
+                // Allow a short window for in-flight scrapes to write cache.
+                await Task.Delay(800).ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        PersistConfig();
+                        RefreshLibraryList();
+                    }
+                    catch { /* ignore */ }
+                });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                    Log("Metadata refresh: " + ex.Message));
+            }
+        });
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
@@ -177,8 +329,17 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool MapKey(Key key, out PadInput.Button button)
+    private bool MapKey(Key key, out PadInput.Button button)
     {
+        // Prefer saved keyboard bindings (PAD-1 table) when present.
+        string code = Options.BindingCaptureDialog.KeyToCode(key);
+        if (!string.IsNullOrEmpty(code))
+        {
+            var table = _config.GetPlayer1BindingTable(ControllerHardwareKind.Keyboard);
+            if (table.TryMapKey(code, out button) && button != PadInput.Button.None)
+                return true;
+        }
+
         // WASD + arrows = D-pad; ZXCI / KL = face; QE = shoulders; Enter/Shift = Start/Select; J = Square
         button = key switch
         {
@@ -216,14 +377,8 @@ public partial class MainWindow : Window
 
     private void Log(string message)
     {
+        // Main window no longer hosts a LOG panel; session file is the live sink.
         _sessionLog.Write(message);
-        if (LogTextBox == null) return;
-        string timestamp = DateTime.Now.ToString("HH:mm:ss");
-        LogTextBox.Text += $"[{timestamp}] {message}" + Environment.NewLine;
-        // Cap UI log size
-        if (LogTextBox.Text.Length > 80_000)
-            LogTextBox.Text = LogTextBox.Text[^60_000..];
-        LogTextBox.CaretIndex = LogTextBox.Text.Length;
     }
 
     private void SetupDragDrop()
@@ -260,26 +415,17 @@ public partial class MainWindow : Window
         {
             if (ext == ".rom")
             {
-                _system.LoadBios(path);
-                _config.BiosPath = path;
-                PersistConfig();
-                UpdateLibraryStatusTexts();
-                Log($"BIOS loaded via drag & drop: {Path.GetFileName(path)}");
+                // BIOS dumps are ignored — Desktop uses built-in native HLE only.
+                Log("BIOS dump ignored (native HLE is always used). Drop an .iso / .bin disc or .elf instead.");
             }
             else if (ext == ".bin")
             {
-                // Large .bin ≈ disc image; small ≈ BIOS
+                // Large .bin ≈ disc image; small files are treated as non-disc (not BIOS).
                 var info = new FileInfo(path);
                 if (info.Length > 2_000_000)
                     await BootMediaPathAsync(path, autoRun: _config.AutoRunAfterBoot);
                 else
-                {
-                    _system.LoadBios(path);
-                    _config.BiosPath = path;
-                    PersistConfig();
-                    UpdateLibraryStatusTexts();
-                    Log($"BIOS loaded via drag & drop: {Path.GetFileName(path)}");
-                }
+                    Log("Small .bin ignored (not treated as BIOS). Drop a disc image (.iso / large .bin) or .elf.");
             }
             else if (ext is ".elf" or ".iso")
             {
@@ -287,7 +433,7 @@ public partial class MainWindow : Window
             }
             else
             {
-                Log("Unsupported file type (use BIOS .bin/.rom, .iso, .elf)");
+                Log("Unsupported file type (use .iso, .bin disc image, or .elf)");
             }
             UpdateSidebar();
         }
@@ -299,90 +445,358 @@ public partial class MainWindow : Window
         if (_system == null) return;
         try
         {
-            if (_isRunning && !_system.Debugger.Halted)
-            {
-                bool netplayActive = _netplay != null && _netplay.Running
-                    && _netplayTransport != null && _netplayTransport.IsConnected;
-                if (netplayActive)
-                {
-                    try
-                    {
-                        _netplay!.AdvanceNetworked(_system, _system.Pad.Buttons, recvTimeoutMs: 1);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Netplay frame error: {ex.Message}");
-                        CrashLog.Write("netplay frame", ex, _system);
-                        StopNetplayInternal();
-                    }
-                    _system.PresentFrame();
-                }
-                else if (_runAhead.Enabled && _presentModeLabel != "Netplay")
-                {
-                    // Solo run-ahead only (never with netplay)
-                    _runAhead.Apply(_system, _cyclesPerTick, () =>
-                    {
-                        _system.PresentFrame();
-                        UpdateFramebuffer();
-                    });
-                }
-                else
-                {
-                    _system.RunFor(_cyclesPerTick);
-                    // Phase 1: FMV advances on host present only (once per UI tick).
-                    // Must not live inside RunFor or the logo burns in one EE slice.
-                    // ActiveQuirk aliases MidwayAssist when the mounted disc is SLUS_210.87
-                    // (see Ps2System.MidwayAssist) — call once via ActiveQuirk so this is
-                    // correctly serial-gated instead of firing for every commercial title.
-                    _system.ActiveQuirk?.OnHostPresent(_system);
-                    _system.PresentFrame();
-                }
+            // CRITICAL: EE never runs on the UI thread for solo play (Windows "Not Responding").
+            // Worker: RunFor + ActiveQuirk.OnHostPresent + PresentFrame + Soft-GS snapshot.
+            // UI: PresentSnapshot / TryGetPresent only (see PresentToGameWindow).
+            bool wantRun = _isRunning && !_system.Debugger.Halted;
+            bool netplayActive = wantRun
+                && _netplay != null && _netplay.Running
+                && _netplayTransport != null && _netplayTransport.IsConnected;
 
-                if (_frameLimit.Enabled && !netplayActive)
-                    _frameLimit.WaitFrame();
+            // Quantum policy ~0.5–4M (adaptive inside worker). Do NOT assign Quantum every
+            // tick — that stomps AdaptQuantum. Seed only when speed/boot bounds change.
+            ApplyWorkerQuantumPolicy(seed: false);
+            // Frame limit WaitFrame on worker only (never UI).
+            SyncWorkerFramePacing();
+
+            if (netplayActive)
+            {
+                // Netplay lockstep stays on UI (deterministic). Worker must stay off.
+                _emuWorker.IsRunning = false;
+                if (!_throughputSw.IsRunning)
+                    BeginThroughputWindow();
+                try
+                {
+                    _netplay!.AdvanceNetworked(_system, _system.Pad.Buttons, recvTimeoutMs: 1);
+                    _system.PresentFrame();
+                }
+                catch (Exception ex)
+                {
+                    Log($"Netplay frame error: {ex.Message}");
+                    CrashLog.Write("netplay frame", ex, _system);
+                    StopNetplayInternal();
+                }
+                MaybeNoteSoftGsAndEndBootBoost();
+                MaybeEndBootSoftwareForce();
+                MaybeLogThroughput();
             }
             else
             {
-                _system.PresentFrame();
+                _emuWorker.IsRunning = wantRun;
+                if (wantRun)
+                {
+                    if (!_throughputSw.IsRunning)
+                        BeginThroughputWindow();
+                    MaybeNoteSoftGsAndEndBootBoost();
+                    MaybeEndBootSoftwareForce();
+                    MaybeLogThroughput();
+                }
             }
 
             if (_system.Debugger.Halted)
             {
                 _isRunning = false;
+                _emuWorker.IsRunning = false;
                 UpdateStatus("Breakpoint");
             }
             PollGamepads();
             DrainAudioMeter();
-            // Always push pixels to the game window while a system exists (paused still shows last frame)
             if (_gameWindow != null)
             {
                 PresentToGameWindow();
                 _detailLogCounter++;
-                // Phase 1 diagnostics: every ~1s at 60fps so FMV freezes are obvious in the log
-                if (_detailLogCounter % 60 == 0 && _system != null && _isRunning)
+                if (_detailLogCounter % 120 == 0 && _isRunning)
                 {
-                    _sessionLog.WriteSystemSnapshot(_system, "tick");
-                    _sessionLog.Write(
-                        $"fmv={_system.MidwayAssist.LogoFrame}/{_system.MidwayAssist.LogoFramesTotal} " +
-                        $"assist={_system.MidwayAssist.Status} overlay={_system.Gs.HostOverlayActive} " +
-                        $"presented={_system.MidwayAssist.FramesPresented}");
-                    Log($"… running PC=0x{_system.EE.PC:X8} c={_system.MasterCycles:N0} " +
-                        $"overlay={(_system.Gs.HostOverlayActive ? "on" : "off")} " +
-                        $"assist={_system.MidwayAssist.Status} " +
-                        $"fmv={_system.MidwayAssist.LogoFrame}/{_system.MidwayAssist.LogoFramesTotal}");
+                    // Status fields may tear vs mid-slice EE; logging only.
+                    Log($"… worker={_emuWorker.Status} q={_emuWorker.Quantum:N0} " +
+                        $"presentHz={_emuWorker.PresentHz:F0} PC=0x{_system.EE.PC:X8} c={_system.MasterCycles:N0} " +
+                        $"px={_system.Gs.PixelsWritten:N0} lit={_gameWindow.LastLitPixels:N0} " +
+                        $"throughput={FormatThroughput(_lastCyclesPerSec)}");
                 }
             }
             UpdateStatusText();
-            UpdateSidebar();
+            _sidebarTickCounter++;
+            if (_system.Debugger.Halted || (_sidebarTickCounter % 15) == 0)
+                UpdateSidebar();
         }
         catch (Exception ex)
         {
             CrashLog.Write("render tick", ex, _system);
             _sessionLog.WriteException("render tick", ex);
-            _sessionLog.WriteSystemSnapshot(_system, "tick-error");
             Log($"Emulation error: {ex.Message}");
             _isRunning = false;
+            _emuWorker.IsRunning = false;
         }
+    }
+
+    /// <summary>True when host WaitFrame must not block (Unlimited, or temporary boot Soft-GS race).</summary>
+    private bool ShouldSkipFrameWait()
+    {
+        if (_bootUncappedUntilSoftGs) return true;
+        return string.Equals(_currentSpeedMode, "Unlimited", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private ulong EffectiveCyclesPerTick()
+    {
+        // Boot race: hard Unlimited quantum so Soft-GS chrome / Deception MidwayFamilyAssist get CPU.
+        // Note: UI never RunFor this amount — worker policy is capped to MaxQuantum (4M).
+        if (_bootUncappedUntilSoftGs)
+            return BootUnlimitedQuantum;
+        return _cyclesPerTick;
+    }
+
+    /// <summary>
+    /// Map speed mode / boot race into worker quantum bounds for ~30–60 present/s.
+    /// Playable band defaults to EmulationWorker.Min/MaxQuantum (0.5–4M). Slow is lower;
+    /// boot/Unlimited still cap at MaxQuantum so UI presents stay fluid (not 50M freezes).
+    /// When <paramref name="seed"/> is false, skip work unless speed/boot key changed.
+    /// </summary>
+    private void ApplyWorkerQuantumPolicy(bool seed)
+    {
+        string mode = _bootUncappedUntilSoftGs
+            ? "BootRace"
+            : (string.IsNullOrWhiteSpace(_currentSpeedMode) ? "Fast" : _currentSpeedMode);
+
+        ulong min, max, seedQ;
+        if (string.Equals(mode, "Slow", StringComparison.OrdinalIgnoreCase))
+        {
+            min = 100_000UL;
+            max = 500_000UL;
+            seedQ = 300_000UL;
+        }
+        else if (string.Equals(mode, "Normal", StringComparison.OrdinalIgnoreCase))
+        {
+            min = EmulationWorker.MinQuantum;
+            max = 3_000_000UL;
+            seedQ = 1_500_000UL;
+        }
+        else
+        {
+            // Fast / Unlimited / BootRace: playable 0.5–4M/slice (more slices, not larger freezes).
+            min = EmulationWorker.MinQuantum;
+            max = EmulationWorker.MaxQuantum;
+            seedQ = 2_000_000UL;
+        }
+
+        // Key includes speed + boot-race so we re-seed when those change.
+        string key = mode + "|" + _cyclesPerTick + "|" + min + "|" + max;
+        bool keyChanged = !string.Equals(key, _lastWorkerSpeedKey, StringComparison.Ordinal);
+        bool boundsChanged = min != _lastWorkerPolicyMin || max != _lastWorkerPolicyMax;
+        bool doSeed = seed || !_workerPolicySeeded || keyChanged;
+
+        if (!doSeed && !boundsChanged)
+            return;
+
+        _emuWorker.SetQuantumPolicy(min, max, seedQuantum: doSeed ? seedQ : null);
+        _lastWorkerPolicyMin = min;
+        _lastWorkerPolicyMax = max;
+        _lastWorkerSpeedKey = key;
+        _workerPolicySeeded = true;
+    }
+
+    /// <summary>
+    /// Host frame pacing on the EE worker only (never Avalonia UI).
+    /// Boot race / Unlimited skip WaitFrame even if Options has frame limit ON.
+    /// </summary>
+    private void SyncWorkerFramePacing()
+    {
+        bool pace = _frameLimit.Enabled && !ShouldSkipFrameWait();
+        _emuWorker.SetFramePacing(_frameLimit, enabled: pace);
+    }
+
+    /// <summary>Alias used by boot/run paths that previously called SyncWorkerQuantumPolicy.</summary>
+    private void SyncWorkerQuantumPolicy() => ApplyWorkerQuantumPolicy(seed: true);
+
+    /// <summary>Host present string for the game window (may temporarily force Software during Auto boot).</summary>
+    private string EffectiveHostPresentMode()
+    {
+        if (_bootForceSoftwarePresent)
+            return "Software";
+        return string.IsNullOrWhiteSpace(_presentModeLabel) ? "Software" : _presentModeLabel;
+    }
+
+    private static bool IsAutoPresentMode(string? mode) =>
+        string.Equals(mode, "Auto", StringComparison.OrdinalIgnoreCase);
+
+    private void BeginThroughputWindow()
+    {
+        _throughputSw.Restart();
+        _throughputLastMs = 0;
+        _throughputLastCycles = _system?.MasterCycles ?? 0;
+        _lastCyclesPerSec = 0;
+    }
+
+    private void MaybeLogThroughput()
+    {
+        if (_system == null || !_throughputSw.IsRunning) return;
+        long ms = _throughputSw.ElapsedMilliseconds;
+        long dt = ms - _throughputLastMs;
+        // After boot: every 1s — cyc, px, lit, Mcyc/s (task metrics for Soft-GS bring-up).
+        if (dt < 1000) return;
+
+        ulong nowC = _system.MasterCycles;
+        ulong dCyc = nowC - _throughputLastCycles;
+        double sec = dt / 1000.0;
+        _lastCyclesPerSec = sec > 0 ? dCyc / sec : 0;
+        _throughputLastMs = ms;
+        _throughputLastCycles = nowC;
+
+        int lit = _gameWindow?.LastLitPixels ?? 0;
+        if (lit <= 0 && _lastWorkerLit > 0)
+            lit = (int)Math.Min(int.MaxValue, _lastWorkerLit);
+        Log($"BootMetrics: cyc={nowC:N0}  px={_system.Gs.PixelsWritten:N0}  lit={lit:N0}  " +
+            $"{FormatThroughput(_lastCyclesPerSec)}  " +
+            $"speed={_currentSpeedMode}  frameLimit={(_frameLimit.Enabled && !ShouldSkipFrameWait() ? "on" : "off")}  " +
+            $"workerQ={_emuWorker.Quantum:N0} presentHz={_emuWorker.PresentHz:F0}" +
+            (_bootUncappedUntilSoftGs ? "  [boot-race]" : ""));
+    }
+
+    private static string FormatThroughput(double cyclesPerSec)
+    {
+        if (cyclesPerSec <= 0) return "— Mcyc/s";
+        if (cyclesPerSec >= 1_000_000)
+            return $"{cyclesPerSec / 1_000_000.0:F1} Mcyc/s";
+        if (cyclesPerSec >= 1_000)
+            return $"{cyclesPerSec / 1_000.0:F0} kcyc/s";
+        return $"{cyclesPerSec:F0} cyc/s";
+    }
+
+    private void MaybeNoteSoftGsAndEndBootBoost()
+    {
+        if (_system == null) return;
+        long px = _system.Gs.PixelsWritten;
+        // Prefer worker snapshot lit (STAB-1) — UI PresentFrame used to race mid-RunFor.
+        long litLong = _lastWorkerLit;
+        if (litLong <= 0)
+            litLong = _emuWorker.LastLit;
+        if (litLong <= 0)
+            litLong = _gameWindow?.LastLitPixels ?? 0;
+        int lit = (int)Math.Min(int.MaxValue, litLong);
+        ulong cycles = _system.MasterCycles;
+
+        if (px > 0 && !_loggedFirstSoftGsPx)
+        {
+            _loggedFirstSoftGsPx = true;
+            Log($"Soft-GS first pixels: px={px:N0} lit={lit:N0} at c={cycles:N0} " +
+                $"(throughput={FormatThroughput(_lastCyclesPerSec)})");
+        }
+
+        if (!_bootUncappedUntilSoftGs) return;
+
+        // End temporary Unlimited / frame-wait skip when Soft-GS chrome is clearly on screen
+        // (lit>100) OR after a hard cycle budget (200M) so Unlimited cannot run forever.
+        bool litDone = lit > BootLitPixelsDone;
+        bool cyclesDone = cycles > BootCyclesCap;
+        if (!litDone && !cyclesDone) return;
+
+        EndBootRace(litDone, lit, cycles);
+    }
+
+    /// <summary>
+    /// Leave temporary Unlimited; restore Normal/Fast (never leave Unlimited as permanent default).
+    /// Optional frame limit (60 fps) resumes on the worker thread without freezing UI.
+    /// </summary>
+    private void EndBootRace(bool litDone, int lit, ulong cycles)
+    {
+        _bootUncappedUntilSoftGs = false;
+
+        // Restore pre-boot speed only if still on temporary Unlimited we armed.
+        // If the user changed speed via Options mid-race, keep their choice.
+        bool stillTempUnlimited =
+            string.Equals(_currentSpeedMode, "Unlimited", StringComparison.OrdinalIgnoreCase) &&
+            _cyclesPerTick >= BootUnlimitedQuantum;
+        if (stillTempUnlimited)
+        {
+            // Prefer Fast/Normal — never persist Unlimited as the post-paint default.
+            string restore = string.IsNullOrWhiteSpace(_preBootSpeedMode) ? "Fast" : _preBootSpeedMode;
+            if (string.Equals(restore, "Unlimited", StringComparison.OrdinalIgnoreCase))
+                restore = "Fast";
+            _currentSpeedMode = restore;
+            if (_preBootCyclesPerTick > 0 && _preBootCyclesPerTick < BootUnlimitedQuantum)
+                _cyclesPerTick = _preBootCyclesPerTick;
+            else
+                _cyclesPerTick = string.Equals(restore, "Normal", StringComparison.OrdinalIgnoreCase)
+                    ? 6_000_000UL
+                    : 25_000_000UL; // Fast default
+        }
+
+        // Re-seed worker quantum for restored Normal/Fast (adaptive takes over after).
+        _lastWorkerSpeedKey = "";
+        ApplyWorkerQuantumPolicy(seed: true);
+
+        // Frame limit optional 60fps after lit>100: if Options has it ON, reset phase so we
+        // do not sleep for a huge backlog, then pace on the EE worker (UI stays free).
+        if (_frameLimit.Enabled)
+        {
+            _frameLimit.TargetFps = _frameLimit.TargetFps > 0 ? _frameLimit.TargetFps : 60;
+            _frameLimit.Reset();
+        }
+        SyncWorkerFramePacing();
+
+        string reason = litDone
+            ? $"lit={lit:N0}>{BootLitPixelsDone}"
+            : $"cycles={cycles:N0}>{BootCyclesCap:N0}";
+        Log($"Boot race ended ({reason}) — speed={_currentSpeedMode} " +
+            $"workerQ={_emuWorker.Quantum:N0} (bounds {_emuWorker.QuantumMin:N0}..{_emuWorker.QuantumMax:N0})  " +
+            $"frameLimit={(_frameLimit.Enabled ? $"on {_frameLimit.TargetFps}fps (worker)" : "off")} " +
+            "(permanent Options unchanged)");
+    }
+
+    private void MaybeEndBootSoftwareForce()
+    {
+        if (!_bootForceSoftwarePresent) return;
+        if (_bootPresentSw.IsRunning && _bootPresentSw.ElapsedMilliseconds < BootSoftwarePresentMs)
+            return;
+
+        _bootForceSoftwarePresent = false;
+        _bootPresentSw.Reset();
+        string mode = EffectiveHostPresentMode();
+        _gameWindow?.SetPresentMode(mode);
+        Log($"Boot Soft-GS Software window ended (30s) — host present → {mode}");
+    }
+
+    private void ArmBootUncappedForCommercial()
+    {
+        // Snapshot permanent speed so we can restore after lit>100 / 200M (never persist Unlimited).
+        // If user was already Unlimited, fall back to Fast for post-paint restore.
+        _preBootSpeedMode = _currentSpeedMode;
+        if (string.Equals(_preBootSpeedMode, "Unlimited", StringComparison.OrdinalIgnoreCase))
+            _preBootSpeedMode = "Fast";
+        _preBootCyclesPerTick = _cyclesPerTick;
+        if (_preBootCyclesPerTick == 0 || _preBootCyclesPerTick >= BootUnlimitedQuantum)
+            _preBootCyclesPerTick = 25_000_000; // Fast
+
+        _bootUncappedUntilSoftGs = true;
+        _loggedFirstSoftGsPx = false;
+        _lastWorkerLit = 0;
+        // Temporary Unlimited — CPU hard until Soft-GS chrome or cycle cap.
+        _cyclesPerTick = BootUnlimitedQuantum;
+        _currentSpeedMode = "Unlimited";
+        BeginThroughputWindow();
+
+        _lastWorkerSpeedKey = "";
+        ApplyWorkerQuantumPolicy(seed: true);
+        SyncWorkerFramePacing(); // boot race → pacing off even if Options has frame limit ON
+
+        // PresentMode Auto: force Avalonia Software so Soft-GS is visible ASAP; GPU exclusive after 30s.
+        string cfgPresent = string.IsNullOrWhiteSpace(_config.PresentMode) ? _presentModeLabel : _config.PresentMode;
+        if (IsAutoPresentMode(cfgPresent))
+        {
+            _bootForceSoftwarePresent = true;
+            _bootPresentSw.Restart();
+            _gameWindow?.SetPresentMode("Software");
+        }
+        else
+        {
+            _bootForceSoftwarePresent = false;
+            _bootPresentSw.Reset();
+        }
+
+        Log($"Boot race: speed=Unlimited (temp) workerQ={_emuWorker.Quantum:N0} " +
+            $"frameLimit={(_frameLimit.Enabled ? "on in Options (skipped until lit>100 or 200M)" : "off")} " +
+            $"present={cfgPresent}" +
+            (_bootForceSoftwarePresent ? "→Software(30s Soft-GS)" : "") +
+            " — restores " + _preBootSpeedMode + " after first paint; Options not rewritten");
     }
 
     private void EnsureGameWindow(string? title = null)
@@ -397,6 +811,7 @@ public partial class MainWindow : Window
             {
                 Log("Game window closed by user — emulation paused");
                 _isRunning = false;
+                _emuWorker.IsRunning = false;
                 _gameWindow = null;
                 UpdateSidebar();
             };
@@ -404,6 +819,7 @@ public partial class MainWindow : Window
             Log("Opened game display window");
             _sessionLog.Write("GameDisplayWindow shown");
         }
+        _gameWindow.SetPresentMode(EffectiveHostPresentMode());
         _gameWindow.SetTitleInfo(_currentGameTitle ?? "Game");
         _gameWindow.Activate();
     }
@@ -420,14 +836,73 @@ public partial class MainWindow : Window
         _gameWindow = null;
     }
 
+    /// <summary>
+    /// Prefer <see cref="EmulationWorker.TryGetPresent"/> → <see cref="GameDisplayWindow.PresentSnapshot"/>
+    /// for solo play (never sample live Soft-GS mid-RunFor). Live
+    /// <see cref="GameDisplayWindow.PresentFrame"/> only when the worker is idle
+    /// (pause / step / test scene / netplay lockstep).
+    /// </summary>
     private void PresentToGameWindow()
     {
         if (_system == null) return;
         if (_gameWindow == null) return;
         try
         {
-            _gameWindow.PresentFrame(_system);
-            _gameWindow.SetStatus($"PC=0x{_system.EE.PC:X8}  cycles={_system.MasterCycles:N0}  px={_system.Gs.PixelsWritten:N0}");
+            bool netplayActive = _netplay != null && _netplay.Running
+                && _netplayTransport != null && _netplayTransport.IsConnected;
+            bool workerDriving = _emuWorker.IsRunning && _emuWorker.IsWorkerAlive && !netplayActive;
+
+            // Prefer snapshot path first — UI must not touch live GS while EE runs on worker.
+            bool usedSnapshot = false;
+            ulong statusPc = 0;
+            ulong statusCycles = 0;
+            long statusPx = 0;
+            long statusLit = _lastWorkerLit;
+            if (_emuWorker.TryGetPresent(out var pixels, out int w, out int h,
+                    out long px, out long lit, out ulong cycles, out ulong pc, out int gifP3))
+            {
+                _lastWorkerLit = lit;
+                statusPc = pc;
+                statusCycles = cycles;
+                statusPx = px;
+                statusLit = lit;
+                if (workerDriving)
+                {
+                    _gameWindow.PresentSnapshot(pixels.Span, w, h, px, cycles, pc, gifP3, litHint: lit);
+                    usedSnapshot = true;
+                }
+            }
+
+            if (!usedSnapshot && !workerDriving)
+            {
+                // Worker idle: safe to sample live Soft-GS (step, pause, test scene, netplay).
+                _gameWindow.PresentFrame(_system);
+                _lastWorkerLit = _gameWindow.LastLitPixels;
+                statusPc = _system.EE.PC;
+                statusCycles = _system.MasterCycles;
+                statusPx = _system.Gs.PixelsWritten;
+                statusLit = _gameWindow.LastLitPixels;
+            }
+            else if (!usedSnapshot && workerDriving)
+            {
+                // Solo + worker active but no snap yet — skip live present (would race mid-RunFor).
+                statusPc = _system.EE.PC;
+                statusCycles = _system.MasterCycles;
+                statusPx = _system.Gs.PixelsWritten;
+                statusLit = _lastWorkerLit;
+            }
+
+            // Status chrome: update ~4×/s (not every UI tick) to cut string/UI churn.
+            // Prefer snapshot metrics when available so we do not chase mid-RunFor GS.
+            if ((_detailLogCounter % 15) == 0)
+            {
+                _gameWindow.SetStatus(
+                    $"PC=0x{statusPc:X8}  c={statusCycles:N0}  " +
+                    $"{FormatThroughput(_lastCyclesPerSec)}  px={statusPx:N0}  " +
+                    $"lit={statusLit:N0}  q={_emuWorker.Quantum:N0}  " +
+                    $"Hz={_emuWorker.PresentHz:F0}  present={_gameWindow.HostPresentName}  " +
+                    $"ee={_emuWorker.Status}");
+            }
         }
         catch (Exception ex)
         {
@@ -448,11 +923,36 @@ public partial class MainWindow : Window
     private void OnStopEmulationClick(object? sender, RoutedEventArgs e)
     {
         _isRunning = false;
+        _emuWorker.PauseAndWait();
+        ClearBootRaceState(restoreSpeed: true);
+        _throughputSw.Reset();
         CloseGameWindow();
         Log("Emulation stopped; game window closed");
         _sessionLog.WriteSystemSnapshot(_system, "stop");
         UpdateStatus("Stopped");
         UpdateSidebar();
+    }
+
+    /// <summary>Clear temporary boot-race flags without writing Options/config.</summary>
+    private void ClearBootRaceState(bool restoreSpeed)
+    {
+        if (restoreSpeed && _bootUncappedUntilSoftGs)
+        {
+            string restore = string.IsNullOrWhiteSpace(_preBootSpeedMode) ? "Fast" : _preBootSpeedMode;
+            if (string.Equals(restore, "Unlimited", StringComparison.OrdinalIgnoreCase))
+                restore = "Fast";
+            _currentSpeedMode = restore;
+            _cyclesPerTick = _preBootCyclesPerTick > 0 && _preBootCyclesPerTick < BootUnlimitedQuantum
+                ? _preBootCyclesPerTick
+                : (string.Equals(restore, "Normal", StringComparison.OrdinalIgnoreCase) ? 6_000_000UL : 25_000_000UL);
+        }
+        _bootUncappedUntilSoftGs = false;
+        _bootForceSoftwarePresent = false;
+        _bootPresentSw.Reset();
+        _loggedFirstSoftGsPx = false;
+        _lastWorkerSpeedKey = "";
+        ApplyWorkerQuantumPolicy(seed: true);
+        SyncWorkerFramePacing();
     }
 
     private void OnOpenLogFolderClick(object? sender, RoutedEventArgs e)
@@ -471,6 +971,12 @@ public partial class MainWindow : Window
         catch (Exception ex) { Log("Could not open log folder: " + ex.Message); }
     }
 
+    /// <summary>
+    /// Pad poll stays on the UI thread (keyboard + HostGamepad). Race note: the EE worker
+    /// may read Pad.Buttons mid-slice while UI writes Press/Release — at most a 1-frame tear
+    /// of button bits. Acceptable for solo play; netplay freezes worker so pad is UI-owned.
+    /// Do not lock Pad from both sides without measuring: pad reads are hot in SIO2.
+    /// </summary>
     private void PollGamepads()
     {
         if (_system == null) return;
@@ -493,18 +999,24 @@ public partial class MainWindow : Window
 
     private void ApplyConfigToUi()
     {
+        // Permanent Options → runtime mirrors. Boot race only overrides WaitFrame / quantum /
+        // Auto→Software host present; never clear DefaultFrameLimit or rewrite speed into config.
         _frameLimit.Enabled = _config.DefaultFrameLimit;
-        _frameLimit.TargetFps = _config.DefaultTargetFps;
+        _frameLimit.TargetFps = _config.DefaultTargetFps > 0 ? _config.DefaultTargetFps : 60;
+        // Default Software: Avalonia Soft-GS blit is reliable; GPU is optional via Options.
+        _presentModeLabel = string.IsNullOrWhiteSpace(_config.PresentMode) ? "Software" : _config.PresentMode;
+        _runAhead.Frames = Math.Clamp(_config.RunAheadFrames, 0, 4);
         if (_system != null)
         {
             _system.UseJit = _config.EnableJit;
             _system.EeJit.Enabled = _config.EnableJit;
-            if (string.Equals(_config.PresentMode, "GPU", StringComparison.OrdinalIgnoreCase))
-            {
-                _system.Present.UseGpu();
-                _presentModeLabel = "GPU";
-            }
+            _system.Present.UseSoftware();
         }
+        _gamepads.ApplyConfigBindings(_config);
+        // EffectiveHostPresentMode keeps Soft-GS Avalonia during Auto boot force window.
+        _gameWindow?.SetPresentMode(EffectiveHostPresentMode());
+        SyncWorkerFramePacing();
+        ApplyWorkerQuantumPolicy(seed: false);
     }
 
     /// <summary>
@@ -513,7 +1025,13 @@ public partial class MainWindow : Window
     /// </summary>
     private void DrainAudioMeter()
     {
-        // Host device pump (Phase 43)
+        // Host device pump (Phase 43) — skip OS pump when host audio disabled
+        if (!_config.EnableHostAudio)
+        {
+            // Still drain the ring so it does not back up
+            _audioSink.Drain(stackalloc short[4096]);
+            return;
+        }
         _hostAudio?.Pump(_audioSink, 2048);
         long recv = _audioSink.SamplesReceived;
         if (recv > 0 && recv - _lastLoggedAudioSamples >= 48000)
@@ -527,42 +1045,23 @@ public partial class MainWindow : Window
 
     private void UpdateStatusText()
     {
-        if (_system == null) return;
-        CyclesText.Text = $"Master Cycles: {_system.MasterCycles:N0}";
+        // Cycles/FPS chrome removed from main — status line is updated via UpdateStatus/UpdateSidebar.
     }
 
     private void UpdateSidebar()
     {
+        // Status sidebar removed from main; thin status line only on notable state.
         if (_system == null) return;
-        if (SidebarStatus != null)
-        {
-            if (_system.Debugger.Halted)
-                SidebarStatus.Text = "Breakpoint";
-            else if (_isRunning)
-                SidebarStatus.Text = "Running (game window)";
-            else
-                SidebarStatus.Text = "Ready";
-        }
-        if (SidebarCycles != null)
-            SidebarCycles.Text = _system.MasterCycles.ToString("N0");
-        if (SidebarPc != null)
-            SidebarPc.Text = $"0x{_system.EE.PC:X8}";
-        if (SidebarBoot != null)
-            SidebarBoot.Text = _lastBootMessage;
-        if (SidebarLogPath != null)
-            SidebarLogPath.Text = _sessionLog.LogPath ?? "—";
+        if (_system.Debugger.Halted)
+            UpdateStatus("Breakpoint");
+        else if (_isRunning && StatusText != null &&
+                 (StatusText.Text == null || !StatusText.Text.StartsWith("Running", StringComparison.Ordinal)))
+            UpdateStatus($"Running — {_lastBootMessage}");
     }
 
     private void UpdateLibraryStatusTexts()
     {
-        if (LibraryFolderText != null)
-            LibraryFolderText.Text = _config.HasGamesFolder
-                ? _config.GamesFolder
-                : "No library path set — click Set library path… (local or \\\\server\\share)";
-        if (LibraryBiosText != null)
-            LibraryBiosText.Text = _config.HasBiosFile
-                ? Path.GetFileName(_config.BiosPath)
-                : "not set (File → Settings…)";
+        // Library path labels live under Options → General now.
     }
 
     private void UpdateStatus(string message)
@@ -571,205 +1070,86 @@ public partial class MainWindow : Window
             StatusText.Text = message;
     }
 
-    private async void OnSettingsClick(object? sender, RoutedEventArgs e)
+    private void OpenOptions(string category)
     {
-        var biosLabel = new TextBlock
-        {
-            Text = _config.HasBiosFile ? _config.BiosPath : "No BIOS selected",
-            TextWrapping = TextWrapping.Wrap,
-            FontSize = 11
-        };
-        var speed = new ComboBox { Width = 280 };
-        speed.Items.Add(new ComboBoxItem { Content = "Slow", Tag = 0 });
-        speed.Items.Add(new ComboBoxItem { Content = "Normal", Tag = 1 });
-        speed.Items.Add(new ComboBoxItem { Content = "Fast", Tag = 2 });
-        speed.Items.Add(new ComboBoxItem { Content = "Unlimited", Tag = 3 });
-        speed.SelectedIndex = _currentSpeedMode switch
-        {
-            "Slow" => 0,
-            "Fast" => 2,
-            "Unlimited" => 3,
-            _ => 1
-        };
-        var autoRun = new CheckBox { Content = "Auto-run after boot", IsChecked = _config.AutoRunAfterBoot };
-        var verify = new CheckBox { Content = "Verify media on boot (serial/hash)", IsChecked = _config.VerifyMediaOnBoot };
-        var frameLimit = new CheckBox { Content = "Frame limit ~60 FPS", IsChecked = _frameLimit.Enabled };
-
-        // Memory cards are always on and are the primary save path — nothing to configure here.
-        // The virtual HDD is optional, larger-capacity storage a title's own save code would
-        // need to explicitly use; off by default until enabled here.
-        var hddLabel = new TextBlock
-        {
-            Text = string.IsNullOrEmpty(_config.VirtualHddPath) ? "No virtual HDD file selected" : _config.VirtualHddPath,
-            TextWrapping = TextWrapping.Wrap,
-            FontSize = 11
-        };
-        var enableHdd = new CheckBox { Content = "Enable virtual HDD (optional — memory cards remain the primary save)", IsChecked = _config.EnableVirtualHdd };
-
-        var win = new Window
-        {
-            Title = "Settings",
-            Width = 480,
-            Height = 520,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner
-        };
-
-        var pickBiosBtn = new Button { Content = "Choose BIOS file…", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch, Padding = new Thickness(10, 8) };
-        pickBiosBtn.Click += async (_, __) =>
-        {
-            var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-            {
-                Title = "Select PS2 BIOS",
-                AllowMultiple = false,
-                FileTypeFilter = new[]
-                {
-                    new FilePickerFileType("BIOS") { Patterns = new[] { "*.bin", "*.rom", "*.BIN", "*.ROM" } },
-                    new FilePickerFileType("All") { Patterns = new[] { "*.*" } }
-                }
-            });
-            if (files == null || files.Count == 0) return;
-            string path = files[0].TryGetLocalPath() ?? files[0].Path.LocalPath;
-            try
-            {
-                _system?.LoadBios(path);
-                _config.BiosPath = path;
-                PersistConfig();
-                biosLabel.Text = path;
-                Log($"BIOS set: {path}");
-                UpdateLibraryStatusTexts();
-            }
-            catch (Exception ex) { Log("BIOS error: " + ex.Message); }
-        };
-
-        var ctrlBtn = new Button { Content = "Controllers (P1/P2)…", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch, Padding = new Thickness(10, 8) };
-        ctrlBtn.Click += (_, __) => OnControllersClick(sender, e);
-
-        var pickHddBtn = new Button { Content = "Choose virtual HDD file…", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch, Padding = new Thickness(10, 8) };
-        pickHddBtn.Click += async (_, __) =>
-        {
-            var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
-            {
-                Title = "Virtual HDD file (created if it doesn't exist yet)",
-                SuggestedFileName = "detps2_hdd.img",
-                FileTypeChoices = new[] { new FilePickerFileType("HDD image") { Patterns = new[] { "*.img", "*.bin" } } }
-            });
-            if (file == null) return;
-            string path = file.TryGetLocalPath() ?? file.Path.LocalPath;
-            hddLabel.Text = path;
-            _config.VirtualHddPath = path;
-        };
-
-        var save = new Button { Content = "Save & close", Width = 120, IsDefault = true };
-        save.Click += (_, __) =>
-        {
-            _config.AutoRunAfterBoot = autoRun.IsChecked == true;
-            _config.VerifyMediaOnBoot = verify.IsChecked == true;
-            _frameLimit.Enabled = frameLimit.IsChecked == true;
-
-            _config.EnableVirtualHdd = enableHdd.IsChecked == true;
-            if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath) && _system != null)
-            {
-                bool ok = _system.TryEnableVirtualHdd(_config.VirtualHddPath, _config.VirtualHddSizeMb * 1024L * 1024L);
-                Log(ok ? $"Virtual HDD enabled: {_config.VirtualHddPath}" : "Virtual HDD failed to open/create — check the path");
-            }
-            else
-            {
-                _system?.DisableVirtualHdd();
-            }
-
-            int si = speed.SelectedIndex;
-            switch (si)
-            {
-                case 0: _cyclesPerTick = 300_000; _currentSpeedMode = "Slow"; break;
-                case 2: _cyclesPerTick = 6_000_000; _currentSpeedMode = "Fast"; break;
-                case 3: _cyclesPerTick = 25_000_000; _currentSpeedMode = "Unlimited"; break;
-                default: _cyclesPerTick = 1_500_000; _currentSpeedMode = "Normal"; break;
-            }
-            PersistConfig();
-            Log($"Settings saved (speed={_currentSpeedMode}, BIOS={(_config.HasBiosFile ? "set" : "none")})");
-            win.Close();
-        };
-
-        win.Content = new StackPanel
-        {
-            Margin = new Thickness(18),
-            Spacing = 10,
-            Children =
-            {
-                new TextBlock { Text = "BIOS", FontWeight = FontWeight.Bold },
-                biosLabel,
-                pickBiosBtn,
-                new Separator(),
-                new TextBlock { Text = "Controllers", FontWeight = FontWeight.Bold },
-                ctrlBtn,
-                new Separator(),
-                new TextBlock { Text = "Storage", FontWeight = FontWeight.Bold },
-                new TextBlock { Text = "Memory cards are always on and are the primary save.", FontSize = 11, Foreground = Brushes.Gray },
-                enableHdd,
-                hddLabel,
-                pickHddBtn,
-                new Separator(),
-                new TextBlock { Text = "Emulation", FontWeight = FontWeight.Bold },
-                new TextBlock { Text = "Speed" },
-                speed,
-                autoRun,
-                verify,
-                frameLimit,
-                new Separator(),
-                new TextBlock
-                {
-                    Text = $"Session log:\n{_sessionLog.LogPath}",
-                    FontSize = 11,
-                    TextWrapping = TextWrapping.Wrap,
-                    Foreground = Brushes.Gray
-                },
-                save
-            }
-        };
-        await win.ShowDialog(this);
-    }
-
-    private async void OnLoadBiosClick(object? sender, RoutedEventArgs e)
-    {
-        if (_system == null) return;
         try
         {
-            var files = await this.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+            if (_optionsWindow != null)
             {
-                Title = "Select PS2 BIOS file",
-                AllowMultiple = false,
-                FileTypeFilter = new[]
-                {
-                    new FilePickerFileType("PS2 BIOS") { Patterns = new[] { "*.bin", "*.rom", "*.BIN", "*.ROM" } },
-                    new FilePickerFileType("All files") { Patterns = new[] { "*.*" } }
-                }
-            });
-            if (files == null || files.Count == 0)
-            {
-                Log("BIOS picker cancelled");
+                _optionsWindow.SelectCategory(category);
+                _optionsWindow.Activate();
                 return;
             }
-            string path = files[0].TryGetLocalPath() ?? files[0].Path.LocalPath;
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+
+            _optionsWindow = new OptionsWindow(this, category);
+            _optionsWindow.Closed += (_, __) =>
             {
-                Log($"BIOS path invalid: {path}");
-                return;
-            }
-            _system.LoadBios(path);
-            _config.BiosPath = path;
-            PersistConfig();
-            UpdateLibraryStatusTexts();
-            _lastBootMessage = $"BIOS {Path.GetFileName(path)}";
-            Log($"BIOS loaded & saved: {path}");
-            UpdateStatus($"BIOS: {Path.GetFileName(path)}");
-            UpdateSidebar();
+                // Apply virtual HDD / JIT / run-ahead when options closes
+                ApplyVirtualHddFromConfig();
+                ApplyConfigToUi();
+                ApplyHostAudioFromConfig();
+                _optionsWindow = null;
+                RefreshLibraryList();
+            };
+            _optionsWindow.Show(this);
         }
         catch (Exception ex)
         {
-            Log($"BIOS error: {ex.Message}");
-            CrashLog.Write("bios picker", ex, _system);
+            CrashLog.Write("open options", ex);
+            Log("Could not open Options: " + ex.Message);
         }
     }
+
+    private void ApplyVirtualHddFromConfig()
+    {
+        if (_system == null) return;
+        if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath))
+        {
+            bool ok = _system.TryEnableVirtualHdd(_config.VirtualHddPath, _config.VirtualHddSizeMb * 1024L * 1024L);
+            Log(ok
+                ? $"Virtual HDD enabled: {_config.VirtualHddPath}"
+                : "Virtual HDD failed to open/create — check the path");
+        }
+        else
+        {
+            _system.DisableVirtualHdd();
+        }
+    }
+
+    /// <summary>Open/close host audio device from <see cref="EmulatorConfig.EnableHostAudio"/>.</summary>
+    private void ApplyHostAudioFromConfig()
+    {
+        try
+        {
+            if (_config.EnableHostAudio)
+            {
+                if (_hostAudio == null || !_hostAudio.IsOpen)
+                {
+                    _hostAudio ??= HostAudioFactory.CreateDefault();
+                    _hostAudio.Open(48000);
+                }
+            }
+            else if (_hostAudio != null && _hostAudio.IsOpen)
+            {
+                _hostAudio.Close();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("Host audio apply: " + ex.Message);
+        }
+    }
+
+    private void OnOptionsGeneralClick(object? sender, RoutedEventArgs e) => OpenOptions("General");
+    private void OnOptionsGraphicsClick(object? sender, RoutedEventArgs e) => OpenOptions("Graphics");
+    private void OnOptionsControllersClick(object? sender, RoutedEventArgs e) => OpenOptions("Controllers");
+    private void OnOptionsEmulationClick(object? sender, RoutedEventArgs e) => OpenOptions("Emulation");
+    private void OnOptionsAudioClick(object? sender, RoutedEventArgs e) => OpenOptions("Audio");
+    private void OnOptionsMetadataClick(object? sender, RoutedEventArgs e) => OpenOptions("Metadata");
+    private void OnOptionsAdvancedClick(object? sender, RoutedEventArgs e) => OpenOptions("Advanced");
+
+    /// <summary>Legacy entry point — opens Options at General (migrated from Settings dialog).</summary>
+    private void OnSettingsClick(object? sender, RoutedEventArgs e) => OpenOptions("General");
 
     private async void OnLoadElfClick(object? sender, RoutedEventArgs e)
     {
@@ -802,17 +1182,27 @@ public partial class MainWindow : Window
 
     private void OnBootSelectedClick(object? sender, RoutedEventArgs e)
     {
-        if (LibraryList?.SelectedItem is GameSettings g)
-            _ = BootMediaPathAsync(g.Path, autoRun: _config.AutoRunAfterBoot);
+        string? path = GetSelectedGamePath();
+        if (path != null)
+            _ = BootMediaPathAsync(path, autoRun: _config.AutoRunAfterBoot);
         else
             Log("Select a game in the media library first");
     }
 
     private void OnLibraryDoubleTapped(object? sender, TappedEventArgs e)
     {
-        if (LibraryList?.SelectedItem is GameSettings g)
-            _ = BootMediaPathAsync(g.Path, autoRun: _config.AutoRunAfterBoot);
+        string? path = GetSelectedGamePath();
+        if (path != null)
+            _ = BootMediaPathAsync(path, autoRun: _config.AutoRunAfterBoot);
     }
+
+    private string? GetSelectedGamePath() =>
+        LibraryList?.SelectedItem switch
+        {
+            LibraryItemVm vm => vm.Game.Path,
+            GameSettings g => g.Path,
+            _ => null
+        };
 
     private void OnRescanLibraryClick(object? sender, RoutedEventArgs e)
     {
@@ -844,13 +1234,18 @@ public partial class MainWindow : Window
 
         try
         {
-            if (_config.HasBiosFile)
-            {
-                try { _system.LoadBios(_config.BiosPath); }
-                catch (Exception ex) { Log($"BIOS reload warning: {ex.Message}"); }
-            }
-            else
-                Log("Warning: no BIOS set — direct ELF/ISO boot may fail on retail discs");
+            // Cold-start each boot (CLI blocker-trace does the same). Reusing a dirty
+            // Ps2System left MasterCycles/GS/DMA from the previous title and made second
+            // boots in one Desktop session show px=0 forever (session-20260731-095158).
+            // Detach waits for in-flight worker RunFor so the old system is idle.
+            _isRunning = false;
+            _emuWorker.Detach();
+            _system = new Ps2System();
+            _system.SetAudioSink(_audioSink);
+            _emuWorker.Attach(_system);
+
+            // Always bring up native commercial HLE — no BIOS dump required on Desktop.
+            _system.LoadBiosNative();
 
             if (ext is ".elf")
             {
@@ -895,18 +1290,31 @@ public partial class MainWindow : Window
             RefreshLibraryList();
 
             _sessionLog.WriteSystemSnapshot(_system, "post-boot");
-            Log("Note: DetPS2 fast-boots the disc ELF (BIOS logo sequence is not fully LLE).");
-            Log($"Boot assist: {_system.MidwayAssist.Status}");
+            Log("Note: DetPS2 fast-boots the disc ELF with native HLE (no BIOS dump).");
+            string quirkName = _system.ActiveQuirk?.DisplayName
+                ?? _system.ActiveQuirk?.Serial
+                ?? "(none)";
+            Log($"Active quirk: {quirkName}  MidwayAssist={_system.MidwayAssist.Status}");
+            // Deception / DA / Arm: MidwayFamilyAssist.Step + OnHostPresent run every UI tick (mkFamHot slices).
+            if (_system.ActiveQuirk is MidwayFamilyAssist)
+                Log("Deception-friendly path: MidwayFamilyAssist ActiveQuirk Step/OnHostPresent armed (SN/PAD/menu gates)");
             Log("Audio: host output is live when SPU2 voices produce samples (no test tone).");
             // Boot logos / Sofdec must come from Soft-GS (IPU/CRI). Host FFmpeg decode was removed.
             if (!_system.MidwayAssist.FramesReady)
                 Log("No host FMV overlay — logos only if Soft-GS renders them (IPU/CRI).");
+            Log("Tip: auto-run boot race = Unlimited 50M/tick, frame wait skipped until lit>100 or 200M cycles (Options not rewritten).");
             if (autoRun)
             {
+                ArmBootUncappedForCommercial();
                 EnsureGameWindow(Path.GetFileNameWithoutExtension(path));
+                // Re-apply effective present after window exists (Auto→Software force).
+                _gameWindow?.SetPresentMode(EffectiveHostPresentMode());
+                _workerPolicySeeded = false; // re-seed after boot race arm
+                SyncWorkerQuantumPolicy();
                 _isRunning = true;
+                _emuWorker.IsRunning = true;
                 UpdateStatus("Running...");
-                Log("Game window open — emulation running (Pause F6 / Stop F9)");
+                Log("Game window open — EE on background thread (UI responsive). Pause F6 / Stop F9");
                 PresentToGameWindow();
             }
             UpdateSidebar();
@@ -924,8 +1332,13 @@ public partial class MainWindow : Window
     private void OnRunClick(object? sender, RoutedEventArgs e)
     {
         EnsureGameWindow(_currentGameTitle);
+        if (_system != null)
+            _emuWorker.Attach(_system);
+        SyncWorkerQuantumPolicy();
         _isRunning = true;
-        Log("Emulation started / resumed");
+        _emuWorker.IsRunning = true;
+        BeginThroughputWindow();
+        Log("Emulation started / resumed (background EE worker; UI present via snapshot)");
         _sessionLog.WriteSystemSnapshot(_system, "run");
         UpdateStatus("Running...");
         UpdateSidebar();
@@ -934,6 +1347,10 @@ public partial class MainWindow : Window
     private void OnPauseClick(object? sender, RoutedEventArgs e)
     {
         _isRunning = false;
+        _emuWorker.PauseAndWait();
+        _throughputSw.Reset();
+        // One live present so pause frame is current Soft-GS.
+        PresentToGameWindow();
         Log("Emulation paused");
         _sessionLog.WriteSystemSnapshot(_system, "pause");
         UpdateStatus("Paused");
@@ -943,22 +1360,28 @@ public partial class MainWindow : Window
     private void OnStepClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
+        // Step is debug-only on UI: worker must be idle so RunFor is exclusive.
+        _isRunning = false;
+        _emuWorker.PauseAndWait();
         _system.RunFor(1_000_000);
         EnsureGameWindow(_currentGameTitle);
         PresentToGameWindow();
         UpdateStatusText();
         UpdateSidebar();
-        Log("Stepped 1M cycles");
+        Log("Stepped 1M cycles (UI thread; worker paused)");
     }
 
     private void OnResetClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
+        _isRunning = false;
+        _emuWorker.PauseAndWait();
         _system.Reset();
         _audioSink.Reset();
         _lastLoggedAudioSamples = 0;
         _system.SetAudioSink(_audioSink);
-        _isRunning = false;
+        ClearBootRaceState(restoreSpeed: true);
+        _throughputSw.Reset();
         CloseGameWindow();
         UpdateStatusText();
         UpdateSidebar();
@@ -969,6 +1392,7 @@ public partial class MainWindow : Window
     private void OnTestDrawClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
+        _emuWorker.PauseAndWait();
         _system.Gs.RenderTestScene();
         EnsureGameWindow("Test scene");
         PresentToGameWindow();
@@ -978,15 +1402,51 @@ public partial class MainWindow : Window
     private async void OnSaveStateClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
+        bool wasRunning = _isRunning;
+        _isRunning = false;
+        _emuWorker.PauseAndWait();
         var file = await this.StorageProvider.SaveFilePickerAsync(new() { Title = "Save State", DefaultExtension = ".dps2", FileTypeChoices = new[] { new FilePickerFileType("DetPS2 Save State") { Patterns = new[] { "*.dps2" } } } });
-        if (file != null) { try { byte[] data = _system.SaveState(); await File.WriteAllBytesAsync(file.Path.LocalPath, data); Log("State saved"); } catch { Log("Save error"); } }
+        if (file != null)
+        {
+            try
+            {
+                byte[] data = _system.SaveState();
+                await File.WriteAllBytesAsync(file.Path.LocalPath, data);
+                Log("State saved");
+            }
+            catch { Log("Save error"); }
+        }
+        if (wasRunning)
+        {
+            _isRunning = true;
+            _emuWorker.IsRunning = true;
+        }
     }
 
     private async void OnLoadStateClick(object? sender, RoutedEventArgs e)
     {
         if (_system == null) return;
+        bool wasRunning = _isRunning;
+        _isRunning = false;
+        _emuWorker.PauseAndWait();
         var files = await this.StorageProvider.OpenFilePickerAsync(new() { Title = "Load State", AllowMultiple = false, FileTypeFilter = new[] { new FilePickerFileType("DetPS2 State") { Patterns = new[] { "*.dps2" } } } });
-        if (files.Count > 0) { try { byte[] data = await File.ReadAllBytesAsync(files[0].Path.LocalPath); _system.LoadState(data); UpdateFramebuffer(); UpdateSidebar(); Log("State loaded"); } catch { Log("Load error"); } }
+        if (files.Count > 0)
+        {
+            try
+            {
+                byte[] data = await File.ReadAllBytesAsync(files[0].Path.LocalPath);
+                _system.LoadState(data);
+                UpdateFramebuffer();
+                UpdateSidebar();
+                Log("State loaded");
+            }
+            catch { Log("Load error"); }
+        }
+        if (wasRunning)
+        {
+            _isRunning = true;
+            _emuWorker.IsRunning = true;
+        }
     }
 
     private void OnDebugStepClick(object? sender, RoutedEventArgs e)
@@ -1320,7 +1780,10 @@ public partial class MainWindow : Window
     {
         _frameLimit.Enabled = !_frameLimit.Enabled;
         _frameLimit.Reset();
-        Log(_frameLimit.Enabled ? $"Frame limit ON ({_frameLimit.TargetFps} FPS)" : "Frame limit OFF");
+        SyncWorkerFramePacing();
+        Log(_frameLimit.Enabled
+            ? $"Frame limit ON ({_frameLimit.TargetFps} FPS, EE worker — UI free)"
+            : "Frame limit OFF");
     }
 
     private void OnRunAhead0Click(object? sender, RoutedEventArgs e) { _runAhead.Frames = 0; Log("Run-ahead off"); }
@@ -1449,6 +1912,7 @@ public partial class MainWindow : Window
         PersistConfig();
         RefreshLibraryList();
         UpdateLibraryStatusTexts();
+        EnqueueLibraryMetadataRefresh();
         Log($"Library path set: {path}");
         Log($"Found {games.Count} media file(s) (.iso / .elf / .bin / .cso)");
         Log($"Saved to {ConfigPath}");
@@ -1457,113 +1921,14 @@ public partial class MainWindow : Window
 
     private async void OnControllersClick(object? sender, RoutedEventArgs e)
     {
-        _config.MigrateGamepadIds();
-        var devices = _gamepads.Enumerate();
-        var p1 = new ComboBox { Width = 360, MinHeight = 32 };
-        var p2 = new ComboBox { Width = 360, MinHeight = 32 };
-        var prof1 = new ComboBox { Width = 360 };
-        var prof2 = new ComboBox { Width = 360 };
-        prof1.Items.Add(new ComboBoxItem { Content = "Standard DualShock-style pad", Tag = "Standard" });
-        prof1.Items.Add(new ComboBoxItem { Content = "Guitar Hero / Riffmaster mapping", Tag = "GuitarHero" });
-        prof2.Items.Add(new ComboBoxItem { Content = "Standard DualShock-style pad", Tag = "Standard" });
-        prof2.Items.Add(new ComboBoxItem { Content = "Guitar Hero / Riffmaster mapping", Tag = "GuitarHero" });
-
-        foreach (var d in devices)
-        {
-            string label = d.Connected
-                ? $"[{d.Kind}] {d.Name}"
-                : $"[{d.Kind}] {d.Name}";
-            p1.Items.Add(new ComboBoxItem { Content = label, Tag = d.Id });
-            p2.Items.Add(new ComboBoxItem { Content = label, Tag = d.Id });
-        }
-        SelectByStringTag(p1, _config.Player1DeviceId);
-        SelectByStringTag(p2, _config.Player2DeviceId);
-        SelectByStringTag(prof1, _config.Player1Profile);
-        SelectByStringTag(prof2, _config.Player2Profile);
-
-        var win = new Window
-        {
-            Title = "Controllers — devices & type (P1 / P2)",
-            Width = 480,
-            Height = 420,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner
-        };
-        var refresh = new Button { Content = "Refresh devices", Width = 130 };
-        refresh.Click += (_, __) =>
-        {
-            // Re-open dialog with fresh enum
-            win.Close();
-            OnControllersClick(sender, e);
-        };
-        var save = new Button { Content = "Save", Width = 100, IsDefault = true };
-        save.Click += (_, __) =>
-        {
-            _config.Player1DeviceId = GetStringTag(p1) ?? "kb";
-            _config.Player2DeviceId = GetStringTag(p2) ?? "kb";
-            _config.Player1Profile = GetStringTag(prof1) ?? "Standard";
-            _config.Player2Profile = GetStringTag(prof2) ?? "Standard";
-            // Keep legacy ints in sync for older code paths
-            _config.Player1Gamepad = _config.Player1DeviceId.StartsWith("xi:") &&
-                int.TryParse(_config.Player1DeviceId.AsSpan(3), out int a) ? a : -1;
-            _config.Player2Gamepad = _config.Player2DeviceId.StartsWith("xi:") &&
-                int.TryParse(_config.Player2DeviceId.AsSpan(3), out int b) ? b : -1;
-            PersistConfig();
-            Log($"P1: {_config.Player1DeviceId} profile={_config.Player1Profile}");
-            Log($"P2: {_config.Player2DeviceId} profile={_config.Player2Profile}");
-            if (_config.Player1Profile == "GuitarHero" || _config.Player2Profile == "GuitarHero")
-                Log("Guitar Hero map: frets→R2/○/△/✕/□, strum→D-pad U/D, whammy→R-stick Y");
-            win.Close();
-        };
-        win.Content = new StackPanel
-        {
-            Margin = new Thickness(16),
-            Spacing = 8,
-            Children =
-            {
-                new TextBlock
-                {
-                    Text = "Detects XInput (Xbox), HID DualShock 4 / DualSense, and guitar-class devices (Riffmaster, GH/RB). " +
-                          "Use Controller type to switch a player to Guitar Hero mapping without changing the physical device.",
-                    TextWrapping = TextWrapping.Wrap
-                },
-                new TextBlock { Text = "Player 1 — device", FontWeight = FontWeight.Bold },
-                p1,
-                new TextBlock { Text = "Player 1 — controller type", FontWeight = FontWeight.Bold },
-                prof1,
-                new TextBlock { Text = "Player 2 — device", FontWeight = FontWeight.Bold },
-                p2,
-                new TextBlock { Text = "Player 2 — controller type", FontWeight = FontWeight.Bold },
-                prof2,
-                new StackPanel
-                {
-                    Orientation = Avalonia.Layout.Orientation.Horizontal,
-                    Spacing = 8,
-                    Children = { save, refresh }
-                }
-            }
-        };
-        await win.ShowDialog(this);
-    }
-
-    private static void SelectByStringTag(ComboBox box, string? tag)
-    {
-        tag ??= "kb";
-        for (int i = 0; i < box.Items.Count; i++)
-        {
-            if (box.Items[i] is ComboBoxItem cbi && cbi.Tag is string t &&
-                string.Equals(t, tag, StringComparison.OrdinalIgnoreCase))
-            {
-                box.SelectedIndex = i;
-                return;
-            }
-        }
-        if (box.Items.Count > 0) box.SelectedIndex = 0;
-    }
-
-    private static string? GetStringTag(ComboBox box)
-    {
-        if (box.SelectedItem is ComboBoxItem cbi && cbi.Tag is string t) return t;
-        return null;
+        bool applied = await Options.OptionsControllersPage.ShowAsDialogAsync(this, _config, _gamepads);
+        if (!applied) return;
+        _gamepads.ApplyConfigBindings(_config);
+        PersistConfig();
+        Log($"P1: {_config.Player1DeviceId} profile={_config.Player1Profile}");
+        Log($"P2: {_config.Player2DeviceId} profile={_config.Player2Profile}");
+        if (_config.Player1Profile == "GuitarHero" || _config.Player2Profile == "GuitarHero")
+            Log("Guitar Hero map: frets→R2/○/△/✕/□, strum→D-pad U/D, whammy→R-stick Y");
     }
 
     private void OnSaveSettingsClick(object? sender, RoutedEventArgs e)
@@ -1635,10 +2000,10 @@ public partial class MainWindow : Window
         stack.Children.Add(new TextBlock { Text = "DetPS2Sharp", FontSize = 22, FontWeight = FontWeight.Bold });
         stack.Children.Add(new TextBlock { Text = "Deterministic PS2 Emulator in Pure C#" });
         stack.Children.Add(new TextBlock { Text = VersionInfo.Banner, TextWrapping = TextWrapping.Wrap });
-        stack.Children.Add(new TextBlock { Text = "Media library · BIOS+ISO boot · deterministic core", TextWrapping = TextWrapping.Wrap });
+        stack.Children.Add(new TextBlock { Text = "Media library · native HLE · deterministic core", TextWrapping = TextWrapping.Wrap });
         stack.Children.Add(new TextBlock
         {
-            Text = "Choose a media folder (saved in AppData). Set BIOS once. Select an ISO and Boot.\nProvide your own legal BIOS/ISOs.",
+            Text = "Choose a media folder (saved in AppData). Select an ISO and Boot.\nCommercial services use built-in native HLE — no BIOS dump required.",
             TextWrapping = TextWrapping.Wrap
         });
         stack.Children.Add(new TextBlock { Text = $"Config: {ConfigPath}", FontSize = 11, TextWrapping = TextWrapping.Wrap, Opacity = 0.7 });

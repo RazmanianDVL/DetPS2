@@ -5,18 +5,21 @@ namespace DetPS2.Core;
 
 /// <summary>
 /// Phase 44/50: <b>software upscale present path</b> (Vulkan-shaped API).
-/// Honest status: there is <b>no native Vulkan device</b> in-tree
-/// (<see cref="VulkanDeviceReady"/> is always false). This class:
+/// Honest status: Core does <b>not</b> open a native Vulkan device
+/// (<see cref="VulkanDeviceReady"/> is always false here). This class:
 /// - stages software GS FB (Det truth remains GS software)
 /// - performs CPU bilinear upscale into a display buffer
 /// - drains GsCommandBuffer with deterministic join before hash
-/// Native Silk.NET/Vortice device is Completeness Campaign Phase 52.
+/// Real Silk.NET device path lives in <c>DetPS2.Present.VulkanSwapPresenter</c>
+/// (see <c>docs/HOST_PRESENT.md</c>) — kept out of Core so CLI smokes stay dep-free.
 /// </summary>
 public sealed class VulkanFramePresenter : IFramePresenter
 {
     public string Name => _vulkanReady ? "Vulkan" : "SoftwareUpscale";
     public bool BackendReady => true;
-    /// <summary>Always false until a real Vulkan device is wired (Phase 52).</summary>
+    /// <summary>
+    /// Always false in Core (software upscale). Native device: DetPS2.Present.VulkanSwapPresenter.DeviceReady.
+    /// </summary>
     public bool VulkanDeviceReady => _vulkanReady;
     public uint[]? TextureRgba { get; private set; }
     public uint[]? DisplayBuffer { get; private set; }
@@ -44,8 +47,8 @@ public sealed class VulkanFramePresenter : IFramePresenter
 
     private static bool TryInitVulkanDevice()
     {
-        // Phase 50 honesty: no native Vulkan package — always software upscale.
-        // Phase 52: return true after vkCreateDevice succeeds.
+        // Core stays software-upscale (no Silk.NET hard dep). Real device:
+        // DetPS2.Present.VulkanSwapPresenter — merge via Desktop or optional plugin later.
         return false;
     }
 

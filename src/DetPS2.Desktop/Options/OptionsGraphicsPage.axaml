@@ -1,0 +1,66 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsGraphicsPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="14" MaxWidth="600">
+            <TextBlock Text="Graphics" FontSize="20" FontWeight="Bold" />
+            <TextBlock Text="Choose how Soft-GS frames are displayed on your GPU. Emulation accuracy always uses software GS — this setting only picks the host renderer."
+                       FontSize="12" Foreground="#999" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Rendering backend" FontSize="15" FontWeight="SemiBold" />
+            <ComboBox x:Name="PresentModeCombo" MinWidth="380" HorizontalAlignment="Left"
+                      SelectionChanged="OnPresentModeSelectionChanged">
+                <ComboBoxItem Tag="Auto" Content="Auto — pick best available (D3D12 → D3D11 → Vulkan → OpenGL → Software)" />
+                <ComboBoxItem Tag="Software" Content="Software — Avalonia CPU blit (always works)" />
+                <ComboBoxItem Tag="D3D11" Content="Direct3D 11" />
+                <ComboBoxItem Tag="D3D12" Content="Direct3D 12" />
+                <ComboBoxItem Tag="Vulkan" Content="Vulkan" />
+                <ComboBoxItem Tag="OpenGL" Content="OpenGL (WGL)" />
+            </ComboBox>
+
+            <Border Background="#12121a" BorderBrush="#333" BorderThickness="1" CornerRadius="6" Padding="12">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Backend status (this PC)" FontWeight="SemiBold" FontSize="12" Foreground="#aaa" />
+                    <TextBlock x:Name="BackendStatusText" FontFamily="Consolas,monospace" FontSize="11"
+                               Foreground="#9c9" TextWrapping="Wrap"
+                               Text="Probe on open…" />
+                    <TextBlock x:Name="SelectionHintText" FontSize="11" Foreground="#888" TextWrapping="Wrap"
+                               Text="" />
+                </StackPanel>
+            </Border>
+
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button x:Name="ApplyRendererButton" Content="Apply renderer now"
+                        Padding="14,8" FontWeight="SemiBold" Click="OnApplyRendererClick" />
+                <Button Content="Refresh status" Padding="12,8" Click="OnRefreshStatusClick" />
+            </StackPanel>
+            <TextBlock Text="“Apply renderer now” saves the choice and switches the game window if it is open. Closing Options also saves."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Frame pacing" FontWeight="SemiBold" />
+            <CheckBox x:Name="FrameLimitCheck" Content="Frame limit (default off — leave off for faster Soft-GS boot)" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Target FPS" VerticalAlignment="Center" />
+                <NumericUpDown x:Name="TargetFpsBox" Minimum="15" Maximum="240" Increment="1"
+                               Width="100" FormatString="0" />
+            </StackPanel>
+            <TextBlock Text="When enabled, caps UI ticks to Target FPS. Speed = Unlimited always skips this wait. Commercial Soft-GS first paint is cycle-budget limited — keep limit off until the title is on-screen."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Display scale (host only)" FontWeight="SemiBold" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Upscale ×" VerticalAlignment="Center" />
+                <NumericUpDown x:Name="UpscaleBox" Minimum="1" Maximum="4" Increment="0.5"
+                               Width="100" FormatString="0.0" />
+            </StackPanel>
+            <TextBlock Text="Does not change Soft-GS internal resolution or determinism hashes."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

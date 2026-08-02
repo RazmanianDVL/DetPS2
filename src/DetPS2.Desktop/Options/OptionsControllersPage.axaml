@@ -1,0 +1,61 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsControllersPage">
+    <DockPanel Margin="12">
+        <StackPanel DockPanel.Dock="Top" Spacing="10">
+            <TextBlock Text="Controllers"
+                       FontSize="18" FontWeight="Bold" Foreground="#eee" />
+            <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="#999"
+                       Text="Pick devices and mapping profiles for Player 1 / Player 2, then rebind individual PS2 buttons (keyboard or gamepad capture, 5s timeout)." />
+
+            <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto,Auto,Auto" Margin="0,4,0,0">
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Player 1 — device" FontWeight="SemiBold" Margin="0,0,8,4" />
+                <TextBlock Grid.Row="0" Grid.Column="1" Text="Player 2 — device" FontWeight="SemiBold" Margin="8,0,0,4" />
+                <ComboBox x:Name="Player1DeviceBox" Grid.Row="1" Grid.Column="0" MinHeight="32" Margin="0,0,8,8"
+                          HorizontalAlignment="Stretch" />
+                <ComboBox x:Name="Player2DeviceBox" Grid.Row="1" Grid.Column="1" MinHeight="32" Margin="8,0,0,8"
+                          HorizontalAlignment="Stretch" />
+
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Player 1 — profile" FontWeight="SemiBold" Margin="0,0,8,4" />
+                <TextBlock Grid.Row="2" Grid.Column="1" Text="Player 2 — profile" FontWeight="SemiBold" Margin="8,0,0,4" />
+                <ComboBox x:Name="Player1ProfileBox" Grid.Row="3" Grid.Column="0" MinHeight="32" Margin="0,0,8,0"
+                          HorizontalAlignment="Stretch" />
+                <ComboBox x:Name="Player2ProfileBox" Grid.Row="3" Grid.Column="1" MinHeight="32" Margin="8,0,0,0"
+                          HorizontalAlignment="Stretch" />
+            </Grid>
+
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button x:Name="RefreshDevicesButton" Content="Refresh devices" Padding="10,6" Click="OnRefreshDevicesClick" />
+                <Button x:Name="ResetBindingsButton" Content="Reset key bindings" Padding="10,6" Click="OnResetBindingsClick" />
+            </StackPanel>
+
+            <Separator />
+            <TextBlock Text="Button remaps (PS2 ← host)" FontWeight="SemiBold" Foreground="#ddd" />
+            <TextBlock FontSize="11" Foreground="#777" TextWrapping="Wrap"
+                       Text="Host keys apply when the player device is Keyboard. Gamepad digital edges can also be captured as Pad:… codes for future InputBindingTable wiring." />
+        </StackPanel>
+
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Spacing="8" Margin="0,10,0,0"
+                    HorizontalAlignment="Right">
+            <TextBlock x:Name="StatusText" VerticalAlignment="Center" FontSize="11" Foreground="#8a8"
+                       Text="" Margin="0,0,12,0" />
+            <Button x:Name="ApplyButton" Content="Apply" Width="100" Padding="10,6" IsDefault="True"
+                    Click="OnApplyClick" />
+        </StackPanel>
+
+        <ListBox x:Name="BindingList" Margin="0,8,0,0" Background="Transparent" BorderThickness="0">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Grid ColumnDefinitions="120,*,Auto" Margin="4,4">
+                        <TextBlock Text="{Binding PadButtonName}" FontWeight="SemiBold" VerticalAlignment="Center"
+                                   Foreground="#eee" />
+                        <TextBlock Grid.Column="1" Text="{Binding HostDisplay}" VerticalAlignment="Center"
+                                   Foreground="#9cf" FontFamily="Consolas,monospace" Margin="8,0" />
+                        <Button Grid.Column="2" Content="Rebind…" Padding="10,4" MinWidth="88"
+                                Command="{Binding RebindCommand}" />
+                    </Grid>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+    </DockPanel>
+</UserControl>

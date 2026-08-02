@@ -1,0 +1,43 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsEmulationPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="12" MaxWidth="560">
+            <TextBlock Text="Emulation" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="CPU speed, JIT, auto-run, and solo run-ahead. Soft-GS accuracy is unchanged by these options."
+                       FontSize="12" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Speed" FontWeight="SemiBold" />
+            <ComboBox x:Name="SpeedCombo" Width="280" HorizontalAlignment="Left">
+                <ComboBoxItem Content="Slow" Tag="Slow" />
+                <ComboBoxItem Content="Normal" Tag="Normal" />
+                <ComboBoxItem Content="Fast" Tag="Fast" />
+                <ComboBoxItem Content="Unlimited" Tag="Unlimited" />
+            </ComboBox>
+            <TextBlock Text="Maps to host cycles-per-tick (how much EE work runs per UI tick). Default Fast (25M) reaches Soft-GS sooner. Unlimited (50M) also skips frame pacing even if Frame limit is on."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <TextBlock Text="Frame limit defaults OFF (Options → Graphics). Enable it for 1× wall pacing after Soft-GS is visible."
+                       FontSize="11" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Boot &amp; CPU" FontWeight="SemiBold" />
+            <CheckBox x:Name="AutoRunCheck" Content="Auto-run after boot" />
+            <CheckBox x:Name="EnableJitCheck" Content="Enable EE JIT (when available)" />
+
+            <Separator />
+
+            <TextBlock Text="Run-ahead (solo / Perf)" FontWeight="SemiBold" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Frames" VerticalAlignment="Center" />
+                <NumericUpDown x:Name="RunAheadBox" Minimum="0" Maximum="4" Increment="1"
+                               Width="100" FormatString="0" />
+            </StackPanel>
+            <TextBlock Text="0 = off. Extra simulated frames before present to reduce input lag. Solo only — never use with netplay."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

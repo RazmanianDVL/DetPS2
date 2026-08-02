@@ -1,0 +1,34 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="DetPS2.Desktop.Options.BindingCaptureDialog"
+        Title="Capture binding"
+        Width="420" Height="200"
+        MinWidth="360" MinHeight="180"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        Background="#1a1a22">
+    <Grid Margin="20" RowDefinitions="Auto,Auto,*,Auto">
+        <TextBlock x:Name="PromptText"
+                   Text="Press a key or gamepad button…"
+                   FontSize="15" FontWeight="SemiBold"
+                   Foreground="#eee"
+                   TextWrapping="Wrap"
+                   TextAlignment="Center"
+                   HorizontalAlignment="Center" />
+        <TextBlock Grid.Row="1" x:Name="TargetText"
+                   Margin="0,8,0,0"
+                   FontSize="12" Foreground="#aaa"
+                   TextAlignment="Center"
+                   HorizontalAlignment="Center" />
+        <TextBlock Grid.Row="2" x:Name="CountdownText"
+                   VerticalAlignment="Center"
+                   HorizontalAlignment="Center"
+                   FontSize="28" FontWeight="Bold"
+                   Foreground="#6cf"
+                   Text="5.0s" />
+        <StackPanel Grid.Row="3" Orientation="Horizontal"
+                    HorizontalAlignment="Center" Spacing="12" Margin="0,12,0,0">
+            <Button x:Name="CancelButton" Content="Cancel" Width="100" Padding="10,6" Click="OnCancelClick" />
+        </StackPanel>
+    </Grid>
+</Window>

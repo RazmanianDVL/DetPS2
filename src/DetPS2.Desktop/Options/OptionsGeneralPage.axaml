@@ -1,0 +1,36 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsGeneralPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="12" MaxWidth="560">
+            <TextBlock Text="General" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="Library and boot behaviour. Shell hosts this page; changes apply via ApplyTo."
+                       FontSize="12" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="BIOS" FontWeight="SemiBold" />
+            <TextBlock Text="Commercial services use built-in native HLE (no BIOS dump required)."
+                       FontSize="12" Foreground="#ccc" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Library" FontWeight="SemiBold" />
+            <TextBlock x:Name="GamesFolderText" Text="(not set)" FontSize="12"
+                       TextWrapping="Wrap" Foreground="#ccc" />
+            <TextBlock Text="Set or rescan the media folder under Options → General (library path controls below, when hosted by the shell)."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Boot" FontWeight="SemiBold" />
+            <CheckBox x:Name="AutoRunCheck" Content="Auto-run after boot" />
+            <CheckBox x:Name="VerifyMediaCheck" Content="Verify media on boot (serial / quick hash)" />
+
+            <Separator />
+
+            <TextBlock Text="Memory cards are always enabled (primary save path). Virtual HDD is optional under Advanced storage in the host settings shell."
+                       FontSize="11" Foreground="#777" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

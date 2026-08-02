@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using DetPS2.Core.Input;
 
 namespace DetPS2.Core;
 
@@ -55,6 +56,13 @@ public sealed class HostGamepadService
     public ControllerProfile Player1Profile { get; set; } = ControllerProfile.Standard;
     public ControllerProfile Player2Profile { get; set; } = ControllerProfile.Standard;
 
+    /// <summary>
+    /// Optional P1 binding table. Null = resolve from <see cref="DefaultInputMaps"/> for device + profile.
+    /// </summary>
+    public InputBindingTable? Player1Bindings { get; set; }
+    /// <summary>Optional P2 binding table. Null = device/profile defaults.</summary>
+    public InputBindingTable? Player2Bindings { get; set; }
+
     // Legacy int API used by older config
     public int Player1Device
     {
@@ -72,6 +80,30 @@ public sealed class HostGamepadService
         if (id != null && id.StartsWith("xi:", StringComparison.OrdinalIgnoreCase) &&
             int.TryParse(id.AsSpan(3), out int i)) return i;
         return -1;
+    }
+
+    /// <summary>Apply config binding lists onto this service (null lists keep defaults).</summary>
+    public void ApplyConfigBindings(EmulatorConfig cfg)
+    {
+        if (cfg == null) return;
+        Player1Profile = EmulatorConfig.ParseProfile(cfg.Player1Profile);
+        Player2Profile = EmulatorConfig.ParseProfile(cfg.Player2Profile);
+        Player1DeviceId = cfg.Player1DeviceId ?? "kb";
+        Player2DeviceId = cfg.Player2DeviceId ?? "kb";
+        // Full effective tables (defaults + overlays) so PollInto uses the same map as config helpers.
+        Player1Bindings = cfg.Player1Bindings is { Count: > 0 }
+            ? cfg.GetPlayer1BindingTable(GuessKind(cfg.Player1DeviceId))
+            : null;
+        Player2Bindings = cfg.Player2Bindings is { Count: > 0 }
+            ? cfg.GetPlayer2BindingTable(GuessKind(cfg.Player2DeviceId))
+            : null;
+    }
+
+    private static ControllerHardwareKind GuessKind(string? deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId) || deviceId == "kb") return ControllerHardwareKind.Keyboard;
+        if (deviceId.StartsWith("xi:", StringComparison.OrdinalIgnoreCase)) return ControllerHardwareKind.XInput;
+        return ControllerHardwareKind.DualShock4;
     }
 
     public IReadOnlyList<GamepadDeviceInfo> Enumerate()
@@ -116,28 +148,47 @@ public sealed class HostGamepadService
         return list;
     }
 
-    public bool PollInto(PadInput pad, string deviceId, ControllerProfile profile)
+    public bool PollInto(PadInput pad, string deviceId, ControllerProfile profile) =>
+        PollInto(pad, deviceId, profile, bindings: null);
+
+    /// <summary>
+    /// Poll host device and apply an <see cref="InputBindingTable"/>.
+    /// When <paramref name="bindings"/> is null, uses player table (if set) or
+    /// <see cref="DefaultInputMaps"/> for the device family + profile.
+    /// Default XInput→PS2 map is identical to the historical hardcoded map.
+    /// </summary>
+    public bool PollInto(PadInput pad, string deviceId, ControllerProfile profile, InputBindingTable? bindings)
     {
         if (string.IsNullOrEmpty(deviceId) || deviceId == "kb") return false;
         if (!OperatingSystem.IsWindows()) return false;
 
-        uint buttons = 0;
-        byte lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+        var host = new HostInputState();
+        ControllerHardwareKind kind = ControllerHardwareKind.XInput;
         bool ok = false;
 
         if (deviceId.StartsWith("xi:", StringComparison.OrdinalIgnoreCase))
         {
             int idx = ParseXi(deviceId);
-            ok = PollXInput(idx, out buttons, out lx, out ly, out rx, out ry);
+            ok = PollXInputRaw(idx, host);
+            kind = ControllerHardwareKind.XInput;
         }
         else if (deviceId.StartsWith("hid:", StringComparison.OrdinalIgnoreCase))
         {
-            ok = PollHidCached(deviceId, out buttons, out lx, out ly, out rx, out ry);
+            ok = PollHidRaw(deviceId, host, out kind);
         }
 
         if (!ok) return false;
 
-        if (profile == ControllerProfile.GuitarHero)
+        var table = bindings
+            ?? (string.Equals(deviceId, Player1DeviceId, StringComparison.OrdinalIgnoreCase) ? Player1Bindings : null)
+            ?? (string.Equals(deviceId, Player2DeviceId, StringComparison.OrdinalIgnoreCase) ? Player2Bindings : null)
+            ?? DefaultInputMaps.Resolve(kind, profile);
+
+        table.Apply(host, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry);
+
+        // If software profile is GH but the table is still Standard (partial custom / old path),
+        // keep the existing frets remap. GH default tables already encode frets → skip.
+        if (profile == ControllerProfile.GuitarHero && table.Profile != ControllerProfile.GuitarHero)
             buttons = ApplyGuitarHeroProfile(buttons, ref lx, ref ly, ref rx, ref ry);
 
         pad.SetButtons(buttons);
@@ -149,6 +200,12 @@ public sealed class HostGamepadService
     /// <summary>Legacy: poll by XInput index only, standard profile.</summary>
     public bool PollInto(PadInput pad, int deviceIndex) =>
         PollInto(pad, deviceIndex < 0 ? "kb" : "xi:" + deviceIndex, ControllerProfile.Standard);
+
+    /// <summary>
+    /// Pure helper for PAD-2 / tests: map a filled <see cref="HostInputState"/> through a table.
+    /// </summary>
+    public static void ApplyBindings(PadInput pad, HostInputState host, InputBindingTable table) =>
+        table.ApplyTo(pad, host);
 
     /// <summary>
     /// Guitar Hero → DualShock bits used by PS2 GH titles / common emulator maps:
@@ -196,35 +253,52 @@ public sealed class HostGamepadService
         return dst;
     }
 
-    private bool PollXInput(int index, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
+    /// <summary>Fill host state with raw XInput physical controls (xi:* sources).</summary>
+    private bool PollXInputRaw(int index, HostInputState host)
     {
-        buttons = 0; lx = ly = rx = ry = 0x80;
         if (index < 0) return false;
         var st = new XINPUT_STATE();
         if (XInputGetState(index, ref st) != 0) return false;
 
         ushort b = st.Gamepad.wButtons;
-        if ((b & 0x1000) != 0) buttons |= (uint)PadInput.Button.Cross;      // A
-        if ((b & 0x2000) != 0) buttons |= (uint)PadInput.Button.Circle;     // B
-        if ((b & 0x4000) != 0) buttons |= (uint)PadInput.Button.Square;     // X
-        if ((b & 0x8000) != 0) buttons |= (uint)PadInput.Button.Triangle;   // Y
-        if ((b & 0x0100) != 0) buttons |= (uint)PadInput.Button.L1;
-        if ((b & 0x0200) != 0) buttons |= (uint)PadInput.Button.R1;
-        if ((b & 0x0001) != 0) buttons |= (uint)PadInput.Button.Up;
-        if ((b & 0x0002) != 0) buttons |= (uint)PadInput.Button.Down;
-        if ((b & 0x0004) != 0) buttons |= (uint)PadInput.Button.Left;
-        if ((b & 0x0008) != 0) buttons |= (uint)PadInput.Button.Right;
-        if ((b & 0x0010) != 0) buttons |= (uint)PadInput.Button.Start;
-        if ((b & 0x0020) != 0) buttons |= (uint)PadInput.Button.Select;
-        if ((b & 0x0040) != 0) buttons |= (uint)PadInput.Button.L3;
-        if ((b & 0x0080) != 0) buttons |= (uint)PadInput.Button.R3;
-        if (st.Gamepad.bLeftTrigger > 30) buttons |= (uint)PadInput.Button.L2;
-        if (st.Gamepad.bRightTrigger > 30) buttons |= (uint)PadInput.Button.R2;
+        host.SetButton(HostSources.XiA, (b & 0x1000) != 0);
+        host.SetButton(HostSources.XiB, (b & 0x2000) != 0);
+        host.SetButton(HostSources.XiX, (b & 0x4000) != 0);
+        host.SetButton(HostSources.XiY, (b & 0x8000) != 0);
+        host.SetButton(HostSources.XiLB, (b & 0x0100) != 0);
+        host.SetButton(HostSources.XiRB, (b & 0x0200) != 0);
+        host.SetButton(HostSources.XiDPadUp, (b & 0x0001) != 0);
+        host.SetButton(HostSources.XiDPadDown, (b & 0x0002) != 0);
+        host.SetButton(HostSources.XiDPadLeft, (b & 0x0004) != 0);
+        host.SetButton(HostSources.XiDPadRight, (b & 0x0008) != 0);
+        host.SetButton(HostSources.XiStart, (b & 0x0010) != 0);
+        host.SetButton(HostSources.XiBack, (b & 0x0020) != 0);
+        host.SetButton(HostSources.XiLS, (b & 0x0040) != 0);
+        host.SetButton(HostSources.XiRS, (b & 0x0080) != 0);
 
-        lx = AxisToByte(st.Gamepad.sThumbLX);
-        ly = AxisToByte((short)-st.Gamepad.sThumbLY);
-        rx = AxisToByte(st.Gamepad.sThumbRX);
-        ry = AxisToByte((short)-st.Gamepad.sThumbRY);
+        // Triggers: digital bit for button maps + continuous 0..1 for axis-threshold bindings
+        float lt = st.Gamepad.bLeftTrigger / 255f;
+        float rt = st.Gamepad.bRightTrigger / 255f;
+        host.SetAxis(HostSources.XiLT, lt);
+        host.SetAxis(HostSources.XiRT, rt);
+        if (st.Gamepad.bLeftTrigger > 30) host.Press(HostSources.XiLT);
+        if (st.Gamepad.bRightTrigger > 30) host.Press(HostSources.XiRT);
+
+        // Match historical Y flip: host up = negative Y short → positive ly after -sThumbLY
+        host.SetAxis(HostSources.XiLX, InputBindingTable.ShortToStickFloat(st.Gamepad.sThumbLX));
+        host.SetAxis(HostSources.XiLY, InputBindingTable.ShortToStickFloat((short)-st.Gamepad.sThumbLY));
+        host.SetAxis(HostSources.XiRX, InputBindingTable.ShortToStickFloat(st.Gamepad.sThumbRX));
+        host.SetAxis(HostSources.XiRY, InputBindingTable.ShortToStickFloat((short)-st.Gamepad.sThumbRY));
+        return true;
+    }
+
+    /// <summary>Legacy direct map (used only if something still needs raw Pad bits without a table).</summary>
+    private bool PollXInput(int index, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
+    {
+        buttons = 0; lx = ly = rx = ry = 0x80;
+        var host = new HostInputState();
+        if (!PollXInputRaw(index, host)) return false;
+        DefaultInputMaps.XInput().Apply(host, out buttons, out lx, out ly, out rx, out ry);
         return true;
     }
 
@@ -344,19 +418,15 @@ public sealed class HostGamepadService
         return ControllerHardwareKind.Unknown;
     }
 
-    private bool PollHidCached(string id, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
+    private bool PollHidRaw(string id, HostInputState host, out ControllerHardwareKind kind)
     {
-        buttons = 0; lx = ly = rx = ry = 0x80;
+        kind = ControllerHardwareKind.GenericHid;
         if (!_hidHandles.TryGetValue(id, out nint h) || h == 0 || h == new nint(-1))
             return false;
 
-        // Non-blocking peek: use HidD_GetInputReport if possible; else skip (XInput path preferred when available)
         byte[] buf = new byte[64];
-        // Many DS4/DualSense devices need exclusive access; if read fails, return false
-        // Try synchronous short read via ReadFile with 0 timeout is hard; use HidD_GetInputReport
         if (!HidD_GetInputReport(h, buf, (uint)buf.Length))
         {
-            // Fallback: if we have last report, use it
             if (_hidLastReport.TryGetValue(id, out var last))
                 buf = last;
             else
@@ -367,106 +437,148 @@ public sealed class HostGamepadService
             _hidLastReport[id] = (byte[])buf.Clone();
         }
 
-        _hidKind.TryGetValue(id, out var kind);
+        _hidKind.TryGetValue(id, out kind);
         if (kind == ControllerHardwareKind.DualShock4)
-            return ParseDs4(buf, out buttons, out lx, out ly, out rx, out ry);
+            return ParseDs4Raw(buf, host);
         if (kind == ControllerHardwareKind.DualSense)
-            return ParseDualSense(buf, out buttons, out lx, out ly, out rx, out ry);
-        // Generic / guitar HID: map first 16 button bits + two axes if present
-        return ParseGenericHid(buf, out buttons, out lx, out ly, out rx, out ry);
+            return ParseDualSenseRaw(buf, host);
+        if (kind == ControllerHardwareKind.GuitarHero)
+        {
+            // Guitar HID often XInput-shaped when also exposed as xi:; generic bit parse as fallback.
+            return ParseGenericHidRaw(buf, host);
+        }
+        return ParseGenericHidRaw(buf, host);
+    }
+
+    private bool PollHidCached(string id, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
+    {
+        buttons = 0; lx = ly = rx = ry = 0x80;
+        var host = new HostInputState();
+        if (!PollHidRaw(id, host, out var kind)) return false;
+        DefaultInputMaps.Resolve(kind, ControllerProfile.Standard)
+            .Apply(host, out buttons, out lx, out ly, out rx, out ry);
+        return true;
+    }
+
+    private static bool ParseDs4Raw(byte[] r, HostInputState host)
+    {
+        // USB report often starts at 0; BT has offset. Detect by size/report id
+        int o = r[0] == 0x11 ? 2 : 0; // BT vs USB rough
+        if (r.Length < o + 10) return false;
+        host.SetAxis(HostSources.DsLX, InputBindingTable.ByteAxisToFloat(r[o + 1]));
+        host.SetAxis(HostSources.DsLY, InputBindingTable.ByteAxisToFloat(r[o + 2]));
+        host.SetAxis(HostSources.DsRX, InputBindingTable.ByteAxisToFloat(r[o + 3]));
+        host.SetAxis(HostSources.DsRY, InputBindingTable.ByteAxisToFloat(r[o + 4]));
+        byte b1 = r[o + 5];
+        byte b2 = r[o + 6];
+        int dpad = b1 & 0x0F;
+        host.SetButton(HostSources.DsUp, dpad is 0 or 1 or 7);
+        host.SetButton(HostSources.DsRight, dpad is 2 or 3 or 1);
+        host.SetButton(HostSources.DsDown, dpad is 4 or 3 or 5);
+        host.SetButton(HostSources.DsLeft, dpad is 6 or 5 or 7);
+        host.SetButton(HostSources.DsSquare, (b1 & 0x10) != 0);
+        host.SetButton(HostSources.DsCross, (b1 & 0x20) != 0);
+        host.SetButton(HostSources.DsCircle, (b1 & 0x40) != 0);
+        host.SetButton(HostSources.DsTriangle, (b1 & 0x80) != 0);
+        host.SetButton(HostSources.DsL1, (b2 & 0x01) != 0);
+        host.SetButton(HostSources.DsR1, (b2 & 0x02) != 0);
+        host.SetButton(HostSources.DsL2, (b2 & 0x04) != 0);
+        host.SetButton(HostSources.DsR2, (b2 & 0x08) != 0);
+        host.SetButton(HostSources.DsSelect, (b2 & 0x10) != 0);
+        host.SetButton(HostSources.DsStart, (b2 & 0x20) != 0);
+        host.SetButton(HostSources.DsL3, (b2 & 0x40) != 0);
+        host.SetButton(HostSources.DsR3, (b2 & 0x80) != 0);
+        return true;
     }
 
     private static bool ParseDs4(byte[] r, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
     {
-        buttons = 0; lx = ly = rx = ry = 0x80;
-        // USB report often starts at 0; BT has offset. Detect by size/report id
-        int o = r[0] == 0x11 ? 2 : 0; // BT vs USB rough
-        if (r.Length < o + 10) return false;
-        lx = r[o + 1];
-        ly = r[o + 2];
-        rx = r[o + 3];
-        ry = r[o + 4];
-        byte b1 = r[o + 5];
-        byte b2 = r[o + 6];
-        byte b3 = r[o + 7];
-        // D-pad in low nibble of b1
+        var host = new HostInputState();
+        if (!ParseDs4Raw(r, host))
+        {
+            buttons = 0; lx = ly = rx = ry = 0x80;
+            return false;
+        }
+        DefaultInputMaps.DualShock4().Apply(host, out buttons, out lx, out ly, out rx, out ry);
+        return true;
+    }
+
+    private static bool ParseDualSenseRaw(byte[] r, HostInputState host)
+    {
+        int o = r[0] == 0x01 ? 1 : 0;
+        if (r.Length < o + 10) return ParseDs4Raw(r, host);
+        host.SetAxis(HostSources.DsLX, InputBindingTable.ByteAxisToFloat(r[o + 0]));
+        host.SetAxis(HostSources.DsLY, InputBindingTable.ByteAxisToFloat(r[o + 1]));
+        host.SetAxis(HostSources.DsRX, InputBindingTable.ByteAxisToFloat(r[o + 2]));
+        host.SetAxis(HostSources.DsRY, InputBindingTable.ByteAxisToFloat(r[o + 3]));
+        byte b1 = r[o + 7];
+        byte b2 = r[o + 8];
         int dpad = b1 & 0x0F;
-        if (dpad is 0 or 1 or 7) buttons |= (uint)PadInput.Button.Up;
-        if (dpad is 2 or 3 or 1) buttons |= (uint)PadInput.Button.Right;
-        if (dpad is 4 or 3 or 5) buttons |= (uint)PadInput.Button.Down;
-        if (dpad is 6 or 5 or 7) buttons |= (uint)PadInput.Button.Left;
-        if ((b1 & 0x10) != 0) buttons |= (uint)PadInput.Button.Square;
-        if ((b1 & 0x20) != 0) buttons |= (uint)PadInput.Button.Cross;
-        if ((b1 & 0x40) != 0) buttons |= (uint)PadInput.Button.Circle;
-        if ((b1 & 0x80) != 0) buttons |= (uint)PadInput.Button.Triangle;
-        if ((b2 & 0x01) != 0) buttons |= (uint)PadInput.Button.L1;
-        if ((b2 & 0x02) != 0) buttons |= (uint)PadInput.Button.R1;
-        if ((b2 & 0x04) != 0) buttons |= (uint)PadInput.Button.L2;
-        if ((b2 & 0x08) != 0) buttons |= (uint)PadInput.Button.R2;
-        if ((b2 & 0x10) != 0) buttons |= (uint)PadInput.Button.Select;
-        if ((b2 & 0x20) != 0) buttons |= (uint)PadInput.Button.Start;
-        if ((b2 & 0x40) != 0) buttons |= (uint)PadInput.Button.L3;
-        if ((b2 & 0x80) != 0) buttons |= (uint)PadInput.Button.R3;
-        _ = b3;
+        host.SetButton(HostSources.DsUp, dpad is 0 or 1 or 7);
+        host.SetButton(HostSources.DsRight, dpad is 2 or 3 or 1);
+        host.SetButton(HostSources.DsDown, dpad is 4 or 3 or 5);
+        host.SetButton(HostSources.DsLeft, dpad is 6 or 5 or 7);
+        host.SetButton(HostSources.DsSquare, (b1 & 0x10) != 0);
+        host.SetButton(HostSources.DsCross, (b1 & 0x20) != 0);
+        host.SetButton(HostSources.DsCircle, (b1 & 0x40) != 0);
+        host.SetButton(HostSources.DsTriangle, (b1 & 0x80) != 0);
+        host.SetButton(HostSources.DsL1, (b2 & 0x01) != 0);
+        host.SetButton(HostSources.DsR1, (b2 & 0x02) != 0);
+        host.SetButton(HostSources.DsL2, (b2 & 0x04) != 0);
+        host.SetButton(HostSources.DsR2, (b2 & 0x08) != 0);
+        host.SetButton(HostSources.DsSelect, (b2 & 0x10) != 0);
+        host.SetButton(HostSources.DsStart, (b2 & 0x20) != 0);
+        host.SetButton(HostSources.DsL3, (b2 & 0x40) != 0);
+        host.SetButton(HostSources.DsR3, (b2 & 0x80) != 0);
         return true;
     }
 
     private static bool ParseDualSense(byte[] r, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
     {
-        // Similar layout to DS4 for first buttons on USB report id 0x01
-        buttons = 0; lx = ly = rx = ry = 0x80;
-        int o = r[0] == 0x01 ? 1 : 0;
-        if (r.Length < o + 10) return ParseDs4(r, out buttons, out lx, out ly, out rx, out ry);
-        lx = r[o + 0];
-        ly = r[o + 1];
-        rx = r[o + 2];
-        ry = r[o + 3];
-        byte b1 = r[o + 7];
-        byte b2 = r[o + 8];
-        int dpad = b1 & 0x0F;
-        if (dpad is 0 or 1 or 7) buttons |= (uint)PadInput.Button.Up;
-        if (dpad is 2 or 3 or 1) buttons |= (uint)PadInput.Button.Right;
-        if (dpad is 4 or 3 or 5) buttons |= (uint)PadInput.Button.Down;
-        if (dpad is 6 or 5 or 7) buttons |= (uint)PadInput.Button.Left;
-        if ((b1 & 0x10) != 0) buttons |= (uint)PadInput.Button.Square;
-        if ((b1 & 0x20) != 0) buttons |= (uint)PadInput.Button.Cross;
-        if ((b1 & 0x40) != 0) buttons |= (uint)PadInput.Button.Circle;
-        if ((b1 & 0x80) != 0) buttons |= (uint)PadInput.Button.Triangle;
-        if ((b2 & 0x01) != 0) buttons |= (uint)PadInput.Button.L1;
-        if ((b2 & 0x02) != 0) buttons |= (uint)PadInput.Button.R1;
-        if ((b2 & 0x04) != 0) buttons |= (uint)PadInput.Button.L2;
-        if ((b2 & 0x08) != 0) buttons |= (uint)PadInput.Button.R2;
-        if ((b2 & 0x10) != 0) buttons |= (uint)PadInput.Button.Select;
-        if ((b2 & 0x20) != 0) buttons |= (uint)PadInput.Button.Start;
-        if ((b2 & 0x40) != 0) buttons |= (uint)PadInput.Button.L3;
-        if ((b2 & 0x80) != 0) buttons |= (uint)PadInput.Button.R3;
+        var host = new HostInputState();
+        if (!ParseDualSenseRaw(r, host))
+        {
+            buttons = 0; lx = ly = rx = ry = 0x80;
+            return false;
+        }
+        DefaultInputMaps.DualSense().Apply(host, out buttons, out lx, out ly, out rx, out ry);
         return true;
+    }
+
+    private static bool ParseGenericHidRaw(byte[] r, HostInputState host)
+    {
+        if (r.Length < 4) return false;
+        if (r.Length > 2)
+        {
+            host.SetAxis("hid:LX", InputBindingTable.ByteAxisToFloat(r[0]));
+            host.SetAxis("hid:LY", InputBindingTable.ByteAxisToFloat(r[1]));
+        }
+        if (r.Length > 4)
+        {
+            host.SetAxis("hid:RX", InputBindingTable.ByteAxisToFloat(r[2]));
+            host.SetAxis("hid:RY", InputBindingTable.ByteAxisToFloat(r[3]));
+        }
+        int btnOff = r.Length > 6 ? 4 : 2;
+        uint bits = r[btnOff];
+        if (r.Length > btnOff + 1) bits |= (uint)r[btnOff + 1] << 8;
+        for (int i = 0; i < 16; i++)
+        {
+            if ((bits & (1u << i)) != 0)
+                host.Press(HostSources.HidBit(i));
+        }
+        return bits != 0 || host.TryGetAxis("hid:LX", out _) || host.TryGetAxis("hid:LY", out _);
     }
 
     private static bool ParseGenericHid(byte[] r, out uint buttons, out byte lx, out byte ly, out byte rx, out byte ry)
     {
-        buttons = 0; lx = ly = rx = ry = 0x80;
-        if (r.Length < 4) return false;
-        // Very rough: axes then buttons
-        if (r.Length > 2) { lx = r[0]; ly = r[1]; }
-        if (r.Length > 4) { rx = r[2]; ry = r[3]; }
-        int btnOff = r.Length > 6 ? 4 : 2;
-        uint bits = r[btnOff];
-        if (r.Length > btnOff + 1) bits |= (uint)r[btnOff + 1] << 8;
-        // Map first 16 bits onto digital face roughly
-        if ((bits & 1) != 0) buttons |= (uint)PadInput.Button.Cross;
-        if ((bits & 2) != 0) buttons |= (uint)PadInput.Button.Circle;
-        if ((bits & 4) != 0) buttons |= (uint)PadInput.Button.Square;
-        if ((bits & 8) != 0) buttons |= (uint)PadInput.Button.Triangle;
-        if ((bits & 16) != 0) buttons |= (uint)PadInput.Button.L1;
-        if ((bits & 32) != 0) buttons |= (uint)PadInput.Button.R1;
-        if ((bits & 64) != 0) buttons |= (uint)PadInput.Button.Select;
-        if ((bits & 128) != 0) buttons |= (uint)PadInput.Button.Start;
-        if ((bits & 256) != 0) buttons |= (uint)PadInput.Button.Up;
-        if ((bits & 512) != 0) buttons |= (uint)PadInput.Button.Down;
-        if ((bits & 1024) != 0) buttons |= (uint)PadInput.Button.Left;
-        if ((bits & 2048) != 0) buttons |= (uint)PadInput.Button.Right;
-        return bits != 0 || lx != 0x80 || ly != 0x80;
+        var host = new HostInputState();
+        if (!ParseGenericHidRaw(r, host))
+        {
+            buttons = 0; lx = ly = rx = ry = 0x80;
+            return false;
+        }
+        DefaultInputMaps.GenericHid().Apply(host, out buttons, out lx, out ly, out rx, out ry);
+        return true;
     }
 
     private static void ParseVidPid(string path, out ushort vid, out ushort pid)

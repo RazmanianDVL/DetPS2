@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>DetPS2.Present</RootNamespace>
+    <AssemblyName>DetPS2.Present</AssemblyName>
+    <Description>Host swap presenters for Soft-GS display (D3D11/Vulkan/Software). Soft-GS remains determinism truth.</Description>
+    <Deterministic>true</Deterministic>
+    <!-- Exe = device harness (Program.cs). Types are still library-usable via ProjectReference. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- GPU-A: D3D11 host present -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <!-- GPU-B: Vulkan host present -->
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.23.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />
+    <!-- OpenGL uses WGL + opengl32 P/Invoke (no extra NuGet). -->
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,45 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="DetPS2.Desktop.Options.OptionsAdvancedPage">
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" Spacing="12" MaxWidth="560">
+            <TextBlock Text="Advanced" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="Diagnostics, optional virtual HDD, and media verification."
+                       FontSize="12" Foreground="#888" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Session log" FontWeight="SemiBold" />
+            <TextBlock Text="Session log path" FontSize="11" Foreground="#666" />
+            <TextBlock x:Name="SessionLogPathText" Text="—" FontSize="11"
+                       TextWrapping="Wrap" Foreground="#acc" FontFamily="Consolas,monospace" />
+            <Button x:Name="OpenLogFolderButton" Content="Open log folder…"
+                    Padding="12,8" HorizontalAlignment="Left" Click="OnOpenLogFolderClick" />
+
+            <Separator />
+
+            <TextBlock Text="Virtual HDD" FontWeight="SemiBold" />
+            <CheckBox x:Name="EnableHddCheck" Content="Enable virtual HDD (optional)" />
+            <TextBlock Text="Memory cards remain the primary save path. HDD is opt-in and only mounted when enabled with a path."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+            <TextBlock x:Name="HddPathText" Text="No virtual HDD file selected" FontSize="12"
+                       TextWrapping="Wrap" Foreground="#ccc" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Choose HDD file…" Padding="12,6" Click="OnPickHddClick" />
+                <Button Content="Clear path" Padding="12,6" Click="OnClearHddClick" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Size (MB)" VerticalAlignment="Center" />
+                <NumericUpDown x:Name="HddSizeBox" Minimum="128" Maximum="131072" Increment="512"
+                               Width="140" FormatString="0" />
+            </StackPanel>
+            <TextBlock Text="Used when creating a new image. Existing files keep their current size."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <Separator />
+
+            <TextBlock Text="Media" FontWeight="SemiBold" />
+            <CheckBox x:Name="VerifyMediaCheck" Content="Verify media on boot (serial / quick hash)" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>
