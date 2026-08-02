@@ -130,7 +130,8 @@ public readonly struct DisplayRect
 
 /// <summary>
 /// Where Soft-GS last sourced composite pixels (GX-041 telemetry).
-/// Natural = software-programmed DISPFB; Frame = FRAME_1 residual; SyntheticFbp0 = FBP page0 IMAGE fallback.
+/// Natural = software-programmed DISPFB; Frame = FRAME_1 residual; SyntheticFbp0 = FBP page0 IMAGE fallback;
+/// LastImageTrx = Host→Local BITBLT dest residual (GoW-class PSMT4 texture page).
 /// </summary>
 public enum GsCompositeSource : byte
 {
@@ -141,6 +142,11 @@ public enum GsCompositeSource : byte
     Frame = 2,
     /// <summary>FBP=0 IMAGE page residual when FRAME is high-page / unset.</summary>
     SyntheticFbp0 = 3,
+    /// <summary>
+    /// Residual: largest Host→Local IMAGE BITBLT destination (GoW PSMT4 @ high DBP while
+    /// DISPFB points at empty CT24 draw target). Real transfer bytes only — no PATH3 invent.
+    /// </summary>
+    LastImageTrx = 4,
 }
 
 /// <summary>
@@ -229,7 +235,7 @@ public sealed class GsDisplayCircuitInfo
         return $"pmode=0x{Pmode:X} circ={PreferredCircuit} naturalDispfb={(HasNaturalDispfb ? 1 : 0)} " +
                $"enNatural={(HasEnabledNaturalDispfb ? 1 : 0)} " +
                $"dispfb1=0x{RegistersRawDispfb1:X} dispfb2=0x{RegistersRawDispfb2:X} " +
-               $"display1=0x{RegistersRawDisplay1:X} " +
-               $"out={r.Width}x{r.Height}+{r.OffsetX},{r.OffsetY} {d}";
+               $"display1=0x{RegistersRawDisplay1:X} display2=0x{RegistersRawDisplay2:X} " +
+               $"out={r.Width}x{r.Height}+{r.OffsetX},{r.OffsetY} (CRT-ofs ignored on Soft-GS) {d}";
     }
 }

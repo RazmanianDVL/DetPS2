@@ -1,0 +1,46 @@
+# DetPS2 pad-script — MK Deception (SLUS_208.81) INTERACTIVE menu probe
+# Soft-GS Midway surface lands ~28–40M (lit~199k). START/CROSS denser 50–150M.
+# Usage:
+#   detps2 pad-inject user-media-deception.json --cycles=150000000 --host-present --pad-script=tools/pad-scripts/dec-menu-interactive.pad
+#   detps2 blocker-trace user-media-deception.json --cycles=100000000 --host-present --pad-script=tools/pad-scripts/dec-menu-interactive.pad
+#
+# HOLD defaults to 50000 cycles when omitted.
+
+# Warm-up D-pad after Soft-GS surface
+@32000000 Down 80000
+@33000000 Cross 100000
+@35000000 Start 100000
+@37000000 Cross 100000
+@38000000 Up 80000
+@40000000 Cross 120000
+
+# INTERACTIVE window 50–100M: START/CROSS accept + selection crawl
+@50000000 Start 150000
+@52000000 Cross 150000
+@54000000 Down 100000
+@56000000 Cross 150000
+@58000000 Start 150000
+@60000000 Cross 200000
+@65000000 Down 100000
+@68000000 Cross 150000
+@70000000 Start 150000
+@75000000 Cross 200000
+@80000000 Up 100000
+@82000000 Cross 150000
+@85000000 Start 200000
+@90000000 Cross 200000
+@95000000 Down 100000
+@98000000 Start 150000
+@100000000 Cross 200000
+
+# Extend through 150M for dec-pad-150m claim
+@105000000 Down 100000
+@110000000 Start 200000
+@115000000 Cross 200000
+@120000000 Up 100000
+@125000000 Cross 200000
+@130000000 Start 200000
+@135000000 Cross 200000
+@140000000 Down 100000
+@145000000 Start 200000
+@148000000 Cross 250000

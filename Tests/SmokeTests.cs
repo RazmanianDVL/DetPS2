@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using DetPS2.Core;
+using DetPS2.Core.Input;
 
 namespace DetPS2.Tests;
 
@@ -368,6 +369,165 @@ public static class SmokeTests
         if (info.PreferredCircuit != 2) throw new Exception($"dual-circuit prefer 2, got {info.PreferredCircuit}");
 
         Console.WriteLine($"[Smoke] Gs_DisplayCircuit_DispfbDisplayDecode OK ({info.SummaryLine()})");
+    }
+
+    /// <summary>
+    /// Soft-GS present: PSMCT16S DISPFB must swizzle-read + expand RGB555 (Dec-class PSM=10),
+    /// and CRT DISPLAY DX/DY must not shift Soft-GS dest (host FB stays origin-aligned).
+    /// </summary>
+    public static void Gs_Dispfb_Psmct16_CompositeNoCrtOffset()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        // Draw target on a high FRAME page so black prims do not pollute FBP0 IMAGE
+        // (WriteFrameLocal mirrors Soft-GS paint into local VRAM at FRAME.FBP).
+        sys.Gs.WriteGsRegister(0x4C, (10UL << 16) | 0x40UL); // FBP=0x40 FBW=640 PSMCT32
+        // Full-FB black prim paint (BO2/Vexx class — px count without lit RGB).
+        sys.Gs.DrawQuad(0, 0, 640, 448, 0xFF000000);
+        long blackPx = sys.Gs.PixelsWritten;
+        if (blackPx < 1000) throw new Exception("expected black full-FB paint");
+
+        // Host→Local 32×32 PSMCT16S red (R=bits0–4) at FBP=0, DBW=640.
+        // DPSM must match DISPFB PSM: 16S uses BlockTable16S (≠ PSMCT16 BlockTable16).
+        sys.Gs.WriteGsRegister(0x50, (10UL << 16) | (10UL << 48) | (0x0AUL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, 32UL | (32UL << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var blob = new byte[32 * 32 * 2];
+        ushort red = 0x1F;
+        for (int i = 0; i < 32 * 32; i++)
+        {
+            blob[i * 2] = (byte)red;
+            blob[i * 2 + 1] = (byte)(red >> 8);
+        }
+        sys.Gs.WriteImageData(blob, 0);
+
+        // DISPFB2: FBP=0 FBW=10 (640, match BITBLT DBW) PSM=0x0A (PSMCT16S) — Dec-class PSM.
+        var dispfb = new DispfbDecoded { Fbp = 0, FbwUnits = 10, Psm = 0x0A, Dbx = 0, Dby = 0 };
+        // DISPLAY with large CRT blanking offsets (must NOT become Soft-GS dest).
+        // MagH=3 Dw=2559 → width≈640; Dy/Mag still produce CRT ofs that used to clip Soft-GS.
+        var display = new DisplayDecoded { Dx = 636, Dy = 50, MagH = 3, MagV = 0, Dw = 2559, Dh = 447 };
+        sys.Gs.WritePrivileged64(0x12000000, 2); // EN2
+        sys.Gs.WritePrivileged64(0x12000090, dispfb.Pack());
+        sys.Gs.WritePrivileged64(0x120000A0, display.Pack());
+
+        long written = sys.Gs.ForceRefreshPresentComposite();
+        if (written < 900) // ~32×32 red block (some edge loss ok)
+            throw new Exception($"expected PSMCT16 DISPFB composite ≥900, got {written}");
+        if (sys.Gs.NaturalDispfbPixels <= 0)
+            throw new Exception("naturalDispfbPx must be >0");
+        // Soft-GS origin must hold red (CRT +159,+50 must not apply).
+        uint p = sys.Gs.GetPixel(8, 8);
+        if (((p >> 16) & 0xFF) < 200)
+            throw new Exception($"expected red at Soft-GS (8,8) without CRT ofs, got 0x{p:X8}");
+        // Pre-fix CRT dest ofs placed the 32×32 block near +159,+50 — that cell must stay black.
+        uint pCrt = sys.Gs.GetPixel(168, 58);
+        if ((pCrt & 0x00FFFFFF) != 0)
+            throw new Exception($"CRT-ofs cell should stay black, got 0x{pCrt:X8}");
+        int lit = sys.Gs.CountLitPresentPixels();
+        if (lit < 900)
+            throw new Exception($"expected lit present after PSMCT16 composite, lit={lit}");
+        Console.WriteLine(
+            $"[Smoke] Gs_Dispfb_Psmct16_CompositeNoCrtOffset OK " +
+            $"(blackPx={blackPx} written={written} lit={lit} p=0x{p:X8})");
+    }
+
+    /// <summary>
+    /// Dec-class present: DISPFB2 PSMCT16S FBW=832 (13×64). Host→Local DPSM=0x0A must
+    /// land via BlockTable16S + ColumnTable16; composite must recover a coherent red field
+    /// (not Morton/CT16-block noise). Also proves CT16 vs CT16S table split.
+    /// </summary>
+    public static void Gs_Dispfb_Psmct16S_Fbw832_CoherentComposite()
+    {
+        var sys = new Ps2System();
+        sys.Gs.Clear(0xFF000000);
+        // Keep FRAME off FBP0 so WriteFrameLocal cannot pollute the 16S IMAGE page.
+        sys.Gs.WriteGsRegister(0x4C, (13UL << 16) | 0x40UL); // FBP=0x40 FBW=832 PSMCT32
+
+        // Host→Local 96×48 PSMCT16S red at FBP=0, DBW=832 (matches DISPFB FBW).
+        // 96 wide spans &gt;1 page (64) so pagesPerRow=13 is exercised.
+        const int tw = 96, th = 48;
+        const int fbwUnits = 13; // 832 px
+        sys.Gs.WriteGsRegister(0x50,
+            ((ulong)fbwUnits << 16) | ((ulong)fbwUnits << 48) | (0x0AUL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, (ulong)tw | ((ulong)th << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        var blob = new byte[tw * th * 2];
+        ushort red = 0x1F; // GS CT16 R channel
+        for (int i = 0; i < tw * th; i++)
+        {
+            blob[i * 2] = (byte)red;
+            blob[i * 2 + 1] = (byte)(red >> 8);
+        }
+        sys.Gs.WriteImageData(blob, 0);
+
+        // DISPFB2: FBP=0 FBW=13 (832) PSM=0x0A DBY=1 (live Dec circuit shape)
+        var dispfb = new DispfbDecoded { Fbp = 0, FbwUnits = fbwUnits, Psm = 0x0A, Dbx = 0, Dby = 1 };
+        var display = new DisplayDecoded { Dx = 636, Dy = 50, MagH = 3, MagV = 0, Dw = 2559, Dh = 447 };
+        sys.Gs.WritePrivileged64(0x12000000, 2); // EN2
+        sys.Gs.WritePrivileged64(0x12000090, dispfb.Pack());
+        sys.Gs.WritePrivileged64(0x120000A0, display.Pack());
+
+        long written = sys.Gs.ForceRefreshPresentComposite();
+        // DBY=1 shifts source: Soft-GS (x,y) reads local (x, y+1). Red band is y=0..47 in
+        // local → present rows 0..46 (47 rows of 96 = 4512).
+        if (written < 4000)
+            throw new Exception($"expected Dec 16S FBW832 composite ≥4000, got {written}");
+        // Interior of the red band must be solid red (coherent, not scrambled noise).
+        uint p = sys.Gs.GetPixel(40, 10);
+        if (((p >> 16) & 0xFF) < 200 || ((p >> 8) & 0xFF) > 40 || (p & 0xFF) > 40)
+            throw new Exception($"expected coherent red at (40,10), got 0x{p:X8}");
+        // Far-right within 96-wide upload (still left of Soft-GS 640) must also be red.
+        uint pRight = sys.Gs.GetPixel(90, 5);
+        if (((pRight >> 16) & 0xFF) < 200)
+            throw new Exception($"expected red at (90,5) across page boundary, got 0x{pRight:X8}");
+        // Below the band must stay black.
+        uint pBelow = sys.Gs.GetPixel(40, 60);
+        if ((pBelow & 0x00FFFFFF) != 0)
+            throw new Exception($"below band must be black, got 0x{pBelow:X8}");
+
+        // Table-split probe: single-pixel red at (48,24) written as PSMCT16 (BlockTable16)
+        // into FBP=1, then DISPFB-read as PSMCT16S. Tables diverge at that coord so present
+        // must NOT recover the red pixel at Soft-GS (48,24). (Solid fills cannot prove this —
+        // every block still holds red.)
+        sys.Gs.Clear(0xFF000000);
+        var single = new byte[tw * th * 2]; // zeros
+        int si = (24 * tw + 48) * 2;
+        single[si] = (byte)red;
+        single[si + 1] = (byte)(red >> 8);
+        // DBP=0x80 (64-byte units) → base 8192 = FBP page 1
+        sys.Gs.WriteGsRegister(0x50,
+            (0x80UL << 32) | ((ulong)fbwUnits << 48) | (0x02UL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, (ulong)tw | ((ulong)th << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        sys.Gs.WriteImageData(single, 0);
+        var dispfbCt16 = new DispfbDecoded { Fbp = 1, FbwUnits = fbwUnits, Psm = 0x0A, Dbx = 0, Dby = 0 };
+        sys.Gs.WritePrivileged64(0x12000090, dispfbCt16.Pack());
+        sys.Gs.ForceRefreshPresentComposite();
+        uint pMis = sys.Gs.GetPixel(48, 24);
+        if ((pMis & 0x00FFFFFF) != 0)
+            throw new Exception(
+                $"CT16-write/CT16S-read at (48,24) must miss (tables diverge), got 0x{pMis:X8}");
+
+        // Positive control: same single pixel written+read as 16S recovers red.
+        sys.Gs.Clear(0xFF000000);
+        sys.Gs.WriteGsRegister(0x50,
+            (0x80UL << 32) | ((ulong)fbwUnits << 48) | (0x0AUL << 56));
+        sys.Gs.WriteGsRegister(0x51, 0);
+        sys.Gs.WriteGsRegister(0x52, (ulong)tw | ((ulong)th << 32));
+        sys.Gs.WriteGsRegister(0x53, 0);
+        sys.Gs.WriteImageData(single, 0);
+        sys.Gs.WritePrivileged64(0x12000090, dispfbCt16.Pack()); // still FBP=1 PSM=0x0A
+        sys.Gs.ForceRefreshPresentComposite();
+        uint pHit = sys.Gs.GetPixel(48, 24);
+        if (((pHit >> 16) & 0xFF) < 200)
+            throw new Exception($"16S write/read must hit red at (48,24), got 0x{pHit:X8}");
+
+        Console.WriteLine(
+            $"[Smoke] Gs_Dispfb_Psmct16S_Fbw832_CoherentComposite OK " +
+            $"(written={written} band p=0x{p:X8} mismatch=0x{pMis:X8} hit=0x{pHit:X8})");
     }
 
     /// <summary>
@@ -907,9 +1067,11 @@ press 3000 Circle 100
         sys.Timers.T0.WriteMode(0x80 | 0x100 | 0x40);
         // Unmask timer0 on INTC
         sys.Intc.SetMask(1u << (int)Intc.InterruptSource.Timer0);
-        // Enable EE interrupts (IE) and unmask IM2 (bit10) — real MIPS gates Cause.IP2
-        // (the INTC summary bit) by the matching Status.IM2 bit, not just global IE.
-        sys.EE.COP0_Status = 1 | (1u << 10);
+        // Enable EE interrupts (IE + EIE) and unmask IM2 (bit10) — real MIPS gates Cause.IP2
+        // (the INTC summary bit) by the matching Status.IM2 bit, not just global IE, and
+        // R5900 additionally requires EIE (Status bit16, set by the EI instruction) alongside
+        // IE before InterruptPending can go true (see EmotionEngine.SyncInterruptsFromIntc).
+        sys.EE.COP0_Status = 1 | (1u << 10) | (1u << 16);
 
         sys.Timers.Step(150);
 
@@ -1227,6 +1389,8 @@ press 3000 Circle 100
             GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric();
             Gs_MergeComposite_AfterSparsePrims();
             Gs_DisplayCircuit_DispfbDisplayDecode();
+            Gs_Dispfb_Psmct16_CompositeNoCrtOffset();
+            Gs_Dispfb_Psmct16S_Fbw832_CoherentComposite();
             Gs_NaturalDispfb_CompositeUsesCircuit();
             Gs_ResidualFrame_CompositeHonestWhenDispfbZero();
             Gs_NaturalDispfb_RebindAfterResidual();
@@ -1575,6 +1739,7 @@ press 3000 Circle 100
             DiscImage_FileBacked_RoundTrip();
             MediaVerify_SyntheticIso();
             HostGamepad_Enumerate();
+            InputBindingTable_DefaultsAndRemap();
 
             // Virtual HDD (APA + PFS foundation)
             Apa_FormatAndPartitionChecksumValid();
@@ -2578,7 +2743,7 @@ press 3000 Circle 100
         sys.EE.PC = 0x8000;
         sys.EE.TakeExceptions = true;
         sys.EE.PreferHleSyscalls = true;
-        sys.EE.COP0_Status = 1 | (1u << 10); // IE + IM2 (Cause.IP2 = INTC summary)
+        sys.EE.COP0_Status = 1 | (1u << 10) | (1u << 16); // IE + EIE + IM2 (Cause.IP2 = INTC summary)
         sys.Intc.SetMask(1u << (int)Intc.InterruptSource.Timer0);
         sys.Timers.T0.WriteCompare(5);
         sys.Timers.T0.WriteMode(0x80 | 0x100 | 0x40);
@@ -4186,10 +4351,12 @@ press 3000 Circle 100
     public static void Gs_TexturePsmct16_Samples()
     {
         var sys = new Ps2System();
-        // 2x2 texture: red, green, blue, white in RGB555
-        ushort r = (ushort)(0x1F << 10);
+        // 2x2 texture: red, green, blue, white in RGB555.
+        // GS CT16 bit layout (PCSX2 / GS manual): R=bits0-4, G=5-9, B=10-14, A=15
+        // (see Gs.ExpandRgb555).
+        ushort r = (ushort)0x1F;
         ushort g = (ushort)(0x1F << 5);
-        ushort b = (ushort)0x1F;
+        ushort b = (ushort)(0x1F << 10);
         ushort w = (ushort)((0x1F << 10) | (0x1F << 5) | 0x1F);
         sys.Gs.UploadTexture16(0, 2, 2, new[] { r, g, b, w });
         uint p0 = sys.Gs.SampleTexture(0.0f, 0.0f);
@@ -5670,7 +5837,8 @@ press 3000 Circle 100
         sys.Gs.WriteGsRegister(0x51, 0);
         sys.Gs.WriteGsRegister(0x52, 2UL | (2UL << 32));
         sys.Gs.WriteGsRegister(0x53, 0);
-        ushort r = (ushort)(0x1F << 10);
+        // GS CT16: R=bits0–4, G=5–9, B=10–14 (PCSX2 / GS manual).
+        ushort r = (ushort)0x1F;
         ushort g = (ushort)(0x1F << 5);
         var blob = new byte[2 * 2 * 2];
         blob[0] = (byte)r; blob[1] = (byte)(r >> 8);
@@ -5840,8 +6008,8 @@ press 3000 Circle 100
     public static void Gs_Texa_Psmct16_Alpha()
     {
         var sys = new Ps2System();
-        // RGB555 red with A-bit=0, and green with A-bit=1
-        ushort r = (ushort)(0x1F << 10); // A=0
+        // GS CT16: R low bits, A=bit15. Red A=0, green A=1.
+        ushort r = (ushort)0x1F; // A=0
         ushort g = (ushort)((0x1F << 5) | (1 << 15)); // A=1
         sys.Gs.UploadTexture16(0, 2, 2, new[] { r, g, r, g });
         // TEXA: TA0=0x40 TA1=0xC0
@@ -7480,6 +7648,66 @@ press 3000 Circle 100
             throw new Exception("guitar classify");
 
         Console.WriteLine($"[Smoke] HostGamepad_Enumerate OK (n={list.Count}, GH remap ok)");
+    }
+
+    /// <summary>PAD-1: pure binding table defaults + custom remap + config round-trip.</summary>
+    public static void InputBindingTable_DefaultsAndRemap()
+    {
+        // Keyboard defaults match Desktop MapKey / InputMapper
+        var kb = DefaultInputMaps.Keyboard();
+        if (!kb.TryMapKey("Z", out var z) || z != PadInput.Button.Cross)
+            throw new Exception("kb Z→Cross");
+        if (!kb.TryMapKey("Enter", out var st) || st != PadInput.Button.Start)
+            throw new Exception("kb Enter→Start");
+        if (!kb.TryMapKey("Q", out var l1) || l1 != PadInput.Button.L1)
+            throw new Exception("kb Q→L1");
+
+        // XInput A → Cross (historical map)
+        var host = new HostInputState();
+        host.Press(HostSources.XiA);
+        host.Press(HostSources.XiStart);
+        host.SetAxis(HostSources.XiLX, 1f);
+        DefaultInputMaps.XInput().Apply(host, out uint buttons, out byte lx, out _, out _, out _);
+        if ((buttons & (uint)PadInput.Button.Cross) == 0) throw new Exception("xi A→Cross");
+        if ((buttons & (uint)PadInput.Button.Start) == 0) throw new Exception("xi Start");
+        if (lx <= 0xC0) throw new Exception("xi LX right");
+
+        // GuitarHero frets via bindings (green A → R2)
+        var ghHost = new HostInputState();
+        ghHost.Press(HostSources.XiA);
+        ghHost.Press(HostSources.XiB);
+        DefaultInputMaps.GuitarHero().Apply(ghHost, out uint ghBtn, out _, out _, out _, out _);
+        if ((ghBtn & (uint)PadInput.Button.R2) == 0) throw new Exception("GH green→R2");
+        if ((ghBtn & (uint)PadInput.Button.Circle) == 0) throw new Exception("GH red→Circle");
+
+        // DualShock identity
+        var ds = new HostInputState();
+        ds.Press(HostSources.DsTriangle);
+        DefaultInputMaps.DualShock4().Apply(ds, out uint dsBtn, out _, out _, out _, out _);
+        if ((dsBtn & (uint)PadInput.Button.Triangle) == 0) throw new Exception("ds identity");
+
+        // Custom remap + config serialize without breaking old configs
+        var table = DefaultInputMaps.XInput().Clone();
+        table.Bind(HostSources.XiA, PadInput.Button.Triangle); // swap A → Triangle
+        var cfg = new EmulatorConfig { Player1Bindings = table.ToEntries() };
+        byte[] raw = cfg.ToBytes();
+        var back = EmulatorConfig.FromBytes(raw);
+        if (back.Player1Bindings == null || back.Player1Bindings.Count < 1)
+            throw new Exception("bindings not serialized");
+        // Old-style JSON without Player1Bindings still loads
+        var legacy = EmulatorConfig.FromBytes(
+            System.Text.Encoding.UTF8.GetBytes("{\"Version\":\"0\",\"BiosPath\":\"\",\"Player1DeviceId\":\"kb\"}"));
+        if (legacy.Player1Bindings != null && legacy.Player1Bindings.Count > 0)
+            throw new Exception("legacy should have null/empty bindings");
+
+        var effective = back.GetPlayer1BindingTable(ControllerHardwareKind.XInput);
+        var h2 = new HostInputState();
+        h2.Press(HostSources.XiA);
+        effective.Apply(h2, out uint remapped, out _, out _, out _, out _);
+        if ((remapped & (uint)PadInput.Button.Triangle) == 0) throw new Exception("custom A→Triangle");
+        if ((remapped & (uint)PadInput.Button.Cross) != 0) throw new Exception("custom should not keep Cross");
+
+        Console.WriteLine($"[Smoke] InputBindingTable_DefaultsAndRemap OK (kb={kb.Count}, xi={DefaultInputMaps.XInput().Count})");
     }
 
     /// <summary>

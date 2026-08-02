@@ -14,8 +14,8 @@
 | Owned | `MidwayFamilyAssist.cs` **REGION DA**, DA docs |
 | Forbidden | Dec-only regions thrash; Gs/Gif ownership; WaitSema fabricate global; Dmac END gate break |
 | ROMDIR gate | **CLOSED** |
-| Agent date | 2026-07-31 (PL-030 / S2 FRONTEND chrome after INTERACTIVE) |
-| Tip base | S1 `0b09a21` / PL-030 claim below |
+| Agent date | 2026-07-31 (MENU-DA-3 free-ride DI/EI assist — Path2 thicken; no MENU YES invent) |
+| Tip base | MENU-DA-2 Path2 restore + MENU-DA-3 free-ride assist below |
 
 ---
 
@@ -134,20 +134,23 @@ Runtime belt: `TrySoftSuccessDaPostLogoInit` + `TryRescueDaPostDisplayExit` + `T
 | Proven selection index / accept | **Yes** — assist-owned sel-idx @`0x7F200` driven by D-pad edges |
 | Pad-inject changes sel-idx **or** prims/gif delta | **Yes** — see PL-013 claim |
 
-### Wall B — FRONTEND chrome (→ **P2** / PL-030) — **PARTIAL (S2)**
+### Wall B — FRONTEND chrome (→ **P2** / PL-030 / MENU-DA-2/3) — **PARTIAL (thickened)**
 
-T3 **numeric** bars green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0). PL-030 title-local chrome:
+T3 **numeric** bars green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0). Live tip after MENU-DA-3:
 
-| Residual | Owner | Status after PL-030 |
-|----------|-------|---------------------|
-| Fail-tail plant debt | S3 | **Reduced** — belt 5 demoted @20M; **core 6** remain |
-| gif completed ratio | S3+S8 | **completed 323→2980**; abort n=289 residual (S8 Path2 sticky class) |
-| Display-queue sticky lock | S3 | **Improved** — head moves ≥16 from menu-band (was 1 @93.8M) |
-| imgBytes=98304 floor | S9 G2 / PL-045 | Held; no art-scale gameart TEX yet |
+| Residual | Owner | Status after MENU-DA-3 |
+|----------|-------|------------------------|
+| Thin wait-ready (gifP2=0 prims=3 lit=32768) | S3 PL-045 | **Cleared** when host STFM@0x7F000 + leave ≥8M (MENU-DA-2 hold) |
+| Path2 thrash rehome | S3 MENU-DA-2 | **Cleared** — Exit/CRT-only rehome; gifP2 live |
+| Path2 chrome density | S3 MENU-DA-3 | **Improved** — prims **4749→6029** gifP2 **240→304** px **70.9M→89.8M** |
+| Fail-tail plant debt | S3 | Core 6 permanent; belt demote when safe |
+| Display sticky lock @DI/EI | S3 | Free-ride assist clears lock when pending; **no PC invent** |
+| Free-ride menu `0x1232xx` | S3 | **Open** — pure DI/EI residual; blind menu rehome **rejected** (UnknownOpcode) |
+| imgBytes art-scale | S3 PL-045 | **360448** Host→Local after gifP2≥2 |
 | gifP3 only **6** | S8/S9 | Sparse; no invent PATH3 |
-| DISPFB 32k / circuit 640×448 | S10 | naturalDispfb=1 out=640x448; composite residual |
+| lit 75656 vs nat DISPFB 224k | S10 | naturalDispfb=1 out=640×448; present-sample residual |
 
-**Next:** art-scale IMAGE (GX-037 / S9) + further plant demotion when natural list-dispatch succeeds (PL-045).
+**Next:** honest leave from DI/EI into menu poll **without** inventing mid-function PC (stack/s0 context); pad→EE selection free-ride; lit present residual.
 
 ---
 
@@ -162,6 +165,138 @@ T3 **numeric** bars green on Soft-GS (prims≥10, imgBytes>0, dispfbPx>0). PL-03
 | **S0** | `agent/seat-s3/s0-g0` | Tip re-claim **px≈47.7M prims=8799 XYZ2=6366**; draw-graph + residual charter |
 | **S1** | `agent/seat-s3/s1-g1` | **PL-013** pad selection keep-alive — **T2 INTERACTIVE**; MENU YES hold |
 | **S2** | `agent/seat-s3/s2-g2` | **PL-030** FRONTEND chrome — display drain + fail-tail demote; INTERACTIVE hold |
+| **MENU-DA-2** | tip `main` + WIP | **gifP2 restore** — thrash rehome no longer kills logo Path2 spine |
+| **MENU-DA-3** | tip `main` + WIP | **free-ride DI/EI assist** (no PC invent) — prims/gifP2 thicken; pad-script lands |
+
+---
+
+## MENU-DA-3 claim (SEMA_OFF) — free-ride DI/EI assist (thicken Path2 chrome)
+
+Build: Core Release (`src/DetPS2.Core/bin/Release/net9.0`). Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
+
+### Wall (before this residual seat)
+
+| Class | Evidence | Metrics |
+|-------|----------|---------|
+| **Thin fleet residual** | `client-b-da-50m` / scoreboard | PC=`0x002F5578` wait-ready; **gifP2=0** prims=**3** lit=**32768** natural DISPFB strip only |
+| **MENU-DA-2 Path2 live** | `menu-da2-100m` / `da-chrome-100m` | PC=`0x00114F20` DI/EI; gifP2=**240** prims=**4749** lit=**75656** px=**70.9M** |
+| Free-ride residual | pure DI/EI after Path2 paint | exitReq=False; never reaches S0 menu band `0x1232xx` |
+
+### What landed (DA region only — `MidwayFamilyAssist`)
+
+| Piece | Behavior |
+|-------|----------|
+| `TryAssistDaFreeRideAtDiEi` | Pure DI/EI + proven Path2 surface (≥20M): **clear sticky display lock** when head≠tail; ForceRefreshPad; sparse pure-sleeper wake. **Never** invent PC / $ra to logo or `0x1232xx` |
+| Rejected (regressed) | Blind rehome DI/EI→`DaMainLogoContinue`/`0x123208` @18M → prims **4749→66**, p2qws 23k→4k, **UnknownOpcode@0x40A51C** (data-as-code) |
+| `tools/pad-scripts/da-menu-interactive.pad` | START/CROSS/D-pad schedule 16–150M (38 events) |
+| Forbidden held | No WaitSema fabricate; no Dmac END edits; no invent Soft-GS / PATH3; **no MENU YES invent** |
+
+### Claim 100M (SEMA_OFF, host-present) — live-queue `da-menu3b-*`
+
+```
+@100M chrome (no pad-script):
+  PC=0x00114F50 exitReq=False
+  px=89805648 prims=6029 gifPath1=0 gifPath2=304 gifPath3=6
+  imgBytes=360448 dispfbPx=75656 naturalDispfbPx=224016
+  softgs-present: lit=75656/286720 mostlyBlack=0
+  softgs-writes: PRIM=304 XYZ2=12046 FRAME=909
+  gif-pkts: completed=5397 aborted=0 p2qws=29471
+
+@100M pad (da-menu-interactive.pad, 55 press/release):
+  PC=0x001B3974 (display outer) exitReq=False
+  px=73567888 prims=4929 gifP2=249 gifP3=6 imgBytes=360448 lit=75656
+  pad-script: 38 events / 55 fires
+```
+
+| Metric | Thin residual | MENU-DA-2 | MENU-DA-3b chrome | Notes |
+|--------|---------------|-----------|-------------------|-------|
+| gifP2 | **0** | 240 | **304** | Path2 thicken |
+| prims | **3** | 4749 | **6029** | Midway sprites |
+| px | 0.46M | 70.9M | **89.8M** | Soft-GS paint |
+| lit | **32768** | 75656 | **75656** | present strip hold (nat DISPFB 224k residual) |
+| imgBytes | 98304 | 360448 | **360448** | Host→Local art-scale hold |
+| PC | wait-ready | DI/EI | DI/EI / display | free-ride incomplete (not `0x1232xx`) |
+| pad | — | assist inject | **55 fires** + PC@display | INTERACTIVE path; not formal T2 MENU |
+| exitReq | False | False | **False** | hold |
+
+**Claim line (MENU-DA-3) — not MENU YES:**
+
+| Title | Serial | MENU | Metrics (100M SEMA_OFF) | Residual wall |
+|-------|--------|------|-------------------------|---------------|
+| **MK Deadly Alliance** | `SLUS_204.23` | **Path2 chrome thickened** (not free-ride MENU YES) | px=**89805648** prims=**6029** gifP2=**304** lit=75656 img=360448 exitReq=**False** | pure DI/EI park; lit≪naturalDispfb; no honest `0x1232xx` menu poll; gifP3=6 |
+
+### Reproduce
+
+```powershell
+cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release --nologo -v q
+# queue (preferred):
+@{ id='da-chrome-100m'; media='user-media-da.json'; cycles=100000000; hostPresent=$true; priority=0 } |
+  ConvertTo-Json | Set-Content out/live-queue/inbox/da-chrome-100m.json
+@{ id='da-pad-100m'; media='user-media-da.json'; cycles=100000000; hostPresent=$true; priority=1;
+   padScript='tools/pad-scripts/da-menu-interactive.pad' } |
+  ConvertTo-Json | Set-Content out/live-queue/inbox/da-pad-100m.json
+# or direct:
+# dotnet exec src/DetPS2.Core/bin/Release/net9.0/DetPS2.Core.dll blocker-trace user-media-da.json --cycles=100000000 --host-present
+```
+
+---
+
+## MENU-DA-2 claim (SEMA_OFF) — Path2 chrome restore after PL-045 thrash wall
+
+Build: `out/menu-da2` Release. Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
+
+### Wall (pre-fix tip)
+
+PL-045 host publish from force-dec gameart was correct (STFM@0x7F000), but broad `postWaitThrash` rehomes from mid-logo PCs (e.g. `0x1A2B44` near list-dispatch `0x1A4E20`) reset the Path2 spine every ~2M → **gifP2=0** forever, WaitSema storm (`0x44`×32k), lit-only Host→Local strip (`lit≈85k`, `prims=14`).
+
+### What landed (DA region only — `MidwayFamilyAssist`)
+
+| Piece | Behavior |
+|-------|----------|
+| `TryRescueDaPostWaitMainExit` | **Exit/CRT only** + late pure-park (≥40M); **never** rehome logo/list-dispatch/display/wait bands |
+| `TryPublishDaGameartHostFromLoadedArt` | **Hold** — DA STFM@0x7F000 from force-dec / Dec stream when path-hash cold |
+| `TryFeedDaGameartHostToLocal` | Requires **gifP2≥2** (no Host→Local mask of dead Path2) |
+| Forbidden held | No WaitSema fabricate; no Dmac END edits; no invent Soft-GS / PATH3 |
+
+### Claim 100M / 200M (SEMA_OFF, host-present)
+
+```
+@100M: PC=0x00114F20 exitReq=False
+       px=70910800 prims=4749 gifPath1=0 gifPath2=240 gifPath3=6 dmac=260
+       cdvdSectors=1043 imgBytes=360448 dispfbPx=75656 naturalDispfbPx=224016
+       softgs-present: lit=75656/286720 mostlyBlack=0
+       gif-pkts: completed=4245 aborted=0 p2qws=23199
+       MKFAM: fail-tail belt demote @20M; Host->Local @30M after Path2; no thrash rehome
+@200M: same Soft-GS class (plateau); PC oscillates DI/EI 0x114Fxx ↔ display 0x1B39xx
+```
+
+| Metric | Pre MENU-DA-2 tip | MENU-DA-2 | Notes |
+|--------|-------------------|-----------|-------|
+| gifP2 | **0** | **240** | gate gifP2>50 **PASS** |
+| lit | ~85647 | 75656 | present strip; natural DISPFB residual |
+| prims / px | 14 / 1.8M | **4749 / 70.9M** | Midway Path2 chrome |
+| imgBytes | 458752 (feed without P2) | 360448 (after P2≥2) | honest Host→Local |
+| gifAborted | 0 | **0** | no DIRECT trunc storm |
+| exitReq | False | **False** | hold |
+
+**Claim line (MENU-DA-2):**
+
+| Title | Serial | MENU chrome | Metrics (100M SEMA_OFF) | Residual |
+|-------|--------|-------------|-------------------------|----------|
+| **MK Deadly Alliance** | `SLUS_204.23` | **Path2 live** (gifP2=240) | px=**70910800** prims=**4749** gifP2=**240** img=360448 lit=75656 exitReq=**False** | gifP2 plateau vs S2=606; PC DI/EI band; lit&lt;150k present residual |
+
+### Reproduce
+
+```powershell
+cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = "1"
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/menu-da2 --nologo -v q
+pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget claim -BuildOut out/menu-da2 -SkipBuild -HostPresent
+# scrape: gifP2 / no "thrash=True" rehome / Host->Local only after p2≥2
+```
 
 ---
 

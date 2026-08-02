@@ -1,0 +1,52 @@
+# DetPS2 pad-script — Burnout 3: Takedown (SLUS_210.50) INTERACTIVE past logo-frontend
+# Soft-GS FRONTEND spine ~40M (cdvd=6584). Dense START/CROSS to leave presentation.
+# Usage:
+#   detps2 pad-inject burnout-only.json --cycles=100000000 --host-present --pad-script=tools/pad-scripts/b3-menu-interactive.pad
+#   detps2 blocker-trace burnout-only.json --cycles=100000000 --host-present --pad-script=tools/pad-scripts/b3-menu-interactive.pad
+#
+# HOLD defaults to 50000 cycles when omitted.
+
+# Warm-up after residual→STG / STAGEHED (~28M)
+@28000000 Start 120000
+@29000000 Cross 100000
+@30000000 Start 150000
+@32000000 Cross 120000
+
+# FRONTEND plant window (~40M): skip-logo START holds
+@40000000 Start 250000
+@40500000 Cross 150000
+@41000000 Start 250000
+@42000000 Cross 200000
+@43000000 Start 300000
+@44000000 Circle 100000
+@45000000 Start 250000
+@46000000 Cross 200000
+@47000000 Down 80000
+@48000000 Start 300000
+@49000000 Cross 200000
+
+# Logo chrome INTERACTIVE window 50–100M: denser START + accept
+@50000000 Start 300000
+@52000000 Cross 200000
+@54000000 Start 300000
+@55000000 Cross 250000
+@56000000 Down 100000
+@58000000 Start 350000
+@60000000 Cross 250000
+@62000000 Start 350000
+@64000000 Cross 250000
+@65000000 Up 100000
+@68000000 Start 400000
+@70000000 Cross 300000
+@72000000 Start 400000
+@75000000 Cross 300000
+@78000000 Start 400000
+@80000000 Cross 300000
+@82000000 Down 100000
+@85000000 Start 450000
+@88000000 Cross 350000
+@90000000 Start 450000
+@92000000 Cross 350000
+@95000000 Start 500000
+@98000000 Cross 400000
+@100000000 Start 500000

@@ -165,6 +165,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     private bool _heapDefaultsPlanted;
     /// <summary>Bump cursor inside synthetic arena — real blocks, never the freelist header.</summary>
     private uint _arenaBump;
+    /// <summary>MENU-GOW lit: Host→Local feed of real R_SHELL/TIT1 payload into Soft-GS IMAGE.</summary>
+    private bool _shellImageFed;
+    private int _shellImageFedBytes;
 
     /// <summary>
     /// Table-index walk at <c>0x155AB0</c>: <c>t4</c> cursor vs <c>*0x30498C</c> limit, step
@@ -326,6 +329,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         _lastWorldKickCyc = 0;
         _lastIopRebootGenSeen = 0;
         _heapDefaultsPlanted = false;
+        _shellImageFed = false;
+        _shellImageFedBytes = 0;
         _arenaBump = HeapArenaBase;
     }
 
@@ -363,6 +368,14 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         if (sys.Gs.PixelsWritten <= 0) return;
         try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
         catch { /* ignore */ }
+        // MENU-GOW lit: black ofx expand stamps full Soft-GS FB while real Host→Local
+        // IMAGE (PSMT4) lives at high DBP. Force residual composite so lit present
+        // samples the real transfer (no invent PATH3).
+        if (sys.Gs.ImageBytesWritten > 0 && sys.Gs.IsPresentMostlyBlack())
+        {
+            try { sys.Gs.ForceRefreshPresentComposite(); }
+            catch { /* ignore */ }
+        }
     }
 
     /// <summary>
@@ -405,6 +418,22 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public void Step(Ps2System sys)
     {
         ulong c = sys.Scheduler.MasterCycles;
+        uint pcNow = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+
+        // Early hang-guard: heap defaults plant (0x01FD8000) + host Fedo/TIT1 windows
+        // misused as PC (live lit residual UnknownOpcode @0x01FD8100 HERO_HEAP hash).
+        // Arm from 25M — plant happens ~28M; type-2 hang-guard alone is too late (40M).
+        if (c >= 25_000_000
+            && (pcNow is (>= 0x01CFE000 and <= 0x01FEFFFF)
+                || pcNow >= 0x20000000u
+                || (pcNow is >= 0x00320000 and <= 0x00FFFFFF && !sys.Memory.IsLikelyEeCode(pcNow))))
+        {
+            RepairCurrentSpIfPoison(sys);
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = 0x0026C0EC;
+            sys.EE.COP0_Status &= ~0x6u;
+            pcNow = 0x0026C0EC;
+        }
 
         // Keep software tick moving every Step after early boot — VBlank handler at
         // 0x182F28 only runs when INTC fires; busy-wait paths disable progress otherwise.
@@ -1001,7 +1030,10 @@ public sealed class GodOfWarAssist : IGameQuirkModule
 
         // Wave-9b: after type-2, observe *0x310384 posts + SignalSema-wake main/worker.
         // Do NOT invent type-3/4 (w7 claim100e thrash). Retail main posts next cmds.
-        if (c >= 40_000_000 && _type2Completed && sys.Gs.PixelsWritten == 0)
+        // MENU-GOW lit: early Path2 expand (px>0) must NOT skip wakes — otherwise EE parks
+        // at 0x1837D0 with gifP2≈31/imgBytes=0 and never reaches DISPFB/PSMT4 IMAGE (gifP2≈81).
+        if (c >= 40_000_000 && _type2Completed
+            && (sys.Gs.PixelsWritten == 0 || sys.Gs.ImageBytesWritten == 0))
             TryPostType2CmdWake(sys, pc, c);
 
         // Wave-11: after type-2, restore retail 0x27D7C8 + seed shell decode consumer state
@@ -1013,7 +1045,9 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         {
             // Hang-guard data-as-code (host Fedo/TIT1/streamObj / high-VA poison) after
             // LoadWad attempts — claim1 saw pc=0x01CFE008 / 0x2032xxxx thrash.
-            if (pc is (>= 0x01CFE000 and <= 0x01F80000)
+            // HeapDefaultNodeBase plant is at 0x01FD8000 (outside old 0x01F80000 ceiling) —
+            // live lit residual UnknownOpcode @0x01FD8100 key=HERO_HEAP hash.
+            if (pc is (>= 0x01CFE000 and <= 0x01FEFFFF)
                 || pc >= 0x20000000u
                 || (pc is >= 0x00320000 and <= 0x00FFFFFF && !sys.Memory.IsLikelyEeCode(pc)))
             {
@@ -1114,13 +1148,16 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // (Started=false Entry=0) or empty-SIF poll — soft-return PC-stomp to 0x27CC08 on the
         // wrong thread poisons SP (sp=0xFFFFFF20) and freezes gifPath3. SwitchTo the real
         // worker thread so the jump-table dispatch runs with s1/s3/s4 + stack.
-        if (c >= 38_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+        // MENU-GOW: also yield when Soft-GS expand already painted but IMAGE not yet uploaded.
+        if (c >= 38_000_000 && sys.Cdvd.SectorsRead > 0
+            && (sys.Gs.PixelsWritten == 0 || sys.Gs.ImageBytesWritten == 0)
             && sys.Gif.Path3Transfers == 0)
             TryYieldToPendingWorker(sys, pc, c);
 
         // Wave-4/8 post-worker residual: byte-copy thrash + 0x26BFB0 hang (size≥0x201).
         // Wave-8/9b: escape from 40M (right after type-2) — hang trapped EE 41–50M in w7.
-        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0 && sys.Gs.PixelsWritten == 0
+        if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0
+            && (sys.Gs.PixelsWritten == 0 || sys.Gs.ImageBytesWritten == 0)
             && pc is >= 0x0026BF50 and <= 0x0026BFC8)
             TryEscapePostWorkerCopy(sys, pc, c);
 
@@ -1137,11 +1174,15 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // host-buffer-as-PC) → stream-poll / post-FreezeCache so main can post cmds.
         // Do NOT invent type-3/4. Do NOT jump mid flip-kick (0x140A04→0x1838A4 spin).
         // PL-023: 0x13F5xx is handled by TryFinishDmaTagBuilder only — never rehome here.
+        // MENU-GOW lit: 0x1837D0 is the PL-023 leave band — when Soft-GS expand already
+        // painted black chrome but IMAGE never lands (imgBytes=0), periodically leave to
+        // stream-poll so DISPFB/PSMT4 Host→Local can run (morning claim gifP2=81 path).
         if (c >= 40_000_000 && _type2Completed && sys.Cdvd.SectorsRead > 0
             && (pc is >= 0x00289A00 and <= 0x00289C00
                 || pc is >= 0x00300000 and <= 0x00320000
                 || pc is >= 0x002A0000 and <= 0x002B0000
                 || pc is >= 0x00183880 and <= 0x001838D0
+                || (pc is >= 0x001837C0 and <= 0x0018387F && sys.Gs.ImageBytesWritten == 0)
                 || pc is >= 0x001415E8 and <= 0x00141614)
             && (c % 200_000UL) < 50_000UL)
         {
@@ -1188,6 +1229,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
         // Also freelist residual 0x2393xx (live w5).
         if (c >= 40_000_000 && sys.Cdvd.SectorsRead > 0)
             MaybeKickWorldProgress(sys, pc, c);
+
+        // MENU-GOW lit residual: black expand Soft-GS + no natural IMAGE (gif image=0).
+        // Host→Local feed of real R_SHELL/TIT1 payload bytes (already on EE from stream kick)
+        // via BITBLT — same class as BO2 PL-027 / Dec PL-029. No invent PATH3 packets.
+        if (c >= 42_000_000 && sys.Gs.PixelsWritten > 0 && sys.Gs.ImageBytesWritten < 64_000)
+            TryFeedShellImageHostToLocal(sys, c);
 
         // PL-016: pad AFTER Soft-GS px only — denser START/CROSS/D-pad + ForceRefreshPad.
         // Soft-GS title surface is live from ~20M; do not wait for 40M world-kick.
@@ -4018,6 +4065,174 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write32(block + o, 0);
         sys.Memory.Write32(block, block);
         return block;
+    }
+
+    /// <summary>
+    /// MENU-GOW lit residual: when Soft-GS expand already painted black chrome and the game
+    /// never delivered GIF IMAGE (live gif-tags image=0), feed real host-loaded R_SHELL/TIT1
+    /// payload bytes through Soft-GS BITBLT Host→Local (same path as FLG=2 IMAGE). Prefer
+    /// TIT1 title buffer; fall back to R_SHELL Fedo payload after magic. No invent PATH3.
+    /// </summary>
+    private void TryFeedShellImageHostToLocal(Ps2System sys, ulong c)
+    {
+        if (_shellImageFed) return;
+        if (sys.Gs.ImageBytesWritten >= 64_000)
+        {
+            _shellImageFed = true;
+            return;
+        }
+        // Need host shell/title plant first (stream kick / pre-type2).
+        uint tit1 = 0x01D00000u;
+        uint shell = 0x01E00000u;
+        uint fedoShell = 0, fedoTit1 = 0;
+        try
+        {
+            fedoShell = sys.Memory.Read32(shell);
+            fedoTit1 = sys.Memory.Read32(tit1);
+        }
+        catch { return; }
+
+        bool shellOk = fedoShell == 0x4665646Fu;
+        bool tit1Ok = fedoTit1 == 0x4665646Fu || fedoTit1 != 0;
+        if (!shellOk && !tit1Ok)
+        {
+            // Force host load once so feed can proceed.
+            TryHostLoadPakMember(sys, "R_SHELL.WAD", shell, maxBytes: 0xC0000);
+            TryHostLoadPakMember(sys, "TIT1E1_2.VPK", tit1, maxBytes: 0xC0000);
+            try
+            {
+                fedoShell = sys.Memory.Read32(shell);
+                fedoTit1 = sys.Memory.Read32(tit1);
+            }
+            catch { return; }
+            shellOk = fedoShell == 0x4665646Fu;
+            tit1Ok = fedoTit1 == 0x4665646Fu || fedoTit1 != 0;
+            if (!shellOk && !tit1Ok) return;
+        }
+
+        long before = sys.Gs.ImageBytesWritten;
+        int total = 0;
+        // Prefer TIT1 (title surface); then R_SHELL. Skip Fedo header (magic+version).
+        if (tit1Ok)
+            total += HostToLocalFedoBulk(sys.Gs, sys.Memory, tit1, maxBytes: 256 * 1024,
+                dbp64: 0x0000, dbwPx: 512, dpsm: 0x00);
+        if (total < 32_000 && shellOk)
+            total += HostToLocalFedoBulk(sys.Gs, sys.Memory, shell, maxBytes: 256 * 1024,
+                dbp64: total > 0 ? 0x0800 : 0x0000, dbwPx: 512, dpsm: 0x00);
+
+        _shellImageFedBytes = total;
+        _shellImageFed = total > 0 || sys.Gs.ImageBytesWritten > before;
+        if (total > 0)
+        {
+            try { sys.Gs.ForceRefreshPresentComposite(); } catch { /* ignore */ }
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[GOW] MENU-GOW Host->Local shell/title fed={total} " +
+                    $"imgBytes={sys.Gs.ImageBytesWritten} lit={sys.Gs.CountLitPresentPixels()} " +
+                    $"src={sys.Gs.LastCompositeSource} cyc={c}");
+        }
+    }
+
+    /// <summary>
+    /// Skip Fedo magic header when present and BITBLT Host→Local bulk RDRAM → GS local.
+    /// Returns bytes accepted by Soft-GS IMAGE path.
+    /// </summary>
+    private static int HostToLocalFedoBulk(Gs gs, SystemMemory mem, uint baseAddr,
+        int maxBytes, int dbp64, int dbwPx, int dpsm)
+    {
+        if (gs == null || mem == null || maxBytes < 256) return 0;
+        int headerSkip = 0;
+        uint magic = mem.Read32(baseAddr);
+        if (magic == 0x4665646Fu) // "Fedo"
+            headerSkip = 0x20; // magic + version + small Fedo hdr residual
+        // Skip zero pad after header.
+        int zeros = 0;
+        for (int i = headerSkip; i < headerSkip + 0x100 && i < maxBytes; i++)
+        {
+            if (mem.Read8(baseAddr + (uint)i) == 0) zeros++;
+            else break;
+        }
+        if (zeros >= 0x10)
+            headerSkip += zeros;
+        // Find first 256-byte window with ≥32 nonzero bytes (avoid pure zero pad).
+        int bestOff = headerSkip;
+        for (int off = headerSkip; off + 256 < maxBytes && off < headerSkip + 0x4000; off += 0x40)
+        {
+            int nz = 0;
+            for (int i = 0; i < 256; i++)
+                if (mem.Read8(baseAddr + (uint)(off + i)) != 0) nz++;
+            if (nz >= 32) { bestOff = off; break; }
+        }
+        int avail = maxBytes - bestOff;
+        if (avail < 256) return 0;
+
+        int texW = Math.Clamp(dbwPx, 64, 512);
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B or 0x14 => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        // PSMT4 special: Host→Local nibble path wants W×H/2 bytes.
+        if (dpsm == 0x14)
+        {
+            int maxH = Math.Min(448, (avail * 2) / texW);
+            if (maxH < 8) return 0;
+            int use = (texW * maxH) / 2;
+            return HostToLocalFromMem(gs, mem, baseAddr + (uint)bestOff, use,
+                dbp64, texW, dpsm, texW, maxH);
+        }
+        int maxH32 = Math.Min(448, avail / (texW * bpp));
+        if (maxH32 < 8) return 0;
+        int use32 = Math.Min(avail, texW * maxH32 * bpp) & ~3;
+        if (use32 < 256) return 0;
+        return HostToLocalFromMem(gs, mem, baseAddr + (uint)bestOff, use32,
+            dbp64, texW, dpsm, texW, maxH32);
+    }
+
+    /// <summary>
+    /// Program Soft-GS BITBLT Host→Local (TRXDIR=0) and stream RDRAM — same as GIF FLG=2 IMAGE.
+    /// Shared pattern with BloodOmen2SnAssist / MidwayFamilyAssist Dec PL-029.
+    /// </summary>
+    private static int HostToLocalFromMem(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (gs == null || mem == null || byteCount <= 0 || w <= 0 || h <= 0) return 0;
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B => 1,
+            0x14 => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        int maxByGeom = dpsm == 0x14 ? (w * h) / 2 : w * h * bpp;
+        int n = Math.Min(byteCount, maxByGeom);
+        if (n <= 0) return 0;
+
+        int dbwUnits = Math.Max(1, (dbwPx + 63) / 64);
+        ulong bitblt = ((ulong)(dbp64 & 0x3FFF) << 32)
+                     | ((ulong)(dbwUnits & 0x3F) << 48)
+                     | ((ulong)(dpsm & 0x3F) << 56);
+        gs.WriteGsRegister(0x50, bitblt); // BITBLTBUF
+        gs.WriteGsRegister(0x51, 0);      // TRXPOS
+        gs.WriteGsRegister(0x52, (ulong)((uint)w & 0xFFFu) | (((ulong)((uint)h & 0xFFFu)) << 32));
+        gs.WriteGsRegister(0x53, 0);      // TRXDIR Host→Local
+
+        long before = gs.ImageBytesWritten;
+        Span<byte> qw = stackalloc byte[16];
+        int off = 0;
+        while (off < n)
+        {
+            int chunk = Math.Min(16, n - off);
+            for (int i = 0; i < 16; i++)
+                qw[i] = i < chunk ? mem.Read8(src + (uint)(off + i)) : (byte)0;
+            gs.WriteImageData(qw, 0);
+            off += chunk;
+            if (gs.ImageBytesWritten - before >= n) break;
+        }
+        return (int)Math.Min(int.MaxValue, gs.ImageBytesWritten - before);
     }
 
     /// <summary>

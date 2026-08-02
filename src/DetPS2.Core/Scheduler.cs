@@ -26,6 +26,12 @@ public sealed class Scheduler
 
     public ulong MasterCycles => _masterCycles;
     public Mode SchedulingMode { get; set; } = Mode.FixedSlice;
+    /// <summary>
+    /// Per-component quantum inside <see cref="RunFor"/>. Must stay fine enough for
+    /// commercial IOP/SIF binds: SliceSize=512 breaks Whip/Haven (px=0); SliceSize=64
+    /// restores px≈286720 / binds=13 (WHIP-HAVEN A/B). Do not raise the global default
+    /// without re-proving commercial Soft-GS on Whip + Haven host-present.
+    /// </summary>
     public ulong SliceSize { get; set; } = 64;
     public bool UseReportedWorkCost { get; set; } = false;
     public int LastReportedWork { get; private set; }

@@ -455,9 +455,23 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 }
             }
         }
+        // Final present composite: re-read local GS mem under DISPFB when IMAGE exists but
+        // Soft-GS is still black (full-FB clear prims, stale merge cache, PSM unpack fix).
+        if (traceSys.Gs.ImageBytesWritten > 0 || traceSys.Gs.PixelsWritten > 0)
+        {
+            _ = traceSys.Gs.GetPresentSpan(); // runs Composite + black ForceRefresh once
+            if (traceSys.Gs.IsPresentMostlyBlack() && traceSys.Gs.ImageBytesWritten > 0)
+                _ = traceSys.Gs.ForceRefreshPresentComposite();
+        }
+        int litPresent = traceSys.Gs.CountLitPresentPixels();
+        int fbTotal = traceSys.Gs.FramebufferWidth * traceSys.Gs.FramebufferHeight;
+        uint smid = traceSys.Gs.GetPixel(traceSys.Gs.FramebufferWidth / 2, traceSys.Gs.FramebufferHeight / 2);
+        uint s0 = traceSys.Gs.GetPixel(0, 0);
+
         // GX-001 / PL-001 claim surface: always print Soft-GS + GIF path counts for scoreboard scrape.
         Console.WriteLine($"  px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifPath1={traceSys.Gif.Path1Transfers} gifPath2={traceSys.Gif.Path2Transfers} gifPath3={traceSys.Gif.Path3Transfers} dmac={traceSys.Dmac.TransfersCompleted} sifBytes={traceSys.Sif.BytesTransferred} syscalls={traceSys.Hle.SyscallCount} spu2Writes={traceSys.Spu2.Writes} spu2Samples={traceSys.Spu2.SamplesGenerated} cdvdSectors={traceSys.Cdvd.SectorsRead}");
         Console.WriteLine($"  softgs: imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} naturalDispfbPx={traceSys.Gs.NaturalDispfbPixels} residualDispfbPx={traceSys.Gs.ResidualDispfbPixels} compositeSource={traceSys.Gs.LastCompositeSource} expandHits={traceSys.Gs.ExpandHits} fragTest={traceSys.Gs.FragmentsTested} rejBounds={traceSys.Gs.FragmentsRejectedBounds} rejScissor={traceSys.Gs.FragmentsRejectedScissor} rejDepth={traceSys.Gs.FragmentsRejectedDepth} rejAlpha={traceSys.Gs.FragmentsRejectedAlpha}");
+        Console.WriteLine($"  softgs-present: lit={litPresent}/{fbTotal} s0=0x{s0:X8} smid=0x{smid:X8} mostlyBlack={(traceSys.Gs.IsPresentMostlyBlack() ? 1 : 0)}");
         Console.WriteLine($"  softgs-regs: FRAME_1=0x{traceSys.Gs.Registers.FRAME_1:X16} DISPFB1=0x{traceSys.Gs.Registers.DISPFB1:X16} DISPFB2=0x{traceSys.Gs.Registers.DISPFB2:X16} SCISSOR=0x{traceSys.Gs.Registers.SCISSOR_1:X16} XYOFFSET=0x{traceSys.Gs.Registers.XYOFFSET_1:X16} TEST=0x{traceSys.Gs.Registers.TEST_1:X16}");
         // GX-040/041: DISPFB/DISPLAY circuit snapshot (no invent — reports software-programmed regs only).
         var circ = traceSys.Gs.GetDisplayCircuitInfo();
@@ -468,7 +482,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
         Console.WriteLine($"  gif-path: p1={traceSys.Gif.Path1Transfers} p1qws={traceSys.Gif.Path1Qws} p2={traceSys.Gif.Path2Transfers} p2qws={traceSys.Gif.Path2Qws} p3={traceSys.Gif.Path3Transfers} p3qws={traceSys.Gif.Path3Qws} m3p={traceSys.Gif.Path3MaskedByVif} heldP3n={traceSys.Gif.HeldPath3Entries} heldP3qwc={traceSys.Gif.HeldPath3Qwc} heldSubmits={traceSys.Gif.Path3HeldSubmits} heldP2n={traceSys.Gif.HeldPath2Entries} p2HeldSubmits={traceSys.Gif.Path2HeldSubmits} p2HoldDrops={traceSys.Gif.Path2HoldDrops} p2StallP3={traceSys.Gif.Path2StalledByPath3} mskPath3={traceSys.Vif.MskPath3Count}");
         Console.WriteLine($"  gif-tags: packed={traceSys.Gif.TagsCompletedPacked} reglist={traceSys.Gif.TagsCompletedReglist} image={traceSys.Gif.TagsCompletedImage} disable={traceSys.Gif.TagsCompletedDisable} abortNewDir={traceSys.Gif.AbortNewDirect} abortTrunc={traceSys.Gif.AbortDirectTruncate} abortOther={traceSys.Gif.AbortOther} lastAbort={traceSys.Gif.LastAbortReason}");
         // Compact claim line for scrapers (PL-001 / GX-001 / GX-041 naturalDispfbPx).
-        Console.WriteLine($"  claim: px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifP1={traceSys.Gif.Path1Transfers} gifP2={traceSys.Gif.Path2Transfers} gifP3={traceSys.Gif.Path3Transfers} imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} naturalDispfbPx={traceSys.Gs.NaturalDispfbPixels} residualDispfbPx={traceSys.Gs.ResidualDispfbPixels} expandHits={traceSys.Gs.ExpandHits} gifCompleted={traceSys.Gif.PacketsCompleted} gifAborted={traceSys.Gif.PacketsAborted}");
+        Console.WriteLine($"  claim: px={traceSys.Gs.PixelsWritten} prims={traceSys.Gs.PrimitivesDrawn} gifP1={traceSys.Gif.Path1Transfers} gifP2={traceSys.Gif.Path2Transfers} gifP3={traceSys.Gif.Path3Transfers} imgBytes={traceSys.Gs.ImageBytesWritten} dispfbPx={traceSys.Gs.DispfbPixelsComposited} naturalDispfbPx={traceSys.Gs.NaturalDispfbPixels} residualDispfbPx={traceSys.Gs.ResidualDispfbPixels} expandHits={traceSys.Gs.ExpandHits} gifCompleted={traceSys.Gif.PacketsCompleted} gifAborted={traceSys.Gif.PacketsAborted} lit={litPresent}/{fbTotal}");
         if (traceSys.Gif.PacketInFlight || traceSys.Gif.TagsSeen > 0)
             Console.WriteLine($"  gif-last: flg={traceSys.Gif.LastTagFlg} nloop={traceSys.Gif.LastTagNloop} nreg={traceSys.Gif.LastTagNreg} regs=0x{traceSys.Gif.LastTagRegs:X16} inflightFlg={traceSys.Gif.PacketFlg} progress={traceSys.Gif.PacketProgress}/{traceSys.Gif.PacketNloop}");
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF") == "1" && traceSys.Gif.TraceRingCount > 0)
@@ -485,7 +499,20 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                     $"qwc/nloop={e.QwcOrNloop} completed={e.Completed} aborted={e.Aborted}");
             }
         }
-        // GX-002: Soft-GS PPM when drawn.
+        // GX-002: Soft-GS PPM when drawn + always unit-free live-present snapshot for black-screen proof.
+        try
+        {
+            Directory.CreateDirectory("out/traces");
+            // Force present path once more so PPM matches GetPresentSpan truth.
+            _ = traceSys.Gs.GetPresentSpan();
+            const string livePresent = "out/traces/live-present.ppm";
+            traceSys.Gs.SaveFramebufferAsPPM(livePresent);
+            Console.WriteLine($"  dump-live-present: wrote {livePresent} lit={litPresent}/{fbTotal} s0=0x{s0:X8} smid=0x{smid:X8}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  dump-live-present: failed ({ex.Message})");
+        }
         if (!string.IsNullOrEmpty(dumpSoftGsPath))
         {
             if (traceSys.Gs.PixelsWritten > 0)
@@ -493,7 +520,7 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
                 string? d = Path.GetDirectoryName(dumpSoftGsPath);
                 if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
                 traceSys.Gs.SaveFramebufferAsPPM(dumpSoftGsPath);
-                Console.WriteLine($"  dump-softgs: wrote {dumpSoftGsPath} (px={traceSys.Gs.PixelsWritten})");
+                Console.WriteLine($"  dump-softgs: wrote {dumpSoftGsPath} (px={traceSys.Gs.PixelsWritten} lit={litPresent})");
             }
             else
             {

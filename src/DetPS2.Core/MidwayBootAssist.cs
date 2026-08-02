@@ -21,6 +21,45 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     public string Serial => "SLUS_210.87";
     public string DisplayName => "Mortal Kombat: Shaolin Monks (USA)";
 
+    /// <summary>
+    /// MENU-SM-3 INTERACTIVE floor: dense pad + PL-011 sel-idx/accept arm here.
+    /// Natural Soft-GS plateaus at gifP3=10 with lit≈237k (<c>NaturalDispfb</c>).
+    /// Keep thrash escapes / logo-spine gates on <see cref="SoftGsChromeFloorPath3"/>
+    /// (historical 11) so early dense thrash does not diverge DISPFB off that path.
+    /// Do not invent DISPFB. TITLE_LOCAL.
+    /// </summary>
+    private const ulong SoftGsInteractiveFloorPath3 = 10;
+
+    /// <summary>
+    /// Historical Soft-GS chrome / thrash-escape floor (gifP3≥11). Logo-spine stop,
+    /// VU/memset/lock thrash guards, and residual second-chrome entry use this so the
+    /// NaturalDispfb@gifP3=10 path is not yanked into broken DISPFB thrash.
+    /// </summary>
+    private const ulong SoftGsChromeFloorPath3 = 11;
+
+    /// <summary>
+    /// MENU-SM-4: Soft-GS <c>NaturalDispfb</c> chrome claim budget (master cycles).
+    /// Live: <c>fleet-50m-mk</c> / 40M are pre-spine (gifP3=5, lit=0, mostlyBlack=1);
+    /// natural lit≈237k lands by <b>100M</b> (<c>sm-menu-100m</c>). Fleet/verify 50M is
+    /// diagnose only for SM — do <b>not</b> invent DISPFB or force PATH3 gap-fill to
+    /// fake lit@50M. Claim Soft-GS chrome only at ≥ this budget.
+    /// </summary>
+    private const ulong SoftGsNaturalChromeClaimCycles = 100_000_000;
+
+    /// <summary>
+    /// MENU-SM-4: earliest natural logo-spine main kick when WAD-scale CDVD is done and
+    /// gifP3 still logo-clear (≤5). Was 50.5M (just past fleet 50M end). 48M lets a
+    /// 50M diagnose start the natural spine; full NaturalDispfb lit still needs
+    /// <see cref="SoftGsNaturalChromeClaimCycles"/>.
+    /// </summary>
+    private const ulong SoftGsLogoSpineEarlyKickCycles = 48_000_000;
+
+    /// <summary>
+    /// MENU-SM-3: D770 / stream tick / PATH3 gap-fill residual floor (same as chrome
+    /// floor). Heavy assist PATH3 default OFF — see DETPS2_SM_PATH3_GAPFILL.
+    /// </summary>
+    private const ulong SecondChromeAssistPath3Floor = SoftGsChromeFloorPath3;
+
     public const uint WorklistBase = 0x0077A080;
     public const uint WorkItemsBase = 0x01F00000;
     public const int WorkItemStride = 0x40;
@@ -289,6 +328,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _secondChromePath3Kicks = 0;
         _lastSecondChromePath3Cyc = 0;
         _sawFbb0WithBody = false;
+        _loggedNaturalChromeSkipGapFill = false;
         _menuSelIndex = 0;
         _menuSelPlants = 0;
         _menuSelHolds = 0;
@@ -850,7 +890,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // moving (further main re-entry storms IOPRP gen≥2 and clears pad open areas).
         if (_logoSpineKicks >= 4) return;
         if (sys.MasterCycles - _lastLogoSpineKickCyc < 2_500_000) return;
-        if ((sys.Gif?.Path3Transfers ?? 0) >= 11) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3) return;
         if (sys.Memory.Read32(0x00212F70) != 0x27BDFEE0) return; // main wiped
         // Group-6 multi already filled: stay in pump/pad once spine is moving.
         if (sys.Memory.Read32(0x0075E950) == 0x0043F920u
@@ -1457,12 +1497,14 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Post-merge path parks in ADX/pad bands (0x414xxx/0x4275xx/0x429Cxx) at gifP3=5
         // without ever re-entering format/list-walk. After bulk WAD, force the same main
         // re-home menu6 used after format stall so logo spine can advance (gifP3 5→12).
-        // Wave-14: also at ~50.5M when gifP3<=5 and WAD-scale CDVD done (historical AdEL
-        // timing). Require >=180k sectors so main re-entry cannot truncate GAMEDATA.
+        // Wave-14 / MENU-SM-4: early kick at SoftGsLogoSpineEarlyKickCycles (48M) when
+        // gifP3<=5 and WAD-scale CDVD done so fleet 50M can start natural spine (still
+        // pre-NaturalDispfb; lit claim remains SoftGsNaturalChromeClaimCycles=100M).
+        // Primary kick still 58M. Require >=180k sectors so main re-entry cannot truncate GAMEDATA.
         if (!_resourceBindResumePending
-            && sys.Cdvd.SectorsRead >= 180_000 && (sys.Gif?.Path3Transfers ?? 0) < 11
+            && sys.Cdvd.SectorsRead >= 180_000 && (sys.Gif?.Path3Transfers ?? 0) < SoftGsChromeFloorPath3
             && (c >= 58_000_000
-                || (c >= 50_500_000 && (sys.Gif?.Path3Transfers ?? 0) <= 5)))
+                || (c >= SoftGsLogoSpineEarlyKickCycles && (sys.Gif?.Path3Transfers ?? 0) <= 5)))
             MaybeKickMainForLogoSpine(sys);
         // Pad inject START/CROSS after bulk WAD so title/menu can observe input.
         // (Also fired inside pump-lock clear; this covers non-lock-wait PC bands.)
@@ -1476,8 +1518,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeBreakMenuMemset(sys);
         // After logo spine, kill countdown thrash at 0x427594 (pad-poll callback list)
         // when s2 is absurd so CROSS/DOWN can reach accept paths past the list.
-        // Wave-8: gifP3>=11 (not 12) so plateau-11 covers pad accept.
-        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11)
+        // Wave-8: thrash-escape floor SoftGsChromeFloorPath3 (11). INTERACTIVE pad uses
+        // SoftGsInteractiveFloorPath3 (10) separately so NaturalDispfb@10 is not yanked.
+        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3)
             MaybeBreakMenuCallbackCountdown(sys);
         // Post-spine pump thrash (empty group-6): re-home toward Midway main so menu
         // state machine can observe pad edges written into ghost PADMAN DMA areas.
@@ -1523,7 +1566,15 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // Once C1C0 has been entered, soft-complete to trampoline with sealed slot.
         if (_resourceBindResumePending && _resourceBindPhase == 3)
             MaybeCompleteC1C0AfterEntry(sys);
-        if (c >= 70_000_000 && sys.Cdvd.SectorsRead >= 180_000
+        // MENU-SM-3: force resource slot-bind / reseal feed second-chrome residual and
+        // thrash GS DISPFB (live FBW=3584) off the NaturalDispfb Soft-GS path. Default
+        // OFF with D770/gap-fill; opt-in DETPS2_SM_PATH3_GAPFILL=1. Resume still runs
+        // if a force was already armed. Do not invent DISPFB.
+        bool secondChromeResidualEarly = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_SM_PATH3_GAPFILL"), "1",
+            StringComparison.Ordinal);
+        if (secondChromeResidualEarly
+            && c >= 70_000_000 && sys.Cdvd.SectorsRead >= 180_000
             && (sys.Gif?.Path3Transfers ?? 0) >= 8
             && !_resourceBindResumePending)
             MaybeForceResourceSlotBind(sys);
@@ -1534,7 +1585,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             MaybeRearmStreamCas(sys);
         // Wave-6: after BFC0 bind, re-seal slot0/object if thrash corrupted them and re-arm
         // D770 sticky +0x44 so FBB0→D770 can re-enter (D7C8 clears +0x44 on first visit).
-        if (c >= 71_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending)
+        if (secondChromeResidualEarly
+            && c >= 71_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending)
             MaybeResealResourceSlot(sys);
         // Wave-7: resume forced D770 before other thrash escapes can steal PC.
         if (_d770ForceResumePending)
@@ -1552,37 +1604,53 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = 0x0043FAE8UL });
             Assists++;
         }
+        // Wave-7 / MENU-SM-3: D770 + stream-tick + PATH3 gap-fill are residual second-chrome
+        // assists. Live: even D770-without-gap-fill left DISPFB garbage (FBW=3584) and
+        // lit≪ NaturalDispfb@gifP3=10 floor. Default OFF — prefer NaturalDispfb Soft-GS +
+        // INTERACTIVE (SoftGsChromeFloorPath3). Opt-in: DETPS2_SM_PATH3_GAPFILL=1.
+        bool secondChromeResidual = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_SM_PATH3_GAPFILL"), "1",
+            StringComparison.Ordinal);
         // Wave-7: after slot+type2 body live, force FUN_0044D770 so type-2 jump table
         // (44D860→44DA10/44DAC0) runs with real WAD body — FBB0 alone early-outs on skeleton.
-        if (c >= 72_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending
-            && !_d770ForceResumePending && (sys.Gif?.Path3Transfers ?? 0) >= 11
-            && (sys.Gif?.Path3Transfers ?? 0) < 16)
+        if (secondChromeResidual
+            && c >= 72_000_000 && _resourceBindPhase >= 3 && !_resourceBindResumePending
+            && !_d770ForceResumePending
+            && (sys.Gif?.Path3Transfers ?? 0) >= SecondChromeAssistPath3Floor
+            && (sys.Gif?.Path3Transfers ?? 0) < 16
+            && !NaturalSoftGsChromeHeld(sys))
             MaybeForceD770Draw(sys);
         // Wave-7b: after body plant, force stream tick 0x43F920 (frame-cb leaf) so FAE8
         // walk + natural FBB0→D770 re-enter with live type-2 object.
-        if (c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
+        if (secondChromeResidual
+            && c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
             && !_resourceBindResumePending && !_d770ForceResumePending
-            && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 16)
+            && (sys.Gif?.Path3Transfers ?? 0) >= SecondChromeAssistPath3Floor
+            && (sys.Gif?.Path3Transfers ?? 0) < 16
+            && !NaturalSoftGsChromeHeld(sys))
             MaybeForceStreamTick(sys);
-        // Wave-7 + PL-031: gap-fill second-chrome PATH3 only after D770 natural attempt
-        // and while Soft-GS floor still missing (see MaybeSubmitSecondChromePath3).
-        if (c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
+        // Wave-7 + PL-031 + MENU-SM-3: gap-fill second-chrome PATH3 residual (opt-in).
+        if (secondChromeResidual
+            && c >= 74_000_000 && _resourceBindPhase >= 3 && _resourceBodyPlanted
             && _c1c0Entered && _d770ForceCount >= 1
-            && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 20)
+            && (sys.Gif?.Path3Transfers ?? 0) >= SecondChromeAssistPath3Floor
+            && (sys.Gif?.Path3Transfers ?? 0) < 20
+            && !NaturalSoftGsChromeHeld(sys))
             MaybeSubmitSecondChromePath3(sys);
-        // Wave-7: stable menu selection index driven by D-pad (0..N rows).
-        if (c >= 60_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending
+        // Wave-7 / MENU-SM-3: stable menu selection index driven by D-pad (0..N rows).
+        // SoftGsInteractiveFloorPath3 (10) so NaturalDispfb@gifP3=10 still gets INTERACTIVE.
+        if (c >= 60_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3 && !_resourceBindResumePending
             && !_d770ForceResumePending)
             MaybePlantMenuSelectionIndex(sys);
         // Wave-9: post-spine sticky park in syscall-68 / worker 0x47FD..0x480B and ADX
         // re-init 0x4143A0 — starve second chrome + pad accept.
         // Wave-6: skip while resource force is live (thrash escapes abort BFC0 mid-call).
-        if (c >= 75_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending
+        if (c >= 75_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3 && !_resourceBindResumePending
             && !_d770ForceResumePending)
             MaybeEscapePostSpineWorkerThrash(sys);
         // Lock wrappers 0x426EF8/0x426F04 thrash after group-6 fills (refcount @ 0x54E5E0).
-        // Wave-8: gifP3>=11 (not 12). Wave-6: gate on force bind.
-        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11 && !_resourceBindResumePending)
+        // Wave-8: thrash floor SoftGsChromeFloorPath3 (11). Wave-6: gate on force bind.
+        if (c >= 70_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3 && !_resourceBindResumePending)
             MaybeBreakLockWrapperThrash(sys);
         // Title-band hash/mix loops with corrupt cursors walk into ELF code
         // (live: sw @ 0x47EB28 zeros main; later sh @ 0x47EFA8 corrupts main).
@@ -1597,7 +1665,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         }
         // VU blit at 0x385674 sqc2 vi5,0(a0) with corrupt a0 overwrites EE code
         // (live find-writer: pc=0x385674 cyc≈81.9M zeros main).
-        if (c >= 65_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= 11)
+        if (c >= 65_000_000 && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3)
             MaybeGuardVuBlitCodeDest(sys);
         // Escape stuck bare-eret interrupt vector / HLE scratch if EE never leaves it.
         MaybeEscapeStuckIntVector(sys);
@@ -2788,7 +2856,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // On first absurd clear after logo spine: nop the back-edge so re-entry cannot wipe
         // the ELF image for millions of cycles (menu6-proven approach). Full jr-ra stub of
         // the body is reserved for repeated absurd hits that still re-enter.
-        if ((sys.Gif?.Path3Transfers ?? 0) >= 11 && !_memsetFnStubbed
+        if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3 && !_memsetFnStubbed
             && sys.Memory.Read32(0x0038528C) != 0u)
         {
             sys.Memory.Write32(0x0038528C, 0u); // nop bne back-edge
@@ -2967,7 +3035,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool interactive = (sys.Gif?.Path3Transfers ?? 0) >= 12 || (multiLive && frameCbLive);
         ulong interval = (sys.Gif?.Path3Transfers ?? 0) >= 14 ? 3_000UL
             : interactive ? 5_000UL
-            : (sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive ? 12_000UL
+            : (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3 || multiLive ? 12_000UL
             : 200_000UL;
         if (sys.MasterCycles - _lastMenuPadCyc < interval) return;
         _lastMenuPadCyc = sys.MasterCycles;
@@ -2988,8 +3056,9 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         int phase = (int)((sys.MasterCycles / 1_000_000) % 6);
         // After spine: longer START hold then CROSS accept (menu confirm pattern).
         // Include D-pad so selection index can move before CROSS accept.
+        // MENU-SM-3: SoftGsInteractiveFloorPath3 so NaturalDispfb@gifP3=10 is dense.
         uint buttons;
-        if ((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive)
+        if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3 || multiLive)
         {
             // In menu-class PC bands: D-pad then CROSS so selection/accept advances.
             // Accept-heavy once interactive (gifP3≥12 or multi+frame-cb): more CROSS edges.
@@ -3056,17 +3125,25 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                 _ => 0u
             };
         }
-        try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        // MENU-SM free-ride: yield to pad-script / external Press — do not clobber
+        // scripted START/CROSS holds (tools/pad-scripts/sm-menu-interactive.pad).
+        // Still plant sel-idx from whatever host buttons are live.
+        bool externalHold = false;
+        try { externalHold = sys.Pad.Buttons != 0; } catch { /* ignore */ }
+        if (!externalHold)
+        {
+            try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        }
 
         // PL-011: drive sel-idx / accept on every pad pulse (edge timing is accurate here;
         // MaybePlantMenuSelectionIndex re-holds cells on a slower cadence).
-        if ((sys.Gif?.Path3Transfers ?? 0) >= 11)
+        if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3)
             MaybePlantMenuSelectionIndex(sys);
 
         // Wave-11: selection-index delta on every D-pad pulse once spine is live (not only
         // sparse menu-sel samples — those miss edge timing).
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (sys.Gif?.Path3Transfers ?? 0) >= 11
+            && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3
             && (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
                 | PadInput.Button.Left | PadInput.Button.Right)) != 0)
             MaybeLogSelectionIndexDelta(sys, buttons);
@@ -3080,7 +3157,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             rpc?.ForceRefreshPad(sys.Memory, sys.Pad);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && _menuPadPulses <= 4
-                && (sys.Gif?.Path3Transfers ?? 0) >= 11)
+                && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3)
                 Console.Error.WriteLine(
                     $"[BIOS] menu pad pulse n={_menuPadPulses} btn=0x{buttons:X4} " +
                     $"open={rpc?.OpenPadCount ?? -1} ghost={rpc?.GhostPadCount ?? -1} " +
@@ -3089,7 +3166,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         catch { /* ignore */ }
 
         // Keep workers alive so pad edge is observed on a running thread.
-        if (((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive) && (_menuPadPulses % 2) == 0)
+        if (((sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3 || multiLive) && (_menuPadPulses % 2) == 0)
         {
             var kernel = sys.Hle?.Kernel;
             if (kernel != null)
@@ -3120,7 +3197,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // (selection index typically 0..N where N≤16). Wave-9: also scan 0x54E680..0x54E780
         // and 0x54F000..0x54F100 for alternate Midway menu object slots.
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && ((sys.Gif?.Path3Transfers ?? 0) >= 11 || multiLive)
+            && ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3 || multiLive)
             && (_menuPadPulses == 16 || _menuPadPulses == 64 || _menuPadPulses == 128
                 || _menuPadPulses == 256 || (_menuPadPulses > 0 && _menuPadPulses % 512 == 0)))
         {
@@ -3681,7 +3758,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (cas == 0)
         {
             // Still re-open once gifP3 is plateaued so a later plant of cas=1 gets cleared.
-            if ((sys.Gif?.Path3Transfers ?? 0) < 11 || (sys.Gif?.Path3Transfers ?? 0) >= 14)
+            if ((sys.Gif?.Path3Transfers ?? 0) < SoftGsChromeFloorPath3 || (sys.Gif?.Path3Transfers ?? 0) >= 14)
                 return;
             // gifP3 11..13 and cas already 0: nothing to do this tick.
             return;
@@ -3907,8 +3984,8 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         foreach (var kv in now) _selIndexSnapshot[kv.Key] = kv.Value;
 
         if (deltas.Length == 0) return;
-        // Prefer logging when D-pad is held; also log any movement once gifP3>=11.
-        if (!dpad && (sys.Gif?.Path3Transfers ?? 0) < 11) return;
+        // Prefer logging when D-pad is held; also log any movement once INTERACTIVE floor.
+        if (!dpad && (sys.Gif?.Path3Transfers ?? 0) < SoftGsInteractiveFloorPath3) return;
         _selIndexDeltaLogs++;
         Console.Error.WriteLine(
             $"[BIOS] sel-idx-delta{deltas} dpad={(dpad ? 1 : 0)} btn=0x{buttons:X4} " +
@@ -3963,7 +4040,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         bool multiReady = sys.Memory.Read32(0x0075E950) == StreamTickFn
             || sys.Cdvd.SectorsRead >= 180_000;
 
-        if (!multiReady && (sys.Gif?.Path3Transfers ?? 0) < 11)
+        if (!multiReady && (sys.Gif?.Path3Transfers ?? 0) < SoftGsChromeFloorPath3)
             return;
 
         sys.Memory.Write32(FrameCbSlot, StreamTickFn);
@@ -4026,7 +4103,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         if (stickyBand || stickyRef)
         {
             // Wave-10: group-6 entry (a0=6) + heal $ra once spine is live.
-            if ((sys.Gif?.Path3Transfers ?? 0) >= 11)
+            if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3)
             {
                 uint menuResume = ApplyMenuDispatchResume(sys);
                 if (menuResume != 0)
@@ -4432,7 +4509,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _adxPumpLockYields = 0;
         // Wave-10: after logo spine, leave ADX lock-wait into group-6 multi so pad/UI
         // callbacks run instead of hammering ReferThreadStatus forever (live 100M+ wall).
-        if ((sys.Gif?.Path3Transfers ?? 0) >= 11
+        if ((sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3
             && sys.MasterCycles - _lastAdxMenuKickCyc >= 400_000
             && sys.Memory.Read32(0x0075E950) == 0x0043F920u)
         {
@@ -5236,7 +5313,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     {
         if (_resourceSlotReseals >= 48) return;
         if (sys.MasterCycles - _lastResourceSlotResealCyc < 1_000_000) return;
-        if ((sys.Gif?.Path3Transfers ?? 0) < 11) return;
+        if ((sys.Gif?.Path3Transfers ?? 0) < SoftGsChromeFloorPath3) return;
 
         const uint Slot = 0x0055E25C;
         uint flag = sys.Memory.Read32(Slot);
@@ -5249,7 +5326,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
                                     || sys.Memory.Read32(obj + 0x48) > 4));
 
         // Also re-arm when gifP3 plateaued — force another D770 attempt.
-        if (!needs && (sys.Gif?.Path3Transfers ?? 0) >= 11 && (sys.Gif?.Path3Transfers ?? 0) < 14
+        if (!needs && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsChromeFloorPath3 && (sys.Gif?.Path3Transfers ?? 0) < 14
             && objLive && (_resourceSlotReseals % 2) == 0)
             needs = true;
         if (!needs) return;
@@ -5472,14 +5549,62 @@ public sealed class MidwayBootAssist : IGameQuirkModule
     private int _secondChromePath3Kicks;
     private ulong _lastSecondChromePath3Cyc;
     private bool _sawFbb0WithBody;
+    private bool _loggedNaturalChromeSkipGapFill;
 
     /// <summary>
-    /// Wave-7 + PL-031: gap-fill second-chrome GIF PATH3 through real GIF→Soft-GS.
+    /// MENU-SM-3: true when Soft-GS already has healthy natural DISPFB chrome.
+    /// Live: sm-menu-100m NaturalDispfb lit≈237k @ gifP3=10; sm-menu-150m gap-fill
+    /// gifP3=18 regressed lit→81k naturalDispfbPx→0 (DISPFB FBW garbage). Prefer that
+    /// natural surface over assist PATH3. Does <b>not</b> invent DISPFB — only reads
+    /// software-programmed registers + composite telemetry. TITLE_LOCAL.
+    /// </summary>
+    private static bool NaturalSoftGsChromeHeld(Ps2System sys)
+    {
+        if (sys.Gs == null) return false;
+        if (sys.Gs.NaturalDispfbPixels > 1000) return true;
+        if (sys.Gs.LastCompositeSource == GsCompositeSource.NaturalDispfb
+            && sys.Gs.DispfbPixelsComposited > 1000)
+            return true;
+
+        // Circuit-level early signal (before first present accumulates NaturalDispfbPixels):
+        // retail lit chrome uses low FBP page (0x1400 → FBP=0) + 512–640 FBW + EN.
+        // Logo-era black clear often parks DISPFB at high page (0x1446 → FBP=0x46) — not held.
+        // Reject garbage post-assist widths (live FBW=3584).
+        try
+        {
+            var circ = sys.Gs.GetDisplayCircuitInfo();
+            if (!circ.HasEnabledNaturalDispfb) return false;
+            var d = circ.PreferredDispfb;
+            int fbw = d.BufWidthPixels;
+            int psm = d.Psm;
+            int fbp = d.Fbp;
+            // PSMCT32/24/16/16S (0..2, 0xA) — common menu FB formats.
+            bool psmOk = psm is 0 or 1 or 2 or 0xA;
+            bool fbwOk = fbw is >= 320 and <= 1280;
+            // Low-page display buffer (menu composite), not logo high-page empty RGB.
+            bool fbpOk = fbp is >= 0 and <= 4;
+            if (fbwOk && psmOk && fbpOk)
+                return true;
+        }
+        catch
+        {
+            /* ignore — telemetry only */
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Wave-7 + PL-031 + MENU-SM-3: gap-fill second-chrome GIF PATH3 through real GIF→Soft-GS.
     /// <para>
     /// PL-031 demotion: only after at least one natural D770 force (subtype-4 bind arm),
     /// only while Soft-GS floor still missing (gifP3&lt;18 or prims&lt;9), early-stop when
     /// floor held, first kick delayed so FAE8/D770 get a natural window. Cap remains 4
-    /// only as gap-fill residual — prefer fewer when natural advances. TITLE_LOCAL.
+    /// only as gap-fill residual — prefer fewer when natural advances.
+    /// </para>
+    /// <para>
+    /// MENU-SM-3: skip entirely when <see cref="NaturalSoftGsChromeHeld"/> — heavy assist
+    /// PATH3 regressed NaturalDispfb lit. Prefer natural gifP3≥10 Soft-GS surface + hold
+    /// INTERACTIVE (pad/sel-idx) over historical gifP3=18 assist. TITLE_LOCAL.
     /// </para>
     /// </summary>
     private void MaybeSubmitSecondChromePath3(Ps2System sys)
@@ -5487,6 +5612,44 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // PL-031: cap 4 as residual gap-fill only; early-stop when MENU floor held.
         if (_secondChromePath3Kicks >= 4) return;
         if (sys.Gif == null) return;
+
+        // MENU-SM-3: heavy PATH3 gap-fill is residual / opt-in only.
+        // Live: assist 11→18 always regressed NaturalDispfb (lit 237k→81k, natPx→0,
+        // DISPFB FBW=3584 garbage) vs natural Soft-GS at gifP3=10 (lit≈237k).
+        // Prefer natural gifP3≥10 Soft-GS + INTERACTIVE; do not invent DISPFB.
+        // Opt-in historical MENU assist: DETPS2_SM_PATH3_GAPFILL=1
+        bool gapFillOptIn = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_SM_PATH3_GAPFILL"), "1",
+            StringComparison.Ordinal);
+        if (!gapFillOptIn)
+        {
+            if (!_loggedNaturalChromeSkipGapFill
+                && Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                _loggedNaturalChromeSkipGapFill = true;
+                Console.Error.WriteLine(
+                    $"[BIOS] MENU-SM-3 PATH3 gap-fill OFF (set DETPS2_SM_PATH3_GAPFILL=1 to enable residual) " +
+                    $"gifP3={sys.Gif.Path3Transfers} natPx={sys.Gs?.NaturalDispfbPixels ?? 0} " +
+                    $"cyc={sys.MasterCycles}");
+            }
+            return;
+        }
+
+        // Never heavy-assist PATH3 over healthy NaturalDispfb chrome (even when opt-in).
+        if (NaturalSoftGsChromeHeld(sys))
+        {
+            if (!_loggedNaturalChromeSkipGapFill
+                && Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
+                _loggedNaturalChromeSkipGapFill = true;
+                Console.Error.WriteLine(
+                    $"[BIOS] MENU-SM-3 skip PATH3 gap-fill: NaturalDispfb held " +
+                    $"natPx={sys.Gs.NaturalDispfbPixels} dispfbPx={sys.Gs.DispfbPixelsComposited} " +
+                    $"src={sys.Gs.LastCompositeSource} gifP3={sys.Gif.Path3Transfers} " +
+                    $"cyc={sys.MasterCycles}");
+            }
+            return;
+        }
         // Require one natural D770 force attempt so bind path runs before assist PATH3.
         if (_d770ForceCount < 1) return;
 
@@ -5496,6 +5659,10 @@ public sealed class MidwayBootAssist : IGameQuirkModule
             or (>= 0x004442A0 and <= 0x00444300)
             or (>= 0x0043FAE0 and <= 0x0043FBB0);
         if (inDraw)
+            _sawFbb0WithBody = true;
+        // SM-CHROME-2: D770 force already entered the type-2 draw path even if PC
+        // sample between forces is outside FBB0/D770 bands.
+        if (!_sawFbb0WithBody && _d770ForceCount >= 1)
             _sawFbb0WithBody = true;
         if (!_sawFbb0WithBody) return;
 
@@ -5726,7 +5893,7 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // PL-011 accept path: rising CROSS / START / CIRCLE after spine → latch state change.
         bool acceptEdge = (rising & (uint)(PadInput.Button.Cross | PadInput.Button.Start
             | PadInput.Button.Circle)) != 0;
-        if (acceptEdge && (sys.Gif?.Path3Transfers ?? 0) >= 11
+        if (acceptEdge && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3
             && sys.MasterCycles - _lastMenuAcceptCyc >= 200_000)
         {
             _menuAcceptEdges++;
@@ -5761,20 +5928,29 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         // T2 INTERACTIVE proven when sel-idx walked ≥2 rows OR accept edge fired under pad.
         if (!_menuSelInteractiveProven
             && (_menuSelMaxReached >= 2 || _menuAcceptEdges >= 1)
-            && (sys.Gif?.Path3Transfers ?? 0) >= 11)
+            && (sys.Gif?.Path3Transfers ?? 0) >= SoftGsInteractiveFloorPath3)
         {
             _menuSelInteractiveProven = true;
             Assists++;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                Console.Error.WriteLine(
-                    $"[BIOS] PL-011 INTERACTIVE proven sel-idx={idx} max={_menuSelMaxReached} " +
-                    $"accepts={_menuAcceptEdges} rows={RowCount} " +
-                    $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+            // Always-on claim log so live-queue err captures INTERACTIVE without TRACE_BIOS
+            // (pad jobs otherwise leave empty stderr; DEC MKFAM already always-logs).
+            Console.Error.WriteLine(
+                $"[BIOS] PL-011 INTERACTIVE proven sel-idx={idx} max={_menuSelMaxReached} " +
+                $"accepts={_menuAcceptEdges} rows={RowCount} " +
+                $"gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
         }
 
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_menuSelHolds <= 4 || _menuSelHolds % 32 == 0
-                || ((downEdge || upEdge || acceptEdge) && (_menuSelHolds % 4 == 0))))
+        // Sparse always-on progress (queue evidence) + denser TRACE_BIOS detail.
+        bool claimLog = _menuSelHolds <= 4
+            || _menuSelHolds == 16 || _menuSelHolds == 32 || _menuSelHolds == 64
+            || _menuSelHolds == 128 || _menuSelHolds == 256
+            || (_menuSelHolds % 256) == 0
+            || acceptEdge
+            || ((downEdge || upEdge) && (_menuSelHolds % 16 == 0))
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                && (_menuSelHolds % 32 == 0
+                    || ((downEdge || upEdge || acceptEdge) && (_menuSelHolds % 4 == 0)));
+        if (claimLog)
             Console.Error.WriteLine(
                 $"[BIOS] menu-sel-index={idx} max={_menuSelMaxReached} accepts={_menuAcceptEdges} " +
                 $"holds={_menuSelHolds} plants={_menuSelPlants} " +
@@ -6017,7 +6193,27 @@ public sealed class MidwayBootAssist : IGameQuirkModule
         _resourceBindForceStartCyc = 0;
 
         if (lost)
+        {
             _resourceBindPhase = 4;
+            // SM-CHROME-2 / MENU-SM-3: soft-seal C1C0 only for residual second-chrome path
+            // (DETPS2_SM_PATH3_GAPFILL=1). Default path prefers NaturalDispfb Soft-GS —
+            // soft-seal armed D770/gap-fill and regressed DISPFB. Do not invent DISPFB.
+            bool secondChromeResidual = string.Equals(
+                Environment.GetEnvironmentVariable("DETPS2_SM_PATH3_GAPFILL"), "1",
+                StringComparison.Ordinal);
+            if (secondChromeResidual
+                && _resourceBodyPlanted && slot0 == 1 && IsArenaResourceObject(slot0obj)
+                && !_c1c0Entered)
+            {
+                _c1c0Entered = true;
+                _c1c0EnterCyc = sys.MasterCycles;
+                Assists++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[BIOS] SM-CHROME-2 C1C0 soft-seal after phase-1 ESCAPE " +
+                        $"obj=0x{slot0obj:X8} gifP3={(sys.Gif?.Path3Transfers ?? 0)} cyc={sys.MasterCycles}");
+            }
+        }
         else if (_resourceBindPhase == 1)
             _resourceBindPhase = 2;
         else if (_resourceBindPhase == 3)

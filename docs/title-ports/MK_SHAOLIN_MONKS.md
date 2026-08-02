@@ -8,12 +8,193 @@
 | ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
 | BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s1` |
-| Agent date | 2026-07-31 (S2 / PL-031 natural texture DMA) |
+| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
+| Agent date | 2026-07-31 (MENU-SM free-ride residual + pad queue) |
 | ROMDIR gate | **CLOSED** |
-| Branch | `agent/seat-s1/s2-g2` |
-| menuKind | **mk-mainmenu** MENU YES · **INTERACTIVE YES** (T2) |
-| Seat | **S1** MIDWAY-SM |
+| Branch | main worktree `detps2` |
+| menuKind | **mk-mainmenu** Soft-GS · **INTERACTIVE YES** (T2 PL-011 @gifP3≥10) · natural gifP3=**11** (assist PATH3 opt-in) |
+| Seat | **MENU-SM-4** MidwayBootAssist owner |
+| Live Soft-GS (natural peak) | @**100M** lit=**237568** · naturalDispfbPx=**94208** · gifP3=**10** · compositeSource=**NaturalDispfb** |
+| Live Soft-GS (pad / gifP3=11) | @**150M** pad lit=**17760** · mostlyBlack=**1** · gifP3=**11** · NaturalDispfb weak residual |
+| Soft-GS claim budget | **≥100M** for lit chrome — fleet/verify **50M expected lit=0** (pre-spine) |
+| Second-chrome residual | Heavy PATH3 gap-fill / D770 force **default OFF** (`DETPS2_SM_PATH3_GAPFILL=1` opt-in) — was regressing NaturalDispfb |
+| Free-ride residual | Natural AnimMenu consumer still open; Soft-GS chrome weak once gifP3=11 |
+
+---
+
+## MENU-SM free-ride residual + pad queue (2026-07-31)
+
+**Mandate:** Drain `sm-pad-150m-*` / free-ride remeasure; scrape INTERACTIVE (prim Δ, state change, pad pulses); no invent DISPFB; Soft-GS truth; SEMA_OFF; queue ≤3.
+
+### Live-queue pad jobs (SEMA_OFF, host-present)
+
+| Job | Budget | pad-script | PC | px | lit | prims | gifP3 | naturalDispfbPx | mostlyBlack | INTERACTIVE |
+|-----|-------:|------------|-----|-----|----:|------:|------:|----------------:|:-----------:|:-----------:|
+| **sm-pad-150m-20260731-150519** | 150M | `sm-menu-interactive.pad` (62 acts) | `0x004275D8` | 591200 | **17760** | 3 | **11** | **17760** | **1** | (no TRACE log) |
+| **sm-pad-free-20260731-150927** | 150M | same (62 acts) | `0x004275D8` | 591200 | **17760** | 3 | **11** | **17760** | **1** | **PL-011 YES** |
+| sm-sm3-final-150m-pad (prior) | 150M | same | `0x004275D8` | 591200 | 17760 | 3 | 11 | 17760 | — | **PL-011 YES** |
+| sm-menu-100m (natural peak) | 100M | none | `0x00240568` | 1171968 | **237568** | 6 | **10** | **94208** | **0** | pad residual |
+
+**sm-pad-free claim:** `claim: px=591200 prims=3 gifP1=0 gifP2=0 gifP3=11 … naturalDispfbPx=17760 … lit=17760/286720`  
+**pad pulses:** always-on `[BIOS] PL-011 INTERACTIVE proven sel-idx=0 max=0 accepts=1 … gifP3=11 cyc=60000000` → end `max=2 accepts=18 holds=1792 plants=1792`  
+**present:** `softgs-present: lit=17760/286720 … mostlyBlack=1` · circuit enNatural=0 / DISPFB2 FBW garbage residual (same class as MENU-SM-3)
+
+### Free-ride fix (minimal TITLE_LOCAL)
+
+| Change | File | Effect |
+|--------|------|--------|
+| Always-on PL-011 claim log | `MidwayBootAssist.cs` | Queue err captures INTERACTIVE without `DETPS2_TRACE_BIOS` |
+| Yield to pad-script | `MaybeInjectMenuPad` | Do not clobber non-zero host buttons from `sm-menu-interactive.pad` |
+| PATH3 gap-fill | **still default OFF** | Prefer NaturalDispfb; opt-in only |
+
+### Honest INTERACTIVE?
+
+| Signal | Result |
+|--------|--------|
+| Pad script applied | **YES** — 41 events / 62 press-release |
+| gifP3 ≥ SoftGsInteractiveFloorPath3 (10) | **YES** — gifP3=**11** |
+| PL-011 sel-idx / accept plant | **YES** — max=**2** accepts=**18** proven |
+| Soft-GS Δ prims/px under pad | **NO** — plateaus prims=3 lit=17k (no free Soft-GS climb) |
+| Natural AnimMenu free-ride | **NO** — assist plant only; thread-1 often `started=False sleeping=True` |
+| Natural Soft-GS chrome peak | **Hold @100M gifP3=10 lit≈237k** — stronger than pad gifP3=11 plate |
+
+**Verdict:** **INTERACTIVE YES** (formal T2 PL-011 under Soft-GS spine) · **free-ride residual** (no natural menu consumer / weak lit@gifP3=11). **Do not claim MENU lit chrome from pad plate** — claim NaturalDispfb from `sm-menu-100m` (lit≈237k).
+
+### Residual walls (post free-ride wave)
+
+1. **DISPFB / lit regression at gifP3=11** — NaturalDispfb peak holds at gifP3=**10** lit≈237k; post-spine assists + game path leave FBW=3584 garbage / mostlyBlack=1 at gifP3=11. PATH3 gap-fill still OFF (would regress further).
+2. **Natural free-ride** — AnimMenuGUI does not consume assist sel-idx; EE thread-1 often dormant.
+3. **Second-chrome** — natural gifP3 plateaus at 11; gifP3≥18 only via opt-in residual assist.
+4. **gif inflight** at end — `flg=1 nloop=28672` IMAGE half-packet residual.
+
+---
+
+## MENU-SM-4 — Soft-GS natural chrome budget (2026-07-31)
+
+**Mandate:** `fleet-50m-mk` reported **lit=0** while earlier `sm-menu-100m` had **lit high**. Ensure Soft-GS natural chrome by 50M **or** document need 100M. Keep MidwayBootAssist on the **natural** path (no invent DISPFB / default PATH3 gap-fill OFF). Enqueue 50M + 100M.
+
+### Diagnosis (fleet 50M black vs 100M NaturalDispfb)
+
+| Job | Budget | PC | px | lit | gifP3 | naturalDispfbPx | compositeSource | notes |
+|-----|--------|-----|-----|----:|------:|----------------:|-----------------|-------|
+| **fleet-50m-mk** | **50M** | `0x00427594` | 286720 | **0** | 5 | 0 | None | logo clear only; WAD done (cdvd≈198k); **pre logo-spine kick** |
+| client-b-sm-40m | 40M | — | 286720 | **0** | 5 | 0 | None | same black present class |
+| **sm-menu-100m** | **100M** | `0x00240568` | 1171968 | **237568** | **10** | **94208** | **NaturalDispfb** | Soft-GS lit chrome claim |
+| sm-menu-200m | 200M | `0x002404E8` | 1171968 | **237568** | 10 | 94208 | NaturalDispfb | hold — no further natural chrome |
+
+**fleet-50m claim:** `claim: px=286720 prims=1 gifP1=0 gifP2=0 gifP3=5 … lit=0/286720`  
+**circuit @50M:** `DISPFB2=0x1446` FBP=`0x8C000` (empty local RGB) · mostlyBlack=1  
+**100M claim:** `claim: … gifP3=10 … naturalDispfbPx=94208 … lit=237568/286720` · `DISPFB2=0x1400` FBP=0
+
+### Why 50M cannot claim Soft-GS chrome (natural path)
+
+1. **Logo-spine main kick** arms at **48M** early (MENU-SM-4; was 50.5M) / **58M** primary when gifP3≤5 and cdvd≥180k — a pure 50M run barely enters the spine window.
+2. **Natural chrome timeline** after WAD: spine → group-6 / frame-cb (~60M+) → Path3 climb to gifP3≈10 → DISPFB FBP=0 composite → lit≈237k. That full NaturalDispfb surface needs **~100M**, not 50M.
+3. **Do not invent DISPFB** or re-enable PATH3 gap-fill to paint lit@50M — MENU-SM-3 already showed assist PATH3 regresses NaturalDispfb (lit 237k→81k, natPx→0).
+
+### TITLE_LOCAL `MidwayBootAssist` (MENU-SM-4)
+
+| Knob | Value | Role |
+|------|-------|------|
+| `SoftGsNaturalChromeClaimCycles` | **100M** | Documented Soft-GS NaturalDispfb lit claim floor |
+| `SoftGsLogoSpineEarlyKickCycles` | **48M** | Natural logo-spine early kick (gifP3≤5 + WAD) so 50M diagnose can *start* spine |
+| PATH3 gap-fill / D770 / invent DISPFB | **default OFF** | Natural path held; `DETPS2_SM_PATH3_GAPFILL=1` residual only |
+| `SoftGsInteractiveFloorPath3` | 10 | PL-011 under NaturalDispfb@gifP3=10 |
+| `SoftGsChromeFloorPath3` | 11 | Thrash / residual second-chrome floor |
+
+### Budget policy (operators / fleet)
+
+| Budget | Expected Soft-GS | Use |
+|--------|------------------|-----|
+| **≤50M** (fleet / verify) | lit=**0** · gifP3≈5 · mostlyBlack — **not a failure** | diagnose CDVD/WAD / pre-spine PC only |
+| **≥100M** (claim) | lit≈**237k** · NaturalDispfb · gifP3≈10 | Soft-GS natural chrome claim |
+| 150M+ pad | NaturalDispfb + PL-011 INTERACTIVE | interactive charter (MENU-SM-3) |
+
+### Live-queue jobs (MENU-SM-4)
+
+Enqueue re-measure after this doc/code:
+
+| id | cycles | purpose |
+|----|-------:|---------|
+| `sm-sm4-50m` | 50M | Confirm fleet-class black / pre-spine (expected lit=0) |
+| `sm-sm4-100m` | 100M | Re-claim NaturalDispfb lit chrome |
+
+### Residual wall (post MENU-SM-4)
+
+1. Soft-GS natural chrome **cannot** be honest at fleet 50M — claim budget is **100M**.
+2. NaturalDispfb lit@100M (237k) is stronger than MENU-SM-3 assist residual (lit 17k @150M pad with gap-fill OFF) — prefer natural claim plate.
+3. INTERACTIVE / second-chrome (gifP3≥11, PATH3 gap-fill) still residual under natural path.
+
+---
+
+## MENU-SM-3 — prefer natural gifP3, hold INTERACTIVE (2026-07-31)
+
+**Mandate:** SM had gifP3=18 with PATH3 gap-fill; prefer natural gifP3≥11 without heavy assist PATH3; hold INTERACTIVE; improve NaturalDispfb if second chrome regressed lit; do not invent DISPFB.
+
+### Diagnosis (second chrome regressed NaturalDispfb)
+
+| Path | gifP3 | lit | naturalDispfbPx | composite | lastAbort |
+|------|------:|----:|----------------:|-----------|-----------|
+| Morning NaturalDispfb @100M | 10 | **237568** | **94208** | NaturalDispfb EN | — |
+| Assist + gap-fill @150M | **18** | 81920 | **0** | enNatural=0 FBW=3584 garbage | `sm-second-chrome` |
+| **MENU-SM-3 default** @150/200M+pad | **11** natural | 17760 | **17760** | NaturalDispfb (weak) | *(none)* |
+
+Gap-fill SPRITE PATH3 plant lifted gifP3 11→18 but **zeroed** natural DISPFB and left DISPFB2 FBW=3584 garbage. Prefer natural spine.
+
+### TITLE_LOCAL `MidwayBootAssist` (MENU-SM-3)
+
+| Knob | Value | Role |
+|------|-------|------|
+| `SoftGsInteractiveFloorPath3` | **10** | Dense pad + PL-011 sel-idx/accept under NaturalDispfb chrome |
+| `SoftGsChromeFloorPath3` | **11** | Historical thrash-escape / logo-spine floor (do not thrash at 10) |
+| PATH3 gap-fill / D770 / stream-tick / resource force-bind / C1C0 soft-seal | **default OFF** | Residual second-chrome; opt-in `DETPS2_SM_PATH3_GAPFILL=1` |
+| `NaturalSoftGsChromeHeld` | telemetry guard | Skip residual assist when NaturalDispfb already healthy |
+| DISPFB invent | **never** | Soft-GS truth only |
+
+### Claim table (SEMA_OFF, host-present, pad-script)
+
+| Job | Budget | PC | px | lit | prims | gifP3 | naturalDispfbPx | INTERACTIVE | PATH3 gap-fill |
+|-----|--------|-----|-----|-----|------:|------:|----------------:|:-----------:|:--------------:|
+| **sm-sm3-final-150m-pad** | 150M | `0x004275D8` | 591200 | 17760 | 3 | **11** | **17760** | **PL-011 YES** | OFF |
+| **sm-sm3-final-200m-pad** | 200M | `0x0043FBA8` | 591200 | 17760 | 3 | **11** | **17760** | **PL-011 YES** | OFF |
+
+**claim line (150M):** `claim: px=591200 prims=3 gifP1=0 gifP2=0 gifP3=11 imgBytes=1024 dispfbPx=0 naturalDispfbPx=17760 residualDispfbPx=0 expandHits=0 gifCompleted=110598 gifAborted=0 lit=17760/286720`  
+**pad:** applied 62 (150M) / 82 (200M) press/release from `tools/pad-scripts/sm-menu-interactive.pad`  
+**proven:** `[BIOS] PL-011 INTERACTIVE proven sel-idx=1 max=1 accepts=1 rows=5 gifP3=11 cyc=60100000`
+
+### Residual wall (post MENU-SM-3)
+
+1. NaturalDispfb lit **below** morning 237k Soft-GS floor; DISPFB circuit still shows garbage FBW=3584 / enNatural=0 at end of claim — deeper GS path residual (not fixed by invent plant).
+2. Second-chrome MENU floor (gifP3=18 prims=9) only via opt-in residual assist — still regresses NaturalDispfb when enabled.
+3. Natural texture DMA / AnimMenuGUI submenu still residual (PL-031 / PL-021).
+
+---
+
+## MENU-SM live Soft-GS chrome (2026-07-31, host-present queue)
+
+**Mandate:** prior live-queue `client-b-sm-40m` was **black** (`lit=0` mostlyBlack=1) despite gifP3 spine. Re-claim Soft-GS chrome with `lit>1000` and document INTERACTIVE residual.
+
+### Claim (SEMA_OFF, host-present, tip `a8de501` + Release Core)
+
+| Budget | PC | px | lit | mostlyBlack | prims | gifP2 | gifP3 | dispfbPx | naturalDispfbPx | compositeSource | notes |
+|--------|-----|-----|-----|-------------|-------|-------|-------|----------|-----------------|-----------------|-------|
+| 40M baseline | `0x4156F4` | 286720 | **0** | 1 | 1 | 0 | 5 | 0 | 0 | None | logo-spine black clear only |
+| **100M** | `0x240568` | **1171968** | **237568** | **0** | **6** | **1** | **10** | **94208** | **94208** | **NaturalDispfb** | **Soft-GS lit chrome** |
+| **200M** | `0x2404E8` | **1171968** | **237568** | **0** | **6** | **1** | **10** | **94208** | **94208** | **NaturalDispfb** | hold — no further chrome |
+
+**claim line:** `claim: px=1171968 prims=6 gifP1=0 gifP2=1 gifP3=10 imgBytes=1024 dispfbPx=94208 naturalDispfbPx=94208 residualDispfbPx=0 expandHits=0 gifCompleted=110600 gifAborted=0 lit=237568/286720`  
+**present:** `softgs-present: lit=237568/286720 s0=0xFF18608C smid=0xFF18608C mostlyBlack=0`  
+**Jobs:** `sm-menu-100m` / `sm-menu-200m` · full writeup: **`out/traces/menu-sm-claim.md`**
+
+### Black @40M vs lit @100M
+
+- 40M: FRAME/DISPFB still logo-era (`DISPFB2=0x1446` FBP=`0x8C000`) with empty local RGB → compositeSource=None, black Soft-GS truth.
+- ≥100M: `DISPFB2=0x1400` FBP=0 + natural composite fills Soft-GS present; Path2=1 Path3=10; **no Midway invent plant** required for lit bar.
+- Working-tree Soft-GS composite/swizzle in Release Core aids DISPFB→present fidelity (general Gs, not SM-only).
+
+### INTERACTIVE residual (MENU-SM)
+
+Live natural chrome plateaus at **gifP3=10**. PL-011 sel-idx / accept latch and second-chrome PATH3 gap-fill still require **gifP3≥11** (+ D770/C1C0 for PATH3). 200M does not grow Soft-GS past 100M floor. Next: pad-inject scripted edges or TITLE_LOCAL floor retune (10) — do not invent DISPFB.
 
 ---
 

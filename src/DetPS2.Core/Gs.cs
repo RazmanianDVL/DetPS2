@@ -43,6 +43,17 @@ public sealed class Gs : ISchedulable
     private int _trxDpsm;
     private int _trxPending; // leftover bytes when packing multi-byte pixels across QWs
     private uint _trxPartial;
+    // Largest completed Host→Local IMAGE (for residual present when DISPFB FB is empty).
+    // GoW: PSMT4 @ DBP=0xA0800 while DISPFB FBP=0x1A0000 PSMCT24 is black.
+    private uint _lastImageDbpBytes;
+    private int _lastImageDbwPx;
+    private int _lastImageDpsm;
+    private int _lastImageW, _lastImageH;
+    private int _lastImageDsaX, _lastImageDsaY;
+    private long _lastImageByteCount;
+
+    /// <summary>Cached DETPS2_TRACE_GS — never re-parse process env on XYZ path.</summary>
+    private static readonly bool TraceGs = Environment.GetEnvironmentVariable("DETPS2_TRACE_GS") == "1";
 
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
@@ -88,8 +99,18 @@ public sealed class Gs : ISchedulable
     /// Honest B3 residual when software never programs DISPFB.
     /// </summary>
     public long ResidualDispfbPixels { get; private set; }
-    /// <summary>GX-041: last composite source class (NaturalDispfb / Frame / SyntheticFbp0).</summary>
+    /// <summary>GX-041: last composite source class (NaturalDispfb / Frame / SyntheticFbp0 / LastImageTrx).</summary>
     public GsCompositeSource LastCompositeSource { get; private set; }
+    /// <summary>Largest Host→Local IMAGE BITBLT dest byte address (telemetry; 0 if none).</summary>
+    public uint LastImageDbpBytes => _lastImageDbpBytes;
+    /// <summary>Largest Host→Local IMAGE DPSM (telemetry).</summary>
+    public int LastImageDpsm => _lastImageDpsm;
+    /// <summary>Largest Host→Local IMAGE RRW×RRH (telemetry).</summary>
+    public int LastImageWidth => _lastImageW;
+    /// <summary>Largest Host→Local IMAGE RRH (telemetry).</summary>
+    public int LastImageHeight => _lastImageH;
+    /// <summary>Byte count of largest Host→Local IMAGE transfer (telemetry).</summary>
+    public long LastImageByteCount => _lastImageByteCount;
     /// <summary>Last preferred PCRTC circuit (0/1/2) seen during composite.</summary>
     public int LastDisplayCircuit { get; private set; }
     /// <summary>Generation of privileged DISPFB/DISPLAY/PMODE writes (invalidates composite skip).</summary>
@@ -163,6 +184,12 @@ public sealed class Gs : ISchedulable
         _trxDpsm = 0;
         _trxPending = 0;
         _trxPartial = 0;
+        _lastImageDbpBytes = 0;
+        _lastImageDbwPx = 0;
+        _lastImageDpsm = 0;
+        _lastImageW = _lastImageH = 0;
+        _lastImageDsaX = _lastImageDsaY = 0;
+        _lastImageByteCount = 0;
         ImageBytesWritten = 0;
         DispfbPixelsComposited = 0;
         NaturalDispfbPixels = 0;
@@ -172,6 +199,7 @@ public sealed class Gs : ISchedulable
         DisplayCircuitGeneration = 0;
         _lastCompositeImageBytes = 0;
         _lastCompositeCircuitGen = -1;
+        _mergeBlackBypassArmed = false;
         ExpandHits = 0;
         FragmentsRejectedBounds = 0;
         FragmentsRejectedScissor = 0;
@@ -457,7 +485,35 @@ public sealed class Gs : ISchedulable
         _trxY = 0;
         _trxActive = _trxW > 0 && _trxH > 0;
         if (_trxActive)
+        {
             _useProceduralTexture = false;
+            // Track largest Host→Local so residual present can sample real IMAGE pages
+            // (GoW: DISPFB empty CT24 while PSMT4 BITBLT lands at high DBP).
+            NoteLargestImageTransfer(_trxDbpBytes, _trxDbwPx, _trxDpsm, _trxW, _trxH, _trxDsaX, _trxDsaY);
+        }
+    }
+
+    /// <summary>
+    /// Remember the largest Host→Local IMAGE window for residual present composite.
+    /// Byte estimate uses PSM packing (PSMT4 ≈ W×H/2).
+    /// </summary>
+    private void NoteLargestImageTransfer(uint dbp, int dbw, int dpsm, int w, int h, int dsax, int dsay)
+    {
+        if (w <= 0 || h <= 0) return;
+        long bytes = dpsm == 0x14
+            ? (long)w * h / 2
+            : (long)w * h * Math.Max(1, TrxBytesPerPixel(dpsm));
+        if (bytes < 64) return; // ignore tiny CLUT-only probes when a real tex already tracked
+        // Prefer larger; equal size still refreshes dest (re-upload same logo).
+        if (bytes < _lastImageByteCount) return;
+        _lastImageByteCount = bytes;
+        _lastImageDbpBytes = dbp;
+        _lastImageDbwPx = dbw > 0 ? dbw : 64;
+        _lastImageDpsm = dpsm;
+        _lastImageW = w;
+        _lastImageH = h;
+        _lastImageDsaX = dsax;
+        _lastImageDsaY = dsay;
     }
 
     /// <summary>
@@ -551,8 +607,10 @@ public sealed class Gs : ISchedulable
             return (int)SwizzleOffset8(baseBytes, px, py, bufW);
         if (psm is 0x00 or 0x01)
             return (int)SwizzleOffset32(baseBytes, px, py, bufW);
-        if (psm is 0x02 or 0x0A)
+        if (psm == 0x02)
             return (int)SwizzleOffset16(baseBytes, px, py, bufW);
+        if (psm == 0x0A)
+            return (int)SwizzleOffset16S(baseBytes, px, py, bufW);
         if (psm is 0x14)
             return (int)baseBytes + (py * bufW + px) / 2;
         return (int)baseBytes + (py * bufW + px) * bpp;
@@ -656,12 +714,15 @@ public sealed class Gs : ISchedulable
         _hasClut = true;
     }
 
-    /// <summary>Expand RGB555 (+ optional A bit) with TEXA TA0/TA1 / AEM.</summary>
+    /// <summary>
+    /// Expand GS PSMCT16/PSMCT16S RGB555 (+ optional A bit) with TEXA TA0/TA1 / AEM.
+    /// GS CT16 bit layout (PCSX2 / GS manual): R=bits0–4, G=5–9, B=10–14, A=15.
+    /// </summary>
     private uint ExpandRgb555(ushort p)
     {
-        int r = ((p >> 10) & 0x1F) * 255 / 31;
+        int r = (p & 0x1F) * 255 / 31;
         int g = ((p >> 5) & 0x1F) * 255 / 31;
-        int b = (p & 0x1F) * 255 / 31;
+        int b = ((p >> 10) & 0x1F) * 255 / 31;
         int aBit = (p >> 15) & 1;
         int a = aBit != 0 ? Registers.TexaTa1 : Registers.TexaTa0;
         // Default TEXA=0 → treat as opaque when TA not programmed (smoke/host uploads).
@@ -767,7 +828,7 @@ public sealed class Gs : ISchedulable
             }
         }
 
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_GS") == "1" && PrimitivesDrawn < 12)
+        if (TraceGs && PrimitivesDrawn < 12)
         {
             Console.Error.WriteLine(
                 $"[GS] XYZ raw=({xRaw:X4},{yRaw:X4}) of=({ofx:X4},{ofy:X4}) -> ({x},{y}) " +
@@ -1151,6 +1212,7 @@ public sealed class Gs : ISchedulable
     /// <summary>
     /// Mirror a painted pixel into local VRAM at FRAME_1 (FBP units = 8192 bytes).
     /// Real GS draws into local mem; DISPFB composite then matches prim paint.
+    /// PSMCT32/24 and PSMCT16/16S (GX-029) so commercial FRAME.PSM=0x0A still lands in local.
     /// </summary>
     private void WriteFrameLocal(int x, int y, uint pixel)
     {
@@ -1170,6 +1232,23 @@ public sealed class Gs : ISchedulable
             _localMem[bi + 1] = (byte)(pixel >> 8);
             _localMem[bi + 2] = (byte)(pixel >> 16);
             _localMem[bi + 3] = (byte)(pixel >> 24);
+            _localMemHasImage = true;
+        }
+        else if (psm is 0x02 or 0x0A)
+        {
+            // Pack Soft-GS 0xAARRGGBB → GS CT16 (R low, B high).
+            int r5 = (int)((pixel >> 16) & 0xFF) >> 3;
+            int g5 = (int)((pixel >> 8) & 0xFF) >> 3;
+            int b5 = (int)(pixel & 0xFF) >> 3;
+            int a1 = ((pixel >> 24) & 0x80) != 0 ? 1 : 0;
+            ushort p16 = (ushort)((r5 & 0x1F) | ((g5 & 0x1F) << 5) | ((b5 & 0x1F) << 10) | (a1 << 15));
+            // PSMCT16S (0x0A) uses a distinct page/block table from PSMCT16 (0x02).
+            int bi = psm == 0x0A
+                ? (int)SwizzleOffset16S(baseBytes, x, y, fbw)
+                : (int)SwizzleOffset16(baseBytes, x, y, fbw);
+            if ((uint)bi + 1u >= (uint)_localMem.Length) return;
+            _localMem[bi] = (byte)p16;
+            _localMem[bi + 1] = (byte)(p16 >> 8);
             _localMemHasImage = true;
         }
     }
@@ -1228,20 +1307,15 @@ public sealed class Gs : ISchedulable
 
     // ===================== GS local memory swizzle addressing =====================
     // Real GS VRAM is not laid out row-major; it's tiled into 8KB "pages" made of 32
-    // fixed-layout blocks, each block internally Z-order (Morton) swizzled. Real games'
+    // fixed-layout blocks, each block internally column-swizzled. Real games'
     // texture/framebuffer data is written and expected to be read back in this layout —
-    // naive row-major addressing (what this file used before) only round-trips data this
-    // engine wrote itself, and would render real GS-hardware-authored texture data as
-    // scrambled noise. blockTable32/columnTable32 below are transcribed VERBATIM from
-    // PCSX2's GSTables.cpp (github.com/PCSX2/pcsx2) — a real, working GS implementation —
-    // rather than derived from a general description, given how easy this is to get
-    // subtly wrong. PSMT8's block table is confirmed identical to PSMT32's; its column
-    // (within-block) table is NOT independently confirmed — generated via the same
-    // Morton bit-interleave pattern columnTable32 was confirmed to follow, extended to
-    // PSMT8's 16x16 block (vs. PSMCT32's 8x8), which is a reasoned extension, not a
-    // verbatim-sourced table. PSMCT16/PSMT4 are NOT swizzled here — deliberately left on
-    // the existing row-major path pending further verification (their block dimensions
-    // are non-square, arithmetically derived rather than confirmed, per research notes).
+    // naive row-major addressing only round-trips data this engine wrote itself, and
+    // would render real GS-hardware-authored texture data as scrambled noise.
+    // Block/column tables below are transcribed VERBATIM from PCSX2's GSTables.cpp
+    // (github.com/PCSX2/pcsx2). PSMCT16 (0x02) and PSMCT16S (0x0A) share columnTable16
+    // but have DISTINCT block tables — using CT16 blocks for DISPFB PSM=0x0A (Dec-class
+    // FBW=832) produces jumbled Soft-GS present. PSMT8 column uses Morton interleave
+    // extension of columnTable32 (reasoned, not verbatim). PSMT4 remains linear residual.
     private static readonly int[,] BlockTable32 =
     {
         { 0, 1, 4, 5,16,17,20,21},
@@ -1302,7 +1376,7 @@ public sealed class Gs : ISchedulable
         return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx);
     }
 
-    // PCSX2-derived block table for PSMCT16: page 64×64, block 16×8, 2 bytes/pixel.
+    // PCSX2-derived block table for PSMCT16 (0x02): page 64×64, block 16×8, 2 bytes/pixel.
     private static readonly int[,] BlockTable16 =
     {
         { 0,  2,  8, 10},
@@ -1315,9 +1389,37 @@ public sealed class Gs : ISchedulable
         {21, 23, 29, 31}
     };
 
+    // PCSX2-derived block table for PSMCT16S (0x0A) — same page/block geometry as CT16,
+    // different block order (frame/DISPFB storage layout). Shared columnTable16 within-block.
+    private static readonly int[,] BlockTable16S =
+    {
+        { 0,  2, 16, 18},
+        { 1,  3, 17, 19},
+        { 8, 10, 24, 26},
+        { 9, 11, 25, 27},
+        { 4,  6, 20, 22},
+        { 5,  7, 21, 23},
+        {12, 14, 28, 30},
+        {13, 15, 29, 31}
+    };
+
+    // PCSX2 columnTable16[y][x] — within-block pixel index for both PSMCT16 and PSMCT16S.
+    // Block is 16×8; values 0..127. Distinct from Morton interleave.
+    private static readonly byte[,] ColumnTable16 =
+    {
+        {  0,  2,  8, 10, 16, 18, 24, 26,  1,  3,  9, 11, 17, 19, 25, 27 },
+        {  4,  6, 12, 14, 20, 22, 28, 30,  5,  7, 13, 15, 21, 23, 29, 31 },
+        { 32, 34, 40, 42, 48, 50, 56, 58, 33, 35, 41, 43, 49, 51, 57, 59 },
+        { 36, 38, 44, 46, 52, 54, 60, 62, 37, 39, 45, 47, 53, 55, 61, 63 },
+        { 64, 66, 72, 74, 80, 82, 88, 90, 65, 67, 73, 75, 81, 83, 89, 91 },
+        { 68, 70, 76, 78, 84, 86, 92, 94, 69, 71, 77, 79, 85, 87, 93, 95 },
+        { 96, 98,104,106,112,114,120,122, 97, 99,105,107,113,115,121,123 },
+        {100,102,108,110,116,118,124,126,101,103,109,111,117,119,125,127 }
+    };
+
     /// <summary>
-    /// PSMCT16/PSMCT16S swizzled byte offset (GX-029). Page 64×64px, block 16×8px,
-    /// 2 bytes/pixel, 256 bytes/block. Column uses Morton interleave of (x%16, y%8).
+    /// PSMCT16 (0x02) swizzled byte offset (GX-029). Page 64×64px, block 16×8px,
+    /// 2 bytes/pixel, 256 bytes/block. Block table = BlockTable16; column = ColumnTable16.
     /// </summary>
     private static uint SwizzleOffset16(uint texBaseBytes, int x, int y, int bufferWidthPx)
     {
@@ -1327,9 +1429,25 @@ public sealed class Gs : ISchedulable
         int pageIdx = pageY * pagesPerRow + pageX;
         int ix = x % pageW, iy = y % pageH;
         int blockIdx = BlockTable16[(iy / blockH) % 8, (ix / blockW) % 4];
-        int pixelIdx = MortonInterleave(ix % blockW, iy % blockH, 4); // 0..127 for 16×8
+        int pixelIdx = ColumnTable16[iy % blockH, ix % blockW];
         // 16×8 block = 128 texels × 2 bytes = 256 bytes
-        pixelIdx &= 127;
+        return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx * 2);
+    }
+
+    /// <summary>
+    /// PSMCT16S (0x0A) swizzled byte offset — distinct from PSMCT16 for DISPFB/FRAME storage.
+    /// Same page 64×64 / block 16×8 / column table as CT16; BlockTable16S only (PCSX2).
+    /// Deception DISPFB2 PSM=10 FBW=832 requires this table for coherent Soft-GS present.
+    /// </summary>
+    private static uint SwizzleOffset16S(uint texBaseBytes, int x, int y, int bufferWidthPx)
+    {
+        const int pageW = 64, pageH = 64, blockW = 16, blockH = 8;
+        int pagesPerRow = Math.Max(1, (bufferWidthPx + pageW - 1) / pageW);
+        int pageX = x / pageW, pageY = y / pageH;
+        int pageIdx = pageY * pagesPerRow + pageX;
+        int ix = x % pageW, iy = y % pageH;
+        int blockIdx = BlockTable16S[(iy / blockH) % 8, (ix / blockW) % 4];
+        int pixelIdx = ColumnTable16[iy % blockH, ix % blockW];
         return texBaseBytes + (uint)(pageIdx * 8192 + blockIdx * 256 + pixelIdx * 2);
     }
 
@@ -1442,10 +1560,12 @@ public sealed class Gs : ISchedulable
             int nibble = ((tu + tv * bufW) & 1) == 0 ? (packed & 0xF) : (packed >> 4);
             return _hasClut ? _clut[nibble & 0xF] : 0xFF000000u | (uint)(nibble * 17) * 0x010101u;
         }
-        // PSMCT16 / PSMCT16S (0x02 / 0x0A): RGB555 + TEXA (swizzled, GX-029)
+        // PSMCT16 (0x02) / PSMCT16S (0x0A): RGB555 + TEXA; 16S uses distinct block table
         if (psm is 0x02 or 0x0A)
         {
-            int bi = (int)SwizzleOffset16(_texBase, tu, tv, bufW);
+            int bi = psm == 0x0A
+                ? (int)SwizzleOffset16S(_texBase, tu, tv, bufW)
+                : (int)SwizzleOffset16(_texBase, tu, tv, bufW);
             if (bi < 0 || bi + 1 >= _localMem.Length) return 0xFFFFFFFF;
             ushort p = (ushort)(_localMem[bi] | (_localMem[bi + 1] << 8));
             return ExpandRgb555(p);
@@ -1926,13 +2046,84 @@ public sealed class Gs : ISchedulable
     {
         // Wave-5: merge composite even after sparse prim paint so logo IMAGE under
         // DISPFB/FRAME/FBP0 can still fill Soft-GS chrome (B3 early px blocked this).
-        if (_localMemHasImage)
+        // Prefer flag, but ImageBytesWritten alone is enough (defensive after black wipe).
+        if (_localMemHasImage || ImageBytesWritten > 0)
+        {
             CompositeDispfbToFramebuffer();
+            // Black full-FB prims (BO2 class: px=full FB lit=0) stamp Soft-GS while logo
+            // lives only in local IMAGE. Force one re-merge when still mostly black;
+            // _mergeBlackBypassArmed prevents per-present thrash when IMAGE is truly empty RGB.
+            if (IsPresentMostlyBlack() && !_mergeBlackBypassArmed)
+                ForceRefreshPresentComposite();
+        }
         return _framebuffer;
+    }
+
+    /// <summary>
+    /// Invalidate the composite skip cache and re-run DISPFB/local IMAGE → Soft-GS FB.
+    /// Host present uses this when <see cref="PixelsWritten"/> &gt; 0 but the present buffer
+    /// is still mostly black (stale skip after wrong FBP, or IMAGE under DISPFB not yet merged).
+    /// Zeros <see cref="DispfbPixelsComposited"/> so the mergeMode early-return cannot re-skip.
+    /// </summary>
+    public long ForceRefreshPresentComposite()
+    {
+        DispfbPixelsComposited = 0;
+        _lastCompositeImageBytes = -1;
+        _lastCompositeCircuitGen = -1;
+        _mergeBlackBypassArmed = false;
+        if (!_localMemHasImage && ImageBytesWritten <= 0) return 0;
+        // If IMAGE bytes landed but flag was cleared, re-arm so composite may run.
+        if (ImageBytesWritten > 0)
+            _localMemHasImage = true;
+        long written = CompositeDispfbToFramebuffer();
+        // One forced re-merge is enough when local RGB under DISPFB is still empty —
+        // avoid GetPresentSpan thrashing a full local scan every host tick.
+        if (IsPresentMostlyBlack())
+            _mergeBlackBypassArmed = true;
+        return written;
+    }
+
+    /// <summary>Alias for <see cref="ForceRefreshPresentComposite"/> (older call sites).</summary>
+    public long ForcePresentComposite() => ForceRefreshPresentComposite();
+
+    /// <summary>
+    /// Count Soft-GS present pixels with non-zero RGB (A ignored). Used by Desktop HUD / black-screen diagnostics.
+    /// </summary>
+    public int CountLitPresentPixels(int step = 1)
+    {
+        if (step < 1) step = 1;
+        int lit = 0;
+        for (int i = 0; i < _framebuffer.Length; i += step)
+        {
+            if ((_framebuffer[i] & 0x00FFFFFFu) != 0)
+                lit++;
+        }
+        return lit;
+    }
+
+    /// <summary>
+    /// True when Soft-GS FB has fewer than ~1% lit samples (stride sample).
+    /// Used to decide whether merge-composite cache is safe to keep.
+    /// </summary>
+    public bool IsPresentMostlyBlack(int stride = 16)
+    {
+        if (stride < 1) stride = 1;
+        int lit = 0;
+        int slots = 0;
+        for (int i = 0; i < _framebuffer.Length; i += stride)
+        {
+            slots++;
+            if ((_framebuffer[i] & 0x00FFFFFFu) != 0)
+                lit++;
+        }
+        // &lt;1% of sampled slots lit → mostly black (commercial logo often missing).
+        return lit * 100 < slots;
     }
 
     private long _lastCompositeImageBytes;
     private int _lastCompositeCircuitGen = -1;
+    /// <summary>One-shot arm so black-FB cache bypass does not thrash every present when composite writes 0.</summary>
+    private bool _mergeBlackBypassArmed;
 
     /// <summary>GX-040: snapshot of privileged DISPFB/DISPLAY/PMODE circuit state.</summary>
     public GsDisplayCircuitInfo GetDisplayCircuitInfo() =>
@@ -1944,19 +2135,44 @@ public sealed class Gs : ISchedulable
     /// pixels (merge) so sparse AFAIL prims no longer block commercial logo IMAGE chrome.
     /// GX-040/041: prefers software-programmed DISPFB (even when PMODE EN=0); does not plant DISPFB.
     /// FRAME/FBP0 fallback remains for residual composite-only titles (B3 DISPFB1=0 residual).
+    /// When natural DISPFB merge writes 0 but IMAGE exists and Soft-GS is still mostly black
+    /// (GoW-class empty RGB under programmed FBP), also tries FRAME then FBP0 residual.
     /// </summary>
     public long CompositeDispfbToFramebuffer()
     {
-        if (!_localMemHasImage) return 0;
+        // IMAGE bytes without the flag (legacy linear upload races) still deserve a scan.
+        if (!_localMemHasImage)
+        {
+            if (ImageBytesWritten <= 0) return 0;
+            _localMemHasImage = true;
+        }
 
         bool mergeMode = PixelsWritten > 0;
         // Avoid re-scanning every host-present once a full merge already ran and IMAGE
         // has not grown (1M-slice OnHostPresent). Invalidate when DISPFB/DISPLAY/PMODE
         // generation advances so natural DISPFB programmed after residual still binds (GX-041).
+        // Keep Soft-GS claim determinism: skip only when present already has chrome.
+        // When px>0 but FB is mostly black and local IMAGE exists, ignore merge cache once
+        // (commercial logos live in IMAGE; Clear/wrong-FBP can stamp cache while FB is black).
         if (mergeMode && DispfbPixelsComposited > 0
             && ImageBytesWritten <= _lastCompositeImageBytes
             && DisplayCircuitGeneration == _lastCompositeCircuitGen)
-            return 0;
+        {
+            bool hasImage = _localMemHasImage || ImageBytesWritten > 0;
+            if (hasImage && IsPresentMostlyBlack())
+            {
+                if (_mergeBlackBypassArmed)
+                    return 0;
+                _mergeBlackBypassArmed = true;
+                // Fall through — re-merge into black Soft-GS pixels once.
+            }
+            else
+            {
+                // Present has chrome — re-arm black bypass for a future FB wipe.
+                _mergeBlackBypassArmed = false;
+                return 0;
+            }
+        }
 
         var circuit = GetDisplayCircuitInfo();
         LastDisplayCircuit = circuit.PreferredCircuit;
@@ -2033,6 +2249,93 @@ public sealed class Gs : ISchedulable
                 source = GsCompositeSource.SyntheticFbp0;
         }
 
+        // GX-041 residual (GoW-class): natural DISPFB is programmed but local RGB under that
+        // FBP is empty (IMAGE BITBLT lives at FBP0 / FRAME / high-page PSMT4). When the natural
+        // merge writes 0, Soft-GS is still mostly black, and IMAGE exists — try FRAME, FBP0,
+        // then largest Host→Local BITBLT dest (PSMT4 texture page residual).
+        // Honest residual metrics only (no DISPFB plant, no invent PATH3).
+        if (fromDispfb && written == 0 && ImageBytesWritten > 0 && IsPresentMostlyBlack())
+        {
+            natural = false;
+            ulong frame = Registers.FRAME_1;
+            if (frame != 0)
+            {
+                residualExtra = CompositeLocalToFb(frame, fromDispfb: false, syntheticFb: false,
+                    mergeMode: true, outRect: null);
+                if (residualExtra > 0)
+                {
+                    written += residualExtra;
+                    source = GsCompositeSource.Frame;
+                }
+            }
+            // FBP=0 IMAGE page — logo BITBLT often lands here while DISPFB points at an empty
+            // high-page draw target (GoW: DISPFB FBP=0x1A0000 PSMCT24 empty, imgBytes>0).
+            if (written == 0 || IsPresentMostlyBlack())
+            {
+                long fbp0Extra = CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true,
+                    mergeMode: true, outRect: null);
+                if (fbp0Extra > 0)
+                {
+                    written += fbp0Extra;
+                    residualExtra += fbp0Extra;
+                    if (source != GsCompositeSource.Frame)
+                        source = GsCompositeSource.SyntheticFbp0;
+                }
+            }
+            // GoW / PSMT4 residual: Host→Local lands at high DBP (e.g. 0xA0800 DPSM=0x14)
+            // while DISPFB/FRAME/FBP0 have no RGB. Sample the real transfer with proper PSM.
+            if ((written == 0 || IsPresentMostlyBlack()) && _lastImageByteCount > 0)
+            {
+                long imgExtra = CompositeLastImageTransfer(mergeMode: true);
+                if (imgExtra > 0)
+                {
+                    written += imgExtra;
+                    residualExtra += imgExtra;
+                    source = GsCompositeSource.LastImageTrx;
+                }
+            }
+        }
+
+        // GX-041b / Vexx-class: natural DISPFB FBP≠FRAME FBP and natural only lands sparse
+        // chrome (lit≈2% while prim raster painted a different FBP page). GoW residual above
+        // requires written==0; sparse non-black natural must still pull FRAME into present.
+        // Merge only (never overwrite existing chrome). No DISPFB plant / invent PATH3.
+        if (fromDispfb && written > 0 && Registers.FRAME_1 != 0)
+        {
+            int dispfbFbp = (int)(DispfbDecoded.From(fb).Fbp);
+            int frameFbp = (int)(Registers.FRAME_1 & 0x1FF);
+            // Sparse: natural wrote less than ~4% of present FB, or lit samples still thin.
+            bool sparseNatural = written < (FB_WIDTH * FB_HEIGHT) / 25
+                || CountLitPresentPixels(8) < (FB_WIDTH * FB_HEIGHT) / 20;
+            if (frameFbp != 0 && frameFbp != dispfbFbp && sparseNatural
+                && (PixelsWritten > written || ImageBytesWritten > 0))
+            {
+                long frameExtra = CompositeLocalToFb(Registers.FRAME_1, fromDispfb: false,
+                    syntheticFb: false, mergeMode: true, outRect: null);
+                if (frameExtra > 0)
+                {
+                    written += frameExtra;
+                    residualExtra += frameExtra;
+                    natural = false; // present now includes residual FRAME pages
+                    source = GsCompositeSource.Frame;
+                }
+            }
+        }
+
+        // Also when DISPFB was unset: after FRAME/FBP0 residual still black, try last IMAGE.
+        if (!fromDispfb && (written == 0 || IsPresentMostlyBlack())
+            && ImageBytesWritten > 0 && _lastImageByteCount > 0)
+        {
+            long imgExtra = CompositeLastImageTransfer(mergeMode: true);
+            if (imgExtra > 0)
+            {
+                written += imgExtra;
+                residualExtra += imgExtra;
+                natural = false;
+                source = GsCompositeSource.LastImageTrx;
+            }
+        }
+
         // Always stamp circuit gen so a no-op scan after DISPFB bind does not thrash every present.
         _lastCompositeImageBytes = ImageBytesWritten;
         _lastCompositeCircuitGen = DisplayCircuitGeneration;
@@ -2085,24 +2388,24 @@ public sealed class Gs : ISchedulable
         // FRAME/DISPFB FBP: units of 2048 words → 8192 bytes (GS page / PCSX2 Block()).
         uint baseBytes = (uint)fbp * 8192u;
         if (baseBytes >= (uint)_localMem.Length) return 0;
-        if (psm is not (0x00 or 0x01 or 0x02 or 0x0A))
+        // Include indexed PSMs for residual LastImageTrx composite (GoW PSMT4).
+        if (psm is not (0x00 or 0x01 or 0x02 or 0x0A or 0x13 or 0x14 or 0x1B))
             psm = 0x00;
 
         long written = 0;
+        // Host Soft-GS FB is a fixed 640×448 present buffer. DISPLAY Width/Height clamp the
+        // *source* window size, but CRT DX/DY blanking offsets must NOT become Soft-GS dest
+        // offsets — they were clipping commercial logos to a thin strip (Dec/Vexx out+160,50).
         int h = FB_HEIGHT;
         int w = Math.Min(FB_WIDTH, fbw);
-        int dstOx = 0, dstOy = 0;
+        const int dstOx = 0;
+        const int dstOy = 0;
         if (outRect is { } rect && rect.IsSensible)
         {
-            // Limit source/dest to CRT output size (do not invent offsets beyond Soft-GS FB).
             w = Math.Min(w, (int)rect.Width);
             h = Math.Min(h, (int)rect.Height);
             w = Math.Min(w, FB_WIDTH);
             h = Math.Min(h, FB_HEIGHT);
-            dstOx = (int)Math.Min(rect.OffsetX, (uint)(FB_WIDTH - 1));
-            dstOy = (int)Math.Min(rect.OffsetY, (uint)(FB_HEIGHT - 1));
-            if (dstOx + w > FB_WIDTH) w = FB_WIDTH - dstOx;
-            if (dstOy + h > FB_HEIGHT) h = FB_HEIGHT - dstOy;
         }
         for (int y = 0; y < h; y++)
         {
@@ -2110,49 +2413,138 @@ public sealed class Gs : ISchedulable
             {
                 int sx = dbx + x;
                 int sy = dby + y;
-                uint pixel;
-                if (psm == 0x00)
-                {
-                    int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
-                    if ((uint)bi + 3u >= (uint)_localMem.Length) continue;
-                    pixel = (uint)_localMem[bi]
-                            | ((uint)_localMem[bi + 1] << 8)
-                            | ((uint)_localMem[bi + 2] << 16)
-                            | ((uint)_localMem[bi + 3] << 24);
-                }
-                else if (psm == 0x01)
-                {
-                    int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
-                    if ((uint)bi + 2u >= (uint)_localMem.Length) continue;
-                    pixel = (uint)_localMem[bi]
-                            | ((uint)_localMem[bi + 1] << 8)
-                            | ((uint)_localMem[bi + 2] << 16)
-                            | 0xFF000000u;
-                }
-                else
-                {
-                    int bi = (int)baseBytes + (sy * fbw + sx) * 2;
-                    if ((uint)bi + 1u >= (uint)_localMem.Length) continue;
-                    ushort p16 = (ushort)(_localMem[bi] | ((uint)_localMem[bi + 1] << 8));
-                    int r = (p16 & 0x1F) << 3;
-                    int g = ((p16 >> 5) & 0x1F) << 3;
-                    int b = ((p16 >> 10) & 0x1F) << 3;
-                    pixel = 0xFF000000u | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
-                }
-
+                uint pixel = LoadLocalPixelForPresent(baseBytes, sx, sy, fbw, psm);
                 if ((pixel & 0x00FFFFFF) == 0) continue;
                 int dx = dstOx + x;
                 int dy = dstOy + y;
                 if ((uint)dx >= (uint)FB_WIDTH || (uint)dy >= (uint)FB_HEIGHT) continue;
                 int idx = dy * FB_WIDTH + dx;
                 // Merge: never overwrite prim/AFAIL chrome already on Soft-GS FB.
+                // Pure black (0xFF000000) is *not* chrome — commercial clears stamp full FB
+                // black (BO2 px=286720 lit=0); allow IMAGE under DISPFB to replace it.
                 if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
                     continue;
-                _framebuffer[idx] = pixel | 0xFF000000;
+                _framebuffer[idx] = pixel | 0xFF000000u;
                 written++;
             }
         }
         return written;
+    }
+
+    /// <summary>
+    /// Residual present: composite the largest Host→Local IMAGE window into Soft-GS FB.
+    /// Used when DISPFB/FRAME/FBP0 have no RGB but a real BITBLT filled a texture page
+    /// (GoW: PSMT4 @ 0xA0800). Reads real local mem; CLUT when loaded else grayscale indices
+    /// (same as <see cref="SampleTexel"/> without inventing PATH3 packets).
+    /// </summary>
+    private long CompositeLastImageTransfer(bool mergeMode)
+    {
+        if (_lastImageByteCount <= 0 || _lastImageW <= 0 || _lastImageH <= 0)
+            return 0;
+        if (_lastImageDbpBytes >= (uint)_localMem.Length)
+            return 0;
+
+        int psm = _lastImageDpsm;
+        if (psm is not (0x00 or 0x01 or 0x02 or 0x0A or 0x13 or 0x14 or 0x1B))
+            psm = 0x00;
+        int fbw = _lastImageDbwPx > 0 ? _lastImageDbwPx : 64;
+        int srcW = Math.Min(_lastImageW, fbw);
+        int srcH = _lastImageH;
+        // Scale-to-fit Soft-GS title FB when transfer is a full-ish width strip/tex.
+        int dstW = Math.Min(FB_WIDTH, srcW > 0 ? srcW : FB_WIDTH);
+        int dstH = Math.Min(FB_HEIGHT, srcH > 0 ? srcH : FB_HEIGHT);
+        // Full-width commercial textures: stretch height into title FB when source is short band.
+        bool stretchH = srcW >= FB_WIDTH / 2 && srcH >= 32 && srcH < FB_HEIGHT / 2;
+        if (stretchH)
+            dstH = FB_HEIGHT;
+        // Tall/wide enough tex: map 1:1 into top-left of Soft-GS (clamp).
+        if (srcW >= FB_WIDTH / 2 && srcH >= FB_HEIGHT / 2)
+        {
+            dstW = Math.Min(FB_WIDTH, srcW);
+            dstH = Math.Min(FB_HEIGHT, srcH);
+        }
+
+        long written = 0;
+        for (int y = 0; y < dstH; y++)
+        {
+            int sy = _lastImageDsaY + (dstH <= 1 ? 0 : y * srcH / dstH);
+            if (sy >= _lastImageDsaY + srcH) sy = _lastImageDsaY + srcH - 1;
+            for (int x = 0; x < dstW; x++)
+            {
+                int sx = _lastImageDsaX + (dstW <= 1 ? 0 : x * srcW / dstW);
+                if (sx >= _lastImageDsaX + srcW) sx = _lastImageDsaX + srcW - 1;
+                uint pixel = LoadLocalPixelForPresent(_lastImageDbpBytes, sx, sy, fbw, psm);
+                if ((pixel & 0x00FFFFFF) == 0) continue;
+                if ((uint)x >= (uint)FB_WIDTH || (uint)y >= (uint)FB_HEIGHT) continue;
+                int idx = y * FB_WIDTH + x;
+                if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
+                    continue;
+                _framebuffer[idx] = pixel | 0xFF000000u;
+                written++;
+            }
+        }
+        return written;
+    }
+
+    /// <summary>
+    /// Read one local-VRAM pixel as Soft-GS 0xAARRGGBB for DISPFB present.
+    /// PSMCT32/24 use SwizzleOffset32; PSMCT16 uses SwizzleOffset16; PSMCT16S uses
+    /// SwizzleOffset16S (distinct block table — Dec-class DISPFB PSM=0x0A).
+    /// PSMT4/PSMT8 use CLUT when loaded, else grayscale indices (SampleTexel parity).
+    /// </summary>
+    private uint LoadLocalPixelForPresent(uint baseBytes, int sx, int sy, int fbw, int psm)
+    {
+        if (psm == 0x14) // PSMT4 — linear nibble pack (Host→Local residual layout)
+        {
+            int bi = (int)baseBytes + (sy * fbw + sx) / 2;
+            if ((uint)bi >= (uint)_localMem.Length) return 0;
+            byte packed = _localMem[bi];
+            int nibble = ((sx + sy * fbw) & 1) == 0 ? (packed & 0xF) : (packed >> 4);
+            if (_hasClut)
+                return _clut[nibble & 0xF] | 0xFF000000u;
+            // Grayscale from real index (not planted logo) — matches SampleTexel no-CLUT path.
+            if (nibble == 0) return 0;
+            uint g = (uint)(nibble * 17);
+            return 0xFF000000u | (g << 16) | (g << 8) | g;
+        }
+        if (psm is 0x13 or 0x1B) // PSMT8 / PSMT8H
+        {
+            int bi = (int)SwizzleOffset8(baseBytes, sx, sy, fbw);
+            if ((uint)bi >= (uint)_localMem.Length) return 0;
+            byte idx8 = _localMem[bi];
+            if (_hasClut)
+                return _clut[idx8] | 0xFF000000u;
+            if (idx8 == 0) return 0;
+            return 0xFF000000u | ((uint)idx8 << 16) | ((uint)idx8 << 8) | idx8;
+        }
+        if (psm is 0x02 or 0x0A)
+        {
+            int bi = psm == 0x0A
+                ? (int)SwizzleOffset16S(baseBytes, sx, sy, fbw)
+                : (int)SwizzleOffset16(baseBytes, sx, sy, fbw);
+            if ((uint)bi + 1u >= (uint)_localMem.Length) return 0;
+            ushort p16 = (ushort)(_localMem[bi] | ((uint)_localMem[bi + 1] << 8));
+            return ExpandRgb555(p16) | 0xFF000000u;
+        }
+        if (psm == 0x01)
+        {
+            int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
+            if ((uint)bi + 2u >= (uint)_localMem.Length) return 0;
+            // GS PSMCT24: low 24 bits B,G,R in byte order (same as CT32 RGB lanes).
+            uint b = _localMem[bi];
+            uint g = _localMem[bi + 1];
+            uint r = _localMem[bi + 2];
+            return 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+        // PSMCT32 / default — LE B,G,R,A → Soft-GS 0xAARRGGBB
+        {
+            int bi = (int)SwizzleOffset32(baseBytes, sx, sy, fbw);
+            if ((uint)bi + 3u >= (uint)_localMem.Length) return 0;
+            return (uint)_localMem[bi]
+                   | ((uint)_localMem[bi + 1] << 8)
+                   | ((uint)_localMem[bi + 2] << 16)
+                   | ((uint)_localMem[bi + 3] << 24);
+        }
     }
 
     public bool HostOverlayActive => _hostOverlayActive;
@@ -2191,6 +2583,8 @@ public sealed class Gs : ISchedulable
     {
         _framebuffer.AsSpan().Fill(color);
         _depthBuffer.AsSpan().Fill(float.MaxValue);
+        // FB wipe must not leave merge-composite cache thinking chrome is still present.
+        InvalidatePresentCompositeCache();
     }
 
     /// <summary>
@@ -2208,7 +2602,8 @@ public sealed class Gs : ISchedulable
             for (int x = 0; x < w; x++)
             {
                 if (srcRow + x >= argb.Length) break;
-                _framebuffer[dstRow + x] = argb[srcRow + x];
+                // Force opaque A so host present (Avalonia Bgra8888 Opaque) never treats RGB as transparent black.
+                _framebuffer[dstRow + x] = argb[srcRow + x] | 0xFF000000u;
                 PixelsWritten++;
             }
         }
@@ -2222,6 +2617,17 @@ public sealed class Gs : ISchedulable
             _framebuffer[i] = color;
             _depthBuffer[i] = depth;
         }
+        // FB wipe must not leave merge-composite cache thinking chrome is still present.
+        InvalidatePresentCompositeCache();
+    }
+
+    /// <summary>Drop merge skip so the next composite re-scans local IMAGE → Soft-GS FB.</summary>
+    private void InvalidatePresentCompositeCache()
+    {
+        DispfbPixelsComposited = 0;
+        _lastCompositeImageBytes = -1;
+        _lastCompositeCircuitGen = -1;
+        _mergeBlackBypassArmed = false;
     }
 
     public int Step(ulong maxCycles)

@@ -488,9 +488,23 @@ public sealed class Ps2System
                     && (MidwayFamilyAssist.IsDecSysInitHotPc(pcPhys)
                         || MidwayFamilyAssist.IsDaPostLogoHotPc(pcPhys)
                         || MidwayFamilyAssist.IsDecMenuHotPc(pcPhys));
-                // Vexx: host-serve CD I/O spin stubs at 0xF00000 (STREE stream-map open/read).
+                // Vexx: host-serve CD I/O spin stubs at 0xF00000 (STREE stream-map open/read);
+                // PL-032g freelist (0x1CE1x0), float-expand list (0x330E54);
+                // PL-032h object ctor 0x3402E0 + base init jal 0x2EE7F0 (epilogue stomp residual);
+                // PL-032i ready-flag poll 0x35E190 + wait 0x369790 (post-begin.pcl spin).
                 bool vexxHot = ActiveQuirk is VexxAssist
-                    && pcPhys is >= 0x00F00000UL and < 0x00F00100UL;
+                    && pcPhys is (>= 0x00F00000UL and < 0x00F00100UL)
+                        or (>= 0x001CE190UL and <= 0x001CEB40UL)
+                        or (>= 0x00330E00UL and <= 0x003310A0UL)
+                        or (>= 0x003402E0UL and <= 0x00340320UL)
+                        or (>= 0x002EE7F0UL and <= 0x002EE9B0UL)
+                        or (>= 0x0032CEE0UL and <= 0x0032CF30UL)
+                        or (>= 0x0035E190UL and <= 0x0035E1A0UL)
+                        or (>= 0x00369790UL and <= 0x003697F4UL)
+                        or (>= 0x001CF400UL and <= 0x001CF460UL) // PL-032m name strcmp 0x1CF410
+                        or (>= 0x00224360UL and <= 0x00224420UL) // PL-032m name-search 0x224360
+                        or (>= 0x00224000UL and <= 0x00225000UL) // PL-032l thrash band
+                        or (>= 0x01F00000UL and < 0x02000000UL); // EE stack path-death
                 ulong slice = (criHot || gowHot || b3Hot || mkFamHot || vexxHot) ? sliceCri : sliceDefault;
 
                 // Kick commercial workers that CreateThread left DORMANT (StartThread never

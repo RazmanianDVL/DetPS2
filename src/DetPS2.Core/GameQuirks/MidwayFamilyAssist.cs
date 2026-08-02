@@ -120,6 +120,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private bool _decGameartTexFed;
     private int _decGameartTexBytes;
     private int _decGameartTexTiles;
+    /// <summary>PL-045 DA: STFM@0x7F000 published from force-dec / path-hash loaded art.</summary>
+    private bool _daGameartHostPublished;
+    private int _daGameartHostPublishes;
+    /// <summary>PL-045 DA: Soft-GS Host→Local feed of real gameart.ssf (past lit=32768 strip).</summary>
+    private bool _daGameartTexFed;
+    private int _daGameartTexBytes;
+    private int _daGameartTexTiles;
     private uint _lastDisplayHead;
     private int _displayHeadMoves;
     private int _postDisplayExitRescues;
@@ -133,6 +140,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private int _daMenuBandLockClears;
     private long _daChromeBaselineImg;
     private int _daChromeImgGrowthHits;
+    /// <summary>MENU-DA-3: DI/EI free-ride assist hits (lock clear / pad refresh only — no PC invent).</summary>
+    private int _daFreeRideAssists;
+    private ulong _lastDaFreeRideAssistCyc;
 
     // PL-013 DA pad selection keep-alive (INTERACTIVE / T2):
     // Dense pad inject after Soft-GS Midway surface + selection-index drive from D-pad.
@@ -268,16 +278,60 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     // After midway-menu Soft-GS is live, dense D-pad/Start/Cross edges + ForceRefreshPad
     // so padGetState dual-buffer polls see non-zero buttons; plant a stable 0..N row index
     // into Dec BSS candidates (gp-relative + gameart table band) driven by D-pad edges.
+    // MENU-DEC 2026-07-31: also recover SleepThread park @0x115F64 (live lit~199k residual)
+    // so pad polls run on idle-pump instead of dormant main.
+    // MENU-DEC-2: accept latch + post-CROSS main/process re-kick so Soft-GS can climb past
+    // prims=86 plateau (live pad-inject: Δprims freezes after ~35M; thrash @0x1E69/0x3153).
     private int _decPadPulses;
     private ulong _decLastPadCyc;
     private int _decMenuSelIndex;
     private int _decMenuSelPlants;
+    private int _decMenuSelDeltas;
+    private int _decMenuSelMaxReached;
+    private int _decMenuAcceptEdges;
+    private ulong _decLastMenuAcceptCyc;
+    private int _decAcceptKicks;
+    private int _decPostAcceptForceProcess;
+    private bool _decMenuInteractiveProven;
+    private int _decNaturalSelDeltas;
     private int _decSelIdxDeltaLogs;
+    private int _decPadEffectHits;
     private long _decPadBaselinePrims;
     private ulong _decPadBaselineP2;
     private long _decPadBaselinePx;
     private bool _decPadBaselineArmed;
+    private long _decPlateauPrims;
+    private long _decPlateauPx;
+    private bool _decPlateauArmed;
+    private uint _decLastPadButtons;
     private readonly Dictionary<uint, uint> _decSelIndexSnapshot = new();
+
+    // Live residual after Soft-GS Midway surface (fleet 40–100M SEMA_OFF host-present):
+    // EE parks at CRT/thread wrappers ~0x115F64 with thread-1 Sleeping WaitSemaId=0
+    // (not PowerOff WaitSema leaf @0x10BE28). Keep-alive must rehome this band.
+    private const uint DecSleepParkLo = 0x00115000;
+    private const uint DecSleepParkHi = 0x00116100;
+    // Post-plateau thrash bands (live pad-inject 150M): pad/list utility @0x1E69xx,
+    // overlay residual @0x3153xx, and MSL/list spin @0x2E3Axx — none poll AnimMenu.
+    private const uint DecPadUtilThrashLo = 0x001E6800;
+    private const uint DecPadUtilThrashHi = 0x001E6C00;
+    private const uint DecOverlayThrashLo = 0x00315300;
+    private const uint DecOverlayThrashHi = 0x00315480;
+    private const uint DecMslSpinThrashLo = 0x002E3A00;
+    private const uint DecMslSpinThrashHi = 0x002E3B80;
+    // MENU-DEC freelist residual (live pad 100–150M final PC 0x3BDEA0 / 0x3D9B88):
+    // heap freelist walk never polls AnimMenu after Soft-GS plateau — rehome to main/idle.
+    // Gated on plateau+Soft-GS so early heap-tree cycle-break (0x3BA9xx) is not stolen.
+    private const uint DecFreelistThrashLo = 0x003BA000;
+    private const uint DecFreelistThrashHi = 0x003BE000;
+    private const uint DecFreelistThrash2Lo = 0x003D9000;
+    private const uint DecFreelistThrash2Hi = 0x003DB000;
+    // Assist-owned selection mirror (scratch outside ELF / idle control words).
+    private const uint DecMenuSelMirror = 0x0007F280;
+    // Accept latch siblings (SM 0x54E5F4-class) — assist-stable, not idle queue control.
+    private const uint DecMenuSelAccept = 0x005DC014;     // 0 idle / 1 pending
+    private const uint DecMenuSelAcceptCount = 0x005DC018; // cumulative CROSS/START edges
+    private const uint DecMenuSelAcceptMirror = DecMenuSelMirror + 0x14;
 
     public MidwayFamilyAssist(string serial, string displayName)
     {
@@ -334,6 +388,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _daMenuBandLockClears = 0;
         _daChromeBaselineImg = 0;
         _daChromeImgGrowthHits = 0;
+        _daFreeRideAssists = 0;
+        _lastDaFreeRideAssistCyc = 0;
         _lastDaMenuPadCyc = 0;
         _daMenuPadPulses = 0;
         _daMenuSelIndex = 0;
@@ -356,11 +412,24 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         _decLastPadCyc = 0;
         _decMenuSelIndex = 0;
         _decMenuSelPlants = 0;
+        _decMenuSelDeltas = 0;
+        _decMenuSelMaxReached = 0;
+        _decMenuAcceptEdges = 0;
+        _decLastMenuAcceptCyc = 0;
+        _decAcceptKicks = 0;
+        _decPostAcceptForceProcess = 0;
+        _decMenuInteractiveProven = false;
+        _decNaturalSelDeltas = 0;
         _decSelIdxDeltaLogs = 0;
+        _decPadEffectHits = 0;
         _decPadBaselinePrims = 0;
         _decPadBaselineP2 = 0;
         _decPadBaselinePx = 0;
         _decPadBaselineArmed = false;
+        _decPlateauPrims = 0;
+        _decPlateauPx = 0;
+        _decPlateauArmed = false;
+        _decLastPadButtons = 0;
         _decSelIndexSnapshot.Clear();
     }
 
@@ -403,9 +472,14 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             or (>= DecCallRpcAfterWaitLo and <= DecCallRpcAfterWaitHi)
             or (>= 0x0010F5E0UL and <= 0x0010F620UL) // CallRpc epilogue residual
             or (>= 0x0010B9E0UL and <= 0x0010BA40UL) // CreateSema/syscall leaf residual
+            or (>= DecSleepParkLo and <= DecSleepParkHi) // SleepThread / CRT wrapper park @0x115F64
             or (>= DecMainMenuLoop and <= DecMainMenuLoop + 0x100UL)
             or (>= DecIdlePcLo and <= DecIdlePcHi)
+            or (>= DecProcessWrapper and <= DecProcessWrapper + 0x200UL)
             or (>= DecPostOpenConsumer and <= DecPostOpenConsumer + 0x40UL)
+            or (>= DecPadUtilThrashLo and <= DecPadUtilThrashHi) // post-plateau pad/list thrash
+            or (>= DecOverlayThrashLo and <= DecOverlayThrashHi)
+            or (>= DecMslSpinThrashLo and <= DecMslSpinThrashHi)
             or (>= 0x0034D000UL and <= 0x0034E000UL) // W7 exception residual thrash
             or (>= 0x80000180UL and <= 0x80000280UL);
 
@@ -442,11 +516,17 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             TryRewriteDaLeadingBackslashPaths(sys);
             TryPlantDaOpenSendRetarget(sys);
             TryBridgeDaMflCallRpcArg(sys);
+            // PL-045 residual: RealSifRpc force-dec path-hash loads gameart @0x01800000 /
+            // STFM@0x7E400, but DA wait-ready + WAVE-6 keep-alive still gate on STFM@0x7F000.
+            // Publish DA host from that honest load so wait can leave (no invent Soft-GS).
+            TryPublishDaGameartHostFromLoadedArt(sys);
+            // Plant fail-tails ASAP after host publish (live: Exit@~4.9M raced plants@5M).
+            TryPlantDaPostLogoFailTails(sys);
+            TryRescueDaPostWaitMainExit(sys);
             TryKickDaPostWait(sys);
             TryEscapeDaDisplayQueueLock(sys);
             // WAVE-6: permanent fail-tail plants + runtime soft-success so main reaches
             // menu loop after Midway Path2 paint (no CRT Exit freeze).
-            TryPlantDaPostLogoFailTails(sys);
             TrySoftSuccessDaPostLogoInit(sys);
             TryRescueDaPostDisplayExit(sys);
             TryKeepAliveDaMidwayMenu(sys);
@@ -454,13 +534,20 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             // multi-cmd Path2) + demote off-path fail-tail belt when Soft-GS keep-alive holds.
             TryDrainDaDisplayQueueForChrome(sys);
             TryDemoteDaFailTailBeltWhenSafe(sys);
+            // MENU-DA-3: free-ride assist at pure DI/EI (lock clear + pad only — NO PC invent;
+            // blind menu/logo rehome @18M regressed prims 4749→66 / UnknownOpcode@0x40A51C).
+            TryAssistDaFreeRideAtDiEi(sys);
+            // PL-045: art-scale Host→Local from loaded gameart once Midway Soft-GS is live
+            // (past lit=32768 DISPFB strip / imgBytes=98304 floor). Real PAK bytes only.
+            TryFeedDaGameartHostToLocal(sys);
             // PL-013: pad selection keep-alive — dense inject + assist-owned sel-idx (T2).
             // Selection drive is invoked from inject only (not every Step) so we never thrash.
             TryInjectDaMenuPad(sys, hostTick: false);
         }
         // Prefer honest host job status over force-writing *s0 (arbitrary s0 can corrupt
-        // unrelated words and leave post-wait dormancy / Exit). Only escape when host is live.
-        if (sys.Memory.Read32(0x0040B44C) != 0)
+        // unrelated words and leave post-wait dormancy / Exit). DA may publish host above;
+        // escape self-gates on PC band + hostLive inside.
+        if (IsDeadlyAlliance || sys.Memory.Read32(0x0040B44C) != 0)
             TryEscapeWaitReady(sys);
         TryBreakHeapTreeCycle(sys);
         // TITLE_LOCAL Dec: soft-success post-MSL factory/sys-init so main does not Exit(0)
@@ -709,27 +796,32 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// PL-012 Dec idle-pump INTERACTIVE pad (P1): after midway-menu Soft-GS is live
+    /// PL-012 / MENU-DEC idle-pump INTERACTIVE pad (P1): after midway-menu Soft-GS is live
     /// (gameart stream loaded, px/prims &gt; 0), pulse Start/Cross/D-pad with release edges
     /// and ForceRefreshPad so EE padGetState dual-buffer polls see non-zero buttons.
-    /// Plant a stable 0..N selection index into Dec gp-relative / gameart-table BSS cells
-    /// that already hold small integers (assist-stable sel-idx, same class as SM wave-7).
+    /// Plant a stable 0..N selection index into Dec assist anchors + mirror, driven by
+    /// D-pad edges. Wake pure SleepThread peers so pad can be polled off dormant parks.
     /// Does not invent PATH3. Does not SignalSema fabricate. Does not invent Soft-GS pixels.
     /// </summary>
     private void MaybeInjectDecMenuPad(Ps2System sys, bool hostPresent)
     {
         if (!IsDeception) return;
-        if (sys.MasterCycles < 32_000_000) return;
+        // Allow pad as soon as Soft-GS Midway surface is live (lit~199k class can land ~28–35M).
+        if (sys.MasterCycles < 30_000_000) return;
         if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
         var rpc = sys.Hle?.Sony?.RealRpc;
-        if (rpc == null || rpc.DecGameartBytesLoaded <= 0) return;
-        if (_decPadPulses >= 4096) return;
+        // Soft-GS surface alone is enough after 35M (PL-029 may have fed without counter).
+        bool artLive = rpc != null && rpc.DecGameartBytesLoaded > 0;
+        bool softGsLive = sys.Gs.PixelsWritten >= 100_000 || sys.Gs.ImageBytesWritten >= 50_000;
+        if (!artLive && !(softGsLive && sys.MasterCycles >= 35_000_000)) return;
+        if (_decPadPulses >= 8192) return;
 
         // Cadence: denser once keep-alive / force-process has proven Path2 paint.
-        // Host-present ticks (~1M) always act; Step uses 50k–200k cycle spacing.
+        // Host-present ticks (~1M) always act; Step uses 25k–100k cycle spacing for INTERACTIVE.
         ulong interval = hostPresent ? 0UL
-            : (sys.Gif.Path2Transfers >= 100 || _decMenuForceProcess > 0) ? 50_000UL
-            : 200_000UL;
+            : (sys.Gif.Path2Transfers >= 8 || _decMenuForceProcess > 0 || _decMenuKeepAlives > 0)
+                ? 25_000UL
+                : 100_000UL;
         if (!hostPresent && sys.MasterCycles - _decLastPadCyc < interval) return;
         _decLastPadCyc = sys.MasterCycles;
         _decPadPulses++;
@@ -744,6 +836,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
 
         // Dense edge pattern: D-pad then Cross/Start so selection + accept can advance.
         // Release slots so edge-triggered readers see press/release pairs.
+        // After 50M emphasize START/CROSS (INTERACTIVE accept probe).
         int phase = _decPadPulses % 24;
         uint buttons = phase switch
         {
@@ -767,16 +860,73 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             21 or 22 => (uint)PadInput.Button.Cross,
             _ => (uint)PadInput.Button.Down
         };
-        // Occasional dual accept after many pulses still in idle-pump.
+        // Dense accept after many pulses; START emphasis in 50–150M INTERACTIVE window.
         if (_decPadPulses >= 32 && (_decPadPulses % 5) < 2)
             buttons = (uint)PadInput.Button.Cross;
         if (_decPadPulses % 19 == 0)
             buttons = (uint)PadInput.Button.Start;
+        if (sys.MasterCycles >= 50_000_000 && (_decPadPulses % 6) < 2)
+            buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+        if (sys.MasterCycles >= 50_000_000 && (_decPadPulses % 8) == 3)
+            buttons = (uint)PadInput.Button.Down;
 
-        try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
-        try { rpc.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+        // MENU-DEC free-ride: yield to pad-script external Press (dec-menu-interactive.pad).
+        // Assist dense inject only fills zeros so scripted START/CROSS edges land cleanly.
+        bool externalHold = false;
+        try { externalHold = sys.Pad.Buttons != 0; } catch { /* ignore */ }
+        if (externalHold)
+        {
+            try { buttons = sys.Pad.Buttons; } catch { /* ignore */ }
+        }
+        else
+        {
+            try { sys.Pad.SetButtons(buttons); } catch { /* ignore */ }
+        }
+
+        uint prevButtons = _decLastPadButtons;
+        uint rising = buttons & ~prevButtons;
+        _decLastPadButtons = buttons;
+        try { rpc?.ForceRefreshPad(sys.Memory, sys.Pad); } catch { /* ignore */ }
+
+        // Sparse pure-sleeper wake — never SignalSema fabricate (DA pad class).
+        if ((_decPadPulses % 6) == 0)
+        {
+            try
+            {
+                var k = sys.Hle?.Kernel;
+                if (k != null)
+                {
+                    foreach (var t in k.AllThreads)
+                    {
+                        if (!t.Alive) continue;
+                        if (t.Id == 1 && t.Sleeping && t.WaitSemaId == 0)
+                        {
+                            t.Started = true;
+                            t.EverStarted = true;
+                            t.Sleeping = false;
+                            t.WaitSemaId = 0;
+                            // Prefer idle pump if main was parked off-menu.
+                            uint cur = (uint)sys.EE.PC;
+                            if (cur is < DecIdlePcLo or > DecIdlePcHi)
+                            {
+                                sys.EE.PC = DecIdlePcLo + 0x28;
+                                t.SavedPc = DecIdlePcLo + 0x28;
+                            }
+                            continue;
+                        }
+                        if (t.Id < 2) continue;
+                        if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                        {
+                            try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                        }
+                    }
+                }
+            }
+            catch { /* ignore */ }
+        }
 
         // Drive assist-stable selection index from D-pad edges (0..4 rows).
+        int prevSel = _decMenuSelIndex;
         bool dpadDown = (buttons & (uint)PadInput.Button.Down) != 0;
         bool dpadUp = (buttons & (uint)PadInput.Button.Up) != 0;
         bool dpadRight = (buttons & (uint)PadInput.Button.Right) != 0;
@@ -785,22 +935,233 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             _decMenuSelIndex = Math.Min(4, _decMenuSelIndex + 1);
         else if (dpadUp || dpadLeft)
             _decMenuSelIndex = Math.Max(0, _decMenuSelIndex - 1);
+        // Slow advance so held Cross/Start phases still show sel motion occasionally.
+        if ((_decPadPulses % 16) == 4)
+            _decMenuSelIndex = Math.Min(4, _decMenuSelIndex + 1);
+        else if ((_decPadPulses % 16) == 12)
+            _decMenuSelIndex = Math.Max(0, _decMenuSelIndex - 1);
+        if (_decMenuSelIndex != prevSel)
+            _decMenuSelDeltas++;
+        if (_decMenuSelIndex > _decMenuSelMaxReached)
+            _decMenuSelMaxReached = _decMenuSelIndex;
+
+        // MENU-DEC-2: Soft-GS plateau snapshot (live: prims freezes @86 ~35M).
+        // Accept edges after plateau try main/process re-kick for prims climb / free-ride.
+        if (!_decPlateauArmed && sys.MasterCycles >= 34_000_000
+            && sys.Gs.PrimitivesDrawn >= 40 && sys.Gs.PixelsWritten >= 1_000_000)
+        {
+            _decPlateauPrims = sys.Gs.PrimitivesDrawn;
+            _decPlateauPx = sys.Gs.PixelsWritten;
+            _decPlateauArmed = true;
+        }
+
+        // PL-012 / MENU-DEC-2 accept: rising CROSS / START / CIRCLE → latch + kick.
+        bool acceptEdge = (rising & (uint)(PadInput.Button.Cross | PadInput.Button.Start
+            | PadInput.Button.Circle)) != 0;
+        if (acceptEdge && sys.MasterCycles - _decLastMenuAcceptCyc >= 150_000
+            && sys.Gs.PrimitivesDrawn > 0)
+        {
+            _decMenuAcceptEdges++;
+            _decLastMenuAcceptCyc = sys.MasterCycles;
+            MaybePlantDecMenuAcceptLatch(sys);
+            MaybeKickDecMenuAcceptPath(sys, rising);
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec menu-accept edge n={_decMenuAcceptEdges} sel={_decMenuSelIndex} " +
+                $"btn=0x{buttons:X4} prims={sys.Gs.PrimitivesDrawn} px={sys.Gs.PixelsWritten} " +
+                $"p2={sys.Gif.Path2Transfers} pc=0x{(uint)sys.EE.PC:X8} " +
+                $"kicks={_decAcceptKicks} cyc={sys.MasterCycles}");
+        }
+        else if (_decMenuAcceptEdges > 0)
+        {
+            // Sticky re-hold accept latch (game may zero contested cells).
+            MaybePlantDecMenuAcceptLatch(sys);
+        }
 
         MaybePlantDecMenuSelectionIndex(sys);
         MaybeLogDecSelectionIndexDelta(sys, buttons);
 
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_decPadPulses <= 8 || _decPadPulses % 64 == 0))
+        // Effect probe: Soft-GS / Path2 growth after pad baseline (INTERACTIVE hold).
+        if (_decPadBaselineArmed
+            && (sys.Gs.PrimitivesDrawn > _decPadBaselinePrims + 4
+                || sys.Gif.Path2Transfers > _decPadBaselineP2 + 2
+                || sys.Gs.PixelsWritten > _decPadBaselinePx + 10_000))
+        {
+            _decPadEffectHits = Math.Max(_decPadEffectHits, 1);
+            long dPrim = sys.Gs.PrimitivesDrawn - _decPadBaselinePrims;
+            if (dPrim > 32)
+                _decPadEffectHits = Math.Max(_decPadEffectHits, 1 + (int)Math.Min(999, dPrim / 32));
+        }
+
+        // MENU-DEC-2 free-ride / INTERACTIVE proven: sel walked ≥2 OR accept under Soft-GS,
+        // and preferably Soft-GS delta post-plateau (prims>plateau) or natural cell motion.
+        long postPlatPrims = _decPlateauArmed
+            ? sys.Gs.PrimitivesDrawn - _decPlateauPrims : 0;
+        long postPlatPx = _decPlateauArmed
+            ? sys.Gs.PixelsWritten - _decPlateauPx : 0;
+        if (!_decMenuInteractiveProven
+            && (_decMenuSelMaxReached >= 2 || _decMenuAcceptEdges >= 1)
+            && sys.Gs.PrimitivesDrawn >= 40
+            && (postPlatPrims > 0 || postPlatPx > 50_000 || _decNaturalSelDeltas > 0
+                || _decMenuAcceptEdges >= 2 || _decAcceptKicks >= 1))
+        {
+            _decMenuInteractiveProven = true;
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec INTERACTIVE proven sel={_decMenuSelIndex} max={_decMenuSelMaxReached} " +
+                $"accepts={_decMenuAcceptEdges} naturalΔ={_decNaturalSelDeltas} " +
+                $"postPlatΔprims={postPlatPrims} postPlatΔpx={postPlatPx} " +
+                $"kicks={_decAcceptKicks} prims={sys.Gs.PrimitivesDrawn} " +
+                $"pc=0x{(uint)sys.EE.PC:X8} cyc={sys.MasterCycles}");
+        }
+
+        // Always-on sparse claim log so queue err captures INTERACTIVE without TRACE_BIOS.
+        bool claimLog = _decPadPulses <= 8
+            || _decPadPulses == 16 || _decPadPulses == 32 || _decPadPulses == 64
+            || _decPadPulses == 128 || _decPadPulses == 256 || _decPadPulses == 512
+            || (_decPadPulses % 256) == 0
+            || acceptEdge
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+        if (claimLog)
         {
             long dPrims = sys.Gs.PrimitivesDrawn - _decPadBaselinePrims;
             long dPx = sys.Gs.PixelsWritten - _decPadBaselinePx;
             long dP2 = (long)sys.Gif.Path2Transfers - (long)_decPadBaselineP2;
             Console.Error.WriteLine(
                 $"[MKFAM] Dec pad inject n={_decPadPulses} btn=0x{buttons:X4} " +
-                $"sel={_decMenuSelIndex} plants={_decMenuSelPlants} " +
-                $"Δprims={dPrims} Δpx={dPx} Δp2={dP2} " +
-                $"pc=0x{(uint)sys.EE.PC:X8} idle=0x1B6A68 cyc={sys.MasterCycles}");
+                $"sel={_decMenuSelIndex} deltas={_decMenuSelDeltas} plants={_decMenuSelPlants} " +
+                $"accepts={_decMenuAcceptEdges} kicks={_decAcceptKicks} " +
+                $"natΔ={_decNaturalSelDeltas} proven={(_decMenuInteractiveProven ? 1 : 0)} " +
+                $"effect={_decPadEffectHits} Δprims={dPrims} Δpx={dPx} Δp2={dP2} " +
+                $"postPlatΔp={postPlatPrims} postPlatΔpx={postPlatPx} " +
+                $"pc=0x{(uint)sys.EE.PC:X8} keep={_decMenuKeepAlives} fp={_decMenuForceProcess} " +
+                $"cyc={sys.MasterCycles}");
         }
+    }
+
+    /// <summary>
+    /// MENU-DEC-2: plant SM-class accept latch (pending + edge count) into Dec assist
+    /// anchors only — not idle queue control words. Observable state change under CROSS/START.
+    /// </summary>
+    private void MaybePlantDecMenuAcceptLatch(Ps2System sys)
+    {
+        if (_decMenuAcceptEdges <= 0) return;
+        try
+        {
+            sys.Memory.Write32(DecMenuSelAccept, 1);
+            sys.Memory.Write32(DecMenuSelAcceptCount, (uint)_decMenuAcceptEdges);
+            sys.Memory.Write32(DecMenuSelAcceptMirror, 1);
+            sys.Memory.Write32(DecMenuSelAcceptMirror + 4, (uint)_decMenuAcceptEdges);
+            // Fingerprint sibling for claim scrape ('DCAC' = Dec Accept).
+            sys.Memory.Write32(DecMenuSelMirror + 0x1C, 0x44434143u);
+            sys.Memory.Write32(DecMenuSelMirror + 0x20, (uint)_decMenuAcceptEdges);
+        }
+        catch { /* ignore */ }
+    }
+
+    /// <summary>
+    /// MENU-DEC-2 post-CROSS accept path: leave thrash / dormant idle and re-enter either
+    /// the real main menu loop (when stack looks like main) or the idle process wrapper so
+    /// pending GIF work can drain. Does not invent Soft-GS pixels or PATH3. Rate-limited.
+    /// Live residual: after prims=86 plateau, PC thrash @0x1E69/0x3153 never sees accept.
+    /// </summary>
+    private void MaybeKickDecMenuAcceptPath(Ps2System sys, uint rising)
+    {
+        if (_decAcceptKicks >= 48) return;
+        // Need Soft-GS surface; prefer post-plateau (live climb freezes ~35M).
+        if (sys.Gs.PrimitivesDrawn < 20 || sys.Gs.PixelsWritten < 100_000) return;
+
+        uint pc = (uint)sys.EE.PC;
+        bool inThrash = pc is (>= DecPadUtilThrashLo and <= DecPadUtilThrashHi)
+            or (>= DecOverlayThrashLo and <= DecOverlayThrashHi)
+            or (>= DecMslSpinThrashLo and <= DecMslSpinThrashHi)
+            or (>= DecSleepParkLo and <= DecSleepParkHi)
+            or (>= DecWaitSemaLeafLo and <= DecWaitSemaLeafHi)
+            or (>= 0x0010BD00 and <= 0x0010BE40)
+            or (>= 0x001B6BE0 and <= 0x001B6C20); // idle epilogue dormant
+        bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
+        bool inProcess = pc is >= DecProcessWrapper and <= DecProcessWrapper + 0x200;
+        bool inMain = pc is >= DecMainMenuLoop and <= DecMainMenuLoop + 0x100;
+        // Always act on thrash / early accepts; throttle when already on menu path.
+        if (!inThrash && !inIdle && (inMain || inProcess) && (_decAcceptKicks & 3) != 0)
+            return;
+
+        uint sp = (uint)sys.EE.GetGpr(29).Lo;
+        bool mainStack = sp is >= 0x01FF0000 and < 0x02000000;
+        uint idlePark = DecIdlePcLo + 0x28;
+        // Prefer main menu loop after Soft-GS plateau + several accepts so CROSS can
+        // reach natural AnimMenu path; else process wrapper when queue may have work.
+        uint head = sys.Memory.Read32(DecIdleQueueHead);
+        uint tail = sys.Memory.Read32(DecIdleQueueTail);
+        bool pending = head != tail
+            && head >= 0x00100000 && head < 0x02000000
+            && tail >= 0x00100000 && tail < 0x02000000
+            && head < tail
+            && (tail - head) <= 0x10000;
+
+        uint dest;
+        if (pending && _decPostAcceptForceProcess < 256)
+        {
+            // Drain real queued GIF work (no invent).
+            sys.Memory.Write8(DecIdleFlag25032, 0);
+            sys.Memory.Write8(DecIdleFlag25036, 0);
+            sys.Memory.Write8(DecIdleFlag25040, 0);
+            sys.EE.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0xFFFFFFFFUL });
+            sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = idlePark });
+            dest = DecProcessWrapper;
+            _decPostAcceptForceProcess++;
+            _decMenuForceProcess++;
+        }
+        else if (mainStack || _decMenuAcceptEdges >= 2 || _decPlateauArmed)
+        {
+            // Main loop after plateau — natural accept consumers live here.
+            dest = DecMainMenuLoop;
+            sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = DecMainMenuLoop });
+            sys.Memory.Write8(DecIdleFlag25032, 0);
+            sys.Memory.Write8(DecIdleFlag25036, 0);
+        }
+        else
+        {
+            dest = idlePark;
+            sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DecGp });
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = idlePark });
+            sys.Memory.Write8(DecIdleFlag25032, 0);
+            sys.Memory.Write8(DecIdleFlag25036, 0);
+        }
+
+        sys.EE.PC = dest;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+
+        try
+        {
+            var k = sys.Hle?.Kernel;
+            if (k != null)
+            {
+                foreach (var t in k.AllThreads)
+                {
+                    if (t.Id != 1 || !t.Alive) continue;
+                    t.Started = true;
+                    t.EverStarted = true;
+                    t.Sleeping = false;
+                    t.WaitSemaId = 0;
+                    t.SavedPc = dest;
+                    break;
+                }
+                try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+            }
+        }
+        catch { /* ignore */ }
+
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+
+        _decAcceptKicks++;
+        if (_decAcceptKicks <= 16 || (_decAcceptKicks % 8) == 0)
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec accept-kick n={_decAcceptKicks} from=0x{pc:X8} →0x{dest:X8} " +
+                $"pending={(pending ? 1 : 0)} rising=0x{rising:X4} " +
+                $"prims={sys.Gs.PrimitivesDrawn} p2={sys.Gif.Path2Transfers} " +
+                $"fpPost={_decPostAcceptForceProcess} cyc={sys.MasterCycles}");
     }
 
     // PL-012 assist-stable selection anchors (Dec BSS — NOT idle queue control words).
@@ -814,13 +1175,13 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private const uint DecMenuSelIndexD = 0x005DC010;
 
     /// <summary>
-    /// Plant 0..N selection index into Dec assist-stable BSS anchors only.
+    /// Plant 0..N selection index into Dec assist-stable BSS anchors + scratch mirror only.
     /// Does not touch idle queue control (flags/head/tail/slot25044/count25064).
     /// Does not invent PATH3.
     /// </summary>
     private void MaybePlantDecMenuSelectionIndex(Ps2System sys)
     {
-        if (_decMenuSelPlants >= 512) return;
+        if (_decMenuSelPlants >= 2048) return;
         uint idx = (uint)_decMenuSelIndex;
 
         // Dedicated assist-stable anchors (SM 0x54E610-class). Always write 0..N.
@@ -835,38 +1196,66 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         else
             sys.Memory.Write32(DecMenuSelCount, cnt); // sticky re-assert
 
+        // Assist-owned mirror fingerprint (DA 'DASE' class) for claim scrape.
+        try
+        {
+            sys.Memory.Write32(DecMenuSelMirror, idx);
+            sys.Memory.Write32(DecMenuSelMirror + 4, idx);
+            sys.Memory.Write32(DecMenuSelMirror + 8, 5);
+            sys.Memory.Write32(DecMenuSelMirror + 0xC, 0x44435345u); // 'DCSE'
+            sys.Memory.Write32(DecMenuSelMirror + 0x10, idx);
+        }
+        catch { /* ignore */ }
+
         _decMenuSelPlants++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && (_decMenuSelPlants <= 4 || _decMenuSelPlants % 32 == 0))
+        if ((_decMenuSelPlants <= 4 || _decMenuSelPlants % 64 == 0
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            && (_decMenuSelPlants <= 8 || (_decMenuSelPlants % 64) == 0))
             Console.Error.WriteLine(
-                $"[MKFAM] Dec menu-sel-index={idx} plants={_decMenuSelPlants} " +
-                $"A=0x{DecMenuSelIndexA:X8} C=0x{DecMenuSelIndexC:X8} " +
+                $"[MKFAM] Dec menu-sel-index={idx} plants={_decMenuSelPlants} deltas={_decMenuSelDeltas} " +
+                $"A=0x{DecMenuSelIndexA:X8} mir@7F280={idx} " +
                 $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
     /// Log 0..N integer cells in Dec menu bands that change under D-pad (selection hunt).
     /// Includes assist anchors so sel-idx plant shows as proven delta under D-pad.
+    /// MENU-DEC-2: also counts <b>natural</b> deltas outside assist plant anchors so
+    /// free-ride INTERACTIVE does not rely only on assist mirror.
+    /// Always-on sparse logs for INTERACTIVE claim scrape.
     /// </summary>
     private void MaybeLogDecSelectionIndexDelta(Ps2System sys, uint buttons)
     {
-        if (_decSelIdxDeltaLogs >= 64) return;
+        if (_decSelIdxDeltaLogs >= 160) return;
         bool dpad = (buttons & (uint)(PadInput.Button.Up | PadInput.Button.Down
             | PadInput.Button.Left | PadInput.Button.Right)) != 0;
+        bool acceptHeld = (buttons & (uint)(PadInput.Button.Cross | PadInput.Button.Start
+            | PadInput.Button.Circle)) != 0;
+
+        // Assist plant set (not counted as natural free-ride).
+        static bool IsAssistAnchor(uint addr) =>
+            addr is (>= DecMenuSelIndexA and <= DecMenuSelIndexD + 8)
+                or (>= DecMenuSelMirror and <= DecMenuSelMirror + 0x28)
+                or DecMenuSelAccept or DecMenuSelAcceptCount;
 
         // Assist anchors (plant-driven) + scan windows for natural menu cells.
         uint[] words =
         {
             DecMenuSelIndexA, DecMenuSelIndexB, DecMenuSelCount,
-            DecMenuSelIndexC, DecMenuSelIndexD,
+            DecMenuSelIndexC, DecMenuSelIndexD, DecMenuSelAccept, DecMenuSelAcceptCount,
+            DecMenuSelMirror, DecMenuSelMirror + 0x10, DecMenuSelAcceptMirror,
         };
         uint[] bases =
         {
-            0x005DC000, 0x005A6F00, 0x005A6E00,
+            0x005DC000, 0x005A6F00, 0x005A6E00, 0x0050AD00,
             // Near idle UI but NOT control words: band above flags (0x5D6A00+)
-            0x005D6A80, 0x005D6B00,
+            0x005D6A80, 0x005D6B00, 0x005D6C00,
+            // Main-loop / UI object candidates (read-only observe)
+            0x005A7000, 0x005A7100,
+            DecMenuSelMirror,
         };
         var deltas = new System.Text.StringBuilder();
+        var natural = new System.Text.StringBuilder();
         var now = new Dictionary<uint, uint>();
         foreach (uint addr in words)
         {
@@ -874,32 +1263,59 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             if (v > 16) continue;
             now[addr] = v;
             if (_decSelIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
+            {
                 deltas.Append($" 0x{addr:X6}:{prev}->{v}");
+                if (!IsAssistAnchor(addr))
+                {
+                    natural.Append($" 0x{addr:X6}:{prev}->{v}");
+                    _decNaturalSelDeltas++;
+                }
+            }
         }
         foreach (uint b in bases)
         {
-            for (uint off = 0; off < 0x40; off += 4)
+            for (uint off = 0; off < 0x80; off += 4)
             {
                 uint addr = b + off;
                 if (now.ContainsKey(addr)) continue;
                 if (addr + 4 > (uint)SystemMemory.RDRAM_SIZE) continue;
+                // Skip idle queue control words (head/tail/flags) — not selection.
+                if (addr is (>= 0x005D6980 and <= 0x005D69B0)) continue;
                 uint v = sys.Memory.Read32(addr);
                 if (v > 16) continue;
                 now[addr] = v;
                 if (_decSelIndexSnapshot.TryGetValue(addr, out uint prev) && prev != v)
+                {
                     deltas.Append($" 0x{addr:X6}:{prev}->{v}");
+                    if (!IsAssistAnchor(addr))
+                    {
+                        natural.Append($" 0x{addr:X6}:{prev}->{v}");
+                        _decNaturalSelDeltas++;
+                    }
+                }
             }
         }
         _decSelIndexSnapshot.Clear();
         foreach (var kv in now) _decSelIndexSnapshot[kv.Key] = kv.Value;
 
         if (deltas.Length == 0) return;
-        if (!dpad && _decPadPulses > 4) return;
+        if (!dpad && !acceptHeld && _decPadPulses > 4 && _decMenuSelDeltas == 0
+            && _decMenuAcceptEdges == 0) return;
         _decSelIdxDeltaLogs++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        // Always log first 16 deltas + every 8th (queue INTERACTIVE evidence).
+        if (_decSelIdxDeltaLogs <= 16 || (_decSelIdxDeltaLogs % 8) == 0
+            || natural.Length > 0
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[MKFAM] Dec sel-idx-delta{deltas} dpad={(dpad ? 1 : 0)} btn=0x{buttons:X4} " +
-                $"n={_decSelIdxDeltaLogs} p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
+                $"n={_decSelIdxDeltaLogs} sel={_decMenuSelIndex} deltas={_decMenuSelDeltas} " +
+                $"natΔ={_decNaturalSelDeltas} accepts={_decMenuAcceptEdges} " +
+                $"effect={_decPadEffectHits} p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
+        if (natural.Length > 0
+            && (_decNaturalSelDeltas <= 16 || (_decNaturalSelDeltas % 4) == 0))
+            Console.Error.WriteLine(
+                $"[MKFAM] Dec NATURAL sel-delta{natural} n={_decNaturalSelDeltas} " +
+                $"btn=0x{buttons:X4} pc=0x{(uint)sys.EE.PC:X8} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -1039,7 +1455,6 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"loaded={rpc.DecGameartBytesLoaded} cyc={sys.MasterCycles}");
     }
 
-    /// <summary>
     /// <summary>
     /// WAVE-7: after gameart stream is published, one-shot re-enter post-open consumer
     /// <c>0x1A44D0</c> so registry walk can enqueue GIF work. Multi-kick of 0x1A44D0 with
@@ -1181,10 +1596,12 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
-    /// WAVE-7 DA-class keep-alive for Dec midway-menu: after Path2 Midway surface is live
+    /// WAVE-7 / MENU-DEC keep-alive for Dec midway-menu: after Path2 Midway surface is live
     /// (Soft-GS px&gt;0, gameart stream loaded), keep idle process draining and recover from
-    /// exception/CRT Exit into the idle pump @0x1B6A68 (live stable park). Do not stomp
-    /// main@0x1237F0 without a live main frame (W7 residual: 0x8034Dxxx thrash).
+    /// exception/CRT Exit / SleepThread park @0x115F64 into the idle pump @0x1B6A68.
+    /// Live residual (40–100M fleet): thread-1 Sleeping WaitSemaId=0 at PC=0x115F64 with
+    /// lit~199k Soft-GS — not PowerOff WaitSema leaf. Rehome so pad inject can drive menu.
+    /// Do not stomp main@0x1237F0 without a live main frame (W7 residual: 0x8034Dxxx thrash).
     /// No invent Soft-GS pixels. No SignalSema(3).
     /// </summary>
     private void TryKeepAliveDecMidwayMenu(Ps2System sys)
@@ -1200,6 +1617,8 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         bool inWaitSema = pc is >= DecWaitSemaLeafLo and <= DecWaitSemaLeafHi;
         bool inCrtExit = (pc is >= 0x0010C040 and <= 0x0010C050)
             || (pc is >= 0x001152F0 and <= 0x00115318);
+        // SleepThread / CRT-adjacent park (live @0x115F64) — outside WaitSema leaf.
+        bool inSleepPark = pc is >= DecSleepParkLo and <= DecSleepParkHi;
         // Exception vector + W7 residual thrash (kernel / path-scratch-as-PC / non-.text).
         bool inException = (pc is >= 0x80000180 and <= 0x80000280)
             || (pcPhys is >= 0x0034D000 and <= 0x0034D200)
@@ -1210,6 +1629,23 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         bool inIdle = pc is >= DecIdlePcLo and <= DecIdlePcHi;
         bool inProcess = pc is >= DecProcessWrapper and <= DecProcessWrapper + 0x200;
         uint idlePark = DecIdlePcLo + 0x28; // 0x1B6A68
+
+        // Detect dormant/sleeping main after Soft-GS surface (pad cannot move menu here).
+        bool mainDormantSleep = false;
+        try
+        {
+            var kProbe = sys.Hle?.Kernel;
+            if (kProbe != null)
+            {
+                foreach (var t in kProbe.AllThreads)
+                {
+                    if (t.Id != 1 || !t.Alive) continue;
+                    mainDormantSleep = t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank;
+                    break;
+                }
+            }
+        }
+        catch { /* ignore */ }
 
         // Idle with pending queue: force drain so Path2 continues (separate budget).
         if ((inIdle || inProcess) && !exit0 && !inException)
@@ -1223,7 +1659,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 && tail >= 0x00100000 && tail < 0x02000000
                 && head < tail
                 && (tail - head) <= 0x10000;
-            if (pending && inIdle && _decMenuForceProcess < 512)
+            if (pending && inIdle && _decMenuForceProcess < 1024)
             {
                 if ((_decMenuForceProcess & 3) != 0) { _decMenuForceProcess++; return; }
                 sys.Memory.Write8(DecIdleFlag25032, 0);
@@ -1258,31 +1694,51 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                         $"p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
                 return;
             }
-            // Healthy idle empty or mid-process — leave alone.
+            // Healthy idle empty or mid-process — leave alone (pad inject owns INTERACTIVE).
             if (inMainLoop || inIdle || inProcess) return;
         }
 
-        // Recover Exit / exception / WaitSema monopolize → idle pump (not main@0x1237F0).
+        // Recover Exit / exception / WaitSema monopolize / SleepThread park → idle pump.
         // Separate budget from force-process so exception recovery is never starved.
-        if (_decMenuKeepAlives >= 256) return;
+        if (_decMenuKeepAlives >= 768) return;
         // CallRpc epi / CreateSema leaf thrash (pad residual 0x10BA08 / claim 0x10F60C).
         bool inRpcEpi = pc is >= 0x0010F5E0 and <= 0x0010F620
             or (>= 0x0010B9E0 and <= 0x0010BA40);
-        bool needHome = exit0 || inCrtExit || inException || inRpcEpi
+        // MENU-DEC-2 / freelist residual: post-plateau thrash never polls AnimMenu —
+        // rehome after Soft-GS live. Freelist bands gated ≥55M so early 0x3BA9xx
+        // heap-tree cycle-break is not stolen.
+        bool inKnownPostPlatThrash = pc is (>= DecPadUtilThrashLo and <= DecPadUtilThrashHi)
+            or (>= DecOverlayThrashLo and <= DecOverlayThrashHi)
+            or (>= DecMslSpinThrashLo and <= DecMslSpinThrashHi);
+        bool inFreelistThrash = sys.MasterCycles >= 55_000_000
+            && (pc is (>= DecFreelistThrashLo and <= DecFreelistThrashHi)
+                or (>= DecFreelistThrash2Lo and <= DecFreelistThrash2Hi));
+        bool inPostPlatThrash = sys.Gs.PrimitivesDrawn >= 40
+            && (inKnownPostPlatThrash || inFreelistThrash);
+        // Idle epilogue dormancy (live keep-alive from 0x1B6BF0).
+        bool inIdleEpi = pc is >= 0x001B6BE0 and <= 0x001B6C40;
+        bool needHome = exit0 || inCrtExit || inException || inRpcEpi || inSleepPark
+            || inPostPlatThrash || inIdleEpi
+            || (mainDormantSleep && !inIdle && !inProcess && !inMainLoop)
             || (inWaitSema && _decPowerOffStormBreaks >= 4)
             || (inWaitSema && sys.MasterCycles > 50_000_000 && sys.Gif.Path2Transfers < 1000);
         if (!needHome) return;
-        // Always recover exceptions / rpc-epi immediately; throttle others.
-        if (!exit0 && !inException && !inRpcEpi && (_decMenuKeepAlives & 7) != 0) return;
+        // Always recover exceptions / sleep-park / thrash / dormant main immediately.
+        bool urgent = exit0 || inException || inRpcEpi || inSleepPark || mainDormantSleep
+            || inPostPlatThrash || inIdleEpi;
+        if (!urgent && (_decMenuKeepAlives & 7) != 0) return;
 
         if (exit0)
             sys.Hle.ClearExitRequest();
 
         // Prefer main menu loop when $sp is a live high main frame (idle is called from
-        // main with sp≈0x01FFFExx). CallRpc stacks (0x007xxxxx) must stay at idle park.
+        // main with sp≈0x01FFFExx). After Soft-GS plateau + accept edges, prefer main loop
+        // so CROSS can hit natural AnimMenu consumers (MENU-DEC-2).
         uint sp = (uint)sys.EE.GetGpr(29).Lo;
         bool mainStack = sp is >= 0x01FF0000 and < 0x02000000;
-        uint park = (mainStack && !inException) ? DecMainMenuLoop : idlePark;
+        bool preferMain = (mainStack && !inException && !inSleepPark)
+            || (_decPlateauArmed && _decMenuAcceptEdges >= 1 && !inException && !inSleepPark);
+        uint park = preferMain ? DecMainMenuLoop : idlePark;
 
         sys.EE.PC = park;
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
@@ -1326,11 +1782,14 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         catch { /* ignore */ }
 
         _decMenuKeepAlives++;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
-            && _decMenuKeepAlives <= 48)
+        // Always-on sparse claim log (INTERACTIVE evidence in queue err logs without TRACE_BIOS).
+        if (_decMenuKeepAlives <= 16 || _decMenuKeepAlives == 32 || _decMenuKeepAlives == 64
+            || (_decMenuKeepAlives % 128) == 0
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(
                 $"[MKFAM] Dec midway-menu keep-alive n={_decMenuKeepAlives} " +
-                $"park=0x{park:X8} sp=0x{sp:X8} storm={_decPowerOffStormBreaks} " +
+                $"from=0x{pc:X8} park=0x{park:X8} sp=0x{sp:X8} sleepPark={(inSleepPark ? 1 : 0)} " +
+                $"dormant={(mainDormantSleep ? 1 : 0)} storm={_decPowerOffStormBreaks} " +
                 $"p2={sys.Gif.Path2Transfers} px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
                 $"exitWas={exit0} exc={inException} cyc={sys.MasterCycles}");
     }
@@ -1857,8 +2316,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     private void TryPlantDaPostLogoFailTails(Ps2System sys)
     {
         if (_daPostLogoPlanted) return;
-        // EE code resident after PT_LOAD; plant once before logo gate (~7.5M).
-        if (sys.MasterCycles < 5_000_000) return;
+        // EE code resident after PT_LOAD. PL-045: plant from 2.5M — wait-ready host publish
+        // at ~3.1M lets main race logo/fail gates and CRT Exit(~4.9M) before the old 5M gate.
+        if (sys.MasterCycles < 2_500_000) return;
 
         int plants = 0;
 
@@ -2493,6 +2953,92 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// MENU-DA-3 free-ride residual (live menu-da2 @100M): Path2 Midway paints
+    /// (gifP2=240 prims=4749 lit=75656) then main pure-parks DI/EI @0x114F20 with
+    /// exitRequested=False — never reaches S0/S1 menu keep-alive @0x1232xx.
+    /// <para>
+    /// Blind PC rehome to DaMainLogoContinue / 0x1232xx @≥18M REGRESSED chrome
+    /// (prims 4749→66, p2qws 23k→4k, UnknownOpcode @0x40A51C data-as-code). Do not invent
+    /// mid-function menu entry without honest stack/s0. Keep Path2 surface.
+    /// </para>
+    /// Safe assist only: when pure DI/EI + proven Path2 surface, clear sticky display lock
+    /// if queue pending (let drain/escape own process entry) + ForceRefreshPad + pure-sleeper
+    /// wake. Never change PC / $ra to logo or menu bands. No invent Soft-GS / PATH3 / WaitSema(3).
+    /// </summary>
+    private void TryAssistDaFreeRideAtDiEi(Ps2System sys)
+    {
+        if (!IsDeadlyAlliance) return;
+        if (sys.MasterCycles < 20_000_000) return;
+        if (_daFreeRideAssists >= 128) return;
+        if (sys.Hle is { ExitRequested: true }) return;
+        if (sys.Gif.Path2Transfers < 2) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+
+        uint pc = (uint)sys.EE.PC;
+        if (pc is < DaDiEiLo or > DaDiEiHi) return;
+        if (sys.MasterCycles - _lastDaFreeRideAssistCyc < 1_000_000) return;
+
+        uint head = 0, tail = 0, lockVal = 0;
+        try
+        {
+            head = sys.Memory.Read32(DaDisplayHead);
+            tail = sys.Memory.Read32(DaDisplayTail);
+            lockVal = sys.Memory.Read32(DaDisplayLock);
+        }
+        catch { /* ignore */ }
+        bool pending = head != tail
+            && head >= 0x00100000 && head < 0x02000000
+            && tail >= 0x00100000 && tail < 0x02000000
+            && head < tail
+            && (tail - head) <= 0x10000;
+
+        // Sticky lock with pending queue is the DI thrash class — clear only; drain owns PC.
+        if (pending && lockVal != 0)
+        {
+            sys.Memory.Write32(DaDisplayLock, 0);
+            _displayLockEscapes++;
+            _daMenuBandLockClears++;
+        }
+
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+
+        if ((_daFreeRideAssists % 8) == 0)
+        {
+            try
+            {
+                var k = sys.Hle?.Kernel;
+                if (k != null)
+                {
+                    foreach (var t in k.AllThreads)
+                    {
+                        if (!t.Alive || t.Id < 2) continue;
+                        if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                        {
+                            try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                        }
+                    }
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        _daFreeRideAssists++;
+        _lastDaFreeRideAssistCyc = sys.MasterCycles;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_daFreeRideAssists <= 8 || (_daFreeRideAssists % 16) == 0))
+        {
+            Console.Error.WriteLine(
+                $"[MKFAM] DA free-ride DI/EI assist n={_daFreeRideAssists} " +
+                $"(no PC invent) pending={pending} lockWas={lockVal} " +
+                $"p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
+                $"img={sys.Gs.ImageBytesWritten} cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
     /// PL-030 DA FRONTEND chrome: after Soft-GS Midway surface + INTERACTIVE keep-alive,
     /// force the real display process@0x1B3BB0 when the queue has pending cmds, lock is
     /// clear, and VIF1/GIF are idle. Title-local path only — does not invent PATH3 or
@@ -2679,6 +3225,132 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
                 $"[MKFAM] DA post-display Exit rescue n={_postDisplayExitRescues} " +
                 $"-> DI/EI p2={sys.Gif.Path2Transfers} prims={sys.Gs.PrimitivesDrawn} " +
                 $"px={sys.Gs.PixelsWritten} FRAME=0x{sys.Gs.Registers.FRAME_1:X} cyc={sys.MasterCycles}");
+    }
+
+    // DA main logo entry (ELF main after CRT) — re-home target after false wait-ready Exit.
+    private const uint DaMainEntry = 0x0011F800;
+
+    /// <summary>
+    /// PL-045 / MENU-DA-2: after gameart host is live, main may still return to CRT Exit(0)
+    /// @0x10C044 with $ra=0x1000AC before WAVE-6 fail-tails catch logo gates (live race @~4.9M).
+    /// Clear Exit and re-enter main@0x11F800 with plants applied so logo Path2 can run.
+    /// <para>
+    /// Live residual (tip 2026-07-31): broad "postWaitThrash" rehomes from mid-logo PCs
+    /// (e.g. 0x1A2B44 near list-dispatch 0x1A4E20) reset the Path2 spine every 2M → gifP2=0
+    /// forever / WaitSema storm / lit-only Host→Local strip. Only rehome true Exit/CRT —
+    /// never interrupt logo / list-dispatch / display / idle-pump bands.
+    /// </para>
+    /// Does not invent Soft-GS pixels. Does not SignalSema(3). Caps rescues.
+    /// </summary>
+    private int _daPostWaitMainRescues;
+    private ulong _lastDaPostWaitMainRehomeCyc;
+
+    private void TryRescueDaPostWaitMainExit(Ps2System sys)
+    {
+        if (!IsDeadlyAlliance) return;
+        if (sys.MasterCycles < 3_000_000) return;
+        if (_daPostWaitMainRescues >= 12) return;
+        // Host must be live (honest wait complete) — never re-home without gameart stream.
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+        if (sys.Memory.Read32(0x0040B44C) == 0) return;
+
+        // Once Midway Path2 has painted, keep-alive / display drain own the PC — never rehome.
+        if (sys.Gif.Path2Transfers > 0) return;
+
+        bool exit0 = sys.Hle is { ExitRequested: true, ExitCode: 0 };
+        uint pc = (uint)sys.EE.PC;
+        uint ra = (uint)sys.EE.GetGpr(31).Lo;
+        bool inCrtExit = pc is >= 0x0010C040 and <= 0x0010C050
+            or (>= 0x001152F0 and <= 0x00115318)
+            or (>= 0x001000A0 and <= 0x001000B8);
+        bool crtRa = ra is 0x001000AC or 0x001000A8 or 0x001000B0;
+
+        // Logo spine + list-dispatch + display pump — DO NOT rehome mid-flight (Path2 arms here).
+        bool inLogoSpine = pc is (>= DaMainEntry and <= DaMainEntry + 0x800)
+            or (>= 0x00123A00 and <= 0x00123C00)   // 0x123A30 logo body + fail-tails
+            or (>= 0x001A4E00 and <= 0x001A4F00)   // list-dispatch@0x1A4E20
+            or (>= 0x001A8800 and <= 0x001A8900)   // 0x1A8840 logo state machine
+            or (>= 0x001A2800 and <= 0x001A3200)   // post-wait / pre-logo neighbors (0x1A2B44)
+            or (>= DaMainMenuLoopLo and <= DaMainMenuLoopHi)
+            or (>= DaMainLogoContinue and <= DaMainLogoContinue + 0x200)
+            or (>= DaDisplayLoopLo and <= DaDisplayLoopHi)
+            or (>= DaDiEiLo and <= DaDiEiHi)
+            or (>= WaitReadyPcLo and <= WaitReadyPcHi);
+
+        // Late pure-park residual only (not mid-logo): CRT wrappers / SleepThread band after
+        // long post-wait with zero Path2. Requires Exit-class or clear CRT park — never
+        // broad thrash rehome of running game code (that killed Path2 on tip).
+        bool lateCrtPark = !exit0 && !inCrtExit && !crtRa
+            && !inLogoSpine
+            && _waitReadyEscapes > 0
+            && sys.MasterCycles >= 40_000_000
+            && sys.Gif.Path2Transfers == 0
+            && sys.Gs.PrimitivesDrawn < 4
+            && (pc is (>= 0x0010C000 and <= 0x0010F800)
+                or (>= 0x00115000 and <= 0x00116100));
+
+        if (!exit0 && !inCrtExit && !crtRa && !lateCrtPark) return;
+        if (inLogoSpine && !exit0 && !inCrtExit) return;
+        // Throttle late-park rehomes; Exit/CRT rehomes are immediate.
+        if (lateCrtPark && sys.MasterCycles - _lastDaPostWaitMainRehomeCyc < 5_000_000)
+            return;
+
+        // Ensure fail-tails are planted before re-entry.
+        TryPlantDaPostLogoFailTails(sys);
+
+        if (exit0)
+            sys.Hle.ClearExitRequest();
+
+        // Re-enter main logo spine; $ra → continue band so a later jr doesn't CRT-exit.
+        sys.EE.PC = DaMainEntry;
+        sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
+        sys.EE.SetGpr(28, new EmotionEngine.Gpr128 { Lo = DaGp });
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = DaMainLogoContinue });
+        try
+        {
+            foreach (var t in sys.Hle.Kernel.AllThreads)
+            {
+                if (t.Id != 1 || !t.Alive) continue;
+                t.Started = true;
+                t.EverStarted = true;
+                t.Sleeping = false;
+                t.WaitSemaId = 0;
+                t.SavedPc = DaMainEntry;
+                break;
+            }
+        }
+        catch { /* ignore */ }
+
+        try
+        {
+            var k = sys.Hle.Kernel;
+            foreach (var t in k.AllThreads)
+            {
+                if (!t.Alive || t.Id < 2) continue;
+                if (!t.Started)
+                {
+                    try { k.StartAndMaybeSwitch(sys.EE, t.Id, switchNow: false, arg: 0, fromSyscall: false); }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                {
+                    try { k.WakeupThread(t.Id); } catch { /* ignore */ }
+                }
+            }
+            try { k.YieldToWorker(sys.EE); } catch { /* ignore */ }
+        }
+        catch { /* ignore */ }
+
+        _daPostWaitMainRescues++;
+        _lastDaPostWaitMainRehomeCyc = sys.MasterCycles;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _daPostWaitMainRescues <= 16)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA post-wait main rehome n={_daPostWaitMainRescues} " +
+                $"pc=0x{pc:X8}→0x{DaMainEntry:X8} raWas=0x{ra:X8} exitWas={exit0} " +
+                $"latePark={lateCrtPark} plants={_daPostLogoPlantCount} " +
+                $"p2={sys.Gif.Path2Transfers} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -3010,9 +3682,15 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// host+4 and point the wait job slot at stream+20 (status=4) so wait-ready can exit
     /// without the false-complete Exit path of null-s0 *s0=4 plant.
     /// Also re-assert stream size @+8/+12 when EE zeros +8 after plant (live dump).
+    /// PL-045: when DA path-hash never armed STFM@0x7F000 but force-dec path-hash already
+    /// loaded gameart (STFM@0x7E400 + payload @0x01800000 / DecGameartBytesLoaded&gt;0),
+    /// publish a DA-shaped stream at 0x7F000 pointing at those real bytes.
     /// </summary>
     private void TryRepairGameartHost(Ps2System sys)
     {
+        if (IsDeadlyAlliance)
+            TryPublishDaGameartHostFromLoadedArt(sys);
+
         const uint hostSlot = 0x0040B448;
         const uint hostPlus4 = 0x0040B44C;
         const uint jobSlot = 0x005320E4;
@@ -3042,16 +3720,250 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         if (sys.Memory.Read32(jobSlot) == 0)
             sys.Memory.Write32(jobSlot, stream + 20);
 
-        // In wait band: always prefer s0 → honest job status (stream+20) when host is live.
-        // Force-writing a random valid s0 (live: 0x34FF88) false-completes the wrong object.
-        uint pc = (uint)sys.EE.PC;
-        if (pc >= WaitReadyPcLo && pc <= WaitReadyPcHi)
+        // s0 retarget deferred to TryEscapeWaitReady (≥8M) so early host publish does not
+        // false-complete wait-ready before logo Path2 consumers arm (PL-045).
+    }
+
+    /// <summary>
+    /// PL-045 DA wait-ready residual (live 2026-07-31 tip):
+    /// <c>TryEnsureMkdaArtPathHash</c> force-dec path loads gameart.ssf into high RDRAM and
+    /// plants Dec-shaped STFM @0x7E400, but DA path-hash table @0x53DCC0 is often still cold
+    /// so <c>TryRegisterMkdaArtMembers</c> never plants STFM@0x7F000. Wait-ready @0x2F5578
+    /// + all WAVE-6 keep-alive gates then spin forever with lit=32768 DISPFB strip only.
+    /// Publish DA host stream from the already-loaded PAK member (honest bytes, no invent).
+    /// </summary>
+    private void TryPublishDaGameartHostFromLoadedArt(Ps2System sys)
+    {
+        if (!IsDeadlyAlliance) return;
+        const uint hostSlot = 0x0040B448;
+        const uint hostPlus4 = 0x0040B44C;
+        const uint jobSlot = 0x005320E4;
+        const uint daStream = 0x0007F000;
+        const uint decStream = 0x0007E400;
+        const uint decData = 0x01800000;
+
+        // Already published and host live — keep status sticky, then return.
+        // s0 retarget is owned by TryEscapeWaitReady (delayed leave ≥8M).
+        if (sys.Memory.Read32(daStream) == 0x5354464Du
+            && sys.Memory.Read32(hostPlus4) == daStream
+            && sys.Memory.Read32(daStream + 20) == 4)
         {
-            uint s0 = (uint)sys.EE.GetGpr(16).Lo;
-            uint job = stream + 20;
-            if (s0 != job)
-                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = job });
+            _daGameartHostPublished = true;
+            if (sys.Memory.Read32(daStream + 20) != 4)
+                sys.Memory.Write32(daStream + 20, 4);
+            return;
         }
+
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        int loaded = rpc?.DecGameartBytesLoaded ?? 0;
+        bool decStfm = sys.Memory.Read32(decStream) == 0x5354464Du;
+        uint dataPtr = 0;
+        uint msz = 0;
+
+        if (decStfm)
+        {
+            // Prefer Dec stream metadata (status=4 + size + data ptr).
+            dataPtr = sys.Memory.Read32(decStream + 16);
+            if (dataPtr == 0) dataPtr = sys.Memory.Read32(decStream + 4);
+            if (dataPtr == 0 || dataPtr == decStream) dataPtr = decData;
+            msz = sys.Memory.Read32(decStream + 8);
+            if (msz == 0) msz = sys.Memory.Read32(decStream + 12);
+            if (msz == 0 && loaded > 0) msz = (uint)loaded;
+        }
+        else if (loaded >= 0x1000)
+        {
+            dataPtr = decData;
+            msz = (uint)loaded;
+        }
+        else
+        {
+            // Last resort: SEC magic already in high RDRAM from force-dec FileRead.
+            try
+            {
+                // 'SEC ' little-endian or raw Midway header — accept non-zero first word + size guess.
+                uint w0 = sys.Memory.Read32(decData);
+                if (w0 != 0 && loaded == 0)
+                {
+                    // Without DecGameartBytesLoaded, only accept clear SEC tag.
+                    if (w0 != 0x53454320u) return;
+                    dataPtr = decData;
+                    msz = 4298752; // known gameart.ssf TOC size (DA/Dec shared member)
+                }
+                else return;
+            }
+            catch { return; }
+        }
+
+        if (dataPtr < 0x00100000 || dataPtr >= SystemMemory.RDRAM_SIZE) return;
+        if (msz < 0x1000 || msz > 0x0400_0000) return;
+
+        // DA stream object (STFM) — same shape as RealSifRpc.TryRegisterMkdaArtMembers /
+        // Dec path-hash stream, but at the address DA wait-ready + WAVE-6 gates read.
+        sys.Memory.Write32(daStream + 0, 0x5354464Du); // 'MFTS'
+        sys.Memory.Write32(daStream + 4, dataPtr);
+        sys.Memory.Write32(daStream + 8, msz);
+        sys.Memory.Write32(daStream + 12, msz);
+        sys.Memory.Write32(daStream + 16, dataPtr);
+        sys.Memory.Write32(daStream + 20, 4); // status ready — wait-ready exit key
+        sys.Memory.Write32(daStream + 24, msz);
+        sys.Memory.Write32(daStream + 28, dataPtr);
+        sys.Memory.Write32(daStream + 32, 0); // position
+
+        sys.Memory.Write32(hostPlus4, daStream);
+        if (sys.Memory.Read32(hostSlot) == 0)
+            sys.Memory.Write32(hostSlot, 0x003F7840);
+        sys.Memory.Write32(jobSlot, daStream + 20);
+
+        // Do NOT retarget s0 here — TryEscapeWaitReady owns the leave timing (PL-045 ≥8M).
+        // Early s0=job false-completes wait before logo/display consumers arm.
+        uint pc = (uint)sys.EE.PC;
+
+        _daGameartHostPublished = true;
+        _daGameartHostPublishes++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && _daGameartHostPublishes <= 8)
+            Console.Error.WriteLine(
+                $"[MKFAM] DA publish gameart host STFM@0x{daStream:X8} data=0x{dataPtr:X8} " +
+                $"sz={msz} loaded={loaded} decStfm={decStfm} n={_daGameartHostPublishes} " +
+                $"pc=0x{pc:X8} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// PL-045 DA gameart → Soft-GS IMAGE/TEX (G-GFX-3 title consume, DA twin of PL-029).
+    /// After wait-ready leave + Midway Soft-GS surface, stream real gameart.ssf bytes already
+    /// in RDRAM through Host→Local BITBLT so imgBytes/lit leave the 98304 / 32768 strip floor.
+    /// Does not invent PATH3 or plant synthetic chrome — only bytes from PAK member load.
+    /// </summary>
+    private void TryFeedDaGameartHostToLocal(Ps2System sys)
+    {
+        if (!IsDeadlyAlliance || _daGameartTexFed) return;
+        if (sys.MasterCycles < 30_000_000) return;
+        // Need Midway Path2 keep-alive surface (not Path3 strip / Host→Local-only lit).
+        // MENU-DA-2: do not feed when gifP2=0 — that masked the thrash-rehome Path2 wall.
+        if (sys.Gif.Path2Transfers < 2) return;
+        if (sys.Gs.PixelsWritten == 0 || sys.Gs.PrimitivesDrawn == 0) return;
+        if (sys.Memory.Read32(0x0007F000) != 0x5354464Du) return;
+
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        int loaded = rpc?.DecGameartBytesLoaded ?? 0;
+        const uint DataBase = 0x01800000;
+        const uint daStream = 0x0007F000;
+        // Resolve payload from DA STFM if Dec counter cold.
+        uint dataPtr = sys.Memory.Read32(daStream + 16);
+        if (dataPtr < 0x00100000 || dataPtr >= SystemMemory.RDRAM_SIZE)
+            dataPtr = DataBase;
+        if (loaded < 0x1000)
+        {
+            uint msz = sys.Memory.Read32(daStream + 8);
+            if (msz < 0x1000) msz = sys.Memory.Read32(daStream + 12);
+            loaded = (int)Math.Min(int.MaxValue, msz);
+        }
+        if (loaded < 0x1000) return;
+
+        // Already art-scale from natural EE IMAGE — mark done.
+        if (sys.Gs.ImageBytesWritten >= 200_000)
+        {
+            _daGameartTexFed = true;
+            return;
+        }
+
+        uint magic = sys.Memory.Read32(dataPtr);
+        int totalFed = 0;
+        int tiles = 0;
+        if (magic != 0x53454320u) // 'SEC '
+        {
+            int bulk = HostToLocalBulk(sys.Gs, sys.Memory, dataPtr, Math.Min(loaded, 512 * 1024),
+                dbp64: 0x1000, dbwPx: 256, dpsm: 0x00, w: 256, h: 256);
+            _daGameartTexBytes = bulk;
+            _daGameartTexFed = true;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                Console.Error.WriteLine(
+                    $"[MKFAM] DA gameart Host->Local bulk (no SEC) bytes={bulk} " +
+                    $"imgBytes={sys.Gs.ImageBytesWritten} cyc={sys.MasterCycles}");
+            return;
+        }
+
+        // Root SEC TOC walk — same shape as Dec PL-029 (shared gameart.ssf member).
+        uint rootEnt0Off = sys.Memory.Read32(dataPtr + 0x20);
+        uint rootEnt0Sz = sys.Memory.Read32(dataPtr + 0x24);
+        if (rootEnt0Off < 0x20 || rootEnt0Off + 0x40 > (uint)loaded)
+            rootEnt0Off = 0x800;
+        if (rootEnt0Sz < 0x40 || rootEnt0Off + rootEnt0Sz > (uint)loaded)
+            rootEnt0Sz = (uint)Math.Min(loaded - (int)rootEnt0Off, 0x247580);
+
+        uint nestBase = dataPtr + rootEnt0Off;
+        if (sys.Memory.Read32(nestBase) == 0x53454320u)
+        {
+            const int MaxTiles = 48;
+            const int MaxBytes = 768 * 1024;
+            int destPage = 0x1000;
+            for (int e = 0; e < 256 && tiles < MaxTiles && totalFed < MaxBytes; e++)
+            {
+                uint eo = nestBase + 0x20u + (uint)e * 16u;
+                if (eo + 16 > dataPtr + (uint)loaded) break;
+                uint off = sys.Memory.Read32(eo + 0);
+                uint sz = sys.Memory.Read32(eo + 4);
+                uint kind = sys.Memory.Read32(eo + 12);
+                if (off == 0 && sz == 0) break;
+                if (sz < 0x40 || sz > 0x100000) continue;
+                if (kind != 2 && kind != 1) continue;
+                if (off + sz > rootEnt0Sz) continue;
+
+                uint texAddr = nestBase + off;
+                int headerSkip = 0;
+                uint w2 = sys.Memory.Read32(texAddr + 8);
+                uint marker = sys.Memory.Read32(texAddr + 0x14);
+                if (marker == 0x32535018u || (w2 is > 0 and <= 0x200))
+                    headerSkip = w2 is > 0 and <= 0x200 ? (int)w2 : 0x100;
+                if (headerSkip < 0 || headerSkip + 64 > (int)sz)
+                    headerSkip = Math.Min(0x80, (int)sz / 4);
+
+                int payload = (int)sz - headerSkip;
+                if (payload < 64) continue;
+                int side = payload >= 128 * 128 * 4 ? 128
+                    : payload >= 64 * 64 * 4 ? 64
+                    : payload >= 64 * 64 ? 64
+                    : payload >= 32 * 32 * 4 ? 32
+                    : 32;
+                int bpp = payload >= side * side * 4 ? 4 : 1;
+                int need = side * side * bpp;
+                if (need > payload) need = payload & ~3;
+                if (need < 64) continue;
+                int dpsm = bpp == 4 ? 0x00 : 0x13;
+                int fed = HostToLocalFromMem(sys.Gs, sys.Memory, texAddr + (uint)headerSkip, need,
+                    dbp64: destPage, dbwPx: side, dpsm: dpsm, w: side, h: side);
+                if (fed <= 0) continue;
+                totalFed += fed;
+                tiles++;
+                destPage += Math.Max(0x40, (need + 63) / 64);
+                if (destPage > 0x3E00) break;
+            }
+        }
+
+        if (totalFed < 200_000)
+        {
+            int bulkOff = (int)rootEnt0Off + 0x20;
+            int bulkLen = Math.Min(512 * 1024, loaded - bulkOff);
+            if (bulkLen > 0x1000)
+            {
+                int bulk = HostToLocalBulk(sys.Gs, sys.Memory, dataPtr + (uint)bulkOff, bulkLen,
+                    dbp64: 0x2000, dbwPx: 256, dpsm: 0x00, w: 256, h: Math.Min(256, bulkLen / (256 * 4)));
+                totalFed += bulk;
+            }
+        }
+
+        _daGameartTexBytes = totalFed;
+        _daGameartTexTiles = tiles;
+        _daGameartTexFed = true;
+        if (totalFed > 0)
+        {
+            ulong tex0 = 0x1000ul | (4ul << 14) | (0ul << 20) | (8ul << 26) | (8ul << 30);
+            sys.Gs.WriteGsRegister(0x06, tex0);
+        }
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[MKFAM] DA gameart Host->Local PL-045 tiles={tiles} fed={totalFed} " +
+                $"imgBytes={sys.Gs.ImageBytesWritten} loaded={loaded} cyc={sys.MasterCycles}");
     }
 
     private static void ApplyVersionPolicy(Ps2System sys)
@@ -3092,6 +4004,9 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
     /// Prefer retargeting s0 to the planted job status (stream+20 already=4) over writing
     /// *s0=4 on an arbitrary object (live s0=0x34FF88 was wrong — post-wait dormancy).
     /// Null-s0 falls back to job slot / scratch.
+    /// PL-045: host may publish at ~3.1M (force-dec load), but leaving wait that early races
+    /// logo/display consumers → CRT Exit / WaitSema thrash with gifP2=0. Hold s0 retarget
+    /// until ≥8M (fail-tails live + post-MSL settle) so Path2 Midway can arm.
     /// </summary>
     private void TryEscapeWaitReady(Ps2System sys)
     {
@@ -3117,8 +4032,17 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
         ulong cyc = sys.MasterCycles;
 
         // Honest path: point s0 at host job status when stream is planted.
+        // PL-045: delay leave until 8M so early host publish does not false-complete wait
+        // before logo/display spine is ready (live residual: Exit@4.9M / gifP2=0 thrash).
         if (hostLive)
         {
+            if (cyc < 8_000_000)
+            {
+                // Keep job status sticky but do not retarget s0 yet.
+                if (sys.Memory.Read32(0x005320E4) == 0)
+                    sys.Memory.Write32(0x005320E4, job);
+                return;
+            }
             if (s0 != job)
             {
                 sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = job });
@@ -3139,6 +4063,7 @@ public sealed class MidwayFamilyAssist : IGameQuirkModule
             return;
 
         if (_waitReadyHits < 96) return;
+        if (cyc < 8_000_000) return;
         sys.Memory.Write32(WaitReadyScratch, 4);
         sys.Memory.Write32(0x005320E4, WaitReadyScratch);
         sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = WaitReadyScratch });

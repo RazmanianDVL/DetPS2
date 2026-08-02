@@ -8,49 +8,56 @@
 | **ISO** | `user-media-whiplash.json` → operator ISO (never commit path) |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-whiplash.json` |
-| **Seat / branch** | **S7 STREAM** (secondary) · `agent/seat-s7/s2-g2` |
-| **Build** | `out/seat-s7` |
+| **Seat / branch** | **MENU-WHIP-2** · tip `detps2` (WhiplashAssist owned) |
+| **Build** | `src/DetPS2.Core/bin/Release/net9.0` (live-queue) |
 | **Assist** | `WhiplashAssist.cs` (owned) + shared GOE in `RealSifRpc.cs` |
-| **Status** | **MENU YES** + **PL-033 ring fill live** — px/prims↑ @100M; pad inject live |
-| **Last updated** | 2026-07-31 |
-| **WP** | PL-033 full texture ring path toward richer Soft-GS |
+| **Status** | Soft-GS lit>0 + natural present DISPFB — **MENU-WHIP-2 Host→Local residual** title chrome @100M (**not natural MENU YES**). LIVE re-verify lit=5189 imgBytes=262144 |
+| **Last updated** | 2026-07-31 residual honesty |
+| **WP** | MENU-WHIP-2 Host→Local residual (done) · natural EE GIF IMAGE residual |
 
 ### MENU gate
 
 **title-surface Soft-GS** = full Soft-GS FB chrome after firstscreen/Code/frontend GOE Start.
-Not MK MAINMENU language.
+Not MK MAINMENU language. **lit>0** required for host-present proof (px alone ≠ chrome).
 
 ---
 
-## Claim 100M (SEMA_STALL_YIELD OFF) — S2 PL-033 · 2026-07-31 seat-s7
+## Claim 100M (SEMA_STALL_YIELD OFF) — MENU-WHIP-2 · 2026-07-31 live-queue
+
+**Baseline (SliceSize=64, pre-fix):** `slice64-whip-20m-host` px=286720 lit=**0** prims=1 imgBytes=0 expandHits=1 mostlyBlack=1
 
 ```
-@100M: PC=0x0035A254  px=573440  prims=2  gifPath1=0  gifPath2=0  gifPath3=4  dmac=38
+@100M: PC=0x0035A254  px=610373  prims=4  gifPath1=0  gifPath2=0  gifPath3=4  dmac=38
        sifBytes=48208 syscalls=3170 cdvdSectors=2547 exitRequested=False
-       softgs: imgBytes=0 dispfbPx=0 expandHits=2 fragTest=573440
-       softgs-regs: FRAME_1=0x100000 DISPFB1=0
+       softgs: imgBytes=262144 dispfbPx=36933 naturalDispfbPx=36933 residual=0
+               compositeSource=NaturalDispfb expandHits=2 fragTest=573440
+       softgs-present: lit=5189/286720 s0=0xFF000000 mostlyBlack=0
+       softgs-regs: FRAME_1=0x100000 DISPFB1=0 DISPFB2=0x9000
                     SCISSOR=0x03FF000003FF0000 XYOFFSET=0x80008000 TEST=0x30002
-       softgs-writes: total=24 PRIM=2 XYZ2=0 XYZF2=4 FRAME=2 SCISSOR=2 TEST=2 XYOFF=2
+       softgs-circuit: pmode=0x66 circ=2 FBP=0 FBW=512 PSM=1 out=512x448
        gif-pkts: completed=6 aborted=0 tags=6 p2qws=0
-       RealSifRpc: binds=13 calls=… unknownBindSids=0
-       pad: inject ≥1536 START/CROSS edges + ForceRefreshPad post PADMAN OPEN
-       ring: assist fill firstscreen+frontend → EE 0x45BC94 (~780 KiB total) from GOE Start dump
+       RealSifRpc: binds=13
+       chrome: Host→Local GOE firstscreen (256 KiB) → Soft-GS IMAGE + ForceRefreshPresentComposite
        spine: UsingCD + IOPRP255 · GOE IOPFILE 0x31/0x40 · WaitSema WHIP-gated only
 ```
 
-**CLAIM LINE (Whip / PL-033):**  
-`Whip SEMA_OFF @100M MENU hold px=573440 prims=2 gifP3=4 expandHits=2 cdvd=2547 | ring fill ~780KiB→0x45BC94 | pad inject live (≥1536) | T3 partial (px↑ prims↑ vs S1 px=286720 prims=1; imgBytes=0 residual)`
+**CLAIM LINE (Whip / MENU-WHIP-2):**  
+`Whip SEMA_OFF @100M lit=5189/286720 mostlyBlack=0 px=610373 prims=4 gifP3=4 imgBytes=262144 dispfbPx=36933 natural | Host→Local firstscreen 256KiB | vs Slice64 baseline px=286720 lit=0 imgBytes=0`
 
-Trace: `out/traces/whiplash-claim100-pl033-20260731-094200-{out,err}.txt`  
-S1 baseline: px=286720 prims=1 imgBytes=0 PC=0x314F80
+Live job: `out/live-queue/done/menu-whip-2-100m-host-20260731-131039.json`  
+Trace: `out/traces/whiplash-claim100-menu-whip2-20260731-131039-{out,err}.txt`  
+PL-033 prior (lit residual): px=573440 prims=2 imgBytes=0
 
 Reproduce:
 
 ```powershell
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
-dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s7
-$env:DETPS2_TRACE_BIOS='1'; $env:DETPS2_TRACE_WHIP='1'
-dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json --cycles=100000000 --host-present
+dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release
+# via live-queue:
+@{ id="menu-whip-2-100m"; media="user-media-whiplash.json"; cycles=100000000; hostPresent=$true; priority=0 } |
+  ConvertTo-Json | Set-Content out/live-queue/inbox/menu-whip-2-100m.json -Encoding utf8
+# or direct:
+dotnet exec src/DetPS2.Core/bin/Release/net9.0/DetPS2.Core.dll blocker-trace user-media-whiplash.json --cycles=100000000 --host-present
 ```
 
 ---
@@ -65,12 +72,14 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json -
 | SN PreferSnFileIo + IOPFILE 0x31/0x40 | **Yes** |
 | PS2.RKV surface + stream-table paint | **Yes** (shared RealSifRpc) |
 | GOE Open+Start firstscreen/Code/frontend | **Yes** |
-| Progressive texture **ring** fill EE `0x45BC94` | **Yes↑** (assist PL-033 ~780 KiB from GOE dump) |
-| Soft-GS title surface | **Yes** (**px=573440** = 2× full-FB class) |
-| Natural Path2 multi-prim / IMAGE tex | **Partial** (prims=**2**, imgBytes=**0**, gifPath2=0) |
-| DISPFB present | **No** (dispfbPx=0) |
-| Pad inject START/CROSS (PL-018) | **Yes** (≥1536) |
-| T2 INTERACTIVE | **Residual** (PC moved 0x314F80→0x35A254; no frontend accept yet) |
+| Progressive texture **ring** fill EE `0x45BC94` | **Yes** (PL-033) |
+| Soft-GS title surface px | **Yes** (**px=610373**, expandHits=2) |
+| Soft-GS **lit** present | **Yes** (**lit=5189/286720**, mostlyBlack=0) |
+| Host→Local IMAGE (MENU-WHIP-2) | **Yes** (**imgBytes=262144**) |
+| Natural DISPFB composite | **Yes** (dispfbPx=**36933**, src=NaturalDispfb) |
+| Natural Path2 multi-prim / EE GIF IMAGE | **Partial** (gifPath2=0; assist IMAGE residual) |
+| Pad inject START/CROSS (PL-018) | **Yes** |
+| T2 INTERACTIVE | **Residual** (PC=0x35A254; no frontend accept yet) |
 
 ---
 
@@ -80,44 +89,47 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json -
 |------|----------------|-------|
 | **Path1 (VU1)** | gifPath1=**0** | None |
 | **Path2 (VIF1/DIRECT)** | gifPath2=**0** | No Path2 tags at claim |
-| **Path3** | gifPath3=**4** | 2× S1 PATH3 |
-| **PRIM/XYZ** | prims=**2**, XYZF2=**4** | Second title sprite / expand |
-| **IMAGE / TEX** | imgBytes=**0** | Ring resident but Soft-GS IMAGE residual (S9) |
-| **DISPFB / PCRTC** | dispfbPx=**0** | S10 |
+| **Path3** | gifPath3=**4** | PATH3 packed tags |
+| **PRIM/XYZ** | prims=**4**, XYZF2=**4** | Title sprites + expand |
+| **IMAGE / TEX** | imgBytes=**262144** | MENU-WHIP-2 Host→Local GOE firstscreen (not EE GIF IMAGE) |
+| **DISPFB / PCRTC** | dispfbPx=**36933** natural | NaturalDispfb composite → lit |
+| **Present lit** | lit=**5189**/286720 | mostlyBlack=0 (host-present proof) |
 | **FRAME / XYOFFSET** | ofx=ofy=**`0x8000`** | Classic retail origin |
 | **Expand policy** | expandHits=**2** | Dual full-FB title strips |
 | **Rejects** | all **0** | Expand lands on FB |
 
-**Draw class:** ofx=0x8000 expand title surface (doubled). Ring bytes honest from GOE Start dump — not invent PATH3.
+**Draw class:** ofx=0x8000 expand title surface + Host→Local firstscreen IMAGE under natural DISPFB.
+Honest GOE Start dump bytes — not invent PATH3 / not synthetic chrome color.
 
 ### Expected next draw graphs
 
-1. Soft-GS IMAGE sample of ring → imgBytes>0 (S9 G-GFX-3/4).
-2. Natural multi-prim Path2 when expand demoted (PL-042 / S9).
-3. DISPFB arm (S10).
+1. ~~Soft-GS IMAGE sample → imgBytes>0~~ **Done (assist Host→Local)**.
+2. Natural EE GIF IMAGE / multi-prim Path2 when expand demoted (PL-042 / S9).
+3. Richer lit fraction (lit still sparse vs full chrome).
 4. Pad accept → frontend chrome change.
 
 ---
 
-## Residual truth — **texture ring + ofx expand**
+## Residual truth — **texture ring + ofx expand + lit chrome**
 
-### 1. Texture ring (PL-033 progress)
+### 1. Texture ring (PL-033) + MENU-WHIP-2 IMAGE
 
 | Item | State |
 |------|--------|
 | GOE Open firstscreen / Code / frontend | Working (shared BridgeWhipGoeOpenStart) |
 | Multi-chunk Start (≤1.5 MiB class) | Working |
 | Stream-table FULL paint | Working |
-| Progressive ring into `0x45BC94` | **Yes** — assist copies GOE high-RDRAM dump (0x1C00000+stride) → ring |
-| GIF IMAGE / TEX0 sample | **imgBytes=0** — Soft-GS never samples ring as textured prims yet (S9) |
+| Progressive ring into `0x45BC94` | **Yes** — assist copies GOE high-RDRAM dump → ring |
+| Host→Local firstscreen → Soft-GS IMAGE | **Yes** — imgBytes=**262144**, lit=**5189** (MENU-WHIP-2) |
+| Natural EE GIF IMAGE / TEX0 sample | **Residual** — gif image tags=0; assist residual only |
 
 ### 2. ofx expand (G-GFX residual)
 
 | Item | State |
 |------|--------|
 | Live sprite | ofx/ofy=`0x8000` → expand full 640×448 |
-| Soft-GS | **px=573440** (2× expandHits) |
-| Natural retail draw | **Not yet** — prims=2 expand class |
+| Soft-GS | **px=610373**, expandHits=2; black expand alone was lit=0 |
+| Natural retail draw | **Not yet** — prims=4 expand class + assist IMAGE |
 | Policy | Expand legal for MENU; demote under PL-042 / S9 |
 
 ### 3. WaitSema (title-local freeze)
@@ -149,6 +161,7 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json -
 - Post-reboot WaitSema pulse (title) + PS2.RKV warm
 - **PL-033** progressive ring fill EE `0x45BC94` from GOE dump
 - **PL-018** dense pad inject + ForceRefreshPad (no global WaitSema)
+- **MENU-WHIP-2** Host→Local GOE firstscreen/frontend → Soft-GS IMAGE + OnHostPresent composite refresh
 
 **Shared (`RealSifRpc` / `SonyKernelHle` / `Gs`) — do not edit without ownership:**
 
@@ -158,15 +171,16 @@ dotnet exec out/seat-s7/DetPS2.Core.dll blocker-trace user-media-whiplash.json -
 
 ## Debt class
 
-`WhiplashAssist` TITLE · imgBytes=0 IMAGE sample (S9) · ofx expand demotion (S9) · WHIP WaitSema stays WHIP
+`WhiplashAssist` TITLE · sparse lit (assist IMAGE not full chrome) · natural EE GIF IMAGE residual · ofx expand demotion (S9) · WHIP WaitSema stays WHIP
 
-## Next WPs (seat S7 secondary)
+## Next WPs
 
 | WP | Goal |
 |----|------|
 | PL-018 | **Done (pad live)** |
-| PL-033 | **Partial** — ring fill + px/prims↑; imgBytes=0 residual |
-| PL-042 | Expand demotion attempt (S9 co-review) |
+| PL-033 | **Done** — ring fill + px/prims↑ |
+| MENU-WHIP-2 | **Done** — lit=5189 imgBytes=262144 natural DISPFB @100M |
+| PL-042 | Expand demotion / natural multi-prim (S9 co-review) |
 | PL-062 | Start run / first gameplay |
 
 ## Related

@@ -2,7 +2,7 @@
 
 **Owner seat:** S9 GFX-RASTER  
 **Status:** G2 ACTIVE — Host→Local + sample paths for commercial IMAGE/TEX  
-**Code paths:** `Gs.SampleTexel`, `Gs.WriteImageTransfer`, `Gs.MaybeLoadClut`, `SwizzleOffset32` / `16` / `8`
+**Code paths:** `Gs.SampleTexel`, `Gs.WriteImageTransfer`, `Gs.MaybeLoadClut`, `SwizzleOffset32` / `16` / `16S` / `8`
 
 ---
 
@@ -12,8 +12,8 @@
 |-----|------|-------------|------------|---------|-------|
 | PSMCT32 | `0x00` | `SampleTexel` default | yes | page/block 32 | primary FB/tex |
 | PSMCT24 | `0x01` | RGB + TEXA.TA0 | yes (3 bpp) | page/block 32 | GX-030 |
-| PSMCT16 | `0x02` | RGB555 + TEXA | yes | page/block 16 | GX-029 |
-| PSMCT16S | `0x0A` | same as 16 | yes | page/block 16 | GX-029 |
+| PSMCT16 | `0x02` | RGB555 + TEXA | yes | page/block 16 (`SwizzleOffset16`) | GX-029 |
+| PSMCT16S | `0x0A` | same as 16 | yes | page/block **16S** (`SwizzleOffset16S`, PCSX2 `blockTable16S`) | GX-029 / GS-1 present (Dec DISPFB FBW=832) |
 | PSMT8 | `0x13` | index→CLUT | yes | page/block 8 | GX-031 |
 | PSMT8H | `0x1B` | index→CLUT | yes | page/block 8 | high twin |
 | PSMT4 | `0x14` | 4-bit index→CLUT | yes (nibble pack) | linear residual | GX-032 partial |

@@ -12,14 +12,23 @@
 | **Branch** | `agent/seat-s6/s2-g2` |
 | **Seat** | **S6 GOW** (PL-016 pad + **PL-023** thrash leave; owned `GodOfWarAssist.cs` + this doc) |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **MENU YES hold + PL-023 thrash leave:** Soft-GS title-surface **px=573440 prims=2** (expand). Sticky GIF DMA tag finish at `0x13F5F8` (END `0x70000000`, no .text kill) → final **PC=0x1837D0**, gifP2 **31**, dmac **50**. Pad densified after Soft-GS; residual PADMAN **open=0**, selection-index not claim-green. |
-| **Last updated** | 2026-07-31 |
+| **Status** | **Host→Local residual Soft-GS lit** (not natural MENU YES): @100M **px=634306 lit=60866** prims=3 expandHits=2 imgBytes=262144. compositeSource=**Frame**, naturalDispfbPx=**0**, residualDispfbPx=**60866**. Path2 expand strips + assist BITBLT R_SHELL/TIT1. PADMAN open=0 residual. |
+| **Last updated** | 2026-07-31 residual honesty |
 
 ### MENU gate
 
 **first-gs-interactive** = Soft-GS **px>0 non-black** + pad interactive surface — **not** MK MAINMENU.
 
-**MENU YES (title-surface Soft-GS):** full Soft-GS FB chrome from real Path2 SPRITE prims (color/UV from prim; no invent PATH3 / no host FMV pixels).
+**Honesty (2026-07-31 residual seat):** Soft-GS lit via **Host→Local residual** + expand-class Path2 is **not** natural MENU YES. Live claim:
+
+```
+claim: px=634306 prims=3 gifP2=31 gifP3=0 imgBytes=262144
+       dispfbPx=60866 naturalDispfbPx=0 residualDispfbPx=60866 expandHits=2
+       lit=60866/286720 compositeSource=Frame
+job: gow-residual-100m-20260731-151114
+```
+
+Prior “MENU YES hold” language = title-surface Soft-GS progress only; **do not promote natural MENU YES** while residual DISPFB + Host→Local IMAGE dominate.
 
 ---
 

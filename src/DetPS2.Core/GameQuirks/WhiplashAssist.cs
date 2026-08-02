@@ -63,6 +63,13 @@ namespace DetPS2.Core;
 /// chrome (imgBytes/prims residual toward G-GFX). Shared RealSifRpc ring service remains;
 /// assist supplements when RPC cadence stalls. No invent PATH3 / no global WaitSema.
 /// </para>
+///
+/// <para>
+/// MENU-WHIP-2: black full-FB expand (px=286720 lit=0, imgBytes=0) after SliceSize=64 —
+/// ring/GOE firstscreen bytes never reach GIF IMAGE. Host→Local BITBLT of honest already-
+/// streamed GOE dump / ring (Dec PL-029 / BO2 MENU class) so Soft-GS imgBytes&gt;0 and DISPFB
+/// composite can light present (lit&gt;0). No invent PATH3 / no synthetic chrome color.
+/// </para>
 /// </summary>
 public sealed class WhiplashAssist : IGameQuirkModule
 {
@@ -127,6 +134,11 @@ public sealed class WhiplashAssist : IGameQuirkModule
     private int _ringFillKicks;
     private ulong _lastRingFillCyc;
     private readonly Dictionary<string, long> _ringMemberPos = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>MENU-WHIP-2: Host→Local firstscreen/frontend → Soft-GS IMAGE (lit residual).</summary>
+    private bool _titleChromeFed;
+    private int _titleChromeBytes;
+    private int _titleChromeAttempts;
+    private ulong _lastTitleChromeCyc;
 
     public void Reset()
     {
@@ -146,6 +158,10 @@ public sealed class WhiplashAssist : IGameQuirkModule
         _ringFillKicks = 0;
         _lastRingFillCyc = 0;
         _ringMemberPos.Clear();
+        _titleChromeFed = false;
+        _titleChromeBytes = 0;
+        _titleChromeAttempts = 0;
+        _lastTitleChromeCyc = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -160,7 +176,20 @@ public sealed class WhiplashAssist : IGameQuirkModule
         PlantIopRpVersion(sys);
     }
 
-    public void OnHostPresent(Ps2System sys) => _ = sys;
+    public void OnHostPresent(Ps2System sys)
+    {
+        // Keep PADMAN dual-buffer DMA STABLE between VBlank ticks (PL-018 residual).
+        try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+        // MENU-WHIP-2: black full-FB expand (px>0 lit=0) — re-merge DISPFB/local IMAGE so
+        // Host→Local firstscreen/frontend bytes land on Soft-GS present (imgBytes/lit residual).
+        try
+        {
+            if (sys.Gs.ImageBytesWritten > 0 && sys.Gs.IsPresentMostlyBlack())
+                sys.Gs.ForceRefreshPresentComposite();
+        }
+        catch { /* ignore */ }
+    }
 
     /// <summary>
     /// Plant IOPRP 2.5.5 version tag. Real hardware fills these when UDNL applies
@@ -286,6 +315,11 @@ public sealed class WhiplashAssist : IGameQuirkModule
         if (c >= 5_000_000
             && (_titleSurfaceWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 200UL))
             MaybeFillTitleRing(sys, c);
+
+        // MENU-WHIP-2: black full-FB expand (px full FB, lit=0, imgBytes=0) — feed honest
+        // GOE firstscreen/frontend / ring bytes Host→Local so Soft-GS composite can light.
+        if (c >= 6_000_000 && sys.Gs.PixelsWritten >= 50_000)
+            TryFeedTitleChromeHostToLocal(sys, c);
 
         // PL-018: pad inject once post-reboot title path is live (Soft-GS or GOE/cdvd).
         // Keep WHIP WaitSema title-local; no global fabricate.
@@ -540,6 +574,216 @@ public sealed class WhiplashAssist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[WHIP] ring fill disc #{_ringFillKicks} \"{name}\" n={n} total={_ringBytesFilled} cyc={c}");
         return true;
+    }
+
+    /// <summary>
+    /// MENU-WHIP-2: feed already-streamed GOE firstscreen/frontend (or title ring) through
+    /// Soft-GS BITBLT Host→Local so DISPFB/FBP0 composite can light present under black
+    /// ofx-expand prims (px full FB lit=0 imgBytes=0). Honest RKV/GOE bytes only.
+    /// </summary>
+    private void TryFeedTitleChromeHostToLocal(Ps2System sys, ulong c)
+    {
+        if (_titleChromeFed) return;
+        if (_titleChromeAttempts >= 12) return;
+        if (_lastTitleChromeCyc != 0 && c - _lastTitleChromeCyc < 400_000UL)
+            return;
+
+        // Natural IMAGE already art-scale — do not double-feed.
+        if (sys.Gs.ImageBytesWritten >= 64_000)
+        {
+            _titleChromeFed = true;
+            return;
+        }
+
+        // Prefer black full-FB clear residual (SliceSize=64 class: px≈286720 lit=0).
+        bool blackLogoClear = sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 8;
+        bool mostlyBlack = false;
+        try { mostlyBlack = sys.Gs.IsPresentMostlyBlack(); } catch { /* ignore */ }
+        if (!blackLogoClear && !mostlyBlack && sys.Gs.ImageBytesWritten > 0)
+            return;
+
+        _lastTitleChromeCyc = c;
+        _titleChromeAttempts++;
+
+        long before = sys.Gs.ImageBytesWritten;
+        int total = 0;
+
+        // GOE bridge layout (RealSifRpc.BridgeWhipGoeOpenStart): streamIdx * 640KiB @ 0x1C00000.
+        const uint DestBase = 0x01C00000u;
+        const uint SlotStride = 640u * 1024;
+        (string name, int streamIdx, int maxBytes)[] order =
+        {
+            ("firstscreen", 1, 256 * 1024),
+            ("frontend", 2, 384 * 1024),
+            ("Code", 0, 192 * 1024),
+        };
+
+        foreach (var (name, streamIdx, maxBytes) in order)
+        {
+            if (total >= 64_000) break;
+            uint srcBase = DestBase + (uint)streamIdx * SlotStride;
+            if (srcBase + 256 > SystemMemory.RDRAM_SIZE) continue;
+
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, srcBase, maxBytes,
+                dbp64: total > 0 ? 0x1000 : 0x0000, dbwPx: 256);
+            if (n > 0)
+            {
+                total += n;
+                if (TraceWhip)
+                    Console.Error.WriteLine(
+                        $"[WHIP] MENU-WHIP-2 Host->Local GOE \"{name}\" fed={n} " +
+                        $"imgBytes={sys.Gs.ImageBytesWritten} cyc={c}");
+            }
+        }
+
+        // Fallback: progressive ring already filled into EE 0x45BC94.
+        if (total < 16_000 && _ringBytesFilled >= 1024)
+        {
+            int cap = (int)Math.Min(_ringBytesFilled, 256 * 1024);
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, TitleRingBase, cap,
+                dbp64: total > 0 ? 0x1000 : 0x0000, dbwPx: 256);
+            if (n > 0)
+            {
+                total += n;
+                if (TraceWhip)
+                    Console.Error.WriteLine(
+                        $"[WHIP] MENU-WHIP-2 Host->Local ring fed={n} " +
+                        $"imgBytes={sys.Gs.ImageBytesWritten} cyc={c}");
+            }
+        }
+
+        _titleChromeBytes = total;
+        if (total > 0 || sys.Gs.ImageBytesWritten > before)
+        {
+            _titleChromeFed = true;
+            try
+            {
+                // Arm TEX0 page 0 so any TME prim can sample; force DISPFB re-merge for lit.
+                ulong tex0 = 0ul
+                    | (4ul << 14)   // TBW = 4 (256px)
+                    | (0ul << 20)   // PSM CT32
+                    | (8ul << 26)   // TW=8
+                    | (8ul << 30);  // TH=8
+                sys.Gs.WriteGsRegister(0x06, tex0);
+            }
+            catch { /* ignore */ }
+            try { sys.Gs.ForceRefreshPresentComposite(); }
+            catch { /* ignore */ }
+        }
+
+        if (TraceWhip && (_titleChromeAttempts <= 3 || total > 0))
+            Console.Error.WriteLine(
+                $"[WHIP] MENU-WHIP-2 chrome feed attempt={_titleChromeAttempts} fed={total} " +
+                $"imgBytes={sys.Gs.ImageBytesWritten} px={sys.Gs.PixelsWritten} " +
+                $"ring={_ringBytesFilled} cyc={c}");
+    }
+
+    /// <summary>
+    /// Skip leading zero / small header slabs and BITBLT Host→Local bulk into local GS.
+    /// Returns bytes accepted by Soft-GS IMAGE path (delta ImageBytesWritten).
+    /// </summary>
+    private static int HostToLocalPayloadBulk(Gs gs, SystemMemory mem, uint baseAddr,
+        int maxBytes, int dbp64, int dbwPx)
+    {
+        if (gs == null || mem == null || maxBytes < 256) return 0;
+        if (baseAddr + 256 > SystemMemory.RDRAM_SIZE) return 0;
+
+        // Empty dump?
+        uint w0 = mem.Read32(baseAddr);
+        uint w1 = mem.Read32(baseAddr + 4);
+        if (w0 == 0 && w1 == 0)
+        {
+            // Scan first 4 KiB for first non-zero QW (GOE may pad header).
+            int found = -1;
+            int scan = Math.Min(maxBytes, 4096);
+            for (int off = 0; off + 8 <= scan; off += 16)
+            {
+                if (mem.Read32(baseAddr + (uint)off) != 0
+                    || mem.Read32(baseAddr + (uint)off + 4) != 0)
+                {
+                    found = off;
+                    break;
+                }
+            }
+            if (found < 0) return 0;
+            baseAddr += (uint)found;
+            maxBytes -= found;
+        }
+
+        // Skip tiny zero run after start (compressed payload often starts after align pad).
+        int headerSkip = 0;
+        int zeros = 0;
+        for (int i = 0; i < 0x100 && i < maxBytes; i++)
+        {
+            if (mem.Read8(baseAddr + (uint)i) == 0) zeros++;
+            else break;
+        }
+        if (zeros >= 0x10)
+            headerSkip = zeros;
+
+        int avail = maxBytes - headerSkip;
+        if (avail < 256) return 0;
+
+        // Geometry: 256×H PSMCT32 from available payload (cap H so we stay in maxBytes).
+        // Live whip circuit FBW=512 PSMCT24 — CT32 page-0 residual still composites RGB lanes.
+        int texW = Math.Clamp(dbwPx, 64, 512);
+        const int bpp = 4;
+        int maxH = Math.Min(512, avail / (texW * bpp));
+        if (maxH < 1) return 0;
+        int texH = maxH;
+        int use = Math.Min(avail, texW * texH * bpp);
+        use &= ~3;
+        if (use < 256) return 0;
+
+        return HostToLocalFromMem(gs, mem, baseAddr + (uint)headerSkip, use,
+            dbp64: dbp64, dbwPx: texW, dpsm: 0x00, w: texW, h: texH);
+    }
+
+    /// <summary>
+    /// Program Soft-GS BITBLT Host→Local (TRXDIR=0) and stream RDRAM bytes — same path as
+    /// GIF FLG=2 IMAGE (Dec PL-029 / BO2 MENU / Midway gameart).
+    /// </summary>
+    private static int HostToLocalFromMem(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (gs == null || mem == null || byteCount <= 0 || w <= 0 || h <= 0) return 0;
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        int maxByGeom = w * h * bpp;
+        int n = Math.Min(byteCount, maxByGeom);
+        if (n <= 0) return 0;
+        if (src + (uint)n > SystemMemory.RDRAM_SIZE) return 0;
+
+        int dbwUnits = Math.Max(1, (dbwPx + 63) / 64);
+        ulong bitblt = ((ulong)(dbp64 & 0x3FFF) << 32)
+                     | ((ulong)(dbwUnits & 0x3F) << 48)
+                     | ((ulong)(dpsm & 0x3F) << 56);
+        gs.WriteGsRegister(0x50, bitblt); // BITBLTBUF
+        gs.WriteGsRegister(0x51, 0);      // TRXPOS
+        gs.WriteGsRegister(0x52, (ulong)((uint)w & 0xFFFu) | (((ulong)((uint)h & 0xFFFu)) << 32));
+        gs.WriteGsRegister(0x53, 0);      // TRXDIR Host→Local
+
+        long before = gs.ImageBytesWritten;
+        Span<byte> qw = stackalloc byte[16];
+        int off = 0;
+        while (off < n)
+        {
+            int chunk = Math.Min(16, n - off);
+            for (int i = 0; i < 16; i++)
+                qw[i] = i < chunk ? mem.Read8(src + (uint)(off + i)) : (byte)0;
+            gs.WriteImageData(qw, 0);
+            off += chunk;
+            if (gs.ImageBytesWritten - before >= n) break;
+        }
+        int got = (int)Math.Min(int.MaxValue, gs.ImageBytesWritten - before);
+        return got > 0 ? got : 0;
     }
 
     private static bool TraceWhip =>

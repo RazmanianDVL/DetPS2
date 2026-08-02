@@ -83,6 +83,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _vblankExits;
     private int _bootWaitFlagPlants;
     private int _logoPadAdvances;
+    private int _presentationLeaves;
+    private int _sceneDeltaReports;
     private ulong _lastGifP3;
     private ulong _lastClearCyc;
     private ulong _lastRearmCyc;
@@ -92,6 +94,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private ulong _lastBootWaitPlantCyc;
     private ulong _lastLogoPadCyc;
     private ulong _logoChromeFirstCyc;
+    private ulong _lastPresentationLeaveCyc;
+    private ulong _lastMainWakeCyc;
+    // PL-014 scene fingerprint at first Soft-GS chrome (for INTERACTIVE delta evidence).
+    private ulong _chromeSnapPc;
+    private long _chromeSnapPx;
+    private long _chromeSnapPrims;
+    private long _chromeSnapImg;
+    private uint _chromeSnapFrame1;
+    private bool _chromeSnapTaken;
+    private bool _interactiveSceneDelta;
     private bool _flipEverUnblocked;
     private bool _versionPlanted;
     private bool _lgDevPostCleared;
@@ -118,6 +130,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _vblankExits = 0;
         _bootWaitFlagPlants = 0;
         _logoPadAdvances = 0;
+        _presentationLeaves = 0;
+        _sceneDeltaReports = 0;
         _tableWalkEscapes = 0;
         _tableWalkEscapes = 0;
         _ioQueueEscapes = 0;
@@ -131,6 +145,15 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _lastBootWaitPlantCyc = 0;
         _lastLogoPadCyc = 0;
         _logoChromeFirstCyc = 0;
+        _lastPresentationLeaveCyc = 0;
+        _lastMainWakeCyc = 0;
+        _chromeSnapPc = 0;
+        _chromeSnapPx = 0;
+        _chromeSnapPrims = 0;
+        _chromeSnapImg = 0;
+        _chromeSnapFrame1 = 0;
+        _chromeSnapTaken = false;
+        _interactiveSceneDelta = false;
         _lastFlipLeaveCyc = 0;
         _lastIoQueueEscapeCyc = 0;
         _flipEverUnblocked = false;
@@ -166,10 +189,19 @@ public sealed class Burnout3Assist : IGameQuirkModule
     {
         // Soft-GS: PATH3 may upload logo IMAGE under M3P; DISPFB→FB composite each present.
         sys.Gs.CompositeDispfbToFramebuffer();
-        // PL-014: after logo Soft-GS chrome, pulse START/CROSS edges on present ticks so
-        // libpad2/DBC poll (every host-present ~1M) sees press→release. No DISPFB plant.
+        // PL-014 / MENU-B3-2: after logo Soft-GS chrome, pulse START/CROSS edges on present
+        // ticks so libpad2/DBC poll sees press→release; wake main + presentation leave.
+        // No DISPFB plant.
         if (LogoChromeLive(sys))
+        {
+            if (_logoChromeFirstCyc == 0)
+                _logoChromeFirstCyc = sys.MasterCycles;
+            MaybeSnapshotLogoChrome(sys);
             PulseLogoPadAdvance(sys, fromPresent: true);
+            MaybeWakeMainForPad(sys);
+            MaybeLeavePresentationPark(sys);
+            MaybeReportSceneDelta(sys);
+        }
     }
 
     /// <summary>Soft-GS non-black + FRONTEND/STG spine (cdvd≥2000) — logo chrome live.</summary>
@@ -235,13 +267,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles >= 22_000_000 && sys.Cdvd.SectorsRead > 0)
             MaybeKickPostGtfsMenu(sys);
 
-        // Wave-2: after force FullyDone, tip residual often parks in WaitSema/SIF poll
-        // bands (0x293xxx / 0x123Exx) with IRX-only cdvd - never reaches STG bind.
-        // Wave-2 thrash leave disabled: early snap to 0x2AF914 caused UnknownSpecial @0x480xxx.
-        // Residual CallRpc->parent + VBlank gate + Soft-GS DISPFB remain the path to STG.
-        // if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && _lgDevEscapes >= 2
-        //     && sys.Cdvd.SectorsRead is >= 400 and < 2000)
-        //     MaybeLeaveResidualBootThrash(sys);
+        // Wave-2 residual-STG: tip parks in SIF/stream/bitfield bands with IRX-only or
+        // STAGEHED-plant-only cdvd (425–609) and never binds Global.txd. Leave is gated to
+        // pre-STG (cdvd<2000) and known thrash PCs — not a blind snap to 0x2AF914.
+        if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && _lgDevEscapes >= 1
+            && sys.Cdvd.SectorsRead is >= 400 and < 2000)
+            MaybeLeaveResidualBootThrash(sys);
 
         // Direct flip-leave once LGDEV is done — do not depend solely on menu-kick cadence
         // (live menu14 stuck at 0x1F24E0 with re-arm only, never leave).
@@ -397,6 +428,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
             // non-zero path past beqz so boot can leave SleepThread park.
             // After many visits still stuck, snap to the function epilogue (0x2371E0).
             // Also cover prologue 0x237120..174 (final telemetry parks at 0x237124).
+            // MENU-B3-2: once Soft-GS logo chrome is live + pad edges running, stop
+            // heavy epilogue stomp — continuous 0x2371E0 monopolized EE (final PC stuck
+            // 0x237138) and starved presentation/menu pad consumers. Plant flags only.
             uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             if (pc is >= 0x00237120 and <= 0x0023719C)
             {
@@ -408,9 +442,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 PlantWakeFlags(sys, VblankWakeFlagBase);
                 sys.Memory.Write8(VblankWakeFlagBase + 4, 1);
                 sys.EE.SetGpr(3, new EmotionEngine.Gpr128 { Lo = 1 }); // v1 = non-zero
+                bool chromePad = LogoChromeLive(sys) && _logoPadAdvances >= 8;
                 // Prefer natural fall-through (0x2371A0) so s1-indexed store runs;
                 // after heavy thrash / when parked at prologue, epilogue return.
-                bool allowHeavy = sys.Cdvd.SectorsRead >= 600 || _menuKickPulses >= 48;
+                bool allowHeavy = !chromePad
+                    && (sys.Cdvd.SectorsRead >= 600 || _menuKickPulses >= 48);
                 bool heavy = allowHeavy && (_sleepWakeups >= 8 || _menuKickPulses >= 16
                     || _vblankExits >= 4 || pc is >= 0x00237120 and <= 0x00237170);
                 if (heavy)
@@ -423,15 +459,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     sys.EE.PC = 0x002371E0; // ld ra / restore / jr ra
                     _vblankExits++;
                 }
-                else
+                else if (!chromePad)
                     sys.EE.PC = 0x002371A0; // past beq delay — success body
+                // chromePad: flags only — let lbu see non-zero and leave SleepThread naturally
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && (sys.MasterCycles - _lastVblankExitCyc >= 5_000_000 || _vblankExits <= 4))
                 {
                     _lastVblankExitCyc = sys.MasterCycles;
                     Console.Error.WriteLine(
                         $"[B3] force VBlank wakeup exit pc was 0x{pc:X8} s0=0x{s0:X8} " +
-                        $"heavy={heavy} n={_vblankExits} cyc={sys.MasterCycles}");
+                        $"heavy={heavy} chromePad={chromePad} n={_vblankExits} cyc={sys.MasterCycles}");
                 }
             }
         }
@@ -444,7 +481,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
         {
             if (_logoChromeFirstCyc == 0)
                 _logoChromeFirstCyc = sys.MasterCycles;
+            MaybeSnapshotLogoChrome(sys);
             PulseLogoPadAdvance(sys, fromPresent: false);
+            MaybeWakeMainForPad(sys);
+            MaybeLeavePresentationPark(sys);
+            MaybeReportSceneDelta(sys);
             return;
         }
 
@@ -467,45 +508,63 @@ public sealed class Burnout3Assist : IGameQuirkModule
     /// PL-014 logo→frontend pad advance: edge-based START/CROSS/Circle/D-pad with explicit
     /// release frames, DualShock analog mode, and ForceRefreshPad / DBC work paint so
     /// libpad2 (PsIIlibpad2 2800) + DBCMAN polls see host buttons. No invented DISPFB.
+    /// MENU-B3-2: yield to pad-script external presses; denser long START holds after chrome.
     /// </summary>
     private void PulseLogoPadAdvance(Ps2System sys, bool fromPresent)
     {
         // Present ticks are rare (~1M); Step may fire every ~50k — rate-limit Step path.
-        ulong minGap = fromPresent ? 0UL : 80_000UL;
+        // After chrome live ≥8M, faster edges so skip-logo detectors see more transitions.
+        ulong chromeAge = _logoChromeFirstCyc != 0
+            ? sys.MasterCycles - _logoChromeFirstCyc : 0UL;
+        ulong minGap = fromPresent ? 0UL
+            : chromeAge >= 8_000_000 ? 40_000UL : 80_000UL;
         if (!fromPresent && sys.MasterCycles - _lastLogoPadCyc < minGap) return;
-        if (_logoPadAdvances >= 4096) return;
+        if (_logoPadAdvances >= 8192) return;
         _lastLogoPadCyc = sys.MasterCycles;
         _logoPadAdvances++;
         _padInjectPulses++;
 
         try { sys.Pad.AnalogMode = true; } catch { /* ignore */ }
 
-        // 16-phase edge train: press windows with clear zeros between so edge detectors fire.
-        int phase = _logoPadAdvances % 16;
-        uint buttons = phase switch
-        {
-            0 or 1 => (uint)PadInput.Button.Start,
-            2 => 0u, // release
-            3 or 4 => (uint)PadInput.Button.Cross,
-            5 => 0u,
-            6 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
-            7 => 0u,
-            8 => (uint)PadInput.Button.Circle,
-            9 => 0u,
-            10 => (uint)PadInput.Button.Down,
-            11 => 0u,
-            12 => (uint)PadInput.Button.Up,
-            13 => 0u,
-            14 => (uint)PadInput.Button.Start,
-            _ => 0u
-        };
-        // After chrome has been live ≥5M cycles, denser START hold (skip-logo / press-start).
-        if (_logoChromeFirstCyc != 0
-            && sys.MasterCycles - _logoChromeFirstCyc >= 5_000_000
-            && (phase is 0 or 1 or 14))
-            buttons = (uint)PadInput.Button.Start;
+        // Yield to pad-script / external Press: do not clobber non-zero host buttons.
+        // Still refresh DBC work so libpad2 sees whatever is currently held.
+        bool externalHold = false;
+        try { externalHold = sys.Pad.Buttons != 0; } catch { /* ignore */ }
 
-        try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+        uint buttons = 0;
+        if (!externalHold)
+        {
+            // 16-phase edge train: press windows with clear zeros between so edge detectors fire.
+            // After chrome ≥5M: longer START holds (phases 0-2, 12-14) for skip-logo / press-start.
+            int phase = _logoPadAdvances % 16;
+            bool longStart = chromeAge >= 5_000_000;
+            buttons = phase switch
+            {
+                0 or 1 => (uint)PadInput.Button.Start,
+                2 => longStart ? (uint)PadInput.Button.Start : 0u,
+                3 or 4 => (uint)PadInput.Button.Cross,
+                5 => 0u,
+                6 => (uint)(PadInput.Button.Start | PadInput.Button.Cross),
+                7 => 0u,
+                8 => (uint)PadInput.Button.Circle,
+                9 => 0u,
+                10 => (uint)PadInput.Button.Down,
+                11 => 0u,
+                12 => (uint)PadInput.Button.Up,
+                13 => longStart ? (uint)PadInput.Button.Start : 0u,
+                14 => (uint)PadInput.Button.Start,
+                _ => 0u
+            };
+            // Every 32nd edge after chrome ≥10M: hard START+CROSS chord (menu accept class).
+            if (longStart && chromeAge >= 10_000_000 && (_logoPadAdvances % 32) < 4)
+                buttons = (uint)(PadInput.Button.Start | PadInput.Button.Cross);
+
+            try { sys.Pad.SetButtons(buttons); } catch { /* Pad may be null early */ }
+        }
+        else
+        {
+            try { buttons = sys.Pad.Buttons; } catch { /* ignore */ }
+        }
 
         // B3 uses libdbc/DBCMAN+DS2O — no PADMAN OPEN. ForceRefreshPad now also paints
         // the captured DBC work buffer (SetWorkAddr/create) so EE pad2Read sees buttons
@@ -531,11 +590,194 @@ public sealed class Burnout3Assist : IGameQuirkModule
             int paints = rpc?.DbcPadPaintCount ?? 0;
             Console.Error.WriteLine(
                 $"[B3] PL-014 logo-pad edge n={_logoPadAdvances} btn=0x{buttons:X4} " +
-                $"present={fromPresent} px={sys.Gs.PixelsWritten} cdvd={sys.Cdvd.SectorsRead} " +
-                $"dbcWork=0x{work:X8} paints={paints} " +
+                $"ext={externalHold} present={fromPresent} px={sys.Gs.PixelsWritten} " +
+                $"cdvd={sys.Cdvd.SectorsRead} dbcWork=0x{work:X8} paints={paints} " +
                 $"pc=0x{(uint)(sys.EE.PC & 0x1FFFFFFFUL):X8} cyc={sys.MasterCycles}");
         }
     }
+
+    /// <summary>
+    /// Snapshot Soft-GS/PC once FRONTEND spine is live (cdvd≥2000 + px>10k) so
+    /// INTERACTIVE scene-delta measures pad-era change, not early boot strip paint.
+    /// </summary>
+    private void MaybeSnapshotLogoChrome(Ps2System sys)
+    {
+        if (_chromeSnapTaken) return;
+        // Prefer post-FRONTEND plant snap (cdvd≥6000); fall back after chrome live ≥12M.
+        bool frontendEra = sys.Cdvd.SectorsRead >= 6000;
+        bool aged = _logoChromeFirstCyc != 0
+            && sys.MasterCycles - _logoChromeFirstCyc >= 12_000_000;
+        if (!frontendEra && !aged) return;
+        _chromeSnapTaken = true;
+        _chromeSnapPc = sys.EE.PC & 0x1FFFFFFFUL;
+        _chromeSnapPx = sys.Gs.PixelsWritten;
+        _chromeSnapPrims = sys.Gs.PrimitivesDrawn;
+        _chromeSnapImg = sys.Gs.ImageBytesWritten;
+        _chromeSnapFrame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+        Console.Error.WriteLine(
+            $"[B3] PL-014 chrome snap pc=0x{_chromeSnapPc:X8} px={_chromeSnapPx} " +
+            $"prims={_chromeSnapPrims} img={_chromeSnapImg} FRAME1=0x{_chromeSnapFrame1:X} " +
+            $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// After logo chrome, keep main (tid=1) runnable so presentation/menu pad consumers
+    /// can poll DBC work. MENU-B3 claim left main pure-Sleeping while tid=3 monopolized
+    /// VBlank park — pad edges painted but nobody advanced logo state.
+    /// </summary>
+    private void MaybeWakeMainForPad(Ps2System sys)
+    {
+        if (sys.MasterCycles - _lastMainWakeCyc < 200_000) return;
+        _lastMainWakeCyc = sys.MasterCycles;
+        var k = sys.Hle?.Kernel;
+        if (k == null) return;
+        foreach (var t in k.AllThreads)
+        {
+            if (!t.Alive || t.Id != 1) continue;
+            if (t.Sleeping && t.WaitSemaId == 0 && !t.WaitVblank)
+                k.WakeupThread(t.Id);
+            else if (t.Sleeping && t.WaitSemaId >= 32)
+            {
+                try { k.SignalSema(t.WaitSemaId); } catch { /* ignore */ }
+            }
+            while (t.SuspendCount > 0)
+                k.ResumeThread(t.Id);
+            if (t.SoftSuspended) t.SoftSuspended = false;
+        }
+    }
+
+    /// <summary>
+    /// Presentation leave assist (MENU-B3-2 / PL-014 residual): after Soft-GS chrome + pad
+    /// edges, if EE is stuck in VBlank wakeup (0x2371xx) or logo draw band (0x253Fxx) with
+    /// healthy flip queues, nudge past the park so logo→menu state can advance.
+    /// No DISPFB plant; no invented Soft-GS pixels.
+    /// </summary>
+    private void MaybeLeavePresentationPark(Ps2System sys)
+    {
+        if (!LogoChromeLive(sys)) return;
+        if (_logoPadAdvances < 16) return;
+        if (_logoChromeFirstCyc == 0 || sys.MasterCycles - _logoChromeFirstCyc < 3_000_000) return;
+        if (sys.MasterCycles - _lastPresentationLeaveCyc < 500_000) return;
+        if (_presentationLeaves >= 256) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
+        bool inVblankPark = pc is >= 0x00237120 and <= 0x002371E8;
+        bool inLogoDraw = pc is >= 0x00253F00 and <= 0x00254080
+            || pc is >= 0x00253A00 and <= 0x00254200;
+        bool inFlipWait = pc is >= 0x001F24E0 and <= 0x001F251C;
+        if (!inVblankPark && !inLogoDraw && !inFlipWait) return;
+
+        uint pending = sys.Memory.Read32(PendingCountAddr) & 0xFF;
+        uint qOut = sys.Memory.Read32(QueueOutAddr);
+        uint qIn = sys.Memory.Read32(QueueInAddr);
+        bool queuesHealthy = qOut == qIn && pending == 0;
+
+        _lastPresentationLeaveCyc = sys.MasterCycles;
+        _presentationLeaves++;
+
+        // Prefer resume at healthy $ra (outside park bands) so presentation state machine
+        // continues; fall back to flip drain or VBlank epilogue.
+        // Live freeze: $ra collapses to 0x200 mid logo-draw (0x253F64) after ~85M — plant a
+        // presentation-graph continue (0x223228 after pad-era beq @0x223224) so jr ra cannot
+        // jump to null page. No DISPFB plant.
+        bool deadRa = ra < 0x00100000 || ra >= 0x00400000 || !sys.Memory.IsLikelyEeCode(ra)
+            || ra is (>= 0x00237120 and <= 0x002371E8)
+            || ra is (>= 0x001F24E0 and <= 0x001F2520);
+        if (deadRa && (inLogoDraw || inFlipWait || inVblankPark))
+        {
+            const uint presentationContinue = 0x00223228u; // delay-slot fall-through after 0x223224
+            sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = presentationContinue });
+            ra = presentationContinue;
+        }
+
+        uint resume = 0;
+        if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
+            && ra is not (>= 0x00237120 and <= 0x002371E8)
+            && ra is not (>= 0x001F24E0 and <= 0x001F2520)
+            && ra is not (>= 0x00253F00 and <= 0x00254200))
+            resume = ra;
+        else if (inFlipWait)
+            resume = 0x001F2520u;
+        else if (inVblankPark)
+            resume = 0x002371E0u; // epilogue once per cadence (not every Step)
+        // Logo draw with dead ra fixed above: hop to presentation continue so pad can advance.
+        else if (inLogoDraw && (deadRa || !queuesHealthy || _presentationLeaves >= 4))
+            resume = 0x00223228u;
+
+        if (resume != 0)
+        {
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
+            sys.EE.PC = resume;
+            sys.EE.COP0_Status &= ~0x6u;
+        }
+
+        ArmFlipConsumer(sys);
+        PlantWakeFlags(sys, VblankWakeFlagBase);
+        MaybeWakeMainForPad(sys);
+
+        // Dense START while leaving presentation — skip-logo class.
+        try
+        {
+            sys.Pad.AnalogMode = true;
+            sys.Pad.SetButtons((uint)PadInput.Button.Start);
+            sys.Hle?.Sony?.RealRpc?.ForceRefreshDbcPad(sys.Memory, sys.Pad);
+        }
+        catch { /* ignore */ }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            && (_presentationLeaves <= 12 || _presentationLeaves % 16 == 0))
+            Console.Error.WriteLine(
+                $"[B3] PL-014 presentation leave pc=0x{pc:X8} ra=0x{ra:X8} " +
+                $"-> 0x{resume:X8} n={_presentationLeaves} pad={_logoPadAdvances} " +
+                $"px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn} " +
+                $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// Log Soft-GS / PC scene change after pad edges relative to chrome snapshot.
+    /// INTERACTIVE evidence = PC left presentation/VBlank park band OR prims/img/FRAME delta.
+    /// </summary>
+    private void MaybeReportSceneDelta(Ps2System sys)
+    {
+        if (!_chromeSnapTaken || _logoPadAdvances < 32) return;
+        if (_sceneDeltaReports >= 8 && _interactiveSceneDelta) return;
+        if (_logoPadAdvances % 64 != 0 && _sceneDeltaReports > 0) return;
+
+        uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
+        long px = sys.Gs.PixelsWritten;
+        long prims = sys.Gs.PrimitivesDrawn;
+        long img = sys.Gs.ImageBytesWritten;
+        uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+
+        bool pcLeftPark = !IsPresentationParkPc(pc)
+            && IsPresentationParkPc((uint)_chromeSnapPc);
+        bool pcMoved = (pc & ~0xFFu) != ((uint)_chromeSnapPc & ~0xFFu);
+        bool primsMoved = prims > _chromeSnapPrims + 200;
+        bool imgMoved = img > _chromeSnapImg + 64_000;
+        bool frameMoved = frame1 != 0 && frame1 != _chromeSnapFrame1;
+        bool scene = pcLeftPark || (pcMoved && (primsMoved || imgMoved || frameMoved));
+
+        if (scene)
+            _interactiveSceneDelta = true;
+
+        _sceneDeltaReports++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" || scene)
+            Console.Error.WriteLine(
+                $"[B3] PL-014 scene-delta scene={scene} interactive={_interactiveSceneDelta} " +
+                $"pc=0x{_chromeSnapPc:X8}->0x{pc:X8} leftPark={pcLeftPark} " +
+                $"prims={_chromeSnapPrims}->{prims} img={_chromeSnapImg}->{img} " +
+                $"FRAME1=0x{_chromeSnapFrame1:X}->0x{frame1:X} " +
+                $"pad={_logoPadAdvances} px={px} cyc={sys.MasterCycles}");
+    }
+
+    private static bool IsPresentationParkPc(uint pc) =>
+        pc is (>= 0x00237120 and <= 0x002371E8)
+            or (>= 0x00253A00 and <= 0x00254200)
+            or (>= 0x001F24E0 and <= 0x001F2520)
+            or (>= 0x00228040 and <= 0x00228070)
+            or (>= 0x00223200 and <= 0x00223300)   // pad-era flip/helper (live 0x223224)
+            or (>= 0x0010BE60 and <= 0x0010BE70);  // WaitSema park
 
     /// <summary>
     /// Scan B3 libdbc client region for an EE work-buffer pointer if RPC capture missed it.
@@ -956,42 +1198,59 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.EE.PC = 0x002371E0;
         }
 
-        // Post-LGDEV poll @0x2AF80C: while(*(gp-23104)==0 && s0<600) SleepThread.
-        // Success: flag!=0 && s0!=600 → 0x2AF914 v0=1 → epi 0x2AF984.
+        // Post-LGDEV dual poll:
+        //   0x2AF750: while(*(gp-23096)==0 && s0<600) SleepThread — flag==277 → primary
+        //             continue @0x2AF7E0; flag!=0 && !=277 → alternate @0x2AF8A4.
+        //   0x2AF80C: while(*(gp-23104)==0 && s0<600) SleepThread —
+        //             flag!=0 && s0!=600 → 0x2AF914 v0=1 → epi 0x2AF984.
         // Fail timeout: 0x2AF91C/0x2AF920 — never soft-leave there.
+        // MENU-B3: tip residual samples 0x2AF750 (before 0x2AF80C) then bitfield thrash
+        // 0x2B45xx with STAGEHED-plant-only cdvd=609 — plant BOTH flags and leave.
         bool irxOnly = sys.Cdvd.SectorsRead is >= 400 and < 600;
+        bool stagePlantOnly = sys.Cdvd.SectorsRead is >= 600 and < 2000;
+        bool preStg = irxOnly || stagePlantOnly;
         bool postTxd = sys.Cdvd.SectorsRead >= 2000;
-        if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && (irxOnly || postTxd))
+        if (_lgDevFullyDone && sys.MasterCycles >= 22_000_000 && (preStg || postTxd))
         {
             uint pcW = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
             uint raW = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
             const uint postLgDevSuccess = 0x002AF914u;
-            bool raInPostLgDev = raW is >= 0x002AF800 and <= 0x002AF994;
+            const uint postLgDevFlag277 = 277u; // live status word for primary continue
+            bool raInPostLgDev = raW is >= 0x002AF700 and <= 0x002AF994;
+            bool pcInPostLgDevEarly = pcW is >= 0x002AF750 and <= 0x002AF7C4;
             bool pcInPostLgDev = pcW is >= 0x002AF800 and <= 0x002AF980;
             bool pcInSleep = pcW is >= 0x0010C0A0 and <= 0x0010C0AC;
             bool pcInWaitSema = pcW is >= 0x0010BE60 and <= 0x0010BE70;
-            if (irxOnly && (pcInPostLgDev || (pcInSleep && raInPostLgDev)
+            if (preStg && (pcInPostLgDevEarly || pcInPostLgDev || (pcInSleep && raInPostLgDev)
                 || (pcInWaitSema && raInPostLgDev)))
             {
                 uint gpW = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
                 if (gpW is < 0x00400000 or >= 0x01000000) gpW = 0x004E8670;
+                uint f23096 = unchecked((uint)((int)gpW - 23096));
                 uint f23104 = unchecked((uint)((int)gpW - 23104));
+                if (f23096 is >= 0x00400000 and < 0x01000000)
+                    sys.Memory.Write32(f23096, postLgDevFlag277);
                 if (f23104 is >= 0x00400000 and < 0x01000000)
                     sys.Memory.Write32(f23104, 1);
                 sys.Memory.Write32(BootWaitFlagDefault, 1);
                 uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
                 if (s0w >= 600)
                     sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
+                // Early poll: re-enter 0x2AF750 so delay-slot sets v0=600 then natural
+                // success junction (flag==277 → 0x2AF7E0). Late poll: 0x2AF914.
+                uint resume = pcInPostLgDevEarly || (raW is >= 0x002AF750 and <= 0x002AF7C4)
+                    ? 0x002AF750u
+                    : postLgDevSuccess;
                 sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
-                sys.EE.PC = postLgDevSuccess;
+                sys.EE.PC = resume;
                 sys.EE.COP0_Status &= ~(1u << 1);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                     && (_menuKickPulses % 8) == 0)
                     Console.Error.WriteLine(
                         $"[B3] leave post-LGDEV spin SUCCESS pc=0x{pcW:X8} ra=0x{raW:X8} " +
-                        $"-> 0x{postLgDevSuccess:X8} v0=1 cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
+                        $"-> 0x{resume:X8} flag23096=277 cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
             }
-            if (irxOnly && k != null && (_menuKickPulses % 2) == 0)
+            if (preStg && k != null && (_menuKickPulses % 2) == 0)
             {
                 foreach (var t in k.AllThreads)
                 {
@@ -1000,10 +1259,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     if (savedRa == 0 && t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 31)
                         savedRa = (uint)(t.SavedGprFull[31] & 0x1FFFFFFFUL);
                     uint savedPc = (uint)(t.SavedPc & 0x1FFFFFFFUL);
-                    bool postPark = (savedRa is >= 0x002AF800 and <= 0x002AF994)
-                        || (savedPc is >= 0x002AF800 and <= 0x002AF994)
-                        || (savedPc is >= 0x0010C0A0 and <= 0x0010C0AC && savedRa is >= 0x002AF800 and <= 0x002AF994)
-                        || (savedPc is >= 0x0010BE60 and <= 0x0010BE70 && savedRa is >= 0x002AF800 and <= 0x002AF994)
+                    bool postPark = (savedRa is >= 0x002AF700 and <= 0x002AF994)
+                        || (savedPc is >= 0x002AF700 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010C0A0 and <= 0x0010C0AC && savedRa is >= 0x002AF700 and <= 0x002AF994)
+                        || (savedPc is >= 0x0010BE60 and <= 0x0010BE70 && savedRa is >= 0x002AF700 and <= 0x002AF994)
                         || (t.Id == 1 && t.WaitSemaId >= 0x40)
                         || (t.Id == 1 && t.WaitSemaId == 0 && !t.WaitVblank && _menuKickPulses >= 16);
                     if (t.WaitSemaId >= 32)
@@ -1084,10 +1343,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         // Dense START/CROSS after disc IRX path (cdvd>0). Pad inject is allowed.
-        // PL-014: after Soft-GS logo chrome, edge pulse + DBC scratch (not level thrash).
+        // PL-014 / MENU-B3-2: after Soft-GS logo chrome, edge pulse + DBC + presentation leave.
         if (LogoChromeLive(sys))
         {
+            if (_logoChromeFirstCyc == 0)
+                _logoChromeFirstCyc = sys.MasterCycles;
+            MaybeSnapshotLogoChrome(sys);
             PulseLogoPadAdvance(sys, fromPresent: false);
+            MaybeWakeMainForPad(sys);
+            MaybeLeavePresentationPark(sys);
+            MaybeReportSceneDelta(sys);
         }
         else
         {
@@ -1131,8 +1396,13 @@ public sealed class Burnout3Assist : IGameQuirkModule
     /// </summary>
     private void MaybeEscapePostTxdHang(Ps2System sys)
     {
-        if (_postTxdEscapes >= 2048) return;
-        if (sys.MasterCycles - _lastPostTxdEscapeCyc < 4_000) return;
+        // MENU-B3-2: chrome runs for tens of M after FRONTEND; 2048 leaves @4k gap
+        // only cover ~8M then Soft-GS freezes (pad-inject saw px/prims stick ~85M while
+        // 0x2199xx UnknownMmioWrite thrash). Raise cap under logo chrome.
+        int escapeCap = LogoChromeLive(sys) ? 8192 : 2048;
+        if (_postTxdEscapes >= escapeCap) return;
+        ulong minGap = LogoChromeLive(sys) ? 2_000UL : 4_000UL;
+        if (sys.MasterCycles - _lastPostTxdEscapeCyc < minGap) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
@@ -1187,7 +1457,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         bool inGifFlush = pc is >= 0x0021A4F0 and <= 0x0021A5E4;
         bool inGifSubmit = pc is >= 0x001F3080 and <= 0x001F3500;
         bool inFlushCaller = pc is >= 0x00218700 and <= 0x00218790;
-        bool inGifPacketBuild = pc is >= 0x00219800 and <= 0x00219A20;
+        // Wave-6/MENU-B3-2: packet-build includes 0x2198xx..0x219Axx ring + live thrash
+        // at 0x219900 writing EE MMIO 0x1000FFxx / VU 0x1100F0xx (pad claim freeze).
+        bool inGifPacketBuild = pc is >= 0x00219800 and <= 0x00219B00;
         bool mmioProbe = (inGifFlush || inGifSubmit || inFlushCaller || inGifPacketBuild)
                          && sys.Cdvd.SectorsRead >= 2000;
         if (mmioProbe)
@@ -1246,7 +1518,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 && ra is not (>= 0x001F3080 and <= 0x001F3500)
                 && ra is not (>= 0x001F24E0 and <= 0x001F2520)
                 && ra is not (>= 0x00218700 and <= 0x00218790)
-                && ra is not (>= 0x00219800 and <= 0x00219A20))
+                && ra is not (>= 0x00219800 and <= 0x00219B00))
                 resume = ra;
             // Sticky thrash at submit final (0x1F308C): after many leaves, bypass submit
             // entry to caller so FRONTEND draw path can continue past empty rings.
@@ -1910,29 +2182,53 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private ulong _lastResidualBootLeaveCyc;
 
     /// <summary>
-    /// Wave-2 residual-STG: after LGDEV force, tip parks in SIF WaitSema (0x293Axx) /
-    /// stream poll (0x123Exx). Leave toward post-LGDEV success so STG can bind.
+    /// Wave-2 / MENU-B3 residual-STG: after LGDEV force, tip parks in SIF WaitSema
+    /// (0x293Axx), stream poll (0x123Exx), dual post-LGDEV flags (0x2AF750/0x2AF80C),
+    /// or bitfield set thrash (0x2B44E0..0x2B45D4) with STAGEHED-plant-only cdvd.
+    /// Leave toward natural success junctions so STG/Global.txd can bind.
     /// </summary>
     private void MaybeLeaveResidualBootThrash(Ps2System sys)
     {
-        if (_residualBootLeaves >= 128) return;
+        if (_residualBootLeaves >= 256) return;
         if (sys.MasterCycles - _lastResidualBootLeaveCyc < 40_000) return;
 
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
-        bool sifWaitBand = pc is >= 0x00293A00 and <= 0x00294200
-            || ra is >= 0x00293A00 and <= 0x00294200;
-        bool streamPoll = pc is >= 0x00123E00 and <= 0x00124000;
-        bool postLgDev = pc is >= 0x002AF800 and <= 0x002AF994
-            || ra is >= 0x002AF800 and <= 0x002AF994;
-        bool bootWait = pc is >= 0x002B34C0 and <= 0x002B35D0;
-        bool waitSemaBoot = pc is >= 0x0010BE60 and <= 0x0010BE70
-            && (postLgDev || sifWaitBand || ra is >= 0x002B34C0 and <= 0x002B35D0
-                || ra is >= 0x00123E00 and <= 0x00124000);
+        // MENU-B3: do NOT snap 0x293xxx / 0x123Exx → post-LGDEV (wave-2 class:
+        // UnknownOpcode @0x49FExx / dead frame). Only leave when EE is already in a
+        // known wait/bitfield body with a live stack (or absurd bitfield span).
+        bool postLgDevEarly = pc is >= 0x002AF750 and <= 0x002AF7C4;
+        bool postLgDevLate = pc is >= 0x002AF800 and <= 0x002AF994;
+        bool postLgDev = postLgDevEarly || postLgDevLate;
+        bool bootWait1 = pc is >= 0x002B34C0 and <= 0x002B34E4;
+        bool bootWait2 = pc is >= 0x002B3510 and <= 0x002B3540;
+        bool bootWait3 = pc is >= 0x002B35A0 and <= 0x002B35C0;
+        bool bootWait = bootWait1 || bootWait2 || bootWait3;
+        // Bitfield set/clear at 0x2B44E0: outer t6..t1 byte loop. Live residual final
+        // PC 0x2B4580 with garbage t1 monopolizes EE after STAGEHED plant (cdvd=609).
+        bool bitfieldThrash = pc is >= 0x002B44E0 and <= 0x002B45D4;
+        bool waitSemaPostLg = pc is >= 0x0010BE60 and <= 0x0010BE70
+            && (ra is >= 0x002AF750 and <= 0x002AF994);
+        bool sleepPostLg = pc is >= 0x0010C0A0 and <= 0x0010C0AC
+            && (ra is >= 0x002AF750 and <= 0x002AF994);
         bool badPc = pc is >= 0x004E0000 and < 0x02000000
             || pc is >= 0x80000180 and <= 0x80000200;
 
-        if (!sifWaitBand && !streamPoll && !waitSemaBoot && !postLgDev && !bootWait && !badPc)
+        // Bitfield: only leave when span is absurd (not mid-sane STAGEHED index paint).
+        if (bitfieldThrash)
+        {
+            uint t1 = (uint)(sys.EE.GetGpr(9).Lo & 0xFFFFFFFFUL);  // t1 end
+            uint t6 = (uint)(sys.EE.GetGpr(14).Lo & 0xFFFFFFFFUL); // t6 cursor
+            uint a0b = (uint)(sys.EE.GetGpr(4).Lo & 0x1FFFFFFFUL);
+            bool absurd = t1 > 0x10000 || t6 > 0x10000
+                || (t1 >= t6 && t1 - t6 > 0x4000)
+                || a0b is < 0x00100000 or >= 0x02000000
+                || _residualBootLeaves >= 8; // sticky thrash after several visits
+            if (!absurd) return;
+        }
+
+        if (!waitSemaPostLg && !sleepPostLg && !postLgDev && !bootWait
+            && !bitfieldThrash && !badPc)
             return;
 
         _lastResidualBootLeaveCyc = sys.MasterCycles;
@@ -1940,8 +2236,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0x1FFFFFFFUL);
         if (gp is < 0x00400000 or >= 0x01000000) gp = 0x004E8670;
+        uint f23096 = unchecked((uint)((int)gp - 23096));
         uint f23104 = unchecked((uint)((int)gp - 23104));
         uint f23028 = unchecked((uint)((int)gp + BootWaitFlagGpOff));
+        if (f23096 is >= 0x00400000 and < 0x01000000)
+            sys.Memory.Write32(f23096, 277); // primary post-LGDEV status
         if (f23104 is >= 0x00400000 and < 0x01000000)
             sys.Memory.Write32(f23104, 1);
         if (f23028 is >= 0x00400000 and < 0x01000000)
@@ -1953,15 +2252,34 @@ public sealed class Burnout3Assist : IGameQuirkModule
             sys.Memory.Write32(f27128, 1);
 
         const uint postLgDevSuccess = 0x002AF914u;
+        const uint postLgDevEarlyPoll = 0x002AF750u;
         const uint bootWaitContinue = 0x002B34E8u;
-        uint resume = sys.Cdvd.SectorsRead < 600 ? postLgDevSuccess : bootWaitContinue;
-        if (bootWait) resume = bootWaitContinue;
-        if (postLgDev) resume = postLgDevSuccess;
+        const uint bitfieldEpi = 0x002B45CCu; // lq s0 / jr ra
+        // Prefer natural re-entry of the active poll so delay slots set v0 correctly.
+        uint resume = postLgDevSuccess;
+        if (postLgDevEarly
+            || ((waitSemaPostLg || sleepPostLg) && ra is >= 0x002AF750 and <= 0x002AF7C4))
+            resume = postLgDevEarlyPoll;
+        else if (postLgDevLate || waitSemaPostLg || sleepPostLg)
+            resume = postLgDevSuccess;
+        if (bootWait1) resume = bootWaitContinue;          // 0x2B34E8
+        else if (bootWait2) resume = 0x002B356Cu;          // after wait-2 result check
+        else if (bootWait3) resume = 0x002B35C0u;          // past wait-3 → jal 0x2AFDD0
+        if (bitfieldThrash)
+        {
+            // Prefer real $ra when it looks like a caller; else clean epilogue.
+            if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
+                && ra is not (>= 0x002B44E0 and <= 0x002B45D8))
+                resume = ra;
+            else
+                resume = bitfieldEpi;
+        }
         if (badPc) resume = bootWaitContinue;
 
         uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
-        if (s0w >= 600 || s0w == 0 || (s0w & 3) != 0
-            || s0w is >= 0x01000000 or < 0x00400000)
+        // Poll counter must stay in 1..599; reject zero, timeout, and pointer-shaped s0.
+        if (s0w >= 600 || s0w == 0 || s0w >= 0x01000000u
+            || (s0w >= 0x00400000u && (s0w & 3) == 0))
             sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
 
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
@@ -1978,9 +2296,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 {
                     try { k.SignalSema(th.WaitSemaId); } catch { /* ignore */ }
                 }
-                if (th.Id == 1 && sys.Cdvd.SectorsRead < 600)
+                if (th.Id == 1 && sys.Cdvd.SectorsRead < 2000)
                 {
-                    th.SavedPc = postLgDevSuccess;
+                    th.SavedPc = (resume == postLgDevEarlyPoll || resume == postLgDevSuccess)
+                        ? resume
+                        : postLgDevSuccess;
                     if (th.HasFullSave && th.SavedGprFull != null && th.SavedGprFull.Length > 2)
                     {
                         th.SavedGprFull[2] = 1;
@@ -2023,14 +2343,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         bool inWait2 = pc is >= 0x002B3510 and <= 0x002B3540;
         bool inWait3 = pc is >= 0x002B35A0 and <= 0x002B35C0;
         bool inSleep = pc is >= 0x0010C0A0 and <= 0x0010C0AC;
-        // 0x2AF80C..0x2AF90C: post-LGDEV poll *(gp-23104) before STG bind.
+        // Dual post-LGDEV polls before STG bind (MENU-B3 residual samples 0x2AF750 first).
+        bool inPostLgDevEarly = pc is >= 0x002AF750 and <= 0x002AF77C;
         bool inPostLgDevSpin = pc is >= 0x002AF800 and <= 0x002AF910;
         bool inPostLgDevWaitSema = pc is >= 0x0010BE60 and <= 0x0010BE70
-            && ((uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL) is >= 0x002AF800 and <= 0x002AF910);
-        // Periodic plant only while IRX-only — stop once game FILEIO opens (cdvd≫425).
-        bool periodic = (_menuKickPulses % 4) == 0 && sys.Cdvd.SectorsRead is >= 400 and < 600;
+            && ((uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL) is >= 0x002AF700 and <= 0x002AF910);
+        // Keep planting until Global.txd/FRONTEND spine (cdvd≥2000) — STAGEHED plant alone
+        // leaves cdvd=609 and used to stop periodic assist → stuck bitfield 0x2B45xx.
+        bool periodic = (_menuKickPulses % 4) == 0 && sys.Cdvd.SectorsRead is >= 400 and < 2000;
         if (!inWait1 && !inWait2 && !inWait3 && !inSleep && !inPostLgDevSpin
-            && !inPostLgDevWaitSema && !periodic) return;
+            && !inPostLgDevEarly && !inPostLgDevWaitSema && !periodic) return;
 
         _lastBootWaitPlantCyc = sys.MasterCycles;
         _bootWaitFlagPlants++;
@@ -2069,9 +2391,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 sys.Memory.Write32(s0 + 0x13A0, 1);
         }
 
-        // Post-LGDEV spin at 0x2AF80C: while (*(gp-23104)==0 && s0<600) SleepThread.
-        // Producer never fills under HLE residual — plant so Criterion can bind STG.
+        // Post-LGDEV dual flags: gp-23096 (0x2AF750, primary status 277) + gp-23104 (0x2AF80C).
+        uint flag23096 = unchecked((uint)((int)gp - 23096));
         uint flag23104 = unchecked((uint)((int)gp - 23104));
+        if (flag23096 is >= 0x00400000 and < 0x01000000)
+            sys.Memory.Write32(flag23096, 277);
         if (flag23104 is >= 0x00400000 and < 0x01000000)
             sys.Memory.Write32(flag23104, 1);
 
@@ -2093,6 +2417,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 1 });
             sys.EE.PC = 0x002B35C0; // past wait-3 → jal 0x2AFDD0
+            sys.EE.COP0_Status &= ~0x6u;
+        }
+        else if (inPostLgDevEarly)
+        {
+            // Re-enter early poll with flag=277 + s0!=600 → natural 0x2AF7E0 continue.
+            uint s0w = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
+            if (s0w >= 600)
+                sys.EE.SetGpr(16, new EmotionEngine.Gpr128 { Lo = 1 });
+            sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 277 });
+            sys.EE.PC = 0x002AF750;
             sys.EE.COP0_Status &= ~0x6u;
         }
         else if (inPostLgDevSpin || inPostLgDevWaitSema)

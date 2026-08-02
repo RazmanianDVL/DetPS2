@@ -1,0 +1,56 @@
+# DetPS2 pad-script — MK Shaolin Monks (SLUS_210.87) INTERACTIVE residual probe
+# Soft-GS natural chrome @100M: lit≈237k gifP3=10. Dense START/CROSS/D-pad 55–150M.
+# Usage:
+#   detps2 pad-inject user-media-mk.json --cycles=150000000 --host-present --pad-script=tools/pad-scripts/sm-menu-interactive.pad
+#   detps2 blocker-trace user-media-mk.json --cycles=150000000 --host-present --pad-script=tools/pad-scripts/sm-menu-interactive.pad
+#
+# HOLD defaults to 50000 cycles when omitted.
+
+# Warm-up after bulk WAD / logo spine
+@55000000 Start 120000
+@56000000 Cross 100000
+@58000000 Down 80000
+@60000000 Cross 150000
+
+# Soft-GS chrome window (~70–110M): selection crawl + accept
+@70000000 Start 150000
+@72000000 Down 100000
+@74000000 Cross 150000
+@76000000 Up 80000
+@78000000 Cross 150000
+@80000000 Start 150000
+@82000000 Cross 200000
+@85000000 Down 100000
+@88000000 Cross 150000
+@90000000 Start 200000
+@92000000 Cross 200000
+@95000000 Right 80000
+@98000000 Cross 150000
+@100000000 Start 200000
+@102000000 Cross 200000
+
+# Extend through 150M for sm-menu-150m claim
+@105000000 Down 100000
+@108000000 Cross 200000
+@110000000 Start 200000
+@115000000 Cross 200000
+@120000000 Up 100000
+@125000000 Cross 200000
+@130000000 Start 200000
+@135000000 Down 100000
+@138000000 Cross 200000
+@142000000 Start 200000
+@145000000 Cross 250000
+@148000000 Cross 250000
+
+# Extend through 200M for sm-menu-sm3-200m-pad
+@155000000 Start 200000
+@160000000 Cross 200000
+@165000000 Down 100000
+@170000000 Cross 200000
+@175000000 Start 200000
+@180000000 Cross 200000
+@185000000 Up 100000
+@190000000 Cross 250000
+@195000000 Start 200000
+@198000000 Cross 250000

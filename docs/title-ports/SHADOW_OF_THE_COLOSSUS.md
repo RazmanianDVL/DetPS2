@@ -8,8 +8,8 @@
 | **Media config** | `user-media-sotc.json` |
 | **Build** | `out/menu-fleet` Release |
 | **ROMDIR gate** | **CLOSED** (post-INTC tip `699397e`) |
-| **Status** | STARTUP+KERNEL.XFF open/read; MANAGER/GAMECORE strings; gifP3=17; still `px=0` |
-| **Last updated** | 2026-07-30 |
+| **Status** | Soft-GS lit>0 @100M via **Host→Local residual** (MANAGER/NICO/KERNEL plant) — **not** natural MENU YES. LIVE: lit=120153 imgBytes=524288 px=2127193 prims=8 gifP3=17. KERNEL thrash residual; MANAGER/GAMECORE FILEIO residual. |
+| **Last updated** | 2026-07-31 residual honesty |
 
 ---
 
@@ -65,11 +65,22 @@ find-string KERNEL / MANAGER / GAMECORE: present
 - TeamIcoAssist policy-only (no `*addr` plants)
 - Prefer SHARED FILEIO/bind HLE
 
+## Soft-GS LIVE (MENU-SOTC-2 Host→Local residual) — 2026-07-31
+
+```
+claim: px=2127193 prims=8 gifP1=0 gifP2=0 gifP3=17 imgBytes=524288
+       dispfbPx=120153 naturalDispfbPx=120153 residualDispfbPx=0
+       lit=120153/286720 compositeSource=NaturalDispfb
+job: sotc-residual-100m-20260731-151114
+```
+
+**Residual class:** Host→Local BITBLT of honest MANAGER.XFF / NICO.DAT / KERNEL.XFF bytes (TeamIcoAssist MENU-SOTC-2). gif image tags=0 — **not** natural EE GIF IMAGE. **not natural MENU YES**.
+
 ## MENU REACHED?
 
-**No.**
+**No** (formal charter). Soft-GS lit residual only.
 
-> **FILEIO-2200 SHARED** opens **STARTUP.XFF** and loads **KERNEL.XFF** (cdvd **450**). MANAGER/GAMECORE path strings resident. Residual: KERNEL entry thrash, **px=0**, gifP3=17.
+> **FILEIO-2200 SHARED** opens **STARTUP.XFF** and loads **KERNEL.XFF**. Host→Local residual lights present. Residual: KERNEL thrash, no natural IMAGE path, MANAGER/GAMECORE open incomplete.
 
 ### Next
 

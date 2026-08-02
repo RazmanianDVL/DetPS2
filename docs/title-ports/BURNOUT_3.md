@@ -6,10 +6,10 @@
 | **Serial** | `SLUS_210.50` |
 | **ISO** | `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
-| **Worktree / seat** | `detps2-seat-s4` · branch `agent/seat-s4/s2-g2` |
+| **Worktree / seat** | `detps2` · seat **MENU-B3-2** |
 | **Agent date** | 2026-07-31 |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **logo-frontend MENU YES** Soft-GS hold; **PL-014 DBC work buffer wired** (`work=0x0067CCC0` paints≥1500); INTERACTIVE logo→menu **not claimed**; residual **natural DISPFB** + pad-driven scene leave |
+| **Status** | **logo-frontend MENU YES** Soft-GS hold; **INTERACTIVE PARTIAL** (PC left presentation park via pad + dead-ra leave); full main-menu chrome **not claimed**; residual second stream / menu UI Soft-GS scene |
 
 ---
 
@@ -344,6 +344,160 @@ dotnet exec out/seat-s4/DetPS2.Core.dll blocker-trace burnout-only.json --cycles
 2. **PL-022** — START/CROSS pad-script claim once consumer polls.  
 3. **PL-026 / GX-045** — natural DISPFB or **documented** FRAME-only present.  
 4. **PL-047** — natural FRONTEND dest bind (plant↓).  
+
+---
+
+## Seat MENU-B3 (2026-07-31) — Soft-GS menu residual re-hold
+
+| Field | Value |
+|-------|-------|
+| Seat | **MENU-B3** · worktree `detps2` · owns `Burnout3Assist.cs` |
+| Media | `burnout-only.json` · **SEMA_OFF** · live-queue 100M `--host-present` |
+| Job | `out/live-queue/done/menu-b3-100m-host-20260731-115249.json` |
+
+### Wall (tip before fix)
+
+100M host-present baseline: **cdvd=609** (STAGEHED plant only) gifP3=20 **px=380928** PC=`0x002B4580` binds=11 — residual died before Global.txd/FRONTEND. EE parked in bitfield set @`0x2B44E0` after missing early post-LGDEV poll.
+
+### Root cause
+
+Post-LGDEV has **two** SleepThread polls:
+
+1. `0x2AF750` — `while (*(gp-23096)==0 && s0<600)` — primary status word **277** continues @`0x2AF7E0`
+2. `0x2AF80C` — `while (*(gp-23104)==0 && s0<600)` — non-zero → `0x2AF914`
+
+Assist only planted `gp-23104`. Live residual sampled **`0x2AF750` first**, never filled `gp-23096`, then thrashed bitfield `0x2B45xx`. After STAGEHED plant (cdvd=609) periodic boot-wait assist also stopped (`cdvd < 600` gate).
+
+### Assist fix (`Burnout3Assist.cs`)
+
+| Change | Notes |
+|--------|-------|
+| Plant `*(gp-23096)=277` + `*(gp-23104)=1` | Dual post-LGDEV flags |
+| Leave early poll `0x2AF750` | Natural re-enter with flag set |
+| Residual thrash leave (gated) | Only in-poll / bitfield / boot-wait bodies — **no** blind `0x293xxx`→post-LGDEV snap |
+| Bitfield absurd leave | `0x2B44E0..0x2B45D4` → epi / `$ra` when span garbage |
+| Periodic plant until cdvd&lt;2000 | Cover STAGEHED-plant-only window |
+
+### Claim 100M (SEMA_OFF, live-queue host-present)
+
+```
+PC=0x00237138 px=65022869 prims=13812 gifP1=0 gifP2=229 gifP3=1375 dmac=920
+  sifBytes=345188 syscalls=122571 cdvdSectors=6584
+softgs: imgBytes=7262944 dispfbPx=0 naturalDispfbPx=94208 expandHits=458
+  fragTest=213659434 rejDepth=148730773 rejAlpha=64641921
+softgs-present: lit=94228/286720 mostlyBlack=1
+softgs-regs: FRAME_1=0xA0046 DISPFB1=0 DISPFB2=0x51400 XYOFFSET=0x72006C00 TEST=0x5140B
+RealSifRpc: binds=13 calls=504 unknown=0
+PL-014: dbcWork=0x0067CCC0 paints≥1854; logo-pad edges n≥704
+```
+
+**Claim line:**
+
+```
+B3 SLUS_210.50 MENU-B3 SEMA_OFF 100M host-present: STG+TXD+FRONTEND cdvd=6584
+  gifP1=0 gifP2=229 gifP3=1375 dmac=920 prims=13812
+  px=65022869 lit=94228 imgBytes=7262944 DISPFB1=0
+  binds=13 calls=504 PC=0x237138 — logo-frontend MENU YES re-hold
+  menuKind=logo-frontend menuHeuristic=LIKELY-NEAR
+  residual: pad-driven scene leave + natural DISPFB; no DISPFB plant
+```
+
+**MENU:** logo-frontend Soft-GS **YES** (SOP bar: non-black Soft-GS after FRONTEND/logo spine). **Not** claiming pad-interactive main menu.
+
+### Reproduce
+
+```powershell
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+# enqueue:
+@{ id='menu-b3-100m'; media='burnout-only.json'; cycles=100000000; hostPresent=$true; priority=0 } |
+  ConvertTo-Json | Set-Content out/live-queue/inbox/menu-b3-100m.json
+pwsh ./tools/live-game-queue.ps1 -MaxConcurrent 1 -Once
+# expect: cdvd=6584 px multi-M gifP3≥100 DISPFB1=0; [B3] leave post-LGDEV … flag23096=277
+```
+
+---
+
+## Seat MENU-B3-2 (2026-07-31) — INTERACTIVE past logo-frontend
+
+| Field | Value |
+|-------|-------|
+| Seat | **MENU-B3-2** · worktree `detps2` · owns `Burnout3Assist.cs` |
+| WP | Push pad past logo presentation (PC change + Soft-GS scene delta) |
+| Media | `burnout-only.json` · **SEMA_OFF** · live-queue **pad-inject** + blocker-trace |
+| Pad script | `tools/pad-scripts/b3-menu-interactive.pad` (39 events, dense START/CROSS 28–100M) |
+| Job | `out/live-queue/done/menu-b3-2-claim3-20260731-131547.json` (+ pad3 twin) |
+
+### Assist changes (`Burnout3Assist.cs`)
+
+| Change | Notes |
+|--------|-------|
+| Soft VBlank after chrome | Stop heavy `0x2371E0` epilogue stomp once logo pad edges ≥8 — plant flags only |
+| Denser logo pad | Faster edges after chrome ≥8M; long START holds; yield to pad-script external presses |
+| DBC refresh | Keep ForceRefreshDbcPad; work=`0x0067CCC0` paints multi-k |
+| Main wake | Wake tid=1 pure-Sleep after chrome so pad consumers run |
+| Presentation leave | After chrome + pad≥16: leave flip/VBlank/logo-draw parks |
+| **Dead `$ra` fix** | Live freeze `$ra=0x200` @ `0x253F64` ~85M → plant presentation continue **`0x223228`** |
+| Scene-delta telemetry | Chrome snap @ FRONTEND (cdvd≥6000); log PC/prims/img delta; `leftPark` |
+| post-TXD cap | Escape cap 8192 under chrome (was 2048 → Soft-GS freeze ~8M after thrash) |
+
+### Claim 100M (SEMA_OFF, pad-script, host-present) — claim3
+
+```
+PC=0x0012DF84 px=23560827 prims=4476 gifP1=0 gifP2=296 gifP3=438 dmac=375
+  sifBytes=132532 syscalls=105085 cdvdSectors=6584
+softgs: imgBytes=2431936 dispfbPx=4084024 naturalDispfbPx=3956736
+softgs-present: lit=100106/286720 mostlyBlack=0
+RealSifRpc: binds=13 calls=202 unknown=0
+pad-script: 39 events / 77 press+release fires
+PL-014: chrome snap @40M cdvd=6584; presentation leave n≥5 ra→0x223228;
+  scene-delta leftPark=True interactive=True (PC 0x10BE68 → 0x12DFxx / 0x207Fxx)
+```
+
+**pad-inject twin (pad3):** final PC `0x0012DF84`; after leave, PC continues to move on pad
+events (`0x12DF84`/`0x12E32C`/`0x207F20`/`0x13A034`) with syscall growth (73k→105k) while Soft-GS
+metrics hold (presentation graph left; no new prim stream yet).
+
+**Claim line:**
+
+```
+B3 SLUS_210.50 MENU-B3-2 SEMA_OFF 100M pad-script host-present:
+  STG+TXD+FRONTEND cdvd=6584 gifP2=296 gifP3=438 dmac=375 prims=4476
+  px=23560827 lit=100106 imgBytes=2431936 DISPFB1=0
+  binds=13 calls=202 PC=0x12DF84 — logo-frontend MENU YES hold
+  INTERACTIVE PARTIAL: leftPark=True (left 0x253F/0x2371 presentation);
+    pad-script 77 fires + DBC paints; PC reacts post-leave
+  residual: full main-menu chrome / second stream Soft-GS scene; natural DISPFB
+```
+
+| Gate | Result |
+|------|--------|
+| logo-frontend Soft-GS | **YES** (lit≈100k mostlyBlack=0 after FRONTEND) |
+| PC leave presentation | **YES** (`leftPark=True`; final `0x12DF84` not logo/VBlank park) |
+| Pad-driven activity | **YES** (script fires + PC/syscall movement post-leave) |
+| Full main-menu INTERACTIVE | **NO** — no second UI stream / menu selection proof |
+| Soft-GS scene change (new chrome) | **PARTIAL** — prims freeze after leave; no multi-chrome delta |
+
+### Reproduce
+
+```powershell
+Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
+$env:DETPS2_TRACE_BIOS = '1'
+# pad-inject INTERACTIVE probe:
+@{
+  id='menu-b3-2-pad'; media='burnout-only.json'; cycles=100000000
+  hostPresent=$true; command='pad-inject'
+  padScript='tools/pad-scripts/b3-menu-interactive.pad'
+  extraArgs=@('--sample-every=2000000'); priority=0
+} | ConvertTo-Json | Set-Content out/live-queue/inbox/menu-b3-2-pad.json
+# claim metrics twin:
+@{
+  id='menu-b3-2-claim'; media='burnout-only.json'; cycles=100000000
+  hostPresent=$true; command='blocker-trace'
+  padScript='tools/pad-scripts/b3-menu-interactive.pad'; priority=1
+} | ConvertTo-Json | Set-Content out/live-queue/inbox/menu-b3-2-claim.json
+pwsh ./tools/live-game-queue.ps1 -MaxConcurrent 2 -Once
+# expect: PC outside 0x253F/0x2371; [B3] PL-014 scene-delta leftPark=True; lit>0
+```
 
 ---
 

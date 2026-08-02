@@ -54,7 +54,27 @@ namespace DetPS2.Core;
 /// <c>jr ra</c> with <c>ra=0</c> (stack slot wiped after open-bus thrash) → JREXIT →
 /// tid1 <c>Started=false</c> while SIF worker parks WaitSema(3). Rescue: revive main +
 /// stack/LastGood resume + worker WaitSema pulse (Whiplash JREXIT class).
-/// Haven-only still: VBlankStart sticky + poll-base repair. Disc: <c>DLL.DAT</c>, <c>DATA/</c>.
+/// Wave-7 (MENU-HAVEN-3): bad-PC escape for post-DLL open-bus thrash at <c>0x005xxxxx</c>
+/// (live UnknownOpcode primary=0x30 / LWC2 data-as-code) + Host→Local residual of honest
+/// disc bytes (<c>DATA\BIN\SYSTEM.RW3</c>, <c>CUBE.BIN</c>) into Soft-GS local when logo
+/// clear paints full FB black (px≈286720 lit=0 imgBytes=0) — same class as BO2 MAINMENU /
+/// Whiplash firstscreen residual. Disc: <c>DLL.DAT</c>, <c>DATA/BIN/*.RW3</c>.
+/// Wave-8 (MENU-HAVEN-4 residual): poison-$ra repair while PC is healthy .text (live
+/// residual ra=<c>0x1</c> @<c>0x2092C8</c> after bad-PC escape) so natural jr-return spine
+/// can leave Host→Local-only park. Fleet 50M still CRT0 pre-decompress (px=0 expected;
+/// claim budget ≥100M — SM-4 class). Host→Local chrome is residual, not natural MENU YES.
+/// Haven-only still: VBlankStart sticky + poll-base repair.
+/// </para>
+///
+/// <para>
+/// <b>SotC residual (MENU-SOTC-2 — Soft-GS lit):</b> after FILEIO-2200 loads
+/// <c>KERNEL.XFF</c> (~416 KiB @ <c>0x001AA7C0</c>) the EE paints full-FB black clears
+/// (<c>px≈2M lit=0 imgBytes=0 prims≈7</c>, gifP3=17, no IMAGE tags; DISPFB2 garbage so
+/// natural composite is <c>None</c>). MANAGER/GAMECORE never open; EE thrash on data-as-code
+/// (<c>UnknownOpcode</c> ASCII "wait"/"init"). Same black-logo residual class as Haven-3 /
+/// Whip-2: Host→Local BITBLT of honest disc bytes (<c>MANAGER.XFF</c> / <c>NICO.DAT</c> head
+/// + live <c>KERNEL.XFF</c>) into Soft-GS local so present can light (lit&gt;0, mostlyBlack=0).
+/// Policy-only PreferIopRp for SotC remains; residual chrome is Host→Local, not memory plant.
 /// </para>
 ///
 /// <para>
@@ -68,6 +88,7 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     private readonly string _serial;
     private readonly string _displayName;
     private readonly bool _isHaven;
+    private readonly bool _isSotc;
 
     // Haven INTC_STAT VBlankStart busy-poll (disasm residual top PC 0x331650).
     private const uint HavenVbPollA = 0x00331650;
@@ -103,6 +124,22 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     private const uint HavenTextLo = 0x00100000;
     private const uint HavenTextHi = 0x00400000;
 
+    // MENU-HAVEN-3: honest disc chrome staging (high RDRAM; below GOE-class 0x1C00000).
+    private const uint HavenSysRw3Dest = 0x01A00000u;
+    private const uint HavenCubeBinDest = 0x01A40000u;
+    private const int HavenSysRw3Max = 195408;   // DATA\BIN\SYSTEM.RW3 size
+    private const int HavenCubeBinMax = 256 * 1024; // first 256 KiB of CUBE.BIN
+
+    // MENU-SOTC-2: honest disc chrome staging (MANAGER.XFF + NICO.DAT head; KERNEL live).
+    // High RDRAM below GOE-class 0x1C00000 — same band as Haven residual.
+    private const uint SotcManagerDest = 0x01A00000u;
+    private const uint SotcNicoDest = 0x01B00000u;
+    private const int SotcManagerMax = 512 * 1024; // first 512 KiB of MANAGER.XFF (~1.6 MiB)
+    private const int SotcNicoMax = 256 * 1024;    // first 256 KiB of NICO.DAT
+    // Live FILEIO-2200 read of KERNEL.XFF (trace: buf=0x001AA7C0 size=415908).
+    private const uint SotcKernelLiveBase = 0x001AA7C0u;
+    private const int SotcKernelLiveMax = 415908;
+
     private int _vbPulses;
     private int _vbBaseRepairs;
     private int _vifBusyClears;
@@ -110,20 +147,29 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     private int _jrExitRescues;
     private int _mainRevives;
     private int _badPcEscapes;
+    private int _poisonRaRepairs;
     private int _semaPulses;
     private int _postNuSoundRescues;
     private ulong _lastLogCyc;
     private ulong _lastVbPulseCyc;
     private ulong _lastVifBusyCyc;
     private ulong _lastJrRescueCyc;
+    private ulong _lastPoisonRaCyc;
     private ulong _lastSemaPulseCyc;
     private uint _lastGoodHavenPc;
+    private bool _titleAssetsStreamed;
+    private int _titleAssetBytes;
+    private bool _titleChromeFed;
+    private int _titleChromeBytes;
+    private int _titleChromeAttempts;
+    private ulong _lastTitleChromeCyc;
 
     public TeamIcoAssist(string serial, string displayName)
     {
         _serial = serial ?? throw new ArgumentNullException(nameof(serial));
         _displayName = displayName ?? serial;
         _isHaven = string.Equals(_serial, "SLUS_205.17", StringComparison.OrdinalIgnoreCase);
+        _isSotc = string.Equals(_serial, "SCUS_974.72", StringComparison.OrdinalIgnoreCase);
     }
 
     public string Serial => _serial;
@@ -138,14 +184,22 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         _jrExitRescues = 0;
         _mainRevives = 0;
         _badPcEscapes = 0;
+        _poisonRaRepairs = 0;
         _semaPulses = 0;
         _postNuSoundRescues = 0;
         _lastLogCyc = 0;
         _lastVbPulseCyc = 0;
         _lastVifBusyCyc = 0;
         _lastJrRescueCyc = 0;
+        _lastPoisonRaCyc = 0;
         _lastSemaPulseCyc = 0;
         _lastGoodHavenPc = 0;
+        _titleAssetsStreamed = false;
+        _titleAssetBytes = 0;
+        _titleChromeFed = false;
+        _titleChromeBytes = 0;
+        _titleChromeAttempts = 0;
+        _lastTitleChromeCyc = 0;
         if (_isHaven)
             SoftFloatBridge.Reset();
     }
@@ -161,7 +215,8 @@ public sealed class TeamIcoAssist : IGameQuirkModule
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1")
             Console.Error.WriteLine(
                 $"[TEAMICO] OnDiscMounted: PreferIopRpGetVersion serial={_serial}"
-                + (_isHaven ? $" havenVbAssist=on softFloatEntries={SoftFloatBridge.EntryCount}" : ""));
+                + (_isHaven ? $" havenVbAssist=on softFloatEntries={SoftFloatBridge.EntryCount}" : "")
+                + (_isSotc ? " sotcHostLocalResidual=on" : ""));
     }
 
     /// <summary>
@@ -190,10 +245,25 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     {
         if (_isHaven && sys.Hle?.Sony?.RealRpc is { Binds: >= 10 })
             PulseHavenVblank(sys, force: false);
+        // MENU-HAVEN-3 / MENU-SOTC-2: re-merge Host→Local chrome into black Soft-GS present.
+        if (_isHaven || _isSotc)
+        {
+            try
+            {
+                if (sys.Gs.ImageBytesWritten > 0 && sys.Gs.IsPresentMostlyBlack())
+                    sys.Gs.ForceRefreshPresentComposite();
+            }
+            catch { /* ignore */ }
+        }
     }
 
     public void Step(Ps2System sys)
     {
+        if (_isSotc)
+        {
+            StepSotc(sys);
+            return;
+        }
         if (!_isHaven) return;
 
         var rpc = sys.Hle?.Sony?.RealRpc;
@@ -230,13 +300,23 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         if (inVifWait)
             MaybeClearHavenVifBusy(sys, cyc);
 
+        // Post-decompress spine: poison $ra (0/1/non-code) while PC is healthy .text freezes
+        // natural jr-return leave (live residual #3 ra=0x1 @0x2092C8 after bad-PC escape).
+        // Run before Host→Local plant so natural path can continue without residual-only chrome.
+        if (cyc >= 80_000_000UL || rpc.Binds >= 12)
+            MaybeRepairHavenPoisonRa(sys, pc, cyc);
+
         // Post-NUSOUND (binds≥13): JREXIT / open-bus / dead-main wall.
-        if (rpc.Binds >= 13 && cyc >= 88_000_000UL)
+        // Live @~89M: DLL.DAT bound + logo clear; rescue/stream from 80M so 100M claim sees chrome.
+        if (rpc.Binds >= 13 && cyc >= 80_000_000UL)
         {
             MaybeRescueHavenJrExit(sys, pc, cyc);
             MaybeReviveHavenMain(sys, cyc);
             MaybeEscapeHavenBadPc(sys, pc, cyc);
+            MaybeRepairHavenPoisonRa(sys, pc, cyc); // re-check after escape seeds ra=resume
             MaybePulseHavenWaiters(sys, cyc);
+            MaybeStreamHavenTitleAssets(sys, cyc);
+            TryFeedHavenTitleChromeHostToLocal(sys, cyc);
         }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
@@ -251,7 +331,9 @@ public sealed class TeamIcoAssist : IGameQuirkModule
                 + $"binds={rpc.Binds} calls={rpc.Calls} fioOps={rpc.FileIoOps} "
                 + $"intcStat=0x{sys.Intc.Stat:X} vbPulse={_vbPulses} vbFix={_vbBaseRepairs} "
                 + $"vifBusyClr={_vifBusyClears} jrResc={_jrExitRescues} mainRev={_mainRevives} "
-                + $"badPc={_badPcEscapes} semaPulse={_semaPulses}");
+                + $"badPc={_badPcEscapes} poisonRa={_poisonRaRepairs} semaPulse={_semaPulses} "
+                + $"assetBytes={_titleAssetBytes} chromeFed={_titleChromeFed} "
+                + $"chromeBytes={_titleChromeBytes} img={sys.Gs.ImageBytesWritten} px={sys.Gs.PixelsWritten}");
         }
     }
 
@@ -485,12 +567,62 @@ public sealed class TeamIcoAssist : IGameQuirkModule
     }
 
     /// <summary>
+    /// MENU-HAVEN-4 natural-spine residual: after bad-PC escape / open-bus, live $ra can be
+    /// poison (<c>0</c>, <c>1</c>, unaligned, non-code) while PC sits in healthy game .text
+    /// (claim residual #3: PC=<c>0x2092C8</c> ra=<c>0x1</c>). Any <c>jr ra</c> then JREXITs
+    /// or open-bus rescues again, starving natural FILEIO/chrome beyond Host→Local plant.
+    /// Seed a safe link only — do not rehome PC.
+    /// </summary>
+    private void MaybeRepairHavenPoisonRa(Ps2System sys, uint pc, ulong cyc)
+    {
+        if (_poisonRaRepairs >= 48) return;
+        if ((cyc - _lastPoisonRaCyc) < 50_000UL) return;
+        // Only when PC is already in post-decompress game .text (not CRT0 / not CallRpc body).
+        if (!IsSafeHavenText(sys, pc)) return;
+        if (pc is >= HavenCallRpcEntry and <= HavenValidateLeafEnd) return;
+        if (pc is >= 0x00340000 and < 0x00360000) return; // soft-float poly body
+
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu);
+        bool poison = ra < 0x1000u
+            || (ra & 3u) != 0
+            || ra >= (uint)SystemMemory.RDRAM_SIZE
+            || !IsSafeHavenText(sys, ra);
+        if (!poison) return;
+
+        // Prefer a return site distinct from current PC so jr ra actually leaves.
+        uint link = 0;
+        if (IsSafeHavenText(sys, HavenPostNuSoundResume) && HavenPostNuSoundResume != pc)
+            link = HavenPostNuSoundResume;
+        else if (_lastGoodHavenPc != 0 && _lastGoodHavenPc != pc
+                 && IsSafeHavenText(sys, _lastGoodHavenPc)
+                 && LooksLikeReturnSite(sys, _lastGoodHavenPc))
+            link = _lastGoodHavenPc;
+        else
+        {
+            uint pick = PickHavenResume(sys);
+            if (pick != 0 && pick != pc && IsSafeHavenText(sys, pick))
+                link = pick;
+        }
+        if (link == 0 || link == pc) return;
+
+        sys.EE.SetGpr(31, new EmotionEngine.Gpr128 { Lo = link });
+        _poisonRaRepairs++;
+        _lastPoisonRaCyc = cyc;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
+            && (_poisonRaRepairs <= 12 || _poisonRaRepairs % 8 == 0))
+            Console.Error.WriteLine(
+                $"[TEAMICO-HAVEN] poison-$ra repair 0x{ra:X8} -> 0x{link:X8} "
+                + $"pc=0x{pc:X8} n={_poisonRaRepairs} cyc={cyc}");
+    }
+
+    /// <summary>
     /// Open-bus / data-as-code after NUSOUND (live: 0x1BBF0090, 0x04C600B8 → generic
-    /// 0x520000/0x11C200 Midway rehomes). Snap back to Haven .text.
+    /// 0x520000/0x11C200 Midway rehomes; WAVE-7: 0x00500xxx LWC2 data thrash). Snap back
+    /// to Haven .text.
     /// </summary>
     private void MaybeEscapeHavenBadPc(Ps2System sys, uint pc, ulong cyc)
     {
-        if (_badPcEscapes >= 48) return;
+        if (_badPcEscapes >= 64) return;
 
         uint pcRaw = (uint)(sys.EE.PC & 0xFFFFFFFFUL);
         bool exceptionVec = pcRaw is >= 0x80000180 and <= 0x80000280
@@ -500,8 +632,12 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         // Midway open-bus defaults + known garbage landings from Haven residual.
         bool midwayRehome = pc is >= 0x00520000 and < 0x00530000
             || pc is >= 0x0011C200 and < 0x0011C400;
-        bool dataAsCode = pc is >= 0x00400000 and < HavenTextHi + 0x00100000
+        // Live residual: 0x00500224 UnknownOpcode primary=0x30 (LWC2 on float tables /
+        // DLL data). Old upper bound was exclusive 0x00500000 so this band slipped through.
+        bool highDataAsCode = pc is >= 0x00400000 and < 0x01000000
             && !IsSafeHavenText(sys, pc);
+        bool dataAsCode = highDataAsCode
+            || (pc is >= 0x00400000 and < HavenTextHi + 0x00100000 && !IsSafeHavenText(sys, pc));
         // Validate-leaf thrash with ra=0 (post-JREXIT fallthrough).
         bool validateThrash = pc is >= HavenValidateLeaf and <= HavenValidateLeafEnd
             && (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu) == 0;
@@ -509,16 +645,21 @@ public sealed class TeamIcoAssist : IGameQuirkModule
         // open-bus rehome — not a safe resume target.
         bool vifLeafStuck = pc is >= 0x00186878 and <= 0x001868B4
             && (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu) is >= 0x00186878 and <= 0x001868B4;
+        // Soft-float poly body / libm mid without registered entry and dead $ra — thrash.
+        bool softFloatOrphan = pc is >= 0x00340000 and < 0x00360000
+            && (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu) == 0;
 
         if (!exceptionVec && !pastRdram && !lowBad && !midwayRehome && !dataAsCode
-            && !validateThrash && !vifLeafStuck)
+            && !validateThrash && !vifLeafStuck && !softFloatOrphan)
             return;
 
         uint resume = PickHavenResume(sys);
-        // Never re-enter the VIF leaf as the resume target.
-        if (resume is >= 0x00186878 and <= 0x001868B4)
+        // Never re-enter the VIF leaf / soft-float poly body as the resume target.
+        if (resume is >= 0x00186878 and <= 0x001868B4
+            || resume is >= 0x00340000 and < 0x00360000
+            || resume == pc)
             resume = HavenPostNuSoundResume;
-        if (resume == 0) return;
+        if (resume == 0 || resume == pc) return;
 
         ReviveHavenMain(sys, resume);
         sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
@@ -651,5 +792,449 @@ public sealed class TeamIcoAssist : IGameQuirkModule
             return pc is >= 0x00200000 and < 0x00300000;
         }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// MENU-SOTC-2: black full-FB logo clear residual after KERNEL.XFF load.
+    /// Stream MANAGER/NICO when needed and Host→Local into Soft-GS local.
+    /// </summary>
+    private void StepSotc(Ps2System sys)
+    {
+        var rpc = sys.Hle?.Sony?.RealRpc;
+        if (rpc == null || rpc.Binds < 10) return;
+
+        ulong cyc = sys.Scheduler.MasterCycles;
+        // Live: KERNEL open+read finishes mid-boot; black prims land by ~tens of M.
+        // Gate on binds (IRX stack) + either logo clear or late budget.
+        bool blackLogoClear = sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 16;
+        bool late = cyc >= 40_000_000UL;
+        if (!blackLogoClear && !late && sys.Gs.PixelsWritten < 1_000)
+            return;
+
+        MaybeStreamSotcTitleAssets(sys, cyc);
+        TryFeedSotcTitleChromeHostToLocal(sys, cyc);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
+            && (cyc - _lastLogCyc) > 5_000_000UL
+            && _lateLogPulses < 8)
+        {
+            _lastLogCyc = cyc;
+            _lateLogPulses++;
+            uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
+            uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFu);
+            Console.Error.WriteLine(
+                $"[TEAMICO-SOTC] residual #{_lateLogPulses} cyc={cyc} pc=0x{pc:X8} ra=0x{ra:X8} "
+                + $"binds={rpc.Binds} calls={rpc.Calls} fioOps={rpc.FileIoOps} "
+                + $"assetBytes={_titleAssetBytes} chromeFed={_titleChromeFed} "
+                + $"chromeBytes={_titleChromeBytes} img={sys.Gs.ImageBytesWritten} "
+                + $"px={sys.Gs.PixelsWritten} prims={sys.Gs.PrimitivesDrawn}");
+        }
+    }
+
+    /// <summary>
+    /// MENU-SOTC-2: stream honest <c>MANAGER.XFF</c> + <c>NICO.DAT</c> head into high RDRAM
+    /// for Host→Local residual. KERNEL.XFF is already live @ <c>0x001AA7C0</c> from FILEIO.
+    /// </summary>
+    private void MaybeStreamSotcTitleAssets(Ps2System sys, ulong cyc)
+    {
+        if (_titleAssetsStreamed) return;
+        // Prefer after logo clear or when FILEIO has progressed (KERNEL read ≈ cdvd heavy).
+        if (sys.Gs.PixelsWritten < 1_000 && cyc < 50_000_000UL
+            && (sys.Hle?.Sony?.RealRpc?.FileIoOps ?? 0) < 4)
+            return;
+
+        int total = 0;
+        total += StreamDiscToEe(sys,
+            new[]
+            {
+                @"cdrom0:\MANAGER.XFF;1",
+                @"cdrom0:\MANAGER.XFF",
+            },
+            SotcManagerDest, SotcManagerMax);
+
+        total += StreamDiscToEe(sys,
+            new[]
+            {
+                @"cdrom0:\NICO.DAT;1",
+                @"cdrom0:\NICO.DAT",
+            },
+            SotcNicoDest, SotcNicoMax);
+
+        // Count live KERNEL.XFF if already resident (FILEIO read).
+        if (SotcKernelLooksResident(sys.Memory))
+            total += Math.Min(SotcKernelLiveMax, 64 * 1024);
+
+        _titleAssetBytes = total;
+        _titleAssetsStreamed = total > 0 || cyc >= 80_000_000UL;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1")
+            Console.Error.WriteLine(
+                $"[TEAMICO-SOTC] title assets streamed bytes={total} "
+                + $"mgr@0x{SotcManagerDest:X8} nico@0x{SotcNicoDest:X8} "
+                + $"kernelLive={SotcKernelLooksResident(sys.Memory)} cyc={cyc}");
+    }
+
+    /// <summary>True when live KERNEL.XFF magic <c>xff2</c> is present at FILEIO dest.</summary>
+    private static bool SotcKernelLooksResident(SystemMemory mem)
+    {
+        if (mem == null) return false;
+        // "xff2" LE: 0x32666678
+        uint mag = mem.Read32(SotcKernelLiveBase);
+        return mag == 0x32666678u;
+    }
+
+    /// <summary>
+    /// MENU-SOTC-2: black full-FB logo clear (px≈2M lit=0 imgBytes=0 prims≈7) — feed honest
+    /// MANAGER.XFF / NICO.DAT / live KERNEL.XFF Host→Local so Soft-GS composite can light
+    /// (Haven-3 / Whip-2 class).
+    /// </summary>
+    private void TryFeedSotcTitleChromeHostToLocal(Ps2System sys, ulong cyc)
+    {
+        if (_titleChromeFed) return;
+        if (_titleChromeAttempts >= 12) return;
+        if (_lastTitleChromeCyc != 0 && cyc - _lastTitleChromeCyc < 400_000UL)
+            return;
+
+        if (sys.Gs.ImageBytesWritten >= 64_000)
+        {
+            _titleChromeFed = true;
+            return;
+        }
+
+        bool blackLogoClear = sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 16;
+        bool mostlyBlack = false;
+        try { mostlyBlack = sys.Gs.IsPresentMostlyBlack(); } catch { /* ignore */ }
+        if (!blackLogoClear && !mostlyBlack && sys.Gs.ImageBytesWritten > 0)
+            return;
+        if (sys.Gs.PixelsWritten < 1_000 && _titleAssetBytes == 0 && cyc < 40_000_000UL)
+            return;
+
+        if (!_titleAssetsStreamed || _titleAssetBytes == 0)
+            MaybeStreamSotcTitleAssets(sys, cyc);
+
+        _lastTitleChromeCyc = cyc;
+        _titleChromeAttempts++;
+
+        long before = sys.Gs.ImageBytesWritten;
+        int total = 0;
+
+        // Prefer streamed MANAGER.XFF (xff2 container; non-zero CT32 residual).
+        if (_titleAssetBytes > 0)
+        {
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, SotcManagerDest,
+                SotcManagerMax, dbp64: 0x0000, dbwPx: 256);
+            total += n;
+        }
+        // NICO.DAT head — stage table + binary payload.
+        if (total < 32_000)
+        {
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, SotcNicoDest,
+                SotcNicoMax, dbp64: total > 0 ? 0x1000 : 0x0000, dbwPx: 256);
+            total += n;
+        }
+        // Live KERNEL.XFF already in RDRAM from FILEIO-2200 (no re-stream).
+        if (total < 16_000 && SotcKernelLooksResident(sys.Memory))
+        {
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, SotcKernelLiveBase,
+                SotcKernelLiveMax, dbp64: total > 0 ? 0x2000 : 0x0000, dbwPx: 256);
+            total += n;
+        }
+
+        _titleChromeBytes = total;
+        if (total > 0 || sys.Gs.ImageBytesWritten > before)
+        {
+            _titleChromeFed = true;
+            try
+            {
+                ulong tex0 = 0ul
+                    | (4ul << 14)   // TBW = 4 (256px)
+                    | (0ul << 20)   // PSM CT32
+                    | (8ul << 26)   // TW=8
+                    | (8ul << 30);  // TH=8
+                sys.Gs.WriteGsRegister(0x06, tex0);
+            }
+            catch { /* ignore */ }
+            try { sys.Gs.ForceRefreshPresentComposite(); }
+            catch { /* ignore */ }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
+            && (_titleChromeAttempts <= 3 || total > 0))
+            Console.Error.WriteLine(
+                $"[TEAMICO-SOTC] MENU-SOTC-2 Host->Local chrome attempt={_titleChromeAttempts} "
+                + $"fed={total} imgBytes={sys.Gs.ImageBytesWritten} px={sys.Gs.PixelsWritten} "
+                + $"assets={_titleAssetBytes} cyc={cyc}");
+    }
+
+    /// <summary>
+    /// MENU-HAVEN-3: stream honest <c>DATA\BIN\SYSTEM.RW3</c> (+ CUBE.BIN head) into high
+    /// RDRAM for Host→Local residual. Idempotent; only after NUSOUND/DLL path is live.
+    /// </summary>
+    private void MaybeStreamHavenTitleAssets(Ps2System sys, ulong cyc)
+    {
+        if (_titleAssetsStreamed) return;
+        if (sys.Gs.PixelsWritten < 1_000 && cyc < 90_000_000UL) return;
+
+        int total = 0;
+        total += StreamDiscToEe(sys,
+            new[]
+            {
+                @"cdrom0:\DATA\BIN\SYSTEM.RW3;1",
+                @"cdrom0:\DATA\BIN\SYSTEM.RW3",
+                @"cdrom0:\SYSTEM.RW3;1",
+            },
+            HavenSysRw3Dest, HavenSysRw3Max);
+
+        total += StreamDiscToEe(sys,
+            new[]
+            {
+                @"cdrom0:\DATA\BIN\CUBE.BIN;1",
+                @"cdrom0:\DATA\BIN\CUBE.BIN",
+                @"cdrom0:\CUBE.BIN;1",
+            },
+            HavenCubeBinDest, HavenCubeBinMax);
+
+        _titleAssetBytes = total;
+        _titleAssetsStreamed = total > 0 || cyc >= 95_000_000UL;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1")
+            Console.Error.WriteLine(
+                $"[TEAMICO-HAVEN] title assets streamed bytes={total} "
+                + $"sys@0x{HavenSysRw3Dest:X8} cube@0x{HavenCubeBinDest:X8} cyc={cyc}");
+    }
+
+    private static int StreamDiscToEe(Ps2System sys, string[] paths, uint dest, int maxBytes)
+    {
+        if (maxBytes < 256 || dest + (uint)maxBytes > (uint)SystemMemory.RDRAM_SIZE)
+            return 0;
+        int fd = -1;
+        foreach (string p in paths)
+        {
+            try { fd = sys.IopModules.FileOpen(p, 1); }
+            catch { fd = -1; }
+            if (fd >= 0) break;
+        }
+        if (fd < 0) return 0;
+
+        uint sz = 0;
+        try { sys.IopModules.TryGetOpenFileSize(fd, out sz); } catch { /* ignore */ }
+        int want = maxBytes;
+        if (sz > 0) want = (int)Math.Min((uint)maxBytes, sz);
+        int got = 0;
+        try
+        {
+            int n = sys.IopModules.FileRead(sys.Memory, fd, dest, (uint)want);
+            got = n > 0 ? n : 0;
+        }
+        catch { got = 0; }
+        try { sys.IopModules.FileClose(fd); } catch { /* ignore */ }
+
+        if (got > 0)
+        {
+            try { sys.Cdvd.NoteHostReadSectors(Math.Max(1, (got + 2047) / 2048)); }
+            catch { /* ignore */ }
+        }
+        return got;
+    }
+
+    /// <summary>
+    /// MENU-HAVEN-3: black full-FB logo clear (px≈286720 lit=0 imgBytes=0) — feed honest
+    /// SYSTEM.RW3 / CUBE.BIN already-streamed bytes Host→Local so Soft-GS composite can light
+    /// (BO2 MAINMENU / Whip firstscreen class).
+    /// </summary>
+    private void TryFeedHavenTitleChromeHostToLocal(Ps2System sys, ulong cyc)
+    {
+        if (_titleChromeFed) return;
+        if (_titleChromeAttempts >= 12) return;
+        if (_lastTitleChromeCyc != 0 && cyc - _lastTitleChromeCyc < 400_000UL)
+            return;
+
+        if (sys.Gs.ImageBytesWritten >= 64_000)
+        {
+            _titleChromeFed = true;
+            return;
+        }
+
+        bool blackLogoClear = sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 8;
+        bool mostlyBlack = false;
+        try { mostlyBlack = sys.Gs.IsPresentMostlyBlack(); } catch { /* ignore */ }
+        if (!blackLogoClear && !mostlyBlack && sys.Gs.ImageBytesWritten > 0)
+            return;
+        // Need at least logo clear or late cycle budget + streamed assets.
+        if (sys.Gs.PixelsWritten < 1_000 && _titleAssetBytes == 0)
+            return;
+
+        if (!_titleAssetsStreamed || _titleAssetBytes == 0)
+            MaybeStreamHavenTitleAssets(sys, cyc);
+        if (_titleAssetBytes < 256)
+            return;
+
+        _lastTitleChromeCyc = cyc;
+        _titleChromeAttempts++;
+
+        long before = sys.Gs.ImageBytesWritten;
+        int total = 0;
+
+        if (_titleAssetBytes > 0)
+        {
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, HavenSysRw3Dest,
+                Math.Min(HavenSysRw3Max, _titleAssetBytes),
+                dbp64: 0x0000, dbwPx: 256);
+            total += n;
+        }
+        if (total < 16_000)
+        {
+            int n = HostToLocalPayloadBulk(sys.Gs, sys.Memory, HavenCubeBinDest,
+                HavenCubeBinMax, dbp64: total > 0 ? 0x1000 : 0x0000, dbwPx: 256);
+            total += n;
+        }
+
+        _titleChromeBytes = total;
+        if (total > 0 || sys.Gs.ImageBytesWritten > before)
+        {
+            _titleChromeFed = true;
+            try
+            {
+                ulong tex0 = 0ul
+                    | (4ul << 14)   // TBW = 4 (256px)
+                    | (0ul << 20)   // PSM CT32
+                    | (8ul << 26)   // TW=8
+                    | (8ul << 30);  // TH=8
+                sys.Gs.WriteGsRegister(0x06, tex0);
+            }
+            catch { /* ignore */ }
+            try { sys.Gs.ForceRefreshPresentComposite(); }
+            catch { /* ignore */ }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_TEAMICO") == "1"
+            && (_titleChromeAttempts <= 3 || total > 0))
+            Console.Error.WriteLine(
+                $"[TEAMICO-HAVEN] MENU-HAVEN-3 Host->Local chrome attempt={_titleChromeAttempts} "
+                + $"fed={total} imgBytes={sys.Gs.ImageBytesWritten} px={sys.Gs.PixelsWritten} "
+                + $"assets={_titleAssetBytes} cyc={cyc}");
+    }
+
+    /// <summary>
+    /// Skip leading zero / pad slabs and BITBLT Host→Local bulk into local GS.
+    /// Returns bytes accepted by Soft-GS IMAGE path (delta ImageBytesWritten).
+    /// </summary>
+    private static int HostToLocalPayloadBulk(Gs gs, SystemMemory mem, uint baseAddr,
+        int maxBytes, int dbp64, int dbwPx)
+    {
+        if (gs == null || mem == null || maxBytes < 256) return 0;
+        if (baseAddr + 256 > SystemMemory.RDRAM_SIZE) return 0;
+
+        uint w0 = mem.Read32(baseAddr);
+        uint w1 = mem.Read32(baseAddr + 4);
+        if (w0 == 0 && w1 == 0)
+        {
+            int found = -1;
+            int scan = Math.Min(maxBytes, 4096);
+            for (int off = 0; off + 8 <= scan; off += 16)
+            {
+                if (mem.Read32(baseAddr + (uint)off) != 0
+                    || mem.Read32(baseAddr + (uint)off + 4) != 0)
+                {
+                    found = off;
+                    break;
+                }
+            }
+            if (found < 0) return 0;
+            baseAddr += (uint)found;
+            maxBytes -= found;
+        }
+
+        // SYSTEM.RW3 live head is 01 00 01 00 FE FE… — skip small structured header.
+        int headerSkip = 0;
+        if ((w0 & 0xFFFF) == 0x0001 || (w0 & 0xFF) == 0x01)
+        {
+            for (int off = 0x10; off < 0x100 && off < maxBytes; off += 0x10)
+            {
+                uint word = mem.Read32(baseAddr + (uint)off);
+                // Prefer first non-pad / non-0xFEFE slab as payload start.
+                if (word != 0 && word != 0xFEFEFEFEu && word != 0xFFFFFFFFu)
+                {
+                    headerSkip = off;
+                    break;
+                }
+            }
+            if (headerSkip < 0x10) headerSkip = 0x20;
+        }
+
+        int zeros = 0;
+        for (int i = headerSkip; i < headerSkip + 0x100 && i < maxBytes; i++)
+        {
+            if (mem.Read8(baseAddr + (uint)i) == 0) zeros++;
+            else break;
+        }
+        if (zeros >= 0x10)
+            headerSkip += zeros;
+
+        int avail = maxBytes - headerSkip;
+        if (avail < 256) return 0;
+
+        int texW = Math.Clamp(dbwPx, 64, 512);
+        const int bpp = 4;
+        int maxH = Math.Min(512, avail / (texW * bpp));
+        if (maxH < 1) return 0;
+        int texH = maxH;
+        int use = Math.Min(avail, texW * texH * bpp);
+        use &= ~3;
+        if (use < 256) return 0;
+
+        return HostToLocalFromMem(gs, mem, baseAddr + (uint)headerSkip, use,
+            dbp64: dbp64, dbwPx: texW, dpsm: 0x00, w: texW, h: texH);
+    }
+
+    /// <summary>
+    /// Program Soft-GS BITBLT Host→Local (TRXDIR=0) and stream RDRAM bytes — same path as
+    /// GIF FLG=2 IMAGE (BO2 / Whip / Dec residual).
+    /// </summary>
+    private static int HostToLocalFromMem(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (gs == null || mem == null || byteCount <= 0 || w <= 0 || h <= 0) return 0;
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        int maxByGeom = w * h * bpp;
+        int n = Math.Min(byteCount, maxByGeom);
+        if (n <= 0) return 0;
+        if (src + (uint)n > SystemMemory.RDRAM_SIZE) return 0;
+
+        int dbwUnits = Math.Max(1, (dbwPx + 63) / 64);
+        ulong bitblt = ((ulong)(dbp64 & 0x3FFF) << 32)
+                     | ((ulong)(dbwUnits & 0x3F) << 48)
+                     | ((ulong)(dpsm & 0x3F) << 56);
+        gs.WriteGsRegister(0x50, bitblt); // BITBLTBUF
+        gs.WriteGsRegister(0x51, 0);      // TRXPOS
+        gs.WriteGsRegister(0x52, (ulong)((uint)w & 0xFFFu) | (((ulong)((uint)h & 0xFFFu)) << 32));
+        gs.WriteGsRegister(0x53, 0);      // TRXDIR Host→Local
+
+        long before = gs.ImageBytesWritten;
+        Span<byte> qw = stackalloc byte[16];
+        int off = 0;
+        while (off < n)
+        {
+            int chunk = Math.Min(16, n - off);
+            for (int i = 0; i < 16; i++)
+                qw[i] = i < chunk ? mem.Read8(src + (uint)(off + i)) : (byte)0;
+            gs.WriteImageData(qw, 0);
+            off += chunk;
+            if (gs.ImageBytesWritten - before >= n) break;
+        }
+        int got = (int)Math.Min(int.MaxValue, gs.ImageBytesWritten - before);
+        return got > 0 ? got : 0;
     }
 }

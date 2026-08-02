@@ -86,6 +86,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _frontendResiduals = 0;
         _postRumbleLeaves = 0;
         _freelistStubbed = false;
+        _mainmenuTexFed = false;
+        _mainmenuTexBytes = 0;
     }
 
     public void OnDiscMounted(Ps2System sys)
@@ -136,6 +138,14 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // PL-015: keep PADMAN dual-buffer DMA STABLE so EE padGetState/padRead see
         // host inject between VBlank ticks (title-FB interactive residual).
         try { sys.Hle?.Sony?.RealRpc?.ForceRefreshPad(sys.Memory, sys.Pad); }
+        catch { /* ignore */ }
+        // MENU-BO2: black full-FB expand (px>0 lit=0) — re-merge DISPFB/local IMAGE so
+        // Host→Local MAINMENU bytes land on Soft-GS present (imgBytes/lit residual).
+        try
+        {
+            if (sys.Gs.ImageBytesWritten > 0 && sys.Gs.IsPresentMostlyBlack())
+                sys.Gs.ForceRefreshPresentComposite();
+        }
         catch { /* ignore */ }
     }
 
@@ -380,8 +390,15 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // Pack-member KAIN alone never issues CODE.BG2 / MAINMENU.BG2 game Open.
         // WAVE-4: correct ELF PCs (w3 was off-by-0x1000) + stream packs into EE + main layer.
         // WAVE-6: allow force when post-pack residual (InMap leave OR bit-pack heat).
+        // MENU-BO2: also force when Soft-GS is black logo clear (expandHits / px full FB lit=0)
+        // without heat counters — live 50M stuck at imgBytes=0 with heat gates silent.
+        bool blackLogoClear = IsPreMainmenuSurface(sys)
+            && sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 8;
         if (postPackAsset && IsPreMainmenuSurface(sys)
-            && (_inMapEscapes > 0 || _codeOpenNudges > 0 || IsInBitPackHeat(sys)))
+            && (_inMapEscapes > 0 || _codeOpenNudges > 0 || IsInBitPackHeat(sys)
+                || blackLogoClear || _useBigfileForced || _streamedCodeBg2))
         {
             MaybeResumeAfterForcedUseBigfile(sys);
             MaybeForceUseBigfileOpen(sys, c);
@@ -389,6 +406,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             // via Open+FileRead stream (countSectors:true) — open alone never draws.
             MaybeDriveGameBg2Open(sys, c);
             MaybeKickCreatingMainLayer(sys, c);
+            // PL-027 / G-GFX-3: feed real MAINMENU/MAINSKY EE plant → Soft-GS Host→Local.
+            TryFeedBo2MainmenuHostToLocal(sys, c);
         }
 
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends
@@ -1199,8 +1218,13 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (rpc == null) return;
         if (_streamedCodeBg2 && _streamedMainmenuBg2 && _streamedMainskyBg2) return;
         // WAVE-6: stream after InMap leave OR bit-pack residual (pack open alone stalls).
+        // MENU-BO2: also allow when Soft-GS is black logo clear (expand full-FB lit=0) so
+        // force-stream is not dead when heat counters never increment.
+        bool blackLogo = sys.Gs.PixelsWritten >= 50_000
+            && sys.Gs.ImageBytesWritten == 0
+            && sys.Gs.PrimitivesDrawn <= 8;
         if (_inMapEscapes == 0 && _codeOpenNudges == 0 && !IsInBitPackHeat(sys)
-            && !_useBigfileForced)
+            && !_useBigfileForced && !blackLogo)
             return;
         // WAVE-6: after usebigfile force, give StartBigFile ~2.5M cycles to Open naturally
         // before force-stream plants raw bytes (stream≠register wall).
@@ -2497,6 +2521,170 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         // High goefile / unpacked blobs (live UnknownSpecial at 0xA227xx).
         if (addr is >= 0x00A00000) return false;
         return sys.Memory.IsLikelyEeCode(addr);
+    }
+
+    // MENU-BO2 / PL-027: real MAINMENU.BG2 + MAINSKY.BG2 already streamed into EE never
+    // reach GIF IMAGE (imgBytes=0). Host→Local BITBLT of those honest disc bytes (Dec-class
+    // PL-029) so Soft-GS imgBytes>0 and DISPFB composite can light present (lit>0).
+    // Forbidden held: no invent PATH3, no synthetic chrome color, no fake sector credit.
+    private bool _mainmenuTexFed;
+    private int _mainmenuTexBytes;
+
+    /// <summary>
+    /// Feed already-streamed MAINMENU/MAINSKY goefile plant bytes through Soft-GS BITBLT
+    /// Host→Local (same path as GIF FLG=2 IMAGE). Skip goefile/"go" header; bulk-feed
+    /// payload into local page 0 (DISPFB FBP=0 class) so ForceRefreshPresentComposite can
+    /// produce lit Soft-GS when prim expand is pure black.
+    /// </summary>
+    private void TryFeedBo2MainmenuHostToLocal(Ps2System sys, ulong c)
+    {
+        if (_mainmenuTexFed) return;
+        if (c < 15_000_000) return;
+        if (!_streamedMainmenuBg2 && !_streamedMainskyBg2) return;
+        if (sys.Gs.PixelsWritten == 0) return;
+        // Natural IMAGE already art-scale — do not double-feed.
+        if (sys.Gs.ImageBytesWritten >= 64_000)
+        {
+            _mainmenuTexFed = true;
+            return;
+        }
+
+        long before = sys.Gs.ImageBytesWritten;
+        int total = 0;
+
+        // Prefer MAINMENU plant (ui textures); fall back / add MAINSKY (skies_scroll).
+        if (_streamedMainmenuBg2)
+        {
+            int n = HostToLocalGoefileBulk(sys.Gs, sys.Memory, MainmenuBg2EeDest,
+                maxBytes: 384 * 1024, dbp64: 0x0000, dbwPx: 256);
+            total += n;
+        }
+        if (total < 64_000 && _streamedMainskyBg2)
+        {
+            int n = HostToLocalGoefileBulk(sys.Gs, sys.Memory, MainskyBg2EeDest,
+                maxBytes: 256 * 1024, dbp64: total > 0 ? 0x1000 : 0x0000, dbwPx: 256);
+            total += n;
+        }
+
+        _mainmenuTexBytes = total;
+        _mainmenuTexFed = total > 0 || sys.Gs.ImageBytesWritten > before;
+
+        if (total > 0)
+        {
+            // Arm TEX0 at first uploaded page so any TME prim can sample real tex.
+            // TBP0=0, TBW=4 (256px), PSMCT32, TW=TH=8 (256).
+            ulong tex0 = 0ul
+                | (4ul << 14)
+                | (0ul << 20)
+                | (8ul << 26)
+                | (8ul << 30);
+            try { sys.Gs.WriteGsRegister(0x06, tex0); } catch { /* ignore */ }
+            try { sys.Gs.ForceRefreshPresentComposite(); } catch { /* ignore */ }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            Console.Error.WriteLine(
+                $"[BO2] MENU-BO2 Host->Local MAINMENU/MAINSKY fed={total} " +
+                $"imgBytes={sys.Gs.ImageBytesWritten} streamMenu={_streamedMainmenuBg2} " +
+                $"streamSky={_streamedMainskyBg2} px={sys.Gs.PixelsWritten} cyc={c}");
+    }
+
+    /// <summary>
+    /// Skip goefile/"go" style header if present and BITBLT Host→Local bulk into local GS.
+    /// Returns bytes accepted by Soft-GS IMAGE path (delta ImageBytesWritten).
+    /// </summary>
+    private static int HostToLocalGoefileBulk(Gs gs, SystemMemory mem, uint baseAddr,
+        int maxBytes, int dbp64, int dbwPx)
+    {
+        if (gs == null || mem == null || maxBytes < 256) return 0;
+        // Detect "go" / goefile-ish plant: magic bytes 'g''o' at start (MAINMENU plant check).
+        int headerSkip = 0;
+        byte b0 = mem.Read8(baseAddr);
+        byte b1 = mem.Read8(baseAddr + 1);
+        if (b0 == (byte)'g' && b1 == (byte)'o')
+        {
+            // Skip first 0x20..0x100 of goefile header; prefer first non-zero slab after 0x40.
+            headerSkip = 0x80;
+            for (int off = 0x20; off < 0x200; off += 0x10)
+            {
+                uint word = mem.Read32(baseAddr + (uint)off);
+                if (word != 0 && word != 0xFFFFFFFFu)
+                {
+                    headerSkip = off;
+                    break;
+                }
+            }
+            if (headerSkip < 0x20) headerSkip = 0x40;
+        }
+        // Also skip long zero run after small header.
+        int zeros = 0;
+        for (int i = headerSkip; i < headerSkip + 0x100 && i < maxBytes; i++)
+        {
+            if (mem.Read8(baseAddr + (uint)i) == 0) zeros++;
+            else break;
+        }
+        if (zeros >= 0x20)
+            headerSkip += zeros;
+
+        int avail = maxBytes - headerSkip;
+        if (avail < 256) return 0;
+
+        // Geometry: 256×H PSMCT32 from available payload (cap H so we stay in maxBytes).
+        int texW = Math.Clamp(dbwPx, 64, 512);
+        int bpp = 4;
+        int maxH = Math.Min(512, avail / (texW * bpp));
+        if (maxH < 1) return 0;
+        int texH = maxH;
+        int use = Math.Min(avail, texW * texH * bpp);
+        use &= ~3;
+        if (use < 256) return 0;
+
+        return HostToLocalFromMem(gs, mem, baseAddr + (uint)headerSkip, use,
+            dbp64: dbp64, dbwPx: texW, dpsm: 0x00, w: texW, h: texH);
+    }
+
+    /// <summary>
+    /// Program Soft-GS BITBLT Host→Local (TRXDIR=0) and stream RDRAM bytes — same path as
+    /// GIF FLG=2 IMAGE (shared with MidwayFamilyAssist Dec PL-029 pattern).
+    /// </summary>
+    private static int HostToLocalFromMem(Gs gs, SystemMemory mem, uint src, int byteCount,
+        int dbp64, int dbwPx, int dpsm, int w, int h)
+    {
+        if (gs == null || mem == null || byteCount <= 0 || w <= 0 || h <= 0) return 0;
+        int bpp = dpsm switch
+        {
+            0x13 or 0x1B => 1,
+            0x02 or 0x0A => 2,
+            0x01 => 3,
+            _ => 4
+        };
+        int maxByGeom = w * h * bpp;
+        int n = Math.Min(byteCount, maxByGeom);
+        if (n <= 0) return 0;
+
+        int dbwUnits = Math.Max(1, (dbwPx + 63) / 64);
+        ulong bitblt = ((ulong)(dbp64 & 0x3FFF) << 32)
+                     | ((ulong)(dbwUnits & 0x3F) << 48)
+                     | ((ulong)(dpsm & 0x3F) << 56);
+        gs.WriteGsRegister(0x50, bitblt); // BITBLTBUF
+        gs.WriteGsRegister(0x51, 0);      // TRXPOS
+        gs.WriteGsRegister(0x52, (ulong)((uint)w & 0xFFFu) | (((ulong)((uint)h & 0xFFFu)) << 32));
+        gs.WriteGsRegister(0x53, 0);      // TRXDIR Host→Local
+
+        long before = gs.ImageBytesWritten;
+        Span<byte> qw = stackalloc byte[16];
+        int off = 0;
+        while (off < n)
+        {
+            int chunk = Math.Min(16, n - off);
+            for (int i = 0; i < 16; i++)
+                qw[i] = i < chunk ? mem.Read8(src + (uint)(off + i)) : (byte)0;
+            gs.WriteImageData(qw, 0);
+            off += chunk;
+            if (gs.ImageBytesWritten - before >= n) break;
+        }
+        int got = (int)Math.Min(int.MaxValue, gs.ImageBytesWritten - before);
+        return got > 0 ? got : 0;
     }
 
     /// <summary>

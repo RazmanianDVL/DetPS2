@@ -331,6 +331,7 @@ T0 always keeps **three** subagents on graphics (see parent seat map):
 | Doc | Role |
 |-----|------|
 | [POST_MENU_PHASE_PLAN.md](POST_MENU_PHASE_PLAN.md) | 10-seat orchestration |
+| [HOST_STACK_PHASE_PLAN.md](HOST_STACK_PHASE_PLAN.md) | Host GPU present (Vulkan/D3D11/D3D12), library UI, controllers — **display only**; Soft-GS remains claim truth |
 | Play! `GSHandler` / GIF | Oracle |
 | [FLOAT_POLICY.md](../FLOAT_POLICY.md) | Deterministic float |
 | ROADMAP Phase 7 | Historical Soft-GS baseline |

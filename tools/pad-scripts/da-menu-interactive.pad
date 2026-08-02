@@ -1,0 +1,52 @@
+# DetPS2 pad-script — MK Deadly Alliance (SLUS_204.23) INTERACTIVE / free-ride menu probe
+# Soft-GS Path2 Midway surface lands ~15–30M (MENU-DA-2: gifP2≥2 prims>0).
+# START/CROSS denser 40–100M after free-ride reenter (MENU-DA-3 DI/EI→menu band).
+# Usage:
+#   detps2 pad-inject user-media-da.json --cycles=100000000 --host-present --pad-script=tools/pad-scripts/da-menu-interactive.pad
+#   detps2 blocker-trace user-media-da.json --cycles=100000000 --host-present --pad-script=tools/pad-scripts/da-menu-interactive.pad
+#
+# HOLD defaults to 50000 cycles when omitted.
+
+# Warm-up after wait-ready leave / Path2 logo spine
+@16000000 Down 80000
+@18000000 Cross 100000
+@20000000 Start 100000
+@22000000 Cross 100000
+@25000000 Up 80000
+@28000000 Cross 120000
+@30000000 Start 120000
+@32000000 Cross 120000
+
+# Free-ride / INTERACTIVE window 40–100M: START/CROSS accept + selection crawl
+@40000000 Start 150000
+@42000000 Cross 150000
+@44000000 Down 100000
+@46000000 Cross 150000
+@48000000 Start 150000
+@50000000 Cross 200000
+@55000000 Down 100000
+@58000000 Cross 150000
+@60000000 Start 150000
+@65000000 Cross 200000
+@70000000 Up 100000
+@72000000 Cross 150000
+@75000000 Start 200000
+@80000000 Cross 200000
+@85000000 Down 100000
+@88000000 Start 150000
+@90000000 Cross 200000
+@95000000 Down 100000
+@98000000 Start 150000
+@100000000 Cross 200000
+
+# Extend through 150M claim budgets
+@105000000 Down 100000
+@110000000 Start 200000
+@115000000 Cross 200000
+@120000000 Up 100000
+@125000000 Cross 200000
+@130000000 Start 200000
+@135000000 Cross 200000
+@140000000 Down 100000
+@145000000 Start 200000
+@148000000 Cross 250000

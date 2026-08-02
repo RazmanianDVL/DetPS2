@@ -122,6 +122,20 @@ public sealed class EmotionEngine : ISchedulable
     /// explaining why the register was bad in the first place.</summary>
     public static readonly bool TraceJrGuard = Environment.GetEnvironmentVariable("DETPS2_TRACE_JRGUARD") == "1";
 
+    // Cached once at type init — Step() used to call Environment.GetEnvironmentVariable on
+    // every instruction for these (even when the PC match later failed). Desktop RunFor burns
+    // millions of instr/s; process-env lookups on the hot path are pure overhead when unset.
+    public static readonly bool TraceStallClear = Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1";
+    public static readonly bool SemaStallYield = Environment.GetEnvironmentVariable("DETPS2_SEMA_STALL_YIELD") == "1";
+    public static readonly bool TraceIrqLoop = Environment.GetEnvironmentVariable("DETPS2_TRACE_IRQLOOP") == "1";
+    public static readonly bool TraceMsgBuf = Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1";
+    public static readonly bool TraceExit = Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1";
+    public static readonly bool TraceBios = Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1";
+    public static readonly bool TraceNestedExc = Environment.GetEnvironmentVariable("DETPS2_TRACE_NESTED_EXC") == "1";
+    public static readonly bool TraceIntcDispatch = Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1";
+    public static readonly bool TraceJrExit = Environment.GetEnvironmentVariable("DETPS2_TRACE_JREXIT") == "1";
+    public static readonly bool TraceCop0Status = Environment.GetEnvironmentVariable("DETPS2_TRACE_COP0STATUS") == "1";
+
     /// <summary>MMI "pipeline 1" HI/LO — real R5900 HI/LO are 128-bit registers; regular
     /// MULT/DIV/MADD use the lower 64 bits (HI/LO above), MULT1/DIV1/MADD1/MFHI1/MTHI1/
     /// MFLO1/MTLO1 use this independent upper-64-bit lane.</summary>
@@ -440,7 +454,7 @@ public sealed class EmotionEngine : ISchedulable
                 COP0_Cause &= ~(1u << 15); // clear timer IP on compare write
                 break;
             case Cop0Status:
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_COP0STATUS") == "1" && value != COP0_Status)
+                if (TraceCop0Status && value != COP0_Status)
                     Console.Error.WriteLine($"[COP0STATUS] pc=0x{PC:X8} old=0x{COP0_Status:X8} new=0x{value:X8} cyc={CurrentCycle()}");
                 COP0_Status = value;
                 break;
@@ -570,7 +584,7 @@ public sealed class EmotionEngine : ISchedulable
                 if (_hle != null && _hle.Kernel.SwitchToNext(this))
                 {
                     _pendingThreadStall = false;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                    if (TraceStallClear)
                         Console.Error.WriteLine($"[STALLCLEAR] cyc={CurrentCycle()} newPc=0x{PC:X8} tid={_hle.Kernel.CurrentThreadId}");
                 }
                 executed++;
@@ -592,7 +606,7 @@ public sealed class EmotionEngine : ISchedulable
                 if (stalledThread == null || !stalledThread.Sleeping)
                 {
                     _pendingSemaStall = false;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                    if (TraceStallClear)
                         Console.Error.WriteLine($"[STALLCLEAR-SEMA] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle?.Kernel.CurrentThreadId}");
                 }
                 else if (stalledThread.WaitSemaId > 0
@@ -609,19 +623,19 @@ public sealed class EmotionEngine : ISchedulable
                         try { _hle.Kernel.SignalSema(stalledThread.WaitSemaId); }
                         catch { /* ignore */ }
                     }
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                    if (TraceStallClear)
                         Console.Error.WriteLine(
                             $"[STALLCLEAR-SEMA-EMPTYQ] cyc={CurrentCycle()} pc=0x{PC:X8} " +
                             $"tid={_hle.Kernel.CurrentThreadId} sema=0x{stalledThread.WaitSemaId:X}");
                 }
-                else if (Environment.GetEnvironmentVariable("DETPS2_SEMA_STALL_YIELD") == "1"
+                else if (SemaStallYield
                          && _hle != null && _hle.Kernel.TryYieldToOtherRunnable(this))
                 {
                     // Opt-in only. Yielding out of a WaitSema stall when another thread is
                     // runnable kills MK Shaolin Monks WAD (cdvdSectors collapses 198k→1).
                     // GoW DualInfo works with pure stall + PollSema-id; leave yield off by default.
                     _pendingSemaStall = false;
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STALLCLEAR") == "1")
+                    if (TraceStallClear)
                         Console.Error.WriteLine($"[STALLCLEAR-SEMA-YIELD] cyc={CurrentCycle()} pc=0x{PC:X8} tid={_hle.Kernel.CurrentThreadId}");
                 }
                 else
@@ -653,7 +667,7 @@ public sealed class EmotionEngine : ISchedulable
             // Exception vectoring for external / compare IRQs
             if (_takeExceptions && InterruptPending)
             {
-                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IRQLOOP") == "1")
+                if (TraceIrqLoop)
                 {
                     _irqLoopStreak++;
                     if (_irqLoopStreak % 1000 == 1)
@@ -702,7 +716,7 @@ public sealed class EmotionEngine : ISchedulable
             // Diagnostic-only (DETPS2_TRACE_MSGBUF, temporary): read the formatted error-message
             // string just before it's NUL-terminated at Shaolin Monks' fatal-exit call site
             // (0x004767F0: sb zero,0(v1)), to identify what assertion is actually failing there.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x004767F0)
+            if (TraceMsgBuf && (PC & 0x1FFFFFFF) == 0x004767F0)
             {
                 ulong bufAddr = GetGpr(3).Lo; // v1
                 var sb = new System.Text.StringBuilder();
@@ -714,7 +728,7 @@ public sealed class EmotionEngine : ISchedulable
                 }
                 Console.Error.WriteLine($"[MSGBUF] v1=0x{bufAddr:X8} cyc={CurrentCycle()} msg=\"{sb}\"");
             }
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x004767B8)
+            if (TraceMsgBuf && (PC & 0x1FFFFFFF) == 0x004767B8)
             {
                 ulong a1v = GetGpr(5).Lo;
                 var fsb = new System.Text.StringBuilder();
@@ -733,7 +747,7 @@ public sealed class EmotionEngine : ISchedulable
             // arguments, reading a1 as text where it looks plausible — the format string itself
             // should reveal what assertion/message the game is actually building, without needing
             // to fully resolve the formatter's own internal NULL-deref mechanics.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_MSGBUF") == "1" && (PC & 0x1FFFFFFF) == 0x00475BA8)
+            if (TraceMsgBuf && (PC & 0x1FFFFFFF) == 0x00475BA8)
             {
                 ulong a0 = GetGpr(4).Lo, a1 = GetGpr(5).Lo, a2 = GetGpr(6).Lo, ra = GetGpr(31).Lo;
                 var sb = new System.Text.StringBuilder();
@@ -753,7 +767,7 @@ public sealed class EmotionEngine : ISchedulable
             // that's the return address the wrapper's own internal jal sets right before the
             // syscall fires — it can never identify who called the wrapper itself. Capturing ra
             // here, before it's overwritten, is the only way to find the real caller.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00476808)
+            if (TraceExit && (PC & 0x1FFFFFFF) == 0x00476808)
                 Console.Error.WriteLine($"[ABORT-CALLER] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
 
             // Diagnostic-only (DETPS2_TRACE_EXIT, temporary): found via Ghidra's own reference
@@ -770,9 +784,9 @@ public sealed class EmotionEngine : ISchedulable
             // 0x00476808 itself, THESE two functions are reached via genuine `jal`s (confirmed via
             // Ghidra's reference manager, not just byte-pattern scanword matching) from 14-22
             // distinct call sites each -- logging $ra here is the only way to find out which one.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00201108)
+            if (TraceExit && (PC & 0x1FFFFFFF) == 0x00201108)
                 Console.Error.WriteLine($"[PANIC-DISPATCH-A] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00202E40)
+            if (TraceExit && (PC & 0x1FFFFFFF) == 0x00202E40)
                 Console.Error.WriteLine($"[PANIC-DISPATCH-B] ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} cyc={CurrentCycle()}");
             // Re-check (2026-07-27, after this session's other EE fixes changed the execution
             // path leading up to the same crash cycle): does the one confirmed tail-jump (j, not
@@ -780,9 +794,9 @@ public sealed class EmotionEngine : ISchedulable
             // earlier this investigation, inside the lookup-or-die function at 0x00204430, fire
             // now? Log entry to the function itself (0x00204430) and the exact tail-jump
             // instruction (0x0020448C) separately.
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x00204430)
+            if (TraceExit && (PC & 0x1FFFFFFF) == 0x00204430)
                 Console.Error.WriteLine($"[LOOKUP-ENTRY] a0=0x{GetGpr(4).Lo:X8} ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_EXIT") == "1" && (PC & 0x1FFFFFFF) == 0x0020448C)
+            if (TraceExit && (PC & 0x1FFFFFFF) == 0x0020448C)
                 Console.Error.WriteLine($"[LOOKUP-TAILJUMP] ra=0x{GetGpr(31).Lo:X8} cyc={CurrentCycle()}");
 
             // Shaolin Monks: guard a NULL-buffer dereference inside the vsnprintf-style
@@ -857,7 +871,10 @@ public sealed class EmotionEngine : ISchedulable
                     // thread scheduler, not by open-bus re-home.
                     if (resumePc == 0 && _memory.Read32(0x00212F70) == 0x27BDFEE0)
                         resumePc = 0x00212F70UL;
-                    if (resumePc == 0 && _memory.IsLikelyEeCode(0x0011C200UL))
+                    // 0x11C200 is Midway CRT0 SetupThread on some titles — but on Vexx it is a
+                    // pure C++ vtable thunk (lw t9,0x28(a0); lw t9,slot(t9); jr t9). Re-homing
+                    // there after null-jr freezes Soft-GS (PL-032p). Only use when NOT a thunk.
+                    if (resumePc == 0 && IsSafeOpenBusCrt0(_memory, 0x0011C200u))
                         resumePc = 0x0011C200UL;
                     if (resumePc == 0)
                         resumePc = 0x00100008UL; // ELF entry fallback
@@ -873,7 +890,7 @@ public sealed class EmotionEngine : ISchedulable
                         {
                             if (_memory.Read32(0x00212F70) == 0x27BDFEE0)
                                 resumePc = 0x00212F70UL;
-                            else if (_memory.IsLikelyEeCode(0x0011C200UL))
+                            else if (IsSafeOpenBusCrt0(_memory, 0x0011C200u))
                                 resumePc = 0x0011C200UL;
                             else
                                 resumePc = 0x00100008UL;
@@ -890,7 +907,7 @@ public sealed class EmotionEngine : ISchedulable
                     COP0_Status &= ~0x6u;
                     PC = resumePc;
                     // Rate-limit: every ~1M instr, not every 64k (stderr flood killed long runs).
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    if (TraceBios
                         && (executed & 0xFFFFF) == 0)
                         Console.Error.WriteLine(
                             $"[BIOS] EE open-bus rescue 0x{pcPhysFetch:X8} -> 0x{resumeU:X8} cyc={cyc}");
@@ -1057,16 +1074,31 @@ public sealed class EmotionEngine : ISchedulable
             resumePc = ra & 0x1FFFFFFFUL;
         if (resumePc == 0 && _memory.Read32(0x00212F70) == 0x27BDFEE0)
             resumePc = 0x00212F70UL;
-        if (resumePc == 0 && _memory.IsLikelyEeCode(0x0011C200UL))
+        if (resumePc == 0 && IsSafeOpenBusCrt0(_memory, 0x0011C200u))
             resumePc = 0x0011C200UL;
         if (resumePc == 0)
             resumePc = 0x00100008UL;
 
         COP0_Status &= ~0x6u;
         PC = resumePc;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+        if (TraceBios)
             Console.Error.WriteLine(
                 $"[BIOS] EE AdEL-data rescue 0x{pcPhys:X8} -> 0x{(uint)(resumePc & 0x1FFFFFFFUL):X8} cyc={cyc}");
+        return true;
+    }
+
+    /// <summary>
+    /// Midway CRT0 @0x11C200 is a valid open-bus re-home only when the word is NOT a
+    /// C++ vtable thunk (<c>lw t9,0x28(a0)</c> family — Vexx residual PL-032p).
+    /// </summary>
+    private static bool IsSafeOpenBusCrt0(SystemMemory mem, uint addr)
+    {
+        if (!mem.IsLikelyEeCode(addr))
+            return false;
+        uint w0 = mem.Read32(addr);
+        // lw t9, imm(a0) with rs=a0 (4), rt=t9 (25) → 0x8C99xxxx
+        if ((w0 & 0xFFFF0000u) == 0x8C990000u)
+            return false;
         return true;
     }
 
@@ -1095,7 +1127,7 @@ public sealed class EmotionEngine : ISchedulable
         // frame as nested for EPC purposes even when software cleared EXL.
         bool nested = (COP0_Status & 0x2) != 0
             || _savedGprAcrossIntcDispatch.Count > 0;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_NESTED_EXC") == "1" && nested)
+        if (TraceNestedExc && nested)
             Console.Error.WriteLine($"[NESTED-EXC] cyc={CurrentCycle()} pc=0x{PC:X8} excCode={causeExcCode} epc(unchanged)=0x{COP0_EPC:X8} eretStack={_savedGprAcrossIntcDispatch.Count}");
         if (!nested)
         {
@@ -1253,7 +1285,7 @@ public sealed class EmotionEngine : ISchedulable
                     _intc.Raise((Intc.InterruptSource)src);
             }
 
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
+            if (TraceIntcDispatch)
                 Console.Error.WriteLine($"[INTC_DISPATCH] cyc={CurrentCycle()} src={src} handler=0x{handlerAddr:X8} fromPc=0x{PC:X8} savedRa=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8} stackDepthBeforePush={_savedGprAcrossIntcDispatch.Count} a0=0x{GetGpr(4).Lo:X8} a1=0x{GetGpr(5).Lo:X8} a2=0x{GetGpr(6).Lo:X8} t0=0x{GetGpr(8).Lo:X8} t1=0x{GetGpr(9).Lo:X8} v0=0x{GetGpr(2).Lo:X8} v1=0x{GetGpr(3).Lo:X8}");
             // Snapshot interrupted GPRs BEFORE EnterException/a0 clobber. Also publish to the
             // thread's SaveFullContext so a handler that WaitSema/SwitchToNext mid-ISR cannot
@@ -1483,7 +1515,7 @@ public sealed class EmotionEngine : ISchedulable
                         int exitingTid = _hle.Kernel.CurrentThreadId;
                         _hle.Kernel.ExitCurrentThread();
                         bool switched = _hle.Kernel.SwitchToNext(this);
-                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_JREXIT") == "1")
+                        if (TraceJrExit)
                             Console.Error.WriteLine($"[JREXIT] pc=0x{PC:X8} tid={exitingTid} switched={switched} newPc=0x{(switched ? HleRedirectPc ?? 0 : 0):X8} cyc={CurrentCycle()}");
                         // If no other thread is runnable, do NOT fall through and execute whatever
                         // raw bytes happen to sit at this jr's delay slot and beyond as if they
@@ -2858,7 +2890,7 @@ public sealed class EmotionEngine : ISchedulable
         if (!erlPath && _savedGprAcrossIntcDispatch.Count > 0)
         {
             ulong[] savedGpr = _savedGprAcrossIntcDispatch.Pop();
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_INTC_DISPATCH") == "1")
+            if (TraceIntcDispatch)
                 Console.Error.WriteLine($"[ERET-POP] cyc={CurrentCycle()} poppedRa=0x{savedGpr[31]:X8} poppedV0=0x{savedGpr[2]:X8} stackDepthAfterPop={_savedGprAcrossIntcDispatch.Count} newPc=0x{PC:X8}");
             for (int i = 1; i < 32; i++) // skip $zero
                 SetGpr(i, new Gpr128 { Lo = savedGpr[i] });

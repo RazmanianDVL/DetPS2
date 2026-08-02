@@ -9,12 +9,69 @@
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-deception.json` |
 | **Assist** | `MidwayFamilyAssist` **REGION DEC** (`IsDeception`) |
-| **Seat** | **S2 MIDWAY-DEC** |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s2` |
-| **Branch** | `agent/seat-s2/s2-g2` |
+| **Seat** | **S2 MIDWAY-DEC** / residual main worktree `detps2` |
+| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` (live pad residual) |
+| **Branch** | main worktree `detps2` (historical seat: `agent/seat-s2/s2-g2`) |
 | **ROMDIR gate** | **CLOSED** |
-| **Status** | **MENU YES** hold · **P1 INTERACTIVE** (assist-stable sel-idx) · **G-GFX-3 partial** Host→Local imgBytes↑ — PL-012 + **PL-029** |
-| **Last updated** | 2026-07-31 |
+| **Status** | **MENU YES** hold · **P1 INTERACTIVE YES** (pad free-ride remeasure) · **G-GFX-3 partial** Host→Local — PL-012 + PL-029 + MENU-DEC-2 + freelist rehome |
+| **Last updated** | 2026-07-31 (MENU-DEC free-ride residual) |
+
+---
+
+## MENU-DEC free-ride residual + pad queue (2026-07-31)
+
+**Mandate:** Drain `dec-pad-100m-*` / free-ride remeasure; scrape INTERACTIVE (prim Δ, state change, pad pulses); Soft-GS truth; SEMA_OFF; no invent PATH3; queue ≤3. PC stuck `0x00115F64` was SleepThread park residual — keep-alive rehomes.
+
+### Live-queue pad jobs (SEMA_OFF, host-present)
+
+| Job | Budget | pad-script | PC | px | lit | prims | gifP2 | naturalDispfbPx | INTERACTIVE |
+|-----|-------:|------------|-----|-----|----:|------:|------:|----------------:|:-----------:|
+| **dec-pad-100m-20260731-150519** | 100M | `dec-menu-interactive.pad` (45 acts) | `0x003D9B88` freelist | **3015151** | **198959** | **146** | 16 | **231727** | **YES** proven |
+| **dec-pad-free-20260731-150927** | 100M | same (45 acts) | **`0x001237F0` main** | 1834223 | **198959** | **66** | 8 | **231727** | **YES** proven + free-ride PC |
+| dec-menu-dec2-150m-pi (prior) | 150M | pad-inject | `0x003BDEA0` freelist | 3015151 | 0 scrape | **146** | 16 | — | YES (prims>86) |
+
+**dec-pad-100m claim:** `claim: px=3015151 prims=146 … gifP3=6 imgBytes=557056 naturalDispfbPx=231727 … lit=198959/286720`  
+**dec-pad-free claim:** `claim: px=1834223 prims=66 … gifP2=8 gifP3=6 imgBytes=557056 naturalDispfbPx=231727 … lit=198959/286720`  
+**present (both):** `softgs-present: lit=198959/286720 … mostlyBlack=0` · compositeSource=**NaturalDispfb** · enNatural=1
+
+### Interactive signals (dec-pad-free free-ride remeasure)
+
+| Signal | Evidence |
+|--------|----------|
+| INTERACTIVE proven | `[MKFAM] Dec INTERACTIVE proven sel=1 max=2 accepts=4 naturalΔ=8 … prims=45 pc=0x001B5CA8 cyc=59110000` |
+| End pad state | `n=1479 accepts=12 kicks=8 natΔ=24 proven=1 effect=2 Δprims=63 Δpx=1.37M postPlatΔp=21 postPlatΔpx=363439 **pc=0x001237F0** keep=196` |
+| Sleep park `0x115F64` | **cleared** — keep-alive `sleepPark=0` throughout; final PC main loop not CRT/sleep |
+| Freelist thrash | **end PC fixed** — freelist rehome → `0x1237F0`; prior residual ended `0x3D9B88` / `0x3BDEA0` |
+| Soft-GS chrome | **HOLD** lit≈**199k** NaturalDispfb · imgBytes=**557056** |
+| prims peak tradeoff | free-ride plateaus **prims=66** (postPlat+21) vs MENU-DEC-2 peak **146** under denser force-process |
+
+### Free-ride fix (minimal TITLE_LOCAL `MidwayFamilyAssist`)
+
+| Change | Effect |
+|--------|--------|
+| Freelist thrash bands `0x3BA000–0x3BE000` / `0x3D9000–0x3DB000` (≥55M, Soft-GS live) | Rehome to main/`0x1B6A68` — end PC **`0x1237F0`** |
+| Yield to pad-script external Press | Assist dense inject does not clobber `dec-menu-interactive.pad` holds |
+| Sleep park keep-alive (existing) | Recovers `0x115F64` SleepThread / CRT park |
+
+### Honest INTERACTIVE?
+
+| Signal | Result |
+|--------|--------|
+| Soft-GS NaturalDispfb chrome | **YES** lit≈199k mostlyBlack=0 |
+| Pad pulses / sel walk / accept | **YES** accepts≥12 natΔ=**24** proven=1 |
+| Soft-GS Δ post-plateau | **YES** postPlatΔprims=**21** postPlatΔpx≈**363k** (weaker than MENU-DEC-2 Δ101/1.54M) |
+| Final PC main menu loop | **YES** free-ride `0x1237F0` (was freelist residual) |
+| Natural AnimMenu without assist kick | **PARTIAL** — natΔ cells move; full free-ride without accept-kick still open |
+| gifP3 climb | **NO** — stuck at **6** (Path3MaskedByVif held; no invent) |
+
+**Verdict:** **INTERACTIVE YES** · Soft-GS **MENU chrome HOLD** · free-ride **improved** (main PC + natΔ=24) · residual: prims peak below 146 under freelist rehome, gifP3=6, natural accept without kick.
+
+### Residual walls (post free-ride wave)
+
+1. **prims peak** — freelist→main rehome holds PC on AnimMenu loop but Path2 force-process volume drops (66 vs 146). Prefer main free-ride PC over freelist thrash; do not invent PATH3 to paint prims.
+2. **gifP3=6 stuck** — Path3MaskedByVif freeze held.
+3. **Natural free-ride** — full AnimMenu accept without assist post-CROSS kick still open.
+4. **Dormant main** — keep-alive still fires on `dormant=1` / `0x1277C0` band under pad.
 
 ---
 
@@ -24,8 +81,8 @@
 
 | Gate | Name | Dec status |
 |------|------|-------------|
-| **P0** | MENU floor | **HOLD** — midway-menu Soft-GS |
-| **P1** | INTERACTIVE | **HOLD (assist-stable)** — pad inject moves sel-idx `*0x5DC000` 0..4 under D-pad; Soft-GS Δ after pad; natural AnimMenu accept residual |
+| **P0** | MENU floor | **HOLD** — midway-menu Soft-GS lit≈199k NaturalDispfb |
+| **P1** | INTERACTIVE | **YES (free-ride remeasure)** — accept latch + post-CROSS kick; main PC `0x1237F0`; natΔ≥24; Soft-GS postPlat Δ; freelist end-PC residual **cleared** |
 | **G-GFX-3** | IMAGE path | **PARTIAL** — `gameart.ssf` body live (2.8 MiB); Soft-GS Host→Local feed **imgBytes=557056** (tiles=48 fed=458752); natural GIF `image=` still 1 |
 
 **Freezes held:** Soft-GS truth · `DETPS2_SEMA_STALL_YIELD` **OFF** · no invent PATH3 · **Path3MaskedByVif** held · no DA-only thrash · no SM `MidwayBootAssist` · no global WaitSema fabricate.
@@ -142,15 +199,16 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 
 ## Walls
 
-### 1. INTERACTIVE wall (P1 / PL-012) — **HOLD assist-stable**
+### 1. INTERACTIVE wall (P1 / PL-012 + MENU-DEC-2 + free-ride) — **YES**
 
-- Main thrash class: **idle-pump** `@0x1B6A68` + keep-alive force-process (not a natural selection GUI loop).  
-- **Proven @100M SEMA_OFF:**  
-  - Dense pad inject (`MaybeInjectDecMenuPad`) n≥1280 with release edges + `ForceRefreshPad`.  
-  - Assist-stable selection index plant at `0x5DC000..0x5DC010` (0..4) driven by D-pad edges — `sel-idx-delta` logs under `dpad=1`.  
-  - Soft-GS growth after pad baseline (Δprims≈1320 Δpx≈19.5M Δp2≈132).  
-- **Residual:** natural game menu accept / AnimMenuGUI row cell (not assist plant); idle thrash still dominates PC.  
-- Same honesty class as SM wave-7 assist-stable sel-idx (not free-ride natural UI).
+- Main thrash class: idle-pump residual; post-plateau thrash `@0x1E69` / `@0x3153` / freelist `@0x3BAxxx` (rehomed ≥55M).  
+- **MENU-DEC-2 proven @150M pad-inject** (`dec-menu-dec2-150m-pi`): Soft-GS **prims 45→146**; postPlatΔprims=101; natΔ=14; freelist end PC residual.  
+- **Free-ride remeasure @100M pad** (`dec-pad-free-20260731-150927`, SEMA_OFF + `dec-menu-interactive.pad`):  
+  - Soft-GS **lit=198959** NaturalDispfb · imgBytes=557056.  
+  - **INTERACTIVE proven** natΔ=**24** accepts≥12 kicks≥8 postPlatΔp=21 · final **PC=`0x001237F0` main**.  
+  - Sleep park `0x115F64` **cleared** (keep-alive sleepPark=0).  
+  - Freelist end-PC residual **cleared** via TITLE_LOCAL freelist thrash rehome.  
+- **Residual (hard):** prims peak 66 under free-ride rehome (vs 146 force-process peak); full natural accept without kick still open; gifP3=6 stuck; historical p2qws≈5988 not reproduced.
 
 ### 2. IMAGE wall (G-GFX-3 / GX-037) — PL-029 **PARTIAL** + S8/S9 handoff
 
@@ -175,6 +233,7 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 - gameart table-open kick + path-hash + stream publish.  
 - PowerOff/WaitSema storm break → midway-menu keep-alive.  
 - **PL-012:** dense pad inject on idle-pump + assist-stable sel-idx plant (`0x5DC000`) + ForceRefreshPad.  
+- **MENU-DEC-2:** accept latch + post-CROSS kick to main/`0x1B5D10`; thrash rehome `0x1E69/0x3153/0x2E3A`; natural sel scan; Soft-GS post-plateau Δ.  
 - **PL-029:** Host→Local Soft-GS BITBLT of nested `gameart.ssf` SEC tiles (imgBytes art-scale).  
 - **Not used:** invent PATH3; Path3MaskedByVif remove; DA wait-ready / MFL path plants; SM CRI/WAD; global WaitSema fabricate; idle queue control-word stomps.
 
@@ -200,6 +259,18 @@ Look for stderr: `[MKFAM] Dec pad inject`, `Dec menu-sel-index=`, `Dec sel-idx-d
 ---
 
 ## Claim line (copy for scoreboard / #12)
+
+```
+Dec MENU-DEC-2 @150M pad-inject SEMA_OFF host-present: MENU YES + INTERACTIVE + Soft-GS post-plateau
+  PC@end=0x3BDEA0 px=3015151 prims=146 (>86) gifP3=6 dmac=25 sif=64496
+  postPlatΔprims=101 postPlatΔpx≈1.54M accepts=518 kicks=48 natΔ=14 proven=1
+  pad: *0x5DC000 sel 0..4 + accept latch *0x5DC014; kick →0x1237F0 / 0x1B5D10
+  NATURAL sel-delta @0x5D6A8C/90 (free-ride PARTIAL)
+  residual: freelist thrash final PC; full natural AnimMenu free-ride; p2 thin vs historical
+  no invent PATH3; mask held; MidwayFamilyAssist Dec-only
+```
+
+### Historical seat claim (PL-029 @100M, force-process heavy)
 
 ```
 Dec S2 PL-029 @100M SEMA_OFF host-present: MENU YES + INTERACTIVE + G-GFX-3 PARTIAL

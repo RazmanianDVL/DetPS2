@@ -71,6 +71,14 @@ public sealed class RealSifRpc
     /// Soft-HLE: bind completes; calls return 0. Not required for STARTUP.XFF path.
     /// </summary>
     public const uint SidPl2303Usb = 0x80000220;
+    /// <summary>
+    /// Vexx (SLUS_203.83) <c>DATA/SOUND/AAAIOP.IRX</c> — <c>AAAIOP_driver</c> v3.0.4.
+    /// Registers <c>sceSifRegisterRpc(..., 0x00054323, handler@0xBC, ...)</c> (IRX file+0x10C
+    /// lui/ori). EE client @0x4455D0; boot path CallRpc fno=0x10 (init) then IOP-heap allocs.
+    /// Handler dispatches on <c>fno &amp; 0x7FF0</c> (0x10/20/30/40/50/60/70/80/90/A0). Soft
+    /// 0-for-success — no public docs; bind+init must not count as unknownBindSids.
+    /// </summary>
+    public const uint SidAaaIop = 0x00054323;
     /// <summary>CDVDFSV <c>sceCdInit</c> service (FUN_00000204 registered at 0x80000592).</summary>
     public const uint SidCdBase = 0x80000592;
     /// <summary>CDVDFSV <c>sceCdSearchFile</c> (FUN_000002f0 registered at 0x80000597).</summary>
@@ -911,6 +919,7 @@ public sealed class RealSifRpc
             && sid != SidDbcMan && sid != Sid989Snd && sid != Sid989Snd2
             && sid != SidMsl && sid != SidMslMfl
             && sid != SidPl2303Usb // SotC binds after PL2303.IRX; soft-HLE, no unknown
+            && sid != SidAaaIop    // Vexx AAAIOP_driver 0x54323; soft-HLE, no unknown
             && !IsIopFileSid(sid)
             && sid != SidLgDev
             && !IsDbcManSibling(sid)
@@ -1383,6 +1392,21 @@ public sealed class RealSifRpc
                 mem.Write32(recvBuf, 0);
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
                 Console.Error.WriteLine($"[RPC] HandleCall sid=PL2303(0x{sid:X8}) fno=0x{rpcNumber:X} result=0");
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return;
+        }
+
+        // AAAIOP_driver (Vexx sid=0x54323) — soft 0-for-success for all fno groups.
+        if (sid == SidAaaIop)
+        {
+            int ar = HandleAaaIop(mem, rpcNumber, argBuf, recvBuf, recvSize);
+            if (recvBuf != 0 && recvSize >= 4)
+                mem.Write32(recvBuf, unchecked((uint)ar));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] HandleCall sid=AAAIOP(0x{sid:X8}) fno=0x{rpcNumber:X} result={ar} " +
+                    $"recvBuf=0x{recvBuf:X8} send={sendSize}");
             CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
             return;
         }
@@ -3404,6 +3428,10 @@ public sealed class RealSifRpc
                 // SN ProDG debug RPC: accept all fnos as success (0). No T10000 present.
                 return 0;
 
+            case SidAaaIop:
+                // Vexx AAAIOP_driver — soft 0 (see HandleAaaIop).
+                return HandleAaaIop(mem, fno, argBuf, recvBuf, recvSize: 0);
+
             case SidDbcMan:
                 // dbcman.irx (libdbc). fno often equals sid|0x63 style version/init.
                 // libdbc prints "Module version mismatch [libdbc.a = %d.%02x, dbcman.irx = %d.%02x]"
@@ -4647,6 +4675,53 @@ public sealed class RealSifRpc
 
         // Soft-bind MFL file client (distinct pointer 0x54F200) so fno 21/22/24 hit HandleMsl.
         TrySoftBindMflClient(mem);
+    }
+
+    /// <summary>
+    /// Host-complete a retail <c>SifRpcClientData_t</c> as if <c>sceSifBindRpc</c> succeeded.
+    /// Used by title assists (Vexx PL-032q) when EE bind-wait spins despite HLE bind transport,
+    /// so a later <c>sceSifCallRpc</c> resolves the real sid instead of sid=0.
+    /// </summary>
+    public void HostCompleteBind(SystemMemory mem, uint cdPtr, uint sid)
+    {
+        if (cdPtr == 0 || sid == 0) return;
+        bool fresh = !_cdToSid.ContainsKey(cdPtr);
+        uint argBuf = _cdToArgBuf.TryGetValue(cdPtr, out var existing) && existing != 0
+            ? existing
+            : AssignSlot();
+        // Keep a stable cbuf when re-stamping so EE polls see a constant non-zero handle.
+        uint ctrlBuf = 0;
+        try { ctrlBuf = mem.Read32(cdPtr + 24); } catch { /* ignore */ }
+        if (ctrlBuf == 0)
+            ctrlBuf = AssignSlot();
+        _cdToSid[cdPtr] = sid;
+        _cdToArgBuf[cdPtr] = argBuf;
+        // Mirror HandleBind field plant (ps2sdk SifRpcClientData_t).
+        mem.Write32(cdPtr + 0, 0); // hdr.pkt_addr free
+        if (mem.Read32(cdPtr + 8) == 0)
+            mem.Write32(cdPtr + 8, 1); // non-zero sema token if EE never created one
+        mem.Write32(cdPtr + 20, argBuf);
+        mem.Write32(cdPtr + 24, ctrlBuf);
+        mem.Write32(cdPtr + 36, sid);
+        if (fresh) Binds++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_VEXX") == "1")
+            Console.Error.WriteLine(
+                $"[RPC] HostCompleteBind sid=0x{sid:X8} cdPtr=0x{cdPtr:X8} argBuf=0x{argBuf:X8} cbuf=0x{ctrlBuf:X8} fresh={fresh}");
+    }
+
+    /// <summary>
+    /// Vexx <c>AAAIOP_driver</c> (sid=<see cref="SidAaaIop"/>) soft RPC.
+    /// IRX dispatches on <c>fno &amp; 0x7FF0</c>; boot only needs fno=0x10 init → 0.
+    /// </summary>
+    private static int HandleAaaIop(SystemMemory mem, uint fno, uint argBuf, uint recvBuf, uint recvSize)
+    {
+        _ = fno; _ = argBuf;
+        // fno groups observed in AAAIOP.IRX handler @0xBC: 0x10 init, 0x20..0xA0 audio cmds.
+        // Return 0 (success) into recv when present; no multi-word contract ground-truthed yet.
+        if (recvBuf != 0 && recvSize >= 4)
+            mem.Write32(recvBuf, 0);
+        return 0;
     }
 
     /// <summary>

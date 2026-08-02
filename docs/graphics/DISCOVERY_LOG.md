@@ -16,3 +16,6 @@ Append-only. When pad/menu advances and Soft-GS shows a **new** wall, add a row.
 | 2026-07-31 | tooling | `--pad-script=` on pad-inject / scoreboard-metrics / blocker-trace; T2 heuristic | T2 still `?` without script | S10 | PL-002 |
 | 2026-07-31 | GoW+DA | GX-010/011 Path2 sticky harden | path-owned sticky; EOP multi-pkt; FIFO DIRECT pad; IMM=0=65536; GoW abortNewDir=1 hold px=573440@20M; DA abort=0 px=2.8M | S8 | GX-010/011 |
 | 2026-07-31 | Dec | imgBytes 98304→557056 Host→Local | gameart.ssf SEC tiles fed via Soft-GS BITBLT (TRXDIR=0); natural gif-tags image=1 residual; Path2-only menu; no invent PATH3 | S2 | PL-029 / GX-037 |
+| 2026-07-31 | GoW | tip@100M host-present px=573440 **lit=0** gifP2=81 imgBytes=114752 dispfbPx=0 | Black ofx expand stamps FB; natural DISPFB FBP=0x1A0000 PSMCT24 composite 0 lit (IMAGE elsewhere / residual FBP0 only when DISPFB unset) | MENU-GOW / S6 | PL-034 / GX-041 residual |
+| 2026-07-31 | GoW | **lit=60866** @100M host-present px=634306 imgBytes=262144 residualDispfbPx=60866 src=Frame | Host→Local real R_SHELL/TIT1 payload (BO2/Dec class) + Gs LastImageTrx residual; expandHits=2; natural DISPFB still 0; gif image=0 residual | MENU-GOW-3 | lit>0 claim |
+
