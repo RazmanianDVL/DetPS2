@@ -55,6 +55,17 @@ public sealed class Gs : ISchedulable
     /// <summary>Cached DETPS2_TRACE_GS — never re-parse process env on XYZ path.</summary>
     private static readonly bool TraceGs = Environment.GetEnvironmentVariable("DETPS2_TRACE_GS") == "1";
 
+    // WriteFrameLocal decode cache: FRAME_1 only changes on an explicit privileged
+    // register write (once per draw-target switch), not per pixel — re-decoding it on
+    // every accepted fragment was pure integer bit-twiddling redone for no reason.
+    // Pure integer arithmetic, so caching is exact/deterministic (no float rounding
+    // concerns): re-decode is triggered only when the raw register value changes.
+    private bool _frameDecodeValid;
+    private ulong _frameDecodeSrc;
+    private uint _frameDecodeBaseBytes;
+    private int _frameDecodeFbw;
+    private int _frameDecodePsm;
+
     private uint _currentPrim;
     private uint _currentRgbaq = 0xFFFFFFFF;
     private float _lastU, _lastV, _lastS = 1f, _lastT = 1f, _lastQ = 1f;
@@ -1069,12 +1080,21 @@ public sealed class Gs : ISchedulable
                 ExpandHits++;
         }
 
+        // uSpan/vSpan/wf/hf are triangle-invariant; hoisted out of the per-pixel loop
+        // (same operand order as before, so results are bit-identical — only the
+        // per-pixel (x-minX)/(y-minY) division itself, which genuinely varies per
+        // pixel, is left as-is rather than replaced with a precomputed reciprocal
+        // multiply, which would change float rounding vs. real division).
+        float uSpan = u1 - u0;
+        float vSpan = v1 - v0;
+        float wf = (float)w;
+        float hf = (float)h;
         for (int y = y0; y <= y1; y++)
         {
-            float tv = v0 + (v1 - v0) * ((y - minY) / (float)h);
+            float tv = v0 + vSpan * ((y - minY) / hf);
             for (int x = x0; x <= x1; x++)
             {
-                float tu = u0 + (u1 - u0) * ((x - minX) / (float)w);
+                float tu = u0 + uSpan * ((x - minX) / wf);
                 WriteFragment(x, y, z, col, tu, tv, a.Fog);
             }
         }
@@ -1112,11 +1132,21 @@ public sealed class Gs : ISchedulable
         int minY = Math.Max(0, Math.Min(v0.Y, Math.Min(v1.Y, v2.Y)));
         int maxY = Math.Min(FB_HEIGHT - 1, Math.Max(v0.Y, Math.Max(v1.Y, v2.Y)));
 
+        // Barycentric setup is invariant for the whole triangle — hoisted out of the
+        // per-pixel loop below (was recomputed from scratch every pixel). Same operand
+        // order/associativity as the old inline PointInTriangle body, so results are
+        // bit-identical; only the per-pixel numerator terms + the two divides remain
+        // genuinely per-pixel (dividing by a precomputed reciprocal instead would change
+        // rounding vs. real division and is deliberately avoided — Soft-GS output must
+        // stay byte-identical for claim hashes / netplay lockstep).
+        if (!TriangleBarycentricSetup(v0, v1, v2, out var bs))
+            return;
+
         for (int y = minY; y <= maxY; y++)
         {
             for (int x = minX; x <= maxX; x++)
             {
-                if (!PointInTriangle(x, y, v0, v1, v2, out float wa, out float wb, out float wc))
+                if (!PointInTriangle(x, y, in bs, out float wa, out float wb, out float wc))
                     continue;
 
                 float z = v0.Z * wa + v1.Z * wb + v2.Z * wc;
@@ -1217,12 +1247,27 @@ public sealed class Gs : ISchedulable
     private void WriteFrameLocal(int x, int y, uint pixel)
     {
         ulong frame = Registers.FRAME_1;
-        int fbp = (int)(frame & 0x1FF);
-        int fbw = (int)((frame >> 16) & 0x3F) * 64;
-        int psm = (int)((frame >> 24) & 0x3F);
-        if (fbw <= 0) fbw = FB_WIDTH;
-        if (fbw > 4096) fbw = 4096;
-        uint baseBytes = (uint)fbp * 8192u;
+        uint baseBytes; int fbw; int psm;
+        if (_frameDecodeValid && frame == _frameDecodeSrc)
+        {
+            baseBytes = _frameDecodeBaseBytes;
+            fbw = _frameDecodeFbw;
+            psm = _frameDecodePsm;
+        }
+        else
+        {
+            int fbp = (int)(frame & 0x1FF);
+            fbw = (int)((frame >> 16) & 0x3F) * 64;
+            psm = (int)((frame >> 24) & 0x3F);
+            if (fbw <= 0) fbw = FB_WIDTH;
+            if (fbw > 4096) fbw = 4096;
+            baseBytes = (uint)fbp * 8192u;
+            _frameDecodeSrc = frame;
+            _frameDecodeBaseBytes = baseBytes;
+            _frameDecodeFbw = fbw;
+            _frameDecodePsm = psm;
+            _frameDecodeValid = true;
+        }
         if (baseBytes >= (uint)_localMem.Length) return;
         if (psm is 0x00 or 0x01 or 0)
         {
@@ -1916,12 +1961,30 @@ public sealed class Gs : ISchedulable
         return (uint)((al << 24) | (r << 16) | (g << 8) | bl);
     }
 
-    private static bool PointInTriangle(int px, int py, Vertex v0, Vertex v1, Vertex v2, out float a, out float b, out float c)
+    /// <summary>Triangle-invariant terms for <see cref="PointInTriangle"/> (GX perf: hoisted out of the per-pixel loop).</summary>
+    private readonly struct TriBary
     {
-        float denom = (v1.Y - v2.Y) * (v0.X - v2.X) + (v2.X - v1.X) * (v0.Y - v2.Y);
-        if (Math.Abs(denom) < 0.0001f) { a = b = c = 0; return false; }
-        a = ((v1.Y - v2.Y) * (px - v2.X) + (v2.X - v1.X) * (py - v2.Y)) / denom;
-        b = ((v2.Y - v0.Y) * (px - v2.X) + (v0.X - v2.X) * (py - v2.Y)) / denom;
+        public readonly float T1, T2, T3, T4, T5, Denom, V2X, V2Y;
+        public TriBary(float t1, float t2, float t3, float t4, float t5, float denom, float v2x, float v2y)
+        { T1 = t1; T2 = t2; T3 = t3; T4 = t4; T5 = t5; Denom = denom; V2X = v2x; V2Y = v2y; }
+    }
+
+    private static bool TriangleBarycentricSetup(Vertex v0, Vertex v1, Vertex v2, out TriBary bs)
+    {
+        float t1 = v1.Y - v2.Y;
+        float t2 = v2.X - v1.X;
+        float t3 = v0.X - v2.X;
+        float t4 = v0.Y - v2.Y;
+        float t5 = v2.Y - v0.Y;
+        float denom = t1 * t3 + t2 * t4;
+        bs = new TriBary(t1, t2, t3, t4, t5, denom, v2.X, v2.Y);
+        return Math.Abs(denom) >= 0.0001f;
+    }
+
+    private static bool PointInTriangle(int px, int py, in TriBary bs, out float a, out float b, out float c)
+    {
+        a = (bs.T1 * (px - bs.V2X) + bs.T2 * (py - bs.V2Y)) / bs.Denom;
+        b = (bs.T5 * (px - bs.V2X) + bs.T3 * (py - bs.V2Y)) / bs.Denom;
         c = 1 - a - b;
         return a >= -0.001f && b >= -0.001f && c >= -0.001f;
     }

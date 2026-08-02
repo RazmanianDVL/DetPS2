@@ -145,7 +145,7 @@ public partial class GameDisplayWindow : Window
         // Optional host GPU upload for dual-present stats, but Avalonia stays visible (never exclusive).
         TryHostPresentNonExclusive(fb, w, h);
 
-        BlitSoftGsToAvalonia(fb, w, h);
+        BlitSoftGsToAvalonia(fb, w, h, computeLit: litHint < 0);
         if (litHint >= 0)
             _lastLitPixels = (int)Math.Min(int.MaxValue, litHint);
         MaybeDumpPresentPpm(fb, w, h);
@@ -248,7 +248,7 @@ public partial class GameDisplayWindow : Window
     /// Optional <see cref="_flipY"/> when the composite is inverted (see Deception PPM diagnostics).
     /// </para>
     /// </summary>
-    private unsafe void BlitSoftGsToAvalonia(ReadOnlySpan<uint> fb, int w, int h)
+    private unsafe void BlitSoftGsToAvalonia(ReadOnlySpan<uint> fb, int w, int h, bool computeLit = true)
     {
         if (GameImage == null) return;
         // Always show Avalonia surface unless PresentFrame proved GPU exclusive this frame.
@@ -268,8 +268,13 @@ public partial class GameDisplayWindow : Window
         {
             int rowBytes = locked.RowBytes;
             byte* dstBase = (byte*)locked.Address;
-            _lastLitPixels = SoftGsAvaloniaBlit.PackToBgraStrided(
-                fb, w, h, dstBase, rowBytes, flipY: _flipY);
+            // Caller (PresentSnapshot) may already know the lit count from the worker-thread
+            // hint — skip the redundant full-framebuffer scan when it does (the result was
+            // being computed here then immediately discarded in favor of the hint).
+            int lit = SoftGsAvaloniaBlit.PackToBgraStrided(
+                fb, w, h, dstBase, rowBytes, flipY: _flipY, computeLit: computeLit);
+            if (computeLit)
+                _lastLitPixels = lit;
         }
 
         // Rebind Source every frame so Avalonia always refreshes after memcpy-only updates
@@ -277,7 +282,9 @@ public partial class GameDisplayWindow : Window
         GameImage.Source = null;
         GameImage.Source = _bitmap;
         GameImage.InvalidateVisual();
-        InvalidateVisual();
+        // (Removed: whole-window InvalidateVisual() — redundant with the image-level
+        // invalidate just above; invalidating the entire Window forced an extra
+        // layout/render pass every frame at 60Hz for no additional visual effect.)
     }
 
     /// <summary>

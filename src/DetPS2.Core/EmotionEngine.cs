@@ -2208,22 +2208,22 @@ public sealed class EmotionEngine : ISchedulable
             // ---- Shift-immediate families (PSLLH/PSRLH/PSRAH over 8 halfwords,
             // PSLLW/PSRLW/PSRAW over 4 words) — sa is the shift amount here, not a sub-opcode.
             case 0x34: // PSLLH
-                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => unchecked((ushort)(x << (int)(s & 0xF))), sa); SetGpr(rd, PackH(h)); }
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => unchecked((ushort)(x << (int)(s & 0xF))), sa); SetGpr(rd, h); }
                 break;
             case 0x36: // PSRLH
-                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)(x >> (int)(s & 0xF)), sa); SetGpr(rd, PackH(h)); }
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)(x >> (int)(s & 0xF)), sa); SetGpr(rd, h); }
                 break;
             case 0x37: // PSRAH
-                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)((short)x >> (int)(s & 0xF)), sa); SetGpr(rd, PackH(h)); }
+                if (rd != 0) { var h = HalfOp1(GetGpr(rt), static (x, s) => (ushort)((short)x >> (int)(s & 0xF)), sa); SetGpr(rd, h); }
                 break;
             case 0x3C: // PSLLW
-                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x << (int)s, sa); SetGpr(rd, PackW(w)); }
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x << (int)s, sa); SetGpr(rd, w); }
                 break;
             case 0x3E: // PSRLW
-                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x >> (int)s, sa); SetGpr(rd, PackW(w)); }
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => x >> (int)s, sa); SetGpr(rd, w); }
                 break;
             case 0x3F: // PSRAW
-                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => (uint)((int)x >> (int)s), sa); SetGpr(rd, PackW(w)); }
+                if (rd != 0) { var w = WordOp1(GetGpr(rt), static (x, s) => (uint)((int)x >> (int)s), sa); SetGpr(rd, w); }
                 break;
 
             default:
@@ -2232,20 +2232,25 @@ public sealed class EmotionEngine : ISchedulable
         }
     }
 
-    private static uint[] WordOp1(Gpr128 t, Func<uint, uint, uint> op, uint sa)
+    // WordOp1/HalfOp1 extract lanes directly from t.Lo/t.Hi via bit-shift instead of
+    // going through ExtractW/ExtractH (which allocate a heap array) — these run once per
+    // MMI shift-immediate instruction executed, so the array churn was pure GC pressure.
+    // Same per-lane values/order as ExtractW/ExtractH would have produced, so output is
+    // identical; only the allocation is gone.
+    private static Gpr128 WordOp1(Gpr128 t, Func<uint, uint, uint> op, uint sa)
     {
-        var tw = ExtractW(t);
-        var r = new uint[4];
-        for (int i = 0; i < 4; i++) r[i] = op(tw[i], sa);
-        return r;
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 2; i++) lo |= (ulong)op((uint)(t.Lo >> (i * 32)), sa) << (i * 32);
+        for (int i = 0; i < 2; i++) hi |= (ulong)op((uint)(t.Hi >> (i * 32)), sa) << (i * 32);
+        return new Gpr128 { Lo = lo, Hi = hi };
     }
 
-    private static ushort[] HalfOp1(Gpr128 t, Func<ushort, uint, ushort> op, uint sa)
+    private static Gpr128 HalfOp1(Gpr128 t, Func<ushort, uint, ushort> op, uint sa)
     {
-        var th = ExtractH(t);
-        var r = new ushort[8];
-        for (int i = 0; i < 8; i++) r[i] = op(th[i], sa);
-        return r;
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 4; i++) lo |= (ulong)op((ushort)(t.Lo >> (i * 16)), sa) << (i * 16);
+        for (int i = 0; i < 4; i++) hi |= (ulong)op((ushort)(t.Hi >> (i * 16)), sa) << (i * 16);
+        return new Gpr128 { Lo = lo, Hi = hi };
     }
 
     private void ExecuteMmiFamily(uint sa, uint func, uint rs, uint rt, uint rd)
@@ -2269,38 +2274,38 @@ public sealed class EmotionEngine : ISchedulable
         switch (key)
         {
             // ---- word lanes (4x32) ----
-            case (0u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => unchecked(x + y)))); break; // PADDW
-            case (1u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => unchecked(x - y)))); break; // PSUBW
-            case (2u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => x == y ? 0xFFFFFFFFu : 0u))); break; // PCEQW
-            case (2u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x > (int)y ? 0xFFFFFFFFu : 0u))); break; // PCGTW
-            case (3u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x > (int)y ? x : y))); break; // PMAXW
-            case (3u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (int)x < (int)y ? x : y))); break; // PMINW
-            case (16u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x + (int)y)))); break; // PADDSW
-            case (17u << 6) | 0x08: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x - (int)y)))); break; // PSUBSW
-            case (16u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => SatU32((long)x + y)))); break; // PADDUW
-            case (17u << 6) | 0x28: SetGpr(rd, PackW(WordOp(a, b, static (x, y) => SatU32((long)x - y)))); break; // PSUBUW
+            case (0u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => unchecked(x + y))); break; // PADDW
+            case (1u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => unchecked(x - y))); break; // PSUBW
+            case (2u << 6) | 0x28: SetGpr(rd, WordOp(a, b, static (x, y) => x == y ? 0xFFFFFFFFu : 0u)); break; // PCEQW
+            case (2u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => (int)x > (int)y ? 0xFFFFFFFFu : 0u)); break; // PCGTW
+            case (3u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => (int)x > (int)y ? x : y)); break; // PMAXW
+            case (3u << 6) | 0x28: SetGpr(rd, WordOp(a, b, static (x, y) => (int)x < (int)y ? x : y)); break; // PMINW
+            case (16u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x + (int)y))); break; // PADDSW
+            case (17u << 6) | 0x08: SetGpr(rd, WordOp(a, b, static (x, y) => (uint)SatS32((long)(int)x - (int)y))); break; // PSUBSW
+            case (16u << 6) | 0x28: SetGpr(rd, WordOp(a, b, static (x, y) => SatU32((long)x + y))); break; // PADDUW
+            case (17u << 6) | 0x28: SetGpr(rd, WordOp(a, b, static (x, y) => SatU32((long)x - y))); break; // PSUBUW
 
             // ---- halfword lanes (8x16) ----
-            case (4u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => unchecked((ushort)(x + y))))); break; // PADDH
-            case (5u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => unchecked((ushort)(x - y))))); break; // PSUBH
-            case (6u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)(x == y ? 0xFFFF : 0)))); break; // PCEQH
-            case (6u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)((short)x > (short)y ? 0xFFFF : 0)))); break; // PCGTH
-            case (7u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (short)x > (short)y ? x : y))); break; // PMAXH
-            case (7u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (short)x < (short)y ? x : y))); break; // PMINH
-            case (20u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x + (short)y)))); break; // PADDSH
-            case (21u << 6) | 0x08: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x - (short)y)))); break; // PSUBSH
-            case (20u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => SatU16(x + y)))); break; // PADDUH
-            case (21u << 6) | 0x28: SetGpr(rd, PackH(HalfOp(a, b, static (x, y) => SatU16(x - y)))); break; // PSUBUH
+            case (4u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => unchecked((ushort)(x + y)))); break; // PADDH
+            case (5u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => unchecked((ushort)(x - y)))); break; // PSUBH
+            case (6u << 6) | 0x28: SetGpr(rd, HalfOp(a, b, static (x, y) => (ushort)(x == y ? 0xFFFF : 0))); break; // PCEQH
+            case (6u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => (ushort)((short)x > (short)y ? 0xFFFF : 0))); break; // PCGTH
+            case (7u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => (short)x > (short)y ? x : y)); break; // PMAXH
+            case (7u << 6) | 0x28: SetGpr(rd, HalfOp(a, b, static (x, y) => (short)x < (short)y ? x : y)); break; // PMINH
+            case (20u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x + (short)y))); break; // PADDSH
+            case (21u << 6) | 0x08: SetGpr(rd, HalfOp(a, b, static (x, y) => (ushort)SatS16((short)x - (short)y))); break; // PSUBSH
+            case (20u << 6) | 0x28: SetGpr(rd, HalfOp(a, b, static (x, y) => SatU16(x + y))); break; // PADDUH
+            case (21u << 6) | 0x28: SetGpr(rd, HalfOp(a, b, static (x, y) => SatU16(x - y))); break; // PSUBUH
 
             // ---- byte lanes (16x8) ----
-            case (8u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => unchecked((byte)(x + y))))); break; // PADDB
-            case (9u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => unchecked((byte)(x - y))))); break; // PSUBB
-            case (10u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)(x == y ? 0xFF : 0)))); break; // PCEQB
-            case (10u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)((sbyte)x > (sbyte)y ? 0xFF : 0)))); break; // PCGTB
-            case (24u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x + (sbyte)y)))); break; // PADDSB
-            case (25u << 6) | 0x08: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x - (sbyte)y)))); break; // PSUBSB
-            case (24u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => SatU8(x + y)))); break; // PADDUB
-            case (25u << 6) | 0x28: SetGpr(rd, PackB(ByteOp(a, b, static (x, y) => SatU8(x - y)))); break; // PSUBUB
+            case (8u << 6) | 0x08: SetGpr(rd, ByteOp(a, b, static (x, y) => unchecked((byte)(x + y)))); break; // PADDB
+            case (9u << 6) | 0x08: SetGpr(rd, ByteOp(a, b, static (x, y) => unchecked((byte)(x - y)))); break; // PSUBB
+            case (10u << 6) | 0x28: SetGpr(rd, ByteOp(a, b, static (x, y) => (byte)(x == y ? 0xFF : 0))); break; // PCEQB
+            case (10u << 6) | 0x08: SetGpr(rd, ByteOp(a, b, static (x, y) => (byte)((sbyte)x > (sbyte)y ? 0xFF : 0))); break; // PCGTB
+            case (24u << 6) | 0x08: SetGpr(rd, ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x + (sbyte)y))); break; // PADDSB
+            case (25u << 6) | 0x08: SetGpr(rd, ByteOp(a, b, static (x, y) => (byte)SatS8((sbyte)x - (sbyte)y))); break; // PSUBSB
+            case (24u << 6) | 0x28: SetGpr(rd, ByteOp(a, b, static (x, y) => SatU8(x + y))); break; // PADDUB
+            case (25u << 6) | 0x28: SetGpr(rd, ByteOp(a, b, static (x, y) => SatU8(x - y))); break; // PSUBUB
 
             // ---- logical (fixes the earlier func-only dispatch, which collided with other real slots) ----
             case (18u << 6) | 0x09: SetGpr(rd, new Gpr128 { Lo = a.Lo & b.Lo, Hi = a.Hi & b.Hi }); break; // PAND
@@ -2582,26 +2587,32 @@ public sealed class EmotionEngine : ISchedulable
         return new Gpr128 { Lo = lo, Hi = hi };
     }
 
-    private static uint[] WordOp(Gpr128 a, Gpr128 b, Func<uint, uint, uint> op)
+    // WordOp/HalfOp/ByteOp back the ~28 common PADD*/PSUB*/PCEQ*/PCGT*/PMAX*/PMIN*-family
+    // MMI opcodes below — extract lanes directly from a.Lo/a.Hi/b.Lo/b.Hi via bit-shift
+    // (same lane order ExtractW/H/B would give) instead of allocating 3 heap arrays
+    // (2 extract + 1 result) per instruction executed. Output is bit-identical; only the
+    // GC churn is gone. ExtractW/H/B themselves are left as-is — still used by the
+    // shuffle/permute MMI opcodes (PEXTLW, PPACW, ...) below, which are untouched here.
+    private static Gpr128 WordOp(Gpr128 a, Gpr128 b, Func<uint, uint, uint> op)
     {
-        var aw = ExtractW(a); var bw = ExtractW(b);
-        var r = new uint[4];
-        for (int i = 0; i < 4; i++) r[i] = op(aw[i], bw[i]);
-        return r;
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 2; i++) lo |= (ulong)op((uint)(a.Lo >> (i * 32)), (uint)(b.Lo >> (i * 32))) << (i * 32);
+        for (int i = 0; i < 2; i++) hi |= (ulong)op((uint)(a.Hi >> (i * 32)), (uint)(b.Hi >> (i * 32))) << (i * 32);
+        return new Gpr128 { Lo = lo, Hi = hi };
     }
-    private static ushort[] HalfOp(Gpr128 a, Gpr128 b, Func<ushort, ushort, ushort> op)
+    private static Gpr128 HalfOp(Gpr128 a, Gpr128 b, Func<ushort, ushort, ushort> op)
     {
-        var ah = ExtractH(a); var bh = ExtractH(b);
-        var r = new ushort[8];
-        for (int i = 0; i < 8; i++) r[i] = op(ah[i], bh[i]);
-        return r;
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 4; i++) lo |= (ulong)op((ushort)(a.Lo >> (i * 16)), (ushort)(b.Lo >> (i * 16))) << (i * 16);
+        for (int i = 0; i < 4; i++) hi |= (ulong)op((ushort)(a.Hi >> (i * 16)), (ushort)(b.Hi >> (i * 16))) << (i * 16);
+        return new Gpr128 { Lo = lo, Hi = hi };
     }
-    private static byte[] ByteOp(Gpr128 a, Gpr128 b, Func<byte, byte, byte> op)
+    private static Gpr128 ByteOp(Gpr128 a, Gpr128 b, Func<byte, byte, byte> op)
     {
-        var ab = ExtractB(a); var bb = ExtractB(b);
-        var r = new byte[16];
-        for (int i = 0; i < 16; i++) r[i] = op(ab[i], bb[i]);
-        return r;
+        ulong lo = 0, hi = 0;
+        for (int i = 0; i < 8; i++) lo |= (ulong)op((byte)(a.Lo >> (i * 8)), (byte)(b.Lo >> (i * 8))) << (i * 8);
+        for (int i = 0; i < 8; i++) hi |= (ulong)op((byte)(a.Hi >> (i * 8)), (byte)(b.Hi >> (i * 8))) << (i * 8);
+        return new Gpr128 { Lo = lo, Hi = hi };
     }
 
     private static int SatS32(long v) => v > int.MaxValue ? int.MaxValue : v < int.MinValue ? int.MinValue : (int)v;

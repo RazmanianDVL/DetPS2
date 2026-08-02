@@ -30,7 +30,8 @@ public static class SoftGsAvaloniaBlit
         int w,
         int h,
         Span<uint> dstBgra,
-        bool flipY = false)
+        bool flipY = false,
+        bool computeLit = true)
     {
         if (w <= 0 || h <= 0) return 0;
         int n = w * h;
@@ -47,7 +48,7 @@ public static class SoftGsAvaloniaBlit
                 // Soft-GS 0xAARRGGBB LE == Avalonia Bgra8888 memory — no channel swizzle.
                 uint p = softGs[srcRow + x] | 0xFF000000u;
                 dstBgra[dstRow + x] = p;
-                if ((p & 0x00FFFFFFu) != 0)
+                if (computeLit && (p & 0x00FFFFFFu) != 0)
                     lit++;
             }
         }
@@ -64,7 +65,8 @@ public static class SoftGsAvaloniaBlit
         int h,
         byte* dst,
         int rowBytes,
-        bool flipY = false)
+        bool flipY = false,
+        bool computeLit = true)
     {
         if (w <= 0 || h <= 0 || dst == null || rowBytes < w * 4) return 0;
         int n = w * h;
@@ -78,12 +80,22 @@ public static class SoftGsAvaloniaBlit
                 int srcY = flipY ? (h - 1 - y) : y;
                 uint* srcRow = srcPtr + (long)srcY * w;
                 uint* dstRow = (uint*)(dst + (long)y * rowBytes);
-                for (int x = 0; x < w; x++)
+                if (computeLit)
                 {
-                    uint p = srcRow[x] | 0xFF000000u;
-                    dstRow[x] = p;
-                    if ((p & 0x00FFFFFFu) != 0)
-                        lit++;
+                    for (int x = 0; x < w; x++)
+                    {
+                        uint p = srcRow[x] | 0xFF000000u;
+                        dstRow[x] = p;
+                        if ((p & 0x00FFFFFFu) != 0)
+                            lit++;
+                    }
+                }
+                else
+                {
+                    // Caller already knows the lit count (worker-thread hint) — skip the
+                    // redundant per-pixel test+increment that was computed then thrown away.
+                    for (int x = 0; x < w; x++)
+                        dstRow[x] = srcRow[x] | 0xFF000000u;
                 }
             }
         }
