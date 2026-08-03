@@ -406,8 +406,16 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
             // via Open+FileRead stream (countSectors:true) — open alone never draws.
             MaybeDriveGameBg2Open(sys, c);
             MaybeKickCreatingMainLayer(sys, c);
-            // PL-027 / G-GFX-3: feed real MAINMENU/MAINSKY EE plant → Soft-GS Host→Local.
-            TryFeedBo2MainmenuHostToLocal(sys, c);
+            // PL-027 / G-GFX-3 DISABLED (2026-08-02): direct byte inspection of the real disc
+            // (RESOUR~1/LEVELS/UI/MAINMENU.BG2) shows the same Crystal Dynamics "goefile"
+            // container Whiplash uses (magic "goefile"/"symlist"), and the bytes right after
+            // the header — the ones HostToLocalGoefileBulk paints as raw PSMCT32 — are ASCII
+            // scripting symbol names ("getstate", "position", "rotation", "color", ...), not
+            // pixels (measured entropy ~4.2 bits/byte with a ~37 KiB symbol table). Painting
+            // them as pixels fabricated "random lines and colors", not real menu art. Per
+            // CORRECTNESS.md ("no pretty lies"), leave the framebuffer honest instead. Re-enable
+            // once a real goefile texture-block parser locates actual pixel data in the BG2.
+            // TryFeedBo2MainmenuHostToLocal(sys, c);
         }
 
         // After GOE/RKV (cdvd≈300+ without host-warm inflation), main sometimes ends

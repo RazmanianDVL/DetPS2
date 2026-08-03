@@ -1577,6 +1577,21 @@ if (args.Length > 0 && args[0].Equals("netplay-cert", StringComparison.OrdinalIg
     Environment.Exit(cert.ProductionGateMet ? 0 : 1);
 }
 
+// detps2 list-iso <iso> [pathSubstringFilter] — dump every file path + size on the disc image
+// so real on-disc layout can be inspected directly instead of guessed.
+if (args.Length > 0 && args[0].Equals("list-iso", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2) { Console.WriteLine("usage: detps2 list-iso <iso> [pathSubstringFilter]"); Environment.Exit(1); }
+    var evolL = Iso9660.OpenFile(args[1]);
+    if (evolL == null) { Console.WriteLine("bad iso"); Environment.Exit(2); }
+    string? filter = args.Length > 2 ? args[2] : null;
+    foreach (var f in evolL.Files.Where(f => !f.IsDirectory)
+                 .Where(f => filter == null || f.Path.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                 .OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase))
+        Console.WriteLine($"{f.Size,12}  {f.Path}");
+    Environment.Exit(0);
+}
+
 // detps2 extract-file <iso> <isoPathOrSubstring> <outPath> — pull a raw file off the disc image
 // so it can be examined directly (e.g. a real IOP .IRX module) rather than only through the
 // running emulator's memory.

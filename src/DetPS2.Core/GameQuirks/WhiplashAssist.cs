@@ -316,10 +316,22 @@ public sealed class WhiplashAssist : IGameQuirkModule
             && (_titleSurfaceWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 200UL))
             MaybeFillTitleRing(sys, c);
 
-        // MENU-WHIP-2: black full-FB expand (px full FB, lit=0, imgBytes=0) — feed honest
-        // GOE firstscreen/frontend / ring bytes Host→Local so Soft-GS composite can light.
-        if (c >= 6_000_000 && sys.Gs.PixelsWritten >= 50_000)
-            TryFeedTitleChromeHostToLocal(sys, c);
+        // MENU-WHIP-2 DISABLED (2026-08-02): Ghidra RE of the real boot ELF (SLUS_206.84,
+        // ghidra project "Whiplash") plus direct byte inspection of the real disc found that
+        // PS2.RKV "firstscreen"/"frontend"/"Code" are NOT texture data — they are Crystal
+        // Dynamics "goefile" containers (magic "goefile"/"symlist") holding scripting symbol
+        // tables and int16/float32 parameter records (measured entropy ~4.2-4.6 bits/byte,
+        // readable ASCII identifiers throughout — see docs/TITLE_HACKS.md). PS2.RKV itself is
+        // confirmed audio-only (music/streams/vo, 1.29 GiB). The real per-level graphics live
+        // in WHIPLASH/MAP/*.MP2, a distinct, not-yet-reverse-engineered container. Painting the
+        // wrong bytes as raw PSMCT32 pixels produced exactly the reported "random lines and
+        // colors and shapes, no discernible graphics" — fabricated noise, not a real image.
+        // Per CORRECTNESS.md ("no pretty lies"), leave the framebuffer honest rather than paint
+        // bytes we now know are not pixels. Re-enable only once a real .MP2 texture decode
+        // exists. TryFeedTitleChromeHostToLocal/HostToLocalPayloadBulk kept as-is: the BITBLT
+        // Host→Local plumbing is reusable once real texture bytes are located.
+        // if (c >= 6_000_000 && sys.Gs.PixelsWritten >= 50_000)
+        //     TryFeedTitleChromeHostToLocal(sys, c);
 
         // PL-018: pad inject once post-reboot title path is live (Soft-GS or GOE/cdvd).
         // Keep WHIP WaitSema title-local; no global fabricate.
