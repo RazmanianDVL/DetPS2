@@ -269,17 +269,42 @@ structure both `BiosHle`'s own switch *and* `SonyKernelHle`'s real-syscall switc
 (`_kernel.CreateThread`, etc.) — one kernel-state model, two syscall-number tables mapping onto
 it.
 
-### 5.3 IOP side — HLE, not real execution
+### 5.3 IOP side — real execution as of 2026-08-02/03, HLE only as fallback
 
-`Iop.cs` is a real R3000A interpreter, but **IOP modules themselves are not fully executed** —
-`IopModuleHost` (`SifRpc.cs`) tracks which named modules are "loaded" (so `sceSifLoadModule`-style
-checks pass) without running their actual code, and IOP-side RPC servers (SIF-bound services like
-`LIBSD`, `CRI_ADXI`, `SDRDRV`) are HLE'd in `RealSifRpc.cs` (§5.4) by directly emulating what the
-real module's RPC handler would have returned, reverse-engineered from disassembling the real
-`.IRX` modules extracted off retail discs (see `IopDisassembler.cs`, the `iop-disasm`/
-`iop-find-word` CLI tools, and `docs/DEVELOPER_GUIDE.md` §9). This is the single biggest reason
-per-title quirks exist at all (§7): a title using an RPC protocol nobody's reverse-engineered yet
-will stall waiting for a response our IOP HLE doesn't know how to produce.
+**Outdated as of 2026-08-02/03 — corrected below.** `Iop.cs` is a real R3000A interpreter, and
+**real IOP module code now genuinely executes**, both at boot (`BiosBootHost.BootIopBtConfLiteral`
+runs every BIOS-bundled IOPBTCONF module's real `_start` unconditionally, always has) and for
+game-provided disc `.IRX` (`RealSifRpc.LoadModuleByPath` → `IopModuleHost.LoadIrx` +
+`TryStartLoadedModule`, fixed 2026-08-02: a stale name-only placeholder registration used to
+permanently block the real load — see `docs/TITLE_HACKS.md`). Verified live: `EXCEPMAN`/
+`INTRMANP`/`INTRMANI`'s real `_start` genuinely overwrites the emulator's placeholder exception
+stub at IOP RAM `0x80` with real dispatcher instructions; `IOPFILE.IRX`/`SDRDRV.IRX`/`IOPSND.IRX`
+now run real `_start` code (hundreds of thousands to millions of real R3000 instructions,
+previously zero). `RealSifRpc.HandleCall` (§5.4) now also walks the REAL, live
+`SifRpcServerData_t` registry that real running code builds via the real `sceSifSetRpcQueue`/
+`sceSifRegisterRpc` (ground-truthed against the real BIOS `SIFCMD.IRX`) and runs a genuinely
+registered handler for real when one exists, before falling through to any hardcoded per-sid HLE.
+
+The **hardcoded per-sid HLE dispatch in `RealSifRpc.cs`** (SIF-bound services like `LIBSD`,
+`CRI_ADXI`, `SDRDRV`, reverse-engineered from disassembling real `.IRX` modules — see
+`IopDisassembler.cs`, the `iop-disasm`/`iop-find-word` CLI tools, and §9) still exists and is
+still the live path for most titles today, because real execution hasn't been fully wired through
+end-to-end yet — not because it's a deliberate architecture choice. Two concrete open gaps,
+found 2026-08-03 while Ghidra-verifying the C# BIOS conversion against the real BIOS ROM:
+1. A real crash in `SDRDRV.IRX`'s own `_start` (traced to a `SifRpcFunc_t`-shaped internal
+   dispatch function reading a zeroed return address off the stack — its own code is completely
+   standard; something upstream in the call chain, likely real-thread/stack-context handling, is
+   the actual gap) that burns the rest of that module's execution budget in a fault loop.
+2. Real IOP module `_start` routines that spawn worker threads and cooperatively yield rather than
+   returning within any single-context instruction budget — our current "run `_start` in
+   isolation until it returns or hits budget" model doesn't yet interleave real IOP threads the
+   way a real cooperative scheduler would.
+
+Until these are resolved, a title using an RPC protocol nobody's reverse-engineered — or whose
+real driver code doesn't survive far enough into its own `_start` — still stalls waiting for a
+response the hardcoded HLE doesn't know how to produce. This is still the single biggest reason
+per-title quirks exist at all (§7), but the fix is now real-execution-completeness work, not
+protocol reverse-engineering.
 
 ### 5.4 SifRpc.cs vs RealSifRpc.cs — two different protocols, not duplicates
 

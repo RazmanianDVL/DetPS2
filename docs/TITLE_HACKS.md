@@ -47,6 +47,45 @@ what real primitive is `IOPFILE.IRX` waiting on early in its own `_start` that w
 service correctly. Once that's solved (for this or any other title's own IOP driver), this
 mechanism activates automatically with zero further per-title work.
 
+**2026-08-03 investigation — Ghidra-verified the C# BIOS conversion against the real BIOS ROM
+(`Documents/PCSX2/bios/...SCPH70008.bin`), per direct instruction not to keep guessing at
+per-title protocols when the underlying infrastructure itself might be the gap.** Findings:
+- **The IOP kernel dispatch is more correct than assumed, not less.** `EXCEPMAN`/`INTRMANP`/
+  `INTRMANI` all genuinely complete their real `_start` during the standard boot's IOPBTCONF walk
+  (`BiosBootHost.BootIopBtConfLiteral`, which runs unconditionally — no skip-list applies there,
+  that only gates *later*, game-requested re-`MOD_LOAD` calls). Verified live: IOP RAM `0x80`
+  (the BEV=0 general exception vector) genuinely changes from the emulator's placeholder stub to
+  real `SW`-opcode dispatcher instructions after they run — real code is installing a real
+  handler chain, exactly as on hardware.
+- **Real IOP syscalls do fire** (confirmed via new `[IOP-EXC]` tracing showing the real Sony
+  kernel convention: syscall number in `$v0` at trap time, e.g. 1, 8, 0x10, 0x14, 0x20 observed
+  live) and mostly return without crashing.
+- **Root-caused the actual blocker**: `SDRDRV.IRX`'s real `_start` (the sound hardware driver,
+  genuinely running per the 2026-08-02 module-loading fix) eventually calls what is almost
+  certainly its own real `SifRpcFunc_t` RPC handler (`FUN_00000410` in the real disc `SDRDRV.IRX`
+  — signature and body are an unmistakable `int fno, void *buf` dispatch across ~40 real SPU2
+  register operations). Its epilogue is completely ordinary MIPS (`lw ra,0x38(sp); jr ra`) — the
+  bug is not in this function. `$ra` reads back as **zero** from the stack at that point, meaning
+  something earlier in the real call chain never wrote a real return address there. Confirmed via
+  new `[IOP-BADJUMP]` tracing (any `JR`/`JALR` landing under `0x1000`) that the CPU then free-falls
+  into the shared, zero-initialized `_start` stack region and infinite-loops on `jr $0` (the raw
+  encoding of an all-zero word) for the rest of that module's instruction budget — which is very
+  likely why `IOPFILE.IRX` (sharing the same per-module execution budget/scheduling model) never
+  gets far enough to reach its own `sceSifSetRpcQueue`/`sceSifRegisterRpc` calls.
+- **Working theory, not yet confirmed**: real IOP module `_start` routines commonly spawn a
+  worker thread and return control cooperatively rather than running everything inline on the
+  entry stack — our current "run `_start` in isolation on one fixed stack until it returns or
+  hits an instruction budget" model doesn't model that, so a module whose real init legitimately
+  depends on a second thread getting scheduled may never see it happen, and calling into its own
+  registered handler from the wrong stack/thread context (as `SDRDRV.IRX` appears to) would
+  produce exactly this symptom. Next step: trace `SDRDRV.IRX`'s real `_start` call chain (Ghidra)
+  from entry down to the `FUN_00000410` call site to confirm.
+
+New diagnostics added and kept (zero cost when unset, same convention as existing `DETPS2_TRACE_*`
+flags): `DETPS2_TRACE_BTCONF_STEP=1` (per-module IOPBTCONF boot step + IOP RAM `0x80`-`0x8F`
+dump), `[IOP-EXC]` now includes `v0`/`v1`/`a0-a3`/`ra`, `[IOP-BADJUMP]` (any indirect jump to an
+address `< 0x1000`).
+
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|
 | Mortal Kombat: Shaolin Monks (USA) | SLUS_210.87 | MidwayBootAssist — Wave-7 WAD/type2/C1C0/second-chrome PATH3 + **PL-011** host-pad sel-idx 0..4 continuous re-hold + CROSS accept latch (`*54E5F0/*54E5F4/*54E5F8`); SearchFile gate; no type5/sm+0x28. | **mk-mainmenu MENU YES + INTERACTIVE YES** gifP3=18 px=966k prims=9 sel-max=4 accepts≥151 | 2026-07-31 |

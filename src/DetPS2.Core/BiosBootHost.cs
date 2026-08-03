@@ -639,6 +639,10 @@ public sealed class BiosBootHost
                     LoadBase = lr.LoadBase,
                     ExecInstructions = execInsns,
                 });
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BTCONF_STEP") == "1")
+                    Console.Error.WriteLine(
+                        $"[BTCONF-STEP] name={name} action=\"{startNote}\" entry=0x{lr.Entry:X8} " +
+                        $"loadBase=0x{lr.LoadBase:X8} execInsns={execInsns}");
             }
             catch (Exception ex)
             {
@@ -651,6 +655,16 @@ public sealed class BiosBootHost
                     Loaded = false, Started = false, Bytes = mod?.Length ?? 0
                 });
             }
+        }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BTCONF_STEP") == "1")
+        {
+            uint w0 = sys.Memory.IopRead32(0x80);
+            uint w1 = sys.Memory.IopRead32(0x84);
+            uint w2 = sys.Memory.IopRead32(0x88);
+            uint w3 = sys.Memory.IopRead32(0x8C);
+            Console.Error.WriteLine(
+                $"[BTCONF-VEC80] after IOPBTCONF walk: 0x80={w0:X8} 0x84={w1:X8} 0x88={w2:X8} 0x8C={w3:X8}");
         }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1" ||

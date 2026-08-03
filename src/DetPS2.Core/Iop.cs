@@ -304,10 +304,19 @@ public sealed class Iop : ISchedulable
             case 0x04: if (rd != 0) _gprs[rd] = _gprs[rt] << (int)(_gprs[rs] & 0x1F); break; // SLLV
             case 0x06: if (rd != 0) _gprs[rd] = _gprs[rt] >> (int)(_gprs[rs] & 0x1F); break; // SRLV
             case 0x07: if (rd != 0) _gprs[rd] = (uint)((int)_gprs[rt] >> (int)(_gprs[rs] & 0x1F)); break; // SRAV
-            case 0x08: return BranchTo(_gprs[rs]); // JR
+            case 0x08: // JR
+                if (TracePc && _gprs[rs] < 0x1000)
+                    Console.Error.WriteLine(
+                        $"[IOP-BADJUMP] JR to 0x{_gprs[rs]:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
+                        $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
+                return BranchTo(_gprs[rs]);
             case 0x09: // JALR
                 uint ret = PC + 8;
                 uint target = _gprs[rs];
+                if (TracePc && target < 0x1000)
+                    Console.Error.WriteLine(
+                        $"[IOP-BADJUMP] JALR to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
+                        $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
                 if (rd != 0) _gprs[rd] = ret;
                 return BranchTo(target);
             case 0x0C: // SYSCALL — real R3000A exception entry (ExcCode 8), not a halt.
@@ -447,7 +456,8 @@ public sealed class Iop : ISchedulable
         {
             Console.Error.WriteLine(
                 $"[IOP-EXC] code={excCode} syscall=0x{LastSyscallCode:X} epc=0x{Cop0Epc:X8} " +
-                $"vec=0x{_vectorTarget:X8} bev={(bev ? 1 : 0)} n={InstructionsExecuted}");
+                $"vec=0x{_vectorTarget:X8} bev={(bev ? 1 : 0)} n={InstructionsExecuted} " +
+                $"v0=0x{_gprs[2]:X8} v1=0x{_gprs[3]:X8} a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8} a3=0x{_gprs[7]:X8} ra=0x{_gprs[31]:X8}");
         }
     }
 
