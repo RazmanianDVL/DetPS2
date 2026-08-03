@@ -2832,19 +2832,30 @@ public sealed class RealSifRpc
             return iopModules.RegisterModule("_empty_path");
         }
 
-        if (iopModules.TryGetModule(name, out int existingId) ||
-            iopModules.TryGetModule(baseName, out existingId) ||
-            iopModules.TryGetModule(modKey, out existingId))
+        if ((iopModules.TryGetModule(name, out int existingId) ||
+             iopModules.TryGetModule(baseName, out existingId) ||
+             iopModules.TryGetModule(modKey, out existingId))
+            && iopModules.TryGetIrx(existingId, out var existingIrx)
+            && (existingIrx.HasImage || LoadFileHleOwnedSkipStart.Contains(existingIrx.Name)))
         {
-            // Proprietary disc IRX: try _start if image present (HLE-owned skipped in helper).
+            // Real image already loaded (or this name is intentionally HLE-owned, e.g. PADMAN —
+            // never runs for real regardless): nothing more to do but try starting it.
             modres = TryStartLoadedModule(iopModules, existingId);
             return existingId;
         }
+        // Otherwise fall through even if a name-only placeholder was registered earlier (e.g. a
+        // prior empty-path MOD_LOAD probe) — a name-only registration is not a real load, and
+        // this request may carry the real disc path that can actually upgrade it. Real bytes
+        // always win over a placeholder.
 
         // Prefer real IRX bytes from mounted disc (cdrom0:IOP/FOO.IRX, root FOO.IRX, etc.)
         byte[]? discElf = iopModules.ReadDiscFileBytes(path)
                           ?? iopModules.ReadDiscFileBytes(baseName)
                           ?? iopModules.ReadDiscFileBytes(modKey + ".IRX");
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+            Console.Error.WriteLine(
+                $"[LOADMOD-DBG] path=\"{path}\" baseName=\"{baseName}\" modKey=\"{modKey}\" " +
+                $"discElfLen={discElf?.Length ?? -1}");
         if (discElf != null)
         {
             // Disc-backed IRX/IMG reads are real ISO traffic (Burnout 3 IOP/* load list).
@@ -2884,6 +2895,10 @@ public sealed class RealSifRpc
             try
             {
                 var lr = iopModules.LoadIrx(discElf, mem, modKey);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+                    Console.Error.WriteLine(
+                        $"[LOADIRX-DBG] modKey=\"{modKey}\" success={lr.Success} msg=\"{lr.Message}\" " +
+                        $"moduleName=\"{lr.ModuleName}\" entry=0x{lr.Entry:X8}");
                 if (lr.Success && iopModules.TryGetModule(lr.ModuleName, out int mid))
                 {
                     // WP-25/31: real R3000 _start for proprietary disc IRX (shared).
@@ -2898,8 +2913,10 @@ public sealed class RealSifRpc
                 }
                 return LfErrNotIrx;
             }
-            catch
+            catch (Exception ex)
             {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+                    Console.Error.WriteLine($"[LOADIRX-DBG] EXCEPTION modKey=\"{modKey}\": {ex}");
                 return LfErrFileIo;
             }
         }
@@ -2946,6 +2963,15 @@ public sealed class RealSifRpc
     /// <summary>Run R3000 _start for proprietary disc IRX; return LOADFILE modres (WP-25/31).</summary>
     private int TryStartLoadedModule(IopModuleHost iopModules, int mid)
     {
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+        {
+            iopModules.TryGetIrx(mid, out var dbgIrx);
+            Console.Error.WriteLine(
+                $"[STARTMOD-DBG] mid={mid} found={dbgIrx != null} hasImage={dbgIrx?.HasImage} " +
+                $"entry=0x{dbgIrx?.Entry:X8} entryExecuted={dbgIrx?.EntryExecuted} " +
+                $"lastInsn={dbgIrx?.LastEntryInstructions} host={_host != null} " +
+                $"literalEnabled={IopModuleHost.IsLiteralIrxEnabled} name={dbgIrx?.Name}");
+        }
         if (mid < 0) return 0;
         if (!iopModules.TryGetIrx(mid, out var irx) || !irx.HasImage || irx.Entry == 0)
             return irx?.LastModRes ?? 0;
