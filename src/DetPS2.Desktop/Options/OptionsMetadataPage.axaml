@@ -10,14 +10,40 @@
             <Separator />
 
             <CheckBox x:Name="ScrapeBoxArtCheck" Content="Scrape box art (network)" />
-            <TextBlock Text="When enabled, LibraryMetadataService may fetch covers after serial identify. Off by default."
+            <TextBlock Text="When enabled, LibraryMetadataService may fetch covers after serial identify. Off by default. Each source below is tried in order until one has a cover."
                        FontSize="11" Foreground="#666" TextWrapping="Wrap" />
 
-            <TextBlock Text="Scraper provider" FontWeight="SemiBold" />
-            <ComboBox x:Name="ProviderCombo" Width="280" HorizontalAlignment="Left">
+            <CheckBox x:Name="Scrape3DCheck" Content="Also fetch 3D box art (rendered case)" />
+            <TextBlock Text="Cached separately from the flat cover. Only xlenore/ps2-covers and ScreenScraper.fr host 3D renders."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <TextBlock Text="Primary provider" FontWeight="SemiBold" />
+            <ComboBox x:Name="ProviderCombo" Width="320" HorizontalAlignment="Left">
                 <ComboBoxItem Content="Local only (cache, no network)" Tag="LocalOnly" />
-                <ComboBoxItem Content="Serial HTTP (community covers)" Tag="SerialHttp" />
+                <ComboBoxItem Content="xlenore/ps2-covers (community, free, no account)" Tag="SerialHttp" />
             </ComboBox>
+
+            <Separator />
+
+            <TextBlock Text="Additional sources (tried after the primary provider)" FontWeight="SemiBold" />
+
+            <CheckBox x:Name="UseLibretroCheck" Content="libretro-thumbnails (community, free, no account)" />
+            <TextBlock Text="Matched by title rather than serial — lower hit rate, but independent coverage. Flat covers only."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+
+            <CheckBox x:Name="UseScreenScraperCheck" Content="ScreenScraper.fr (requires your own free account)" />
+            <TextBlock Text="Register a free account at screenscraper.fr. Supports both flat and 3D box art. Credentials are stored only in your local config — never bundled with DetPS2."
+                       FontSize="11" Foreground="#666" TextWrapping="Wrap" />
+            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto,Auto" Margin="16,0,0,0">
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Account (ssid)" VerticalAlignment="Center" Margin="0,0,8,6" />
+                <TextBox Grid.Row="0" Grid.Column="1" x:Name="ScreenScraperUserBox" Watermark="your ScreenScraper username" Margin="0,0,0,6" />
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Password" VerticalAlignment="Center" Margin="0,0,8,6" />
+                <TextBox Grid.Row="1" Grid.Column="1" x:Name="ScreenScraperPasswordBox" PasswordChar="•" Watermark="your ScreenScraper password" Margin="0,0,0,6" />
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Dev id (optional)" VerticalAlignment="Center" Margin="0,0,8,6" />
+                <TextBox Grid.Row="2" Grid.Column="1" x:Name="ScreenScraperDevIdBox" Watermark="raises your personal rate limit; leave blank if unsure" Margin="0,0,0,6" />
+                <TextBlock Grid.Row="3" Grid.Column="0" Text="Dev password" VerticalAlignment="Center" Margin="0,0,8,0" />
+                <TextBox Grid.Row="3" Grid.Column="1" x:Name="ScreenScraperDevPasswordBox" PasswordChar="•" />
+            </Grid>
 
             <Separator />
 
@@ -28,7 +54,7 @@
                 <Button Content="Use default" Padding="12,6" Click="OnUseDefaultCacheClick" />
                 <Button Content="Browse…" Padding="12,6" Click="OnBrowseCacheClick" />
             </StackPanel>
-            <TextBlock Text="Layout: {cache}\{serial}\box.jpg  (serial normalized, e.g. SLUS_210.87)"
+            <TextBlock Text="Layout: {cache}\{serial}\box.jpg (flat) and \box3d.png (3D)  — serial normalized, e.g. SLUS_210.87"
                        FontSize="11" Foreground="#666" TextWrapping="Wrap" />
 
             <Separator />

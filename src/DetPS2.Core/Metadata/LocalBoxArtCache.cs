@@ -3,14 +3,26 @@ using System.IO;
 
 namespace DetPS2.Core.Metadata;
 
+/// <summary>Which box art asset — flat front cover, or a rendered 3D case.</summary>
+public enum BoxArtKind
+{
+    /// <summary>Flat front-cover scan/render (traditional box art).</summary>
+    Flat = 0,
+
+    /// <summary>Rendered 3D case (rotated box render), e.g. ScreenScraper "box-3D" / xlenore <c>covers/3d/</c>.</summary>
+    ThreeD = 1,
+}
+
 /// <summary>
 /// On-disk box-art cache under
-/// <c>%LocalAppData%\DetPS2\metadata\{serial}\box.jpg</c>
+/// <c>%LocalAppData%\DetPS2\metadata\{serial}\box.jpg</c> (flat) and
+/// <c>...\{serial}\box3d.png</c> (3D case)
 /// (or a custom root via constructor / <see cref="EmulatorConfig.MetadataCacheDir"/>).
 /// </summary>
 public sealed class LocalBoxArtCache
 {
     public const string BoxFileName = "box.jpg";
+    public const string Box3DFileName = "box3d.png";
 
     private readonly string _root;
 
@@ -38,14 +50,17 @@ public sealed class LocalBoxArtCache
         return s;
     }
 
-    public string GetBoxArtPath(string serial) =>
-        Path.Combine(_root, SanitizeSerialFolder(serial), BoxFileName);
+    private static string FileNameFor(BoxArtKind kind) =>
+        kind == BoxArtKind.ThreeD ? Box3DFileName : BoxFileName;
+
+    public string GetBoxArtPath(string serial, BoxArtKind kind = BoxArtKind.Flat) =>
+        Path.Combine(_root, SanitizeSerialFolder(serial), FileNameFor(kind));
 
     /// <summary>Returns absolute path if a non-empty box art file exists.</summary>
-    public string? TryGet(string serial)
+    public string? TryGet(string serial, BoxArtKind kind = BoxArtKind.Flat)
     {
         if (string.IsNullOrWhiteSpace(serial)) return null;
-        string path = GetBoxArtPath(serial);
+        string path = GetBoxArtPath(serial, kind);
         try
         {
             if (File.Exists(path))
@@ -62,7 +77,7 @@ public sealed class LocalBoxArtCache
     }
 
     /// <summary>Write image bytes and return the absolute path written.</summary>
-    public string Save(string serial, byte[] bytes)
+    public string Save(string serial, byte[] bytes, BoxArtKind kind = BoxArtKind.Flat)
     {
         if (string.IsNullOrWhiteSpace(serial))
             throw new ArgumentException("Serial is required.", nameof(serial));
@@ -71,14 +86,14 @@ public sealed class LocalBoxArtCache
 
         string dir = Path.Combine(_root, SanitizeSerialFolder(serial));
         Directory.CreateDirectory(dir);
-        string path = Path.Combine(dir, BoxFileName);
+        string path = Path.Combine(dir, FileNameFor(kind));
         File.WriteAllBytes(path, bytes);
         return path;
     }
 
-    public bool Delete(string serial)
+    public bool Delete(string serial, BoxArtKind kind = BoxArtKind.Flat)
     {
-        string path = GetBoxArtPath(serial);
+        string path = GetBoxArtPath(serial, kind);
         try
         {
             if (File.Exists(path))

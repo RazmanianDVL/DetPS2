@@ -13,8 +13,11 @@ public sealed class GameMetadata
     /// <summary>Display title if known (from override, scraper, or SYSTEM.CNF heuristics).</summary>
     public string? Title { get; set; }
 
-    /// <summary>Absolute path to local box art image (JPEG/PNG), if present.</summary>
+    /// <summary>Absolute path to local flat/front-cover box art image (JPEG/PNG), if present.</summary>
     public string? BoxArtPath { get; set; }
+
+    /// <summary>Absolute path to local 3D box art (rendered case) image, if present.</summary>
+    public string? BoxArt3DPath { get; set; }
 
     /// <summary>When online metadata was last attempted (UTC).</summary>
     public DateTimeOffset? LastFetchedUtc { get; set; }

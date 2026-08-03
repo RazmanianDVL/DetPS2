@@ -27,8 +27,10 @@ public sealed class GameSettings
 
     /// <summary>Normalized disc serial (e.g. SLUS_210.87), if known.</summary>
     public string? Serial { get; set; }
-    /// <summary>Absolute path to cached/local box art image, if any.</summary>
+    /// <summary>Absolute path to cached/local box art image (flat front cover), if any.</summary>
     public string? BoxArtPath { get; set; }
+    /// <summary>Absolute path to cached/local 3D box art image (rendered case), if any.</summary>
+    public string? BoxArt3DPath { get; set; }
     /// <summary>Optional display title override (library list may prefer this over filename).</summary>
     public string? TitleOverride { get; set; }
 
@@ -105,13 +107,37 @@ public sealed class EmulatorConfig
 
     /// <summary>When true, library may fetch box art online via <see cref="ScraperProvider"/>.</summary>
     public bool ScrapeBoxArt { get; set; }
-    /// <summary>Box-art provider id: LocalOnly | SerialHttp (see DetPS2.Core.Metadata).</summary>
+    /// <summary>Primary box-art provider id: LocalOnly | SerialHttp (see DetPS2.Core.Metadata).</summary>
     public string ScraperProvider { get; set; } = "LocalOnly";
     /// <summary>
     /// Root for metadata cache. Empty = %LocalAppData%\DetPS2\metadata\
-    /// Layout: {MetadataCacheDir}\{serial}\box.jpg
+    /// Layout: {MetadataCacheDir}\{serial}\box.jpg (+ box3d.png when <see cref="Scrape3DBoxArt"/>).
     /// </summary>
     public string MetadataCacheDir { get; set; } = "";
+
+    /// <summary>
+    /// Additive free/keyless source (github.com/libretro-thumbnails) tried after
+    /// <see cref="ScraperProvider"/> when that misses. Title-indexed, flat covers only.
+    /// </summary>
+    public bool UseLibretroThumbnails { get; set; }
+    /// <summary>
+    /// Additive source: screenscraper.fr — requires the user's own free account (never
+    /// embed credentials in source). Supports both flat and 3D box art.
+    /// </summary>
+    public bool UseScreenScraper { get; set; }
+    /// <summary>ScreenScraper end-user account id (ssid) — required for UseScreenScraper.</summary>
+    public string ScreenScraperUser { get; set; } = "";
+    /// <summary>ScreenScraper end-user account password (sspassword).</summary>
+    public string ScreenScraperPassword { get; set; } = "";
+    /// <summary>
+    /// Optional ScreenScraper developer id (devid) for a higher personal rate limit — most
+    /// users can leave this blank; requests work with just ssid/sspassword.
+    /// </summary>
+    public string ScreenScraperDevId { get; set; } = "";
+    /// <summary>Optional ScreenScraper developer password (devpassword), paired with <see cref="ScreenScraperDevId"/>.</summary>
+    public string ScreenScraperDevPassword { get; set; } = "";
+    /// <summary>When true, also scrape/cache a 3D box-art render alongside the flat cover.</summary>
+    public bool Scrape3DBoxArt { get; set; }
 
     public void MigrateGamepadIds()
     {

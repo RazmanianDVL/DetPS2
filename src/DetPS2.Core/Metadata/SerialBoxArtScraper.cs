@@ -6,9 +6,15 @@ using System.Threading.Tasks;
 namespace DetPS2.Core.Metadata;
 
 /// <summary>
-/// Best-effort free/public box-art fetch by disc serial (no API key).
-/// Tries community cover repos over raw HTTPS; returns null on miss/failure.
+/// Best-effort free/public box-art fetch by disc serial (no API key) against
+/// <c>xlenore/ps2-covers</c> (github.com/xlenore/ps2-covers — community-maintained PS2 cover
+/// collection, public raw HTTPS, no auth). Returns null on miss/failure.
 /// Provider id: <c>SerialHttp</c>.
+/// <para>
+/// Verified live against the repo (2026-08-02): <c>covers/default/</c> (flat) is <c>.jpg</c>;
+/// <c>covers/3d/</c> is <c>.png</c> — a prior version of this scraper requested <c>.jpg</c> for
+/// the 3D path too, which 404'd every time (the 3D fallback silently never worked).
+/// </para>
 /// </summary>
 public sealed class SerialBoxArtScraper : IBoxArtScraper, IDisposable
 {
@@ -18,6 +24,8 @@ public sealed class SerialBoxArtScraper : IBoxArtScraper, IDisposable
     private readonly bool _ownsClient;
 
     public string ProviderName => ProviderId;
+
+    public bool SupportsKind(BoxArtKind kind) => true; // flat + 3D both hosted
 
     public SerialBoxArtScraper(HttpClient? httpClient = null)
     {
@@ -35,7 +43,8 @@ public sealed class SerialBoxArtScraper : IBoxArtScraper, IDisposable
     }
 
     /// <inheritdoc />
-    public async Task<byte[]?> FetchAsync(string serial, CancellationToken cancellationToken = default)
+    public async Task<byte[]?> FetchAsync(
+        string serial, string? titleHint, BoxArtKind kind, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(serial))
             return null;
@@ -45,13 +54,17 @@ public sealed class SerialBoxArtScraper : IBoxArtScraper, IDisposable
         string hyphenNoDot = norm.Replace('_', '-').Replace(".", "");
         string underscoreDot = norm;
 
-        string[] candidates =
-        {
-            // xlenore/ps2-covers — public GitHub raw (best-effort; may 404)
-            $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{hyphenNoDot}.jpg",
-            $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{underscoreDot}.jpg",
-            $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/3d/{hyphenNoDot}.jpg",
-        };
+        string[] candidates = kind == BoxArtKind.ThreeD
+            ? new[]
+            {
+                $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/3d/{hyphenNoDot}.png",
+                $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/3d/{underscoreDot}.png",
+            }
+            : new[]
+            {
+                $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{hyphenNoDot}.jpg",
+                $"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{underscoreDot}.jpg",
+            };
 
         foreach (string url in candidates)
         {
@@ -97,7 +110,9 @@ public sealed class NullBoxArtScraper : IBoxArtScraper
 {
     public const string ProviderId = "LocalOnly";
     public string ProviderName => ProviderId;
+    public bool SupportsKind(BoxArtKind kind) => false;
 
-    public Task<byte[]?> FetchAsync(string serial, CancellationToken cancellationToken = default) =>
+    public Task<byte[]?> FetchAsync(
+        string serial, string? titleHint, BoxArtKind kind, CancellationToken cancellationToken = default) =>
         Task.FromResult<byte[]?>(null);
 }

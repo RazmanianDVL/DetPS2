@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Concurrent;
-using System.IO;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -8,8 +8,14 @@ namespace DetPS2.Core.Metadata;
 
 /// <summary>
 /// Resolves disc serials via <see cref="MediaVerify"/> and optionally scrapes box art
-/// into <see cref="LocalBoxArtCache"/>. All work is async / fire-and-forget friendly —
-/// never call network paths on the UI thread without awaiting off-thread.
+/// (flat + optional 3D case render) into <see cref="LocalBoxArtCache"/>. All work is async /
+/// fire-and-forget friendly — never call network paths on the UI thread without awaiting
+/// off-thread.
+/// <para>
+/// Multiple scrapers may be configured (<see cref="EmulatorConfig.ScraperProvider"/> plus the
+/// additive <c>Use*</c> toggles) — <see cref="ResolveScrapers"/> returns them in priority
+/// order and each art kind is tried against each scraper in turn until one hits.
+/// </para>
 /// </summary>
 public sealed class LibraryMetadataService : IDisposable
 {
@@ -17,7 +23,7 @@ public sealed class LibraryMetadataService : IDisposable
     private readonly LocalBoxArtCache _cache;
     private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, GameMetadata> _memory = new(StringComparer.OrdinalIgnoreCase);
-    private IBoxArtScraper? _scraper;
+    private readonly List<IBoxArtScraper> _ownedScrapers = new();
     private bool _disposed;
 
     public LibraryMetadataService(EmulatorConfig config)
@@ -33,16 +39,26 @@ public sealed class LibraryMetadataService : IDisposable
 
     public event Action<GameMetadata>? MetadataUpdated;
 
-    public IBoxArtScraper ResolveScraper()
+    /// <summary>Configured scrapers in try-order. Lazily created once, reused for the service lifetime.</summary>
+    public IReadOnlyList<IBoxArtScraper> ResolveScrapers()
     {
+        if (_ownedScrapers.Count > 0)
+            return _ownedScrapers;
+
         string provider = string.IsNullOrWhiteSpace(_config.ScraperProvider)
             ? NullBoxArtScraper.ProviderId
             : _config.ScraperProvider.Trim();
 
         if (string.Equals(provider, SerialBoxArtScraper.ProviderId, StringComparison.OrdinalIgnoreCase))
-            return _scraper ??= new SerialBoxArtScraper();
+            _ownedScrapers.Add(new SerialBoxArtScraper());
 
-        return NullBoxArtScraperHolder.Instance;
+        if (_config.UseLibretroThumbnails)
+            _ownedScrapers.Add(new LibretroThumbnailsScraper());
+
+        if (_config.UseScreenScraper && !string.IsNullOrWhiteSpace(_config.ScreenScraperUser))
+            _ownedScrapers.Add(new ScreenScraperBoxArtScraper(_config));
+
+        return _ownedScrapers;
     }
 
     /// <summary>
@@ -88,21 +104,27 @@ public sealed class LibraryMetadataService : IDisposable
         if (game != null)
             game.Serial = serial;
 
-        string? cached = _cache.TryGet(serial);
+        string? cachedFlat = _cache.TryGet(serial, BoxArtKind.Flat);
+        string? cached3D = _cache.TryGet(serial, BoxArtKind.ThreeD);
         var meta = new GameMetadata
         {
             Serial = serial,
             Title = game?.TitleOverride ?? game?.DisplayName,
-            BoxArtPath = cached ?? game?.BoxArtPath,
-            Provider = cached != null ? "cache" : null
+            BoxArtPath = cachedFlat ?? game?.BoxArtPath,
+            BoxArt3DPath = cached3D ?? game?.BoxArt3DPath,
+            Provider = cachedFlat != null ? "cache" : null
         };
 
-        if (cached != null && game != null)
-            game.BoxArtPath = cached;
+        if (cachedFlat != null && game != null)
+            game.BoxArtPath = cachedFlat;
+        if (cached3D != null && game != null)
+            game.BoxArt3DPath = cached3D;
 
         _memory[serial] = meta;
 
-        if (_config.ScrapeBoxArt && cached == null)
+        bool needFlat = _config.ScrapeBoxArt && cachedFlat == null;
+        bool need3D = _config.ScrapeBoxArt && _config.Scrape3DBoxArt && cached3D == null;
+        if (needFlat || need3D)
             _ = EnqueueScrapeAsync(serial, game, writePlaceholder: false, cancellationToken);
 
         return meta;
@@ -135,28 +157,49 @@ public sealed class LibraryMetadataService : IDisposable
     {
         try
         {
-            string? existing = _cache.TryGet(serial);
-            if (existing != null)
+            string? titleHint = game?.TitleOverride ?? game?.DisplayName;
+            string? flatPath = _cache.TryGet(serial, BoxArtKind.Flat);
+            string? threeDPath = _cache.TryGet(serial, BoxArtKind.ThreeD);
+            string? flatProvider = flatPath != null ? "cache" : null;
+
+            if (_config.ScrapeBoxArt)
             {
-                Publish(serial, existing, game, "cache");
-                return;
+                if (flatPath == null)
+                    (flatPath, flatProvider) = await TryFetchAndSaveAsync(
+                        serial, titleHint, BoxArtKind.Flat, cancellationToken).ConfigureAwait(false);
+
+                if (_config.Scrape3DBoxArt && threeDPath == null)
+                    (threeDPath, _) = await TryFetchAndSaveAsync(
+                        serial, titleHint, BoxArtKind.ThreeD, cancellationToken).ConfigureAwait(false);
             }
 
-            if (!_config.ScrapeBoxArt)
+            if (flatPath == null && writePlaceholder)
             {
-                if (writePlaceholder)
-                {
-                    string path = _cache.Save(serial, LocalBoxArtCache.MinimalPlaceholderJpeg());
-                    Publish(serial, path, game, "placeholder");
-                }
-                return;
+                flatPath = _cache.Save(serial, LocalBoxArtCache.MinimalPlaceholderJpeg(), BoxArtKind.Flat);
+                flatProvider = "placeholder";
             }
 
-            IBoxArtScraper scraper = ResolveScraper();
-            byte[]? bytes = null;
+            Publish(serial, flatPath, threeDPath, game, flatProvider);
+        }
+        finally
+        {
+            _inFlight.TryRemove(serial, out _);
+        }
+    }
+
+    /// <summary>Try every configured scraper (that supports this kind) in order; first hit wins.</summary>
+    private async Task<(string? path, string? provider)> TryFetchAndSaveAsync(
+        string serial, string? titleHint, BoxArtKind kind, CancellationToken cancellationToken)
+    {
+        foreach (var scraper in ResolveScrapers())
+        {
+            if (!scraper.SupportsKind(kind))
+                continue;
+
+            byte[]? bytes;
             try
             {
-                bytes = await scraper.FetchAsync(serial, cancellationToken).ConfigureAwait(false);
+                bytes = await scraper.FetchAsync(serial, titleHint, kind, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -169,38 +212,28 @@ public sealed class LibraryMetadataService : IDisposable
 
             if (bytes != null && bytes.Length > 0)
             {
-                string path = _cache.Save(serial, bytes);
-                Publish(serial, path, game, scraper.ProviderName);
-                return;
+                string path = _cache.Save(serial, bytes, kind);
+                return (path, scraper.ProviderName);
             }
+        }
 
-            if (writePlaceholder)
-            {
-                string path = _cache.Save(serial, LocalBoxArtCache.MinimalPlaceholderJpeg());
-                Publish(serial, path, game, "placeholder");
-            }
-            else
-            {
-                // leave BoxArtPath empty — documented in METADATA_SCRAPE.md
-                Publish(serial, null, game, scraper.ProviderName);
-            }
-        }
-        finally
-        {
-            _inFlight.TryRemove(serial, out _);
-        }
+        return (null, null);
     }
 
-    private void Publish(string serial, string? boxPath, GameSettings? game, string? provider)
+    private void Publish(string serial, string? boxPath, string? box3DPath, GameSettings? game, string? provider)
     {
-        if (game != null && boxPath != null)
-            game.BoxArtPath = boxPath;
+        if (game != null)
+        {
+            if (boxPath != null) game.BoxArtPath = boxPath;
+            if (box3DPath != null) game.BoxArt3DPath = box3DPath;
+        }
 
         var meta = new GameMetadata
         {
             Serial = serial,
             Title = game?.TitleOverride ?? game?.DisplayName,
             BoxArtPath = boxPath,
+            BoxArt3DPath = box3DPath,
             LastFetchedUtc = DateTimeOffset.UtcNow,
             Provider = provider
         };
@@ -219,9 +252,10 @@ public sealed class LibraryMetadataService : IDisposable
             meta = m;
             return true;
         }
-        string? path = _cache.TryGet(serial);
-        if (path == null) return false;
-        meta = new GameMetadata { Serial = serial, BoxArtPath = path, Provider = "cache" };
+        string? path = _cache.TryGet(serial, BoxArtKind.Flat);
+        string? path3D = _cache.TryGet(serial, BoxArtKind.ThreeD);
+        if (path == null && path3D == null) return false;
+        meta = new GameMetadata { Serial = serial, BoxArtPath = path, BoxArt3DPath = path3D, Provider = "cache" };
         _memory[serial] = meta;
         return true;
     }
@@ -230,13 +264,9 @@ public sealed class LibraryMetadataService : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        if (_scraper is IDisposable d)
-            d.Dispose();
-        _scraper = null;
-    }
-
-    private static class NullBoxArtScraperHolder
-    {
-        public static readonly NullBoxArtScraper Instance = new();
+        foreach (var scraper in _ownedScrapers)
+            if (scraper is IDisposable d)
+                d.Dispose();
+        _ownedScrapers.Clear();
     }
 }

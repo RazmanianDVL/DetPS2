@@ -26,6 +26,20 @@ public partial class OptionsMetadataPage : UserControl
         ArgumentNullException.ThrowIfNull(cfg);
         if (ScrapeBoxArtCheck != null)
             ScrapeBoxArtCheck.IsChecked = cfg.ScrapeBoxArt;
+        if (Scrape3DCheck != null)
+            Scrape3DCheck.IsChecked = cfg.Scrape3DBoxArt;
+        if (UseLibretroCheck != null)
+            UseLibretroCheck.IsChecked = cfg.UseLibretroThumbnails;
+        if (UseScreenScraperCheck != null)
+            UseScreenScraperCheck.IsChecked = cfg.UseScreenScraper;
+        if (ScreenScraperUserBox != null)
+            ScreenScraperUserBox.Text = cfg.ScreenScraperUser ?? "";
+        if (ScreenScraperPasswordBox != null)
+            ScreenScraperPasswordBox.Text = cfg.ScreenScraperPassword ?? "";
+        if (ScreenScraperDevIdBox != null)
+            ScreenScraperDevIdBox.Text = cfg.ScreenScraperDevId ?? "";
+        if (ScreenScraperDevPasswordBox != null)
+            ScreenScraperDevPasswordBox.Text = cfg.ScreenScraperDevPassword ?? "";
 
         if (ProviderCombo != null)
         {
@@ -52,14 +66,20 @@ public partial class OptionsMetadataPage : UserControl
         if (StatusText != null)
         {
             string root = ResolveCacheRoot(cfg.MetadataCacheDir);
-            int count = 0;
+            int flatCount = 0, threeDCount = 0;
             try
             {
                 if (Directory.Exists(root))
-                    count = Directory.GetDirectories(root).Length;
+                {
+                    foreach (string dir in Directory.GetDirectories(root))
+                    {
+                        if (File.Exists(Path.Combine(dir, LocalBoxArtCache.BoxFileName))) flatCount++;
+                        if (File.Exists(Path.Combine(dir, LocalBoxArtCache.Box3DFileName))) threeDCount++;
+                    }
+                }
             }
             catch { /* ignore */ }
-            StatusText.Text = $"Cache root: {root}\nCached serial folders: {count}";
+            StatusText.Text = $"Cache root: {root}\nCached flat covers: {flatCount}\nCached 3D covers: {threeDCount}";
         }
     }
 
@@ -68,6 +88,20 @@ public partial class OptionsMetadataPage : UserControl
         ArgumentNullException.ThrowIfNull(cfg);
         if (ScrapeBoxArtCheck != null)
             cfg.ScrapeBoxArt = ScrapeBoxArtCheck.IsChecked == true;
+        if (Scrape3DCheck != null)
+            cfg.Scrape3DBoxArt = Scrape3DCheck.IsChecked == true;
+        if (UseLibretroCheck != null)
+            cfg.UseLibretroThumbnails = UseLibretroCheck.IsChecked == true;
+        if (UseScreenScraperCheck != null)
+            cfg.UseScreenScraper = UseScreenScraperCheck.IsChecked == true;
+        if (ScreenScraperUserBox != null)
+            cfg.ScreenScraperUser = (ScreenScraperUserBox.Text ?? "").Trim();
+        if (ScreenScraperPasswordBox != null)
+            cfg.ScreenScraperPassword = ScreenScraperPasswordBox.Text ?? "";
+        if (ScreenScraperDevIdBox != null)
+            cfg.ScreenScraperDevId = (ScreenScraperDevIdBox.Text ?? "").Trim();
+        if (ScreenScraperDevPasswordBox != null)
+            cfg.ScreenScraperDevPassword = ScreenScraperDevPasswordBox.Text ?? "";
 
         if (ProviderCombo?.SelectedItem is ComboBoxItem item && item.Tag is string tag)
             cfg.ScraperProvider = tag;

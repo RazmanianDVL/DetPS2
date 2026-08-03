@@ -1,9 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using DetPS2.Core;
 using DetPS2.Core.Input;
+using DetPS2.Core.Metadata;
 
 namespace DetPS2.Tests;
 
@@ -1751,6 +1756,13 @@ press 3000 Circle 100
             VirtualHdd_SaveFileRoundTripAcrossReopen();
             Ps2System_VirtualHddOptInWiring();
 
+            // Metadata / box-art scrape (flat + 3D, multi-source)
+            LocalBoxArtCache_FlatAnd3DAreDistinctFiles();
+            SerialBoxArtScraper_3DUsesPngExtension();
+            LibretroThumbnailsScraper_BuildsTitleBasedCandidateUrl();
+            ScreenScraperBoxArtScraper_ParsesMediaJsonAndFetchesImage();
+            ScreenScraperBoxArtScraper_InactiveWithoutUser();
+
             Console.WriteLine("\n=== ALL SMOKE TESTS PASSED (Phase 56 + media) ===");
             return 0;
         }
@@ -1958,6 +1970,154 @@ press 3000 Circle 100
             try { File.Delete(path); } catch { /* ignore */ }
         }
         Console.WriteLine("[Smoke] Ps2System_VirtualHddOptInWiring OK");
+    }
+
+    // ---- Metadata / box-art scrape (offline — fake HttpMessageHandler, no real network) ----
+
+    private sealed class FakeHttpHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _responder;
+        public List<string> RequestedUrls { get; } = new();
+
+        public FakeHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) => _responder = responder;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            // AbsoluteUri (not ToString()) preserves percent-encoding — ToString() unescapes
+            // %20 back to a literal space for display, which would hide encoding regressions.
+            RequestedUrls.Add(request.RequestUri!.AbsoluteUri);
+            return Task.FromResult(_responder(request));
+        }
+    }
+
+    public static void LocalBoxArtCache_FlatAnd3DAreDistinctFiles()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "detps2_boxart_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var cache = new LocalBoxArtCache(root);
+            const string serial = "SLUS_210.87";
+            byte[] flatBytes = { 0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4 };
+            byte[] threeDBytes = { 0x89, 0x50, 0x4E, 0x47, 5, 6, 7, 8 };
+
+            string flatPath = cache.Save(serial, flatBytes, BoxArtKind.Flat);
+            string threeDPath = cache.Save(serial, threeDBytes, BoxArtKind.ThreeD);
+
+            if (string.Equals(flatPath, threeDPath, StringComparison.OrdinalIgnoreCase))
+                throw new Exception("flat and 3D paths must differ");
+            if (!flatPath.EndsWith("box.jpg", StringComparison.OrdinalIgnoreCase))
+                throw new Exception($"flat filename unexpected: {flatPath}");
+            if (!threeDPath.EndsWith("box3d.png", StringComparison.OrdinalIgnoreCase))
+                throw new Exception($"3D filename unexpected: {threeDPath}");
+
+            if (cache.TryGet(serial, BoxArtKind.Flat) != flatPath) throw new Exception("TryGet flat mismatch");
+            if (cache.TryGet(serial, BoxArtKind.ThreeD) != threeDPath) throw new Exception("TryGet 3D mismatch");
+
+            if (!cache.Delete(serial, BoxArtKind.ThreeD)) throw new Exception("delete 3D failed");
+            if (cache.TryGet(serial, BoxArtKind.ThreeD) != null) throw new Exception("3D still present after delete");
+            if (cache.TryGet(serial, BoxArtKind.Flat) == null) throw new Exception("flat should survive 3D delete");
+
+            Console.WriteLine("[Smoke] LocalBoxArtCache_FlatAnd3DAreDistinctFiles OK");
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>
+    /// Regression test: an earlier version of this scraper requested <c>.jpg</c> for the 3D
+    /// xlenore/ps2-covers path (which is actually <c>.png</c>, verified live 2026-08-02) and
+    /// silently 404'd on every attempt. Locks in the fix.
+    /// </summary>
+    public static void SerialBoxArtScraper_3DUsesPngExtension()
+    {
+        var handler = new FakeHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NotFound));
+        using var http = new HttpClient(handler);
+        using var scraper = new SerialBoxArtScraper(http);
+
+        _ = scraper.FetchAsync("SLUS_203.21", null, BoxArtKind.ThreeD, CancellationToken.None).GetAwaiter().GetResult();
+
+        if (handler.RequestedUrls.Count == 0) throw new Exception("no requests made");
+        foreach (string url in handler.RequestedUrls)
+        {
+            if (!url.Contains("/covers/3d/", StringComparison.OrdinalIgnoreCase))
+                throw new Exception($"3D fetch used wrong folder: {url}");
+            if (!url.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                throw new Exception($"3D fetch used wrong extension (regression!): {url}");
+        }
+        Console.WriteLine($"[Smoke] SerialBoxArtScraper_3DUsesPngExtension OK (urls={handler.RequestedUrls.Count})");
+    }
+
+    public static void LibretroThumbnailsScraper_BuildsTitleBasedCandidateUrl()
+    {
+        var handler = new FakeHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.NotFound));
+        using var http = new HttpClient(handler);
+        using var scraper = new LibretroThumbnailsScraper(http);
+
+        _ = scraper.FetchAsync("SLUS_203.83", "Vexx", BoxArtKind.Flat, CancellationToken.None).GetAwaiter().GetResult();
+
+        if (handler.RequestedUrls.Count == 0) throw new Exception("no requests made");
+        bool sawUsaCandidate = handler.RequestedUrls.Any(u => u.Contains("Vexx%20(USA).png", StringComparison.OrdinalIgnoreCase));
+        if (!sawUsaCandidate)
+            throw new Exception("expected a 'Vexx (USA).png' candidate URL, got: " + string.Join(", ", handler.RequestedUrls));
+        if (handler.RequestedUrls.Any(u => u.Contains("%28") || u.Contains("%29")))
+            throw new Exception("parens should stay literal in raw GitHub URL, not percent-encoded");
+
+        Console.WriteLine($"[Smoke] LibretroThumbnailsScraper_BuildsTitleBasedCandidateUrl OK (urls={handler.RequestedUrls.Count})");
+    }
+
+    public static void ScreenScraperBoxArtScraper_ParsesMediaJsonAndFetchesImage()
+    {
+        const string mediaUrl = "https://images.screenscraper.fr/fake/box3d.png";
+        string json = "{\"response\":{\"jeu\":{\"medias\":[" +
+            "{\"type\":\"box-2D\",\"region\":\"eu\",\"url\":\"https://images.screenscraper.fr/fake/box2d-eu.png\"}," +
+            "{\"type\":\"box-3D\",\"region\":\"us\",\"url\":\"" + mediaUrl + "\"}" +
+            "]}}}";
+        byte[] fakePng =
+        {
+            0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+        };
+
+        var handler = new FakeHttpHandler(req =>
+        {
+            string url = req.RequestUri!.ToString();
+            if (url.Contains("jeuInfos.php", StringComparison.OrdinalIgnoreCase))
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+            if (string.Equals(url, mediaUrl, StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(fakePng) };
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        using var http = new HttpClient(handler);
+        var config = new EmulatorConfig { ScreenScraperUser = "testuser", ScreenScraperPassword = "testpass" };
+        using var scraper = new ScreenScraperBoxArtScraper(config, http);
+
+        byte[]? result = scraper.FetchAsync("SCUS_973.99", "God of War", BoxArtKind.ThreeD, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        if (result == null) throw new Exception("expected 3D box art bytes, got null");
+        if (!result.SequenceEqual(fakePng)) throw new Exception("returned bytes do not match canned media response");
+
+        Console.WriteLine($"[Smoke] ScreenScraperBoxArtScraper_ParsesMediaJsonAndFetchesImage OK (bytes={result.Length})");
+    }
+
+    public static void ScreenScraperBoxArtScraper_InactiveWithoutUser()
+    {
+        var handler = new FakeHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+        using var http = new HttpClient(handler);
+        var config = new EmulatorConfig(); // ScreenScraperUser left empty — must stay inactive
+        using var scraper = new ScreenScraperBoxArtScraper(config, http);
+
+        byte[]? result = scraper.FetchAsync("SCUS_973.99", "God of War", BoxArtKind.Flat, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        if (result != null) throw new Exception("expected null when no ScreenScraper account configured");
+        if (handler.RequestedUrls.Count != 0)
+            throw new Exception("should never issue an HTTP request without a configured account");
+
+        Console.WriteLine("[Smoke] ScreenScraperBoxArtScraper_InactiveWithoutUser OK");
     }
 
     private static bool BytesEqual(byte[] a, byte[] b)
