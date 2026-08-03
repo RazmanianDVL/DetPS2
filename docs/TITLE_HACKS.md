@@ -208,6 +208,48 @@ root cause is a real, general IOP module-placement collision, now fixed:**
   zero exceptions, telemetry identical except each title's final IOP `pc` (expected — modules now
   legitimately execute different, no-longer-corrupted code than before).
 
+**2026-08-03 continued — a second general infra bug in the same family (single-slot state silently
+overwritten), and conclusive proof of the real remaining blocker:**
+- With the placement collision fixed, checked whether real SIF RPC registration
+  (`sceSifSetRpcQueue`/`sceSifRegisterRpc`) finally happens. It still never did —
+  `TryFindRealRpcServer`'s `firstQueue` stayed `0x00000000` across every one of 114 real RPC calls
+  in a 20,000,000-cycle trace. Traced why with `DETPS2_TRACE_IOP_CALLWATCH=6D620` (IOPFILE's real
+  entry physical address): zero hits, with **and** without `--host-present` (ruling out "just a
+  test-harness pacing artifact" — confirmed to reproduce under the same per-tick `RunFor` pattern
+  the real Desktop app uses).
+- Root cause: `IopModuleHost`'s "pending literal entry" arming state (`_pendingLiteralId` and
+  friends) was a **single overwritable field, not a queue** — the same class of bug as the
+  placement-allocator fix above, just in a different subsystem. `LoadIrx` recorded whichever
+  module loaded *last* as "the one to arm next"; if several modules loaded in quick succession
+  (confirmed live: `IOPFILE`→`SDRDRV`→`IOPSND` load back to back during Whiplash's real disc IOPRP
+  handoff, all within the same tick), every entry but the final one was silently discarded before
+  ever getting its real `_start` armed. Fixed (`SifRpc.cs`): converted to an actual FIFO queue
+  (`_pendingLiteralQueue`); `TryArmPendingLiteralEntry` now dequeues-and-arms one entry per call
+  instead of idempotently re-reading a single slot, so every queued module eventually gets its
+  turn across successive `RunFor` calls instead of all but the last being lost. New
+  `DETPS2_TRACE_STARTMOD=1` output: `[LITQUEUE] enqueue/dequeue+arm/removed` shows the exact
+  sequence live.
+- This fix *did* let `IOPFILE`'s real `_start` finally run (confirmed via `[LITQUEUE] removed
+  id=100 (finished via StartLoadedModule)` — it turns out `StartLoadedModule`'s host-driven direct
+  `PC` write, used by the synchronous disc-module-load path, was *also* already reaching it; the
+  `CALLWATCH`-based "zero hits" check above was a false negative from watching only real jump/call
+  *instructions*, which a host-side register poke doesn't go through). But real SIF RPC
+  registration still never completes. Directly tested (not assumed) whether this is simply an
+  instruction-budget problem: reran with `DETPS2_LOADFILE_START_INSNS=10000000` (100× the default
+  100,000-instruction budget `TryStartLoadedModule` gives real disc IRX `_start` calls). Result:
+  **`firstQueue` is still `0x00000000` at 10,000,000 instructions, identical to 100,000.** This
+  conclusively rules out "just needs more budget" — `IOPFILE.IRX`'s real `_start` is genuinely
+  blocked waiting on something this emulator's single-register-file `Iop` can never deliver, not
+  merely slow. Matches, and now conclusively confirms rather than just suspects, the
+  already-documented gap: real IOP `_start` routines that spawn a worker thread and cooperatively
+  yield need actual per-thread register contexts and a real scheduler to resume; a single flat
+  `Iop` GPR set with a bounded "run until sentinel or budget" model cannot represent that no matter
+  how large the budget is. **Not fixed this pass** — modeling real per-thread IOP register
+  contexts is a substantial feature (multiple GPR sets, real context-switch triggers, a real
+  scheduler), scoped out of this investigation; this is the concrete next engineering target.
+  Verified safe: full 9-title roster at 2,000,000 cycles, zero exceptions, telemetry unchanged
+  except final IOP `pc` per title (expected, same reason as the placement fix above).
+
 New diagnostics added and kept (zero cost when unset, same convention as existing `DETPS2_TRACE_*`
 flags): `DETPS2_TRACE_BTCONF_STEP=1` (per-module IOPBTCONF boot step + IOP RAM `0x80`-`0x8F`
 dump), `[IOP-EXC]` now includes `v0`/`v1`/`a0-a3`/`ra`, `[IOP-BADJUMP]` (any indirect jump to an
@@ -217,7 +259,11 @@ address), `DETPS2_TRACE_IOP_CALLWATCH_AFTER=N` (trace N instructions after a cal
 then disarms), `DETPS2_TRACE_IOP_HEARTBEAT=1` (PC every ~1M instructions), `DETPS2_TRACE_SPU2REG=1`
 (every real SPU2 register read), `[IOP-ADEL]` (real address-fault trace), `[LOADIRX-BASE]` under
 `DETPS2_TRACE_STARTMOD=1` (name + candidate/final physical base + whether a prior slot was reused,
-for every real `LoadIrx` call — the tool that caught the `THREADMAN`/`SDRDRV` collision above).
+for every real `LoadIrx` call — the tool that caught the `THREADMAN`/`SDRDRV` collision above),
+`[LITQUEUE]` also under `DETPS2_TRACE_STARTMOD=1` (enqueue/dequeue+arm/removed for the pending
+real-`_start` queue — the tool that caught the single-slot overwrite bug), `DETPS2_LOADFILE_START_INSNS=N`
+(override the real disc-IRX `_start` instruction budget, default 100,000 — used to conclusively
+rule out "just needs more budget" for `IOPFILE.IRX`'s real registration stall).
 
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|

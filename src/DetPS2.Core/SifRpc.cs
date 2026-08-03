@@ -271,16 +271,23 @@ public sealed class IopModuleHost
     /// </summary>
     public const uint ModuleBootParamPhys = 0x001EF000u;
 
-    private int _pendingLiteralId = -1;
-    private uint _pendingLiteralEntryPhys;
-    private uint _pendingLiteralGp;
-    private string _pendingLiteralName = "";
+    private readonly record struct PendingLiteralEntry(int Id, uint EntryPhys, uint Gp, string Name);
+
+    // A real FIFO, not a single overwritable slot (2026-08-03 fix): when several modules load in
+    // quick succession within the same RunFor call -- e.g. IOPFILE/SDRDRV/IOPSND loading back to
+    // back during a real disc IOPRP handoff, exactly what happens in practice -- the old single
+    // "_pendingLiteralId" field meant every load but the last silently discarded the previous
+    // one's real _start before it ever got armed. Confirmed live: IOPFILE.IRX's real entry
+    // (0x1C06D620) never once got jumped to across a 15M-cycle Whiplash trace, with or without
+    // --host-present (i.e. not a test-harness artifact -- the real per-tick RunFor pattern hits
+    // the same bug whenever more than one module loads inside a single tick's worth of cycles).
+    private readonly Queue<PendingLiteralEntry> _pendingLiteralQueue = new();
 
     /// <summary>True when a LoadIrx under LITERAL_IRX left an entry ready to arm on the IOP.</summary>
-    public bool HasPendingLiteralEntry => _pendingLiteralId >= 0;
+    public bool HasPendingLiteralEntry => _pendingLiteralQueue.Count > 0;
 
-    /// <summary>Module id of the pending literal entry, or -1.</summary>
-    public int PendingLiteralModuleId => _pendingLiteralId;
+    /// <summary>Module id of the next pending literal entry (front of queue), or -1.</summary>
+    public int PendingLiteralModuleId => _pendingLiteralQueue.Count > 0 ? _pendingLiteralQueue.Peek().Id : -1;
 
     /// <summary>Share system memory card instance (Phase 31).</summary>
     public void BindMemCard(MemoryCard card) => _memcard = card ?? new MemoryCard();
@@ -314,13 +321,25 @@ public sealed class IopModuleHost
         _memcard.Format();
     }
 
-    /// <summary>Clear the optional post-LoadIrx literal entry arming state.</summary>
-    public void ClearPendingLiteralEntry()
+    /// <summary>Clear all optional post-LoadIrx literal entry arming state.</summary>
+    public void ClearPendingLiteralEntry() => _pendingLiteralQueue.Clear();
+
+    /// <summary>Removes a specific module id from the pending queue if present (it already ran to
+    /// completion via a different path, e.g. <see cref="StartLoadedModule"/>, so it no longer
+    /// needs its own turn through <see cref="TryArmPendingLiteralEntry"/>).</summary>
+    private void RemovePendingLiteralEntry(int id)
     {
-        _pendingLiteralId = -1;
-        _pendingLiteralEntryPhys = 0;
-        _pendingLiteralGp = 0;
-        _pendingLiteralName = "";
+        if (_pendingLiteralQueue.Count == 0) return;
+        var kept = new Queue<PendingLiteralEntry>(_pendingLiteralQueue.Count);
+        bool removed = false;
+        while (_pendingLiteralQueue.Count > 0)
+        {
+            var e = _pendingLiteralQueue.Dequeue();
+            if (e.Id != id) kept.Enqueue(e); else removed = true;
+        }
+        while (kept.Count > 0) _pendingLiteralQueue.Enqueue(kept.Dequeue());
+        if (removed && Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+            Console.Error.WriteLine($"[LITQUEUE] removed id={id} (finished via StartLoadedModule) remainingDepth={_pendingLiteralQueue.Count}");
     }
 
     /// <summary>
@@ -611,17 +630,25 @@ public sealed class IopModuleHost
     }
 
     /// <summary>
-    /// If <see cref="LoadIrx"/> recorded a pending literal entry (<c>DETPS2_LITERAL_IRX=1</c>),
-    /// set <see cref="Iop.PC"/> (and GP) so the next IOP Step quantum executes module text.
-    /// Does not clear the pending record (idempotent re-arm). Returns false if none pending.
+    /// If <see cref="LoadIrx"/> recorded one or more pending literal entries
+    /// (<c>DETPS2_LITERAL_IRX=1</c>), dequeue the front one and set <see cref="Iop.PC"/> (and GP)
+    /// so the next IOP Step quantum executes its module text. Real FIFO, not idempotent re-arm
+    /// (2026-08-03 fix, see the queue field's own doc comment) — each call consumes one entry, so
+    /// a caller that wants every queued module to eventually run its real _start must call this
+    /// again on a later tick once that entry's had a chance to run (<c>Ps2System.RunFor</c> does,
+    /// once per top-level call). Returns false if none pending.
     /// <b>T0 handoff:</b> wire from <c>Ps2System.RunFor</c> when LITERAL_IRX=1 (WP-11).
     /// </summary>
     public bool TryArmPendingLiteralEntry(Iop iop)
     {
-        if (iop == null || _pendingLiteralId < 0) return false;
-        if (!PrepareModuleEntry(iop, _pendingLiteralId))
-            return false;
-        return true;
+        if (iop == null || _pendingLiteralQueue.Count == 0) return false;
+        var entry = _pendingLiteralQueue.Dequeue();
+        bool ok = PrepareModuleEntry(iop, entry.Id);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+            Console.Error.WriteLine(
+                $"[LITQUEUE] dequeue+arm id={entry.Id} name=\"{entry.Name}\" " +
+                $"entryPhys=0x{entry.EntryPhys:X8} ok={ok} remainingDepth={_pendingLiteralQueue.Count}");
+        return ok;
     }
 
     /// <summary>
@@ -707,8 +734,7 @@ public sealed class IopModuleHost
         if (insns > 0)
             ModuleEntryRuns++;
 
-        if (_pendingLiteralId == id)
-            ClearPendingLiteralEntry();
+        RemovePendingLiteralEntry(id);
 
         // After SIFMAN/SIFCMD/_start, present EE-visible SMFLAG bits those modules would post
         // once SIF DMA is fully live. Without this, sibling IRX and EE pollers wait forever
@@ -1032,10 +1058,11 @@ public sealed class IopModuleHost
 
         if (IsLiteralIrxEnabled && result.Entry != 0)
         {
-            _pendingLiteralId = id;
-            _pendingLiteralEntryPhys = ToIopPhys(result.Entry);
-            _pendingLiteralGp = result.Gp;
-            _pendingLiteralName = name;
+            _pendingLiteralQueue.Enqueue(new PendingLiteralEntry(id, ToIopPhys(result.Entry), result.Gp, name));
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+                Console.Error.WriteLine(
+                    $"[LITQUEUE] enqueue id={id} name=\"{name}\" entryPhys=0x{ToIopPhys(result.Entry):X8} " +
+                    $"queueDepth={_pendingLiteralQueue.Count}");
         }
 
         // Advance base for next load, rounded up to a 16KB boundary past this module's real

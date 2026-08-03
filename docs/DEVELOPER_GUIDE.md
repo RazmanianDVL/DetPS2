@@ -313,7 +313,21 @@ found 2026-08-03 while Ghidra-verifying the C# BIOS conversion against the real 
    returning within any single-context instruction budget — our current "run `_start` in
    isolation until it returns or hits budget" model doesn't yet interleave real IOP threads the
    way a real cooperative scheduler would. Still open — gap 1 above turned out to be an unrelated
-   memory-placement bug, not an instance of this one after all.
+   memory-placement bug, not an instance of this one after all. Also found and fixed a *second*,
+   related general bug while chasing this (2026-08-03): `IopModuleHost`'s "pending literal entry"
+   arming state was a single overwritable field, not a queue, so when several modules loaded in
+   quick succession (confirmed live: Whiplash's `IOPFILE`→`SDRDRV`→`IOPSND` disc IOPRP handoff, all
+   within one tick) every entry but the last was silently discarded before its real `_start` ever
+   ran. Fixed to a real FIFO queue. That fix *did* get `IOPFILE.IRX`'s real `_start` running (it
+   turns out `StartLoadedModule`'s host-driven direct PC write was already reaching it via a
+   different path than expected) — but real SIF RPC registration still never completes even so.
+   Directly tested rather than assumed: reran with 100× the default instruction budget
+   (`DETPS2_LOADFILE_START_INSNS=10000000` vs. the default 100,000) — the result was identical,
+   registration never happens either way. This rules out "just needs a bigger budget" and
+   conclusively confirms gap 2 itself as the actual remaining blocker: `IOPFILE.IRX`'s real
+   `_start` is genuinely blocked waiting on something a single flat `Iop` GPR set can never
+   deliver, not merely slow. See `docs/TITLE_HACKS.md`'s "2026-08-03 continued" entry for the full
+   trace.
 
 Until these are resolved, a title using an RPC protocol nobody's reverse-engineered — or whose
 real driver code doesn't survive far enough into its own `_start` — still stalls waiting for a
