@@ -156,6 +156,58 @@ IOP thread/context-switch dispatch, not modeled:**
   instead of free-running for millions of instructions); the corrected diagnosis here is the
   concrete next engineering target for anyone picking this up.
 
+**2026-08-03 resolved — the "context-switch dispatch" hypothesis above was itself wrong; actual
+root cause is a real, general IOP module-placement collision, now fixed:**
+- The "internal label reached via a real dispatch" story didn't survive a direct check against
+  the pristine module. Extracted the real BIOS `THREADMAN.IRX` (via `romdir-extract`, not a
+  possibly-mislabeled prior Ghidra project this time) and Ghidra-decompiled its actual bytes at
+  the exact live addresses from the trace. The real disassembly shows `0x00040940` is a normal
+  function's own prologue (`addiu sp,sp,-0x30`, straight-line for 40+ instructions, no branch to
+  `0x40B78` anywhere nearby), and — decisively — `0x00040BE4` in the real file is `addiu sp,sp,
+  -0x20`, the *start of a completely different function*, not `jr ra` at all. The real epilogue
+  for the `0x940` function is at `0x40BBC`. **The live trace's control flow (`0x940→0xB78→0xBD0`
+  in ~17 instructions, ending in a "jr ra" that isn't really there in the pristine file) could not
+  possibly be executing THREADMAN's real code** — something had overwritten it.
+- Used the existing `--track-writers --find-writer=ADDR:LEN` diagnostic (already in the codebase
+  from an earlier session, built for exactly this) on `0x1C040BE4`. Every word in that range had
+  been overwritten by a single write at `cyc=4867856` with values that are themselves real,
+  correctly-formed MIPS instructions (`0x03E00008`="jr ra", `0x27BD0040`="addiu sp,sp,0x40", …) —
+  i.e. **another real module's own code, landing directly on top of THREADMAN's resident memory.**
+- Extended the `[LOADIRX-BASE]` trace (name + assigned base for every real `LoadIrx` call) across
+  the *entire* trace window instead of stopping early, and found the actual mechanism: after the
+  generic BIOS module set loads once (`SYSMEM`…`FILEIO`, `XLOADFILE`…`XCDVDFSV`), a **second,
+  entirely legitimate wave** reloads `LOADCORE`/`SIFCMD`/`SIFMAN`/`THREADMAN`/`IOMAN`/`MODLOAD`/
+  `FILEIO`/`CDVDMAN`/`CDVDFSV` under their own names — genuine PS2 behavior (a disc-provided IOPRP
+  image swapping in a custom IOP kernel stack after a real IOP reset). The bug: `LoadIrx`'s
+  placement allocator (`_nextIopBase`) **never reclaimed a reloaded module's old slot** — every
+  same-name reload consumed a *brand new* address instead of reusing its own now-abandoned one —
+  which raced the allocator past its `0x00180000` ceiling far faster than real cumulative module
+  size alone would. Once past the ceiling, the allocator **blindly wrapped back to
+  `DefaultLoadBase = 0x00010000`** with zero check for whether that address range was still
+  occupied by a live, still-resident module. The very next load (Whiplash's real `SDRDRV.IRX`)
+  landed at physical `0x00040000` — identical to where `THREADMAN` had already been placed —
+  silently overwriting it mid-run. This is general and universal (not Whiplash- or SDRDRV-
+  specific): any title whose cumulative real IOP module loading exceeds ~1.47MB across its
+  lifetime (entirely plausible on a 2MB IOP given a mid-run IOP reset re-loads its whole kernel
+  stack again) would hit the same silent corruption, just at a different pair of modules.
+- **Fixed** (`IopModuleHost.LoadIrx`, `SifRpc.cs`): replaced the blind bump-then-wrap allocator
+  with one that (1) reuses a same-name reload's own prior slot when the new image still fits in
+  it, instead of always burning a fresh one, and (2) for any placement that isn't a same-name
+  reuse, skips forward past the real footprint of every other currently-registered module instead
+  of trusting the raw bump position — including right after a wraparound, so the wraparound itself
+  is now safe rather than needing to be removed. (Caught and fixed a follow-on bug in the same
+  change: `LoadedIrx.LoadBase` is stored EE-mapped, `0x1C000000`-based, while the allocator's
+  candidate/placement values are local/physical — comparing or reusing them without normalizing
+  through the existing `ToIopPhys` helper would have silently never detected real overlaps.)
+- **Verified live**: re-ran the same 8,000,000-cycle Whiplash trace that previously hit the crash
+  at `n=5,681,324` — the `DETPS2_TRACE_IOP_ADDR_ONESHOT=40BE4` breakpoint never fires at all now.
+  `--find-writer=1C040BE4` confirms the address holds `0x27BDFFE0` ("addiu sp,sp,-0x20") — the
+  real, correct, pristine THREADMAN byte — written once at `cyc=0` (initial load) and never again
+  for the rest of the run. `SDRDRV` now lands at a genuinely free address (`0x00088000` in this
+  run) with zero overlap against any other loaded module. Full 9-title roster at 2,000,000 cycles:
+  zero exceptions, telemetry identical except each title's final IOP `pc` (expected — modules now
+  legitimately execute different, no-longer-corrupted code than before).
+
 New diagnostics added and kept (zero cost when unset, same convention as existing `DETPS2_TRACE_*`
 flags): `DETPS2_TRACE_BTCONF_STEP=1` (per-module IOPBTCONF boot step + IOP RAM `0x80`-`0x8F`
 dump), `[IOP-EXC]` now includes `v0`/`v1`/`a0-a3`/`ra`, `[IOP-BADJUMP]` (any indirect jump to an
@@ -164,8 +216,8 @@ address), `DETPS2_TRACE_IOP_CALLWATCH_AFTER=N` (trace N instructions after a cal
 `DETPS2_TRACE_IOP_ADDR_ONESHOT=0xHEXADDR` (full GPR/stack/approach-path dump on first PC hit,
 then disarms), `DETPS2_TRACE_IOP_HEARTBEAT=1` (PC every ~1M instructions), `DETPS2_TRACE_SPU2REG=1`
 (every real SPU2 register read), `[IOP-ADEL]` (real address-fault trace), `[LOADIRX-BASE]` under
-`DETPS2_TRACE_STARTMOD=1` (name + assigned physical base for every real `LoadIrx` call — the tool
-that caught the `THREADMAN`/`SDRDRV` mislabeling above).
+`DETPS2_TRACE_STARTMOD=1` (name + candidate/final physical base + whether a prior slot was reused,
+for every real `LoadIrx` call — the tool that caught the `THREADMAN`/`SDRDRV` collision above).
 
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|

@@ -926,17 +926,19 @@ public sealed class IopModuleHost
     /// it). Matches MODLOAD LoadStartModule: image load then implicit start (modres resident).</summary>
     public IrxLoader.LoadResult LoadIrx(byte[] elf, SystemMemory mem, string? nameOverride = null)
     {
-        uint baseLocal = _nextIopBase;
-        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
-            Console.Error.WriteLine(
-                $"[LOADIRX-BASE] nameOverride=\"{nameOverride}\" baseLocal=0x{baseLocal:X8}");
-        var result = IrxLoader.Load(elf, mem, baseLocal);
-        if (!result.Success)
-            return result;
+        // Peek the module name/size at the current candidate base before committing to a final
+        // placement, so a same-name reload (a real IOP reset/IOPRP module-set swap re-loading
+        // e.g. LOADCORE/THREADMAN/SIFCMD under their own names) can reuse its own prior slot
+        // instead of always consuming a fresh one (see the placement fixup below for why that
+        // matters).
+        uint candidate = _nextIopBase;
+        var probe = IrxLoader.Load(elf, mem, candidate);
+        if (!probe.Success)
+            return probe;
 
         string name = !string.IsNullOrEmpty(nameOverride)
             ? nameOverride!
-            : (string.IsNullOrEmpty(result.ModuleName) ? $"IRX{_nextModuleId}" : result.ModuleName);
+            : (string.IsNullOrEmpty(probe.ModuleName) ? $"IRX{_nextModuleId}" : probe.ModuleName);
         name = NormalizeName(name);
 
         // Real cross-module linking: scan this module's own real loaded extent (result.Size,
@@ -944,11 +946,47 @@ public sealed class IopModuleHost
         // earlier ones). Real BIOS modules vary a lot in size — e.g. THREADMAN's real loaded
         // size is 0x6C94 (~27KB), confirmed live via `load-irx --scan-exports` against the real
         // extracted module, well past a fixed 16KB window.
-        uint moduleSize = Math.Max(result.Size, 0x1000u); // sane floor for the legacy no-Size path
+        uint moduleSize = Math.Max(probe.Size, 0x1000u); // sane floor for the legacy no-Size path
+
+        _modules.TryGetValue(name, out int existingId);
+        _irxById.TryGetValue(existingId, out var prior);
+
+        // Real placement fixup (2026-08-03): the old scheme just bumped `_nextIopBase` forward
+        // and, once past 0x180000, blindly wrapped back to DefaultLoadBase — with zero check for
+        // whether that address range was still occupied by a live module. Every same-name reload
+        // (e.g. a real IOP reset re-loading LOADCORE/SIFCMD/SIFMAN/THREADMAN/IOMAN/MODLOAD/
+        // FILEIO/CDVDMAN/CDVDFSV from a disc IOPRP image under their own names, genuinely how PS2
+        // titles swap in a custom IOP stack) also always consumed a *fresh* slot rather than
+        // reusing its own now-abandoned one, which raced the allocator toward that wraparound far
+        // faster than real cumulative module size alone would. Once wrapped, the very next load
+        // landed straight on top of a still-resident module's code — confirmed live: Whiplash's
+        // real SDRDRV.IRX reload lands at physical 0x00040000, identical to THREADMAN's original
+        // placement, corrupting it mid-run (docs/TITLE_HACKS.md "2026-08-03 correction"). Fixed:
+        // reuse the prior slot on a same-name reload that still fits it; otherwise skip forward
+        // past any currently-registered module's real footprint instead of trusting the blind
+        // bump position.
+        uint baseLocal = candidate;
+        bool reusePriorSlot = prior != null && prior.HasImage && moduleSize <= prior.Size;
+        if (reusePriorSlot)
+            // prior.LoadBase is stored EE-mapped (IOP_RAM_BASE + local); IrxLoader.Load's
+            // iopLoadBase parameter expects the local/physical form, same as `candidate` above.
+            baseLocal = ToIopPhys(prior!.LoadBase);
+        else
+            baseLocal = FindFreeIopBase(candidate, moduleSize, existingId);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+            Console.Error.WriteLine(
+                $"[LOADIRX-BASE] nameOverride=\"{nameOverride}\" name=\"{name}\" " +
+                $"candidate=0x{candidate:X8} baseLocal=0x{baseLocal:X8} reusedPriorSlot={reusePriorSlot}");
+
+        var result = baseLocal == candidate ? probe : IrxLoader.Load(elf, mem, baseLocal);
+        if (!result.Success)
+            return result;
 
         int id;
-        if (_modules.TryGetValue(name, out id) && _irxById.TryGetValue(id, out var prior))
+        if (prior != null)
         {
+            id = existingId;
             // Upgrade existing name registration with a real image (keep id).
             prior.Entry = result.Entry;
             prior.Gp = result.Gp;
@@ -1005,8 +1043,11 @@ public sealed class IopModuleHost
         // module bigger than 16KB (confirmed real: THREADMAN) have its own tail overwritten by
         // whatever loaded right after it.
         uint afterModule = baseLocal + moduleSize;
-        _nextIopBase = (afterModule + 0x3FFFu) & ~0x3FFFu;
-        if (_nextIopBase <= baseLocal) _nextIopBase = baseLocal + 0x4000; // overflow guard
+        uint advanced = (afterModule + 0x3FFFu) & ~0x3FFFu;
+        if (advanced <= baseLocal) advanced = baseLocal + 0x4000; // overflow guard
+        // Only ever move the bump pointer forward: a same-name reload can land behind it (reusing
+        // its own earlier slot via reusePriorSlot above), and must not regress future placement.
+        if (advanced > _nextIopBase) _nextIopBase = advanced;
         if (_nextIopBase > 0x00180000) _nextIopBase = IrxLoader.DefaultLoadBase;
         IrxLoads++;
         return new IrxLoader.LoadResult
@@ -1020,6 +1061,48 @@ public sealed class IopModuleHost
             Size = moduleSize,
             ModuleName = name
         };
+    }
+
+    /// <summary>Finds a base &gt;= <paramref name="candidate"/> that doesn't overlap the real,
+    /// currently-registered footprint of any other loaded module (skipping <paramref
+    /// name="excludeId"/> — the module being reloaded in place, if any). Real IOP memory is never
+    /// handed out while a module still occupies it; see the doc comment on the call site in
+    /// <see cref="LoadIrx"/> for why this exists.</summary>
+    private uint FindFreeIopBase(uint candidate, uint size, int excludeId)
+    {
+        uint baseLocal = candidate;
+        const uint moduleAreaCeiling = 0x00180000u; // matches AllocIopHeap's IopHeapBase start
+        for (int guard = 0; guard < 256; guard++)
+        {
+            bool moved = false;
+            foreach (var kv in _irxById)
+            {
+                if (kv.Key == excludeId) continue;
+                var m = kv.Value;
+                if (!m.HasImage || m.Size == 0) continue;
+                // m.LoadBase is stored EE-mapped (IOP_RAM_BASE + local); normalize to local form
+                // before comparing against baseLocal (also local), or nothing would ever appear
+                // to overlap even when it genuinely does.
+                uint mStart = ToIopPhys(m.LoadBase), mEnd = mStart + m.Size;
+                uint newEnd = baseLocal + size;
+                if (baseLocal < mEnd && newEnd > mStart)
+                {
+                    // Overlaps this module's real footprint — skip past it and re-scan from
+                    // there (another module could sit right after this one).
+                    uint next = (mEnd + 0x3FFFu) & ~0x3FFFu;
+                    baseLocal = next > baseLocal ? next : baseLocal + 0x4000;
+                    moved = true;
+                }
+            }
+            if (!moved) break;
+            if (baseLocal + size > moduleAreaCeiling)
+            {
+                // Out of contiguous module space below the IOP heap region — wrap once and
+                // keep scanning rather than looping forever or spilling into heap territory.
+                baseLocal = IrxLoader.DefaultLoadBase;
+            }
+        }
+        return baseLocal;
     }
 
     private static string NormalizeName(string name)

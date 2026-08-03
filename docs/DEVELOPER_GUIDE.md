@@ -291,23 +291,29 @@ The **hardcoded per-sid HLE dispatch in `RealSifRpc.cs`** (SIF-bound services li
 still the live path for most titles today, because real execution hasn't been fully wired through
 end-to-end yet — not because it's a deliberate architecture choice. Two concrete open gaps,
 found 2026-08-03 while Ghidra-verifying the C# BIOS conversion against the real BIOS ROM:
-1. A real fault inside `THREADMAN`'s own resident dispatcher (**not** `SDRDRV.IRX` — an earlier
-   session mislabeled this after decompiling the wrong extracted file; corrected 2026-08-03, see
-   `docs/TITLE_HACKS.md`'s "2026-08-03 correction" entry). A real caller inside `INTRMANI`'s
-   resident code makes what looks like an ordinary linked call, but lands on an internal
-   `THREADMAN` label reached only via that module's own dispatch — consistent with a thread
-   reschedule/context-switch, not a plain function call — and `$ra` reads back zero by the time
-   that path reaches its shared epilogue. This module's own code is completely standard; the gap
-   is that real hardware's context switch saves/restores a *complete, separate* register file per
-   thread, and this emulator's `Iop` class has only one flat set of 32 GPRs with no per-thread
-   save/restore, so any real switch-triggering call corrupts registers relative to what a
-   genuinely multi-threaded IOP would preserve. Bounded (no longer a silent unbounded runaway,
-   since the general AdEL fix below) but not yet fixed.
+1. ~~A real fault inside `THREADMAN`'s own resident dispatcher~~ — **fixed 2026-08-03.** This was
+   never a `THREADMAN` code bug or a missing thread-context-switch feature (an earlier session
+   mislabeled the crashing module after decompiling the wrong extracted file, then a follow-up
+   session's first hypothesis — a context-switch dispatch — also didn't survive checking the real
+   pristine module's bytes). The actual cause: `IopModuleHost.LoadIrx`'s placement allocator
+   (`_nextIopBase`) never reclaimed a same-name reload's old address slot (a real IOP reset
+   re-loading its kernel stack — `LOADCORE`/`THREADMAN`/`SIFCMD`/etc. — from a disc IOPRP image is
+   genuine PS2 behavior), so it raced past its `0x180000` ceiling and blindly wrapped back to
+   `DefaultLoadBase` with zero check for whether that range was still occupied by a live, resident
+   module. Whiplash's real `SDRDRV.IRX` landed directly on top of `THREADMAN`'s memory as a result,
+   corrupting it mid-run — general and universal, not title-specific: any title whose cumulative
+   real module loading exceeds ~1.47MB (plausible on a 2MB IOP once a mid-run reset re-loads its
+   whole kernel stack) would hit the same silent corruption. Fixed by making the allocator reuse a
+   reloaded module's own prior slot when it still fits, and otherwise skip forward past every
+   other currently-registered module's real footprint (including right after a wraparound) instead
+   of trusting the raw bump position. See `docs/TITLE_HACKS.md`'s "2026-08-03 resolved" entry for
+   the full trace (Ghidra cross-check against the real BIOS module, `--find-writer` catching the
+   overwrite red-handed, before/after verification).
 2. Real IOP module `_start` routines that spawn worker threads and cooperatively yield rather than
    returning within any single-context instruction budget — our current "run `_start` in
    isolation until it returns or hits budget" model doesn't yet interleave real IOP threads the
-   way a real cooperative scheduler would. Gap 1 above is a sharper, exactly-traced instance of
-   this same missing capability (real per-thread IOP register contexts), not a separate cause.
+   way a real cooperative scheduler would. Still open — gap 1 above turned out to be an unrelated
+   memory-placement bug, not an instance of this one after all.
 
 Until these are resolved, a title using an RPC protocol nobody's reverse-engineered — or whose
 real driver code doesn't survive far enough into its own `_start` — still stalls waiting for a
