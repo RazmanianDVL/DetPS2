@@ -1071,6 +1071,169 @@ public sealed class RealSifRpc
         return p;
     }
 
+    /// <summary>
+    /// Module-relative offset of SIFCMD's own global head-of-queue-chain pointer within its
+    /// <c>.data</c>, ground-truthed 2026-08-02 against the real BIOS SIFCMD.IRX (Ghidra project
+    /// "SIFCMD", function <c>FUN_00001088</c> == the real <c>sceSifSetRpcQueue</c>: appends each
+    /// new queue to this same global chain via the queue struct's own <c>+0x14</c> "next" field).
+    /// </summary>
+    private const uint SifCmdQueueChainOffset = 0x2a60;
+
+    /// <summary>
+    /// Walk the REAL, live SifRpcServerData_t registry that real running IOP module code builds
+    /// via the real <c>sceSifRegisterRpc</c> (ground-truthed layout, same Ghidra decompile:
+    /// <c>FUN_00001130</c>) -- not a per-title guess. Real struct layout:
+    /// <para>SifRpcDataQueue_t: +0x00 arg, +0x08 serverListHead, +0x14 nextQueue.</para>
+    /// <para>SifRpcServerData_t: +0x00 sid, +0x04 func, +0x08 buff, +0x38 nextServer.</para>
+    /// Returns false whenever nothing is genuinely registered yet for this sid (module hasn't
+    /// reached its registration call, or SIFCMD's real image isn't loaded) -- always safe to
+    /// call speculatively; callers fall back to existing HLE on false.
+    /// </summary>
+    private bool TryFindRealRpcServer(SystemMemory mem, IopModuleHost iopModules, uint sid,
+        out uint funcAddr, out uint buffAddr)
+    {
+        funcAddr = 0;
+        buffAddr = 0;
+        bool trace = Environment.GetEnvironmentVariable("DETPS2_TRACE_REALRPC") == "1";
+        if (!iopModules.TryGetModule("SIFCMD", out int sifcmdId) ||
+            !iopModules.TryGetIrx(sifcmdId, out var sifcmd) || !sifcmd.HasImage)
+        {
+            if (trace) Console.Error.WriteLine($"[REALRPC-DBG] sid=0x{sid:X8} SIFCMD not loaded");
+            return false;
+        }
+
+        uint chainHead = sifcmd.LoadBase + SifCmdQueueChainOffset;
+        uint queue = mem.IopRead32(chainHead) & 0x1FFFFFFFu;
+        if (trace)
+            Console.Error.WriteLine(
+                $"[REALRPC-DBG] sid=0x{sid:X8} sifcmdLoadBase=0x{sifcmd.LoadBase:X8} " +
+                $"chainHead=0x{chainHead:X8} firstQueue=0x{queue:X8}");
+        int queueGuard = 0;
+        while (queue != 0 && queueGuard++ < 64)
+        {
+            uint server = mem.IopRead32(queue + 8) & 0x1FFFFFFFu;
+            if (trace)
+                Console.Error.WriteLine($"[REALRPC-DBG]   queue=0x{queue:X8} serverHead=0x{server:X8}");
+            int serverGuard = 0;
+            while (server != 0 && serverGuard++ < 256)
+            {
+                uint serverSid = mem.IopRead32(server);
+                if (trace)
+                    Console.Error.WriteLine(
+                        $"[REALRPC-DBG]     server=0x{server:X8} sid=0x{serverSid:X8} " +
+                        $"func=0x{mem.IopRead32(server + 4):X8} buff=0x{mem.IopRead32(server + 8):X8}");
+                if (serverSid == sid)
+                {
+                    uint f = mem.IopRead32(server + 4) & 0x1FFFFFFFu;
+                    uint b = mem.IopRead32(server + 8) & 0x1FFFFFFFu;
+                    // Real handler must land inside SOME genuinely loaded module's real image --
+                    // guards against a partially-initialized entry while a module's _start is
+                    // still mid-registration (its own budget hasn't let it finish yet).
+                    if (f == 0 || !IsWithinAnyLoadedModule(iopModules, f))
+                        return false;
+                    funcAddr = f;
+                    buffAddr = b;
+                    return true;
+                }
+                server = mem.IopRead32(server + 0x38) & 0x1FFFFFFFu;
+            }
+            queue = mem.IopRead32(queue + 0x14) & 0x1FFFFFFFu;
+        }
+        return false;
+    }
+
+    private static bool IsWithinAnyLoadedModule(IopModuleHost iopModules, uint addr)
+    {
+        foreach (var m in iopModules.GetModuleTable())
+        {
+            if (m.HasImage && m.Size != 0 && addr >= m.LoadBase && addr < m.LoadBase + m.Size)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Actually run a genuinely-registered real RPC handler on the IOP R3000 core with the real
+    /// request bytes, and hand back its real reply -- instead of guessing. Real convention (real
+    /// SifRpcFunc_t signature): <c>void *handler(int fno, void *buf, int size)</c>; the real SIF
+    /// library DMAs the incoming request into the registered buffer before calling the handler
+    /// (replicated here), and the handler's return value (v0) points at the reply, typically the
+    /// same buffer written in place. Saves/restores the IOP CPU context around the call since
+    /// this runs mid-quantum, from EE-side RPC-call handling, not at a normal Iop.Step boundary.
+    /// </summary>
+    private bool TryDispatchRealRegisteredRpc(SystemMemory mem, IopModuleHost iopModules,
+        uint funcAddr, uint buffAddr, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
+    {
+        var iop = _host?.Iop;
+        if (iop == null) return false;
+
+        uint gp = 0;
+        foreach (var m in iopModules.GetModuleTable())
+        {
+            if (m.HasImage && m.Size != 0 && funcAddr >= m.LoadBase && funcAddr < m.LoadBase + m.Size)
+            {
+                gp = m.Gp;
+                break;
+            }
+        }
+
+        if (buffAddr != 0 && argBuf != 0 && sendSize > 0)
+        {
+            uint n = Math.Min(sendSize, 0x4000u);
+            for (uint i = 0; i < n; i++)
+                mem.IopWrite8(buffAddr + i, mem.Read8(argBuf + i));
+        }
+
+        uint savedPc = iop.PC;
+        var savedGpr = new uint[32];
+        for (int i = 0; i < 32; i++) savedGpr[i] = iop.GetGpr(i);
+
+        // Dedicated scratch stack, distinct from DefaultModuleStack (0x1F0000) used by a
+        // module's own _start, so a mid-flight handler call never collides with a module still
+        // parked/spinning after its own entry.
+        const uint scratchStack = 0x001E0000u;
+        iop.PC = IopModuleHost.ToIopPhys(funcAddr);
+        if (gp != 0) iop.SetGpr(28, gp);
+        iop.SetGpr(29, scratchStack);
+        iop.SetGpr(30, scratchStack);
+        iop.SetGpr(31, IopModuleHost.ModuleReturnSentinel);
+        iop.SetGpr(4, fno);
+        iop.SetGpr(5, IopModuleHost.ToIopPhys(buffAddr));
+        iop.SetGpr(6, sendSize);
+
+        ulong before = iop.InstructionsExecuted;
+        const ulong maxInsn = 200_000;
+        bool returned = false;
+        while (iop.InstructionsExecuted - before < maxInsn)
+        {
+            if (iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
+            if (!iop.Running) break;
+            iop.Step(1);
+            if (iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
+        }
+
+        uint replyPtr = iop.GetGpr(2) & 0x1FFFFFFFu;
+        ulong insns = iop.InstructionsExecuted - before;
+
+        iop.PC = savedPc;
+        for (int i = 0; i < 32; i++) iop.SetGpr(i, savedGpr[i]);
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[REAL-RPC] func=0x{funcAddr:X8} fno={fno} buf=0x{buffAddr:X8} send={sendSize} " +
+                $"returned={returned} insns={insns} reply=0x{replyPtr:X8}");
+
+        if (!returned || replyPtr == 0) return false;
+
+        if (recvBuf != 0 && recvSize > 0)
+        {
+            uint n = Math.Min(recvSize, 0x4000u);
+            for (uint i = 0; i < n; i++)
+                mem.Write8(recvBuf + i, mem.IopRead8(replyPtr + i));
+        }
+        return true;
+    }
+
     private void HandleCall(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, IopModuleHost iopModules, uint pktAddr)
     {
         // SifRpcCallPkt_t (56B): +0 sifcmd(16) +16 rec_id +20 pkt_addr +24 rpc_id +28 cd(ptr)
@@ -1084,6 +1247,24 @@ public sealed class RealSifRpc
 
         uint sid = _cdToSid.TryGetValue(cdPtr, out var s) ? s : 0;
         uint argBuf = _cdToArgBuf.TryGetValue(cdPtr, out var a) ? a : 0;
+
+        // Real, generic dispatch (2026-08-02): every PS2 title -- however different its own
+        // engine -- registers its IOP-side RPC services through the exact same standard BIOS
+        // mechanism (sceSifSetRpcQueue + sceSifRegisterRpc, ground-truthed against the real BIOS
+        // SIFCMD.IRX). If a genuinely loaded, genuinely running module has for-real registered a
+        // handler for this sid, run THAT handler on the IOP core and use its real reply instead
+        // of guessing -- this is what makes the per-title hardcoded branches below unnecessary
+        // for any title whose own driver has actually reached this call. Falls through to the
+        // existing HLE below whenever nothing is really registered yet (or for the small set of
+        // BIOS-stack services intentionally never run for real, e.g. LOADFILE/CDVDFSV).
+        if (sid != 0 && Environment.GetEnvironmentVariable("DETPS2_NO_REAL_RPC") != "1"
+            && TryFindRealRpcServer(mem, iopModules, sid, out uint realFunc, out uint realBuf)
+            && TryDispatchRealRegisteredRpc(mem, iopModules, realFunc, realBuf, rpcNumber,
+                argBuf, sendSize, recvBuf, recvSize))
+        {
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return;
+        }
 
         // CRI Middleware ADX (CRI_ADXI.IRX, sid=0x90000200).
         // Live-traced (2026-07-29) on Shaolin Monks SJX_Init:
@@ -2896,9 +3077,22 @@ public sealed class RealSifRpc
             {
                 var lr = iopModules.LoadIrx(discElf, mem, modKey);
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+                {
                     Console.Error.WriteLine(
                         $"[LOADIRX-DBG] modKey=\"{modKey}\" success={lr.Success} msg=\"{lr.Message}\" " +
-                        $"moduleName=\"{lr.ModuleName}\" entry=0x{lr.Entry:X8}");
+                        $"moduleName=\"{lr.ModuleName}\" entry=0x{lr.Entry:X8} " +
+                        $"importsResolved={iopModules.ImportsResolved} importsUnresolved={iopModules.ImportsUnresolved}");
+                    foreach (var probe in new[] { "SIFMAN", "SIFCMD", "SIFINIT" })
+                    {
+                        if (iopModules.TryGetModule(probe, out int pid) && iopModules.TryGetIrx(pid, out var pIrx))
+                            Console.Error.WriteLine(
+                                $"[LOADIRX-DBG]   {probe}: hasImage={pIrx.HasImage} entry=0x{pIrx.Entry:X8} loadBase=0x{pIrx.LoadBase:X8}");
+                        else
+                            Console.Error.WriteLine($"[LOADIRX-DBG]   {probe}: NOT REGISTERED");
+                    }
+                    Console.Error.WriteLine(
+                        $"[LOADIRX-DBG]   exportRegistry keys=[{string.Join(",", iopModules.ExportRegistry.Keys)}]");
+                }
                 if (lr.Success && iopModules.TryGetModule(lr.ModuleName, out int mid))
                 {
                     // WP-25/31: real R3000 _start for proprietary disc IRX (shared).

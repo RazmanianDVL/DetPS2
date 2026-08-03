@@ -8,6 +8,45 @@ Only add a row here when a global fix would break other titles.
 `IGameQuirkModule`, registered by disc serial in `GameQuirkRegistry`, and logged here.
 They should NOT be hand-edited into shared core files.
 
+## Real SIF RPC dispatch (2026-08-02) — the thing this whole file exists to make unnecessary
+
+Every PS2 title, however different its own engine, registers its IOP-side services through the
+exact same standard BIOS mechanism: `sceSifSetRpcQueue` + `sceSifRegisterRpc`, building a real
+linked list of `SifRpcServerData_t` entries in IOP memory that the real SIFCMD dispatcher walks
+by `sid`. This was ground-truthed by extracting the real `SIFCMD.IRX` straight from the BIOS ROM
+(`romdir-extract`) and decompiling it in Ghidra (project `SIFCMD`):
+
+- `sceSifSetRpcQueue` == `FUN_00001088` — appends a queue to a global chain (module-relative
+  `.data` offset `0x2a60` holds the chain head; each queue's `+0x14` is "next queue").
+- `sceSifRegisterRpc` == `FUN_00001130` — appends a `SifRpcServerData_t` to a queue's server list
+  (`+0x00` sid, `+0x04` func, `+0x08` buff, `+0x38` "next server", queue's `+0x08` is the list
+  head). Verified the offset convention is correct: SIFCMD's real live entry point
+  (`0x1C1580D0`) minus its real live load base (`0x1C158000`) is exactly `0xD0`, matching the
+  Ghidra-analyzed `module_start` function address.
+
+`RealSifRpc.HandleCall` now walks this REAL, live registry first (`TryFindRealRpcServer`) before
+falling through to any hardcoded per-sid HLE branch below. If a genuinely loaded, genuinely
+running module has actually registered a handler for the sid being called, its real handler runs
+on the IOP R3000 core with the real request bytes (`TryDispatchRealRegisteredRpc` — full IOP
+context save/restore around the call, since it runs mid-quantum from EE-side call handling), and
+its real reply is used — no guessing. Bounds-checked (a matched handler address must land inside
+some genuinely loaded module's real image, guarding against a partially-initialized entry while a
+module's own `_start` is still mid-registration) and fully backward-compatible: whenever nothing
+is really registered yet (module hasn't reached that call, or the service is one of the small set
+BIOS-stack modules intentionally never run for real, e.g. LOADFILE/CDVDFSV), it falls straight
+through to the existing HLE below, unchanged. Verified safe across the whole roster (all 9 titles
+in `user-media.json` boot cleanly, no regressions) and opt-out via `DETPS2_NO_REAL_RPC=1` for
+bisection. Trace via `DETPS2_TRACE_REALRPC=1`.
+
+**Current status — not yet firing in practice**: for Whiplash, `IOPFILE.IRX`'s real `_start` now
+genuinely executes (see its row below), but its queue-chain head reads `0x00000000` even after
+2,000,000 real instructions — meaning its real init hasn't reached `sceSifSetRpcQueue` yet within
+that budget, or is blocked on something else earlier in its own init that isn't yet correctly
+emulated. That's the next real question: not a per-title hack, but IOP-execution correctness —
+what real primitive is `IOPFILE.IRX` waiting on early in its own `_start` that we don't yet
+service correctly. Once that's solved (for this or any other title's own IOP driver), this
+mechanism activates automatically with zero further per-title work.
+
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|
 | Mortal Kombat: Shaolin Monks (USA) | SLUS_210.87 | MidwayBootAssist — Wave-7 WAD/type2/C1C0/second-chrome PATH3 + **PL-011** host-pad sel-idx 0..4 continuous re-hold + CROSS accept latch (`*54E5F0/*54E5F4/*54E5F8`); SearchFile gate; no type5/sm+0x28. | **mk-mainmenu MENU YES + INTERACTIVE YES** gifP3=18 px=966k prims=9 sel-max=4 accepts≥151 | 2026-07-31 |
