@@ -310,11 +310,16 @@ public sealed class WhiplashAssist : IGameQuirkModule
         if (c >= 4_000_000 && (_rkvWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 100UL))
             MaybeWarmTitleSurface(sys, c);
 
-        // PL-033: progressive firstscreen/frontend ring fill into EE 0x45BC94.
-        // Gate on Soft-GS / disc activity — do not require assist RKV warm (GOE bridge may own it).
-        if (c >= 5_000_000
-            && (_titleSurfaceWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 200UL))
-            MaybeFillTitleRing(sys, c);
+        // PL-033 DISABLED (2026-08-02): this periodically guessed at the EE's ring pointer by
+        // scanning fixed candidate addresses and pulled from a hardcoded RealSifRpc scratch
+        // region that no longer exists (RealSifRpc now delivers real title-stream bytes
+        // directly into the real per-request ring pointer as the game asks for them — see
+        // RealSifRpc.ServiceWhipTitleStream, driven by the actual sid=0x31 stream-table poll
+        // packet, not a periodic guess). Keeping both running would just race two writers over
+        // the same buffer with no real coordination.
+        // if (c >= 5_000_000
+        //     && (_titleSurfaceWarmed || sys.Gs.PixelsWritten > 0 || sys.Cdvd.SectorsRead >= 200UL))
+        //     MaybeFillTitleRing(sys, c);
 
         // MENU-WHIP-2 DISABLED (2026-08-02): Ghidra RE of the real boot ELF (SLUS_206.84,
         // ghidra project "Whiplash") plus direct byte inspection of the real disc found that
