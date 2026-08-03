@@ -927,6 +927,9 @@ public sealed class IopModuleHost
     public IrxLoader.LoadResult LoadIrx(byte[] elf, SystemMemory mem, string? nameOverride = null)
     {
         uint baseLocal = _nextIopBase;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_STARTMOD") == "1")
+            Console.Error.WriteLine(
+                $"[LOADIRX-BASE] nameOverride=\"{nameOverride}\" baseLocal=0x{baseLocal:X8}");
         var result = IrxLoader.Load(elf, mem, baseLocal);
         if (!result.Success)
             return result;

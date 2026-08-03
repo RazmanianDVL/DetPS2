@@ -52,6 +52,33 @@ public sealed class Iop : ISchedulable
         uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CALLWATCH"),
             System.Globalization.NumberStyles.HexNumber, null, out var wct) ? wct : (uint?)null;
 
+    /// <summary>Diagnostic-only: once DETPS2_TRACE_IOP_CALLWATCH fires, trace every retired
+    /// instruction for this many slots afterward (PC + opcode + v0/a0/ra/sp), so a call site with
+    /// no clean, short return can be watched all the way through instead of just at entry/exit.
+    /// Opt-in via DETPS2_TRACE_IOP_CALLWATCH_AFTER=N.</summary>
+    public static readonly ulong WatchTraceAfterInsns =
+        ulong.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CALLWATCH_AFTER"), out var wta) ? wta : 0;
+
+    private ulong _watchTraceRemaining;
+
+    /// <summary>Diagnostic-only: the first time PC reaches this address, dumps full GPRs plus a
+    /// stack window (sp-0x20..sp+0x40) to stderr, then disarms itself for the rest of the process.
+    /// For catching a crash-site PC (e.g. a "jr ra" with a corrupted $ra) with full context on the
+    /// very first hit, without knowing in advance which call chain reaches it.
+    /// Opt-in via DETPS2_TRACE_IOP_ADDR_ONESHOT=0xHEXADDR.</summary>
+    public static readonly uint? OneshotAddr =
+        uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_ADDR_ONESHOT"),
+            System.Globalization.NumberStyles.HexNumber, null, out var osa) ? osa : (uint?)null;
+    private static bool _oneshotFired;
+
+    // Always-on (cheap: fixed-size array, no I/O) ring buffer of the last N (pc,ra) pairs, dumped
+    // only if OneshotAddr fires -- lets a single crash-site hit show its own approach path without
+    // needing a separate, possibly-huge full trace run.
+    private const int RingSize = 256;
+    private readonly uint[] _ringPc = new uint[RingSize];
+    private readonly uint[] _ringRa = new uint[RingSize];
+    private int _ringPos;
+
     /// <summary>Diagnostic-only: prints current PC every 0x100000 (~1M) executed instructions --
     /// coarse enough to be cheap, fine enough to show whether a long-running stretch is a tight
     /// loop (PC barely moves between heartbeats) or genuine varied work. Opt-in via
@@ -178,6 +205,44 @@ public sealed class Iop : ISchedulable
                 Console.Error.WriteLine($"[IOPTRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8}");
             if (TraceHeartbeat && (InstructionsExecuted & 0xFFFFF) == 0)
                 Console.Error.WriteLine($"[IOP-HEARTBEAT] n={InstructionsExecuted} pc=0x{PC:X8}");
+            if (OneshotAddr.HasValue && !_oneshotFired)
+            {
+                _ringPc[_ringPos] = PC;
+                _ringRa[_ringPos] = _gprs[31];
+                _ringPos = (_ringPos + 1) % RingSize;
+            }
+            if (_watchTraceRemaining > 0)
+            {
+                Console.Error.WriteLine(
+                    $"[IOP-CALLWATCH-TRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8} " +
+                    $"v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} ra=0x{_gprs[31]:X8} sp=0x{_gprs[29]:X8}");
+                _watchTraceRemaining--;
+            }
+            if (OneshotAddr.HasValue && PC == OneshotAddr.Value && !_oneshotFired)
+            {
+                _oneshotFired = true;
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"[IOP-ADDR-ONESHOT] hit pc=0x{PC:X8} n={InstructionsExecuted} op=0x{opcode:X8}");
+                for (int r = 0; r < 32; r++)
+                    sb.Append($"r{r}=0x{_gprs[r]:X8} ").Append(r % 8 == 7 ? "\n" : "");
+                sb.AppendLine();
+                sb.AppendLine($"cop0status=0x{Cop0Status:X8} cop0cause=0x{Cop0Cause:X8} cop0epc=0x{Cop0Epc:X8}");
+                uint sp = _gprs[29];
+                sb.AppendLine("stack window:");
+                for (uint off = unchecked((uint)-0x20); off != 0x44; off += 4)
+                {
+                    uint addr = sp + off;
+                    uint val = _memory.IsKnownIopAddress(addr) ? _memory.IopRead32(addr) : 0xFFFFFFFF;
+                    sb.AppendLine($"  [sp{(int)off:+0;-0}] = 0x{addr:X8} -> 0x{val:X8}");
+                }
+                sb.AppendLine($"approach path (last {RingSize} retired instructions, oldest first):");
+                for (int i = 0; i < RingSize; i++)
+                {
+                    int idx = (_ringPos + i) % RingSize;
+                    sb.AppendLine($"  pc=0x{_ringPc[idx]:X8} ra=0x{_ringRa[idx]:X8}");
+                }
+                Console.Error.WriteLine(sb.ToString());
+            }
             bool tookBranch = ExecuteInstruction(opcode);
             executed++;
             InstructionsExecuted++;
@@ -300,10 +365,13 @@ public sealed class Iop : ISchedulable
     {
         uint target = ((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2);
         if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+        {
             Console.Error.WriteLine(
                 $"[IOP-CALLWATCH] J (no-link, ra inherited) to 0x{target:X8} from pc=0x{PC:X8} " +
                 $"n={InstructionsExecuted} sp=0x{_gprs[29]:X8} ra=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
                 $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+            _watchTraceRemaining = WatchTraceAfterInsns;
+        }
         return BranchTo(target);
     }
 
@@ -312,10 +380,13 @@ public sealed class Iop : ISchedulable
         _gprs[31] = PC + 8;
         uint target = ((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2);
         if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+        {
             Console.Error.WriteLine(
                 $"[IOP-CALLWATCH] JAL to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                 $"sp=0x{_gprs[29]:X8} ra(after)=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
                 $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+            _watchTraceRemaining = WatchTraceAfterInsns;
+        }
         return BranchTo(target);
     }
 
@@ -360,10 +431,13 @@ public sealed class Iop : ISchedulable
                         $"[IOP-BADJUMP] JR to 0x{_gprs[rs]:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
                 if (WatchCallTarget.HasValue && _gprs[rs] == WatchCallTarget.Value)
+                {
                     Console.Error.WriteLine(
                         $"[IOP-CALLWATCH] JR to 0x{_gprs[rs]:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} sp=0x{_gprs[29]:X8} ra=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
                         $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+                    _watchTraceRemaining = WatchTraceAfterInsns;
+                }
                 return BranchTo(_gprs[rs]);
             case 0x09: // JALR
                 uint ret = PC + 8;
@@ -373,10 +447,13 @@ public sealed class Iop : ISchedulable
                         $"[IOP-BADJUMP] JALR to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
                 if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+                {
                     Console.Error.WriteLine(
                         $"[IOP-CALLWATCH] JALR to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} sp=0x{_gprs[29]:X8} ra(before)=0x{_gprs[31]:X8} ret(after)=0x{ret:X8} gp=0x{_gprs[28]:X8} " +
                         $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+                    _watchTraceRemaining = WatchTraceAfterInsns;
+                }
                 if (rd != 0) _gprs[rd] = ret;
                 return BranchTo(target);
             case 0x0C: // SYSCALL — real R3000A exception entry (ExcCode 8), not a halt.

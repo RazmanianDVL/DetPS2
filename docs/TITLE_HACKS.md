@@ -113,12 +113,59 @@ game, is at fault:**
     target (single confirmed fault site, `pc=0x00040BE4`, real function `FUN_00000410`) than it
     was before this investigation started.
 
+**2026-08-03 correction — the crashing module is `THREADMAN`, not `SDRDRV.IRX`; root cause is real
+IOP thread/context-switch dispatch, not modeled:**
+- Continuing "find the gap between our system and real hardware": added `DETPS2_TRACE_IOP_CALLWATCH_AFTER=N`
+  (trace N retired instructions after a callwatch hit) and `DETPS2_TRACE_IOP_ADDR_ONESHOT=0xADDR`
+  (full GPR + stack dump + a 256-instruction approach-path ring buffer, first hit only) to watch the
+  crash site directly instead of inferring it from static decompile alone.
+- The one-shot fired at `pc=0x00040BE4 n=5681324`, confirming `$ra` (r31) really is `0x00000000` at
+  the "jr ra" — matches the prior finding. But the approach-path ring buffer showed the *actual*
+  live call chain reaching it: a real caller at `pc=0x00021178` does a linked call (`ra` set to the
+  correct return address `0x00021180`) landing not at the documented function entry `0x00040410`
+  but at `0x00040940` — a label deep *inside* the same function body. From there: two more internal
+  branches (`0x00040940→0x00040B78→0x00040BD0`) before `$ra` flips to `0` at `0x00040BD8` and the
+  shared epilogue at `0x00040BE4` faults.
+- Cross-checked address ownership directly instead of trusting the earlier static Ghidra project's
+  labels: a new `[LOADIRX-BASE]` trace print in `IopModuleHost.LoadIrx` (every real module load,
+  name + assigned physical base) shows the *entire* generic BIOS/stack module set — `SYSMEM`,
+  `LOADCORE`, …, up through `XCDVDFSV` — loads through the **same shared sequential allocator**
+  (`_nextIopBase`, starting at `IrxLoader.DefaultLoadBase = 0x00010000`) as later game-requested
+  loads, each placed contiguously with zero overlap. That trace shows `THREADMAN` — not `SDRDRV` —
+  assigned physical base `0x00040000`. `SDRDRV` never appears in `[LOADIRX-BASE]` output at all
+  within a 1,000,000-cycle Whiplash trace (i.e. it had not been real-loaded yet at the point the
+  earlier session's crash trace was captured). **The earlier session's `sdrdrv_all.txt`/
+  `sdrdrv_crash.txt` Ghidra project was decompiling the wrong extracted file** — its `FUN_00000410`
+  is really `THREADMAN`'s real internal dispatcher, not `SDRDRV`'s RPC handler; the "~40 real SPU2
+  register operations" read in that decompile were misread, not SPU2 calls at all.
+- This reframes the bug from a Whiplash-specific audio-driver quirk into a **general, universal
+  kernel-module gap**: the real caller at `0x00021178` sits inside `INTRMANI`'s resident range
+  (`0x00020000`–`0x00024000`) and makes what looks like an ordinary linked call, but lands on an
+  internal `THREADMAN` label reached only via that module's own switch/dispatch logic — consistent
+  with a **thread reschedule/context-switch dispatch** (`THREADMAN`'s actual job), not a plain
+  function call. Real hardware's context switch saves and restores a *complete, separate* register
+  file per thread (including `$ra`) when switching stacks; this emulator's `Iop` class has exactly
+  one flat set of 32 GPRs with no per-thread save/restore, so any real switch-triggering call
+  necessarily corrupts registers relative to what a genuinely multi-threaded IOP would preserve.
+  This matches, and sharpens, the already-documented "real IOP threads spawning/yielding not
+  modeled" gap in `docs/DEVELOPER_GUIDE.md` §5.3 — same root cause, now traced to an exact call
+  site and exact corrupted register, not a general suspicion.
+- **Not fixed this pass**: modeling real per-thread IOP register contexts (multiple GPR sets +
+  THREADMAN-aware scheduling) is a substantial feature, not a targeted bug fix — scoped out of this
+  investigation. The AdEL fix already bounds the *symptom* (this fault now recovers in one step
+  instead of free-running for millions of instructions); the corrected diagnosis here is the
+  concrete next engineering target for anyone picking this up.
+
 New diagnostics added and kept (zero cost when unset, same convention as existing `DETPS2_TRACE_*`
 flags): `DETPS2_TRACE_BTCONF_STEP=1` (per-module IOPBTCONF boot step + IOP RAM `0x80`-`0x8F`
 dump), `[IOP-EXC]` now includes `v0`/`v1`/`a0-a3`/`ra`, `[IOP-BADJUMP]` (any indirect jump to an
 address `< 0x1000`), `DETPS2_TRACE_IOP_CALLWATCH=0xHEXADDR` (full call context to a chosen
-address), `DETPS2_TRACE_IOP_HEARTBEAT=1` (PC every ~1M instructions), `DETPS2_TRACE_SPU2REG=1`
-(every real SPU2 register read), `[IOP-ADEL]` (real address-fault trace).
+address), `DETPS2_TRACE_IOP_CALLWATCH_AFTER=N` (trace N instructions after a callwatch hit),
+`DETPS2_TRACE_IOP_ADDR_ONESHOT=0xHEXADDR` (full GPR/stack/approach-path dump on first PC hit,
+then disarms), `DETPS2_TRACE_IOP_HEARTBEAT=1` (PC every ~1M instructions), `DETPS2_TRACE_SPU2REG=1`
+(every real SPU2 register read), `[IOP-ADEL]` (real address-fault trace), `[LOADIRX-BASE]` under
+`DETPS2_TRACE_STARTMOD=1` (name + assigned physical base for every real `LoadIrx` call — the tool
+that caught the `THREADMAN`/`SDRDRV` mislabeling above).
 
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|

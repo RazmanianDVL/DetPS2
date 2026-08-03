@@ -291,14 +291,23 @@ The **hardcoded per-sid HLE dispatch in `RealSifRpc.cs`** (SIF-bound services li
 still the live path for most titles today, because real execution hasn't been fully wired through
 end-to-end yet — not because it's a deliberate architecture choice. Two concrete open gaps,
 found 2026-08-03 while Ghidra-verifying the C# BIOS conversion against the real BIOS ROM:
-1. A real crash in `SDRDRV.IRX`'s own `_start` (traced to a `SifRpcFunc_t`-shaped internal
-   dispatch function reading a zeroed return address off the stack — its own code is completely
-   standard; something upstream in the call chain, likely real-thread/stack-context handling, is
-   the actual gap) that burns the rest of that module's execution budget in a fault loop.
+1. A real fault inside `THREADMAN`'s own resident dispatcher (**not** `SDRDRV.IRX` — an earlier
+   session mislabeled this after decompiling the wrong extracted file; corrected 2026-08-03, see
+   `docs/TITLE_HACKS.md`'s "2026-08-03 correction" entry). A real caller inside `INTRMANI`'s
+   resident code makes what looks like an ordinary linked call, but lands on an internal
+   `THREADMAN` label reached only via that module's own dispatch — consistent with a thread
+   reschedule/context-switch, not a plain function call — and `$ra` reads back zero by the time
+   that path reaches its shared epilogue. This module's own code is completely standard; the gap
+   is that real hardware's context switch saves/restores a *complete, separate* register file per
+   thread, and this emulator's `Iop` class has only one flat set of 32 GPRs with no per-thread
+   save/restore, so any real switch-triggering call corrupts registers relative to what a
+   genuinely multi-threaded IOP would preserve. Bounded (no longer a silent unbounded runaway,
+   since the general AdEL fix below) but not yet fixed.
 2. Real IOP module `_start` routines that spawn worker threads and cooperatively yield rather than
    returning within any single-context instruction budget — our current "run `_start` in
    isolation until it returns or hits budget" model doesn't yet interleave real IOP threads the
-   way a real cooperative scheduler would.
+   way a real cooperative scheduler would. Gap 1 above is a sharper, exactly-traced instance of
+   this same missing capability (real per-thread IOP register contexts), not a separate cause.
 
 Until these are resolved, a title using an RPC protocol nobody's reverse-engineered — or whose
 real driver code doesn't survive far enough into its own `_start` — still stalls waiting for a
