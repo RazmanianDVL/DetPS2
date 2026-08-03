@@ -44,6 +44,21 @@ public sealed class Iop : ISchedulable
     public static readonly ulong TracePcLimit =
         ulong.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_LIMIT"), out var lim) ? lim : 2000;
 
+    /// <summary>Diagnostic-only: logs full call context (sp/ra/gp/a0-a2) every time any call
+    /// instruction (J/JAL/JR/JALR) targets this physical IOP address. Opt-in via
+    /// DETPS2_TRACE_IOP_CALLWATCH=0xHEXADDR — for tracing who calls a specific real function
+    /// (and with what stack) when the static decompile shows no in-module caller.</summary>
+    public static readonly uint? WatchCallTarget =
+        uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CALLWATCH"),
+            System.Globalization.NumberStyles.HexNumber, null, out var wct) ? wct : (uint?)null;
+
+    /// <summary>Diagnostic-only: prints current PC every 0x100000 (~1M) executed instructions --
+    /// coarse enough to be cheap, fine enough to show whether a long-running stretch is a tight
+    /// loop (PC barely moves between heartbeats) or genuine varied work. Opt-in via
+    /// DETPS2_TRACE_IOP_HEARTBEAT=1.</summary>
+    public static readonly bool TraceHeartbeat =
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_HEARTBEAT") == "1";
+
     private readonly SystemMemory _memory;
     private uint _branchTarget;
     private bool _pendingVectorJump;
@@ -142,9 +157,27 @@ public sealed class Iop : ISchedulable
         int executed = 0;
         while ((ulong)executed < maxCycles && Running)
         {
+            // Real R3000A raises an Address Error (AdEL) immediately when PC leaves mapped
+            // memory, trapping into the real, now-installed exception handler chain (2026-08-03).
+            // Without this, a derailed PC (from any earlier bug) walked forward forever through
+            // IopRead32's "unmapped == 0 == NOP" fallback -- turning one real, recoverable fault
+            // into an unbounded, silent runaway that burned the rest of a module's execution
+            // budget doing nothing. Root-caused via a real SDRDRV.IRX crash trace, not guessed.
+            if (!_memory.IsKnownIopAddress(PC))
+            {
+                if (TracePc && ExceptionCount <= TracePcLimit)
+                    Console.Error.WriteLine($"[IOP-ADEL] fetch fault pc=0x{PC:X8} n={InstructionsExecuted}");
+                EnterException(4, PC); // AdEL
+                executed++;
+                InstructionsExecuted++;
+                if (_pendingVectorJump) { _pendingVectorJump = false; PC = _vectorTarget; }
+                continue;
+            }
             uint opcode = _memory.IopRead32(PC);
             if (TracePc && InstructionsExecuted < TracePcLimit)
                 Console.Error.WriteLine($"[IOPTRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8}");
+            if (TraceHeartbeat && (InstructionsExecuted & 0xFFFFF) == 0)
+                Console.Error.WriteLine($"[IOP-HEARTBEAT] n={InstructionsExecuted} pc=0x{PC:X8}");
             bool tookBranch = ExecuteInstruction(opcode);
             executed++;
             InstructionsExecuted++;
@@ -190,7 +223,7 @@ public sealed class Iop : ISchedulable
         {
             0x00 => ExecuteSpecial(opcode),
             0x01 => ExecuteRegimm(opcode),
-            0x02 => BranchTo(((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2)),
+            0x02 => J(opcode),
             0x03 => Jal(opcode),
             0x04 => BranchIf(_gprs[Rs(opcode)] == _gprs[Rt(opcode)], opcode),
             0x05 => BranchIf(_gprs[Rs(opcode)] != _gprs[Rt(opcode)], opcode),
@@ -263,10 +296,27 @@ public sealed class Iop : ISchedulable
         return BranchTo((uint)(PC + 4 + off));
     }
 
+    private bool J(uint opcode)
+    {
+        uint target = ((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2);
+        if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+            Console.Error.WriteLine(
+                $"[IOP-CALLWATCH] J (no-link, ra inherited) to 0x{target:X8} from pc=0x{PC:X8} " +
+                $"n={InstructionsExecuted} sp=0x{_gprs[29]:X8} ra=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
+                $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+        return BranchTo(target);
+    }
+
     private bool Jal(uint opcode)
     {
         _gprs[31] = PC + 8;
-        return BranchTo(((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2));
+        uint target = ((PC + 4) & 0xF0000000) | ((opcode & 0x03FFFFFF) << 2);
+        if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+            Console.Error.WriteLine(
+                $"[IOP-CALLWATCH] JAL to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
+                $"sp=0x{_gprs[29]:X8} ra(after)=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
+                $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
+        return BranchTo(target);
     }
 
     private bool ImmArith(uint opcode, Func<uint, int, uint> fn)
@@ -309,6 +359,11 @@ public sealed class Iop : ISchedulable
                     Console.Error.WriteLine(
                         $"[IOP-BADJUMP] JR to 0x{_gprs[rs]:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
+                if (WatchCallTarget.HasValue && _gprs[rs] == WatchCallTarget.Value)
+                    Console.Error.WriteLine(
+                        $"[IOP-CALLWATCH] JR to 0x{_gprs[rs]:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
+                        $"rs=${rs} sp=0x{_gprs[29]:X8} ra=0x{_gprs[31]:X8} gp=0x{_gprs[28]:X8} " +
+                        $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
                 return BranchTo(_gprs[rs]);
             case 0x09: // JALR
                 uint ret = PC + 8;
@@ -317,6 +372,11 @@ public sealed class Iop : ISchedulable
                     Console.Error.WriteLine(
                         $"[IOP-BADJUMP] JALR to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
                         $"rs=${rs} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8}");
+                if (WatchCallTarget.HasValue && target == WatchCallTarget.Value)
+                    Console.Error.WriteLine(
+                        $"[IOP-CALLWATCH] JALR to 0x{target:X8} from pc=0x{PC:X8} n={InstructionsExecuted} " +
+                        $"rs=${rs} sp=0x{_gprs[29]:X8} ra(before)=0x{_gprs[31]:X8} ret(after)=0x{ret:X8} gp=0x{_gprs[28]:X8} " +
+                        $"a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8}");
                 if (rd != 0) _gprs[rd] = ret;
                 return BranchTo(target);
             case 0x0C: // SYSCALL — real R3000A exception entry (ExcCode 8), not a halt.

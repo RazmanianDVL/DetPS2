@@ -334,6 +334,9 @@ public sealed class SystemMemory
             return (byte)(ReadIopIo32(raw & ~3u) >> (int)((raw & 3) * 8));
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
             return _cdvd.ReadMmio8(raw);
+        // SPU2 register window — see the matching comment in IopRead32.
+        if (raw >= Spu2.PhysBase && raw < Spu2.PhysBase + 0x800 && _spu2 != null)
+            return (byte)(_spu2.ReadRegister(raw & ~3u) >> (int)((raw & 3) * 8));
         if (raw >= BIOS_BASE && raw < BIOS_BASE + (uint)BIOS_SIZE) return _bios[raw - BIOS_BASE];
         return 0;
     }
@@ -362,7 +365,38 @@ public sealed class SystemMemory
             _cdvd.WriteMmio8(raw, value);
             return;
         }
+        // SPU2 register window — see the matching comment in IopRead32.
+        if (raw >= Spu2.PhysBase && raw < Spu2.PhysBase + 0x800 && _spu2 != null)
+        {
+            uint aligned = raw & ~3u;
+            int shift = (int)((raw & 3) * 8);
+            uint cur = _spu2.ReadRegister(aligned);
+            _spu2.WriteRegister(aligned, (cur & ~(0xFFu << shift)) | ((uint)value << shift));
+            return;
+        }
         // BIOS ROM / unmapped — ignore writes, matching the EE-side Write8 policy.
+    }
+
+    /// <summary>True when <paramref name="addr"/> is any address the IOP bus actually services
+    /// (RAM, SIF, generic I/O port range, CDVD MMIO, SPU2, BIOS ROM) -- i.e. everywhere
+    /// <see cref="IopRead32"/>/<see cref="IopRead8"/> return real, meaningful data rather than
+    /// their final "unmapped" fallback. Used to gate real R3000 instruction fetch (2026-08-03):
+    /// on real hardware, fetching from a genuinely unmapped address raises an Address Error
+    /// exception immediately; this emulator's IopRead32 fallback silently returns 0 (decodes as
+    /// NOP), which let a derailed PC walk forward forever through "unmapped == infinite NOPs"
+    /// instead of trapping -- turning one real bug into an unbounded, undetectable runaway.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool IsKnownIopAddress(uint addr)
+    {
+        uint paddr = NormalizeIopBusAddr(addr);
+        if (paddr < (uint)IOP_RAM_SIZE) return true;
+        uint raw = addr & 0x1FFFFFFFu;
+        if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE) return true;
+        if (IsIopIoPort(raw)) return true;
+        if (_cdvd != null && Cdvd.IsMmioAddress(raw)) return true;
+        if (raw >= Spu2.PhysBase && raw < Spu2.PhysBase + 0x800) return true;
+        if (raw >= BIOS_BASE && raw < BIOS_BASE + (uint)BIOS_SIZE) return true;
+        return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -383,6 +417,14 @@ public sealed class SystemMemory
                 | (_cdvd.ReadMmio8(raw + 2) << 16)
                 | (_cdvd.ReadMmio8(raw + 3) << 24));
         }
+        // SPU2 register window (0x1F900000-0x1F9007FF) -- real IOP-side sound drivers
+        // (SDRDRV/LIBSD) address SPU2 directly from here, distinct from the EE-side SPU2
+        // window this file already services in Read32/Write32. Unwired until 2026-08-03:
+        // every real IOP-side SPU2 access silently read 0 / dropped writes, so a real driver
+        // polling a real hardware status bit here would spin forever waiting for a response
+        // that could never arrive -- root-caused via a real SDRDRV.IRX crash trace, not guessed.
+        if (raw >= Spu2.PhysBase && raw < Spu2.PhysBase + 0x800 && _spu2 != null)
+            return _spu2.ReadRegister(raw);
         if (raw >= BIOS_BASE && raw + 3 < BIOS_BASE + (uint)BIOS_SIZE)
             return Unsafe.ReadUnaligned<uint>(ref _bios[raw - BIOS_BASE]);
         return 0;
@@ -410,6 +452,12 @@ public sealed class SystemMemory
             _cdvd.WriteMmio8(raw + 1, (byte)(value >> 8));
             _cdvd.WriteMmio8(raw + 2, (byte)(value >> 16));
             _cdvd.WriteMmio8(raw + 3, (byte)(value >> 24));
+            return;
+        }
+        // SPU2 register window — see the matching comment in IopRead32.
+        if (raw >= Spu2.PhysBase && raw < Spu2.PhysBase + 0x800 && _spu2 != null)
+        {
+            _spu2.WriteRegister(raw, value);
             return;
         }
         // BIOS ROM / unmapped — ignore writes.

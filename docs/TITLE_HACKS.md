@@ -72,19 +72,53 @@ per-title protocols when the underlying infrastructure itself might be the gap.*
   encoding of an all-zero word) for the rest of that module's instruction budget — which is very
   likely why `IOPFILE.IRX` (sharing the same per-module execution budget/scheduling model) never
   gets far enough to reach its own `sceSifSetRpcQueue`/`sceSifRegisterRpc` calls.
-- **Working theory, not yet confirmed**: real IOP module `_start` routines commonly spawn a
-  worker thread and return control cooperatively rather than running everything inline on the
-  entry stack — our current "run `_start` in isolation on one fixed stack until it returns or
-  hits an instruction budget" model doesn't model that, so a module whose real init legitimately
-  depends on a second thread getting scheduled may never see it happen, and calling into its own
-  registered handler from the wrong stack/thread context (as `SDRDRV.IRX` appears to) would
-  produce exactly this symptom. Next step: trace `SDRDRV.IRX`'s real `_start` call chain (Ghidra)
-  from entry down to the `FUN_00000410` call site to confirm.
+**2026-08-03 continued — traced the actual call chain and found two more real, general gaps
+(not per-title), per direct instruction that a non-response means the infrastructure, not the
+game, is at fault:**
+- Traced who calls `SDRDRV.IRX`'s `FUN_00000410`: a new `DETPS2_TRACE_IOP_CALLWATCH` diagnostic
+  (traps any `J`/`JAL`/`JALR`/`JR` targeting a chosen physical address) caught a single real call
+  from real `LOADCORE` code (`FUN_0000069c` in `tools/bios-decomp/LOADCORE_ALL.txt` — a generic
+  "invoke a registered callback now, or queue it if the registry isn't ready" mechanism, not SIF
+  RPC dispatch or an interrupt table), at `n=77516`, with a real, correctly-set return address.
+  That call **returns correctly** — so the corruption isn't at the call site.
+- Ruled out the leading hypothesis directly instead of assuming it: added `DETPS2_TRACE_SPU2REG`
+  and confirmed SDRDRV makes only ~106 real SPU2 register reads total in the 5.6M-instruction
+  window before the crash — sparse, not a busy-poll. **This wasn't a starved hardware register.**
+  (Fixed anyway, since it's real and general regardless: `IopRead8`/`IopRead32`/`IopWrite8`/
+  `IopWrite32` never routed IOP-side SPU2 access — `0x1F900000`-`0x1F9007FF` — to the `Spu2` object
+  at all; every real access silently read `0`/dropped. Now wired through to the same `Spu2` the
+  EE side already uses.)
+- Added a coarse `DETPS2_TRACE_IOP_HEARTBEAT` (PC every ~1M instructions) and found the real
+  answer: PC advances by exactly `0x400000` between heartbeats spaced `0x100000` instructions
+  apart — precisely 4 bytes per instruction. **The CPU isn't looping or waiting on anything — it's
+  walking forward through raw memory as NOPs, unbounded, because `IopRead32`'s fallback for a
+  genuinely unmapped address silently returns `0` (which decodes as a real NOP) instead of
+  faulting.** Real R3000A hardware raises an Address Error (AdEL) the instant PC leaves mapped
+  memory; this emulator didn't, so one real, still-unidentified bug (whatever puts `0` in `$ra`
+  before `SDRDRV.IRX`'s `jr ra`) turned into an *undetectable, unbounded* runaway that silently
+  burned the rest of that module's entire execution budget walking through arbitrary memory
+  (confirmed reaching literal ASCII string data and executing it as code) instead of trapping
+  immediately into the real, already-correctly-installed exception handler chain.
+  - **Fixed**: `Iop.Step` now checks `SystemMemory.IsKnownIopAddress(PC)` before every fetch and
+    raises a real AdEL (`EnterException(4, PC)`) when it's false, exactly like real hardware.
+    Verified live: the fault now fires and is handled instead of free-running (3 faults in a
+    20M-cycle Whiplash trace, each recovering in one step). Verified safe across the full title
+    roster — all 9 titles in `user-media.json` produce byte-identical telemetry at 10M cycles
+    before and after this change; zero regressions.
+  - **Still open**: this makes the *symptom* (unbounded runaway) recoverable and bounded, but the
+    original bug — what writes `0` into `$ra` before `SDRDRV.IRX` reaches its own `jr ra` — is not
+    yet identified. `IOPFILE.IRX`'s queue-chain head is still `0x00000000` after this fix in the
+    same trace window, i.e. real registration still hasn't happened yet in the time available;
+    with the runaway now bounded rather than budget-exhausting, this is a more tractable next
+    target (single confirmed fault site, `pc=0x00040BE4`, real function `FUN_00000410`) than it
+    was before this investigation started.
 
 New diagnostics added and kept (zero cost when unset, same convention as existing `DETPS2_TRACE_*`
 flags): `DETPS2_TRACE_BTCONF_STEP=1` (per-module IOPBTCONF boot step + IOP RAM `0x80`-`0x8F`
 dump), `[IOP-EXC]` now includes `v0`/`v1`/`a0-a3`/`ra`, `[IOP-BADJUMP]` (any indirect jump to an
-address `< 0x1000`).
+address `< 0x1000`), `DETPS2_TRACE_IOP_CALLWATCH=0xHEXADDR` (full call context to a chosen
+address), `DETPS2_TRACE_IOP_HEARTBEAT=1` (PC every ~1M instructions), `DETPS2_TRACE_SPU2REG=1`
+(every real SPU2 register read), `[IOP-ADEL]` (real address-fault trace).
 
 | Title id | Serial | Hack | Reason | Date |
 |----------|--------|------|--------|------|

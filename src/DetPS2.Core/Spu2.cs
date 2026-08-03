@@ -180,8 +180,10 @@ public sealed class Spu2 : ISchedulable
     {
         Reads++;
         uint idx = (address & 0x3FF) / 4;
-        if (idx < _regs.Length) return _regs[idx];
-        return 0;
+        uint val = idx < _regs.Length ? _regs[idx] : 0;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SPU2REG") == "1")
+            Console.Error.WriteLine($"[SPU2-REG-R] addr=0x{address:X8} off=0x{address & 0x3FF:X3} val=0x{val:X8} reads={Reads}");
+        return val;
     }
 
     public void WriteRegister(uint address, uint value)
