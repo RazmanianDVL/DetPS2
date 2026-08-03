@@ -24,13 +24,13 @@ public sealed class Gs : ISchedulable
     private readonly byte[] _localMem = new byte[4 * 1024 * 1024];
 
     /// <summary>
-    /// Per-8192-byte-page last-written PSM. -1 = untracked (never written by a tracked path).
-    /// Only <see cref="StoreLocalPixel"/> (Host→Local BITBLT) and <see cref="WriteFrameLocal"/>
-    /// (prim-draw local mirror) update this — the two paths whose own doc comments say they
-    /// exist specifically to keep local mem in sync with what DISPFB present later reads.
-    /// Texture uploads / bulk IMAGE / save-state restore deliberately do NOT update it, so this
-    /// can only ever ADD a "don't trust this composite" signal — it never changes behavior for
-    /// a region populated solely through an untracked writer.
+    /// Per-8192-byte-page last-written PSM (-1 = untracked) and buffer stride (bufW in pixels,
+    /// 0 = untracked). Only <see cref="StoreLocalPixel"/> (Host→Local BITBLT),
+    /// <see cref="WriteFrameLocal"/> (prim-draw local mirror), and <c>UploadTexture*</c> update
+    /// these — paths with unambiguous format/stride info. Texture-adjacent bulk IMAGE / save-state
+    /// restore deliberately do NOT update them, so this can only ever ADD a "don't trust this
+    /// composite" signal — it never changes behavior for a region populated solely through an
+    /// untracked writer.
     /// <para>
     /// Motivation (verified 2026-08-02, MK Deception): DISPFB2 declared PSM=0x0A (PSMCT16S)
     /// FBW=832 pointing at a page whose only real writes were PSM=0x01 (PSMCT24) FBW=640 boot
@@ -41,8 +41,16 @@ public sealed class Gs : ISchedulable
     /// verified byte-for-byte against PCSX2's real GSTables.cpp before finding this — the bug is
     /// a declared-vs-actual format mismatch, not a swizzle math error.
     /// </para>
+    /// <para>
+    /// Stride tracking added the same day after finding a second, distinct case (Whiplash):
+    /// PSM matched (both PSMCT32) but the BITBLT wrote with bufW=256 while the FRAME-residual
+    /// read declared bufW=1024 — same-PSM/different-stride still scrambles which physical page
+    /// backs a given (x,y), since swizzle addressing's pagesPerRow depends on the stride. A
+    /// PSM-only check missed this entirely.
+    /// </para>
     /// </summary>
     private readonly sbyte[] _pageLastWritePsm = CreateUntrackedPageArray(4 * 1024 * 1024 / 8192);
+    private readonly short[] _pageLastWriteStride = new short[4 * 1024 * 1024 / 8192];
 
     private static sbyte[] CreateUntrackedPageArray(int count)
     {
@@ -51,11 +59,27 @@ public sealed class Gs : ISchedulable
         return a;
     }
 
-    private void MarkPageWritten(int byteOffset, int psm)
+    private void MarkPageWritten(int byteOffset, int psm, int bufW)
     {
         int pageIdx = byteOffset / 8192;
         if ((uint)pageIdx < (uint)_pageLastWritePsm.Length)
+        {
             _pageLastWritePsm[pageIdx] = (sbyte)psm;
+            _pageLastWriteStride[pageIdx] = (short)Math.Clamp(bufW, 0, short.MaxValue);
+        }
+    }
+
+    /// <summary>True when a composite should refuse to paint given what this page was actually last written as.</summary>
+    private bool IsPageMismatched(int byteOffset, int declaredPsm, int declaredBufW)
+    {
+        if (byteOffset < 0) return false;
+        int pageIdx = byteOffset / 8192;
+        if ((uint)pageIdx >= (uint)_pageLastWritePsm.Length) return false;
+        sbyte lastPsm = _pageLastWritePsm[pageIdx];
+        if (lastPsm < 0) return false; // untracked — no opinion
+        if (lastPsm != declaredPsm) return true;
+        short lastStride = _pageLastWriteStride[pageIdx];
+        return lastStride > 0 && lastStride != declaredBufW;
     }
 
     /// <summary>
@@ -634,7 +658,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)baseBytes + (py * bufW + px) / 2;
             if (bi < 0 || bi >= _localMem.Length) return;
-            MarkPageWritten(bi, psm);
+            MarkPageWritten(bi, psm, bufW);
             int nibbleIndex = py * bufW + px;
             if ((nibbleIndex & 1) == 0)
                 _localMem[bi] = (byte)((_localMem[bi] & 0xF0) | (pixel & 0xF));
@@ -644,7 +668,7 @@ public sealed class Gs : ISchedulable
         }
         int off = LocalPixelByteOffset(baseBytes, px, py, bufW, psm, bpp);
         if (off < 0 || off >= _localMem.Length) return;
-        MarkPageWritten(off, psm);
+        MarkPageWritten(off, psm, bufW);
         for (int b = 0; b < bpp && off + b < _localMem.Length; b++)
             _localMem[off + b] = (byte)(pixel >> (8 * b));
     }
@@ -1310,7 +1334,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)SwizzleOffset32(baseBytes, x, y, fbw);
             if ((uint)bi + 3u >= (uint)_localMem.Length) return;
-            MarkPageWritten(bi, psm);
+            MarkPageWritten(bi, psm, fbw);
             _localMem[bi] = (byte)pixel;
             _localMem[bi + 1] = (byte)(pixel >> 8);
             _localMem[bi + 2] = (byte)(pixel >> 16);
@@ -1330,7 +1354,7 @@ public sealed class Gs : ISchedulable
                 ? (int)SwizzleOffset16S(baseBytes, x, y, fbw)
                 : (int)SwizzleOffset16(baseBytes, x, y, fbw);
             if ((uint)bi + 1u >= (uint)_localMem.Length) return;
-            MarkPageWritten(bi, psm);
+            MarkPageWritten(bi, psm, fbw);
             _localMem[bi] = (byte)p16;
             _localMem[bi + 1] = (byte)(p16 >> 8);
             _localMemHasImage = true;
@@ -1712,7 +1736,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)SwizzleOffset8(_texBase, i % width, i / width, _texBufWidth);
             if (bi >= _localMem.Length) break;
-            MarkPageWritten(bi, 0x13);
+            MarkPageWritten(bi, 0x13, _texBufWidth);
             _localMem[bi] = indices[i];
         }
         if (clutRgba.Length > 0)
@@ -1770,7 +1794,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)SwizzleOffset32(_texBase, i % width, i / width, _texBufWidth);
             if (bi + 3 >= _localMem.Length) break;
-            MarkPageWritten(bi, 0x00);
+            MarkPageWritten(bi, 0x00, _texBufWidth);
             uint p = pixels[i];
             _localMem[bi] = (byte)p;
             _localMem[bi + 1] = (byte)(p >> 8);
@@ -1805,7 +1829,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)SwizzleOffset16(_texBase, i % width, i / width, _texBufWidth);
             if (bi + 1 >= _localMem.Length) break;
-            MarkPageWritten(bi, 0x02);
+            MarkPageWritten(bi, 0x02, _texBufWidth);
             ushort p = pixels[i];
             _localMem[bi] = (byte)p;
             _localMem[bi + 1] = (byte)(p >> 8);
@@ -2521,26 +2545,19 @@ public sealed class Gs : ISchedulable
                 uint pixel = LoadLocalPixelForPresent(baseBytes, sx, sy, fbw, psm, out int bi);
                 if ((pixel & 0x00FFFFFF) == 0) continue;
                 // Don't paint a pixel whose backing page was demonstrably last written in a
-                // different format than this composite is decoding it as — reading swizzled
-                // bytes with the wrong PSM/stride produces scrambled static, not a real picture
-                // (see _pageLastWritePsm doc; verified 2026-08-02 against MK Deception, where
-                // DISPFB2 declared PSM=0x0A/832 over a page whose only real writes were
-                // PSM=0x01/640 boot chrome). Untracked pages (-1, e.g. populated via texture
-                // upload / bulk IMAGE) are never second-guessed. Applies to every composite kind
-                // here (natural, residual, synthetic FBP0) — a residual fallback reading real
-                // disc bytes in the wrong format is exactly as dishonest as the natural path
-                // doing it; "Host→Local residual" only means non-natural sourcing, not license
-                // to reinterpret bytes in a format they were never written in.
-                if (bi >= 0)
-                {
-                    int pageIdx = bi / 8192;
-                    if ((uint)pageIdx < (uint)_pageLastWritePsm.Length)
-                    {
-                        sbyte lastPsm = _pageLastWritePsm[pageIdx];
-                        if (lastPsm >= 0 && lastPsm != psm)
-                            continue;
-                    }
-                }
+                // different format or stride than this composite is decoding it as — reading
+                // swizzled bytes with the wrong PSM/stride produces scrambled static, not a real
+                // picture (see _pageLastWritePsm doc; verified 2026-08-02 against two distinct
+                // cases: MK Deception, DISPFB2 declared PSM=0x0A/832 over a page whose only real
+                // writes were PSM=0x01/640 boot chrome; Whiplash, same PSM but a BITBLT write at
+                // stride 256 read back at stride 1024). Untracked pages are never second-guessed.
+                // Applies to every composite kind here (natural, residual, synthetic FBP0) — a
+                // residual fallback reading real disc bytes in the wrong format/stride is exactly
+                // as dishonest as the natural path doing it; "Host→Local residual" only means
+                // non-natural sourcing, not license to reinterpret bytes in a layout they were
+                // never written in.
+                if (IsPageMismatched(bi, psm, fbw))
+                    continue;
                 int dx = dstOx + x;
                 int dy = dstOy + y;
                 if ((uint)dx >= (uint)FB_WIDTH || (uint)dy >= (uint)FB_HEIGHT) continue;
@@ -2602,17 +2619,9 @@ public sealed class Gs : ISchedulable
                 uint pixel = LoadLocalPixelForPresent(_lastImageDbpBytes, sx, sy, fbw, psm, out int bi);
                 if ((pixel & 0x00FFFFFF) == 0) continue;
                 // See CompositeLocalToFb's identical check: don't paint a pixel whose backing
-                // page was demonstrably last written in a different format than declared here.
-                if (bi >= 0)
-                {
-                    int pageIdx = bi / 8192;
-                    if ((uint)pageIdx < (uint)_pageLastWritePsm.Length)
-                    {
-                        sbyte lastPsm = _pageLastWritePsm[pageIdx];
-                        if (lastPsm >= 0 && lastPsm != psm)
-                            continue;
-                    }
-                }
+                // page was demonstrably last written in a different format/stride than declared here.
+                if (IsPageMismatched(bi, psm, fbw))
+                    continue;
                 if ((uint)x >= (uint)FB_WIDTH || (uint)y >= (uint)FB_HEIGHT) continue;
                 int idx = y * FB_WIDTH + x;
                 if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
