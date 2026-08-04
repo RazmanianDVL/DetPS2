@@ -413,9 +413,10 @@ public sealed class Ps2System
             // (IRX is the product path; DETPS2_FORCE_HLE_IOP=1 skips arming via IsLiteralIrxEnabled).
             if (IopModuleHost.IsLiteralIrxEnabled && IopModules.HasPendingLiteralEntry)
                 IopModules.TryArmPendingLiteralEntry(Iop);
-            // C1 yield-start: continue module _start residuals across quanta (flag-gated).
+            // C1 yield-start: continue module _start residuals (flag-gated).
+            // D1: up to 2 slices at RunFor entry so short/non-loop callers still progress.
             if (IopModules.YieldStartEnabled && IopModules.HasResidualModuleStart)
-                IopModules.DrainResidualModuleStarts(this);
+                IopModules.DrainResidualModuleStarts(this, maxSlices: 2);
             while (left > 0)
             {
                 ulong pcPhys = EE.PC & 0x1FFFFFFFUL;
@@ -551,6 +552,10 @@ public sealed class Ps2System
                 // draining once per real slice here, where it's actually reached.
                 SchedulerGeneration++;
                 Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
+                // C1 D4: one residual slice per commercial EE slice (~50k/2k) — multiplies
+                // drain opportunities vs once-per-RunFor (FIFO HOL starve; see design doc).
+                if (IopModules.YieldStartEnabled && IopModules.HasResidualModuleStart)
+                    IopModules.DrainResidualModuleStarts(this);
             }
         }
         else
@@ -558,6 +563,8 @@ public sealed class Ps2System
             Scheduler.RunFor(cyclesToRun);
             SchedulerGeneration++;
             Hle.Sony?.DrainRealRpcQueue(SchedulerGeneration);
+            if (IopModules.YieldStartEnabled && IopModules.HasResidualModuleStart)
+                IopModules.DrainResidualModuleStarts(this, maxSlices: 2);
         }
     }
 

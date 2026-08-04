@@ -193,6 +193,11 @@ public sealed class IopModuleHost
 
     /// <summary>True when residual yield-start work is queued.</summary>
     public bool HasResidualModuleStart => _residualModuleStarts.Count > 0;
+
+    /// <summary>C1: how many times <see cref="DrainResidualModuleStarts"/> was entered (telemetry).</summary>
+    public ulong ResidualDrainCalls { get; private set; }
+    /// <summary>C1: residual slices that retired at least one IOP instruction.</summary>
+    public ulong ResidualSlicesRan { get; private set; }
     /// <summary>Legacy synthetic SifRpcCmd.Open path only (unbounded). Real FILEIO/IOMAN
     /// allocation uses <see cref="AllocIoManFd"/> over slots 0..15.</summary>
     private int _nextFd = 3;
@@ -1041,15 +1046,32 @@ public sealed class IopModuleHost
     }
 
     /// <summary>
-    /// C1 yield-start: drain one residual module <c>_start</c> slice on a later IOP quantum.
-    /// No-op when flag off or queue empty. Call from <see cref="Ps2System.RunFor"/> slices.
+    /// C1 yield-start: drain residual module <c>_start</c> slices on later IOP quanta.
+    /// Default one front-item slice; <paramref name="maxSlices"/> &gt; 1 services multiple
+    /// (D1) for short RunFor paths. No-op when flag off or queue empty.
+    /// Call from <see cref="Ps2System.RunFor"/> (top + per commercial EE slice — D4).
     /// </summary>
-    public int DrainResidualModuleStarts(Ps2System system, ulong maxInsn = YieldStartResidualSliceInsn)
+    public int DrainResidualModuleStarts(Ps2System system, ulong maxInsn = YieldStartResidualSliceInsn,
+        int maxSlices = 1)
     {
         if (!YieldStartEnabled || system == null || _residualModuleStarts.Count == 0)
             return 0;
+        if (maxSlices < 1) maxSlices = 1;
+        ResidualDrainCalls++;
+        int totalRan = 0;
+        for (int s = 0; s < maxSlices && _residualModuleStarts.Count > 0; s++)
+        {
+            int ran = DrainOneResidualSlice(system, maxInsn);
+            totalRan += ran;
+            if (ran <= 0) break; // empty/unserviceable
+        }
+        return totalRan;
+    }
+
+    private int DrainOneResidualSlice(Ps2System system, ulong maxInsn)
+    {
         var iop = system.Iop;
-        if (!iop.MultiThreadEnabled)
+        if (!iop.MultiThreadEnabled || _residualModuleStarts.Count == 0)
             return 0;
 
         var work = _residualModuleStarts.Peek();
@@ -1100,6 +1122,8 @@ public sealed class IopModuleHost
         ulong ran = iop.InstructionsExecuted - before;
         ModuleEntryInstructions += ran;
         m.LastEntryInstructions += ran;
+        if (ran > 0)
+            ResidualSlicesRan++;
         // Always restore the pre-drain thread (boot / caller).
         if (iop.MultiThreadEnabled && prev != iop.CurrentThreadId)
             iop.SwitchToThread(prev);
@@ -1114,6 +1138,12 @@ public sealed class IopModuleHost
             m.LastModRes = (int)iop.GetGpr(2);
             m.EntryExecuted = true;
         }
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_YIELD_START") == "1")
+            Console.Error.WriteLine(
+                $"[YIELD-RESIDUAL] name=\"{m.Name}\" ran={ran} remain={work.RemainingInsn} " +
+                $"slicesLeft={work.SlicesLeft} returned={(returned ? 1 : 0)} " +
+                $"qdepth={_residualModuleStarts.Count}");
 
         return (int)ran;
     }

@@ -1,8 +1,8 @@
 # C1 design — residual module-start drain policy (FIFO HOL)
 
-**Status:** design only — **ready for dual ACK** — **no Core this turn**  
+**Status:** dual-ACK'd + **implemented** (D4+D1) — see `c1-residual-drain-policy-implement.md`  
 **Date:** 2026-08-04  
-**Tip ref:** `cfb2a93` / S1 `ba196e6`  
+**Tip ref:** design `52ef5b1`; implement following  
 **Evidence:** Claude seat B (seq0159): post-S1 BO2 still 0 WaitYield; drain = **one** `DrainResidualModuleStarts` per `RunFor`, front-only FIFO  
 **Depends on:** S1 peer scoping closed  
 **Locks:** `Ps2System.RunFor`, `IopModuleHost.DrainResidualModuleStarts` — no Gif/Gs/GameQuirks  
