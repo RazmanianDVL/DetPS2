@@ -217,10 +217,29 @@ public sealed class RealSifRpc
     public bool PadModVerMajor4 { get; set; }
 
     /// <summary>
-    /// When true, LOADFILE GetVersion returns the IOPRP/DNAS ASCII tag after reboot
-    /// (DA/BO2/B3 gates). Default false keeps classic 0x00020000 for Shaolin Monks spine.
+    /// Legacy per-title opt-in for LOADFILE GetVersion ASCII replies (DA/BO2/B3/TeamIco/Vexx/
+    /// Whip gates). Superseded by the tag-if-applied policy below (M4-b, S2) -- GetVersion no
+    /// longer requires this to be true, so it is now redundant-but-harmless for that check.
+    /// Kept set by GameQuirks call sites and as a manual force-on for bisect; not removed until
+    /// evidence-gated T10 retirement (docs/UDNL_GETVERSION_UNIFICATION.md §5.3).
     /// </summary>
     public bool PreferIopRpGetVersion { get; set; }
+
+    /// <summary>
+    /// Emergency override (M4-b, S2): when set, LOADFILE GetVersion always returns classic
+    /// <c>0x00020000</c> regardless of any applied IOPRP/DNAS tag -- bisect for Shaolin Monks
+    /// or any other title suspected of regressing under tag-if-applied.
+    /// See docs/UDNL_GETVERSION_UNIFICATION.md §5.2.
+    /// </summary>
+    public static bool GetVersionClassicOverride
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_GETVERSION_CLASSIC");
+            return string.Equals(v, "1", StringComparison.Ordinal) ||
+                   string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
 
     /// <summary>
     /// When true, FILEIO stays on SN ProDG / Midway layouts (eeReply* mirror, open returns fd,
@@ -2891,10 +2910,14 @@ public sealed class RealSifRpc
                 // Real UDNL would surface the image version; without that handoff HLE used
                 // to return a bare LOADFILE 0x00020000 placeholder and the gate returned
                 // 0xFFFEFFFC forever (cdvdSectors stuck at 0) on those titles.
-                // Shaolin Monks (SLUS_210.87) A/B (2026-07-30): always-IOPRP-ASCII path
-                // changes post-reboot RPC cadence vs pre-merge spine. Prefer classic
-                // 0x00020000 unless <see cref="PreferIopRpGetVersion"/> is set (DA/BO2/B3).
-                result = PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii)
+                // M4-b (S2, docs/UDNL_GETVERSION_UNIFICATION.md): tag-if-applied policy --
+                // return the ASCII tag whenever a real UDNL/RESET arg was actually extracted
+                // this session, independent of the legacy per-title PreferIopRpGetVersion
+                // flag. DETPS2_GETVERSION_CLASSIC=1 is the emergency all-classic override
+                // (bisect for Shaolin Monks SLUS_210.87, whose IOPRP gen>=2 reboot storm
+                // legitimately re-extracts "IOPRP300" every generation -- see SM canary
+                // result in playability-roadmap.json M4-b before trusting this default-on).
+                result = !GetVersionClassicOverride && !string.IsNullOrEmpty(_lastIopRpVersionAscii)
                     ? PackAsciiVersion(_lastIopRpVersionAscii)
                     : 0x00020000;
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
