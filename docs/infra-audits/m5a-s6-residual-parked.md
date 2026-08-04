@@ -58,3 +58,7 @@ M5-a S6 PARKED tip 5bfbd53
   root-cause: early plateau thrash under assist x re-Raise
   no further promote without redesign dual-ACK
 ```
+
+## 5. Haven addendum (2026-08-04)
+
+`m5a-haven-signal-no-consumer.md`: CATCHUP flat tryTake is **throughput mismatch** (one-take-per-pass x VIF1 finish ~2x GIF), not lost signal. Further strengthens park; multi-take dispatch is a separate dual-ACK design if ever reopened.
