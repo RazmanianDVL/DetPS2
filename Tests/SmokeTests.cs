@@ -1423,6 +1423,7 @@ press 3000 Circle 100
             IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
             IopExecSmokes.RealRpc_DispatchCompose_WithMultiThread();
+            IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
             Sif_DmaRoundTrip_UpdatesMemory();
             Sif_Bridge_MailboxAndDmaVisibleToIop();
             Timer_CompareRaisesIntc_EeSeesCop0();

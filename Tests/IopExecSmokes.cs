@@ -651,4 +651,210 @@ public static class IopExecSmokes
                 $"liveEnabled={RealSifRpc.LiveRpcDispatchEnabled()})");
         }
     }
+
+    /// <summary>
+    /// M3-e (docs/infra-audits/real-sif-rpc-dual-path.md §7): plant a synthetic
+    /// <c>sceSifRegisterRpc</c> server entry in IOP RAM matching
+    /// <c>RealSifRpc.TryFindRealRpcServer</c> layout, run a tiny R3000 handler that returns
+    /// known reply bytes, EE BIND+CALL through existing <see cref="RealSifRpc.TryHandle"/>,
+    /// assert <see cref="RealSifRpc.LiveRpcHits"/> increments and HLE unknown path is skipped.
+    /// <para>
+    /// Honest limitations: does not assemble a real IRX that calls <c>sceSifRegisterRpc</c>;
+    /// plants the SIFCMD queue/server chain that live registration would have built. BIND is
+    /// still HLE (product policy). Skips when live dispatch is env-opted-out so fleet defaults
+    /// and emergency <c>DETPS2_NO_REAL_RPC=1</c> are not forced on.
+    /// </para>
+    /// </summary>
+    public static void RealRpc_SyntheticLiveRegister_BindCallHits()
+    {
+        if (!RealSifRpc.LiveRpcDispatchEnabled())
+        {
+            Console.WriteLine(
+                "[Smoke] RealRpc_SyntheticLiveRegister_BindCallHits SKIP " +
+                "(DETPS2_NO_REAL_RPC=1 or DETPS2_IOP_REAL_RPC=0 — live path hard-off)");
+            return;
+        }
+
+        uint Addiu(uint rt, uint rs, short imm) =>
+            (0x09u << 26) | (rs << 21) | (rt << 16) | (ushort)imm;
+        uint Lui(uint rt, ushort imm) => (0x0Fu << 26) | (rt << 16) | imm;
+        uint Ori(uint rt, uint rs, ushort imm) =>
+            (0x0Du << 26) | (rs << 21) | (rt << 16) | imm;
+        uint Sw(uint rt, uint baseReg, short off) =>
+            (0x2Bu << 26) | (baseReg << 21) | (rt << 16) | (ushort)off;
+        uint Jr(uint rs) => (rs << 21) | 0x08u;
+        const uint Nop = 0;
+
+        // Proprietary test SID — not in the RealSifRpc allow-list, so HLE would soft-0 +
+        // UnknownServiceCalls++ if live dispatch were skipped.
+        const uint testSid = 0x4D33452Du; // 'M3E-'
+        // Ground-truthed SIFCMD .data chain head (same private const as RealSifRpc).
+        const uint sifCmdQueueChainOffset = 0x2a60;
+        // Free IOP phys below RealSifRpc scratch (0x1F0000) and above typical IRX loads.
+        const uint queuePhys = 0x00190000;
+        const uint serverPhys = 0x00190100;
+        const uint buffPhys = 0x00190200;
+        const uint magic0 = 0xDEADBEEFu;
+        const uint magic1 = 0xCAFEBABEu;
+
+        var sys = new Ps2System();
+        sys.Hle.EnableSonyKernel();
+        var rpc = sys.Hle.Sony!.RealRpc;
+        // BindHost already set by SonyKernelHle ctor; re-bind is idempotent and keeps
+        // TryDispatchRealRegisteredRpc's _host.Iop path honest if ctor order changes.
+        rpc.BindHost(sys);
+        var mem = sys.Memory;
+        var k = sys.Hle.Kernel;
+
+        // 1) SIFCMD name + image so TryFindRealRpcServer can resolve chain head.
+        // 2) LIVETST image hosts the R3000 handler (func must land in a loaded module).
+        if (!sys.LoadIrx(IrxLoader.BuildMinimalIrx("SIFCMD"), "SIFCMD").Success)
+            throw new Exception("LoadIrx SIFCMD failed");
+        if (!sys.LoadIrx(IrxLoader.BuildMinimalIrx("LIVETST"), "LIVETST").Success)
+            throw new Exception("LoadIrx LIVETST failed");
+        if (!sys.IopModules.TryGetModule("SIFCMD", out int sifId) ||
+            !sys.IopModules.TryGetIrx(sifId, out var sifcmd) || !sifcmd.HasImage)
+            throw new Exception("SIFCMD module not registered with image");
+        if (!sys.IopModules.TryGetModule("LIVETST", out int liveId) ||
+            !sys.IopModules.TryGetIrx(liveId, out var liveMod) || !liveMod.HasImage)
+            throw new Exception("LIVETST module not registered with image");
+        if (liveMod.Size == 0)
+            throw new Exception("LIVETST size 0 — IsWithinAnyLoadedModule would reject handler");
+
+        // Handler at module base (EE-mapped LoadBase). SifRpcFunc_t:
+        //   void *handler(int fno, void *buf, int size)  — a0/a1/a2
+        // Writes magic0/magic1 into *buf, returns buf in v0.
+        uint handlerEe = liveMod.LoadBase;
+        uint handlerPhys = IopModuleHost.ToIopPhys(handlerEe);
+        var handlerWords = new uint[]
+        {
+            // v0 = a1 (buf)
+            Addiu(2, 5, 0),
+            // t0 = 0xDEADBEEF; sw t0, 0(a1)
+            Lui(8, (ushort)(magic0 >> 16)),
+            Ori(8, 8, (ushort)(magic0 & 0xFFFF)),
+            Sw(8, 5, 0),
+            // t0 = 0xCAFEBABE; sw t0, 4(a1)
+            Lui(8, (ushort)(magic1 >> 16)),
+            Ori(8, 8, (ushort)(magic1 & 0xFFFF)),
+            Sw(8, 5, 4),
+            Jr(31),
+            Nop
+        };
+        if (handlerWords.Length * 4 > liveMod.Size)
+            throw new Exception("handler larger than LIVETST image floor");
+        for (int i = 0; i < handlerWords.Length; i++)
+            mem.IopWrite32(handlerPhys + (uint)(i * 4), handlerWords[i]);
+
+        uint buffEe = SystemMemory.IOP_RAM_BASE + buffPhys;
+        // Clear reply buffer so a silent HLE soft-0 cannot look like a live hit.
+        mem.IopWrite32(buffPhys, 0);
+        mem.IopWrite32(buffPhys + 4, 0);
+
+        // Plant SifRpcDataQueue_t + SifRpcServerData_t matching TryFindRealRpcServer:
+        //   queue +0x08 = server list head, +0x14 = next queue
+        //   server +0x00 = sid, +0x04 = func, +0x08 = buff, +0x38 = next server
+        // Func stored EE-mapped so IsWithinAnyLoadedModule (compares to LoadBase) accepts it.
+        for (uint o = 0; o < 0x40; o += 4)
+        {
+            mem.IopWrite32(queuePhys + o, 0);
+            mem.IopWrite32(serverPhys + o, 0);
+        }
+        mem.IopWrite32(queuePhys + 0x08, serverPhys);
+        mem.IopWrite32(queuePhys + 0x14, 0);
+        mem.IopWrite32(serverPhys + 0x00, testSid);
+        mem.IopWrite32(serverPhys + 0x04, handlerEe);
+        mem.IopWrite32(serverPhys + 0x08, buffEe);
+        mem.IopWrite32(serverPhys + 0x38, 0);
+        // SIFCMD global chain head at LoadBase + 0x2a60
+        uint chainHead = sifcmd.LoadBase + sifCmdQueueChainOffset;
+        mem.IopWrite32(chainHead, queuePhys);
+
+        if (rpc.LiveRpcHits != 0 || rpc.LiveRpcFallbacks != 0)
+            throw new Exception("LiveRpc counters must start at 0");
+
+        // --- EE BIND (still HLE plant of cd handles — product dual-path policy) ---
+        const uint cd = 0x0000F100;
+        const uint bindPkt = 0x0000F000;
+        int sema = k.CreateSema(0, 1);
+        mem.Write32(cd + 8, (uint)sema);
+        mem.Write32(bindPkt + 8, RealSifRpc.CidRpcBind);
+        mem.Write32(bindPkt + 16, 1); // PACKET_F_ALLOC
+        mem.Write32(bindPkt + 28, cd);
+        mem.Write32(bindPkt + 32, testSid);
+        ulong unkBindBefore = rpc.UnknownBindSids;
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, bindPkt))
+            throw new Exception("BIND TryHandle returned false");
+        if (rpc.Binds == 0)
+            throw new Exception("BIND not counted");
+        // Unknown SID on BIND is telemetry-only; still completes (allow-list miss is fine).
+        if (rpc.UnknownBindSids < unkBindBefore + 1)
+            throw new Exception("test SID should count as UnknownBindSids (not in allow-list)");
+        if (mem.Read32(bindPkt + 8) != RealSifRpc.CidRpcEnd)
+            throw new Exception("BIND must stamp RPC_END");
+
+        // --- EE CALL through live path ---
+        const uint recvBuf = 0x0000F200;
+        const uint callPkt = 0x0000F300;
+        mem.Write32(recvBuf, 0);
+        mem.Write32(recvBuf + 4, 0);
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(callPkt + 28, cd);
+        mem.Write32(callPkt + 32, 1); // fno
+        mem.Write32(callPkt + 36, 0); // send_size (no arg DMA needed)
+        mem.Write32(callPkt + 40, recvBuf);
+        mem.Write32(callPkt + 44, 8); // recv_size
+        ulong unkCallBefore = rpc.UnknownServiceCalls;
+        ulong hitsBefore = rpc.LiveRpcHits;
+        ulong fbBefore = rpc.LiveRpcFallbacks;
+
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("CALL TryHandle returned false");
+
+        if (rpc.LiveRpcHits < hitsBefore + 1)
+            throw new Exception(
+                $"LiveRpcHits did not increment (got {rpc.LiveRpcHits}, before={hitsBefore}) — " +
+                "live registry miss or handler did not return");
+        if (rpc.LiveRpcFallbacks != fbBefore)
+            throw new Exception($"LiveRpcFallbacks unexpectedly advanced to {rpc.LiveRpcFallbacks}");
+        // HLE unknown branch must not have run for this SID.
+        if (rpc.UnknownServiceCalls != unkCallBefore)
+            throw new Exception(
+                $"UnknownServiceCalls advanced ({unkCallBefore}->{rpc.UnknownServiceCalls}) — HLE branch ran");
+        if (mem.Read32(callPkt + 8) != RealSifRpc.CidRpcEnd)
+            throw new Exception("live CALL must stamp RPC_END");
+        if (mem.Read32(recvBuf) != magic0 || mem.Read32(recvBuf + 4) != magic1)
+            throw new Exception(
+                $"reply bytes wrong: 0x{mem.Read32(recvBuf):X8} 0x{mem.Read32(recvBuf + 4):X8} " +
+                $"(want DEADBEEF CAFEBABE from R3000 handler)");
+        // Handler also wrote IOP-side buff (same reply source).
+        if (mem.IopRead32(buffPhys) != magic0 || mem.IopRead32(buffPhys + 4) != magic1)
+            throw new Exception("IOP buff not written by live handler");
+
+        // Determinism: second CALL also hits live and does not grow UnknownServiceCalls.
+        mem.Write32(recvBuf, 0);
+        mem.Write32(recvBuf + 4, 0);
+        mem.Write32(callPkt + 8, RealSifRpc.CidRpcCall);
+        mem.Write32(callPkt + 16, 1);
+        mem.Write32(callPkt + 28, cd);
+        mem.Write32(callPkt + 32, 2);
+        mem.Write32(callPkt + 36, 0);
+        mem.Write32(callPkt + 40, recvBuf);
+        mem.Write32(callPkt + 44, 8);
+        ulong hits2 = rpc.LiveRpcHits;
+        if (!rpc.TryHandle(mem, k, sys.Cdvd, sys.Pad, sys.IopModules, callPkt))
+            throw new Exception("second CALL failed");
+        if (rpc.LiveRpcHits < hits2 + 1)
+            throw new Exception("second live CALL did not hit");
+        if (mem.Read32(recvBuf) != magic0)
+            throw new Exception("second CALL reply wrong");
+        if (rpc.UnknownServiceCalls != unkCallBefore)
+            throw new Exception("UnknownServiceCalls changed after second live CALL");
+
+        Console.WriteLine(
+            $"[Smoke] RealRpc_SyntheticLiveRegister_BindCallHits OK " +
+            $"(sid=0x{testSid:X8} LiveRpcHits={rpc.LiveRpcHits} " +
+            $"handler=0x{handlerEe:X8} sifcmdBase=0x{sifcmd.LoadBase:X8})");
+    }
 }
