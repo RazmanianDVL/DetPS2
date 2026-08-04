@@ -1,6 +1,6 @@
 # M5-a design — DMAC → VIF/GIF handler IRQ completion fidelity
 
-**Status:** design **implement-ready** (await Claude ACK on open questions) — **no Core code in this note**  
+**Status:** S1 telemetry **landed** (Phase 0, zero behavior change) — Q0 ACK; S6 still blocked on Q1–Q5  
 **Date:** 2026-08-04  
 **Tip ref:** `9f312bd` (windows-detps2 / detps2)  
 **Mode:** read-only investigation → flag-gated PRs only after ACK.  
@@ -501,3 +501,18 @@ Implement only after explicit ACK. This note contains **no Core changes**.
 ---
 
 *Design only. Expand of seed `m5a-dmac-vif-gif-completion-seed.md`. Flag-gated investigation first; no Core behavior change until A0 telemetry and open-question ACK.*
+
+## 12. S1 implementation note (2026-08-04)
+
+**Landed:** Phase 0 / S1 telemetry only — zero DMA completion behavior change.
+
+| Item | Detail |
+|------|--------|
+| Env | `DETPS2_TRACE_DMAC=1` — print only (interval every 4096 finishes + blocker-trace end dump via `DumpTraceSummary`) |
+| Counters | Always accumulate per channel 0-9 (cheap ulong/int bumps) |
+| Names | `finish`, `owedInc`, `owedPeak`, `preEnableInc`, `preEnablePromote`, `creditAssist`, `w1cWhileOwed`, `tryTakeCis`, `tryTakeOwed`, `raise` (+ totals finish/raise) |
+| Ring | Last 32 (ch, reason, seq) when TRACE on; reason finish/credit/enable/take |
+| Files | `Dmac.cs` (counters + dump), `SonyKernelHle.cs` (`NoteHandlerTake` only), `Program.cs` (end dump if TRACE) |
+| Scoreboard | **Not** wired — TRACE-only first |
+| Not done | EE dispatch optional hook; Phase 1 kill-switch / catch-up |
+

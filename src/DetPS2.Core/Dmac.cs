@@ -51,6 +51,44 @@ public sealed class Dmac : ISchedulable
     private static readonly bool DisableA3ChcrCap =
         Environment.GetEnvironmentVariable("DETPS2_DISABLE_A3_CHCR_CAP") == "1";
 
+    /// <summary>M5-a S1 / Phase 0: <c>DETPS2_TRACE_DMAC=1</c> enables stderr dumps.
+    /// Counters always accumulate (cheap); print only when this flag is set. Zero DMA behavior change.</summary>
+    public static readonly bool TraceDmac =
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_DMAC") == "1";
+
+    // --- M5-a Phase 0 per-channel completion/credit telemetry (always accumulate) ---
+    // finish: FinishChannel entries
+    // owedInc: FinishChannel owed++ when CIM live
+    // owedPeak: max depth of _owedHandlerCalls[ch]
+    // preEnableInc: FinishChannel while CIM off
+    // preEnablePromote: units promoted on EnableChannelIrq (after cap)
+    // creditAssist: units added via CreditOwedHandlerCall (assist / public API)
+    // w1cWhileOwed: software D_STAT W1C of CIS while owed>0 (race before take)
+    // tryTakeCis / tryTakeOwed: AddDmacHandler takes (CIS path vs owed-only fallback)
+    // raiseIrq: RaiseDmacIrq attributed to this channel
+    private readonly ulong[] _telemFinish = new ulong[10];
+    private readonly ulong[] _telemOwedInc = new ulong[10];
+    private readonly int[] _telemOwedPeak = new int[10];
+    private readonly ulong[] _telemPreEnableInc = new ulong[10];
+    private readonly ulong[] _telemPreEnablePromote = new ulong[10];
+    private readonly ulong[] _telemCreditAssist = new ulong[10];
+    private readonly ulong[] _telemW1cWhileOwed = new ulong[10];
+    private readonly ulong[] _telemTryTakeCis = new ulong[10];
+    private readonly ulong[] _telemTryTakeOwed = new ulong[10];
+    private readonly ulong[] _telemRaiseIrq = new ulong[10];
+    private ulong _telemRaiseIrqTotal;
+    private ulong _telemFinishTotal;
+    private ulong _telemLastDumpFinishTotal;
+
+    // Optional TRACE ring: last N (ch, reason, seq). reason: 0=finish 1=credit 2=enable 3=take
+    private const int TelemRingCap = 32;
+    private readonly byte[] _telemRingCh = new byte[TelemRingCap];
+    private readonly byte[] _telemRingReason = new byte[TelemRingCap];
+    private readonly ulong[] _telemRingSeq = new ulong[TelemRingCap];
+    private int _telemRingWrite;
+    private int _telemRingCount;
+    private ulong _telemEventSeq;
+
     public Dmac(SystemMemory memory)
     {
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
@@ -69,8 +107,11 @@ public sealed class Dmac : ISchedulable
     /// the bit then a later SetMask/DisableIntc path can drop it while D_STAT channel
     /// masks stay live — AddDmacHandler then never runs and flip pending-count wedges.
     /// </summary>
-    private void RaiseDmacIrq()
+    private void RaiseDmacIrq(int channel = -1)
     {
+        _telemRaiseIrqTotal++;
+        if ((uint)channel < 10)
+            _telemRaiseIrq[channel]++;
         if (_intc == null) return;
         uint bit = 1u << (int)Intc.InterruptSource.DmaController;
         if ((_intc.Mask & bit) == 0)
@@ -89,6 +130,27 @@ public sealed class Dmac : ISchedulable
         ChainTagsProcessed = 0;
         Array.Clear(_owedHandlerCalls);
         Array.Clear(_preEnableCompletions);
+        ClearTelemetry();
+    }
+
+    private void ClearTelemetry()
+    {
+        Array.Clear(_telemFinish);
+        Array.Clear(_telemOwedInc);
+        Array.Clear(_telemOwedPeak);
+        Array.Clear(_telemPreEnableInc);
+        Array.Clear(_telemPreEnablePromote);
+        Array.Clear(_telemCreditAssist);
+        Array.Clear(_telemW1cWhileOwed);
+        Array.Clear(_telemTryTakeCis);
+        Array.Clear(_telemTryTakeOwed);
+        Array.Clear(_telemRaiseIrq);
+        _telemRaiseIrqTotal = 0;
+        _telemFinishTotal = 0;
+        _telemLastDumpFinishTotal = 0;
+        _telemRingWrite = 0;
+        _telemRingCount = 0;
+        _telemEventSeq = 0;
     }
 
     /// <summary>Per-channel DMA state for SaveState.cs — previously not saved at all, so a
@@ -364,10 +426,13 @@ public sealed class Dmac : ISchedulable
         if ((uint)channel >= 10 || count <= 0) return;
         int add = Math.Min(count, 8);
         _owedHandlerCalls[channel] = Math.Min(64, _owedHandlerCalls[channel] + add);
+        _telemCreditAssist[channel] += (ulong)add;
+        NoteOwedPeak(channel);
+        TelemRingPush(channel, reason: 1);
         // Sticky CIS so TryTakePendingDmacHandler prefers the D_STAT path when possible.
         DStat |= 1u << channel;
         if (IsChannelIrqEnabled(channel))
-            RaiseDmacIrq();
+            RaiseDmacIrq(channel);
     }
 
     private void FinishChannel(Channel channel, ChannelState ch)
@@ -379,6 +444,9 @@ public sealed class Dmac : ISchedulable
         TransfersCompleted++;
 
         int chNum = (int)channel;
+        _telemFinish[chNum]++;
+        _telemFinishTotal++;
+        TelemRingPush(chNum, reason: 0);
         // Channel complete bit in D_STAT (low 10 bits)
         DStat |= 1u << chNum;
         // Mask lives in high half of D_STAT on real HW; we also keep DMask mirror
@@ -386,16 +454,24 @@ public sealed class Dmac : ISchedulable
         {
             // Queue a handler call that survives a racey D_STAT W1C before EE dispatch.
             if (_owedHandlerCalls[chNum] < 64)
+            {
                 _owedHandlerCalls[chNum]++;
-            RaiseDmacIrq();
+                _telemOwedInc[chNum]++;
+                NoteOwedPeak(chNum);
+            }
+            RaiseDmacIrq(chNum);
         }
         else
         {
             // Remember for EnableChannelIrq catch-up (Burnout registers handlers then
             // EnableDmac after some path-sync DMA has already finished).
             if (_preEnableCompletions[chNum] < 64)
+            {
                 _preEnableCompletions[chNum]++;
+                _telemPreEnableInc[chNum]++;
+            }
         }
+        MaybeIntervalDump();
     }
 
     /// <summary>Whether channel <paramref name="channel"/>'s completion IRQ is unmasked
@@ -433,13 +509,21 @@ public sealed class Dmac : ISchedulable
             _preEnableCompletions[channel] = 0;
             // Cap: game pending-count is a byte; don't flood dozens of stale IRQs.
             if (n > 4) n = 4;
+            int before = _owedHandlerCalls[channel];
             _owedHandlerCalls[channel] = Math.Min(64, _owedHandlerCalls[channel] + n);
+            int promoted = _owedHandlerCalls[channel] - before;
+            if (promoted > 0)
+            {
+                _telemPreEnablePromote[channel] += (ulong)promoted;
+                NoteOwedPeak(channel);
+            }
+            TelemRingPush(channel, reason: 2);
             // Ensure CIS sticky so D_STAT path also sees work.
             DStat |= bit;
         }
         // Level-sensitive: already-complete + newly unmasked → IRQ now.
         if ((DStat & bit) != 0 || _owedHandlerCalls[channel] > 0)
-            RaiseDmacIrq();
+            RaiseDmacIrq(channel);
     }
 
     /// <summary>DisableDmac(channel) — mask off per-channel completion IRQ.</summary>
@@ -665,6 +749,18 @@ public sealed class Dmac : ISchedulable
         {
             // D_STAT: low bits w1c status; high bits XOR mask
             uint clear = value & 0x3FF;
+            // M5-a S1: software W1C of CIS while owed credits remain (race before take).
+            if (clear != 0)
+            {
+                for (int b = 0; b < 10; b++)
+                {
+                    uint bbit = 1u << b;
+                    if ((clear & bbit) == 0) continue;
+                    if ((DStat & bbit) == 0) continue; // was not sticky
+                    if (_owedHandlerCalls[b] > 0)
+                        _telemW1cWhileOwed[b]++;
+                }
+            }
             DStat &= ~clear;
             uint maskXor = (value >> 16) & 0x3FF;
             // Mirror mask into DMask and high half of DStat
@@ -765,5 +861,105 @@ public sealed class Dmac : ISchedulable
         if (address >= 0x1000D000 && address < 0x1000D400) return (int)Channel.SPR_FROM;
         if (address >= 0x1000D400 && address < 0x1000E000) return (int)Channel.SPR_TO;
         return -1;
+    }
+
+    // --- M5-a Phase 0 telemetry helpers (no DMA behavior) ---
+
+    private void NoteOwedPeak(int channel)
+    {
+        int depth = _owedHandlerCalls[channel];
+        if (depth > _telemOwedPeak[channel])
+            _telemOwedPeak[channel] = depth;
+    }
+
+    private void TelemRingPush(int channel, byte reason)
+    {
+        if (!TraceDmac) return;
+        _telemEventSeq++;
+        int i = _telemRingWrite;
+        _telemRingCh[i] = (byte)channel;
+        _telemRingReason[i] = reason;
+        _telemRingSeq[i] = _telemEventSeq;
+        _telemRingWrite = (i + 1) % TelemRingCap;
+        if (_telemRingCount < TelemRingCap) _telemRingCount++;
+    }
+
+    /// <summary>Record one AddDmacHandler take (CIS sticky path vs owed-only fallback).
+    /// Called from <c>SonyKernelHle.TryTakePendingDmacHandler</c> — counters only.</summary>
+    public void NoteHandlerTake(int channel, bool viaCis)
+    {
+        if ((uint)channel >= 10) return;
+        if (viaCis) _telemTryTakeCis[channel]++;
+        else _telemTryTakeOwed[channel]++;
+        TelemRingPush(channel, reason: 3);
+    }
+
+    /// <summary>Per-channel finish count (M5-a S1 telemetry).</summary>
+    public ulong GetTelemFinish(int channel) => (uint)channel < 10 ? _telemFinish[channel] : 0;
+    /// <summary>Per-channel CreditOwedHandlerCall units (assist residual probe).</summary>
+    public ulong GetTelemCreditAssist(int channel) => (uint)channel < 10 ? _telemCreditAssist[channel] : 0;
+    /// <summary>Per-channel CIS-path handler takes.</summary>
+    public ulong GetTelemTryTakeCis(int channel) => (uint)channel < 10 ? _telemTryTakeCis[channel] : 0;
+    /// <summary>Per-channel owed-only handler takes.</summary>
+    public ulong GetTelemTryTakeOwed(int channel) => (uint)channel < 10 ? _telemTryTakeOwed[channel] : 0;
+
+    private void MaybeIntervalDump()
+    {
+        if (!TraceDmac) return;
+        // Dump every 4096 finishes so long canaries stay readable without flooding.
+        if (_telemFinishTotal - _telemLastDumpFinishTotal < 4096) return;
+        _telemLastDumpFinishTotal = _telemFinishTotal;
+        DumpTraceSummary(prefix: "[DMAC-TRACE] interval");
+    }
+
+    /// <summary>
+    /// Print M5-a Phase 0 DMAC completion telemetry to stderr.
+    /// Safe to call anytime; intended under <c>DETPS2_TRACE_DMAC=1</c>.
+    /// </summary>
+    public void DumpTraceSummary(string prefix = "[DMAC-TRACE]")
+    {
+        var w = Console.Error;
+        w.WriteLine(
+            $"{prefix} total finish={_telemFinishTotal} raise={_telemRaiseIrqTotal} " +
+            $"transfersCompleted={TransfersCompleted} active={ActiveChannelCount}");
+        for (int ch = 0; ch < 10; ch++)
+        {
+            ulong fin = _telemFinish[ch];
+            ulong oinc = _telemOwedInc[ch];
+            ulong pre = _telemPreEnableInc[ch];
+            ulong prom = _telemPreEnablePromote[ch];
+            ulong cred = _telemCreditAssist[ch];
+            ulong w1c = _telemW1cWhileOwed[ch];
+            ulong tCis = _telemTryTakeCis[ch];
+            ulong tOwed = _telemTryTakeOwed[ch];
+            ulong raise = _telemRaiseIrq[ch];
+            if (fin == 0 && oinc == 0 && pre == 0 && prom == 0 && cred == 0 &&
+                w1c == 0 && tCis == 0 && tOwed == 0 && raise == 0)
+                continue;
+            w.WriteLine(
+                $"{prefix} ch={(Channel)ch}({ch}) finish={fin} owedInc={oinc} owedPeak={_telemOwedPeak[ch]} " +
+                $"preEnableInc={pre} preEnablePromote={prom} creditAssist={cred} " +
+                $"w1cWhileOwed={w1c} tryTakeCis={tCis} tryTakeOwed={tOwed} raise={raise} " +
+                $"owedNow={_owedHandlerCalls[ch]} preNow={_preEnableCompletions[ch]}");
+        }
+        if (TraceDmac && _telemRingCount > 0)
+        {
+            w.WriteLine($"{prefix} ring (newest last, reason 0=finish 1=credit 2=enable 3=take):");
+            int start = (_telemRingWrite - _telemRingCount + TelemRingCap) % TelemRingCap;
+            for (int n = 0; n < _telemRingCount; n++)
+            {
+                int i = (start + n) % TelemRingCap;
+                string rn = _telemRingReason[i] switch
+                {
+                    0 => "finish",
+                    1 => "credit",
+                    2 => "enable",
+                    3 => "take",
+                    _ => "?"
+                };
+                w.WriteLine(
+                    $"{prefix}   seq={_telemRingSeq[i]} ch={(Channel)_telemRingCh[i]}({_telemRingCh[i]}) {rn}");
+            }
+        }
     }
 }

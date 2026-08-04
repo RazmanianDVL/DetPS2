@@ -601,6 +601,9 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             foreach (var sid in rpc.UnknownSidsSeen)
                 Console.WriteLine($"    unknown sid=0x{sid:X8}");
         }
+        // M5-a S1 Phase 0: DMAC completion telemetry dump (print only when TRACE_DMAC set).
+        if (Dmac.TraceDmac)
+            traceSys.Dmac.DumpTraceSummary(prefix: "[DMAC-TRACE] end");
         foreach (var ev in traceSys.Telemetry.SnapshotEvents())
             Console.WriteLine($"    cyc={ev.Cycle,10} pc=0x{ev.Pc:X8} {ev.Kind,-16} key=0x{ev.Key:X8} {ev.Detail}");
         if (PcProfiler.Enabled)

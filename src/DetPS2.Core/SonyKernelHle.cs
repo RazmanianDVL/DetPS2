@@ -567,6 +567,7 @@ public sealed class SonyKernelHle
             dmac.ClearChannelStatus(ch);
             // Also consume one owed-call credit so the soft queue doesn't double-fire.
             dmac.TryConsumeOwedHandlerCall(ch);
+            dmac.NoteHandlerTake(ch, viaCis: true); // M5-a S1 telemetry only
             channel = ch;
             // If other channels still need service, re-raise so the next instruction after
             // this handler's eret dispatches them (EXL blocks nesting mid-handler).
@@ -583,6 +584,7 @@ public sealed class SonyKernelHle
             if (!dmac.IsChannelIrqEnabled(ch)) continue;
             if (!_dmacHandlers.TryGetValue(ch, out handlerAddr) || handlerAddr == 0) continue;
             dmac.TryConsumeOwedHandlerCall(ch);
+            dmac.NoteHandlerTake(ch, viaCis: false); // M5-a S1 telemetry only
             channel = ch;
             if (dmac.HasPendingChannelIrq() || HasAnyOwedDmacHandler(dmac))
                 _system.Intc.Raise(Intc.InterruptSource.DmaController);
