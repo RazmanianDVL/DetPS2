@@ -87,18 +87,30 @@ public sealed class MmioBus
         if (address >= 0x10003000 && address < 0x10003100 && _gif != null)
         {
             // GIF_STAT (…3020) poll: path-sync loops (Burnout 3 @ 0x001F1A28) spin on FQC
-            // immediately after kicking a masked PATH3 DMA. EE.Step quanta can run thousands
-            // of those poll instructions before the scheduler turns hit DMAC, so FQC never
-            // rises inside the spin. Pump a few GIF/VIF-relevant DMAC steps on STAT read —
-            // not a blanket force-finish of every channel (MK WAD path is sensitive to that).
+            // immediately after kicking a masked PATH3 DMA. EE.Step quanta can run many of
+            // those poll instructions before the scheduler's own round-robin turn reaches
+            // DMAC, so FQC can lag behind inside a tight spin. Nudge DMAC forward on STAT
+            // read so the poller isn't starved by scheduling granularity alone.
+            //
+            // A1 (dual-orchestrator timing-realism milestone): this used to loop up to 16x
+            // Step(128) -- up to 2048 "cycles" worth of DMAC progress (and whatever channel-
+            // completion IRQ falls out of it) manufactured inside a single MMIO read, with no
+            // relation to how much real elapsed time actually passed. That let a channel
+            // finish, and its INTC DmaController interrupt land on the CPU, at a moment real
+            // hardware could never produce -- confirmed as the underlying mechanism behind a
+            // reproduced Blood Omen 2 stack-corruption race (see orchestrator-sync.json
+            // known_infra_gap_2 concrete_repro). One bounded nudge, matching a single regular
+            // scheduler round's cadence rather than up to sixteen of them, keeps the "poller
+            // isn't permanently starved" property this hack exists for while removing the
+            // "instant multi-round burst" property that made it a timing-realism bug in its
+            // own right -- especially now that DoNormalTransfer (Dmac.cs) also caps QW
+            // throughput by real elapsed cycles via DrainCyclesPerQw, so this one nudge can't
+            // silently grant more progress than the cycle budget it's given actually justifies.
             if ((address & 0xFF) == 0x20 && _dmac != null)
             {
-                for (int i = 0; i < 16; i++)
-                {
-                    if (_dmac.Step(128) == 0) break;
-                    // FQC already non-zero — poller will observe it; stop early.
-                    if ((_gif.ReadStat() & 0x1F00_0000u) != 0) break;
-                }
+                const ulong OneRoundNudgeCycles = 128;
+                if ((_gif.ReadStat() & 0x1F00_0000u) == 0)
+                    _dmac.Step(OneRoundNudgeCycles);
             }
             return _gif.ReadRegister(address);
         }

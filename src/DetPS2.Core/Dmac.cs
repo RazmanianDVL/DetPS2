@@ -215,7 +215,7 @@ public sealed class Dmac : ISchedulable
                 continue;
             }
 
-            DoNormalTransfer(channel, ch);
+            DoNormalTransfer(channel, ch, maxCycles);
 
             if (ch.QWC == 0)
             {
@@ -453,7 +453,7 @@ public sealed class Dmac : ISchedulable
         return false;
     }
 
-    private void DoNormalTransfer(Channel channel, ChannelState ch)
+    private void DoNormalTransfer(Channel channel, ChannelState ch, ulong cycleBudget)
     {
         // Drain limited QWs per step (priority via DPcr: higher nibble = more budget)
         uint priority = (DPcr >> ((int)channel * 2)) & 0x3;
@@ -461,6 +461,23 @@ public sealed class Dmac : ISchedulable
         // For video path progress: allow larger bursts so GIF packets complete quickly
         if (channel is Channel.GIF or Channel.VIF1 or Channel.VIF0)
             budget = Math.Max(budget, 64u);
+        // A1 (dual-orchestrator timing-realism milestone): DrainCyclesPerQw used to be dead
+        // scaffolding -- serialized in save-states, documented "Det cost model", never actually
+        // read. Channel completion was gated only by the fixed priority-derived per-Step() QW
+        // cap above, independent of Step's own maxCycles argument -- so however many times a
+        // caller chose to invoke Step() in a row, each call's progress was "free" with no real
+        // elapsed-cycle cost. Cap the per-call QW budget by the cycles this Step() call was
+        // actually granted (maxCycles / DrainCyclesPerQw) so a channel can only finish as fast
+        // as real elapsed scheduler time allows -- a big transfer now genuinely spans multiple
+        // scheduler rounds instead of being bounded only by the priority cap. DrainCyclesPerQw
+        // stays save-state compatible (same field, same wire format); default of 1 keeps normal
+        // per-round throughput close to the old fixed caps under the scheduler's regular slice
+        // cadence, and only matters once a caller can no longer manufacture artificial extra
+        // Step() calls to bypass it (see MmioBus.cs GIF_STAT poll-pump fix, same milestone).
+        uint cyclesPerQw = Math.Max(1u, DrainCyclesPerQw);
+        ulong maxQwFromBudget = Math.Max(1UL, cycleBudget / cyclesPerQw);
+        if (maxQwFromBudget < budget)
+            budget = (uint)Math.Min(maxQwFromBudget, uint.MaxValue);
         uint qwToTransfer = Math.Min(ch.QWC, budget);
         ch.MADR += qwToTransfer * 16;
         ch.QWC -= qwToTransfer;
