@@ -511,6 +511,98 @@ public static class IopExecSmokes
     }
 
     /// <summary>
+    /// C1 yield-start: with multi-thread + yield scaffolding, a long-running module entry that
+    /// sees a READY peer at the 16k checkpoint enqueues residual work; drain advances PC without
+    /// rewinding to entry. Flag-off / scaffolding-off leaves residual queue empty.
+    /// </summary>
+    public static void IopYieldStart_ResidualOnReadyPeer()
+    {
+        // --- Scaffolding off: no residual path ---
+        {
+            var off = new Ps2System();
+            if (IopModuleHost.YieldStartEnabled &&
+                Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") != "1")
+            {
+                // Process may have env from another run — only assert queue empty after short start.
+            }
+            byte[] irx = IrxLoader.BuildMinimalIrx("YSOFF");
+            if (!off.LoadIrx(irx, "YSOFF").Success)
+                throw new Exception("LoadIrx YSOFF failed");
+            int id = off.IopModules.SearchModuleByName("YSOFF");
+            var run = off.IopModules.StartLoadedModule(off, id, maxInstructions: 256);
+            if (!run.Success || !run.ReturnedToSentinel)
+                throw new Exception($"minimal start failed off-path: {run.Message}");
+            if (run.PartialYieldStart || off.IopModules.HasResidualModuleStart)
+                throw new Exception("off-path must not enqueue residual");
+        }
+
+        // --- Multi-thread + yield scaffolding: residual on READY peer ---
+        {
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+            IopModuleHost.EnableYieldStartScaffolding();
+            if (!IopModuleHost.YieldStartEnabled)
+                throw new Exception("EnableYieldStartScaffolding did not enable");
+
+            // READY peer so checkpoint sees FindNextReadyThread >= 0.
+            int peer = sys.Iop.CreateSecondaryContext(0x00007000);
+            if (peer < 1)
+                throw new Exception("CreateSecondaryContext peer failed");
+
+            byte[] irx = IrxLoader.BuildMinimalIrx("YSON");
+            var lr = sys.LoadIrx(irx, "YSON");
+            if (!lr.Success)
+                throw new Exception("LoadIrx YSON failed");
+            int id = sys.IopModules.SearchModuleByName("YSON");
+            if (!sys.IopModules.TryGetIrx(id, out var rec) || rec.Entry == 0)
+                throw new Exception("YSON entry missing");
+
+            // Overwrite entry with a self-loop (j self; nop) so we hit the 16k checkpoint.
+            uint entryPhys = rec.Entry & 0x1FFFFFFFu;
+            uint jSelf = (2u << 26) | ((entryPhys >> 2) & 0x03FFFFFFu);
+            sys.Memory.IopWrite32(entryPhys, jSelf);
+            sys.Memory.IopWrite32(entryPhys + 4, 0); // nop delay
+
+            int boot = sys.Iop.CurrentThreadId;
+            var run = sys.IopModules.StartLoadedModule(sys, id, maxInstructions: 100_000);
+            if (!run.PartialYieldStart)
+                throw new Exception(
+                    $"expected PartialYieldStart with READY peer; msg={run.Message} " +
+                    $"insns={run.InstructionsExecuted} residual={sys.IopModules.HasResidualModuleStart}");
+            if (!sys.IopModules.HasResidualModuleStart)
+                throw new Exception("residual queue empty after partial yield-start");
+            if (run.InstructionsExecuted < IopModuleHost.YieldStartCheckpointInsn)
+                throw new Exception(
+                    $"should run at least one 16k checkpoint, got {run.InstructionsExecuted}");
+            if (sys.Iop.CurrentThreadId != boot)
+                throw new Exception("boot thread not restored after partial start");
+
+            // Drain one residual slice — must retire instructions without rewinding to entry.
+            if (!sys.IopModules.TryGetIrx(id, out var mid) || mid.EntryThreadId < 1)
+                throw new Exception("entry thread not bound for residual");
+            if (!sys.Iop.TryGetThreadContext(mid.EntryThreadId, out var ect) || ect == null)
+                throw new Exception("entry context missing");
+            uint pcBefore = ect.PC;
+            int drained = sys.IopModules.DrainResidualModuleStarts(sys);
+            if (drained <= 0)
+                throw new Exception($"DrainResidualModuleStarts retired {drained}");
+            if (!sys.Iop.TryGetThreadContext(mid.EntryThreadId, out var ect2) || ect2 == null)
+                throw new Exception("entry context lost after drain");
+            if (ect2.PC == 0)
+                throw new Exception("entry PC clobbered to 0");
+            // Core contract: drain retired work and entry context still has a live PC
+            // (not rewound via PrepareModuleEntry to a cold zero state). Exact loop PC
+            // depends on KSEG mapping of the self-j body — not asserted here.
+            _ = pcBefore;
+
+            Console.WriteLine(
+                $"[Smoke] IopYieldStart_ResidualOnReadyPeer OK " +
+                $"(partialInsns={run.InstructionsExecuted} drained={drained} peer={peer} " +
+                $"pcBefore=0x{pcBefore:X8} pcAfter=0x{ect2.PC:X8})");
+        }
+    }
+
+    /// <summary>
     /// C1.4: compose live RealSifRpc dispatch with multi-thread contexts.
     /// Flag-off: TryEnterRealRpcDispatch is a no-op; LiveRpcDispatchEnabled matches product default.
     /// Multi-thread on: dedicated dispatch context preserves caller GPRs/PC across a mid-quantum

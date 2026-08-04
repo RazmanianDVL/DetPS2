@@ -291,14 +291,21 @@ public sealed class IopModuleHost
         }
     }
 
+    /// <summary>Test scaffolding: force yield-start on without process env (mirrors IOP thread scaffolding).</summary>
+    private static bool _yieldStartScaffolding;
+
+    /// <summary>Enable yield-start for smokes without <c>DETPS2_IOP_YIELD_START</c> env.</summary>
+    public static void EnableYieldStartScaffolding() => _yieldStartScaffolding = true;
+
     /// <summary>
     /// C1 yield-surviving start: residual slices when multi-thread shows a yield surface.
-    /// Requires <c>DETPS2_IOP_THREADS=1</c> at process start. Default off.
+    /// Requires multi-thread (env or scaffolding). Default off.
     /// Kill: <c>DETPS2_DISABLE_IOP_YIELD_START=1</c>.
     /// </summary>
     public static bool YieldStartEnabled =>
-        Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") == "1"
-        && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_YIELD_START") != "1";
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_YIELD_START") != "1"
+        && (_yieldStartScaffolding
+            || Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") == "1");
 
     /// <summary>Default first-call instruction cap (matches historical StartLoadedModule default).</summary>
     public const ulong YieldStartMaxInsnFirstCall = 100_000;
@@ -1035,17 +1042,14 @@ public sealed class IopModuleHost
                 returned = true;
                 break;
             }
-            // Peer READY mid-slice: give them a turn next residual call.
-            if (iop.FindNextReadyThread() >= 0)
-            {
-                iop.YieldToReady();
-                break;
-            }
+            // Stay on the entry thread for the whole residual slice (v1).
+            // Peer READY work runs on later IOP quanta / other paths — not mid-slice yield here.
         }
 
         ulong ran = iop.InstructionsExecuted - before;
         ModuleEntryInstructions += ran;
         m.LastEntryInstructions += ran;
+        // Always restore the pre-drain thread (boot / caller).
         if (iop.MultiThreadEnabled && prev != iop.CurrentThreadId)
             iop.SwitchToThread(prev);
 

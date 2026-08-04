@@ -1283,6 +1283,10 @@ press 3000 Circle 100
     /// M5-a S6: default-off level catch-up must be a no-op (flag-off byte-identical posture).
     /// Does not require DETPS2_DMAC_LEVEL_CATCHUP (static readonly at process start).
     /// </summary>
+    /// <summary>Forward to <see cref="IopExecSmokes.IopYieldStart_ResidualOnReadyPeer"/> for single-smoke CLI.</summary>
+    public static void IopYieldStart_ResidualOnReadyPeer() =>
+        IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
+
     public static void Dmac_LevelCatchup_DefaultOff_NoOp()
     {
         var sys = new Ps2System();
@@ -1450,6 +1454,7 @@ press 3000 Circle 100
             IopExecSmokes.IopThreadContext_Scaffolding_FlagAndSwitch();
             IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
+            IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
             IopExecSmokes.RealRpc_DispatchCompose_WithMultiThread();
             IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
             Sif_DmaRoundTrip_UpdatesMemory();
