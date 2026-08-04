@@ -104,6 +104,7 @@ public sealed class Intc : ISchedulable
         Stat = 0;
         Mask = 0;
         CpuLatched = 0;
+        Array.Clear(_latchedAtCycle);
         Array.Clear(_statHoldUntil);
     }
 
@@ -241,7 +242,11 @@ public sealed class Intc : ISchedulable
         _onChanged?.Invoke();
     }
 
-    /// <summary>Restore STAT/MASK from save state.</summary>
+    /// <summary>
+    /// Legacy save path (file version ≤6): restore sticky STAT/MASK only.
+    /// Forces <see cref="CpuLatched"/> to 0 (storm avoidance) and zeros A2 / hold arrays so
+    /// stale timestamps cannot survive a load of an old blob that never carried them.
+    /// </summary>
     public void RestoreState(uint stat, uint mask)
     {
         Stat = stat;
@@ -249,6 +254,35 @@ public sealed class Intc : ISchedulable
         // After restore, treat sticky STAT as already-delivered so we don't storm on load;
         // next Raise edge re-arms. Callers that need immediate re-fire can Raise again.
         CpuLatched = 0;
+        Array.Clear(_latchedAtCycle);
+        Array.Clear(_statHoldUntil);
+        _onChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Full INTC blob for save-state v7+: Stat, Mask, CpuLatched, A2 edge stamps, VBlank hold
+    /// windows. Array lengths are fixed at 16 (see InterruptSource max = 14).
+    /// </summary>
+    public void WriteState(System.IO.BinaryWriter w)
+    {
+        w.Write(Stat);
+        w.Write(Mask);
+        w.Write(CpuLatched);
+        for (int i = 0; i < 16; i++)
+            w.Write(_latchedAtCycle[i]);
+        for (int i = 0; i < 16; i++)
+            w.Write(_statHoldUntil[i]);
+    }
+
+    public void ReadState(System.IO.BinaryReader r)
+    {
+        Stat = r.ReadUInt32();
+        Mask = r.ReadUInt32();
+        CpuLatched = r.ReadUInt32();
+        for (int i = 0; i < 16; i++)
+            _latchedAtCycle[i] = r.ReadUInt64();
+        for (int i = 0; i < 16; i++)
+            _statHoldUntil[i] = r.ReadUInt64();
         _onChanged?.Invoke();
     }
 

@@ -1,7 +1,7 @@
 # A2 save-state notes: `_latchedAtCycle[16]` serialization
 
 **Scope:** How DetPS2 save/load works today for INTC, what A2 (min IRQ dispatch latency) adds, and how to serialize `Intc._latchedAtCycle` without breaking old save files.  
-**Status:** audit / design only — no code changes in this note.  
+**Status:** implemented (A2.1) — save-state v7 soft branch + `Intc.WriteState`/`ReadState`.  
 **Date:** 2026-08-04  
 **Files:** `src/DetPS2.Core/Intc.cs`, `SaveState.cs`, `EmotionEngine.cs` (A2 gate), subsystem `WriteState`/`ReadState` peers.
 

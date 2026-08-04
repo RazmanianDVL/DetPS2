@@ -5,6 +5,11 @@ using System.IO.Compression;
 namespace DetPS2.Core;
 
 /// <summary>
+/// Save state v7: same full-system layout as v6, plus Intc A2 / hold fields
+/// (CpuLatched, _latchedAtCycle[16], _statHoldUntil[16]) via <see cref="Intc.WriteState"/>.
+/// v6 files still load: Intc slice stays 2×uint and arrays default to zeros (soft branch —
+/// unlike the v5→v6 Kernel hard refuse).
+///
 /// Save state v6: same layout as v5 plus KernelState THREADMAN fields that v5 omitted
 /// (EverStarted/SoftSuspended/SuspendCount/WakeupCount/Sema.InitCount). Older v5 files
 /// refuse to load once Kernel.ReadState advances (see <see cref="CurrentVersion"/>).
@@ -33,7 +38,7 @@ namespace DetPS2.Core;
 public static class SaveState
 {
     private const uint Magic = 0x44505332; // 'DPS2'
-    private const uint CurrentVersion = 6;
+    private const uint CurrentVersion = 7;
 
     public static byte[] Save(Ps2System system) => Save(system, compress: true);
 
@@ -73,8 +78,7 @@ public static class SaveState
             system.Vu0.WriteState(writer);
             system.Vu1.WriteState(writer);
 
-            writer.Write(system.Intc.Stat);
-            writer.Write(system.Intc.Mask);
+            system.Intc.WriteState(writer);
 
             system.Dmac.WriteState(writer);
             system.Cdvd.WriteState(writer);
@@ -158,12 +162,12 @@ public static class SaveState
                 system.Memory.Write8(SystemMemory.SPR_BASE + (uint)i, spr[i]);
         }
 
-        // v5 and v6 share LoadV5 sequencing; Kernel.ReadState itself is only compatible with
-        // the writer that produced the file. CurrentVersion=6 writers emit the extended
-        // THREADMAN fields — loading a v5 blob into a v6 Kernel.ReadState would desync the
-        // stream, so v5 is no longer accepted once we ship v6.
+        // v6+ share LoadV5Plus sequencing. Kernel.ReadState is only compatible with the
+        // writer that produced the file: loading a v5 blob into the v6 THREADMAN layout
+        // would desync the stream, so v5 is refused. v7 only lengthens the Intc slice
+        // (gated below) — v6 files still load with Stat/Mask only and A2 arrays zeroed.
         bool ok = version >= 6
-            ? LoadV5(system, reader)
+            ? LoadV5Plus(system, reader, version)
             : version >= 5
                 ? false // v5 kernel blob is not forward-compatible with v6 THREADMAN fields
                 : LoadV3OrV4(system, reader, version);
@@ -173,7 +177,7 @@ public static class SaveState
         return true;
     }
 
-    private static bool LoadV5(Ps2System system, BinaryReader reader)
+    private static bool LoadV5Plus(Ps2System system, BinaryReader reader, uint version)
     {
         system.EE.ReadState(reader);
         system.Iop.ReadState(reader);
@@ -195,9 +199,16 @@ public static class SaveState
         system.Vu0.ReadState(reader);
         system.Vu1.ReadState(reader);
 
-        uint stat = reader.ReadUInt32();
-        uint mask = reader.ReadUInt32();
-        system.Intc.RestoreState(stat, mask);
+        // Soft Intc gate: v7+ full A2/hold blob; v6 (and any 6.x) Stat+Mask only so the
+        // stream stays aligned for Dmac and everything after.
+        if (version >= 7)
+            system.Intc.ReadState(reader);
+        else
+        {
+            uint stat = reader.ReadUInt32();
+            uint mask = reader.ReadUInt32();
+            system.Intc.RestoreState(stat, mask);
+        }
 
         system.Dmac.ReadState(reader);
         system.Cdvd.ReadState(reader);

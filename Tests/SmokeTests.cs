@@ -1439,6 +1439,7 @@ press 3000 Circle 100
             BiosStub_TraceNoCrash();
             SaveState_StableAcrossBiosRun();
             SaveState_FullSubsystemRoundTrip();
+            SaveState_IntcA2LatchRoundTrip();
 
             // Phase 10
             Scheduler_EventQueue_MasterCyclesExact();
@@ -2307,6 +2308,56 @@ press 3000 Circle 100
             throw new Exception("registered INTC handler lost");
 
         Console.WriteLine("[Smoke] SaveState_FullSubsystemRoundTrip OK");
+    }
+
+    /// <summary>
+    /// A2.1 / save-state v7: CpuLatched + _latchedAtCycle[16] (+ hold windows) must survive a
+    /// full-system save/load. v≤6 RestoreState forced CpuLatched=0 and never wrote stamps.
+    /// </summary>
+    public static void SaveState_IntcA2LatchRoundTrip()
+    {
+        var sys = new Ps2System();
+        sys.RunFor(50_000); // non-zero MasterCycles so "already paid" vs stamp is meaningful
+
+        int src = (int)Intc.InterruptSource.DmaController;
+        Intc.CurrentCycleForTrace = sys.MasterCycles;
+        sys.Intc.SetMask(1u << src);
+        sys.Intc.Raise(Intc.InterruptSource.DmaController);
+
+        if (sys.Intc.CpuLatched == 0)
+            throw new Exception("Raise should arm CpuLatched");
+        ulong stamp = sys.Intc.LatchedAtCycle(src);
+        if (stamp != sys.MasterCycles)
+            throw new Exception($"expected LatchedAtCycle={sys.MasterCycles}, got {stamp}");
+        uint expectStat = sys.Intc.Stat;
+        uint expectMask = sys.Intc.Mask;
+        uint expectLatch = sys.Intc.CpuLatched;
+
+        byte[] state = sys.SaveState(compress: false);
+        var loaded = new Ps2System();
+        if (!loaded.LoadState(state))
+            throw new Exception("LoadState failed");
+
+        if (loaded.Intc.Stat != expectStat)
+            throw new Exception($"Stat lost: 0x{loaded.Intc.Stat:X} vs 0x{expectStat:X}");
+        if (loaded.Intc.Mask != expectMask)
+            throw new Exception($"Mask lost: 0x{loaded.Intc.Mask:X} vs 0x{expectMask:X}");
+        if (loaded.Intc.CpuLatched != expectLatch)
+            throw new Exception($"CpuLatched lost: 0x{loaded.Intc.CpuLatched:X} vs 0x{expectLatch:X}");
+        if (loaded.Intc.LatchedAtCycle(src) != stamp)
+            throw new Exception($"LatchedAtCycle lost: {loaded.Intc.LatchedAtCycle(src)} vs {stamp}");
+        // Unrelated sources stay zero (fixed 16-entry layout)
+        if (loaded.Intc.LatchedAtCycle((int)Intc.InterruptSource.VBlankStart) != 0)
+            throw new Exception("unrelated LatchedAtCycle should be zero");
+
+        // Legacy RestoreState path still zeros A2 fields (v≤6 semantics)
+        loaded.Intc.RestoreState(expectStat, expectMask);
+        if (loaded.Intc.CpuLatched != 0)
+            throw new Exception("RestoreState must force CpuLatched=0");
+        if (loaded.Intc.LatchedAtCycle(src) != 0)
+            throw new Exception("RestoreState must clear _latchedAtCycle");
+
+        Console.WriteLine("[Smoke] SaveState_IntcA2LatchRoundTrip OK");
     }
 
     // -------------------- Phase 10 --------------------
