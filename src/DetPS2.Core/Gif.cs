@@ -11,6 +11,29 @@ public sealed class Gif : ISchedulable
 {
     private readonly Gs _gs;
 
+    // M1-b (playability-roadmap.json): large single-call transfers are budgeted instead of
+    // instant-completing in one ProcessTransfer call -- same "manufactured instant progress"
+    // bug class A1 fixed for Dmac.cs's GIF_STAT poll-pump. Dmac.DeliverSegment hands the WHOLE
+    // original DMA segment (ch.OriginalQWC, can be many thousands of QW for a large IMAGE) to
+    // Receive*Data in one call regardless of A1's own per-Step cycle budgeting inside the DMAC
+    // itself -- that budgets how fast the channel drains, not how much GIF renders in one call
+    // once it does. Residual re-enters through the SAME public Receive*Data entry point on a
+    // later Step() tick (not a raw ProcessTransfer call), so existing Path2/Path3 sticky-hold
+    // semantics apply to the deferred part exactly as they would to a fresh, unrelated transfer.
+    private const uint MaxQwPerReceiveCall = 256;
+    private static readonly bool DisableM1bBudgetedProcess =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1B_BUDGETED_PROCESS") == "1";
+    private byte _pendingBudgetPath; // 0 = none, else 1/2/3 matching APATH
+    // M1-b: true only while Step() is re-entering Receive*Data to drain a deferred
+    // residual. Path*Transfers is a load-bearing counter -- MidwayBootAssist.cs gates
+    // real boot-progression heuristics on Path3Transfers thresholds (<=5, >=8, >=11),
+    // tuned against "one count per real external segment". Budgeted continuation calls
+    // must NOT inflate that count, or those thresholds fire early/wrong for titles that
+    // happen to submit one large Path3 segment split across ticks.
+    private bool _isBudgetContinuation;
+    private uint _pendingBudgetAddr;
+    private uint _pendingBudgetQwc;
+
     private uint _lastQwcProcessed;
     private ulong _path3Transfers;
     private ulong _path2Transfers;
@@ -73,6 +96,34 @@ public sealed class Gif : ISchedulable
     private uint _mode;
     private readonly uint[] _fifo = new uint[64]; // 16 QW max
     private int _fifoR, _fifoW, _fifoCount;
+
+    // M1-c: dedicated staging for real EE FIFO pokes (WriteFifo), independent of
+    // _fifo/_fifoR/_fifoW/_fifoCount above. Those four fields are ALSO reused by
+    // EnqueueHeldPath3 purely as a synthetic FQC/telemetry counter (it resets
+    // _fifoR/_fifoW/_fifoCount to represent held-Path3 QWC, without touching _fifo's
+    // contents) -- trusting them for real word data here would risk feeding stale or
+    // mismatched bytes into the GIFtag parser as if they were genuine FIFO words.
+    // _fifoStage only ever holds words this call actually wrote via WriteFifo while
+    // unmasked, so draining it is safe regardless of what the shared counters say.
+    private static readonly bool DisableM1cBudgetedFifo =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1C_BUDGETED_FIFO") == "1";
+    private readonly uint[] _fifoStage = new uint[4];
+    private int _fifoStageCount;
+
+    // M1-a: ReadStat's FQC fabrication (below) used to fire unconditionally whenever
+    // Path3Masked && fqc==0, forever, even when PATH3 had never actually transferred
+    // anything -- an outright invention, not just an early/optimistic report. The real
+    // race it exists for (Burnout 3 @ 0x001F1A28) only happens right after an UNMASKED
+    // PATH3 delivery instant-completes just before the game's own mask+poll instructions
+    // run; ReceivePath3Data's unmasked branch sets this evidence counter at that moment.
+    // Fabrication now requires that evidence and is capped by a generous poll budget as
+    // a pure safety backstop -- NOT tightened enough to risk resurrecting the documented
+    // hang, since the honest fix here is "don't lie about PATH3 that never ran," not
+    // "shrink the window for PATH3 that genuinely did."
+    private static readonly bool DisableM1aHonestFqc =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1A_HONEST_FQC") == "1";
+    private const int M1aRaceEvidencePollBudget = 65536;
+    private int _path3RaceEvidencePolls;
 
     /// <summary>
     /// PATH3 temporarily masked by VIF1 <c>MSKPATH3</c> (GIF_STAT bit 1 = M3P).
@@ -555,8 +606,21 @@ public sealed class Gif : ISchedulable
         // M3P=1 with FQC=0 forever and the busy-flag in the flip-queue consumer stuck.
         // While PATH3 is masked, report at least 1 QW so the poller proceeds; the next
         // chain re-validates against real DMA state. Unmasked path is unchanged.
+        // M1-a: only when there's real evidence a PATH3 delivery just raced the mask
+        // (see _path3RaceEvidencePolls) -- not unconditionally, which would report FQC=1
+        // even for titles/masks where PATH3 never ran at all. Bounded, not permanent.
         if (Path3Masked && fqc == 0)
-            fqc = 1;
+        {
+            if (DisableM1aHonestFqc)
+            {
+                fqc = 1;
+            }
+            else if (_path3RaceEvidencePolls > 0)
+            {
+                fqc = 1;
+                _path3RaceEvidencePolls--;
+            }
+        }
         uint oph = (_fifoCount > 0 || _apath != 0 || (Path3Masked && fqc > 0)) ? 1u : 0u;
         uint imt = (_mode & 2) != 0 ? 1u : 0u; // GIF_MODE.IMT → STAT.IMT
         return (_mode & 1)                      // M3R
@@ -599,6 +663,7 @@ public sealed class Gif : ISchedulable
                     _heldPath2Count = 0;
                     _heldPath2TotalQwc = 0;
                     _heldPath2InlineCount = 0;
+                    _path3RaceEvidencePolls = 0;
                     // GX-010: RST must drop sticky mid-packet so next path is not
                     // swallowed as body data (Play! / PCSX2 clear path state on RST).
                     ClearPacketState();
@@ -629,19 +694,59 @@ public sealed class Gif : ISchedulable
         if (Path3Masked)
             return;
         // Unmasked: every full QW is fair game to consume (DMA is the usual path; FIFO
-        // pokes are rare and treated as fire-and-forget for telemetry).
-        if (_fifoCount >= 4 && (_fifoCount % 4) == 0)
-            DrainFifoQuadwords();
+        // pokes are rare and treated as fire-and-forget for telemetry). Stage separately
+        // from _fifoCount (see M1-c comment above) so a concurrent held-Path3 FQC reset
+        // of the shared counters can never desync this word's position in its QW.
+        _fifoStage[_fifoStageCount++] = value;
+        if (_fifoStageCount >= 4)
+        {
+            _fifoStageCount = 0;
+            DrainFifoQuadwords(_fifoStage[0], _fifoStage[1], _fifoStage[2], _fifoStage[3]);
+            _fifoR = _fifoW = _fifoCount = 0;
+        }
     }
 
-    private void DrainFifoQuadwords()
+    /// <summary>
+    /// M1-c: honestly process one QW poked directly into the GIF FIFO (0x10006000) through
+    /// the same GIFtag/packet state machine as Path1-3, instead of silently dropping it.
+    /// FIFO pokes have no EE/SPR address, so the QW is fed via the inline-QW mechanism
+    /// (the same one <see cref="ReceivePath2Quadword"/> uses). Kill-switch restores the old
+    /// drop/reset stub for A/B testing.
+    /// </summary>
+    private void DrainFifoQuadwords(uint w0, uint w1, uint w2, uint w3)
     {
-        // Instant-process: GIF FIFO PATH3-style streaming is rare vs DMA; when games poke FIFO we
-        // accumulate words into a temporary buffer on the GS local mem high area and run ProcessTransfer.
-        // Minimal: count transfers for telemetry; full FIFO-to-GS PATH3 stream needs a proper state machine.
+        if (DisableM1cBudgetedFifo)
+        {
+            _path3Transfers++;
+            return;
+        }
+        // GX-010 parity: Path2-owned sticky must not be clobbered by FIFO/Path3-style data.
+        // FIFO pokes are rare/telemetry-grade (per existing WriteFifo comment); dropping this
+        // one QW under an active Path2 DIRECT is safer than corrupting the reassembly.
+        if (_pktActive && _pktPath == 2)
+        {
+            _path3StalledByPath2++;
+            return;
+        }
         _path3Transfers++;
-        // Drop words (games often uses DMA not FIFO). Keep FIFO empty so STAT never stalls.
-        _fifoR = _fifoW = _fifoCount = 0;
+        uint prevApath = _apath;
+        _apath = 3;
+        _inlineQw[0] = w0;
+        _inlineQw[1] = w1;
+        _inlineQw[2] = w2;
+        _inlineQw[3] = w3;
+        _inlineActive = true;
+        try
+        {
+            ProcessTransfer(0, 1);
+        }
+        finally
+        {
+            _inlineActive = false;
+            _apath = prevApath;
+        }
+        if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
+            DrainHeldPath3();
     }
 
     /// <summary>Path3 — DMAC GIF channel.</summary>
@@ -664,7 +769,11 @@ public sealed class Gif : ISchedulable
             }
             return;
         }
-        _path3Transfers++;
+        // M1-b: don't recount a budgeted residual continuation as a new external segment
+        // (see _isBudgetContinuation doc) -- MidwayBootAssist.cs gates real thresholds on
+        // Path3Transfers. QW accumulation (_path3Qws) still reflects genuine data moved.
+        if (!_isBudgetContinuation)
+            _path3Transfers++;
         _path3Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path3->GS", address, 0, qwc * 16);
 
@@ -693,8 +802,12 @@ public sealed class Gif : ISchedulable
                 $"[GIF] Path3 xfer addr=0x{address:X8} qwc={qwc} n={_path3Transfers} " +
                 $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
         }
-        ProcessTransfer(address, qwc);
+        ProcessTransferBudgeted(address, qwc);
         _apath = 0;
+        // M1-a: this unmasked delivery is the exact evidence ReadStat's FQC fabrication
+        // requires — if the game masks PATH3 and polls STAT right after this, honor the
+        // documented race for a bounded number of polls instead of lying unconditionally.
+        _path3RaceEvidencePolls = M1aRaceEvidencePollBudget;
         // G2: Path3 multi-DMA IMAGE just completed — drain Path2 held under Path3 sticky.
         if (!_pktActive && (_heldPath2Count > 0 || _heldPath2InlineCount > 0))
             DrainHeldPath2();
@@ -724,7 +837,9 @@ public sealed class Gif : ISchedulable
             }
             return;
         }
-        _path2Transfers++;
+        // M1-b: see _isBudgetContinuation doc — don't recount a residual continuation.
+        if (!_isBudgetContinuation)
+            _path2Transfers++;
         _path2Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path2->GS", address, 0, qwc * 16);
         _apath = 2;
@@ -736,7 +851,7 @@ public sealed class Gif : ISchedulable
                 $"[GIF] Path2 xfer addr=0x{address:X8} qwc={qwc} n={_path2Transfers} p2qws={_path2Qws} " +
                 $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
         }
-        ProcessTransfer(address, qwc);
+        ProcessTransferBudgeted(address, qwc);
         _apath = 0;
         // If Path2 sticky just finished, drain Path3 held during path2-stall.
         if (!_pktActive && _heldPath3Count > 0 && !Path3Masked)
@@ -781,7 +896,9 @@ public sealed class Gif : ISchedulable
     public void ReceivePath1Data(uint address, uint qwc)
     {
         if (qwc == 0) return;
-        _path1Transfers++;
+        // M1-b: see _isBudgetContinuation doc — don't recount a residual continuation.
+        if (!_isBudgetContinuation)
+            _path1Transfers++;
         _path1Qws += qwc;
         if (TransferLog.Enabled) TransferLog.Log("GIF:Path1->GS", address, 0, qwc * 16);
         _apath = 1;
@@ -792,8 +909,35 @@ public sealed class Gif : ISchedulable
                 $"[GIF] Path1 xfer addr=0x{address:X8} qwc={qwc} n={_path1Transfers} " +
                 $"inFlight={_pktActive} completed={_pktCompleted} aborted={_pktAborted}");
         }
-        ProcessTransfer(address, qwc);
+        ProcessTransferBudgeted(address, qwc);
         _apath = 0;
+    }
+
+    /// <summary>
+    /// M1-b: bounded front door for Path1/2/3's "process now" call sites. Callers must set
+    /// <c>_apath</c> to the correct path (1/2/3) before calling, same as they already do for
+    /// the direct <see cref="ProcessTransfer"/> call this replaces. When <paramref name="qwc"/>
+    /// exceeds <see cref="MaxQwPerReceiveCall"/> and no residual is already outstanding, only
+    /// the budgeted portion is processed now; the remainder is deferred to <see cref="Step"/>,
+    /// which re-submits it through the SAME public Receive*Data entry point (not a raw
+    /// ProcessTransfer call) so Path2/Path3 sticky-hold semantics apply to the deferred part
+    /// exactly as they would to any other transfer. If a residual is already outstanding when
+    /// a new large transfer arrives (rare double-large-transfer collision), this falls back to
+    /// processing the new one unbounded rather than dropping data or silently reordering two
+    /// pending residuals -- correctness over perfect budgeting for that edge case.
+    /// </summary>
+    private void ProcessTransferBudgeted(uint address, uint qwc)
+    {
+        uint thisCall = qwc;
+        if (!DisableM1bBudgetedProcess && qwc > MaxQwPerReceiveCall && _pendingBudgetPath == 0)
+            thisCall = MaxQwPerReceiveCall;
+        ProcessTransfer(address, thisCall);
+        if (thisCall < qwc && _pendingBudgetPath == 0)
+        {
+            _pendingBudgetPath = (byte)_apath;
+            _pendingBudgetAddr = address + thisCall * 16;
+            _pendingBudgetQwc = qwc - thisCall;
+        }
     }
 
     /// <summary>
@@ -1070,6 +1214,35 @@ public sealed class Gif : ISchedulable
 
     public int Step(ulong maxCycles)
     {
+        // M1-b: drain one budgeted chunk of a deferred large transfer, if any, before
+        // reporting cost. Clear the pending slot BEFORE re-entering Receive*Data so a
+        // still-oversized residual correctly re-arms a fresh pending slot for the NEXT
+        // Step() tick (chains across as many ticks as the transfer needs) instead of the
+        // re-entrant call seeing its own not-yet-cleared residual and taking the "already
+        // outstanding" fallback path in ProcessTransferBudgeted.
+        if (_pendingBudgetPath != 0)
+        {
+            byte path = _pendingBudgetPath;
+            uint addr = _pendingBudgetAddr;
+            uint qwc = _pendingBudgetQwc;
+            _pendingBudgetPath = 0;
+            _pendingBudgetAddr = 0;
+            _pendingBudgetQwc = 0;
+            _isBudgetContinuation = true;
+            try
+            {
+                switch (path)
+                {
+                    case 1: ReceivePath1Data(addr, qwc); break;
+                    case 2: ReceivePath2Data(addr, qwc); break;
+                    case 3: ReceivePath3Data(addr, qwc); break;
+                }
+            }
+            finally
+            {
+                _isBudgetContinuation = false;
+            }
+        }
         if (_lastQwcProcessed == 0)
             return 1;
         uint nreg = _nreg == 0 ? 1u : _nreg;
