@@ -56,6 +56,13 @@ public sealed class Dmac : ISchedulable
     public static readonly bool TraceDmac =
         Environment.GetEnvironmentVariable("DETPS2_TRACE_DMAC") == "1";
 
+    /// <summary>M5-a S6: <c>DETPS2_DMAC_LEVEL_CATCHUP=1</c> enables opt-in level-sensitive
+    /// re-Raise while owed/CIS remain after a handler take (no invent credits).
+    /// Hard kill: <c>DETPS2_DISABLE_M5A_DMAC=1</c> forces off. Default off = pre-S6 behavior.</summary>
+    public static readonly bool LevelCatchup =
+        Environment.GetEnvironmentVariable("DETPS2_DMAC_LEVEL_CATCHUP") == "1"
+        && Environment.GetEnvironmentVariable("DETPS2_DISABLE_M5A_DMAC") != "1";
+
     // --- M5-a Phase 0 per-channel completion/credit telemetry (always accumulate) ---
     // finish: FinishChannel entries
     // owedInc: FinishChannel owed++ when CIM live
@@ -66,6 +73,7 @@ public sealed class Dmac : ISchedulable
     // w1cWhileOwed: software D_STAT W1C of CIS while owed>0 (race before take)
     // tryTakeCis / tryTakeOwed: AddDmacHandler takes (CIS path vs owed-only fallback)
     // raiseIrq: RaiseDmacIrq attributed to this channel
+    // catchupRaise: S6 level re-Raise (no invent) after take/ack path
     private readonly ulong[] _telemFinish = new ulong[10];
     private readonly ulong[] _telemOwedInc = new ulong[10];
     private readonly int[] _telemOwedPeak = new int[10];
@@ -79,6 +87,7 @@ public sealed class Dmac : ISchedulable
     private ulong _telemRaiseIrqTotal;
     private ulong _telemFinishTotal;
     private ulong _telemLastDumpFinishTotal;
+    private ulong _telemCatchupRaise;
 
     // Optional TRACE ring: last N (ch, reason, seq). reason: 0=finish 1=credit 2=enable 3=take
     private const int TelemRingCap = 32;
@@ -147,6 +156,7 @@ public sealed class Dmac : ISchedulable
         Array.Clear(_telemRaiseIrq);
         _telemRaiseIrqTotal = 0;
         _telemFinishTotal = 0;
+        _telemCatchupRaise = 0;
         _telemLastDumpFinishTotal = 0;
         _telemRingWrite = 0;
         _telemRingCount = 0;
@@ -406,6 +416,32 @@ public sealed class Dmac : ISchedulable
     /// <summary>True when any channel still owes an AddDmacHandler call (queue or D_STAT).</summary>
     public bool HasOwedHandlerCall(int channel) =>
         (uint)channel < 10 && _owedHandlerCalls[channel] > 0;
+
+    /// <summary>True when any IRQ-enabled channel still has sticky CIS or owed handler credits.</summary>
+    public bool HasLevelSensitiveDmacWork()
+    {
+        for (int ch = 0; ch < 10; ch++)
+        {
+            if (!IsChannelIrqEnabled(ch)) continue;
+            if ((DStat & (1u << ch)) != 0 || _owedHandlerCalls[ch] > 0)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// M5-a S6: re-Raise DmaController when level-sensitive work remains, without inventing
+    /// owed credits. Call after a viaDmacFallback take + INTC Acknowledge so edge-clear does
+    /// not drop remaining owed/CIS work. No-op when <see cref="LevelCatchup"/> is off.
+    /// </summary>
+    public bool MaybeLevelCatchupRaise()
+    {
+        if (!LevelCatchup) return false;
+        if (!HasLevelSensitiveDmacWork()) return false;
+        RaiseDmacIrq(-1);
+        _telemCatchupRaise++;
+        return true;
+    }
 
     /// <summary>Consume one owed handler call for <paramref name="channel"/>. Returns false if none.</summary>
     public bool TryConsumeOwedHandlerCall(int channel)
@@ -921,6 +957,7 @@ public sealed class Dmac : ISchedulable
         var w = Console.Error;
         w.WriteLine(
             $"{prefix} total finish={_telemFinishTotal} raise={_telemRaiseIrqTotal} " +
+            $"catchupRaise={_telemCatchupRaise} levelCatchup={(LevelCatchup ? 1 : 0)} " +
             $"transfersCompleted={TransfersCompleted} active={ActiveChannelCount}");
         for (int ch = 0; ch < 10; ch++)
         {

@@ -1264,6 +1264,11 @@ public sealed class EmotionEngine : ISchedulable
                 // for the entire hold (2M cycles) — denser after multi-handler eret sync.
                 if (_intc.IsPending((Intc.InterruptSource)src))
                     _intc.ClearCpuLatch((Intc.InterruptSource)src);
+                // M5-a S6: TryTake may re-Raise while owed remains, but Acknowledge above
+                // edge-clears DmaController. Level catch-up re-arms without inventing owed
+                // (DETPS2_DMAC_LEVEL_CATCHUP=1; kill DETPS2_DISABLE_M5A_DMAC=1). Flag-off no-op.
+                if (src == (int)Intc.InterruptSource.DmaController)
+                    sony.MaybeLevelCatchupAfterDmacDispatch();
             }
 
             // Traced (2026-07-27, Mortal Kombat: Shaolin Monks): the same interrupt-storm class

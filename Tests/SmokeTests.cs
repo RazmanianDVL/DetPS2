@@ -1280,6 +1280,34 @@ press 3000 Circle 100
     }
 
     /// <summary>
+    /// M5-a S6: default-off level catch-up must be a no-op (flag-off byte-identical posture).
+    /// Does not require DETPS2_DMAC_LEVEL_CATCHUP (static readonly at process start).
+    /// </summary>
+    public static void Dmac_LevelCatchup_DefaultOff_NoOp()
+    {
+        var sys = new Ps2System();
+        sys.LoadBiosNative();
+        int gifCh = (int)Dmac.Channel.GIF;
+        sys.Dmac.EnableChannelIrq(gifCh);
+        // Invent one owed unit via public credit API so HasLevelSensitiveDmacWork is true.
+        sys.Dmac.CreditOwedHandlerCall(gifCh, 1);
+        if (!sys.Dmac.HasOwedHandlerCall(gifCh))
+            throw new Exception("CreditOwedHandlerCall did not queue owed");
+        if (!sys.Dmac.HasLevelSensitiveDmacWork())
+            throw new Exception("expected level-sensitive work after credit");
+        // Default process has LEVEL_CATCHUP unset → MaybeLevelCatchupRaise is no-op.
+        if (Dmac.LevelCatchup)
+        {
+            Console.WriteLine("[Smoke] Dmac_LevelCatchup_DefaultOff_NoOp SKIP (LEVEL_CATCHUP already on in process)");
+            return;
+        }
+        bool raised = sys.Dmac.MaybeLevelCatchupRaise();
+        if (raised)
+            throw new Exception("MaybeLevelCatchupRaise must be no-op when LevelCatchup is off");
+        Console.WriteLine("[Smoke] Dmac_LevelCatchup_DefaultOff_NoOp OK");
+    }
+
+    /// <summary>
     /// Real BIOS keeps a linked list of AddIntcHandler registrations per cause and the ISR
     /// walks every entry. A single-slot dictionary silently dropped all but the last
     /// registration (Burnout 3 VBlankStart: 0x2370A0 → 0x1F1CE8 → 0x22B830). Verify the
@@ -1433,6 +1461,7 @@ press 3000 Circle 100
             Mmio_TimerAndIntc_ViaBus();
             Dmac_IrqOnComplete();
             Dmac_EnableDmac_DispatchesAddDmacHandler();
+            Dmac_LevelCatchup_DefaultOff_NoOp();
             Intc_AddIntcHandler_MultiHandlerChain();
 
             // Phase 9

@@ -602,6 +602,14 @@ public sealed class SonyKernelHle
         return false;
     }
 
+    /// <summary>
+    /// M5-a S6: after DmaController viaDmacFallback take + INTC Acknowledge, re-arm
+    /// DmaController if level-sensitive CIS/owed work remains (no invent). Flag-gated
+    /// inside <see cref="Dmac.MaybeLevelCatchupRaise"/>.
+    /// </summary>
+    public void MaybeLevelCatchupAfterDmacDispatch() =>
+        _system.Dmac.MaybeLevelCatchupRaise();
+
     public ulong Handled { get; private set; }
     public ulong Unknown { get; private set; }
     /// <summary>Last few Sony syscall numbers (ring) for boot diagnostics.</summary>
