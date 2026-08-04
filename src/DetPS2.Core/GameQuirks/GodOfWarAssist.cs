@@ -350,15 +350,83 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public const uint WorkerStackTop = 0x0031C8C0;
     public const uint WorkerStackAfterPrologue = WorkerStackTop - 608; // 0x0031C660
 
+    // --- M8-a GoW dual-suppress gates (seed m8a-b3-gow-evidence-seed.md) ---
+    // Prefer: product soft-off (Vexx-style; Stage A byte-identical @diagnose).
+    // Plant / force-tag / force-UDNL: evidence =1 suppress; product plant remains ON (load-bearing).
+
+    /// <summary>
+    /// M8-a quiet Prefer half (m8a-gow-dual-suppress-results.md Stage A byte-identical @diagnose).
+    /// Default soft-off: skip Prefer assign on mount + Ensure + hold Prefer false in Step
+    /// (LITERAL_IRX auto-set neutralized). Rollback: DETPS2_M8A_GOW_NO_PREFER_IOPRP=0.
+    /// </summary>
+    private static bool SkipPreferIopRp
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_GOW_NO_PREFER_IOPRP");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// Evidence-only plant suppress: DETPS2_M8A_GOW_NO_VERSION_PLANT=1 skips all "3000"
+    /// PlantIopRpVersion sites. Product default remains plant ON — dual-suppress @diagnose
+    /// showed plant load-bearing (cdvd 136→0). Do not soft-off without claim-class green.
+    /// </summary>
+    private static bool SkipVersionPlant
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_GOW_NO_VERSION_PLANT");
+            return string.Equals(v, "1", StringComparison.Ordinal) ||
+                   string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
+    /// Stage C: skip SetIopRpVersionAscii("3000") inside Ensure. DETPS2_M8A_GOW_NO_FORCE_TAG=1.
+    /// Evidence-only; product default ON (force tag after empty reboot remains).
+    /// </summary>
+    private static bool SkipForceTag
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_GOW_NO_FORCE_TAG");
+            return string.Equals(v, "1", StringComparison.Ordinal) ||
+                   string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
+    /// Stage C: skip ApplyUdnlHandoff(IOPRP300) on empty reboot. DETPS2_M8A_GOW_NO_FORCE_UDNL=1.
+    /// Evidence-only; product default ON.
+    /// </summary>
+    private static bool SkipForceUdnl
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_GOW_NO_FORCE_UDNL");
+            return string.Equals(v, "1", StringComparison.Ordinal) ||
+                   string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
         if (sys.Hle?.Sony?.RealRpc != null)
-            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+        {
+            if (!SkipPreferIopRp)
+                sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+            else
+                sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = false;
+        }
         // EE RAM "3000" plant only at boot — do NOT SetIopRpVersionAscii early:
         // live claim with GetVersion="3000" from cyc0 regressed binds 16→10 / dmac 463→321
         // (FILEIO-2200 arming / LOADFILE path skew). Post-empty-reboot handoff below sets it.
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
     }
 
     public void OnHostPresent(Ps2System sys)
@@ -384,6 +452,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     /// </summary>
     public static void PlantIopRpVersion(Ps2System sys)
     {
+        // All call sites (mount, post-ELF, reboot-gen, FreezeCache) share this gate.
+        if (SkipVersionPlant) return;
         // Only overwrite the unfilled "...." placeholder — never clobber a real version.
         uint w = sys.Memory.Read32(IopVersionPlaceholder);
         if (w == 0x2E2E2E2Eu || w == 0) // "...." or zero
@@ -404,7 +474,11 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     {
         var rpc = sys.Hle?.Sony?.RealRpc;
         if (rpc == null) return;
-        rpc.PreferIopRpGetVersion = true;
+        if (!SkipPreferIopRp)
+            rpc.PreferIopRpGetVersion = true;
+        else
+            rpc.PreferIopRpGetVersion = false;
+        if (SkipForceTag) return;
         if (string.IsNullOrEmpty(rpc.LastIopRpVersionAscii)
             || !string.Equals(rpc.LastIopRpVersionAscii, "3000", StringComparison.Ordinal))
         {
@@ -463,17 +537,30 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             if (missingIopRp)
             {
                 EnsureIopRpGetVersion(sys, c, reason: $"reboot-gen={rebootGen}");
-                try
+                if (!SkipForceUdnl)
                 {
-                    sys.IopExtendedBios.ApplyUdnlHandoff(sys, UdnlIopRp300Arg);
-                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                        Console.Error.WriteLine(
-                            $"[GOW] post-reboot UDNL IOPRP300 handoff gen={rebootGen} " +
-                            $"wasArg=\"{arg}\" cyc={c}");
+                    try
+                    {
+                        sys.IopExtendedBios.ApplyUdnlHandoff(sys, UdnlIopRp300Arg);
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                            Console.Error.WriteLine(
+                                $"[GOW] post-reboot UDNL IOPRP300 handoff gen={rebootGen} " +
+                                $"wasArg=\"{arg}\" cyc={c}");
+                    }
+                    catch { /* ignore */ }
                 }
-                catch { /* ignore */ }
+                else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                {
+                    Console.Error.WriteLine(
+                        $"[GOW] skip forced UDNL IOPRP300 handoff (DETPS2_M8A_GOW_NO_FORCE_UDNL) " +
+                        $"gen={rebootGen} wasArg=\"{arg}\" cyc={c}");
+                }
             }
         }
+
+        // Dual-suppress Prefer hold: neutralize LITERAL_IRX Prefer auto-set side channel.
+        if (SkipPreferIopRp && sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = false;
 
         // Belt-and-suspenders: if freeze flag still holds the version-mismatch error after
         // sound/RPC surface is up, clear it so 0x185F28 can take the non-bltz path.

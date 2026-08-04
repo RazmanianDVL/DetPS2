@@ -1891,14 +1891,19 @@ public sealed class SonyKernelHle
         // when present, so classic 0x00020000 does not fight disc IOPRP version gates.
         // LITERAL_IRX=0 / unset: leave PreferIopRpGetVersion alone (title assists / smokes).
         // No GameQuirk plants here — only surface the arg SifIopReset already captured.
-        // M8-a B3 dual-suppress: DETPS2_M8A_B3_HOLD_PREFER_OFF=1 skips Prefer auto-set so
-        // plant-quiet seats can hold Prefer false (Burnout3Assist also re-clears in Step).
+        // M8-a dual-suppress: B3 HOLD_PREFER_OFF and GoW NO_PREFER_IOPRP skip Prefer auto-set
+        // so plant-quiet / dual seats can hold Prefer false (assists also re-clear in Step).
         bool holdPreferOffB3 = Environment.GetEnvironmentVariable("DETPS2_M8A_B3_HOLD_PREFER_OFF") is "1"
             || string.Equals(Environment.GetEnvironmentVariable("DETPS2_M8A_B3_HOLD_PREFER_OFF"),
                 "true", StringComparison.OrdinalIgnoreCase);
+        // GoW: explicit DETPS2_M8A_GOW_NO_PREFER_IOPRP=1 only (do NOT use soft-off unset here — would hold Prefer off for all titles). Soft-off Prefer re-clears in GodOfWarAssist.Step.
+        string? gowNoPrefer = Environment.GetEnvironmentVariable("DETPS2_M8A_GOW_NO_PREFER_IOPRP");
+        bool holdPreferOffGow = gowNoPrefer is "1"
+            || string.Equals(gowNoPrefer, "true", StringComparison.OrdinalIgnoreCase);
+        bool holdPreferOff = holdPreferOffB3 || holdPreferOffGow;
         if (IopExtendedBiosHost.IsLiteralIrxEnabled()
             && !string.IsNullOrEmpty(RealRpc.LastIopRpVersionAscii)
-            && !holdPreferOffB3)
+            && !holdPreferOff)
         {
             RealRpc.PreferIopRpGetVersion = true;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
@@ -1906,12 +1911,13 @@ public sealed class SonyKernelHle
                 Console.Error.WriteLine(
                     $"[LOADFILE] LITERAL_IRX: PreferIopRpGetVersion=1 ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
         }
-        else if (holdPreferOffB3
+        else if (holdPreferOff
             && (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                 || Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1"))
         {
+            string why = holdPreferOffB3 ? "DETPS2_M8A_B3_HOLD_PREFER_OFF" : "DETPS2_M8A_GOW_NO_PREFER_IOPRP";
             Console.Error.WriteLine(
-                $"[LOADFILE] LITERAL_IRX: PreferIopRp auto-set skipped (DETPS2_M8A_B3_HOLD_PREFER_OFF) ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
+                $"[LOADFILE] LITERAL_IRX: PreferIopRp auto-set skipped ({why}) ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
         }
 
         // Wake one WaitSema sleeper if any (EESYNC post → EE SifIopSync consumer).
