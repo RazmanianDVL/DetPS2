@@ -90,19 +90,48 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         _mainmenuTexBytes = 0;
     }
 
+    /// <summary>
+    /// M8-a quiet (M4-h evidence: dual-suppress Prefer+plant byte-identical at claim when
+    /// LITERAL_IRX auto-set also isolated). Default soft-off PreferIopRp; rollback
+    /// DETPS2_M8A_BO2_NO_PREFER_IOPRP=0.
+    /// </summary>
+    private static bool SkipPreferIopRp
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_BO2_NO_PREFER_IOPRP");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// M8-a quiet plant half for "2340" cells. Rollback DETPS2_M8A_BO2_NO_VERSION_PLANT=0.
+    /// </summary>
+    private static bool SkipVersionPlant
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_BO2_NO_VERSION_PLANT");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
         // ELF load happens after OnDiscMounted and rewrites .text — only plant RDRAM
         // stubs that live outside the PT_LOAD window here. Code patches must re-apply
         // in Step() once the boot ELF is resident (see ApplyPostElfPatches).
-        if (sys.Hle?.Sony?.RealRpc != null)
+        if (!SkipPreferIopRp && sys.Hle?.Sony?.RealRpc != null)
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         PlantSnExtensionStubs(sys);
         ForceSnScanSuccess(sys);
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BO2") == "1")
-            Console.Error.WriteLine("[BO2-SN] OnDiscMounted: low-RDRAM SN stubs + IOPRP version cells");
+            Console.Error.WriteLine($"[BO2-SN] OnDiscMounted: SN stubs + plant={!SkipVersionPlant} prefer={!SkipPreferIopRp}");
     }
 
     /// <summary>
@@ -113,7 +142,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
     {
         PatchSnLoadToSucceed(sys);
         PatchCdromPathCombine(sys);
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
         ForceSnScanSuccess(sys);
     }
 
@@ -238,7 +268,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         {
             ForceSnScanSuccess(sys);
             // Version cells must stay "2340" across SifIopReset (game zeros them at 0x48C9C8).
-            PlantIopRpVersion(sys);
+            if (!SkipVersionPlant)
+                PlantIopRpVersion(sys);
             // Post-SN-check boot parks thread 1 on WaitSema(id) with no producer yet
             // (SN ProDG / disc gate). Periodically SignalSema any waiter so SIF/CDVD progress.
             PulseWaiters(sys);
@@ -340,7 +371,8 @@ public sealed class BloodOmen2SnAssist : IGameQuirkModule
         if (_snQuietPatches < 8 && c >= 10_000_000)
         {
             ForceSnScanSuccess(sys);
-            PlantIopRpVersion(sys);
+            if (!SkipVersionPlant)
+                PlantIopRpVersion(sys);
             _snQuietPatches++;
         }
 

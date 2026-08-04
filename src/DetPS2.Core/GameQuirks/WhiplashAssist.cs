@@ -164,16 +164,47 @@ public sealed class WhiplashAssist : IGameQuirkModule
         _lastTitleChromeCyc = 0;
     }
 
+    /// <summary>
+    /// M8-a quiet (docs/infra-audits/m8a-haven-vexx-retirement-checklist.md pattern):
+    /// M4-b/M4-g tag-if-applied GetVersion + M4-f H1 FILEIO packing make PreferIopRp redundant
+    /// for Whip. Default soft-off; DETPS2_M8A_WHIP_NO_PREFER_IOPRP=0 opts back in.
+    /// </summary>
+    private static bool SkipPreferIopRp
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_WHIP_NO_PREFER_IOPRP");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// M8-a quiet plant half: default skip "2550" cell plant. Rollback
+    /// DETPS2_M8A_WHIP_NO_VERSION_PLANT=0.
+    /// </summary>
+    private static bool SkipVersionPlant
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_WHIP_NO_VERSION_PLANT");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
         if (sys.Hle?.Sony?.RealRpc != null)
         {
-            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
+            if (!SkipPreferIopRp)
+                sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
             // Crystal Dynamics / SN ProDG FILEIO residual — keep classic SN eeReply layout.
             sys.Hle.Sony.RealRpc.PreferSnFileIo = true;
         }
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
     }
 
     public void OnHostPresent(Ps2System sys)
@@ -235,11 +266,11 @@ public sealed class WhiplashAssist : IGameQuirkModule
         ulong c = sys.Scheduler.MasterCycles;
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFu);
 
-        // Keep PreferIopRp + PreferSnFileIo across OnIopReboot surface clears.
+        // Keep PreferIopRp (unless M8-a quiet) + PreferSnFileIo across OnIopReboot clears.
         if (sys.Hle?.Sony?.RealRpc != null)
         {
             var rpc = sys.Hle.Sony.RealRpc;
-            if (!rpc.PreferIopRpGetVersion)
+            if (!SkipPreferIopRp && !rpc.PreferIopRpGetVersion)
                 rpc.PreferIopRpGetVersion = true;
             if (!rpc.PreferSnFileIo)
                 rpc.PreferSnFileIo = true;
@@ -252,15 +283,16 @@ public sealed class WhiplashAssist : IGameQuirkModule
             if (probe != 0)
             {
                 ApplyUsingCdPatches(sys);
-                PlantIopRpVersion(sys);
+                if (!SkipVersionPlant)
+                    PlantIopRpVersion(sys);
                 _patchesApplied = true;
-                _versionPlanted = true;
+                _versionPlanted = !SkipVersionPlant;
                 if (TraceWhip)
-                    Console.Error.WriteLine($"[WHIP] UsingCD patches + IOPRP2550 plant cyc={c}");
+                    Console.Error.WriteLine($"[WHIP] UsingCD patches + IOPRP2550 plant cyc={c} plant={!SkipVersionPlant}");
             }
         }
 
-        if (_versionPlanted)
+        if (_versionPlanted && !SkipVersionPlant)
             PlantIopRpVersion(sys);
 
         // If reboot arg still carries host0, rewrite to retail disc path.
