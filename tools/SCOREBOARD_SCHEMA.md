@@ -39,6 +39,9 @@
 | `cdvdSectors` / `cdvd` | long | CDVD sectors read |
 | `syscalls` | long | EE HLE syscall count |
 | `binds` / `calls` | ulong | RealSifRpc bind/call counts |
+| `liveRpcHits` | ulong | Successful live `sceSifRegisterRpc` handler dispatches (C1.4 / M3-d) |
+| `liveRpcFallbacks` | ulong | Live registry hit but dispatch failed → HLE fall-through |
+| `unknownServiceCalls` | ulong | HLE unknown SID / unmatched CALL path |
 | `exitRequested` | bool | EE exited (run may look “alive” via IOP) |
 | `pc` | string | EE PC hex |
 | `serial` | string | Disc serial if known |

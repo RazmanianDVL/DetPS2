@@ -592,7 +592,10 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             foreach (var kv in traceSys.Hle.Sony.SyscallHistogram.OrderByDescending(k => k.Value).Take(30))
                 Console.WriteLine($"    0x{kv.Key:X2} x{kv.Value}");
             var rpc = traceSys.Hle.Sony.RealRpc;
-            Console.WriteLine($"  RealSifRpc: binds={rpc.Binds} calls={rpc.Calls} unknownServiceCalls={rpc.UnknownServiceCalls} unknownBindSids={rpc.UnknownBindSids}");
+            Console.WriteLine(
+                $"  RealSifRpc: binds={rpc.Binds} calls={rpc.Calls} " +
+                $"unknownServiceCalls={rpc.UnknownServiceCalls} unknownBindSids={rpc.UnknownBindSids} " +
+                $"liveRpcHits={rpc.LiveRpcHits} liveRpcFallbacks={rpc.LiveRpcFallbacks}");
             foreach (var sid in rpc.UnknownSidsSeen)
                 Console.WriteLine($"    unknown sid=0x{sid:X8}");
         }
@@ -879,6 +882,10 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["sifBytes"] = smSys.Sif.BytesTransferred,
             ["binds"] = rpc?.Binds ?? 0UL,
             ["calls"] = rpc?.Calls ?? 0UL,
+            // M3-d: RealSifRpc live/HLE dual-path counters (scoreboard scrape; not savestate).
+            ["liveRpcHits"] = rpc?.LiveRpcHits ?? 0UL,
+            ["liveRpcFallbacks"] = rpc?.LiveRpcFallbacks ?? 0UL,
+            ["unknownServiceCalls"] = rpc?.UnknownServiceCalls ?? 0UL,
             ["exitRequested"] = exitReq,
             ["exitCode"] = smSys.Hle.ExitCode,
             ["cycles"] = smSys.MasterCycles,

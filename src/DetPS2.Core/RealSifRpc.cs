@@ -1312,6 +1312,51 @@ public sealed class RealSifRpc
         return true;
     }
 
+    /// <summary>
+    /// M3-a / dual-path §6 steps 1–2: formal extract of the live CALL body from
+    /// <see cref="HandleCall"/>. Prefer a genuine <c>sceSifRegisterRpc</c> server when
+    /// <see cref="LiveRpcDispatchEnabled"/> and the registry walk + R3000 dispatch succeed.
+    /// <para>
+    /// Returns <c>true</c> only when the live path fully completed the CALL (RPC_END stamped).
+    /// Returns <c>false</c> for HLE fallthrough: unbound SID, live path disabled, registry miss,
+    /// or registry hit with failed dispatch (increments <see cref="LiveRpcFallbacks"/> in that
+    /// last case — same counters as the pre-extract inline block).
+    /// </para>
+    /// Behavior is byte-identical to the former contiguous top-of-<c>HandleCall</c> live block
+    /// (C1.4 compose already present). No denylist / no-HLE-fallback here (M3-b/c later).
+    /// </summary>
+    private bool TryHandleCallLive(SystemMemory mem, KernelState kernel, IopModuleHost iopModules,
+        uint pktAddr, uint cdPtr, uint sid, uint argBuf, uint rpcNumber,
+        uint sendSize, uint recvBuf, uint recvSize)
+    {
+        // Real, generic dispatch (2026-08-02): every PS2 title -- however different its own
+        // engine -- registers its IOP-side RPC services through the exact same standard BIOS
+        // mechanism (sceSifSetRpcQueue + sceSifRegisterRpc, ground-truthed against the real BIOS
+        // SIFCMD.IRX). If a genuinely loaded, genuinely running module has for-real registered a
+        // handler for this sid, run THAT handler on the IOP core and use its real reply instead
+        // of guessing -- this is what makes the per-title hardcoded branches below unnecessary
+        // for any title whose own driver has actually reached this call. Falls through to the
+        // existing HLE below whenever nothing is really registered yet (or for the small set of
+        // BIOS-stack services intentionally never run for real, e.g. LOADFILE/CDVDFSV).
+        // C1.4: gate via LiveRpcDispatchEnabled (DETPS2_IOP_REAL_RPC / DETPS2_NO_REAL_RPC);
+        // multi-thread compose lives inside TryDispatchRealRegisteredRpc when IOP_THREADS=1.
+        if (sid == 0 || !LiveRpcDispatchEnabled())
+            return false;
+        if (!TryFindRealRpcServer(mem, iopModules, sid, out uint realFunc, out uint realBuf))
+            return false;
+
+        if (TryDispatchRealRegisteredRpc(mem, iopModules, realFunc, realBuf, rpcNumber,
+                argBuf, sendSize, recvBuf, recvSize))
+        {
+            LiveRpcHits++;
+            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+            return true;
+        }
+        // Registry had a real server but handler did not complete — fall through to HLE.
+        LiveRpcFallbacks++;
+        return false;
+    }
+
     private void HandleCall(SystemMemory mem, KernelState kernel, Cdvd cdvd, PadInput pad, IopModuleHost iopModules, uint pktAddr)
     {
         // SifRpcCallPkt_t (56B): +0 sifcmd(16) +16 rec_id +20 pkt_addr +24 rpc_id +28 cd(ptr)
@@ -1326,30 +1371,10 @@ public sealed class RealSifRpc
         uint sid = _cdToSid.TryGetValue(cdPtr, out var s) ? s : 0;
         uint argBuf = _cdToArgBuf.TryGetValue(cdPtr, out var a) ? a : 0;
 
-        // Real, generic dispatch (2026-08-02): every PS2 title -- however different its own
-        // engine -- registers its IOP-side RPC services through the exact same standard BIOS
-        // mechanism (sceSifSetRpcQueue + sceSifRegisterRpc, ground-truthed against the real BIOS
-        // SIFCMD.IRX). If a genuinely loaded, genuinely running module has for-real registered a
-        // handler for this sid, run THAT handler on the IOP core and use its real reply instead
-        // of guessing -- this is what makes the per-title hardcoded branches below unnecessary
-        // for any title whose own driver has actually reached this call. Falls through to the
-        // existing HLE below whenever nothing is really registered yet (or for the small set of
-        // BIOS-stack services intentionally never run for real, e.g. LOADFILE/CDVDFSV).
-        // C1.4: gate via LiveRpcDispatchEnabled (DETPS2_IOP_REAL_RPC / DETPS2_NO_REAL_RPC);
-        // multi-thread compose lives inside TryDispatchRealRegisteredRpc when IOP_THREADS=1.
-        if (sid != 0 && LiveRpcDispatchEnabled()
-            && TryFindRealRpcServer(mem, iopModules, sid, out uint realFunc, out uint realBuf))
-        {
-            if (TryDispatchRealRegisteredRpc(mem, iopModules, realFunc, realBuf, rpcNumber,
-                    argBuf, sendSize, recvBuf, recvSize))
-            {
-                LiveRpcHits++;
-                CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
-                return;
-            }
-            // Registry had a real server but handler did not complete — fall through to HLE.
-            LiveRpcFallbacks++;
-        }
+        // Live sceSifRegisterRpc precedence (dual-path §3 / M3-a extract).
+        if (TryHandleCallLive(mem, kernel, iopModules, pktAddr, cdPtr, sid, argBuf,
+                rpcNumber, sendSize, recvBuf, recvSize))
+            return;
 
         // CRI Middleware ADX (CRI_ADXI.IRX, sid=0x90000200).
         // Live-traced (2026-07-29) on Shaolin Monks SJX_Init:
