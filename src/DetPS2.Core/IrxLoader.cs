@@ -789,14 +789,15 @@ public static class IrxLoader
     }
 
     /// <summary>
-    /// C1 CreateThread intercept: after <see cref="LinkImports"/>, re-point <c>thbase</c>
-    /// CreateThread (ord 4) / StartThread (ord 6) import stubs to DetPS2 HLE trap PCs.
+    /// C1 thbase intercept: after <see cref="LinkImports"/>, re-point Create(4)/Delete(5)/
+    /// Start(6)/Exit(7) import stubs to DetPS2 HLE trap PCs.
     /// Only call when product flag <c>DETPS2_IOP_CREATE_THREAD=1</c> is on.
     /// Word[1] still holds the ordinal ADDIU after link (word[0] is the J we overwrite).
     /// </summary>
     public static int OverrideThbaseCreateStartImports(
         SystemMemory memory, uint rangeStart, uint rangeEnd,
-        uint createThreadPc, uint startThreadPc)
+        uint createThreadPc, uint startThreadPc,
+        uint deleteThreadPc = 0, uint exitThreadPc = 0)
     {
         int patched = 0;
         for (uint addr = rangeStart; addr + 0x14 <= rangeEnd; addr += 4)
@@ -820,7 +821,9 @@ public static class IrxLoader
                 uint ordinal = word1 & 0xFFFF;
                 uint target = 0;
                 if (ordinal == 4) target = createThreadPc;
+                else if (ordinal == 5 && deleteThreadPc != 0) target = deleteThreadPc;
                 else if (ordinal == 6) target = startThreadPc;
+                else if (ordinal == 7 && exitThreadPc != 0) target = exitThreadPc;
                 if (target != 0)
                 {
                     uint jInstr = ((target >> 2) & 0x03FFFFFFu) | 0x08000000u;

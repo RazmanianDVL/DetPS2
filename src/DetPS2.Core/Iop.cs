@@ -334,17 +334,43 @@ public sealed class Iop : ISchedulable
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
 
-    /// <summary>C1 CreateThread HLE trap PCs (low IOP RAM). Only used when CREATE_THREAD flag on.</summary>
+    /// <summary>C1 thbase HLE trap PCs (low IOP RAM). Only when CREATE_THREAD flag on.</summary>
     public const uint HleThbaseCreateThreadPc = 0x0000BF00u;
     public const uint HleThbaseStartThreadPc = 0x0000BF04u;
+    public const uint HleThbaseDeleteThreadPc = 0x0000BF10u;
+    public const uint HleThbaseExitThreadPc = 0x0000BF14u;
+
+    // THREADMAN CreateThread error immediates (tools/bios-decomp/THREADMAN_ALL.txt FUN_00000c5c).
+    public const uint KeIllegalContext = 0xFFFFFF9Cu;   // -100
+    public const uint KeThNoMemory = 0xFFFFFE70u;       // alloc/table full
+    public const uint KeThIllegalAttr = 0xFFFFFE6Fu;
+    public const uint KeThIllegalEntry = 0xFFFFFE6Eu;   // entry not 4-byte aligned / bad
+    public const uint KeThIllegalPriority = 0xFFFFFE6Du;
+    public const uint KeThIllegalThid = 0xFFFFFE6Au;    // Start/Delete bad tid
 
     /// <summary>
-    /// Product: <c>DETPS2_IOP_CREATE_THREAD=1</c> enables thbase Create/Start HLE trampolines.
+    /// Product: <c>DETPS2_IOP_CREATE_THREAD=1</c> enables thbase Create/Start/Delete/Exit HLE.
     /// Kill: <c>DETPS2_DISABLE_IOP_CREATE_THREAD=1</c>. Default off — real THREADMAN.IRX runs.
     /// </summary>
     public static bool CreateThreadHleEnvEnabled =>
         Environment.GetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD") == "1"
         && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD") != "1";
+
+    /// <summary>
+    /// Encode dense slot id as THREADMAN-shaped tid: <c>(slot &lt;&lt; 5) | 1</c>.
+    /// Real IRX checks bit0 / encoding; plain 1..N (esp. even slots) and 0xFFFFFFFF storm retries.
+    /// </summary>
+    public static uint EncodeThbaseTid(int slot) =>
+        slot < 1 ? 0u : ((uint)slot << 5) | 1u;
+
+    /// <summary>Decode HLE tid → slot, or −1 if not our encoding / out of range.</summary>
+    public static int DecodeThbaseTid(uint tid)
+    {
+        if ((tid & 1u) == 0) return -1;
+        int slot = (int)(tid >> 5);
+        if (slot < 1 || slot >= MaxIopThreadSlots) return -1;
+        return slot;
+    }
 
     public int Step(ulong maxCycles)
     {
@@ -353,14 +379,19 @@ public sealed class Iop : ISchedulable
         int executed = 0;
         while ((ulong)executed < maxCycles && Running)
         {
-            // C1 CreateThread HLE: intercept before fetch when trampoline flag on + multi-thread.
+            // C1 thbase HLE: intercept before fetch when trampoline flag on + multi-thread.
             if (CreateThreadHleEnvEnabled && _multiThreadEnabled &&
-                (PC == HleThbaseCreateThreadPc || PC == HleThbaseStartThreadPc))
+                (PC == HleThbaseCreateThreadPc || PC == HleThbaseStartThreadPc ||
+                 PC == HleThbaseDeleteThreadPc || PC == HleThbaseExitThreadPc))
             {
                 if (PC == HleThbaseCreateThreadPc)
                     HleThbaseCreateThread();
-                else
+                else if (PC == HleThbaseStartThreadPc)
                     HleThbaseStartThread();
+                else if (PC == HleThbaseDeleteThreadPc)
+                    HleThbaseDeleteThread();
+                else
+                    HleThbaseExitThread();
                 executed++;
                 InstructionsExecuted++;
                 continue;
@@ -1216,34 +1247,141 @@ public sealed class Iop : ISchedulable
 
     private void HleThbaseCreateThread()
     {
-        // a0 = thread param block*; entry at +0x08 (c1-thbase-ordinal-scan.md).
+        // a0 = thread param block*; entry at +0x08 (c1-thbase-ordinal-scan.md / FUN_00000c5c).
         uint a0 = GetGpr(4);
         uint entry = 0;
-        try
+        uint err = KeThIllegalAttr; // null / unreadable param → attr-class fail
+        if (a0 != 0)
         {
-            if (_memory.IsKnownIopAddress(a0 + 8))
-                entry = _memory.IopRead32(a0 + 8);
+            try
+            {
+                if (_memory.IsKnownIopAddress(a0 + 8))
+                {
+                    entry = _memory.IopRead32(a0 + 8);
+                    err = 0;
+                }
+            }
+            catch { err = KeThIllegalAttr; }
         }
-        catch { /* fall through */ }
 
-        int tid = entry != 0 ? CreateDormantThreadContext(entry) : -1;
-        SetGpr(2, tid < 1 ? unchecked((uint)(-1)) : (uint)tid);
-        // Return to caller (jr ra semantics without delay-slot fetch).
+        uint v0;
+        int slot = -1;
+        if (err != 0)
+            v0 = err;
+        else if (entry == 0 || (entry & 3u) != 0)
+            v0 = KeThIllegalEntry; // real checks (param_1[2] & 3) == 0
+        else
+        {
+            slot = CreateDormantThreadContext(entry);
+            // Table full / no slot → KE_NO_MEMORY family (decomp 0xfffffe70 after alloc fail).
+            v0 = slot < 1 ? KeThNoMemory : EncodeThbaseTid(slot);
+        }
+
+        SetGpr(2, v0);
         PC = GetGpr(31);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
-            Console.Error.WriteLine(
-                $"[IOP-CREATE-THREAD] HLE CreateThread entry=0x{entry:X8} tid={tid} ra=0x{GetGpr(31):X8}");
+        {
+            // Throttle storm TRACE: only first 32 fails + every success.
+            bool ok = slot >= 1;
+            if (ok || _createHleFailTraceLeft > 0)
+            {
+                if (!ok) _createHleFailTraceLeft--;
+                else _createHleFailTraceLeft = 32;
+                Console.Error.WriteLine(
+                    $"[IOP-CREATE-THREAD] HLE CreateThread entry=0x{entry:X8} slot={slot} " +
+                    $"v0=0x{v0:X8} ra=0x{GetGpr(31):X8}");
+            }
+        }
     }
+
+    private int _createHleFailTraceLeft = 32;
 
     private void HleThbaseStartThread()
     {
-        int tid = (int)GetGpr(4);
-        bool ok = StartThreadReady(tid);
-        SetGpr(2, ok ? 0u : unchecked((uint)(-1)));
+        uint enc = GetGpr(4);
+        int slot = DecodeThbaseTid(enc);
+        // Accept plain slot ids too (smokes / early v1) when in range and in-use.
+        if (slot < 1 && enc > 0 && enc < (uint)MaxIopThreadSlots)
+            slot = (int)enc;
+        bool ok = slot >= 1 && StartThreadReady(slot);
+        SetGpr(2, ok ? 0u : KeThIllegalThid);
         PC = GetGpr(31);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
             Console.Error.WriteLine(
-                $"[IOP-CREATE-THREAD] HLE StartThread tid={tid} ok={ok} ra=0x{GetGpr(31):X8}");
+                $"[IOP-CREATE-THREAD] HLE StartThread enc=0x{enc:X8} slot={slot} ok={ok} ra=0x{GetGpr(31):X8}");
+    }
+
+    private void HleThbaseDeleteThread()
+    {
+        uint enc = GetGpr(4);
+        int slot = DecodeThbaseTid(enc);
+        if (slot < 1 && enc > 0 && enc < (uint)MaxIopThreadSlots)
+            slot = (int)enc;
+        bool ok = slot >= 1 && FreeThreadSlot(slot);
+        SetGpr(2, ok ? 0u : KeThIllegalThid);
+        PC = GetGpr(31);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-CREATE-THREAD] HLE DeleteThread enc=0x{enc:X8} slot={slot} ok={ok}");
+    }
+
+    private void HleThbaseExitThread()
+    {
+        // Exit current: free slot and yield to a READY peer if any (THREADMAN ExitThread-shaped).
+        int cur = _currentThreadId;
+        if (cur >= 1)
+        {
+            // Park-free: mark free then switch if peer exists.
+            int peer = FindNextReadyThread(cur);
+            FreeThreadSlot(cur);
+            if (peer >= 1 && _threads != null && _threads[peer].InUse)
+            {
+                LoadContextToLive(_threads[peer]);
+                _threads[peer].Status = IopThreadStatus.Run;
+                _currentThreadId = peer;
+            }
+            else
+            {
+                // No peer: stay on boot context if still alive.
+                if (_threads != null && _threads[0].InUse)
+                {
+                    LoadContextToLive(_threads[0]);
+                    _threads[0].Status = IopThreadStatus.Run;
+                    _currentThreadId = 0;
+                }
+            }
+        }
+        SetGpr(2, 0);
+        // ExitThread does not return to ra on real HW; residual callers may still have ra set.
+        // Prefer peer/boot PC already loaded; only use ra if we somehow stayed put.
+        if (cur < 1)
+            PC = GetGpr(31);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-CREATE-THREAD] HLE ExitThread was={cur} now={_currentThreadId}");
+    }
+
+    /// <summary>Free a non-boot slot (DeleteThread / ExitThread). Returns false if invalid.</summary>
+    public bool FreeThreadSlot(int tid)
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        if (tid < 1 || tid >= MaxIopThreadSlots || !_threads[tid].InUse) return false;
+        if (tid == _currentThreadId)
+        {
+            // Caller must switch away first for live free; Exit HLE handles current specially.
+            // Allow free of current only when Exit path already transferred — still clear slot.
+        }
+        if (tid == _rpcDispatchThreadId)
+            _rpcDispatchThreadId = -1;
+        var t = _threads[tid];
+        t.InUse = false;
+        t.Status = IopThreadStatus.None;
+        t.PC = 0;
+        Array.Clear(t.Gprs);
+        t.HI = t.LO = 0;
+        t.StackTop = 0;
+        t.StackSize = 0;
+        return true;
     }
 
     /// <summary>

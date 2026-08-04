@@ -1303,15 +1303,17 @@ public sealed class IopModuleHost
         ImportsResolved += (ulong)resolved;
         ImportsUnresolved += (ulong)unresolved;
 
-        // C1 CreateThread intercept: only when product flag on (THREADS alone does not re-patch).
+        // C1 thbase intercept: only when product flag on (THREADS alone does not re-patch).
+        // Create/Start + Delete/Exit so slots free (BO2 canary: table fill → retry storm).
         if (Iop.CreateThreadHleEnvEnabled)
         {
             int n = IrxLoader.OverrideThbaseCreateStartImports(
                 mem, scanStart, scanEnd,
-                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc);
+                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc,
+                Iop.HleThbaseDeleteThreadPc, Iop.HleThbaseExitThreadPc);
             if (n > 0 && Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
                 Console.Error.WriteLine(
-                    $"[LINKIMPORTS] thbase Create/Start HLE overrides={n} name=\"{name}\"");
+                    $"[LINKIMPORTS] thbase Create/Start/Delete/Exit HLE overrides={n} name=\"{name}\"");
         }
 
         // MODLOAD LoadStartModule: after load, real hardware runs _start. DetPS2 still soft-marks

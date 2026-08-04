@@ -952,14 +952,14 @@ public static class IopExecSmokes
     }
 
     /// <summary>
-    /// C1 CreateThread intercept: (1) OverrideThbase patches thbase ord 4/6 only;
-    /// (2) CreateDormant + StartThreadReady → FindNextReadyThread; (3) HLE trap PCs under
-    /// process flag DETPS2_IOP_CREATE_THREAD=1 create READY peer via Step. Flag-off: no API
-    /// change without multi-thread; CREATE_THREAD alone does not enable multi-thread table.
+    /// C1 CreateThread intercept: (1) OverrideThbase patches thbase 4/5/6/7;
+    /// (2) CreateDormant + StartThreadReady → FindNextReadyThread; (3) HLE trap under
+    /// DETPS2_IOP_CREATE_THREAD=1 returns encoded tid + frees via Delete; (4) table-full
+    /// returns KE_NO_MEMORY (0xFFFFFE70) not 0xFFFFFFFF.
     /// </summary>
     public static void IopCreateThread_HleTrampoline_ReadyPeer()
     {
-        // --- Override patches thbase Create(4)/Start(6); leaves other ordinals alone ---
+        // --- Override patches thbase Create/Delete/Start/Exit ---
         {
             var mem = new SystemMemory();
             const uint importerBase = SystemMemory.IOP_RAM_BASE + 0x030000;
@@ -970,33 +970,39 @@ public static class IopExecSmokes
             byte[] name = System.Text.Encoding.ASCII.GetBytes("thbase\0\0");
             for (int i = 0; i < 8; i++) mem.Write8(importerBase + 0x0C + (uint)i, name[i]);
 
-            // ordinals 4, 5, 6 — only 4 and 6 should re-point
             uint Stub(uint ord) => (9u << 26) | (ord & 0xFFFF);
             const uint s4 = importerBase + 0x14;
             const uint s5 = importerBase + 0x1C;
             const uint s6 = importerBase + 0x24;
+            const uint s7 = importerBase + 0x2C;
+            const uint s8 = importerBase + 0x34; // not patched (Sleep)
             mem.Write32(s4 + 0, 0x03E00008); mem.Write32(s4 + 4, Stub(4));
             mem.Write32(s5 + 0, 0x03E00008); mem.Write32(s5 + 4, Stub(5));
             mem.Write32(s6 + 0, 0x03E00008); mem.Write32(s6 + 4, Stub(6));
-            mem.Write32(importerBase + 0x2C, 0); // terminator
+            mem.Write32(s7 + 0, 0x03E00008); mem.Write32(s7 + 4, Stub(7));
+            mem.Write32(s8 + 0, 0x03E00008); mem.Write32(s8 + 4, Stub(24));
+            mem.Write32(importerBase + 0x3C, 0); // terminator
 
             int n = IrxLoader.OverrideThbaseCreateStartImports(
                 mem, importerBase, importerBase + 0x100,
-                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc);
-            if (n != 2)
-                throw new Exception($"expected 2 thbase overrides, got {n}");
+                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc,
+                Iop.HleThbaseDeleteThreadPc, Iop.HleThbaseExitThreadPc);
+            if (n != 4)
+                throw new Exception($"expected 4 thbase overrides, got {n}");
 
             uint jCreate = ((Iop.HleThbaseCreateThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            uint jDel = ((Iop.HleThbaseDeleteThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
             uint jStart = ((Iop.HleThbaseStartThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
-            if (mem.Read32(s4) != jCreate)
-                throw new Exception($"ord4 not patched to Create HLE: 0x{mem.Read32(s4):X8}");
-            if (mem.Read32(s5) != 0x03E00008)
-                throw new Exception($"ord5 must stay jr-ra placeholder, got 0x{mem.Read32(s5):X8}");
-            if (mem.Read32(s6) != jStart)
-                throw new Exception($"ord6 not patched to Start HLE: 0x{mem.Read32(s6):X8}");
+            uint jExit = ((Iop.HleThbaseExitThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            if (mem.Read32(s4) != jCreate) throw new Exception("ord4 Create patch");
+            if (mem.Read32(s5) != jDel) throw new Exception("ord5 Delete patch");
+            if (mem.Read32(s6) != jStart) throw new Exception("ord6 Start patch");
+            if (mem.Read32(s7) != jExit) throw new Exception("ord7 Exit patch");
+            if (mem.Read32(s8) != 0x03E00008)
+                throw new Exception($"ord24 must stay placeholder, got 0x{mem.Read32(s8):X8}");
         }
 
-        // --- API: DORMANT create + Start → READY peer visible to FindNextReadyThread ---
+        // --- API: DORMANT create + Start → READY peer; FreeThreadSlot reclaims ---
         {
             var sys = new Ps2System();
             sys.Iop.EnableMultiThreadScaffolding();
@@ -1015,9 +1021,25 @@ public static class IopExecSmokes
                 throw new Exception($"FindNextReadyThread expected {tid} got {sys.Iop.FindNextReadyThread()}");
             if (!sys.Iop.TryGetThreadContext(tid, out var ctx) || ctx == null || ctx.PC != 0x0000A000)
                 throw new Exception("dormant entry PC not preserved");
+            if (!sys.Iop.FreeThreadSlot(tid))
+                throw new Exception("FreeThreadSlot failed");
+            if (sys.Iop.GetThreadStatus(tid) != IopThreadStatus.None)
+                throw new Exception("freed slot must be None");
+            int tid2 = sys.Iop.CreateDormantThreadContext(0x0000A100);
+            if (tid2 != tid)
+                throw new Exception($"expected slot reuse {tid} got {tid2}");
         }
 
-        // --- Flag-off identity: CREATE_THREAD env alone does not multi-thread without THREADS ---
+        // --- Encode/decode contract (bit0 set — BO2 retry-storm root cause class) ---
+        {
+            uint enc = Iop.EncodeThbaseTid(3);
+            if ((enc & 1) == 0 || Iop.DecodeThbaseTid(enc) != 3)
+                throw new Exception($"encode/decode failed enc=0x{enc:X8}");
+            if (Iop.DecodeThbaseTid(0xFFFFFFFF) >= 0)
+                throw new Exception("0xFFFFFFFF must not decode as a valid slot");
+        }
+
+        // --- Flag-off identity ---
         if (!Iop.MultiThreadEnvEnabled)
         {
             var off = new Ps2System();
@@ -1027,7 +1049,7 @@ public static class IopExecSmokes
                 throw new Exception("StartThreadReady must fail when multi-thread off");
         }
 
-        // --- HLE Step path: plant param block, hit trap PCs with CREATE_THREAD=1 ---
+        // --- HLE Step path ---
         string? prevCreate = Environment.GetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD");
         string? prevKill = Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD");
         try
@@ -1040,45 +1062,77 @@ public static class IopExecSmokes
             var sys = new Ps2System();
             sys.Iop.EnableMultiThreadScaffolding();
 
-            // thread param block: entry at +0x08 (c1-thbase-ordinal-scan)
             const uint paramPhys = 0x00008000;
-            const uint entryPc = 0x00009000;
+            const uint entryPc = 0x00009000; // 4-byte aligned
             sys.Memory.IopWrite32(paramPhys + 0x00, 0);
             sys.Memory.IopWrite32(paramPhys + 0x04, 0);
             sys.Memory.IopWrite32(paramPhys + 0x08, entryPc);
 
             uint retPc = 0x0000C000;
             sys.Iop.PC = Iop.HleThbaseCreateThreadPc;
-            sys.Iop.SetGpr(4, paramPhys); // a0
-            sys.Iop.SetGpr(31, retPc);    // ra
+            sys.Iop.SetGpr(4, paramPhys);
+            sys.Iop.SetGpr(31, retPc);
             int retired = sys.Iop.Step(1);
-            if (retired != 1)
-                throw new Exception($"Create HLE Step retired {retired}");
-            if (sys.Iop.PC != retPc)
-                throw new Exception($"Create HLE did not return to ra: PC=0x{sys.Iop.PC:X8}");
-            int newTid = (int)sys.Iop.GetGpr(2);
-            if (newTid < 1)
-                throw new Exception($"Create HLE v0={newTid}");
-            if (sys.Iop.GetThreadStatus(newTid) != IopThreadStatus.Dormant)
+            if (retired != 1 || sys.Iop.PC != retPc)
+                throw new Exception($"Create HLE bad retire={retired} pc=0x{sys.Iop.PC:X8}");
+            uint encTid = sys.Iop.GetGpr(2);
+            int newSlot = Iop.DecodeThbaseTid(encTid);
+            if (newSlot < 1)
+                throw new Exception($"Create HLE v0=0x{encTid:X8} not encoded tid");
+            if ((encTid & 1) == 0)
+                throw new Exception("encoded tid must have bit0 set");
+            if (sys.Iop.GetThreadStatus(newSlot) != IopThreadStatus.Dormant)
                 throw new Exception("HLE CreateThread must leave DORMANT");
 
+            // Unaligned entry → KE_ILLEGAL_ENTRY
+            sys.Memory.IopWrite32(paramPhys + 0x08, 0x00009001);
+            sys.Iop.PC = Iop.HleThbaseCreateThreadPc;
+            sys.Iop.SetGpr(4, paramPhys);
+            sys.Iop.SetGpr(31, retPc);
+            sys.Iop.Step(1);
+            if (sys.Iop.GetGpr(2) != Iop.KeThIllegalEntry)
+                throw new Exception($"unaligned entry expected KE_ILLEGAL_ENTRY got 0x{sys.Iop.GetGpr(2):X8}");
+
             sys.Iop.PC = Iop.HleThbaseStartThreadPc;
-            sys.Iop.SetGpr(4, (uint)newTid);
+            sys.Iop.SetGpr(4, encTid);
             sys.Iop.SetGpr(31, retPc);
             retired = sys.Iop.Step(1);
             if (retired != 1 || sys.Iop.PC != retPc)
                 throw new Exception($"Start HLE bad retire={retired} pc=0x{sys.Iop.PC:X8}");
             if (sys.Iop.GetGpr(2) != 0)
-                throw new Exception($"Start HLE v0 expected 0 got {sys.Iop.GetGpr(2)}");
-            if (sys.Iop.GetThreadStatus(newTid) != IopThreadStatus.Ready)
+                throw new Exception($"Start HLE v0 expected 0 got 0x{sys.Iop.GetGpr(2):X8}");
+            if (sys.Iop.GetThreadStatus(newSlot) != IopThreadStatus.Ready)
                 throw new Exception("HLE StartThread must make READY");
-            if (sys.Iop.FindNextReadyThread() != newTid)
+            if (sys.Iop.FindNextReadyThread() != newSlot)
                 throw new Exception("HLE path READY peer not visible");
+
+            // Delete frees → Create can reuse
+            sys.Iop.PC = Iop.HleThbaseDeleteThreadPc;
+            sys.Iop.SetGpr(4, encTid);
+            sys.Iop.SetGpr(31, retPc);
+            sys.Iop.Step(1);
+            if (sys.Iop.GetGpr(2) != 0)
+                throw new Exception("Delete HLE should return 0");
+            if (sys.Iop.GetThreadStatus(newSlot) != IopThreadStatus.None)
+                throw new Exception("Delete must free slot");
+
+            // Fill table then expect KE_NO_MEMORY (not 0xFFFFFFFF)
+            for (int i = 1; i < Iop.MaxIopThreadSlots; i++)
+            {
+                int s = sys.Iop.CreateDormantThreadContext(0x0000B000 + (uint)i * 4);
+                if (s < 1) throw new Exception($"fill CreateDormant failed at i={i}");
+            }
+            sys.Memory.IopWrite32(paramPhys + 0x08, entryPc);
+            sys.Iop.PC = Iop.HleThbaseCreateThreadPc;
+            sys.Iop.SetGpr(4, paramPhys);
+            sys.Iop.SetGpr(31, retPc);
+            sys.Iop.Step(1);
+            if (sys.Iop.GetGpr(2) != Iop.KeThNoMemory)
+                throw new Exception($"full table expected KE_NO_MEMORY got 0x{sys.Iop.GetGpr(2):X8}");
 
             Console.WriteLine(
                 $"[Smoke] IopCreateThread_HleTrampoline_ReadyPeer OK " +
-                $"(tid={newTid} createPc=0x{Iop.HleThbaseCreateThreadPc:X} " +
-                $"startPc=0x{Iop.HleThbaseStartThreadPc:X})");
+                $"(slot={newSlot} enc=0x{encTid:X8} createPc=0x{Iop.HleThbaseCreateThreadPc:X})");
         }
         finally
         {
