@@ -102,7 +102,8 @@ public sealed class Iop : ISchedulable
     // --- C1 multi-thread context scaffolding (DETPS2_IOP_THREADS) ---
     // When disabled: _threads stays null, no allocations, Step path untouched.
     // When enabled: table of IopThreadContext; live PC/_gprs/HI/LO are the current thread.
-    // RR scheduler / WaitSema yield hooks: THREADMAN later (see IOP_MULTITHREAD_AND_REAL_RPC.md).
+    // C1.3: explicit YieldToReady / ParkAndYieldToReady hooks (WaitSema/SleepThread-shaped).
+    // Full THREADMAN ready-queues / wait-object ids: later (IOP_MULTITHREAD_AND_REAL_RPC.md).
     private bool _multiThreadEnabled = MultiThreadEnvEnabled;
     private IopThreadContext[]? _threads;
     private int _currentThreadId;
@@ -1098,7 +1099,7 @@ public sealed class Iop : ISchedulable
     /// <summary>
     /// Enable multi-context scaffolding after construction (tests / diagnostics).
     /// Product path: set <c>DETPS2_IOP_THREADS=1</c> before process start.
-    /// Does not start a RR scheduler — only data structures + create/switch.
+    /// C1.3 yield hooks become live; automatic Step-path RR is not enabled (explicit only).
     /// </summary>
     public void EnableMultiThreadScaffolding()
     {
@@ -1236,6 +1237,110 @@ public sealed class Iop : ISchedulable
             SaveLiveToContext(_threads[tid]);
         ctx = _threads[tid];
         return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // C1.3 yield hooks (DETPS2_IOP_THREADS) — WaitSema / SleepThread-shaped
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Round-robin search for a runnable peer (READY, or stray RUN on a non-current slot).
+    /// Starts after <paramref name="afterId"/> (default: current). Returns −1 when multi-thread
+    /// is off or no peer is runnable. Does not modify state.
+    /// </summary>
+    public int FindNextReadyThread(int afterId = -1)
+    {
+        if (!_multiThreadEnabled || _threads == null) return -1;
+        int start = afterId >= 0 ? afterId : _currentThreadId;
+        for (int i = 1; i <= MaxIopThreadSlots; i++)
+        {
+            int id = (start + i) % MaxIopThreadSlots;
+            if (!_threads[id].InUse || id == _currentThreadId) continue;
+            var st = _threads[id].Status;
+            if (st == IopThreadStatus.Ready || st == IopThreadStatus.Run)
+                return id;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Cooperative yield: leave current as READY and switch to the next READY peer (RR).
+    /// No-op (false) when multi-thread is off or no other READY exists — zero flag-off impact.
+    /// Does not model THREADMAN priorities.
+    /// </summary>
+    public bool YieldToReady()
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        int next = FindNextReadyThread(_currentThreadId);
+        if (next < 0) return false;
+        return SwitchToThread(next);
+    }
+
+    /// <summary>
+    /// WaitSema / SleepThread-shaped park: mark current WAIT, switch to a READY peer if any.
+    /// When a peer exists: returns true and runs that peer. When alone: marks current WAIT,
+    /// remains on the live set, returns false (caller is parked with no one to run).
+    /// Flag off: always false, no status writes.
+    /// Sema counts / wait-object ids are not modeled (C1.4+ / real THREADMAN).
+    /// </summary>
+    public bool ParkAndYieldToReady()
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        EnsureThreadTable();
+
+        int next = FindNextReadyThread(_currentThreadId);
+        SaveLiveToContext(_threads![_currentThreadId]);
+        _threads[_currentThreadId].Status = IopThreadStatus.Wait;
+
+        if (next < 0)
+            return false;
+
+        LoadContextToLive(_threads[next]);
+        _threads[next].Status = IopThreadStatus.Run;
+        _currentThreadId = next;
+        return true;
+    }
+
+    /// <summary>
+    /// WaitSema-shaped alias for <see cref="ParkAndYieldToReady"/> (C1.3).
+    /// Host / future IOP thsema HLE can call this when a wait would block under multi-thread.
+    /// </summary>
+    public bool WaitSemaYieldHook() => ParkAndYieldToReady();
+
+    /// <summary>
+    /// SleepThread-shaped alias for <see cref="ParkAndYieldToReady"/> (C1.3).
+    /// Same park semantics as WaitSema for this slice (no wakeup-count yet).
+    /// </summary>
+    public bool SleepThreadYieldHook() => ParkAndYieldToReady();
+
+    /// <summary>
+    /// Wake a parked context: WAIT (or DORMANT) → READY. No switch. Returns false when
+    /// multi-thread is off or the slot is unused. Current thread is left RUN if <paramref name="tid"/>
+    /// is current.
+    /// </summary>
+    public bool ReadyThread(int tid)
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        if ((uint)tid >= (uint)MaxIopThreadSlots || !_threads[tid].InUse) return false;
+        if (tid == _currentThreadId)
+        {
+            _threads[tid].Status = IopThreadStatus.Run;
+            return true;
+        }
+        _threads[tid].Status = IopThreadStatus.Ready;
+        return true;
+    }
+
+    /// <summary>
+    /// Status of a context (None when multi-thread off / unused). Current slot is synced first.
+    /// </summary>
+    public IopThreadStatus GetThreadStatus(int tid)
+    {
+        if (!_multiThreadEnabled || _threads == null) return IopThreadStatus.None;
+        if ((uint)tid >= (uint)MaxIopThreadSlots || !_threads[tid].InUse) return IopThreadStatus.None;
+        if (tid == _currentThreadId)
+            SaveLiveToContext(_threads[tid]);
+        return _threads[tid].Status;
     }
 
     private void EnsureThreadTable()

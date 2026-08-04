@@ -343,4 +343,170 @@ public static class IopExecSmokes
                 $"(spA=0x{spA:X8} spB=0x{spB:X8} tidA={ra.EntryThreadId} tidB={rb.EntryThreadId})");
         }
     }
+
+    /// <summary>
+    /// C1.3: WaitSema/SleepThread-shaped yield hooks — park current as WAIT, run another READY,
+    /// wake parent with intact callee-saves. Flag-off path is a pure no-op.
+    /// </summary>
+    public static void IopThreadContext_YieldHooks_ParkAndReady()
+    {
+        uint Addiu(uint rt, uint rs, short imm) =>
+            (0x09u << 26) | (rs << 21) | (rt << 16) | (ushort)imm;
+        uint Beq(uint rs, uint rt, short off) =>
+            (0x04u << 26) | (rs << 21) | (rt << 16) | (ushort)off;
+        const uint Nop = 0;
+
+        // --- Flag OFF: all hooks no-op ---
+        {
+            var off = new Ps2System();
+            if (!Iop.MultiThreadEnvEnabled)
+            {
+                if (off.Iop.YieldToReady())
+                    throw new Exception("YieldToReady must fail when multi-thread off");
+                if (off.Iop.ParkAndYieldToReady())
+                    throw new Exception("ParkAndYieldToReady must fail when multi-thread off");
+                if (off.Iop.WaitSemaYieldHook() || off.Iop.SleepThreadYieldHook())
+                    throw new Exception("Wait/Sleep yield hooks must fail when multi-thread off");
+                if (off.Iop.ReadyThread(0) || off.Iop.ReadyThread(1))
+                    throw new Exception("ReadyThread must fail when multi-thread off");
+                if (off.Iop.FindNextReadyThread() != -1)
+                    throw new Exception("FindNextReadyThread must return -1 when multi-thread off");
+                if (off.Iop.GetThreadStatus(0) != IopThreadStatus.None)
+                    throw new Exception("GetThreadStatus must be None when multi-thread off");
+            }
+        }
+
+        // --- ON: parent parks → worker runs real insns → parent resumes intact ---
+        {
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+
+            // Worker program at 0x5000: r2 = 0; r2++; loop (so RunInstructions advances r2)
+            const uint workerBase = 0x00005000;
+            var workerProg = new uint[]
+            {
+                Addiu(2, 0, 0),
+                Addiu(2, 2, 1),
+                Beq(0, 0, -2),
+                Nop
+            };
+            for (int i = 0; i < workerProg.Length; i++)
+                sys.Memory.IopWrite32(workerBase + (uint)(i * 4), workerProg[i]);
+
+            // Parent (boot tid 0) plants callee-saved + PC that must survive park
+            const uint parentPc = 0x00004000;
+            const uint parentS0 = 0x11111111;
+            const uint parentS1 = 0x22222222;
+            const uint parentSp = 0x001F0000;
+            const uint parentRa = 0xDEADBEEF;
+            sys.Iop.PC = parentPc;
+            sys.Iop.SetGpr(16, parentS0);
+            sys.Iop.SetGpr(17, parentS1);
+            sys.Iop.SetGpr(29, parentSp);
+            sys.Iop.SetGpr(31, parentRa);
+            sys.Iop.SetGpr(2, 0x99); // parent v0 — must not leak into worker
+
+            int worker = sys.Iop.CreateSecondaryContext(workerBase);
+            if (worker < 1)
+                throw new Exception($"CreateSecondaryContext failed: {worker}");
+            if (sys.Iop.FindNextReadyThread() != worker)
+                throw new Exception($"FindNextReadyThread expected worker {worker} got {sys.Iop.FindNextReadyThread()}");
+            if (sys.Iop.GetThreadStatus(worker) != IopThreadStatus.Ready)
+                throw new Exception("worker must be READY at create");
+
+            // Alone-park: with only boot RUN and we park before... worker is READY so park yields.
+            // First prove YieldToReady (cooperative, both stay runnable-ish):
+            // ParkAndYieldToReady: parent → WAIT, switch to worker.
+            if (!sys.Iop.ParkAndYieldToReady())
+                throw new Exception("ParkAndYieldToReady should switch to READY worker");
+            if (sys.Iop.CurrentThreadId != worker)
+                throw new Exception($"after park CurrentThreadId={sys.Iop.CurrentThreadId} want {worker}");
+            if (sys.Iop.PC != workerBase)
+                throw new Exception($"worker live PC 0x{sys.Iop.PC:X8}");
+            if (sys.Iop.GetThreadStatus(0) != IopThreadStatus.Wait)
+                throw new Exception($"parent status after park={sys.Iop.GetThreadStatus(0)} want Wait");
+            if (!sys.Iop.TryGetThreadContext(0, out var pctx) || pctx == null)
+                throw new Exception("parent context missing after park");
+            if (pctx.PC != parentPc || pctx.Gprs[16] != parentS0 || pctx.Gprs[17] != parentS1 ||
+                pctx.Gprs[29] != parentSp || pctx.Gprs[31] != parentRa)
+                throw new Exception("parent GPRs/PC not preserved across ParkAndYield");
+            if (pctx.Status != IopThreadStatus.Wait)
+                throw new Exception("saved parent status must be Wait");
+
+            // Worker executes real R3000 quanta while parent is parked
+            int retired = sys.Iop.RunInstructions(32);
+            if (retired <= 0)
+                throw new Exception("worker RunInstructions retired 0");
+            if (sys.Iop.GetGpr(2) == 0)
+                throw new Exception("worker r2 did not advance (loop not running)");
+            uint workerR2 = sys.Iop.GetGpr(2);
+            uint workerPcAfter = sys.Iop.PC;
+
+            // Worker cannot YieldToReady to parent while parent is WAIT
+            if (sys.Iop.YieldToReady())
+                throw new Exception("YieldToReady must not switch to WAIT parent");
+            if (sys.Iop.FindNextReadyThread() != -1)
+                throw new Exception("no READY peer while parent WAIT");
+
+            // SignalSema-shaped wake: WAIT → READY, then cooperative yield
+            if (!sys.Iop.ReadyThread(0))
+                throw new Exception("ReadyThread(parent) failed");
+            if (sys.Iop.GetThreadStatus(0) != IopThreadStatus.Ready)
+                throw new Exception("parent not READY after wake");
+            if (!sys.Iop.YieldToReady())
+                throw new Exception("YieldToReady after ReadyThread should switch to parent");
+            if (sys.Iop.CurrentThreadId != 0)
+                throw new Exception($"expected parent after yield, got {sys.Iop.CurrentThreadId}");
+            if (sys.Iop.PC != parentPc)
+                throw new Exception($"parent PC not restored: 0x{sys.Iop.PC:X8}");
+            if (sys.Iop.GetGpr(16) != parentS0 || sys.Iop.GetGpr(17) != parentS1)
+                throw new Exception("parent $s* not restored after yield cycle");
+            if (sys.Iop.GetGpr(29) != parentSp || sys.Iop.GetGpr(31) != parentRa)
+                throw new Exception("parent $sp/$ra not restored after yield cycle");
+            if (sys.Iop.GetGpr(2) != 0x99)
+                throw new Exception("parent $v0 clobbered by worker quanta");
+
+            // Worker still holds its progress when switched back
+            if (!sys.Iop.SwitchToThread(worker))
+                throw new Exception("re-switch worker failed");
+            if (sys.Iop.GetGpr(2) != workerR2 || sys.Iop.PC != workerPcAfter)
+                throw new Exception("worker state lost across parent resume");
+
+            // Aliases must match ParkAndYield (parent READY again → park yields to worker)
+            sys.Iop.SwitchToThread(0);
+            sys.Iop.ReadyThread(worker); // ensure worker READY after prior Run status
+            // After SwitchToThread(0), worker was left Ready (SwitchToThread demotes Run→Ready).
+            if (!sys.Iop.WaitSemaYieldHook())
+                throw new Exception("WaitSemaYieldHook should park+yield");
+            if (sys.Iop.CurrentThreadId != worker || sys.Iop.GetThreadStatus(0) != IopThreadStatus.Wait)
+                throw new Exception("WaitSemaYieldHook semantics");
+            sys.Iop.ReadyThread(0);
+            sys.Iop.SwitchToThread(0);
+            // SleepThread-shaped same contract
+            if (!sys.Iop.SleepThreadYieldHook())
+                throw new Exception("SleepThreadYieldHook should park+yield");
+            if (sys.Iop.GetThreadStatus(0) != IopThreadStatus.Wait)
+                throw new Exception("SleepThreadYieldHook must leave parent WAIT");
+
+            // Alone-park: only one runnable — mark WAIT, return false, stay current
+            {
+                var alone = new Ps2System();
+                alone.Iop.EnableMultiThreadScaffolding();
+                alone.Iop.PC = 0x6000;
+                alone.Iop.SetGpr(16, 0xABCDEF01);
+                if (alone.Iop.ParkAndYieldToReady())
+                    throw new Exception("alone ParkAndYield must return false");
+                if (alone.Iop.CurrentThreadId != 0)
+                    throw new Exception("alone park must stay on boot thread");
+                if (alone.Iop.GetThreadStatus(0) != IopThreadStatus.Wait)
+                    throw new Exception("alone park must still mark WAIT");
+                if (alone.Iop.PC != 0x6000 || alone.Iop.GetGpr(16) != 0xABCDEF01)
+                    throw new Exception("alone park must not clobber live regs");
+            }
+
+            Console.WriteLine(
+                $"[Smoke] IopThreadContext_YieldHooks_ParkAndReady OK " +
+                $"(worker={worker} workerR2={workerR2} retired={retired})");
+        }
+    }
 }
