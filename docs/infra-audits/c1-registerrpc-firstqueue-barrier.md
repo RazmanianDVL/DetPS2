@@ -1,8 +1,8 @@
 # C1 audit — why `firstQueue` stays 0 after full C1 stack (registerRpc barrier)
 
-**Status:** measurement / synthesis — **docs only, no Core**  
+**Status:** dual-ACK'd (FQ-Q1..Q4) — FQ-2 exit criterion **already landed** (see §5)  
 **Date:** 2026-08-04  
-**Tip:** `27af7d7` (yield-start + CreateThread storm-fixed + WaitSema phase-2)  
+**Tip:** `a8379d5` / prior C1 stack `27af7d7`  
 **Seat:** dual-idle split A (Grok); Claude on C (IOPFILE 100k-reach)  
 **Evidence:** `c1-registerrpc-trace-bo2.md`, `c1-start-trace-bo2.md`, Claude BO2 canaries seq0133/0138/0142  
 
@@ -106,12 +106,13 @@ North star: **IRX is product**; empty firstQueue means live path never armed.
 | ID | Seat | Type | Why |
 |----|------|------|-----|
 | **FQ-1** | Claude **C** outcome: IOPFILE PC/insn class at 100k | measure | Explains WaitSema=0 and whether more budget alone helps |
-| **FQ-2** | Synthetic IRX smoke: CreateThread+Wait/Signal+`RegisterRpc` plant → EE CALL `LiveRpcHits≥1` | smoke | **Exit criterion** for C1 registry growth independent of BO2 |
+| **FQ-2** | Synthetic plant: SIFCMD chain head + server → EE CALL `LiveRpcHits≥1` | smoke | **DONE** — `IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits` (M3-e; plants queue/server layout live registration would build; does not require real IRX to call RegisterRpc) |
+| **FQ-2b** | Optional compose: multi-thread + WaitYield park/signal **then** same plant+CALL | smoke | Only if dual-ACK wants C1 flags in same test as LiveRpcHits |
 | **FQ-3** | Optional: one non-BO2 title TRACE with disc IRX that registers early | measure | Cross-title proof |
 | **FQ-4** | Design: HLE-owned skip policy vs “literal SIFCMD queue init once” | design | Only if B2 is the residual after B1 |
 | **FQ-5** | **Not** raise 100k budget as sole fix | — | Already known insufficient without yield completion |
 
-**Bias:** **FQ-2** after Claude C (or in parallel if C is pure TRACE docs) — proves the C1 chain end-to-end without depending on BO2 IOPFILE reach.
+**FQ-2 exit criterion:** already green in suite. Proves prefer-live + R3000 handler path independent of BO2 `_start` reach. Residual for product titles remains B1/B2 (empty firstQueue on real modules), not missing LiveRpc plumbing.
 
 ---
 
@@ -131,8 +132,9 @@ North star: **IRX is product**; empty firstQueue means live path never armed.
 - [x] firstQueue semantics tied to RealSifRpc DBG + SetRpcQueue  
 - [x] Post-C1 canary evidence folded in (39 creates, 0 WaitYield, firstQueue=0)  
 - [x] Barrier classes B1–B4 + next seats FQ-1..5  
-- [ ] Dual-ACK FQ-Q1..Q4  
-- [ ] **No Core** this seat  
+- [x] Dual-ACK FQ-Q1..Q4  
+- [x] FQ-2 exit criterion identified as existing `RealRpc_SyntheticLiveRegister_BindCallHits`  
+- [x] **No new Core** required for FQ-2  
 
 ---
 
@@ -141,5 +143,7 @@ firstQueue=0 after full C1 stack
   SIFCMD image present; queue head never linked
   IOPFILE/SDRDRV _start incomplete; WaitSema surface unreached
   IOPRP HLE-skip blocks SIFCMD re-register
-  next: synthetic RegisterRpc smoke + Claude C reach TRACE
+  FQ-2 synthetic LiveRpcHits smoke already green (plant path)
+  residual: Claude C reach + optional FQ-2b compose
 ```
+

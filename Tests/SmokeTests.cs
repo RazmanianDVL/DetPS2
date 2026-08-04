@@ -1295,6 +1295,11 @@ press 3000 Circle 100
     public static void IopWaitYield_HleParkAndSignal() =>
         IopExecSmokes.IopWaitYield_HleParkAndSignal();
 
+    /// <summary>Forward to <see cref="IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits"/> for single-smoke CLI.</summary>
+    public static void RealRpc_SyntheticLiveRegister_BindCallHits() =>
+        IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
+
+
 
 
     public static void Dmac_LevelCatchup_DefaultOff_NoOp()
