@@ -82,9 +82,10 @@ Multiple titles arm `AddDmacHandler(VIF1/GIF)` and expect **completion → CIS �
 
 | File | Change |
 |------|--------|
-| `Dmac.cs` | Gate re-Raise strengthen + counters `catchupRaise` under flags; TRACE dump field |
-| `SonyKernelHle.cs` | Only if take path fails to call re-Raise today — verify before edit |
-| `EmotionEngine.cs` / `Intc.cs` | **Out of v1** unless latch bug proven (not seen in TRACE) |
+| `Dmac.cs` | `MaybeLevelCatchupRaise` + `catchupRaise` TRACE; flags |
+| `SonyKernelHle.cs` | `MaybeLevelCatchupAfterDmacDispatch` thin forwarder to Dmac |
+| `EmotionEngine.cs` | **v1 required (one call):** after viaDmacFallback `Acknowledge`+`ClearCpuLatch` for DmaController, call catch-up. Necessary because Acknowledge edge-clears the TryTake re-Raise; EE is the only site that pairs take+ack. Flag-off no-op. |
+| `Intc.cs` | **Out of v1** — generic Acknowledge has no take/owed context; hooking every DmaController ack couples Intc→Dmac worse than the EE one-liner |
 
 ### 2.3 Flag table (S6)
 
@@ -158,3 +159,13 @@ M5-a S6 design (docs only) tip 1fe6444+
 ---
 
 *Design only. Supersedes nothing in parent until dual-ACK; refines parent Phase 1 candidate A/C with session evidence.*
+
+---
+
+## 7. S6.1 implement note (2026-08-04, tip b36dfd1)
+
+**Landed:** opt-in level catch-up. Full smoke suite green; `Dmac_LevelCatchup_DefaultOff_NoOp` smoke.
+
+**File-scope amendment (Claude review seq0058):** §2.2 originally listed EmotionEngine out of v1. Implement **must** call catch-up from EmotionEngine after viaDmacFallback Acknowledge because that Acknowledge edge-clears any re-Raise performed inside `TryTakePendingDmacHandler`. Intc.Acknowledge is source-generic and lacks take/owed context — not a better seam. Confirmed necessary (not convenient); table updated.
+
+**Flags (process start):** `DETPS2_DMAC_LEVEL_CATCHUP=1` (static readonly at type load, same pattern as `TRACE_DMAC`); kill `DETPS2_DISABLE_M5A_DMAC=1`.
