@@ -241,4 +241,106 @@ public static class IopExecSmokes
             $"[Smoke] IopThreadContext_Scaffolding_FlagAndSwitch OK " +
             $"(envOn={Iop.MultiThreadEnvEnabled} workerSp=0x{workerSp:X8} threads={sys.Iop.ThreadCount})");
     }
+
+    /// <summary>
+    /// C1.2: <see cref="IopModuleHost.PrepareModuleEntry"/> / <see cref="IopModuleHost.StartLoadedModule"/>
+    /// bind unique per-module stacks when multi-thread is on; flag-off keeps shared DefaultModuleStack.
+    /// </summary>
+    public static void PrepareModuleEntry_UniqueStacks_WhenMultiThread()
+    {
+        // --- Flag OFF (default scaffolding not enabled): shared DefaultModuleStack ---
+        {
+            var off = new Ps2System();
+            if (off.Iop.MultiThreadEnabled && !Iop.MultiThreadEnvEnabled)
+                throw new Exception("unexpected MultiThreadEnabled without env");
+
+            byte[] a = IrxLoader.BuildMinimalIrx("STKA");
+            byte[] b = IrxLoader.BuildMinimalIrx("STKB");
+            if (!off.LoadIrx(a, "STKA").Success || !off.LoadIrx(b, "STKB").Success)
+                throw new Exception("LoadIrx failed (off path)");
+            int idA = off.IopModules.SearchModuleByName("STKA");
+            int idB = off.IopModules.SearchModuleByName("STKB");
+            if (idA < 1 || idB < 1) throw new Exception("module ids");
+
+            if (!off.IopModules.PrepareModuleEntry(off.Iop, idA, off.Memory))
+                throw new Exception("PrepareModuleEntry A failed (off)");
+            uint spA = off.Iop.GetGpr(29);
+            if (!off.IopModules.PrepareModuleEntry(off.Iop, idB, off.Memory))
+                throw new Exception("PrepareModuleEntry B failed (off)");
+            uint spB = off.Iop.GetGpr(29);
+
+            // Non-THREADMAN modules share DefaultModuleStack when multi-thread is off.
+            if (!off.Iop.MultiThreadEnabled)
+            {
+                if (spA != IopModuleHost.DefaultModuleStack || spB != IopModuleHost.DefaultModuleStack)
+                    throw new Exception(
+                        $"flag-off SP must be DefaultModuleStack " +
+                        $"spA=0x{spA:X8} spB=0x{spB:X8} def=0x{IopModuleHost.DefaultModuleStack:X8}");
+                if (!off.IopModules.TryGetIrx(idA, out var recA) || recA.EntryThreadId != -1)
+                    throw new Exception("flag-off must leave EntryThreadId unbound");
+            }
+        }
+
+        // --- Multi-thread ON via scaffolding: unique SP + EntryThreadId bind ---
+        {
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+
+            byte[] a = IrxLoader.BuildMinimalIrx("MTSTA");
+            byte[] b = IrxLoader.BuildMinimalIrx("MTSTB");
+            if (!sys.LoadIrx(a, "MTSTA").Success || !sys.LoadIrx(b, "MTSTB").Success)
+                throw new Exception("LoadIrx failed (on path)");
+            int idA = sys.IopModules.SearchModuleByName("MTSTA");
+            int idB = sys.IopModules.SearchModuleByName("MTSTB");
+
+            // Parent boot context plant — must survive StartLoadedModule switch-back.
+            sys.Iop.SetGpr(16, 0xCAFEBABE);
+            sys.Iop.PC = 0x00001234;
+            int bootTid = sys.Iop.CurrentThreadId;
+
+            if (!sys.IopModules.PrepareModuleEntry(sys.Iop, idA, sys.Memory))
+                throw new Exception("PrepareModuleEntry A failed (on)");
+            if (!sys.IopModules.TryGetIrx(idA, out var ra) || ra.EntryThreadId < 1)
+                throw new Exception($"EntryThreadId A not bound ({ra?.EntryThreadId})");
+            uint spA = sys.Iop.GetGpr(29);
+            if (spA == 0 || spA == IopModuleHost.DefaultModuleStack)
+                throw new Exception($"A SP not unique: 0x{spA:X8}");
+            if (ra.EntryStackTop != spA)
+                throw new Exception("EntryStackTop A mismatch");
+            if (sys.Iop.CurrentThreadId != ra.EntryThreadId)
+                throw new Exception("PrepareModuleEntry must switch onto entry thread");
+
+            if (!sys.IopModules.PrepareModuleEntry(sys.Iop, idB, sys.Memory))
+                throw new Exception("PrepareModuleEntry B failed (on)");
+            if (!sys.IopModules.TryGetIrx(idB, out var rb) || rb.EntryThreadId < 1)
+                throw new Exception($"EntryThreadId B not bound ({rb?.EntryThreadId})");
+            uint spB = sys.Iop.GetGpr(29);
+            if (spB == 0 || spB == spA || spB == IopModuleHost.DefaultModuleStack)
+                throw new Exception($"B SP must differ from A and default: A=0x{spA:X8} B=0x{spB:X8}");
+            if (rb.EntryThreadId == ra.EntryThreadId)
+                throw new Exception("modules must bind distinct entry threads");
+
+            // StartLoadedModule: runs on entry thread, restores caller context.
+            sys.Iop.SwitchToThread(bootTid);
+            sys.Iop.SetGpr(16, 0xCAFEBABE);
+            sys.Iop.PC = 0x00001234;
+            var run = sys.IopModules.StartLoadedModule(sys, idA, maxInstructions: 64);
+            if (!run.Success || !run.ReturnedToSentinel)
+                throw new Exception($"StartLoadedModule failed: {run.Message}");
+            if (sys.Iop.CurrentThreadId != bootTid)
+                throw new Exception($"caller thread not restored: {sys.Iop.CurrentThreadId}");
+            if (sys.Iop.GetGpr(16) != 0xCAFEBABE || sys.Iop.PC != 0x00001234)
+                throw new Exception("caller $s0/PC not restored after StartLoadedModule");
+
+            // Entry context still holds its unique SP after switch-back.
+            if (!sys.Iop.TryGetThreadContext(ra.EntryThreadId, out var actx) || actx == null)
+                throw new Exception("entry context A lost");
+            if (actx.StackTop != spA)
+                throw new Exception($"entry A stack not preserved: 0x{actx.StackTop:X8}");
+
+            Console.WriteLine(
+                $"[Smoke] PrepareModuleEntry_UniqueStacks_WhenMultiThread OK " +
+                $"(spA=0x{spA:X8} spB=0x{spB:X8} tidA={ra.EntryThreadId} tidB={rb.EntryThreadId})");
+        }
+    }
 }

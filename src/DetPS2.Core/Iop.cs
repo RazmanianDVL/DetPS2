@@ -82,6 +82,15 @@ public sealed class Iop : ISchedulable
     public const uint ThreadStackRegionBase = 0x001C0000u;
     public const uint ThreadStackSlotSize = 0x2000u;
 
+    /// <summary>
+    /// C1.2: dedicated module-entry stack arena (IOP phys) for <c>PrepareModuleEntry</c> binds
+    /// when multi-thread is on. Region <c>[0x1B0000, 0x1C0000)</c> = 8 × 8 KiB, immediately
+    /// below <see cref="ThreadStackRegionBase"/>. Opt-in only — flag-off path never touches this.
+    /// Remaining work: real THREADMAN heap-backed stacks; free slots on UnloadModule.
+    /// </summary>
+    public const uint ModuleEntryStackArenaBase = 0x001B0000u;
+    public const int MaxModuleEntryStacks = 8;
+
     public Intc Intc { get; }
 
     public uint PC { get; set; } = 0xBFC00000;
@@ -1111,6 +1120,10 @@ public sealed class Iop : ISchedulable
         {
             if (_threads![id].InUse) continue;
             uint stackTop = ThreadStackRegionBase + (uint)(id + 1) * ThreadStackSlotSize;
+            // Prefer dedicated module-entry arena for low slot ids (C1.2): first
+            // MaxModuleEntryStacks secondaries land in [ModuleEntryStackArenaBase, ThreadStackRegionBase).
+            if (id <= MaxModuleEntryStacks)
+                stackTop = ModuleEntryStackArenaBase + (uint)id * ThreadStackSlotSize;
             return InitThreadSlot(id, entryPc, stackTop, ThreadStackSlotSize, IopThreadStatus.Ready);
         }
         return -1;
@@ -1130,6 +1143,65 @@ public sealed class Iop : ISchedulable
             return InitThreadSlot(id, entryPc, stackTop, stackSize, IopThreadStatus.Ready);
         }
         return -1;
+    }
+
+    /// <summary>
+    /// C1.2: bind or re-arm a secondary context for a module <c>_start</c> with a unique stack.
+    /// Reuses <paramref name="existingTid"/> when still in-use; otherwise allocates a new slot
+    /// with SP from the module-entry stack arena (then ThreadStackRegion). Optionally switches
+    /// to the bound context so live PC/SP match the entry. Returns thread id, or -1 if off/full.
+    /// </summary>
+    public int BindModuleEntryContext(int existingTid, uint entryPc, bool switchTo, out uint stackTop)
+    {
+        stackTop = 0;
+        if (!_multiThreadEnabled) return -1;
+        EnsureThreadTable();
+
+        int tid = existingTid;
+        if (tid < 1 || tid >= MaxIopThreadSlots || !_threads![tid].InUse)
+        {
+            tid = CreateSecondaryContext(entryPc);
+            if (tid < 1) return -1;
+        }
+        else
+        {
+            // Re-arm: keep unique SP, reset PC/GPRs for a fresh _start (caller sets a0/gp/ra).
+            var t = _threads![tid];
+            stackTop = t.StackTop != 0 ? t.StackTop : ModuleEntryStackArenaBase + (uint)tid * ThreadStackSlotSize;
+            Array.Clear(t.Gprs);
+            t.PC = entryPc;
+            t.Gprs[29] = stackTop;
+            t.Gprs[30] = stackTop;
+            t.HI = t.LO = 0;
+            t.Status = IopThreadStatus.Ready;
+            if (tid == _currentThreadId)
+            {
+                // Live set must match re-arm when already on this context.
+                PC = entryPc;
+                for (int i = 0; i < 32; i++) _gprs[i] = 0;
+                _gprs[29] = stackTop;
+                _gprs[30] = stackTop;
+                HI = LO = 0;
+            }
+        }
+
+        if (!TryGetThreadContext(tid, out var ctx) || ctx == null)
+            return -1;
+        stackTop = ctx.StackTop;
+        if (switchTo && tid != _currentThreadId)
+            SwitchToThread(tid);
+        return tid;
+    }
+
+    /// <summary>
+    /// Unique stack top from the module-entry arena (rotating). Used only when the thread
+    /// table is full but multi-thread is on — still avoids sharing DefaultModuleStack.
+    /// </summary>
+    public uint NextModuleEntryStackTop(ref int slotCounter)
+    {
+        int slot = slotCounter++ % MaxModuleEntryStacks;
+        // Tops at base+(slot+1)*size → [0x1B2000 .. 0x1C0000]
+        return ModuleEntryStackArenaBase + (uint)(slot + 1) * ThreadStackSlotSize;
     }
 
     /// <summary>

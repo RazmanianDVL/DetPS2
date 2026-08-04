@@ -111,6 +111,14 @@ public sealed class LoadedIrx
     /// addresses -- a cached offset from one must never be reused against the other).</summary>
     public uint BssAddr { get; set; }
     public uint BssSize { get; set; }
+    /// <summary>
+    /// C1.2: IOP cooperative thread id bound for this module's literal <c>_start</c>
+    /// when <c>DETPS2_IOP_THREADS=1</c> (−1 = unbound / flag off). Stack is unique per bind
+    /// so concurrent residents do not share <see cref="IopModuleHost.DefaultModuleStack"/>.
+    /// </summary>
+    public int EntryThreadId { get; set; } = -1;
+    /// <summary>IOP-physical stack top assigned at last multi-thread <c>PrepareModuleEntry</c> (0 if none).</summary>
+    public uint EntryStackTop { get; set; }
 }
 
 /// <summary>Result of running a loaded module's entry on the R3000 IOP core.</summary>
@@ -147,8 +155,11 @@ public sealed class IopModuleHost
     private int _nextModuleId = 1;
     private int _nextStartOrder = 1;
     /// <summary>Per-invocation rotating stack slot for THREADMAN's own _start specifically --
-    /// see the full justification at <see cref="PrepareModuleEntry"/>'s own call site.</summary>
+    /// see the full justification at <see cref="PrepareModuleEntry"/>'s own call site.
+    /// Flag-off path only; multi-thread uses unique per-entry stacks (C1.2).</summary>
     private int _threadmanEntryStackSlot;
+    /// <summary>C1.2 fallback rotator when multi-thread is on but the IOP thread table is full.</summary>
+    private int _moduleEntryStackSlot;
     /// <summary>Legacy synthetic SifRpcCmd.Open path only (unbounded). Real FILEIO/IOMAN
     /// allocation uses <see cref="AllocIoManFd"/> over slots 0..15.</summary>
     private int _nextFd = 3;
@@ -611,7 +622,11 @@ public sealed class IopModuleHost
     /// <summary>
     /// Arm IOP GPRs/PC for a loaded module's <c>_start</c> without stepping.
     /// Sets PC = entry (IOP phys), <c>$gp</c>, <c>$ra</c> = <see cref="ModuleReturnSentinel"/>,
-    /// <c>$sp</c> = <see cref="DefaultModuleStack"/>, a0/a1 = 0 (argc/argv).
+    /// <c>$sp</c> = <see cref="DefaultModuleStack"/> (flag off), a0 = boot param.
+    /// When <see cref="Iop.MultiThreadEnabled"/> (C1.2 / <c>DETPS2_IOP_THREADS=1</c>): bind or
+    /// re-arm a secondary context with a <b>unique</b> stack from the module-entry arena and
+    /// switch onto it so concurrent residents no longer share one zero-wipe region.
+    /// Flag-off path is byte-identical to the pre-C1.2 single-stack + THREADMAN rotator.
     /// Hook for T0: call from Ps2System when scheduling IOP quanta under LITERAL_IRX.
     /// </summary>
     public bool PrepareModuleEntry(Iop iop, int id, SystemMemory? mem = null)
@@ -620,33 +635,43 @@ public sealed class IopModuleHost
         if (!_irxById.TryGetValue(id, out var m) || !m.HasImage || m.Entry == 0)
             return false;
         uint entryPhys = ToIopPhys(m.Entry);
+
+        // --- Stack + optional thread bind ---
+        // Real hardware gives every thread (including each module's own _start) its own
+        // distinct stack. Flag-off still uses DefaultModuleStack for all non-THREADMAN modules
+        // (THREADMAN-only rotator is a stopgap for the shared-stack wipe bug). Multi-thread
+        // replaces that with unique per-entry SP + IopThreadContext bind (C1.2).
+        uint sp;
+        if (iop.MultiThreadEnabled)
+        {
+            int tid = iop.BindModuleEntryContext(m.EntryThreadId, entryPhys, switchTo: true, out sp);
+            if (tid >= 1)
+            {
+                m.EntryThreadId = tid;
+                m.EntryStackTop = sp;
+            }
+            else
+            {
+                // Table full: still avoid DefaultModuleStack so concurrent residents do not
+                // clobber each other; no thread id until a slot frees (Unload / THREADMAN later).
+                sp = iop.NextModuleEntryStackTop(ref _moduleEntryStackSlot);
+                m.EntryThreadId = -1;
+                m.EntryStackTop = sp;
+            }
+        }
+        else
+        {
+            // FLAG OFF — keep exact pre-C1.2 behavior (do not touch EntryThreadId / arena).
+            // THREADMAN reload: small rotating range below RealSifRpc scratch (0x1E0000).
+            bool isThreadmanReload = string.Equals(m.Name, "THREADMAN", StringComparison.OrdinalIgnoreCase);
+            sp = isThreadmanReload
+                ? 0x001D0000u + (uint)(_threadmanEntryStackSlot++ % 8) * 0x2000u
+                : DefaultModuleStack;
+        }
+
         iop.PC = entryPhys;
         if (m.Gp != 0)
             iop.SetGpr(28, m.Gp); // $gp
-        // Real hardware gives every thread (including each module's own _start) its own,
-        // distinct stack allocation. Ours hands every module the exact same fixed address
-        // (DefaultModuleStack), re-zeroed on every call -- harmless for the overwhelming
-        // majority of modules (each _start runs to completion or a benign resident spin without
-        // any other code ever trying to resume a stale saved SP through it), but ground-truthed
-        // 2026-08-03 as the real cause of THREADMAN's reload deadlocking: THREADMAN's own real
-        // _start invokes the shared, never-reloading kernel's exception/scheduler trampoline
-        // (via a direct `j` into the general exception vector, a real, intentional kernel
-        // primitive, not a bug), which can legitimately "resume" a saved SP belonging to a
-        // DIFFERENT _start invocation's stack -- confirmed live: a real `lw ra,0x1C(sp)` at a
-        // real kernel trampoline address read zero from a location that had legitimately held
-        // real data moments earlier, wiped by this same zeroing loop preparing a later _start.
-        // Scoped to THREADMAN specifically (the only module whose own real code exercises this
-        // path) rather than every module, after a broader attempt (every module getting a
-        // rotating stack slot in [0x180000,0x1E0000)) regressed MK Shaolin Monks -- that range
-        // overlaps real, live SYSMEM heap allocations for titles that allocate more; a wide,
-        // blind "safe" range guessed from the module-load bump allocator's own upper bound is
-        // not actually proof nothing else legitimately lives there. This uses a small, separate
-        // few-slot range immediately below RealSifRpc.cs's own established scratchStack
-        // (0x1E0000, used for temporary handler calls) rather than reusing that exact address.
-        bool isThreadmanReload = string.Equals(m.Name, "THREADMAN", StringComparison.OrdinalIgnoreCase);
-        uint sp = isThreadmanReload
-            ? 0x001D0000u + (uint)(_threadmanEntryStackSlot++ % 8) * 0x2000u
-            : DefaultModuleStack;
         if (mem != null)
         {
             // Zero descending stack so ($fp+N) counters start at 0.
@@ -727,6 +752,11 @@ public sealed class IopModuleHost
         // GAMEDATA.WAD cdvd 198840->1 when combined with IOPRP StartLoadedModule path.
         // EE MSFLAG is still planted from Sif.PresentSifInit / explicit cold-boot sites.
 
+        // C1.2: when multi-thread is on, PrepareModuleEntry switches onto the module's
+        // entry context; capture prior so we restore the caller after the quanta (and so a
+        // budget-hit resident keeps its PC/SP in its own saved context, not the boot thread).
+        int prevThreadId = iop.MultiThreadEnabled ? iop.CurrentThreadId : 0;
+
         if (!PrepareModuleEntry(iop, id, system.Memory))
             return new ModuleRunResult { Success = false, Message = "PrepareModuleEntry failed", ModuleId = id, Name = m.Name };
 
@@ -765,6 +795,9 @@ public sealed class IopModuleHost
 
         ulong insns = iop.InstructionsExecuted - before;
         int modres = (int)iop.GetGpr(2);
+        // Capture entry-thread PC before any switch-back (C1.2 multi-thread).
+        uint finalPc = iop.PC;
+
         m.LastModRes = modres;
         m.LastEntryInstructions = insns;
         m.EntryExecuted = insns > 0;
@@ -799,7 +832,7 @@ public sealed class IopModuleHost
         bool residentSpin = false;
         if (budget && !returned && insns > 256)
         {
-            uint pc = ToIopPhys(iop.PC);
+            uint pc = ToIopPhys(finalPc);
             uint modPhys = ToIopPhys(m.LoadBase);
             uint modEnd = modPhys + Math.Max(m.Size, 0x1000u);
             if (pc >= modPhys && pc < modEnd)
@@ -853,23 +886,28 @@ public sealed class IopModuleHost
             bootQuantaResident = true;
         }
 
+        // C1.2: restore caller thread after entry quanta so saved entry context keeps finalPc/SP.
+        // Flag-off: CurrentThreadId is always 0 — no switch.
+        if (iop.MultiThreadEnabled && prevThreadId != iop.CurrentThreadId)
+            iop.SwitchToThread(prevThreadId);
+
         bool ok = insns > 0 && (returned || budget || residentSpin || bootQuantaResident);
         return new ModuleRunResult
         {
             Success = ok,
             Message = bootQuantaResident
-                ? $"boot quanta resident (IRQ wait) pc=0x{iop.PC:X8} after {insns} insn"
+                ? $"boot quanta resident (IRQ wait) pc=0x{finalPc:X8} after {insns} insn"
                 : returned && residentSpin
-                    ? $"resident spin at pc=0x{iop.PC:X8} after {insns} insn"
+                    ? $"resident spin at pc=0x{finalPc:X8} after {insns} insn"
                     : returned
                         ? $"returned to sentinel after {insns} insn"
                         : budget
                             ? $"hit budget {maxInstructions} after {insns} insn"
-                            : insns == 0 ? "no instructions executed" : $"stopped pc=0x{iop.PC:X8} after {insns} insn",
+                            : insns == 0 ? "no instructions executed" : $"stopped pc=0x{finalPc:X8} after {insns} insn",
             ModuleId = id,
             Name = m.Name,
             EntryPc = entryPhys,
-            FinalPc = iop.PC,
+            FinalPc = finalPc,
             InstructionsExecuted = insns,
             ModRes = modres,
             ReturnedToSentinel = returned,
