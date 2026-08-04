@@ -413,6 +413,9 @@ public sealed class Ps2System
             // (IRX is the product path; DETPS2_FORCE_HLE_IOP=1 skips arming via IsLiteralIrxEnabled).
             if (IopModuleHost.IsLiteralIrxEnabled && IopModules.HasPendingLiteralEntry)
                 IopModules.TryArmPendingLiteralEntry(Iop);
+            // C1 yield-start: continue module _start residuals across quanta (flag-gated).
+            if (IopModuleHost.YieldStartEnabled && IopModules.HasResidualModuleStart)
+                IopModules.DrainResidualModuleStarts(this);
             while (left > 0)
             {
                 ulong pcPhys = EE.PC & 0x1FFFFFFFUL;

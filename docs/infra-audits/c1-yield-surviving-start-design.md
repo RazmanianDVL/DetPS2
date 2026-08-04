@@ -111,8 +111,18 @@ When `DETPS2_IOP_YIELD_START=1` (name TBD) **and** `IOP_THREADS=1`:
 
 - [x] Problem named from BO2 TRACE  
 - [x] Mechanism + flags + files  
-- [ ] Dual-ACK C1-Y1..Y4  
-- [ ] **No Core** until ACK  
+- [x] Dual-ACK C1-Y1..Y4  
+- [x] **S6.1-style implement landed** (see §6)  
+
+---
+
+## 6. Implement note (2026-08-04)
+
+**Landed:** checkpoint + residual queue + `DrainResidualModuleStarts` from `Ps2System.RunFor` under `DETPS2_IOP_YIELD_START=1` + `IOP_THREADS=1`. Kill `DETPS2_DISABLE_IOP_YIELD_START=1`. Default off.
+
+**Yield surface v1:** `Iop.FindNextReadyThread() >= 0` only (READY peer). Residual resume uses `SwitchToThread(EntryThreadId)` — does **not** re-call `PrepareModuleEntry` (would rewind PC).
+
+**Honest residual:** IOPFILE may still hit 100k without residual if THREADMAN never creates READY peers via DetPS2 hooks — infrastructure is ready; CreateThread intercept is a follow-on.  
 
 ---
 

@@ -136,6 +136,8 @@ public sealed class ModuleRunResult
     public int ModRes { get; init; }
     public bool ReturnedToSentinel { get; init; }
     public bool HitInstructionBudget { get; init; }
+    /// <summary>C1 yield-start: first arm returned early with residual queue work remaining.</summary>
+    public bool PartialYieldStart { get; init; }
 }
 
 /// <summary>
@@ -160,6 +162,19 @@ public sealed class IopModuleHost
     private int _threadmanEntryStackSlot;
     /// <summary>C1.2 fallback rotator when multi-thread is on but the IOP thread table is full.</summary>
     private int _moduleEntryStackSlot;
+
+    /// <summary>C1 yield-start residual queue (module still in _start after yield surface).</summary>
+    private readonly Queue<ResidualModuleStart> _residualModuleStarts = new();
+
+    private struct ResidualModuleStart
+    {
+        public int ModuleId;
+        public ulong RemainingInsn;
+        public int SlicesLeft;
+    }
+
+    /// <summary>True when residual yield-start work is queued.</summary>
+    public bool HasResidualModuleStart => _residualModuleStarts.Count > 0;
     /// <summary>Legacy synthetic SifRpcCmd.Open path only (unbounded). Real FILEIO/IOMAN
     /// allocation uses <see cref="AllocIoManFd"/> over slots 0..15.</summary>
     private int _nextFd = 3;
@@ -275,6 +290,22 @@ public sealed class IopModuleHost
             return true;
         }
     }
+
+    /// <summary>
+    /// C1 yield-surviving start: residual slices when multi-thread shows a yield surface.
+    /// Requires <c>DETPS2_IOP_THREADS=1</c> at process start. Default off.
+    /// Kill: <c>DETPS2_DISABLE_IOP_YIELD_START=1</c>.
+    /// </summary>
+    public static bool YieldStartEnabled =>
+        Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") == "1"
+        && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_YIELD_START") != "1";
+
+    /// <summary>Default first-call instruction cap (matches historical StartLoadedModule default).</summary>
+    public const ulong YieldStartMaxInsnFirstCall = 100_000;
+    /// <summary>Checkpoint size while looking for a yield surface (not a hard cap).</summary>
+    public const ulong YieldStartCheckpointInsn = 16_384;
+    /// <summary>Per residual drain slice on later quanta.</summary>
+    public const ulong YieldStartResidualSliceInsn = 16_384;
 
     /// <summary>Return address planted in <c>$ra</c> so <c>jr ra</c> from module entry is detectable.</summary>
     public const uint ModuleReturnSentinel = 0x0000BEE0u;
@@ -764,6 +795,13 @@ public sealed class IopModuleHost
         ulong before = iop.InstructionsExecuted;
         bool returned = false;
         bool budget = false;
+        bool partialYield = false;
+
+        // C1 yield-start: 16k checkpoints within maxInstructions (default 100k). Flag-off
+        // uses a single unlimited loop to maxInstructions (byte-identical path).
+        bool yieldStart = YieldStartEnabled && iop.MultiThreadEnabled;
+        ulong nextCheckpoint = yieldStart ? YieldStartCheckpointInsn : ulong.MaxValue;
+        ulong firstCallCap = maxInstructions;
 
         // Step one outer Iop.Step(1) at a time so we stop as soon as PC lands on the
         // return sentinel. (A large Step(N) would keep fetching past $ra after jr ra.)
@@ -771,7 +809,7 @@ public sealed class IopModuleHost
         while (true)
         {
             ulong done = iop.InstructionsExecuted - before;
-            if (done >= maxInstructions)
+            if (done >= firstCallCap)
             {
                 budget = true;
                 break;
@@ -790,6 +828,32 @@ public sealed class IopModuleHost
             {
                 returned = true;
                 break;
+            }
+
+            if (yieldStart)
+            {
+                done = iop.InstructionsExecuted - before;
+                if (done >= nextCheckpoint)
+                {
+                    nextCheckpoint += YieldStartCheckpointInsn;
+                    // Yield surface: multi-thread peer READY (worker created). Residual only then.
+                    if (iop.FindNextReadyThread() >= 0)
+                    {
+                        ulong remain = firstCallCap > done ? firstCallCap - done : 0;
+                        if (remain > 0)
+                        {
+                            _residualModuleStarts.Enqueue(new ResidualModuleStart
+                            {
+                                ModuleId = id,
+                                RemainingInsn = remain + YieldStartMaxInsnFirstCall, // extra residual budget
+                                SlicesLeft = 32,
+                            });
+                            partialYield = true;
+                        }
+                        break;
+                    }
+                    // No yield surface: continue same call toward firstCallCap (Y2).
+                }
             }
         }
 
@@ -891,11 +955,13 @@ public sealed class IopModuleHost
         if (iop.MultiThreadEnabled && prevThreadId != iop.CurrentThreadId)
             iop.SwitchToThread(prevThreadId);
 
-        bool ok = insns > 0 && (returned || budget || residentSpin || bootQuantaResident);
+        bool ok = insns > 0 && (returned || budget || residentSpin || bootQuantaResident || partialYield);
         return new ModuleRunResult
         {
             Success = ok,
-            Message = bootQuantaResident
+            Message = partialYield
+                ? $"partial yield-start residual queued after {insns} insn pc=0x{finalPc:X8}"
+                : bootQuantaResident
                 ? $"boot quanta resident (IRQ wait) pc=0x{finalPc:X8} after {insns} insn"
                 : returned && residentSpin
                     ? $"resident spin at pc=0x{finalPc:X8} after {insns} insn"
@@ -911,8 +977,90 @@ public sealed class IopModuleHost
             InstructionsExecuted = insns,
             ModRes = modres,
             ReturnedToSentinel = returned,
-            HitInstructionBudget = budget && !returned,
+            HitInstructionBudget = budget && !returned && !partialYield,
+            PartialYieldStart = partialYield,
         };
+    }
+
+    /// <summary>
+    /// C1 yield-start: drain one residual module <c>_start</c> slice on a later IOP quantum.
+    /// No-op when flag off or queue empty. Call from <see cref="Ps2System.RunFor"/> slices.
+    /// </summary>
+    public int DrainResidualModuleStarts(Ps2System system, ulong maxInsn = YieldStartResidualSliceInsn)
+    {
+        if (!YieldStartEnabled || system == null || _residualModuleStarts.Count == 0)
+            return 0;
+        var iop = system.Iop;
+        if (!iop.MultiThreadEnabled)
+            return 0;
+
+        var work = _residualModuleStarts.Peek();
+        if (!_irxById.TryGetValue(work.ModuleId, out var m) || !m.HasImage)
+        {
+            _residualModuleStarts.Dequeue();
+            return 0;
+        }
+
+        int prev = iop.CurrentThreadId;
+        // Resume entry context — do NOT PrepareModuleEntry (that rewinds PC to entry).
+        if (m.EntryThreadId >= 1)
+        {
+            if (!iop.SwitchToThread(m.EntryThreadId))
+            {
+                _residualModuleStarts.Dequeue();
+                return 0;
+            }
+        }
+        else
+        {
+            // No bound thread: cannot residual-resume without clobbering boot PC.
+            _residualModuleStarts.Dequeue();
+            return 0;
+        }
+
+        ulong before = iop.InstructionsExecuted;
+        ulong cap = Math.Min(maxInsn, work.RemainingInsn);
+        bool returned = false;
+        while (iop.InstructionsExecuted - before < cap)
+        {
+            if (iop.PC == ModuleReturnSentinel)
+            {
+                returned = true;
+                break;
+            }
+            if (!iop.Running) break;
+            iop.Step(1);
+            if (iop.PC == ModuleReturnSentinel)
+            {
+                returned = true;
+                break;
+            }
+            // Peer READY mid-slice: give them a turn next residual call.
+            if (iop.FindNextReadyThread() >= 0)
+            {
+                iop.YieldToReady();
+                break;
+            }
+        }
+
+        ulong ran = iop.InstructionsExecuted - before;
+        ModuleEntryInstructions += ran;
+        m.LastEntryInstructions += ran;
+        if (iop.MultiThreadEnabled && prev != iop.CurrentThreadId)
+            iop.SwitchToThread(prev);
+
+        work.RemainingInsn = work.RemainingInsn > ran ? work.RemainingInsn - ran : 0;
+        work.SlicesLeft--;
+        _residualModuleStarts.Dequeue();
+        if (!returned && work.RemainingInsn > 0 && work.SlicesLeft > 0)
+            _residualModuleStarts.Enqueue(work);
+        else if (returned)
+        {
+            m.LastModRes = (int)iop.GetGpr(2);
+            m.EntryExecuted = true;
+        }
+
+        return (int)ran;
     }
 
     /// <summary>
