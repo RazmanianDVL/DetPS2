@@ -65,3 +65,6 @@ atural=224016). Fresh claim-class Soft-GS evidence at tip of M7-c-2b / GIF_BISEC
 aturalDispfbPx=0**, compositeSource=LastImageTrx, esidualDispfbPx=46080, with real Path3 IMAGE delivered (imgBytes=98304, gifP3=6) — see docs/infra-audits/m7c-2b-midway-image-stall-rootcause.md and docs/infra-audits/m7c-slice3-dispfb-composite-design.md §1.3.
 
 **Do not build Slice 3 mechanism on either number alone.** Next reconciling seat: single canonical MK:DA claim-tier run at current tip. Until then treat A0 MK:DA natural count as **stale/historical**.
+
+**RECONCILED 2026-08-04 (Grok claim 100M):** 
+aturalDispfbPx=0, esidualDispfbPx=46080, compositeSource=LastImageTrx, imgBytes=98304, gifP3=6 — see `docs/infra-audits/m7-slice3-mkda-residual-accepted.md`. Residual **accepted**; no Slice 3 Core PR.
