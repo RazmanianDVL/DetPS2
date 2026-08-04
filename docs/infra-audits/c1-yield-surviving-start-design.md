@@ -46,14 +46,18 @@ C1.3 yield hooks exist but **cannot help if the entire budget is burned inside o
 
 When `DETPS2_IOP_YIELD_START=1` (name TBD) **and** `IOP_THREADS=1`:
 
-1. **First arm** (LOADFILE / literal start): run at most `MaxInsnFirstSlice` (e.g. 16k–32k, not 100k) of `_start`.  
-2. If **returned to sentinel** → same as today (modres from v0).  
-3. If **budget/slice hit** and multi-thread shows **other READY threads** or parked wait:  
+1. **First arm** (LOADFILE / literal start): run `_start` in **checkpoints** of `MaxInsnFirstSlice` (default **16k**), up to `MaxInsnFirstCall` (default **100k**, same as today’s hard cap).  
+2. After each checkpoint (and at end): if **returned to sentinel** → same as today (modres from v0).  
+3. If checkpoint hit **and** multi-thread shows **other READY threads** or parked wait (**yield surface detected**):  
    - Save entry context (already C1.2)  
    - Enqueue **residual start work item** `(moduleId, remainingBudgetCap, slicesLeft)`  
    - Return soft status: `Partial=true` / `ret=False` but **do not** treat as permanent failure  
-4. **IOP Step / SIF Step / scheduler tick:** drain residual queue: each tick runs `MaxInsnPerResidualSlice` on the module’s thread context, then yields to other IOP READY threads (C1.3 RR).  
-5. Complete residual when sentinel hit or `TotalInsnCap` / `MaxSlices` exhausted (honest budget residual — document metrics).
+4. If checkpoint hit **and no yield surface** (straight-line boot, no peer READY / park):  
+   - **Continue in the same call** through further checkpoints until return or `MaxInsnFirstCall` — **16k is not a hard cap**.  
+   - Rationale (C1-Y2 clarification): a module that legitimately finishes in e.g. 40k insn without yielding must not be marked Partial at 16k.  
+5. If `MaxInsnFirstCall` hit with still no return and still no yield surface → same honest budget outcome as today (`ret=False`, no residual invent). Optional later: residual-even-without-yield for spin loops (out of v1).  
+6. **IOP Step / SIF Step / scheduler tick:** drain residual queue: each tick runs `MaxInsnPerResidualSlice` on the module’s thread context, then yields to other IOP READY threads (C1.3 RR).  
+7. Complete residual when sentinel hit or `TotalInsnCap` / `MaxSlices` exhausted (honest budget residual — document metrics).
 
 ### 2.3 Flags
 
@@ -89,7 +93,7 @@ When `DETPS2_IOP_YIELD_START=1` (name TBD) **and** `IOP_THREADS=1`:
 | ID | Question | Bias |
 |----|----------|------|
 | **C1-Y1** | Approve residual slice design (not budget++ alone)? | **Yes** |
-| **C1-Y2** | First slice default 16k vs keep 100k first then residual? | **16k first** (force early yield surface) |
+| **C1-Y2** | First slice default 16k vs keep 100k first then residual? | **16k checkpoint, 100k first-call cap** — continue same call if no yield surface (not Partial at 16k alone) |
 | **C1-Y3** | Include SDRDRV in success bar or IOPFILE-only? | **IOPFILE primary**; SDRDRV secondary |
 | **C1-Y4** | Implement now after ACK or park until next session? | Partner choice — design ready |
 
