@@ -62,10 +62,33 @@ Artifacts: `out/canaries/c1-thbase-ordinal-scan/out.txt`
 
 ---
 
-## 4. Non-claims
+## 4. CreateThread arg layout (disassembly at export #4)
 
-- Argument layouts (ee_thread / stack size in `$a0`) still need a short decompile pass before implement.  
-- Does not implement trampoline this seat.
+```text
+CreateThread @ 0x1C010C5C (loadBase+0xC5C):
+  addiu sp,sp,-40
+  addu  s1, a0, zero          ; s1 = thread param block*
+  jal   ...
+  lw    v0, 0(s1)             ; +0x00 attr (mask check)
+  lw    v0, 16(s1)            ; +0x10 initPriority (sltiu vs 126)
+  lw    v0, 8(s1)             ; +0x08 entry (must be 4-byte aligned)
+```
+
+**v1 trampoline contract (sufficient for READY peers):**
+
+| Arg | Meaning |
+|-----|---------|
+| `$a0` | Pointer to thread param block in IOP RAM |
+| `*(a0+0x08)` | **entry PC** (function) |
+| `*(a0+0x10)` | initPriority (validate only; ignore for v1 RR) |
+| stack | Prefer DetPS2 unique stack arena (C1.2); optional later: honor `*(a0+0x0C)` stack if present |
+
+**StartThread (`$a0` = thread id):** mark that tid READY; return 0 on success.
+
+## 5. Non-claims
+
+- Full attr/option/gp fidelity not required for v1 READY-peer surface.  
+- Does not implement trampoline this seat (ordinals + args now enough to implement next).
 
 ---
 
