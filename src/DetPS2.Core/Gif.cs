@@ -1129,6 +1129,9 @@ public sealed class Gif : ISchedulable
                 // _apath is set for the duration of ReceivePath3Data / held Path3 drain.
                 if (_apath == 3)
                     _path3ImageCompleted++;
+                // M7-c 2b: IMAGE packet actually completed — any earlier partial-progress
+                // stall reason is now stale telemetry, not a real in-flight stall.
+                _lastImageStallReason = "";
                 break;
             default: _tagsCompletedDisable++; break;
         }
