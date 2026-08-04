@@ -1287,6 +1287,11 @@ press 3000 Circle 100
     public static void IopYieldStart_ResidualOnReadyPeer() =>
         IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
 
+    /// <summary>Forward to <see cref="IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer"/> for single-smoke CLI.</summary>
+    public static void IopCreateThread_HleTrampoline_ReadyPeer() =>
+        IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer();
+
+
     public static void Dmac_LevelCatchup_DefaultOff_NoOp()
     {
         var sys = new Ps2System();
@@ -1455,6 +1460,7 @@ press 3000 Circle 100
             IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
             IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
+            IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer();
             IopExecSmokes.RealRpc_DispatchCompose_WithMultiThread();
             IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
             Sif_DmaRoundTrip_UpdatesMemory();

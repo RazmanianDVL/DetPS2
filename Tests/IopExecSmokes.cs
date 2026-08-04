@@ -950,4 +950,141 @@ public static class IopExecSmokes
             $"(sid=0x{testSid:X8} LiveRpcHits={rpc.LiveRpcHits} " +
             $"handler=0x{handlerEe:X8} sifcmdBase=0x{sifcmd.LoadBase:X8})");
     }
+
+    /// <summary>
+    /// C1 CreateThread intercept: (1) OverrideThbase patches thbase ord 4/6 only;
+    /// (2) CreateDormant + StartThreadReady → FindNextReadyThread; (3) HLE trap PCs under
+    /// process flag DETPS2_IOP_CREATE_THREAD=1 create READY peer via Step. Flag-off: no API
+    /// change without multi-thread; CREATE_THREAD alone does not enable multi-thread table.
+    /// </summary>
+    public static void IopCreateThread_HleTrampoline_ReadyPeer()
+    {
+        // --- Override patches thbase Create(4)/Start(6); leaves other ordinals alone ---
+        {
+            var mem = new SystemMemory();
+            const uint importerBase = SystemMemory.IOP_RAM_BASE + 0x030000;
+            mem.Write32(importerBase + 0x00, IrxLoader.ImportStubMagic);
+            mem.Write32(importerBase + 0x04, 0);
+            mem.Write8(importerBase + 0x08, 0); mem.Write8(importerBase + 0x09, 1);
+            mem.Write8(importerBase + 0x0A, 0); mem.Write8(importerBase + 0x0B, 0);
+            byte[] name = System.Text.Encoding.ASCII.GetBytes("thbase\0\0");
+            for (int i = 0; i < 8; i++) mem.Write8(importerBase + 0x0C + (uint)i, name[i]);
+
+            // ordinals 4, 5, 6 — only 4 and 6 should re-point
+            uint Stub(uint ord) => (9u << 26) | (ord & 0xFFFF);
+            const uint s4 = importerBase + 0x14;
+            const uint s5 = importerBase + 0x1C;
+            const uint s6 = importerBase + 0x24;
+            mem.Write32(s4 + 0, 0x03E00008); mem.Write32(s4 + 4, Stub(4));
+            mem.Write32(s5 + 0, 0x03E00008); mem.Write32(s5 + 4, Stub(5));
+            mem.Write32(s6 + 0, 0x03E00008); mem.Write32(s6 + 4, Stub(6));
+            mem.Write32(importerBase + 0x2C, 0); // terminator
+
+            int n = IrxLoader.OverrideThbaseCreateStartImports(
+                mem, importerBase, importerBase + 0x100,
+                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc);
+            if (n != 2)
+                throw new Exception($"expected 2 thbase overrides, got {n}");
+
+            uint jCreate = ((Iop.HleThbaseCreateThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            uint jStart = ((Iop.HleThbaseStartThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            if (mem.Read32(s4) != jCreate)
+                throw new Exception($"ord4 not patched to Create HLE: 0x{mem.Read32(s4):X8}");
+            if (mem.Read32(s5) != 0x03E00008)
+                throw new Exception($"ord5 must stay jr-ra placeholder, got 0x{mem.Read32(s5):X8}");
+            if (mem.Read32(s6) != jStart)
+                throw new Exception($"ord6 not patched to Start HLE: 0x{mem.Read32(s6):X8}");
+        }
+
+        // --- API: DORMANT create + Start → READY peer visible to FindNextReadyThread ---
+        {
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+            int tid = sys.Iop.CreateDormantThreadContext(0x0000A000);
+            if (tid < 1)
+                throw new Exception($"CreateDormantThreadContext failed: {tid}");
+            if (sys.Iop.GetThreadStatus(tid) != IopThreadStatus.Dormant)
+                throw new Exception($"expected DORMANT got {sys.Iop.GetThreadStatus(tid)}");
+            if (sys.Iop.FindNextReadyThread() >= 0)
+                throw new Exception("DORMANT must not appear as READY peer");
+            if (!sys.Iop.StartThreadReady(tid))
+                throw new Exception("StartThreadReady failed");
+            if (sys.Iop.GetThreadStatus(tid) != IopThreadStatus.Ready)
+                throw new Exception($"expected READY got {sys.Iop.GetThreadStatus(tid)}");
+            if (sys.Iop.FindNextReadyThread() != tid)
+                throw new Exception($"FindNextReadyThread expected {tid} got {sys.Iop.FindNextReadyThread()}");
+            if (!sys.Iop.TryGetThreadContext(tid, out var ctx) || ctx == null || ctx.PC != 0x0000A000)
+                throw new Exception("dormant entry PC not preserved");
+        }
+
+        // --- Flag-off identity: CREATE_THREAD env alone does not multi-thread without THREADS ---
+        if (!Iop.MultiThreadEnvEnabled)
+        {
+            var off = new Ps2System();
+            if (off.Iop.CreateDormantThreadContext(0x1000) != -1)
+                throw new Exception("CreateDormant must fail when multi-thread off");
+            if (off.Iop.StartThreadReady(1))
+                throw new Exception("StartThreadReady must fail when multi-thread off");
+        }
+
+        // --- HLE Step path: plant param block, hit trap PCs with CREATE_THREAD=1 ---
+        string? prevCreate = Environment.GetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD");
+        string? prevKill = Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD");
+        try
+        {
+            Environment.SetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD", "1");
+            Environment.SetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD", null);
+            if (!Iop.CreateThreadHleEnvEnabled)
+                throw new Exception("CreateThreadHleEnvEnabled false after set");
+
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+
+            // thread param block: entry at +0x08 (c1-thbase-ordinal-scan)
+            const uint paramPhys = 0x00008000;
+            const uint entryPc = 0x00009000;
+            sys.Memory.IopWrite32(paramPhys + 0x00, 0);
+            sys.Memory.IopWrite32(paramPhys + 0x04, 0);
+            sys.Memory.IopWrite32(paramPhys + 0x08, entryPc);
+
+            uint retPc = 0x0000C000;
+            sys.Iop.PC = Iop.HleThbaseCreateThreadPc;
+            sys.Iop.SetGpr(4, paramPhys); // a0
+            sys.Iop.SetGpr(31, retPc);    // ra
+            int retired = sys.Iop.Step(1);
+            if (retired != 1)
+                throw new Exception($"Create HLE Step retired {retired}");
+            if (sys.Iop.PC != retPc)
+                throw new Exception($"Create HLE did not return to ra: PC=0x{sys.Iop.PC:X8}");
+            int newTid = (int)sys.Iop.GetGpr(2);
+            if (newTid < 1)
+                throw new Exception($"Create HLE v0={newTid}");
+            if (sys.Iop.GetThreadStatus(newTid) != IopThreadStatus.Dormant)
+                throw new Exception("HLE CreateThread must leave DORMANT");
+
+            sys.Iop.PC = Iop.HleThbaseStartThreadPc;
+            sys.Iop.SetGpr(4, (uint)newTid);
+            sys.Iop.SetGpr(31, retPc);
+            retired = sys.Iop.Step(1);
+            if (retired != 1 || sys.Iop.PC != retPc)
+                throw new Exception($"Start HLE bad retire={retired} pc=0x{sys.Iop.PC:X8}");
+            if (sys.Iop.GetGpr(2) != 0)
+                throw new Exception($"Start HLE v0 expected 0 got {sys.Iop.GetGpr(2)}");
+            if (sys.Iop.GetThreadStatus(newTid) != IopThreadStatus.Ready)
+                throw new Exception("HLE StartThread must make READY");
+            if (sys.Iop.FindNextReadyThread() != newTid)
+                throw new Exception("HLE path READY peer not visible");
+
+            Console.WriteLine(
+                $"[Smoke] IopCreateThread_HleTrampoline_ReadyPeer OK " +
+                $"(tid={newTid} createPc=0x{Iop.HleThbaseCreateThreadPc:X} " +
+                $"startPc=0x{Iop.HleThbaseStartThreadPc:X})");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD", prevCreate);
+            Environment.SetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD", prevKill);
+        }
+    }
 }
+

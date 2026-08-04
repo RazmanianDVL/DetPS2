@@ -334,6 +334,18 @@ public sealed class Iop : ISchedulable
 
     public uint ReadSifMailboxToEE() => SifMbxToEE;
 
+    /// <summary>C1 CreateThread HLE trap PCs (low IOP RAM). Only used when CREATE_THREAD flag on.</summary>
+    public const uint HleThbaseCreateThreadPc = 0x0000BF00u;
+    public const uint HleThbaseStartThreadPc = 0x0000BF04u;
+
+    /// <summary>
+    /// Product: <c>DETPS2_IOP_CREATE_THREAD=1</c> enables thbase Create/Start HLE trampolines.
+    /// Kill: <c>DETPS2_DISABLE_IOP_CREATE_THREAD=1</c>. Default off — real THREADMAN.IRX runs.
+    /// </summary>
+    public static bool CreateThreadHleEnvEnabled =>
+        Environment.GetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD") == "1"
+        && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD") != "1";
+
     public int Step(ulong maxCycles)
     {
         if (!Running || maxCycles == 0) return 0;
@@ -341,6 +353,19 @@ public sealed class Iop : ISchedulable
         int executed = 0;
         while ((ulong)executed < maxCycles && Running)
         {
+            // C1 CreateThread HLE: intercept before fetch when trampoline flag on + multi-thread.
+            if (CreateThreadHleEnvEnabled && _multiThreadEnabled &&
+                (PC == HleThbaseCreateThreadPc || PC == HleThbaseStartThreadPc))
+            {
+                if (PC == HleThbaseCreateThreadPc)
+                    HleThbaseCreateThread();
+                else
+                    HleThbaseStartThread();
+                executed++;
+                InstructionsExecuted++;
+                continue;
+            }
+
             // Real R3000A hardware interrupt delivery (2026-08-03). The whole real IOP INTC
             // (VBLANK, timers, DMA, SIF, ...) wires its combined output to a single external
             // interrupt input -- COP0 hardware interrupt 2 (Status/Cause bit 10, IM2/IP2), the
@@ -1154,6 +1179,71 @@ public sealed class Iop : ISchedulable
             return InitThreadSlot(id, entryPc, stackTop, stackSize, IopThreadStatus.Ready);
         }
         return -1;
+    }
+
+    /// <summary>
+    /// C1 CreateThread HLE: new context as DORMANT (StartThread makes READY). Unique stack arena.
+    /// Returns tid or -1.
+    /// </summary>
+    public int CreateDormantThreadContext(uint entryPc)
+    {
+        if (!_multiThreadEnabled) return -1;
+        EnsureThreadTable();
+        for (int id = 1; id < MaxIopThreadSlots; id++)
+        {
+            if (_threads![id].InUse) continue;
+            uint stackTop = id <= MaxModuleEntryStacks
+                ? ModuleEntryStackArenaBase + (uint)id * ThreadStackSlotSize
+                : ThreadStackRegionBase + (uint)(id + 1) * ThreadStackSlotSize;
+            return InitThreadSlot(id, entryPc, stackTop, ThreadStackSlotSize, IopThreadStatus.Dormant);
+        }
+        return -1;
+    }
+
+    /// <summary>C1 StartThread HLE: DORMANT/WAIT → READY. Returns false if invalid tid.</summary>
+    public bool StartThreadReady(int tid)
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        if ((uint)tid >= (uint)MaxIopThreadSlots || !_threads[tid].InUse) return false;
+        if (tid == _currentThreadId)
+        {
+            _threads[tid].Status = IopThreadStatus.Run;
+            return true;
+        }
+        _threads[tid].Status = IopThreadStatus.Ready;
+        return true;
+    }
+
+    private void HleThbaseCreateThread()
+    {
+        // a0 = thread param block*; entry at +0x08 (c1-thbase-ordinal-scan.md).
+        uint a0 = GetGpr(4);
+        uint entry = 0;
+        try
+        {
+            if (_memory.IsKnownIopAddress(a0 + 8))
+                entry = _memory.IopRead32(a0 + 8);
+        }
+        catch { /* fall through */ }
+
+        int tid = entry != 0 ? CreateDormantThreadContext(entry) : -1;
+        SetGpr(2, tid < 1 ? unchecked((uint)(-1)) : (uint)tid);
+        // Return to caller (jr ra semantics without delay-slot fetch).
+        PC = GetGpr(31);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-CREATE-THREAD] HLE CreateThread entry=0x{entry:X8} tid={tid} ra=0x{GetGpr(31):X8}");
+    }
+
+    private void HleThbaseStartThread()
+    {
+        int tid = (int)GetGpr(4);
+        bool ok = StartThreadReady(tid);
+        SetGpr(2, ok ? 0u : unchecked((uint)(-1)));
+        PC = GetGpr(31);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_CREATE_THREAD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-CREATE-THREAD] HLE StartThread tid={tid} ok={ok} ra=0x{GetGpr(31):X8}");
     }
 
     /// <summary>

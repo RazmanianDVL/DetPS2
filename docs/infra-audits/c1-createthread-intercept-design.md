@@ -1,8 +1,8 @@
 # C1 design — IOP THREADMAN `CreateThread` / `StartThread` → READY peer (for yield-start)
 
-**Status:** design only — **ready for dual ACK** — **no Core this turn**  
+**Status:** dual-ACK'd + **implemented** — see `c1-createthread-intercept-implement.md`  
 **Date:** 2026-08-04  
-**Tip ref:** `a845d74` / `24a8427`  
+**Tip ref (design):** `a845d74` / `24a8427`  
 **Depends on:** C1.1–C1.3 scaffolding, C1 yield-start residual (`DETPS2_IOP_YIELD_START`)  
 **Evidence:** `c1-start-trace-bo2.md` (IOPFILE hit budget, no READY peer), yield-start residual only fires when `FindNextReadyThread() >= 0`  
 **Locks:** no `Intc.cs` / `EmotionEngine.cs`. Prefer `Iop.cs`, IOP HLE / import stubs, `SifRpc` module start only if needed.

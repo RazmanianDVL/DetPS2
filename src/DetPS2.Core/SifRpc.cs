@@ -1303,6 +1303,17 @@ public sealed class IopModuleHost
         ImportsResolved += (ulong)resolved;
         ImportsUnresolved += (ulong)unresolved;
 
+        // C1 CreateThread intercept: only when product flag on (THREADS alone does not re-patch).
+        if (Iop.CreateThreadHleEnvEnabled)
+        {
+            int n = IrxLoader.OverrideThbaseCreateStartImports(
+                mem, scanStart, scanEnd,
+                Iop.HleThbaseCreateThreadPc, Iop.HleThbaseStartThreadPc);
+            if (n > 0 && Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
+                Console.Error.WriteLine(
+                    $"[LINKIMPORTS] thbase Create/Start HLE overrides={n} name=\"{name}\"");
+        }
+
         // MODLOAD LoadStartModule: after load, real hardware runs _start. DetPS2 still soft-marks
         // Started for registry/LOADFILE compatibility (games probes must see the module as up).
         // R3000 entry is armed for scheduler quanta (always unless DETPS2_FORCE_HLE_IOP=1).
