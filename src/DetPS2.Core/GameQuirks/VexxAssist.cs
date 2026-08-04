@@ -134,6 +134,40 @@ public sealed class VexxAssist : IGameQuirkModule
     public string Serial => "SLUS_203.83";
     public string DisplayName => "Vexx (USA)";
 
+    /// <summary>
+    /// M8-a quiet retirement (docs/infra-audits/m8a-haven-vexx-retirement-checklist.md §5
+    /// stage 4): once M4-b's tag-if-applied GetVersion policy is proven sufficient for Vexx
+    /// (see playability-roadmap.json M4-d/M8-a evidence), this title no longer needs its own
+    /// PreferIopRpGetVersion opt-in -- default is now to SKIP setting it. Set
+    /// DETPS2_M8A_VEXX_NO_PREFER_IOPRP=0 to opt back in to the legacy per-title flag
+    /// (rollback path per checklist §6).
+    /// </summary>
+    private static bool SkipPreferIopRp
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_VEXX_NO_PREFER_IOPRP");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// M8-a quiet retirement, plant half: default is now to SKIP the "2520" IopVersionCellA/B
+    /// RAM plant and its Step() per-tick re-plant, since GetVersion's own tag-if-applied policy
+    /// (M4-b) already supplies the same digits without it (playability-roadmap.json M8-a Vexx
+    /// evidence). Set DETPS2_M8A_VEXX_NO_VERSION_PLANT=0 to opt back in (rollback path §6).
+    /// </summary>
+    private static bool SkipVersionPlant
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_VEXX_NO_VERSION_PLANT");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     public const uint IopVersionCellA = 0x003D18B8;
     public const uint IopVersionCellB = 0x003D1938;
     public const uint PathBasenameA = 0x00146170;
@@ -552,9 +586,10 @@ public sealed class VexxAssist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
-        if (sys.Hle?.Sony?.RealRpc != null)
+        if (!SkipPreferIopRp && sys.Hle?.Sony?.RealRpc != null)
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
         PlantCrtMallocTable(sys);
         PlantStringHeapHook(sys);
         // Host CD stubs ready; live vtable wired after STREE0 TOC CdReads (see Step).
@@ -568,7 +603,7 @@ public sealed class VexxAssist : IGameQuirkModule
 
     public void Step(Ps2System sys)
     {
-        if (!VersionCellsOk(sys)) { PlantIopRpVersion(sys); _versionReplants++; }
+        if (!SkipVersionPlant && !VersionCellsOk(sys)) { PlantIopRpVersion(sys); _versionReplants++; }
 
         if (!_mallocPlanted || sys.Memory.Read32(CrtMallocSlot) == 0)
         {

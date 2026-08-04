@@ -243,6 +243,112 @@ public sealed class KernelState
         }
     }
 
+    /// <summary>
+    /// M6-b1: title-independent SleepThread / SuspendThread starve rescue. Sibling of
+    /// <see cref="MaybeRescueGenericStarvedSema"/> for parks with <c>WaitSemaId == 0</c>
+    /// (pure SleepThread or Suspend nest). Never calls <see cref="SignalSema"/> — B3
+    /// thrash history forbids fabricating WaitSema progress from this path.
+    ///
+    /// Default gate = whole-system deadlock only (no other <see cref="IsRunnable"/> peer),
+    /// same spirit as generic WaitSema rescue. Grace mirrors Midway: 2M cycles pure sleep,
+    /// 400k suspend. Kill-switch: <c>DETPS2_DISABLE_M6B_SLEEP_RESCUE=1</c>. Optional
+    /// peer-runnable pure-sleep orphan (off by default): <c>DETPS2_STARVED_SLEEP_ORPHAN=1</c>
+    /// after 2× pure-sleep grace; still never force-Resume Suspend under orphan mode.
+    /// </summary>
+    /// <remarks>kind: 0 = pure sleep, 1 = suspend nest</remarks>
+    private readonly Dictionary<int, (int kind, ulong sinceCycle)> _genericSleepWaitStart = new();
+
+    public int GenericStarvedSleepRescues { get; private set; }
+
+    public void MaybeRescueGenericStarvedSleep(
+        Ps2System sys,
+        ulong graceSleep = 2_000_000UL,
+        ulong graceSuspend = 400_000UL)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("DETPS2_DISABLE_M6B_SLEEP_RESCUE"), "1",
+                StringComparison.Ordinal))
+            return;
+
+        bool orphanEnv = string.Equals(
+            Environment.GetEnvironmentVariable("DETPS2_STARVED_SLEEP_ORPHAN"), "1",
+            StringComparison.Ordinal);
+
+        foreach (var t in _threads)
+        {
+            // Candidate: Alive, no WaitSema, not VBlank, pure sleep or suspend nest,
+            // lifecycle Started||tid1; skip SoftSuspended ExitThread sticky DORMANT peers.
+            bool pureSleep = t.Sleeping && t.SuspendCount == 0;
+            bool suspendNest = t.SuspendCount > 0;
+            bool lifecycleOk = t.Started || t.Id == 1;
+            bool softExitSticky = t.SoftSuspended && t.EverStarted && !t.Started;
+            bool candidate = t.Alive
+                && t.WaitSemaId == 0
+                && !t.WaitVblank
+                && (pureSleep || suspendNest)
+                && lifecycleOk
+                && !softExitSticky;
+
+            if (!candidate)
+            {
+                _genericSleepWaitStart.Remove(t.Id);
+                continue;
+            }
+
+            int kind = suspendNest ? 1 : 0; // 1 = suspend, 0 = pure sleep
+            if (!_genericSleepWaitStart.TryGetValue(t.Id, out var w) || w.kind != kind)
+            {
+                _genericSleepWaitStart[t.Id] = (kind, sys.MasterCycles);
+                continue;
+            }
+
+            ulong grace = kind == 1 ? graceSuspend : graceSleep;
+            ulong elapsed = sys.MasterCycles - w.sinceCycle;
+            if (elapsed < grace) continue;
+
+            // Whole-system deadlock gate (default). Orphan env may allow pure sleep after 2× grace.
+            bool anyoneElseRunnable = false;
+            foreach (var other in _threads)
+            {
+                if (other.Id == t.Id) continue;
+                if (IsRunnable(other)) { anyoneElseRunnable = true; break; }
+            }
+            if (anyoneElseRunnable)
+            {
+                // Orphan: pure Sleep only, after 2× pure-sleep grace; never force-Resume Suspend.
+                bool orphanOk = orphanEnv && kind == 0 && elapsed >= graceSleep * 2UL;
+                if (!orphanOk)
+                {
+                    // Keep timer armed while orphan pure-sleep accumulates toward 2×;
+                    // otherwise reset so intentional multi-thread parks do not thrash.
+                    if (!(orphanEnv && kind == 0))
+                        _genericSleepWaitStart[t.Id] = (kind, sys.MasterCycles);
+                    continue;
+                }
+            }
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] generic force-waking starved sleep/suspend thread={t.Id} " +
+                    $"susp={t.SuspendCount} cyc={sys.MasterCycles}");
+
+            if (kind == 1)
+            {
+                // Drain suspend nest; safety cap avoids infinite loop if Resume no-ops
+                // (SoftSuspended sticky already filtered above, but be defensive).
+                for (int i = 0; i < 16 && t.SuspendCount > 0; i++)
+                    ResumeThread(t.Id);
+            }
+            else
+            {
+                // Pure sleep: WakeupThread only (refuses WaitSema parks and Suspend-only).
+                WakeupThread(t.Id);
+            }
+
+            _genericSleepWaitStart.Remove(t.Id); // fresh grace if it re-parks
+            GenericStarvedSleepRescues++;
+        }
+    }
+
     /// <summary>Diagnostic-only: a chronological log of every thread lifecycle/switch event —
     /// built specifically to stop misattributing a register/stack observation at some cycle to
     /// the wrong logical thread (the actual root cause of several false leads while tracing MK
@@ -282,6 +388,8 @@ public sealed class KernelState
         WaitingVblank = false;
         VblankWaits = 0;
         _cyclesSinceLastPreempt = 0;
+        _genericSemaWaitStart.Clear();
+        _genericSleepWaitStart.Clear();
         // Main thread — already running; priority 1 (high) matches typical EE idle/main setup
         _threads.Add(new Thread { Id = 1, Alive = true, Started = true, Entry = 0, Priority = 1, InitialPriority = 1 });
         LogThreadEvent("MainReset", 1, 0, 0);

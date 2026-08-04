@@ -204,10 +204,18 @@ public sealed class TeamIcoAssist : IGameQuirkModule
             SoftFloatBridge.Reset();
     }
 
+    // M8-a quiet retirement (docs/infra-audits/m8a-haven-vexx-retirement-checklist.md):
+    // M4-b's tag-if-applied GetVersion policy makes this per-title flag redundant for Haven
+    // specifically (proven by M4-c's forced-false canary). Default is soft-off (flag no longer
+    // set for Haven) per checklist stage 4; DETPS2_M8A_HAVEN_NO_PREFER_IOPRP=0 is the explicit
+    // rollback/opt-back-in path. SotC/Ico are unaffected -- out of scope for this checklist.
+    private static readonly bool HavenPreferIopRpSoftOff =
+        Environment.GetEnvironmentVariable("DETPS2_M8A_HAVEN_NO_PREFER_IOPRP") != "0";
+
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
-        if (sys.Hle?.Sony?.RealRpc != null)
+        if (sys.Hle?.Sony?.RealRpc != null && !(_isHaven && HavenPreferIopRpSoftOff))
             sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
         if (_isHaven)
             RegisterHavenSoftFloat();

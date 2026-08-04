@@ -446,6 +446,8 @@ public sealed class Ps2System
                 // could make progress, so it never preempts a real, eventually-self-resolving
                 // completion.
                 Hle.Kernel?.MaybeRescueGenericStarvedSema(this);
+                // M6-b1: SleepThread / Suspend starve rescue (whole-system gate; never SignalSema).
+                Hle.Kernel?.MaybeRescueGenericStarvedSleep(this);
 
                 bool criHot = pcPhys is (>= 0x0041D0C0UL and <= 0x0041D1E4UL)
                     or (>= 0x00417F80UL and <= 0x00418020UL)
