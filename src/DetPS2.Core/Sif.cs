@@ -40,6 +40,18 @@ public sealed class Sif : ISchedulable
     private readonly Queue<uint> _cmdQueue = new();
     private readonly Queue<uint> _rpcPacketAddrs = new();
 
+    // M1-d (playability-roadmap / docs/infra-audits/instant-progress-audit.md #3):
+    // simplified/HLE _rpcPacketAddrs used to drain up to 16 packets per Step() call, which
+    // manufactures multi-packet progress when syscall HLE (or a single scheduler slice)
+    // invokes Sif.Step. Default is now 1 packet per Step (one slice). Kill-switch
+    // DETPS2_DISABLE_M1D_SIF_BATCH=1 restores the legacy batch of 16 for bisect only.
+    // Real-RPC generation gate (SubmitRealRpc / TryDequeueRealRpc) is unchanged — that path
+    // is already the correct anti-instant pattern and is not drained here.
+    private const int HleRpcBatchPerStep = 1;
+    private const int HleRpcBatchLegacy = 16;
+    private static readonly bool DisableM1dSifBatch =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1D_SIF_BATCH") == "1";
+
     /// <summary>
     /// Real, retail-compiled sifrpc.c bind/call packets (cid 0x80000009/0x8000000A), queued
     /// for the IOP's own scheduler tick to drain instead of being answered synchronously
@@ -608,6 +620,11 @@ public sealed class Sif : ISchedulable
     /// Under <see cref="LiteralIrxMode"/> keep this for homebrew/bisect only; WP-20 routes
     /// sifcmd through live IOP. Optional stub: log via <c>DETPS2_TRACE_SIF_HLE=1</c>.
     /// </para>
+    /// <para>
+    /// <b>M1-d:</b> drains at most one simplified packet per call (legacy 16 restored by
+    /// <c>DETPS2_DISABLE_M1D_SIF_BATCH=1</c>). Does not touch the real-RPC queue or its
+    /// generation gate.
+    /// </para>
     /// </summary>
     public int Step(ulong maxCycles)
     {
@@ -617,8 +634,9 @@ public sealed class Sif : ISchedulable
         if (_rpcPacketAddrs.Count > 0 && LiteralIrxMode)
             NoteHleBypass("Sif.Step pure-HLE SifRpcPacket→IopModuleHost");
 
+        int batchLimit = DisableM1dSifBatch ? HleRpcBatchLegacy : HleRpcBatchPerStep;
         int n = 0;
-        while (_rpcPacketAddrs.Count > 0 && n < 16)
+        while (_rpcPacketAddrs.Count > 0 && n < batchLimit)
         {
             uint addr = _rpcPacketAddrs.Dequeue();
             var pkt = SifRpcPacket.Read(_memory, addr);
