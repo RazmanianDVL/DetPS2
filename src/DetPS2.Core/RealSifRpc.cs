@@ -550,8 +550,38 @@ public sealed class RealSifRpc
     public ulong SysmemOps { get; private set; }
     public ulong UnknownServiceCalls { get; private set; }
     public ulong UnknownBindSids { get; private set; }
+    /// <summary>
+    /// C1.4: successful live <c>sceSifRegisterRpc</c> handler dispatches (registry hit + R3000 return).
+    /// Scoreboard / diagnostics only — not part of savestate.
+    /// </summary>
+    public ulong LiveRpcHits { get; private set; }
+    /// <summary>
+    /// C1.4: live registry hit but dispatch failed (budget / no return / null reply) → HLE fallback.
+    /// Scoreboard / diagnostics only — not part of savestate.
+    /// </summary>
+    public ulong LiveRpcFallbacks { get; private set; }
     private readonly List<uint> _unknownSidsSeen = new();
     public IReadOnlyList<uint> UnknownSidsSeen => _unknownSidsSeen;
+
+    /// <summary>
+    /// C1.4: whether CALL bodies may walk the live SIFCMD registry and run real handlers.
+    /// <list type="bullet">
+    /// <item><c>DETPS2_NO_REAL_RPC=1</c> — hard off (HLE only; emergency / bisect).</item>
+    /// <item><c>DETPS2_IOP_REAL_RPC=0</c> — explicit opt-out (same as hard off).</item>
+    /// <item><c>DETPS2_IOP_REAL_RPC=1</c> — explicit prefer-live.</item>
+    /// <item>Both unset — product default: prefer live (historical path; empty registry → HLE).</item>
+    /// </list>
+    /// Pair with <c>DETPS2_IOP_THREADS=1</c> so mid-quantum dispatch uses multi-thread context compose.
+    /// </summary>
+    public static bool LiveRpcDispatchEnabled()
+    {
+        if (Environment.GetEnvironmentVariable("DETPS2_NO_REAL_RPC") == "1")
+            return false;
+        string? prefer = Environment.GetEnvironmentVariable("DETPS2_IOP_REAL_RPC");
+        if (prefer == "0") return false;
+        // "1" or unset: prefer live when a genuine server is registered.
+        return true;
+    }
 
     /// <summary>IOP physical bump watermark for SidSysmem (diagnostics / smokes).</summary>
     public uint IopHeapBump => _iopHeapNext;
@@ -612,6 +642,7 @@ public sealed class RealSifRpc
         _nextSlot = 0;
         ResetIopHeap();
         Binds = Calls = RdataOps = FileIoOps = SysmemOps = UnknownServiceCalls = UnknownBindSids = 0;
+        LiveRpcHits = LiveRpcFallbacks = 0;
         _unknownSidsSeen.Clear();
         _padAreas.Clear();
         _padAreasGhost.Clear();
@@ -1179,6 +1210,11 @@ public sealed class RealSifRpc
     /// (replicated here), and the handler's return value (v0) points at the reply, typically the
     /// same buffer written in place. Saves/restores the IOP CPU context around the call since
     /// this runs mid-quantum, from EE-side RPC-call handling, not at a normal Iop.Step boundary.
+    /// <para>
+    /// C1.4: when <see cref="Iop.MultiThreadEnabled"/>, prefers a dedicated dispatch context
+    /// (<see cref="Iop.TryEnterRealRpcDispatch"/>) so the caller's thread slot is preserved via
+    /// multi-thread save/restore. Flag-off path keeps classic in-place GPR save/restore.
+    /// </para>
     /// </summary>
     private bool TryDispatchRealRegisteredRpc(SystemMemory mem, IopModuleHost iopModules,
         uint funcAddr, uint buffAddr, uint fno, uint argBuf, uint sendSize, uint recvBuf, uint recvSize)
@@ -1203,14 +1239,24 @@ public sealed class RealSifRpc
                 mem.IopWrite8(buffAddr + i, mem.Read8(argBuf + i));
         }
 
-        uint savedPc = iop.PC;
-        var savedGpr = new uint[32];
-        for (int i = 0; i < 32; i++) savedGpr[i] = iop.GetGpr(i);
+        // C1.4 multi-thread compose: pin handler Steps on a dedicated dispatch context so the
+        // caller's cooperative thread (module _start / RPC worker) is left intact in the table.
+        // When multi-thread is off (default product), usedMt is false → classic path below.
+        const uint scratchStack = Iop.RealRpcDispatchStackTop;
+        bool usedMt = iop.TryEnterRealRpcDispatch(out int prevThreadId, scratchStack);
+
+        uint savedPc = 0;
+        uint[]? savedGpr = null;
+        if (!usedMt)
+        {
+            savedPc = iop.PC;
+            savedGpr = new uint[32];
+            for (int i = 0; i < 32; i++) savedGpr[i] = iop.GetGpr(i);
+        }
 
         // Dedicated scratch stack, distinct from DefaultModuleStack (0x1F0000) used by a
         // module's own _start, so a mid-flight handler call never collides with a module still
         // parked/spinning after its own entry.
-        const uint scratchStack = 0x001E0000u;
         iop.PC = IopModuleHost.ToIopPhys(funcAddr);
         if (gp != 0) iop.SetGpr(28, gp);
         iop.SetGpr(29, scratchStack);
@@ -1227,6 +1273,11 @@ public sealed class RealSifRpc
         {
             if (iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
             if (!iop.Running) break;
+            // If a yield hook switched us off the dispatch context mid-handler, pin back so
+            // the budget still advances the SifRpcFunc_t (C1.4 residual: full WaitSema wakeup
+            // for live handlers is later THREADMAN work).
+            if (usedMt && iop.CurrentThreadId != iop.RpcDispatchThreadId && iop.RpcDispatchThreadId >= 1)
+                iop.SwitchToThread(iop.RpcDispatchThreadId);
             iop.Step(1);
             if (iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
         }
@@ -1234,13 +1285,21 @@ public sealed class RealSifRpc
         uint replyPtr = iop.GetGpr(2) & 0x1FFFFFFFu;
         ulong insns = iop.InstructionsExecuted - before;
 
-        iop.PC = savedPc;
-        for (int i = 0; i < 32; i++) iop.SetGpr(i, savedGpr[i]);
+        if (usedMt)
+        {
+            // Restore caller thread (saved intact at TryEnterRealRpcDispatch / SwitchToThread).
+            iop.LeaveRealRpcDispatch(prevThreadId);
+        }
+        else
+        {
+            iop.PC = savedPc;
+            for (int i = 0; i < 32; i++) iop.SetGpr(i, savedGpr![i]);
+        }
 
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
             Console.Error.WriteLine(
                 $"[REAL-RPC] func=0x{funcAddr:X8} fno={fno} buf=0x{buffAddr:X8} send={sendSize} " +
-                $"returned={returned} insns={insns} reply=0x{replyPtr:X8}");
+                $"returned={returned} insns={insns} reply=0x{replyPtr:X8} mtDispatch={usedMt}");
 
         if (!returned || replyPtr == 0) return false;
 
@@ -1276,13 +1335,20 @@ public sealed class RealSifRpc
         // for any title whose own driver has actually reached this call. Falls through to the
         // existing HLE below whenever nothing is really registered yet (or for the small set of
         // BIOS-stack services intentionally never run for real, e.g. LOADFILE/CDVDFSV).
-        if (sid != 0 && Environment.GetEnvironmentVariable("DETPS2_NO_REAL_RPC") != "1"
-            && TryFindRealRpcServer(mem, iopModules, sid, out uint realFunc, out uint realBuf)
-            && TryDispatchRealRegisteredRpc(mem, iopModules, realFunc, realBuf, rpcNumber,
-                argBuf, sendSize, recvBuf, recvSize))
+        // C1.4: gate via LiveRpcDispatchEnabled (DETPS2_IOP_REAL_RPC / DETPS2_NO_REAL_RPC);
+        // multi-thread compose lives inside TryDispatchRealRegisteredRpc when IOP_THREADS=1.
+        if (sid != 0 && LiveRpcDispatchEnabled()
+            && TryFindRealRpcServer(mem, iopModules, sid, out uint realFunc, out uint realBuf))
         {
-            CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
-            return;
+            if (TryDispatchRealRegisteredRpc(mem, iopModules, realFunc, realBuf, rpcNumber,
+                    argBuf, sendSize, recvBuf, recvSize))
+            {
+                LiveRpcHits++;
+                CompleteRpcEnd(mem, kernel, pktAddr, cdPtr, isCall: true);
+                return;
+            }
+            // Registry had a real server but handler did not complete — fall through to HLE.
+            LiveRpcFallbacks++;
         }
 
         // CRI Middleware ADX (CRI_ADXI.IRX, sid=0x90000200).

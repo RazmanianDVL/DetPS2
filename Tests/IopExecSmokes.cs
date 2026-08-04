@@ -509,4 +509,146 @@ public static class IopExecSmokes
                 $"(worker={worker} workerR2={workerR2} retired={retired})");
         }
     }
+
+    /// <summary>
+    /// C1.4: compose live RealSifRpc dispatch with multi-thread contexts.
+    /// Flag-off: TryEnterRealRpcDispatch is a no-op; LiveRpcDispatchEnabled matches product default.
+    /// Multi-thread on: dedicated dispatch context preserves caller GPRs/PC across a mid-quantum
+    /// synthetic handler (jr $ra to ModuleReturnSentinel).
+    /// </summary>
+    public static void RealRpc_DispatchCompose_WithMultiThread()
+    {
+        // --- Flag helpers: default prefer-live; NO_REAL_RPC / IOP_REAL_RPC=0 hard-off ---
+        // (Cannot mutate process env safely for other smokes — only assert current process
+        //  defaults and the static helper's documented mapping for unset vars.)
+        if (Environment.GetEnvironmentVariable("DETPS2_NO_REAL_RPC") != "1" &&
+            Environment.GetEnvironmentVariable("DETPS2_IOP_REAL_RPC") != "0")
+        {
+            if (!RealSifRpc.LiveRpcDispatchEnabled())
+                throw new Exception("LiveRpcDispatchEnabled should be true with default env");
+        }
+        if (Environment.GetEnvironmentVariable("DETPS2_NO_REAL_RPC") == "1" ||
+            Environment.GetEnvironmentVariable("DETPS2_IOP_REAL_RPC") == "0")
+        {
+            if (RealSifRpc.LiveRpcDispatchEnabled())
+                throw new Exception("LiveRpcDispatchEnabled should be false when opt-out env set");
+        }
+
+        // --- Flag OFF: TryEnterRealRpcDispatch no-op ---
+        {
+            var off = new Ps2System();
+            if (!Iop.MultiThreadEnvEnabled)
+            {
+                if (off.Iop.TryEnterRealRpcDispatch(out int prev))
+                    throw new Exception("TryEnterRealRpcDispatch must fail when multi-thread off");
+                if (prev != 0)
+                    throw new Exception("previousThreadId should be 0 when multi-thread off");
+                if (off.Iop.RpcDispatchThreadId != -1)
+                    throw new Exception("RpcDispatchThreadId must be -1 when multi-thread off");
+            }
+        }
+
+        // --- ON: caller preserved across dedicated dispatch + synthetic jr ra ---
+        {
+            uint Jr(uint rs) => (rs << 21) | 0x08u; // SPECIAL jr rs
+            const uint Nop = 0;
+
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+            sys.Hle.EnableSonyKernel();
+            var rpc = sys.Hle.Sony!.RealRpc;
+            rpc.BindHost(sys);
+
+            const uint parentPc = 0x00004100;
+            const uint parentS0 = 0xCAFEBABE;
+            const uint parentSp = 0x001F0000;
+            const uint parentRa = 0xA5A5A5A5;
+            const uint parentV0 = 0x11112222;
+            sys.Iop.PC = parentPc;
+            sys.Iop.SetGpr(16, parentS0);
+            sys.Iop.SetGpr(29, parentSp);
+            sys.Iop.SetGpr(31, parentRa);
+            sys.Iop.SetGpr(2, parentV0);
+
+            // Synthetic handler at 0x7000: addiu v0, zero, 0x42; jr ra; nop
+            // With $ra = ModuleReturnSentinel, dispatch loop stops on sentinel.
+            const uint handlerBase = 0x00007000;
+            uint Addiu(uint rt, uint rs, short imm) =>
+                (0x09u << 26) | (rs << 21) | (rt << 16) | (ushort)imm;
+            var handler = new uint[]
+            {
+                Addiu(2, 0, 0x42), // v0 = 0x42 (reply pointer-ish for smoke)
+                Jr(31),           // jr $ra
+                Nop
+            };
+            for (int i = 0; i < handler.Length; i++)
+                sys.Memory.IopWrite32(handlerBase + (uint)(i * 4), handler[i]);
+
+            if (!sys.Iop.TryEnterRealRpcDispatch(out int prevTid, Iop.RealRpcDispatchStackTop))
+                throw new Exception("TryEnterRealRpcDispatch should succeed with multi-thread on");
+            if (prevTid != 0)
+                throw new Exception($"expected prevTid=0 got {prevTid}");
+            if (sys.Iop.CurrentThreadId == prevTid)
+                throw new Exception("dispatch should switch off caller thread");
+            if (sys.Iop.RpcDispatchThreadId < 1)
+                throw new Exception("RpcDispatchThreadId not set");
+
+            // Parent slot must still hold pre-enter GPRs (saved by SwitchToThread).
+            if (!sys.Iop.TryGetThreadContext(prevTid, out var pctx) || pctx == null)
+                throw new Exception("caller context missing after enter");
+            if (pctx.PC != parentPc || pctx.Gprs[16] != parentS0 || pctx.Gprs[29] != parentSp ||
+                pctx.Gprs[31] != parentRa || pctx.Gprs[2] != parentV0)
+                throw new Exception("caller GPRs/PC not preserved in thread table during dispatch");
+
+            // Arm handler like TryDispatchRealRegisteredRpc
+            sys.Iop.PC = handlerBase;
+            sys.Iop.SetGpr(29, Iop.RealRpcDispatchStackTop);
+            sys.Iop.SetGpr(30, Iop.RealRpcDispatchStackTop);
+            sys.Iop.SetGpr(31, IopModuleHost.ModuleReturnSentinel);
+            sys.Iop.SetGpr(4, 1);
+            sys.Iop.SetGpr(5, 0);
+            sys.Iop.SetGpr(6, 0);
+
+            ulong before = sys.Iop.InstructionsExecuted;
+            bool returned = false;
+            for (int i = 0; i < 32; i++)
+            {
+                if (sys.Iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
+                sys.Iop.Step(1);
+                if (sys.Iop.PC == IopModuleHost.ModuleReturnSentinel) { returned = true; break; }
+            }
+            if (!returned)
+                throw new Exception($"handler did not return to sentinel pc=0x{sys.Iop.PC:X8}");
+            uint replyV0 = sys.Iop.GetGpr(2);
+            if (replyV0 != 0x42)
+                throw new Exception($"handler v0 expected 0x42 got 0x{replyV0:X}");
+            if (sys.Iop.InstructionsExecuted <= before)
+                throw new Exception("handler retired 0 insns");
+
+            sys.Iop.LeaveRealRpcDispatch(prevTid);
+            if (sys.Iop.CurrentThreadId != prevTid)
+                throw new Exception($"Leave did not restore caller tid={sys.Iop.CurrentThreadId}");
+            if (sys.Iop.PC != parentPc)
+                throw new Exception($"caller PC not restored: 0x{sys.Iop.PC:X8}");
+            if (sys.Iop.GetGpr(16) != parentS0 || sys.Iop.GetGpr(29) != parentSp ||
+                sys.Iop.GetGpr(31) != parentRa || sys.Iop.GetGpr(2) != parentV0)
+                throw new Exception("caller live GPRs not restored after LeaveRealRpcDispatch");
+
+            // Counters exist and start at 0 on a fresh RealSifRpc
+            if (rpc.LiveRpcHits != 0 || rpc.LiveRpcFallbacks != 0)
+                throw new Exception("LiveRpc counters should be 0 before any live CALL");
+
+            // Second enter reuses the same dispatch slot
+            if (!sys.Iop.TryEnterRealRpcDispatch(out int prev2))
+                throw new Exception("second TryEnterRealRpcDispatch failed");
+            if (sys.Iop.RpcDispatchThreadId < 1)
+                throw new Exception("dispatch tid lost after re-enter");
+            sys.Iop.LeaveRealRpcDispatch(prev2);
+
+            Console.WriteLine(
+                $"[Smoke] RealRpc_DispatchCompose_WithMultiThread OK " +
+                $"(dispatchTid={sys.Iop.RpcDispatchThreadId} replyV0=0x{replyV0:X} " +
+                $"liveEnabled={RealSifRpc.LiveRpcDispatchEnabled()})");
+        }
+    }
 }

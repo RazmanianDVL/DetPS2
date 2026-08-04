@@ -103,11 +103,21 @@ public sealed class Iop : ISchedulable
     // When disabled: _threads stays null, no allocations, Step path untouched.
     // When enabled: table of IopThreadContext; live PC/_gprs/HI/LO are the current thread.
     // C1.3: explicit YieldToReady / ParkAndYieldToReady hooks (WaitSema/SleepThread-shaped).
+    // C1.4: dedicated RealSifRpc mid-quantum dispatch context (see TryEnterRealRpcDispatch).
     // Full THREADMAN ready-queues / wait-object ids: later (IOP_MULTITHREAD_AND_REAL_RPC.md).
     private bool _multiThreadEnabled = MultiThreadEnvEnabled;
     private IopThreadContext[]? _threads;
     private int _currentThreadId;
     private int _nextThreadSlot = 1;
+    /// <summary>Reusable secondary slot for <see cref="TryEnterRealRpcDispatch"/> (−1 = none).</summary>
+    private int _rpcDispatchThreadId = -1;
+
+    /// <summary>
+    /// RealSifRpc mid-quantum handler scratch stack top (IOP phys). Matches
+    /// <c>RealSifRpc.TryDispatchRealRegisteredRpc</c>; below THREADMAN entry slots, above
+    /// module-entry arena when multi-thread is on.
+    /// </summary>
+    public const uint RealRpcDispatchStackTop = 0x001E0000u;
 
     public uint Cop0Status { get; set; }
     public uint Cop0Cause { get; set; }
@@ -1343,6 +1353,90 @@ public sealed class Iop : ISchedulable
         return _threads[tid].Status;
     }
 
+    // -------------------------------------------------------------------------
+    // C1.4 real SIF RPC dispatch compose (DETPS2_IOP_THREADS + live registry)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Dedicated RealSifRpc dispatch thread id when multi-thread is on (−1 when unused / off).
+    /// Diagnostics / smokes only.
+    /// </summary>
+    public int RpcDispatchThreadId =>
+        _multiThreadEnabled && _rpcDispatchThreadId >= 1 ? _rpcDispatchThreadId : -1;
+
+    /// <summary>
+    /// C1.4: switch onto a dedicated mid-quantum RealSifRpc dispatch context so handler
+    /// <see cref="Step"/> quanta do not clobber the caller's multi-thread slot (parent
+    /// GPRs/PC stay in the thread table via <see cref="SwitchToThread"/>).
+    /// <para>
+    /// Returns true when switched — caller must pair with <see cref="LeaveRealRpcDispatch"/>.
+    /// Flag-off, table-full, or already-on-dispatch: false (caller uses classic in-place
+    /// GPR save/restore; zero behavior change vs pre-C1.4 single-context path).
+    /// </para>
+    /// </summary>
+    public bool TryEnterRealRpcDispatch(out int previousThreadId, uint scratchStackTop = RealRpcDispatchStackTop)
+    {
+        previousThreadId = _currentThreadId;
+        if (!_multiThreadEnabled) return false;
+        EnsureThreadTable();
+        previousThreadId = _currentThreadId;
+
+        int tid = _rpcDispatchThreadId;
+        if (tid < 1 || tid >= MaxIopThreadSlots || !_threads![tid].InUse)
+        {
+            tid = CreateThreadContext(0, scratchStackTop, ThreadStackSlotSize);
+            if (tid < 1) return false;
+            _rpcDispatchThreadId = tid;
+        }
+        else
+        {
+            // Re-arm: clean GPRs + SP for a fresh SifRpcFunc_t call.
+            var t = _threads![tid];
+            Array.Clear(t.Gprs);
+            t.PC = 0;
+            t.Gprs[29] = scratchStackTop;
+            t.Gprs[30] = scratchStackTop;
+            t.HI = t.LO = 0;
+            t.StackTop = scratchStackTop;
+            t.StackSize = ThreadStackSlotSize;
+            t.Status = IopThreadStatus.Ready;
+            if (tid == _currentThreadId)
+            {
+                for (int i = 0; i < 32; i++) _gprs[i] = 0;
+                _gprs[29] = scratchStackTop;
+                _gprs[30] = scratchStackTop;
+                HI = LO = 0;
+                PC = 0;
+            }
+        }
+
+        // Same slot as caller → classic in-place path (no nested switch needed).
+        if (tid == previousThreadId) return false;
+        return SwitchToThread(tid);
+    }
+
+    /// <summary>
+    /// C1.4: restore the thread that was current before <see cref="TryEnterRealRpcDispatch"/>.
+    /// No-op when multi-thread is off or <paramref name="previousThreadId"/> is already current.
+    /// Captures reply GPRs from the dispatch context <b>before</b> calling this.
+    /// </summary>
+    public void LeaveRealRpcDispatch(int previousThreadId)
+    {
+        if (!_multiThreadEnabled || _threads == null) return;
+        if ((uint)previousThreadId >= (uint)MaxIopThreadSlots || !_threads[previousThreadId].InUse)
+            return;
+        if (previousThreadId == _currentThreadId) return;
+        SwitchToThread(previousThreadId);
+        // Dispatch slot is Ready after SwitchToThread demotes the left context.
+        if (_rpcDispatchThreadId >= 1 &&
+            (uint)_rpcDispatchThreadId < (uint)MaxIopThreadSlots &&
+            _threads[_rpcDispatchThreadId].InUse &&
+            _rpcDispatchThreadId != _currentThreadId)
+        {
+            _threads[_rpcDispatchThreadId].Status = IopThreadStatus.Ready;
+        }
+    }
+
     private void EnsureThreadTable()
     {
         if (_threads != null) return;
@@ -1365,6 +1459,7 @@ public sealed class Iop : ISchedulable
     {
         _currentThreadId = 0;
         _nextThreadSlot = 1;
+        _rpcDispatchThreadId = -1;
         if (!_multiThreadEnabled)
         {
             // Drop any table so a later Enable re-captures live state; no alloc when still off.
