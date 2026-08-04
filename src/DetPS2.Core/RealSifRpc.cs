@@ -1862,12 +1862,18 @@ public sealed class RealSifRpc
                 return openRes;
             }
             case FioGetVersion:
-                // SN ProDG / Midway FILEIO clients (MK: Deception, DA, BO2/B3) probe fno=0xFF
+                // SN ProDG / Midway FILEIO clients (MK: Deception, DA, BO2/B3, Whip) probe fno=0xFF
                 // and strcmp the 4-byte reply against the post-UDNL IOPRP digits ("3000"/
                 // "2800"/…). Returning the bare LOADFILE 2.0 token 0x00020000 overwrites a
                 // previously correct LOADFILE GetVersion cell and makes sceOpen return
                 // 0xFFFEFFFC forever (live Deci2: "Failed overlay load: <cdrom0:\GAMER.OVL;1>").
-                // Same PreferIopRpGetVersion gate as LOADFILE: SM needs classic 0x00020000.
+                //
+                // M4-g (docs/infra-audits/m4g-fileio-getversion-tag-if-applied.md): packing
+                // is tag-if-applied — same policy as LOADFILE M4-b S2 — NOT PreferIopRp-
+                // gated. M4-f proved Prefer-gated FILEIO packing caused Whip dual-suppress
+                // +169 syscalls while LOADFILE still returned the real tag. Classic
+                // 0x00020000 when no tag extracted, or DETPS2_GETVERSION_CLASSIC=1.
+                // FILEIO-2200 arm below STILL uses PreferIopRp + iopVer>=3000 (unchanged).
                 //
                 // FILEIO-2200 Init (Play! CFileIoHandler2200 method 255): args[0]/args[1] are
                 // EE reply-buffer pointers used by later Getstat/Open replies. Capture them so
@@ -1894,6 +1900,8 @@ public sealed class RealSifRpc
                     {
                         _fio2200ResultPtr0 = rp0 & 0x1FFFFFFFu;
                         _fio2200ResultPtr1 = rp1 & 0x1FFFFFFFu;
+                        // 2200 arm: PreferIopRp still required (NOT tag-if-applied) — M4-g
+                        // only changes the packed reply dword below, not Init arming.
                         if (PreferIopRpGetVersion && TryParseIopRpVersionNumber(out int iopVer) && iopVer >= 3000)
                             _fio2200Armed = true;
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
@@ -1908,9 +1916,15 @@ public sealed class RealSifRpc
                             $"[FILEIO] GetVersion SN-shaped rp0=0x{rp0:X8} rp1=0x{rp1:X8} (not arming 2200)");
                     }
                 }
-                if (PreferIopRpGetVersion && !string.IsNullOrEmpty(_lastIopRpVersionAscii))
-                    return PackAsciiVersion(_lastIopRpVersionAscii);
-                return 0x00020000;
+                // M4-g packing: tag-if-applied (mirror LOADFILE), not PreferIopRp-gated.
+                int fioGv = !GetVersionClassicOverride && !string.IsNullOrEmpty(_lastIopRpVersionAscii)
+                    ? PackAsciiVersion(_lastIopRpVersionAscii)
+                    : unchecked((int)0x00020000);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[FILEIO] GET_VERSION result=0x{unchecked((uint)fioGv):X8} " +
+                        $"ioprp=\"{_lastIopRpVersionAscii}\" preferIopRp={PreferIopRpGetVersion}");
+                return fioGv;
             case FioClose:
             {
                 // SN wrapper (send≈20): {seq, eeReply*, 4, …} — fd omitted; use last open.
