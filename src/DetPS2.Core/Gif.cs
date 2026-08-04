@@ -80,6 +80,14 @@ public sealed class Gif : ISchedulable
     private ulong _tagsCompletedImage;
     private ulong _tagsCompletedDisable;
 
+    // M7-c Slice 2a: Path3 IMAGE delivery bisect (counters always accumulate; print gated).
+    // path3Kicks reuses _path3Transfers. Dmac already has GetTelemFinish(GIF) for finish-side
+    // (no new Dmac kick counter). TRACE_GIF ring is 48-slot + gated — full-run buckets need counters.
+    private ulong _path3ImageTags;
+    private ulong _path3ImageCompleted;
+    private ulong _path3ImageStalled;
+    private string _lastImageStallReason = "";
+
     // GX-003: DETPS2_TRACE_GIF=1 transfer/tag ring (Path1/2/3 + sticky state)
     private const int TraceRingCap = 48;
     private readonly GifTraceSlot[] _traceRing = new GifTraceSlot[TraceRingCap];
@@ -194,6 +202,14 @@ public sealed class Gif : ISchedulable
     public ulong TagsCompletedReglist => _tagsCompletedReglist;
     public ulong TagsCompletedImage => _tagsCompletedImage;
     public ulong TagsCompletedDisable => _tagsCompletedDisable;
+    /// <summary>M7-c Slice 2a: IMAGE GIFtags parsed on Path3 (flg=2).</summary>
+    public ulong Path3ImageTags => _path3ImageTags;
+    /// <summary>M7-c Slice 2a: IMAGE packets fully drained on Path3.</summary>
+    public ulong Path3ImageCompleted => _path3ImageCompleted;
+    /// <summary>M7-c Slice 2a: times Path3 IMAGE left sticky mid-packet after a Receive* chunk.</summary>
+    public ulong Path3ImageStalled => _path3ImageStalled;
+    /// <summary>M7-c Slice 2a: last Path3 IMAGE partial reason (telemetry only).</summary>
+    public string LastImageStallReason => _lastImageStallReason;
     public int TraceRingCount => _traceRingCount;
     /// <summary>Path (1/2/3) that owns the in-flight sticky packet; 0 if idle.</summary>
     public uint PacketPath => _pktActive ? _pktPath : 0;
@@ -256,6 +272,8 @@ public sealed class Gif : ISchedulable
         _tagsSeen = 0;
         _path2Qws = 0;
         _tagsCompletedPacked = _tagsCompletedReglist = _tagsCompletedImage = _tagsCompletedDisable = 0;
+        _path3ImageTags = _path3ImageCompleted = _path3ImageStalled = 0;
+        _lastImageStallReason = "";
         _traceRingW = 0;
         _traceRingCount = 0;
         _traceGifCached = null;
@@ -290,6 +308,25 @@ public sealed class Gif : ISchedulable
             _traceGifCached = b;
             return b;
         }
+    }
+
+    /// <summary>M7-c Slice 2a: <c>DETPS2_TRACE_GIF_BISECT=1</c> prints Path3 IMAGE bisect line.
+    /// Counters always accumulate (cheap); print only when set. Zero transfer behavior change.</summary>
+    public static bool TraceGifBisect =>
+        Environment.GetEnvironmentVariable("DETPS2_TRACE_GIF_BISECT") == "1";
+
+    /// <summary>
+    /// Print M7-c Slice 2a Path3 IMAGE bisect telemetry.
+    /// <c>path3Kicks</c> reuses <see cref="Path3Transfers"/> (GIF-side submits).
+    /// DMAC finish-side for GIF channel: <c>Dmac.GetTelemFinish((int)Dmac.Channel.GIF)</c> — no new Dmac counter.
+    /// </summary>
+    public void DumpBisectSummary(string prefix = "[GIF-BISECT]")
+    {
+        string reason = string.IsNullOrEmpty(_lastImageStallReason) ? "-" : _lastImageStallReason;
+        Console.Error.WriteLine(
+            $"{prefix} path3Kicks={_path3Transfers} path3ImageTags={_path3ImageTags} " +
+            $"path3ImageCompleted={_path3ImageCompleted} path3ImageStalled={_path3ImageStalled} " +
+            $"lastStallReason={reason}");
     }
 
     private void RingPush(byte kind, byte path, byte flg, byte flags, uint addr, uint qwcOrNloop)
@@ -990,6 +1027,9 @@ public sealed class Gif : ISchedulable
                 _lastTagRegs = _regs;
                 byte path = (byte)(_apath != 0 ? _apath : 0);
                 RingPush(1, path, (byte)flg, 0, currentAddr - 16, nloop);
+                // M7-c Slice 2a: Path3 IMAGE tag seen (telemetry only).
+                if (flg == 2 && path == 3)
+                    _path3ImageTags++;
                 // GX-010 inventory: Path2 non-PACKED with huge nloop often means garbage DIRECT
                 // (GoW IMM=0xBF0 REGLIST nloop=12301). Telemetry only — do not invent abort here;
                 // new-DIRECT / DIRECT-end-truncated already drop sticky so real PACKED A+D lands.
@@ -1060,6 +1100,13 @@ public sealed class Gif : ISchedulable
                 // Still need more data from a future Receive* call (VIF1 QW-slice).
                 if (remaining == 0)
                     _pktPartialQws++;
+                // M7-c Slice 2a: Path3 IMAGE sticky across chunk (multi-DMA or budgeted residual).
+                // Telemetry only — does not alter drain/hold behavior.
+                if (_pktFlg == 2 && _pktPath == 3)
+                {
+                    _path3ImageStalled++;
+                    _lastImageStallReason = $"image-partial progress={_pktLoop}/{_pktNloop}";
+                }
                 break;
             }
 
@@ -1076,7 +1123,13 @@ public sealed class Gif : ISchedulable
         {
             case 0: _tagsCompletedPacked++; break;
             case 1: _tagsCompletedReglist++; break;
-            case 2: _tagsCompletedImage++; break;
+            case 2:
+                _tagsCompletedImage++;
+                // M7-c Slice 2a: Path3-specific IMAGE complete (split of global counter).
+                // _apath is set for the duration of ReceivePath3Data / held Path3 drain.
+                if (_apath == 3)
+                    _path3ImageCompleted++;
+                break;
             default: _tagsCompletedDisable++; break;
         }
         byte path = (byte)(_apath != 0 ? _apath : 0);
