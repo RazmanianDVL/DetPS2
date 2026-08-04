@@ -14,6 +14,7 @@ public sealed class Pcrtc : ISchedulable
     private ulong _cyclesAccum;
     private ulong _vblankPeriod = 500_000;
     private bool _inVblank;
+    private SystemMemory? _iopMem;
 
     public ulong FrameCount { get; private set; }
     public bool InVblank => _inVblank;
@@ -31,6 +32,11 @@ public sealed class Pcrtc : ISchedulable
 
     public void SetIntc(Intc intc) => _intc = intc;
     public void SetVblankCallback(Action? cb) => _onVblank = cb;
+
+    /// <summary>Real IOP INTC needs a real hardware VBLANK source (bit 0 start, bit 11 end —
+    /// ground-truthed against VBLANK.IRX's own real IRQ registration, see IopVblankHost's doc
+    /// comment). Distinct from <see cref="_intc"/>, which is the EE's own separate INTC.</summary>
+    public void AttachIopMemory(SystemMemory mem) => _iopMem = mem;
 
     public void Reset()
     {
@@ -77,6 +83,7 @@ public sealed class Pcrtc : ISchedulable
         _inVblank = true;
         VblankCount++;
         _intc?.Raise(Intc.InterruptSource.VBlankStart);
+        _iopMem?.RaiseIopInterrupt(0); // real IOP INTC bit 0 = VBLANK start
         _onVblank?.Invoke();
     }
 
@@ -86,6 +93,7 @@ public sealed class Pcrtc : ISchedulable
         // Do NOT clear VBlankStart here — busy-pollers (e.g. MKSM 0x4803D0) need sticky STAT
         // bit2 until software write-1-clear. Only raise End edge.
         _intc?.Raise(Intc.InterruptSource.VBlankEnd);
+        _iopMem?.RaiseIopInterrupt(11); // real IOP INTC bit 11 = VBLANK end (EVBLANK)
     }
 
     public int Step(ulong maxCycles)

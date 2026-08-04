@@ -103,6 +103,14 @@ public sealed class LoadedIrx
     public bool EntryExecuted { get; set; }
     /// <summary>IOP instructions retired during the last <see cref="IopModuleHost.StartLoadedModule"/> call.</summary>
     public ulong LastEntryInstructions { get; set; }
+    /// <summary>Module-relative start of the real .bss (SHT_NOBITS) section, if the image had
+    /// section headers (0 otherwise). Build-specific -- differs across otherwise-identical
+    /// modules compiled with different toolchain versions (ground-truthed 2026-08-03: the
+    /// BIOS's own THREADMAN.IRX and a given game's IOPRP-bundled THREADMAN.IRX are genuinely
+    /// different compiled images with different section sizes, NOT the same binary at two
+    /// addresses -- a cached offset from one must never be reused against the other).</summary>
+    public uint BssAddr { get; set; }
+    public uint BssSize { get; set; }
 }
 
 /// <summary>Result of running a loaded module's entry on the R3000 IOP core.</summary>
@@ -138,6 +146,9 @@ public sealed class IopModuleHost
     private readonly Dictionary<int, OpenDir> _openDirs = new();
     private int _nextModuleId = 1;
     private int _nextStartOrder = 1;
+    /// <summary>Per-invocation rotating stack slot for THREADMAN's own _start specifically --
+    /// see the full justification at <see cref="PrepareModuleEntry"/>'s own call site.</summary>
+    private int _threadmanEntryStackSlot;
     /// <summary>Legacy synthetic SifRpcCmd.Open path only (unbounded). Real FILEIO/IOMAN
     /// allocation uses <see cref="AllocIoManFd"/> over slots 0..15.</summary>
     private int _nextFd = 3;
@@ -291,6 +302,16 @@ public sealed class IopModuleHost
 
     /// <summary>Share system memory card instance (Phase 31).</summary>
     public void BindMemCard(MemoryCard card) => _memcard = card ?? new MemoryCard();
+
+    /// <summary>A real IOP reset (IOPRP/UDNL handoff) makes the whole module/heap area free
+    /// again -- unlike <see cref="Reset()"/>, this does NOT clear module registrations (modules
+    /// that stay resident across the handoff, e.g. SYSMEM/EXCEPMAN, must keep their entries so
+    /// <see cref="FindFreeIopBase"/> still skips their real footprint correctly); it only moves
+    /// the placement bump pointer back to the start. Pair with <see
+    /// cref="SystemMemory.RestoreIopHeapRegion"/>, which undoes the actual bytes (SYSMEM's real
+    /// heap bookkeeping, any resident module's own post-boot state) -- this alone would just let
+    /// new placements collide with whatever is still really there.</summary>
+    public void ResetModulePlacementForIopReset() => _nextIopBase = IrxLoader.DefaultLoadBase;
 
     public void Reset()
     {
@@ -602,7 +623,30 @@ public sealed class IopModuleHost
         iop.PC = entryPhys;
         if (m.Gp != 0)
             iop.SetGpr(28, m.Gp); // $gp
-        uint sp = DefaultModuleStack;
+        // Real hardware gives every thread (including each module's own _start) its own,
+        // distinct stack allocation. Ours hands every module the exact same fixed address
+        // (DefaultModuleStack), re-zeroed on every call -- harmless for the overwhelming
+        // majority of modules (each _start runs to completion or a benign resident spin without
+        // any other code ever trying to resume a stale saved SP through it), but ground-truthed
+        // 2026-08-03 as the real cause of THREADMAN's reload deadlocking: THREADMAN's own real
+        // _start invokes the shared, never-reloading kernel's exception/scheduler trampoline
+        // (via a direct `j` into the general exception vector, a real, intentional kernel
+        // primitive, not a bug), which can legitimately "resume" a saved SP belonging to a
+        // DIFFERENT _start invocation's stack -- confirmed live: a real `lw ra,0x1C(sp)` at a
+        // real kernel trampoline address read zero from a location that had legitimately held
+        // real data moments earlier, wiped by this same zeroing loop preparing a later _start.
+        // Scoped to THREADMAN specifically (the only module whose own real code exercises this
+        // path) rather than every module, after a broader attempt (every module getting a
+        // rotating stack slot in [0x180000,0x1E0000)) regressed MK Shaolin Monks -- that range
+        // overlaps real, live SYSMEM heap allocations for titles that allocate more; a wide,
+        // blind "safe" range guessed from the module-load bump allocator's own upper bound is
+        // not actually proof nothing else legitimately lives there. This uses a small, separate
+        // few-slot range immediately below RealSifRpc.cs's own established scratchStack
+        // (0x1E0000, used for temporary handler calls) rather than reusing that exact address.
+        bool isThreadmanReload = string.Equals(m.Name, "THREADMAN", StringComparison.OrdinalIgnoreCase);
+        uint sp = isThreadmanReload
+            ? 0x001D0000u + (uint)(_threadmanEntryStackSlot++ % 8) * 0x2000u
+            : DefaultModuleStack;
         if (mem != null)
         {
             // Zero descending stack so ($fp+N) counters start at 0.
@@ -1023,6 +1067,8 @@ public sealed class IopModuleHost
             prior.State = IopModuleState.Loaded;
             prior.EntryExecuted = false;
             prior.LastEntryInstructions = 0;
+            prior.BssAddr = result.BssAddr;
+            prior.BssSize = result.BssSize;
         }
         else
         {
@@ -1040,6 +1086,8 @@ public sealed class IopModuleHost
                 HasImage = true,
                 State = IopModuleState.Loaded,
                 SystemResident = false,
+                BssAddr = result.BssAddr,
+                BssSize = result.BssSize,
             };
         }
 
@@ -1048,6 +1096,10 @@ public sealed class IopModuleHost
         foreach (var lib in IrxLoader.ScanExports(mem, scanStart, scanEnd))
             _exportRegistry[lib.Name] = lib;
         var (resolved, unresolved) = IrxLoader.LinkImports(mem, scanStart, scanEnd, _exportRegistry);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
+            Console.Error.WriteLine(
+                $"[LINKIMPORTS] name=\"{name}\" loadBase=0x{result.LoadBase:X8} size=0x{moduleSize:X8} " +
+                $"resolved={resolved} unresolved={unresolved} registrySize={_exportRegistry.Count}");
         ImportsResolved += (ulong)resolved;
         ImportsUnresolved += (ulong)unresolved;
 

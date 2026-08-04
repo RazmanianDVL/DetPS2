@@ -185,6 +185,18 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
     string? padScriptPath = null;
     foreach (var a in args)
         if (a.StartsWith("--pad-script=")) padScriptPath = a.Substring("--pad-script=".Length);
+    // Diagnostic-only: dump ADDR:LEN of live IOP RAM to a raw binary file (ADDR is IOP-physical),
+    // for feeding an exact, currently-loaded module image into Ghidra instead of a possibly
+    // mismatched cached extraction.
+    string? dumpIopRamSpec = null;
+    foreach (var a in args)
+        if (a.StartsWith("--dump-iop-ram=")) dumpIopRamSpec = a.Substring("--dump-iop-ram=".Length);
+    // Diagnostic-only: same as --dump-iop-ram but for EE main memory (ADDR is EE-physical,
+    // e.g. 0x01000000 for a typical ELF load base) — for grabbing exact live EE code bytes
+    // around a stuck PC instead of guessing from a possibly-stale cached ELF extraction.
+    string? dumpEeRamSpec = null;
+    foreach (var a in args)
+        if (a.StartsWith("--dump-ee-ram=")) dumpEeRamSpec = a.Substring("--dump-ee-ram=".Length);
     PadScript blockerPadScript = PadScript.Empty;
     if (!string.IsNullOrEmpty(padScriptPath))
         blockerPadScript = PadScript.LoadFile(padScriptPath);
@@ -285,17 +297,24 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             msg = traceSys.BootDiscFile(title.Path).Message;
         }
         Console.WriteLine($"[{title.Id}] {msg}");
-        if (watchAddrArg.HasValue && watchAfter > 0)
+        // --watch-after used to skip its prefix via a separate RunFor(watchAfter) call BEFORE
+        // arming WatchAddr, or (a later attempt) via an extra RunFor split inserted exactly at
+        // watchAfter. Both change the run itself: splitting a single continuous RunFor changes
+        // where OnHostPresent/pad-script boundaries fall, or otherwise perturbs whatever's
+        // happening deep inside the engine at that exact cycle — confirmed concretely (Blood
+        // Omen 2 stack-corruption race, 2026-08-04) that either approach could make the run reach
+        // a clean PC at the target cycle where the plain, unwatched run reliably crashes into a
+        // garbage jump target. WatchAfterCycle instead filters at the point of each memory access
+        // (SystemMemory, gated on the same live per-instruction cycle counter every access
+        // already has available) — RunFor is called with the exact same arguments and the exact
+        // same 1M-cycle boundaries as an unwatched run, only which hits get *recorded* differs.
+        if (watchAddrArg.HasValue)
         {
-            traceSys.RunFor(Math.Min(watchAfter, cycles));
             SystemMemory.WatchAddr = watchAddrArg;
+            SystemMemory.WatchAfterCycle = watchAfter;
         }
-        else if (watchAddrArg.HasValue)
-        {
-            SystemMemory.WatchAddr = watchAddrArg;
-        }
-        ulong remaining = cycles > watchAfter ? cycles - watchAfter : 0;
-        ulong doneCycles = cycles > remaining ? cycles - remaining : 0;
+        ulong remaining = cycles;
+        ulong doneCycles = 0;
         int padEvtIdx = 0;
         var padPending = new List<(ulong releaseAt, PadInput.Button button, string name)>();
         int padFires = 0;
@@ -526,6 +545,34 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             {
                 Console.WriteLine($"  dump-softgs: skipped (px=0) path={dumpSoftGsPath}");
             }
+        }
+        if (!string.IsNullOrEmpty(dumpIopRamSpec))
+        {
+            var specParts = dumpIopRamSpec.Split(':');
+            uint dStart = Convert.ToUInt32(specParts[0], 16);
+            uint dLen = specParts.Length > 1 ? Convert.ToUInt32(specParts[1], 16) : 0x1000u;
+            string outPath = specParts.Length > 2 ? specParts[2] : "out/traces/iop-ram-dump.bin";
+            string? od = Path.GetDirectoryName(outPath);
+            if (!string.IsNullOrEmpty(od)) Directory.CreateDirectory(od);
+            var buf = new byte[dLen];
+            for (uint i = 0; i < dLen; i++)
+                buf[i] = (byte)(traceSys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + dStart + (i & ~3u)) >> (int)((i & 3) * 8));
+            File.WriteAllBytes(outPath, buf);
+            Console.WriteLine($"  dump-iop-ram: wrote {outPath} start=0x{dStart:X8} len=0x{dLen:X8}");
+        }
+        if (!string.IsNullOrEmpty(dumpEeRamSpec))
+        {
+            var specParts = dumpEeRamSpec.Split(':');
+            uint dStart = Convert.ToUInt32(specParts[0], 16);
+            uint dLen = specParts.Length > 1 ? Convert.ToUInt32(specParts[1], 16) : 0x1000u;
+            string outPath = specParts.Length > 2 ? specParts[2] : "out/traces/ee-ram-dump.bin";
+            string? od = Path.GetDirectoryName(outPath);
+            if (!string.IsNullOrEmpty(od)) Directory.CreateDirectory(od);
+            var buf = new byte[dLen];
+            for (uint i = 0; i < dLen; i++)
+                buf[i] = (byte)(traceSys.Memory.Read32(dStart + (i & ~3u)) >> (int)((i & 3) * 8));
+            File.WriteAllBytes(outPath, buf);
+            Console.WriteLine($"  dump-ee-ram: wrote {outPath} start=0x{dStart:X8} len=0x{dLen:X8}");
         }
         Console.WriteLine($"  lastCreatedThread: entry=0x{traceSys.Hle.Sony?.LastCreatedThreadEntry:X8} sp=0x{traceSys.Hle.Sony?.LastCreatedThreadStack:X8}");
         if (traceSys.Hle.Sony != null)
@@ -1670,7 +1717,16 @@ if (args.Length > 0 && args[0].Equals("load-irx", StringComparison.OrdinalIgnore
         var exports = IrxLoader.ScanExports(mem, result.LoadBase, scanEnd);
         Console.WriteLine($"exports found: {exports.Count}");
         foreach (var e in exports)
-            Console.WriteLine($"  lib={e.Name} v{e.VersionMajor}.{e.VersionMinor} funcs={e.Exports.Length} [{string.Join(",", e.Exports.Take(5).Select(x => $"0x{x:X8}"))}{(e.Exports.Length > 5 ? ",..." : "")}]");
+            Console.WriteLine($"  lib={e.Name} v{e.VersionMajor}.{e.VersionMinor} funcs={e.Exports.Length} [{string.Join(",", e.Exports.Select((x, i) => $"{i}:0x{x:X8}"))}]");
+    }
+    if (result.Success && args.Any(a => a == "--scan-imports"))
+    {
+        uint scanEnd = result.LoadBase + Math.Max(result.Size, 0x4000u);
+        Console.WriteLine($"scan range: 0x{result.LoadBase:X8}..0x{scanEnd:X8} (real size=0x{result.Size:X})");
+        var imports = IrxLoader.ScanImports(mem, result.LoadBase, scanEnd);
+        Console.WriteLine($"import stub tables found: {imports.Count}");
+        foreach (var im in imports)
+            Console.WriteLine($"  lib={im.Name} v{im.VersionMajor}.{im.VersionMinor} ordinals=[{string.Join(",", im.Ordinals)}]");
     }
     Environment.Exit(result.Success ? 0 : 1);
 }

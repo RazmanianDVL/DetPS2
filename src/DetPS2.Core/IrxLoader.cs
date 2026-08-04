@@ -48,6 +48,10 @@ public static class IrxLoader
         /// the real extent to scan for export/import tables over, not a fixed guess. 0 for the
         /// legacy PT_LOAD-only path (no section-level size tracking).</summary>
         public uint Size { get; init; }
+        /// <summary>Module-relative start/size of the real .bss (SHT_NOBITS) section, 0 if none
+        /// (legacy PT_LOAD-only path, or a module with no uninitialized globals).</summary>
+        public uint BssAddr { get; init; }
+        public uint BssSize { get; init; }
     }
 
     // Confirmed live (2026-07-28) against a real disc IRX (IOP/CDVDSTM.IRX): the real value is
@@ -131,6 +135,7 @@ public static class IrxLoader
         // relocatable (not directly-executable) ELF is conventionally loaded.
         int segs = 0;
         uint highestEnd = 0;
+        uint bssAddr = 0, bssSize = 0;
         foreach (var s in sections)
         {
             if ((s.Flags & SHF_ALLOC) == 0) continue;
@@ -138,6 +143,9 @@ public static class IrxLoader
             if (s.Type == SHT_NOBITS)
             {
                 for (uint b = 0; b < s.Size; b++) memory.Write8(destEe + b, 0);
+                // First (lowest-addr) NOBITS section is the real .bss -- .sbss (if present)
+                // conventionally follows it, so don't let a later NOBITS section overwrite this.
+                if (bssSize == 0 || s.Addr < bssAddr) { bssAddr = s.Addr; bssSize = s.Size; }
             }
             else
             {
@@ -149,6 +157,18 @@ public static class IrxLoader
         }
         if (segs == 0) return Fail("no allocatable sections");
 
+        var (nameEarly, _, _, _) = ParseIopMod(elf, sections, iopLoadBase);
+        string? traceSectionsFilter = Environment.GetEnvironmentVariable("DETPS2_TRACE_SECTIONS");
+        if (!string.IsNullOrEmpty(traceSectionsFilter))
+            Console.Error.WriteLine($"[SECTIONS] candidate module name=\"{nameEarly}\"");
+        if (string.Equals(traceSectionsFilter, nameEarly, StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var s in sections)
+                Console.Error.WriteLine(
+                    $"[SECTIONS] name=\"{s.Name}\" type=0x{s.Type:X} flags=0x{s.Flags:X} " +
+                    $"addr=0x{s.Addr:X} size=0x{s.Size:X} end=0x{s.Addr + s.Size:X}");
+        }
+
         // Apply relocations — see this class's own doc comment for why S is always 0 (the
         // loader-supplied base substitutes for a real symbol lookup here).
         foreach (var s in sections)
@@ -157,6 +177,21 @@ public static class IrxLoader
             if (s.Link >= sections.Length) continue;
             var target = FindSectionByIndexOrName(sections, s.Name);
             if (target == null) continue;
+            if (string.Equals(traceSectionsFilter, nameEarly, StringComparison.OrdinalIgnoreCase))
+            {
+                int relCount = (int)(s.Size / 8);
+                for (int ri = 0; ri < relCount; ri++)
+                {
+                    uint recOff = s.Offset + (uint)ri * 8;
+                    if (recOff + 8 > elf.Length) break;
+                    uint rOff = BitConverter.ToUInt32(elf, (int)recOff);
+                    uint rInfo = BitConverter.ToUInt32(elf, (int)recOff + 4);
+                    if (rOff >= target.Addr && rOff < target.Addr + target.Size && target.Type == SHT_NOBITS)
+                        Console.Error.WriteLine(
+                            $"[SECTIONS] REL targeting NOBITS section \"{target.Name}\" rOffset=0x{rOff:X} " +
+                            $"rType={rInfo & 0xFF} (relSec=\"{s.Name}\")");
+                }
+            }
             ApplyRelRelocations(elf, memory, s, target, iopLoadBase);
         }
 
@@ -177,6 +212,8 @@ public static class IrxLoader
             VersionMajor = verMajor,
             VersionMinor = verMinor,
             Size = highestEnd,
+            BssAddr = bssAddr,
+            BssSize = bssSize,
         };
     }
 
@@ -236,6 +273,26 @@ public static class IrxLoader
             // r_sym (rInfo >> 8) intentionally unused — see class doc comment: real files
             // observed always use the null symbol for these, with the loader's own base
             // substituting for what would otherwise be a symbol-table lookup.
+
+            // A .rel entry naming an offset inside a NOBITS (.bss) target section has no
+            // legitimate static value to relocate -- .bss has no file content, real ELF
+            // convention defines it as always starting at zero, with any real address that
+            // belongs there computed at runtime by the module's own code, not baked in at load
+            // time. Applying a relocation here would silently turn a freshly-zeroed global into
+            // "0 + load_base", corrupting it before the module's own _start ever runs. No IRX in
+            // the current title fleet's own build actually emits one of these (verified via
+            // DETPS2_TRACE_SECTIONS), but nothing before this skipped past section boundaries to
+            // check, so a future title/module build with one would corrupt silently instead of
+            // failing loudly.
+            if (rOffset >= targetSec.Addr && rOffset < targetSec.Addr + targetSec.Size &&
+                targetSec.Type == SHT_NOBITS)
+            {
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SECTIONS") != null)
+                    Console.Error.WriteLine(
+                        $"[SECTIONS] SKIPPED relocation into NOBITS section \"{targetSec.Name}\" " +
+                        $"rOffset=0x{rOffset:X} rType={rType}");
+                continue;
+            }
 
             uint instrAddr = SystemMemory.IOP_RAM_BASE + iopLoadBase + rOffset;
             uint instr = memory.Read32(instrAddr);
@@ -594,21 +651,82 @@ public static class IrxLoader
             if (nameLen == 0) continue; // not a real table -- reject empty/garbage name
             string name = Encoding.ASCII.GetString(nameBytes, 0, nameLen);
 
+            // Real Sony export tables are NOT zero-terminated -- a zero entry is a legitimate
+            // "no function at this ordinal" placeholder (ground-truthed: Whiplash's real
+            // reloaded THREADMAN.IRX imports timrman ordinal 18, past a null placeholder
+            // earlier in timrman's own table; stopping at the first zero word silently
+            // truncated the table, leaving ordinal 18 unresolved -- a bare `jr ra` no-op --
+            // which fed a garbage "pool base" into THREADMAN's TCB allocator and cascaded into
+            // a real scheduler crash). The table only ends where the NEXT tagged structure
+            // (another export table, or an import stub table) begins, or at rangeEnd.
             var exports = new List<uint>();
             uint p = addr + 0x14;
             while (p + 4 <= rangeEnd && exports.Count < MaxExportsPerTable)
             {
                 uint fn = memory.Read32(p);
-                if (fn == 0) break;
+                if (fn == ExportTableMagic || fn == ImportStubMagic) break;
                 exports.Add(fn);
                 p += 4;
             }
+            // Trim only STRICTLY TRAILING zeros (alignment padding after the real table, when no
+            // tagged structure immediately follows within this module's range) -- an ordinal past
+            // the real table must still fail resolution safely (unresolved -> jr ra no-op), not
+            // "resolve" to a bogus j 0x0 call. Interior zero placeholders (the actual bug fixed
+            // above) are left in place since real code may legitimately import them by ordinal.
+            while (exports.Count > 0 && exports[^1] == 0) exports.RemoveAt(exports.Count - 1);
             found.Add(new ExportTable
             {
                 Name = name,
                 VersionMajor = (byte)(ver >> 8),
                 VersionMinor = (byte)(ver & 0xFF),
                 Exports = exports.ToArray(),
+            });
+        }
+        return found;
+    }
+
+    public sealed class ImportTable
+    {
+        public string Name { get; init; } = "";
+        public byte VersionMajor { get; init; }
+        public byte VersionMinor { get; init; }
+        public int[] Ordinals { get; init; } = Array.Empty<int>();
+    }
+
+    /// <summary>Diagnostic-only: scans a loaded module's memory range for real 0x41E00000-tagged
+    /// import-stub tables and reports which library + ordinal each stub calls, without resolving
+    /// or mutating anything (unlike <see cref="LinkImports"/>). For answering "what does this
+    /// module actually call" directly from real module bytes instead of inferring from execution
+    /// traces — <c>detps2 load-irx &lt;file&gt; --scan-imports</c>.</summary>
+    public static List<ImportTable> ScanImports(SystemMemory memory, uint rangeStart, uint rangeEnd)
+    {
+        var found = new List<ImportTable>();
+        for (uint addr = rangeStart; addr + 0x14 <= rangeEnd; addr += 4)
+        {
+            if (memory.Read32(addr) != ImportStubMagic) continue;
+            ushort ver = (ushort)(memory.Read8(addr + 8) | (memory.Read8(addr + 9) << 8));
+            byte[] nameBytes = new byte[8];
+            for (int i = 0; i < 8; i++) nameBytes[i] = memory.Read8(addr + 0xC + (uint)i);
+            int nameLen = Array.IndexOf(nameBytes, (byte)0);
+            if (nameLen < 0) nameLen = 8;
+            if (nameLen == 0) continue;
+            string name = Encoding.ASCII.GetString(nameBytes, 0, nameLen);
+
+            var ordinals = new List<int>();
+            uint p = addr + 0x14;
+            while (p + 8 <= rangeEnd)
+            {
+                uint word1 = memory.Read32(p + 4);
+                if ((word1 >> 26) != OpcodeAddiu) break;
+                ordinals.Add((int)(word1 & 0xFFFF));
+                p += 8;
+            }
+            found.Add(new ImportTable
+            {
+                Name = name,
+                VersionMajor = (byte)(ver >> 8),
+                VersionMinor = (byte)(ver & 0xFF),
+                Ordinals = ordinals.ToArray(),
             });
         }
         return found;
@@ -658,6 +776,11 @@ public static class IrxLoader
                 {
                     memory.Write32(word0Addr, InstrJrRa);
                     unresolved++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
+                        Console.Error.WriteLine(
+                            $"[LINKIMPORTS] UNRESOLVED stubAt=0x{word0Addr:X8} lib=\"{name}\" ordinal={ordinal} " +
+                            $"verMajor={verMajor} inRegistry={lib != null} versionOk={versionOk} " +
+                            $"libExportsLen={(lib?.Exports.Length ?? -1)}");
                 }
                 p += 8;
             }

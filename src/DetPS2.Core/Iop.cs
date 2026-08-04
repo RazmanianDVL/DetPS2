@@ -35,6 +35,10 @@ public sealed class Iop : ISchedulable
     public ulong InstructionsExecuted { get; private set; }
     /// <summary>Number of times <see cref="EnterException"/> ran (SYSCALL/BREAK/…).</summary>
     public ulong ExceptionCount { get; private set; }
+    /// <summary>Subset of <see cref="ExceptionCount"/> that were hardware-interrupt entries
+    /// (excCode==0), i.e. real INTC line takes -- diagnostic for telling "spending its whole
+    /// quantum servicing one interrupt per instruction" apart from "doing real work".</summary>
+    public ulong InterruptExceptionCount { get; private set; }
     /// <summary>Last COP0 Cause ExcCode (e.g. 8=SYSCALL, 9=BREAK).</summary>
     public uint LastExceptionCode { get; private set; }
     /// <summary>Code field from last SYSCALL/BREAK insn (bits 25:6), if any.</summary>
@@ -69,6 +73,11 @@ public sealed class Iop : ISchedulable
     public static readonly uint? OneshotAddr =
         uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_ADDR_ONESHOT"),
             System.Globalization.NumberStyles.HexNumber, null, out var osa) ? osa : (uint?)null;
+    /// <summary>Ignore OneshotAddr hits before this global instruction count -- avoids catching
+    /// an earlier, unrelated legitimate pass through the same PC value before the quantum of
+    /// interest even starts. Opt-in via DETPS2_TRACE_IOP_ADDR_ONESHOT_AFTER_N=decimal.</summary>
+    public static readonly ulong OneshotMinInsn =
+        ulong.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_ADDR_ONESHOT_AFTER_N"), out var omn) ? omn : 0;
     private static bool _oneshotFired;
 
     // Always-on (cheap: fixed-size array, no I/O) ring buffer of the last N (pc,ra) pairs, dumped
@@ -86,6 +95,38 @@ public sealed class Iop : ISchedulable
     public static readonly bool TraceHeartbeat =
         Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_HEARTBEAT") == "1";
 
+    /// <summary>Diagnostic-only: fires the first time $sp (r29) transitions TO this exact value
+    /// (not merely equals it -- catches the actual assignment/restore, not every instruction
+    /// while it stays there). Opt-in via DETPS2_TRACE_IOP_SP_BECOMES=0xHEXVALUE.</summary>
+    public static readonly uint? WatchSpBecomes =
+        uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_SP_BECOMES"),
+            System.Globalization.NumberStyles.HexNumber, null, out var wsb) ? wsb : (uint?)null;
+    private uint _lastSp;
+    private bool _spWatchFired;
+
+    /// <summary>Diagnostic-only: logs sp/ra/a3 whenever PC hits one of a comma-separated list of
+    /// addresses, up to a small cap per address -- for comparing register state across two or more
+    /// specific instructions (e.g. a call site vs. its epilogue) without a full trace dump.
+    /// Opt-in via DETPS2_TRACE_IOP_PC_LOG=0xHEXADDR,0xHEXADDR,...</summary>
+    private static readonly HashSet<uint>? PcLogAddrs = ParsePcLogAddrs();
+    private readonly Dictionary<uint, int> _pcLogHits = new();
+    private const int PcLogCapPerAddr = 6;
+
+    private static HashSet<uint>? ParsePcLogAddrs()
+    {
+        var s = Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_PC_LOG");
+        if (string.IsNullOrEmpty(s)) return null;
+        var set = new HashSet<uint>();
+        foreach (var part in s.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var t = part.Trim();
+            if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) t = t.Substring(2);
+            if (uint.TryParse(t, System.Globalization.NumberStyles.HexNumber, null, out var v))
+                set.Add(v);
+        }
+        return set.Count > 0 ? set : null;
+    }
+
     private readonly SystemMemory _memory;
     private uint _branchTarget;
     private bool _pendingVectorJump;
@@ -98,6 +139,24 @@ public sealed class Iop : ISchedulable
         Intc = intc ?? throw new ArgumentNullException(nameof(intc));
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
         Reset();
+    }
+
+    /// <summary>
+    /// Real MIPS R3000 hardware reset clears Status (IEc/KUc/IM all zero) -- a genuine IOP reset
+    /// (EELOAD's IOPRP/UDNL handoff) resets the CPU's interrupt-enable state along with its
+    /// peripherals, so a freshly-reloaded module's _start always begins with interrupts
+    /// genuinely disabled, exactly like real hardware, instead of inheriting whatever Status/
+    /// Cause a *previous*, unrelated module's synthetic quantum happened to leave behind (which
+    /// let a stale pending interrupt fire on THREADMAN's very first instruction, before it ever
+    /// reached its own real init code). Deliberately does not touch PC/GPRs/PC -- the module
+    /// loader (SifRpc.PrepareModuleEntry) owns those per-module. Pair with
+    /// SystemMemory.ResetIopInterruptControllerForIopReset.
+    /// </summary>
+    public void ResetInterruptStateForIopReset()
+    {
+        Cop0Status = 0;
+        Cop0Cause = 0;
+        _pendingVectorJump = false;
     }
 
     public void Reset()
@@ -184,6 +243,34 @@ public sealed class Iop : ISchedulable
         int executed = 0;
         while ((ulong)executed < maxCycles && Running)
         {
+            // Real R3000A hardware interrupt delivery (2026-08-03). The whole real IOP INTC
+            // (VBLANK, timers, DMA, SIF, ...) wires its combined output to a single external
+            // interrupt input -- COP0 hardware interrupt 2 (Status/Cause bit 10, IM2/IP2), the
+            // standard PS1/PS2 IOP convention. Checked at every instruction boundary (never
+            // mid-delay-slot, since delay slots execute inline within one loop iteration here),
+            // matching real timing. Before this, Iop.Step never checked for a pending interrupt
+            // at all (only SYSCALL/BREAK/AdEL) -- so even though real EXCEPMAN/INTRMAN/THREADMAN/
+            // VBLANK.IRX genuinely install a real exception vector and real interrupt handlers
+            // (confirmed running for real elsewhere this session), no real hardware event could
+            // ever reach them, starving THREADMAN's own real interrupt-driven scheduler of the
+            // only thing that lets it ever switch to a newly-started worker thread. Root-caused
+            // via IOPFILE.IRX's real _start returning cleanly (having created+started a worker)
+            // without that worker ever getting CPU time again, not guessed.
+            if (_memory.IopInterruptLineAsserted)
+                Cop0Cause |= 0x400u;
+            else
+                Cop0Cause &= ~0x400u;
+            if ((Cop0Status & 1u) != 0 && (Cop0Status & 0x400u) != 0 && (Cop0Cause & 0x400u) != 0)
+            {
+                if (TracePc && ExceptionCount <= TracePcLimit)
+                    Console.Error.WriteLine($"[IOP-IRQ] hw interrupt pc=0x{PC:X8} n={InstructionsExecuted}");
+                EnterException(0);
+                InterruptExceptionCount++;
+                executed++;
+                InstructionsExecuted++;
+                if (_pendingVectorJump) { _pendingVectorJump = false; PC = _vectorTarget; }
+                continue;
+            }
             // Real R3000A raises an Address Error (AdEL) immediately when PC leaves mapped
             // memory, trapping into the real, now-installed exception handler chain (2026-08-03).
             // Without this, a derailed PC (from any earlier bug) walked forward forever through
@@ -205,7 +292,28 @@ public sealed class Iop : ISchedulable
                 Console.Error.WriteLine($"[IOPTRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8}");
             if (TraceHeartbeat && (InstructionsExecuted & 0xFFFFF) == 0)
                 Console.Error.WriteLine($"[IOP-HEARTBEAT] n={InstructionsExecuted} pc=0x{PC:X8}");
-            if (OneshotAddr.HasValue && !_oneshotFired)
+            if (WatchSpBecomes.HasValue && !_spWatchFired &&
+                _gprs[29] == WatchSpBecomes.Value && _lastSp != WatchSpBecomes.Value)
+            {
+                _spWatchFired = true;
+                Console.Error.WriteLine(
+                    $"[IOP-SP-BECOMES] sp transitioned to 0x{_gprs[29]:X8} at pc=0x{PC:X8} " +
+                    $"n={InstructionsExecuted} ra=0x{_gprs[31]:X8} v0=0x{_gprs[2]:X8} lastSp=0x{_lastSp:X8}");
+            }
+            _lastSp = _gprs[29];
+            if (PcLogAddrs != null && PcLogAddrs.Contains(PC))
+            {
+                _pcLogHits.TryGetValue(PC, out var hitCount);
+                if (hitCount < PcLogCapPerAddr)
+                {
+                    _pcLogHits[PC] = hitCount + 1;
+                    Console.Error.WriteLine(
+                        $"[IOP-PC-LOG] pc=0x{PC:X8} hit#{hitCount} n={InstructionsExecuted} " +
+                        $"sp=0x{_gprs[29]:X8} ra=0x{_gprs[31]:X8} a3=0x{_gprs[7]:X8} v0=0x{_gprs[2]:X8} s0=0x{_gprs[16]:X8}");
+                }
+            }
+            if ((OneshotAddr.HasValue && !_oneshotFired) || WatchWriteAddr.HasValue ||
+                (WatchWriteRange.HasValue && _watchRangeHits == 0))
             {
                 _ringPc[_ringPos] = PC;
                 _ringRa[_ringPos] = _gprs[31];
@@ -215,12 +323,16 @@ public sealed class Iop : ISchedulable
             {
                 Console.Error.WriteLine(
                     $"[IOP-CALLWATCH-TRACE] n={InstructionsExecuted} pc=0x{PC:X8} op=0x{opcode:X8} " +
-                    $"v0=0x{_gprs[2]:X8} a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} ra=0x{_gprs[31]:X8} sp=0x{_gprs[29]:X8}");
+                    $"v0=0x{_gprs[2]:X8} v1=0x{_gprs[3]:X8} a0=0x{_gprs[4]:X8} a1=0x{_gprs[5]:X8} a2=0x{_gprs[6]:X8} " +
+                    $"t0=0x{_gprs[8]:X8} t1=0x{_gprs[9]:X8} s0=0x{_gprs[16]:X8} " +
+                    $"ra=0x{_gprs[31]:X8} sp=0x{_gprs[29]:X8}");
                 _watchTraceRemaining--;
             }
-            if (OneshotAddr.HasValue && PC == OneshotAddr.Value && !_oneshotFired)
+            if (OneshotAddr.HasValue && PC == OneshotAddr.Value && !_oneshotFired &&
+                InstructionsExecuted >= OneshotMinInsn)
             {
                 _oneshotFired = true;
+                _watchTraceRemaining = WatchTraceAfterInsns; // also trace forward from a PC-value hit
                 var sb = new System.Text.StringBuilder();
                 sb.AppendLine($"[IOP-ADDR-ONESHOT] hit pc=0x{PC:X8} n={InstructionsExecuted} op=0x{opcode:X8}");
                 for (int r = 0; r < 32; r++)
@@ -690,7 +802,11 @@ public sealed class Iop : ISchedulable
         // Isolated cache: real R3000 returns dcache contents; we have no dcache model, so 0.
         // Instruction fetch still uses IopRead32(PC) directly — only load ops go through here.
         if (CacheIsolated) return 0;
-        if (!IsKnownIopMap(addr)) TraceUnknownMmio("R32", addr);
+        if (!IsKnownIopMap(addr))
+        {
+            TraceUnknownMmio("R32", addr);
+            RaiseDataAddressFault(4, addr); // AdEL
+        }
         return _memory.IopRead32(addr);
     }
 
@@ -698,22 +814,51 @@ public sealed class Iop : ISchedulable
     {
         // Isolated cache: discard store (FlushDcache invalidation must not touch IOP RAM).
         if (CacheIsolated) return;
-        if (!IsKnownIopMap(addr)) TraceUnknownMmio("W32", addr, value);
+        if (!IsKnownIopMap(addr))
+        {
+            TraceUnknownMmio("W32", addr, value);
+            RaiseDataAddressFault(5, addr); // AdES
+        }
         _memory.IopWrite32(addr, value);
     }
 
     private byte MemRead8(uint addr)
     {
         if (CacheIsolated) return 0;
-        if (!IsKnownIopMap(addr)) TraceUnknownMmio("R8", addr);
+        if (!IsKnownIopMap(addr))
+        {
+            TraceUnknownMmio("R8", addr);
+            RaiseDataAddressFault(4, addr); // AdEL
+        }
         return _memory.IopRead8(addr);
     }
 
     private void MemWrite8(uint addr, byte value)
     {
         if (CacheIsolated) return;
-        if (!IsKnownIopMap(addr)) TraceUnknownMmio("W8", addr, value);
+        if (!IsKnownIopMap(addr))
+        {
+            TraceUnknownMmio("W8", addr, value);
+            RaiseDataAddressFault(5, addr); // AdES
+        }
         _memory.IopWrite8(addr, value);
+    }
+
+    /// <summary>
+    /// Real R3000A raises an Address Error on a data load/store to an address outside every
+    /// known-mapped region too, not just on instruction fetch (2026-08-03; extends the fetch-side
+    /// AdEL fix from earlier the same day — see <see cref="Step"/>'s own doc comment). Root-caused
+    /// via a real crash: a worker thread's real stack pointer drifted 0x28 bytes past the top of
+    /// 2 MiB IOP RAM (0x200000), and the offending `lw ra,...(sp)` silently read back 0 from
+    /// SystemMemory's out-of-range fallback instead of faulting — turning a real, detectable
+    /// stack error into a mysterious "$ra corrupted" crash several instructions later. Only fires
+    /// once per faulting instruction (idempotent if called again before the vector jump lands —
+    /// harmless, matches how a real pipeline would also not double-fault the same access).
+    /// </summary>
+    private void RaiseDataAddressFault(uint excCode, uint badVAddr)
+    {
+        if (_pendingVectorJump) return; // already faulting this instruction (e.g. re-entrant read/modify/write)
+        EnterException(excCode, badVAddr);
     }
 
     private bool LoadWord(uint opcode)
@@ -724,9 +869,67 @@ public sealed class Iop : ISchedulable
         return false;
     }
 
+    /// <summary>Diagnostic-only: log any store of a value near/past the top of IOP RAM (a
+    /// suspicious computed stack pointer). Opt-in via DETPS2_TRACE_IOP_NEARTOP=1 — cheap,
+    /// independent of the full-instruction DETPS2_TRACE_IOP trace.</summary>
+    public static readonly bool TraceNearTop = Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_NEARTOP") == "1";
+    public static readonly uint? WatchWriteAddr =
+        uint.TryParse(Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_WATCH_WRITE"),
+            System.Globalization.NumberStyles.HexNumber, null, out var wwa) ? wwa : (uint?)null;
+    public static readonly (uint start, uint end)? WatchWriteRange = ParseWatchRange();
+    private static (uint, uint)? ParseWatchRange()
+    {
+        var s = Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_WATCH_RANGE");
+        if (string.IsNullOrEmpty(s)) return null;
+        var parts = s.Split(':');
+        if (parts.Length != 2) return null;
+        if (!uint.TryParse(parts[0], System.Globalization.NumberStyles.HexNumber, null, out var a)) return null;
+        if (!uint.TryParse(parts[1], System.Globalization.NumberStyles.HexNumber, null, out var b)) return null;
+        return (a, b);
+    }
+    private static ulong _watchRangeHits;
+
     private bool StoreWord(uint opcode)
     {
-        MemWrite32(EffectiveAddress(opcode), _gprs[Rt(opcode)]);
+        uint addr = EffectiveAddress(opcode);
+        uint val = _gprs[Rt(opcode)];
+        if (TraceNearTop && val >= 0x001FFE00u && val <= 0x00200200u)
+            Console.Error.WriteLine(
+                $"[IOP-NEARTOP-SW] storing near-top-of-RAM value 0x{val:X8} at addr=0x{addr:X8} " +
+                $"pc=0x{PC:X8} n={InstructionsExecuted} ra=0x{_gprs[31]:X8}");
+        if (WatchWriteAddr.HasValue && addr == WatchWriteAddr.Value)
+        {
+            Console.Error.WriteLine(
+                $"[IOP-WATCH-WRITE] sw val=0x{val:X8} to addr=0x{addr:X8} pc=0x{PC:X8} " +
+                $"n={InstructionsExecuted} ra=0x{_gprs[31]:X8} sp=0x{_gprs[29]:X8} " +
+                $"rt=${Rt(opcode)} rs=${Rs(opcode)}");
+            Console.Error.WriteLine("[IOP-WATCH-WRITE] approach path (last 256 retired, oldest first):");
+            for (int k = 0; k < RingSize; k++)
+            {
+                int idx = (_ringPos + k) % RingSize;
+                Console.Error.WriteLine($"  pc=0x{_ringPc[idx]:X8} ra=0x{_ringRa[idx]:X8}");
+            }
+        }
+        if (WatchWriteRange.HasValue && addr >= WatchWriteRange.Value.start && addr < WatchWriteRange.Value.end)
+        {
+            bool isFirst = _watchRangeHits == 0;
+            _watchRangeHits++;
+            if (_watchRangeHits <= 20)
+                Console.Error.WriteLine(
+                    $"[IOP-WATCH-RANGE] sw val=0x{val:X8} to addr=0x{addr:X8} pc=0x{PC:X8} " +
+                    $"n={InstructionsExecuted} ra=0x{_gprs[31]:X8} sp=0x{_gprs[29]:X8} " +
+                    $"rt=${Rt(opcode)} rs=${Rs(opcode)}");
+            if (isFirst)
+            {
+                Console.Error.WriteLine("[IOP-WATCH-RANGE] approach path to FIRST hit (last 256 retired, oldest first):");
+                for (int k = 0; k < RingSize; k++)
+                {
+                    int idx = (_ringPos + k) % RingSize;
+                    Console.Error.WriteLine($"  pc=0x{_ringPc[idx]:X8} ra=0x{_ringRa[idx]:X8}");
+                }
+            }
+        }
+        MemWrite32(addr, val);
         return false;
     }
 

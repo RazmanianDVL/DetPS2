@@ -85,6 +85,52 @@ public sealed class SystemMemory
     private readonly byte[] _scratchpad = new byte[SPR_SIZE];
     private readonly byte[] _iopRam = new byte[IOP_RAM_SIZE];
     private readonly byte[] _bios = new byte[BIOS_SIZE];
+
+    // ---- Real IOP module/heap area snapshot (2026-08-03) ----
+    // SYSMEM's real code (ground-truthed via Ghidra decompile of the real BIOS SYSMEM.IRX)
+    // maintains a genuine, persistent, in-IOP-RAM free-list heap -- real THREADMAN/etc pool
+    // allocations (CreateThread/CreateSema/CreateEventFlag/...) call into it for real. SYSMEM
+    // itself never reloads during a real IOP reset / IOPRP module-set handoff (confirmed live:
+    // it appears exactly once in the boot module list, never in the later reload wave), so its
+    // heap bookkeeping is never reinitialized -- but the higher-level modules that DO reload
+    // (LOADCORE/THREADMAN/SIFCMD/...) each allocate their own pools from it again on every
+    // reload, and nothing ever frees the previous instance's allocations first. Confirmed live:
+    // Whiplash's real IOPFILE.IRX calls CreateSema during its own _start and gets back
+    // KE_NO_MEMORY (real heap genuinely exhausted), so it bails out immediately via its own real
+    // error path -- before ever reaching its own CreateThread/StartThread calls, which is why no
+    // amount of real interrupt delivery or thread-scheduling infrastructure could ever have
+    // helped: the worker threads that would register real SIF RPC services are never created in
+    // the first place. Real hardware doesn't have this problem because a genuine IOP reset wipes
+    // the whole region; simulate the same effect by snapshotting the module/heap area right after
+    // the initial boot walk (before any game-provided modules or their real pool allocations
+    // exist) and restoring it whenever a real IOP reset is detected (IOPRP/UDNL handoff).
+    private byte[]? _iopHeapSnapshot;
+    /// <summary>[snapshotStart, snapshotEnd) — matches IopModuleHost's own module/heap area
+    /// convention (IrxLoader.DefaultLoadBase .. AllocIopHeap's IopHeapBase).</summary>
+    private const uint IopHeapSnapshotStart = 0x00010000u;
+    private const uint IopHeapSnapshotEnd = 0x00180000u;
+
+    /// <summary>Captures the real module/heap area's current bytes. Call once, right after the
+    /// initial IOPBTCONF boot walk completes (SYSMEM's real heap is freshly initialized and no
+    /// game-provided module has allocated from it yet) -- idempotent, only the first call sticks,
+    /// matching "there is exactly one genuine cold-boot state to remember".</summary>
+    public void SnapshotIopHeapRegionOnce()
+    {
+        if (_iopHeapSnapshot != null) return;
+        _iopHeapSnapshot = new byte[IopHeapSnapshotEnd - IopHeapSnapshotStart];
+        Array.Copy(_iopRam, (int)IopHeapSnapshotStart, _iopHeapSnapshot, 0, _iopHeapSnapshot.Length);
+    }
+
+    /// <summary>Restores the module/heap area to its post-cold-boot state, simulating what a
+    /// real IOP reset's RAM wipe achieves for real SYSMEM's real, persistent heap bookkeeping
+    /// (and for every other resident module's own state living in that same region). No-op if
+    /// <see cref="SnapshotIopHeapRegionOnce"/> was never called.</summary>
+    public bool RestoreIopHeapRegion()
+    {
+        if (_iopHeapSnapshot == null) return false;
+        Array.Copy(_iopHeapSnapshot, 0, _iopRam, (int)IopHeapSnapshotStart, _iopHeapSnapshot.Length);
+        return true;
+    }
     /// <summary>IOP I/O ports at phys 0x1F801000 (word-indexed). See <see cref="IOP_IO_BASE"/>.</summary>
     private readonly uint[] _iopIo = new uint[IOP_IO_SIZE / 4];
 
@@ -108,14 +154,69 @@ public sealed class SystemMemory
         // Indices are offsets from IOP_IO_BASE (0x1F801000).
         // 0x1F801450 — INTRMANP PS2-mode / board-ID bit 3 must be set for full init.
         _iopIo[0x450 / 4] = IopIoIntrmanConfigDefault;
-        // 0x1F801078 — INTRMAN ICTRL/status. Query paths return KE_CPUDI (-102) when 0;
-        // non-zero = "interrupts not globally disabled" so SIFCMD init does not spin.
-        _iopIo[0x078 / 4] = 0x00000400u;
+        // 0x1F801078 — real I_CTRL now lives in _iopIntcCtrl (see IopRead32/IopWrite32); this
+        // array slot is no longer read for that address, kept zeroed harmlessly.
         // Common DMAC master-enable / DPCR-ish defaults so DMACMAN/SIFMAN stores stick.
         _iopIo[0x0F0 / 4] = 0x07777777u;
         _iopIo[0x570 / 4] = 0x07777777u;
         _iopIo[0x578 / 4] = 1u;
+        _iopIntcStat = 0;
+        _iopIntcMask = 0;
+        _iopIntcCtrl = 0x00000400u; // non-zero: "interrupts not globally disabled" (matches prior default)
     }
+
+    // ---- Real IOP hardware interrupt controller (I_STAT/I_MASK/I_CTRL), 2026-08-03 ----
+    // Ground-truthed against the real BIOS INTRMANP/INTRMANI decompile (not guessed):
+    // I_STAT=0x1F801070 (hardware sets bits; software acks by writing 1 to a bit — confirmed
+    // live via real INTRMANI's low-level dispatcher, `uRambf801070 = 1 << irq;` to ack exactly
+    // one source, the same write-1-to-clear convention as the EE's own Intc, not the inverted
+    // PS1-style AND-to-clear scheme), I_MASK=0x1F801074 (plain enable mask), I_CTRL=0x1F801078
+    // (master line enable — real handler entry writes 1 to keep it armed for the next event;
+    // COP0 IEc is the separate, real per-instruction gate). Previously this whole window was a
+    // raw read/write scratchpad with zero interrupt-generating behavior, and Iop.Step() never
+    // checked for a pending hardware interrupt at all (only SYSCALL/BREAK/AdEL) — so even though
+    // real THREADMAN/EXCEPMAN/VBLANK.IRX genuinely install a real exception vector and real
+    // interrupt handlers (confirmed running for real elsewhere this session), no real hardware
+    // event could ever actually reach them. <see cref="RaiseIopInterrupt"/> is the real-hardware
+    // side of this; real R3000A wires the whole controller's combined output to a single
+    // external interrupt input (not one COP0 IP bit per source) — the already-installed real
+    // handler chain reads STAT/MASK itself to find which specific source fired.
+    public const uint IOP_INTC_STAT = 0x1F801070u;
+    public const uint IOP_INTC_MASK = 0x1F801074u;
+    public const uint IOP_INTC_CTRL = 0x1F801078u;
+    private uint _iopIntcStat;
+    private uint _iopIntcMask;
+    private uint _iopIntcCtrl;
+
+    /// <summary>
+    /// Real hardware IOP reset (EELOAD's IOPRP/UDNL handoff) resets the whole INTC, not just the
+    /// module/heap area. Without this, any I_STAT bit latched-but-unacked before the handoff
+    /// (e.g. a VBLANK that fired during a prior module's synchronous _start quantum, before its
+    /// real ISR chain ever got to run) survives into the freshly-reloaded module set and fires
+    /// on literally the first vulnerable instruction of the new THREADMAN/etc _start -- before
+    /// that code has reached the point of installing its own real handlers or scheduler hooks.
+    /// Pair with <see cref="RestoreIopHeapRegion"/> and Iop.ResetInterruptStateForIopReset.
+    /// </summary>
+    public void ResetIopInterruptControllerForIopReset()
+    {
+        _iopIntcStat = 0;
+        _iopIntcMask = 0;
+        _iopIntcCtrl = 0x00000400u;
+    }
+
+    /// <summary>Hardware asserts a real IOP INTC source (e.g. VBLANK bit 0, EVBLANK bit 11 —
+    /// ground-truthed against VBLANK.IRX's own real IRQ registration, see IopVblankHost's doc
+    /// comment). Real sources OR their bit into STAT; software later acks by writing 1 to it.</summary>
+    public void RaiseIopInterrupt(int irqBit)
+    {
+        if ((uint)irqBit >= 32) return;
+        _iopIntcStat |= 1u << irqBit;
+    }
+
+    /// <summary>True when the IOP INTC's combined output line is asserted (master enable on,
+    /// STAT &amp; MASK non-zero) — what <see cref="Iop.Step"/> checks each instruction to decide
+    /// whether to raise a real Interrupt exception (COP0 ExcCode 0).</summary>
+    public bool IopInterruptLineAsserted => _iopIntcCtrl != 0 && (_iopIntcStat & _iopIntcMask) != 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool IsIopIoPort(uint rawPhys) =>
@@ -183,7 +284,7 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write8(ulong vaddr, byte value)
     {
-        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL & ~3UL) == WatchAddr.Value)
+        if (WatchAddr.HasValue && CurrentCycleForWriterLog >= WatchAfterCycle && (vaddr & 0xFFFFFFFFUL & ~3UL) == WatchAddr.Value)
             WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
         ulong paddr = TranslateAddress(vaddr);
 
@@ -240,7 +341,7 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public uint Read32(ulong vaddr)
     {
-        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
+        if (WatchAddr.HasValue && CurrentCycleForWriterLog >= WatchAfterCycle && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
             WatchHits.Add((CurrentPcForWatch, vaddr, 0, false));
         if (IsScratchpad(vaddr))
         {
@@ -330,6 +431,9 @@ public sealed class SystemMemory
         uint raw = addr & 0x1FFFFFFFu;
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return (byte)(_sif.ReadRegister(raw) >> (int)((raw & 3) * 8));
+        if ((raw & ~3u) == IOP_INTC_STAT) return (byte)(_iopIntcStat >> (int)((raw & 3) * 8));
+        if ((raw & ~3u) == IOP_INTC_MASK) return (byte)(_iopIntcMask >> (int)((raw & 3) * 8));
+        if ((raw & ~3u) == IOP_INTC_CTRL) return (byte)(_iopIntcCtrl >> (int)((raw & 3) * 8));
         if (IsIopIoPort(raw))
             return (byte)(ReadIopIo32(raw & ~3u) >> (int)((raw & 3) * 8));
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
@@ -350,6 +454,23 @@ public sealed class SystemMemory
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
         {
             _sif.WriteRegister(raw, value);
+            return;
+        }
+        if ((raw & ~3u) == IOP_INTC_STAT)
+        {
+            _iopIntcStat &= ~((uint)value << (int)((raw & 3) * 8)); // write-1-to-clear
+            return;
+        }
+        if ((raw & ~3u) == IOP_INTC_MASK)
+        {
+            int shift = (int)((raw & 3) * 8);
+            _iopIntcMask = (_iopIntcMask & ~(0xFFu << shift)) | ((uint)value << shift);
+            return;
+        }
+        if ((raw & ~3u) == IOP_INTC_CTRL)
+        {
+            int shift = (int)((raw & 3) * 8);
+            _iopIntcCtrl = (_iopIntcCtrl & ~(0xFFu << shift)) | ((uint)value << shift);
             return;
         }
         if (IsIopIoPort(raw))
@@ -407,6 +528,9 @@ public sealed class SystemMemory
         uint raw = addr & 0x1FFFFFFFu;
         if (raw >= IOP_SIF_BASE && raw < IOP_SIF_BASE + IOP_SIF_SIZE && _sif != null)
             return _sif.ReadRegister(raw);
+        if (raw == IOP_INTC_STAT) return _iopIntcStat;
+        if (raw == IOP_INTC_MASK) return _iopIntcMask;
+        if (raw == IOP_INTC_CTRL) return _iopIntcCtrl;
         if (IsIopIoPort(raw))
             return ReadIopIo32(raw);
         if (_cdvd != null && Cdvd.IsMmioAddress(raw))
@@ -441,6 +565,9 @@ public sealed class SystemMemory
             _sif.WriteRegister(raw, value);
             return;
         }
+        if (raw == IOP_INTC_STAT) { _iopIntcStat &= ~value; return; } // write-1-to-clear
+        if (raw == IOP_INTC_MASK) { _iopIntcMask = value; return; }
+        if (raw == IOP_INTC_CTRL) { _iopIntcCtrl = value; return; }
         if (IsIopIoPort(raw))
         {
             WriteIopIo32(raw, value);
@@ -470,6 +597,19 @@ public sealed class SystemMemory
     public static uint? WatchAddr;
     public static readonly List<(ulong Pc, ulong Vaddr, uint Value, bool IsWrite)> WatchHits = new();
     public static ulong CurrentPcForWatch;
+    /// <summary>Diagnostic-only: suppresses WatchHits entries recorded before this cycle
+    /// (blocker-trace --watch-after=N). Filters at the point of the access itself, using the
+    /// same live CurrentCycleForWriterLog every instruction already stamps — NOT by skipping the
+    /// prefix with a separate RunFor call before arming WatchAddr. That earlier approach changed
+    /// the run itself: splitting a single continuous RunFor into "prefix, then rest" moves where
+    /// OnHostPresent/pad-script boundaries fall relative to whatever's happening deep inside the
+    /// engine at that exact cycle, and confirmed concretely (Blood Omen 2 stack-corruption race,
+    /// 2026-08-04) that an extra RunFor split placed near a timing-sensitive interrupt window
+    /// can make the very bug being chased not reproduce at all under the "helpful" tool while it
+    /// reproduces every time without it. Filtering after the fact keeps every run's RunFor/
+    /// OnHostPresent/pad-script timeline byte-for-byte identical to the unwatched run regardless
+    /// of watchAfter's value — only which hits get recorded changes.</summary>
+    public static ulong WatchAfterCycle;
 
     /// <summary>Diagnostic-only: when true, every 32-bit-aligned write (any region — RDRAM,
     /// scratchpad, IOP RAM, MMIO, SPU2 registers, all of it) overwrites its slot in
@@ -505,7 +645,7 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write32(ulong vaddr, uint value)
     {
-        if (WatchAddr.HasValue && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
+        if (WatchAddr.HasValue && CurrentCycleForWriterLog >= WatchAfterCycle && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
             WatchHits.Add((CurrentPcForWatch, vaddr, value, true));
         if (IsScratchpad(vaddr))
         {

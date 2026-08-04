@@ -676,6 +676,11 @@ public sealed class BiosBootHost
                 $"started={result.ModulesStarted} nameOnly={result.NameOnlyRegistered} " +
                 $"fail={result.LoadFailures} literalEnv={result.LiteralIrxEnv}");
 
+        // Snapshot the real module/heap area now -- SYSMEM's real heap is freshly initialized
+        // and no game-provided module has allocated from it yet. See SystemMemory's own doc
+        // comment on SnapshotIopHeapRegionOnce for why this exists.
+        sys.Memory.SnapshotIopHeapRegionOnce();
+
         _lastLiteralBoot = result;
         return result;
     }

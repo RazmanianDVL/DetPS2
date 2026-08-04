@@ -176,6 +176,73 @@ public sealed class KernelState
     public int ThreadCount => _threads.Count;
     public int CurrentThreadId => _currentTid;
 
+    /// <summary>
+    /// General (title-independent) version of MidwayBootAssist.MaybeUnblockStarvedSema — a
+    /// last-resort rescue for a real deadlock: a thread genuinely, correctly blocked on WaitSema
+    /// (Play!'s reference sc_WaitSema semantics, ground-truthed 2026-08-03) whose real producer
+    /// never signals it, because some other real mechanism DetPS2 doesn't yet model correctly
+    /// never runs. Confirmed live (Shadow of the Colossus, SCUS_974.72): every thread ends up
+    /// genuinely asleep simultaneously with no thread left to make the real producer's work
+    /// happen — a true full deadlock, not a scheduler-fairness bug (the would-be producer is
+    /// provably Sleeping too, not merely unscheduled).
+    ///
+    /// Was previously only implemented per-title inside MidwayBootAssist (proven safe there);
+    /// this promotes the same, already-validated logic (long real grace period, drain the real
+    /// RPC queue first, force-signal only as a last resort) to the core scheduler so every title
+    /// benefits, not just the one where it happened to be hand-wired first. Grace period is
+    /// deliberately long (matching Midway's 1.5M-cycle default) so it never preempts a genuine,
+    /// eventually-self-resolving real completion.
+    /// </summary>
+    private readonly Dictionary<int, (int semaId, ulong sinceCycle)> _genericSemaWaitStart = new();
+
+    public int GenericStarvedSemaRescues { get; private set; }
+
+    public void MaybeRescueGenericStarvedSema(Ps2System sys, ulong graceCycles = 1_500_000UL)
+    {
+        foreach (var t in _threads)
+        {
+            if (!t.Alive || !t.Sleeping || t.WaitSemaId == 0)
+            {
+                _genericSemaWaitStart.Remove(t.Id);
+                continue;
+            }
+            if (!_genericSemaWaitStart.TryGetValue(t.Id, out var w) || w.semaId != t.WaitSemaId)
+            {
+                _genericSemaWaitStart[t.Id] = (t.WaitSemaId, sys.MasterCycles);
+                continue;
+            }
+            if (sys.MasterCycles - w.sinceCycle < graceCycles) continue;
+
+            // Only rescue a true, whole-system deadlock: every other thread must ALSO be
+            // genuinely non-runnable right now, not just lower priority. If anyone else could
+            // still make real progress, let the real scheduler run them instead of guessing.
+            bool anyoneElseRunnable = false;
+            foreach (var other in _threads)
+            {
+                if (other.Id == t.Id) continue;
+                if (IsRunnable(other)) { anyoneElseRunnable = true; break; }
+            }
+            if (anyoneElseRunnable)
+            {
+                _genericSemaWaitStart[t.Id] = (t.WaitSemaId, sys.MasterCycles);
+                continue;
+            }
+
+            // Drain real RPC first — often the producer for this WaitSema (matches
+            // MidwayBootAssist.MaybeUnblockStarvedSema exactly).
+            sys.Hle?.Sony?.DrainRealRpcQueue(sys.SchedulerGeneration + 1);
+            if (!t.Sleeping) { _genericSemaWaitStart.Remove(t.Id); continue; }
+
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[RPC] generic force-unblocking starved sema={t.WaitSemaId} thread={t.Id} " +
+                    $"cyc={sys.MasterCycles} (whole-system deadlock)");
+            SignalSema(t.WaitSemaId);
+            _genericSemaWaitStart[t.Id] = (t.WaitSemaId, sys.MasterCycles);
+            GenericStarvedSemaRescues++;
+        }
+    }
+
     /// <summary>Diagnostic-only: a chronological log of every thread lifecycle/switch event —
     /// built specifically to stop misattributing a register/stack observation at some cycle to
     /// the wrong logical thread (the actual root cause of several false leads while tracing MK

@@ -204,6 +204,27 @@ public sealed class IopExtendedBiosHost
     public void ApplyUdnlHandoff(Ps2System sys, string? rebootArg)
     {
         if (sys == null) return;
+
+        // Real IOP reset (2026-08-03): a genuine hardware reset wipes the module/heap area, so
+        // SYSMEM's real (persistent, never-reloading) heap bookkeeping and every resident
+        // module's own post-boot state come back fresh. We don't reset -- so real pool
+        // allocations from modules that DO reload each handoff (LOADCORE/THREADMAN/SIFCMD/...)
+        // never got freed and kept eating the same real heap, until a late-loading module's own
+        // real _start (confirmed live: Whiplash's IOPFILE.IRX calling CreateSema) got real
+        // KE_NO_MEMORY back and bailed out before ever creating the worker threads that would
+        // register real SIF RPC services. See SystemMemory.RestoreIopHeapRegion's own doc
+        // comment for the full chain. Restore bytes first, then let placement start from the
+        // bottom of the now-genuinely-free area again (IopModuleHost.FindFreeIopBase still
+        // correctly skips anything still really resident).
+        if (sys.Memory.RestoreIopHeapRegion())
+            sys.IopModules.ResetModulePlacementForIopReset();
+
+        // Real IOP reset also resets the INTC and the R3000's own interrupt-enable state (see
+        // both methods' doc comments) -- otherwise a latched-but-unacked interrupt from before
+        // the handoff fires on the very first instruction of the freshly-reloaded module chain.
+        sys.Memory.ResetIopInterruptControllerForIopReset();
+        sys.Iop.ResetInterruptStateForIopReset();
+
         _lastUdnlArg = rebootArg ?? "";
         string ver = RealSifRpc.ExtractIopRpVersionAscii(_lastUdnlArg);
         if (!string.IsNullOrEmpty(ver))
@@ -343,6 +364,12 @@ public sealed class IopExtendedBiosHost
         bool startHleOwned = string.Equals(
             Environment.GetEnvironmentVariable("DETPS2_IOPRP_START_HLE_OWNED"), "1",
             StringComparison.Ordinal);
+        var budgetOverride = Environment.GetEnvironmentVariable("DETPS2_IOPRP_MAX_INSN_PER_MODULE");
+        if (!string.IsNullOrEmpty(budgetOverride) && ulong.TryParse(budgetOverride, out var parsedBudget))
+            maxInsnPerModule = parsedBudget;
+
+        if (startHleOwned)
+            RegisterModulesWithLoadCore(sys);
 
         int started = 0;
         int skippedHle = 0;
@@ -372,7 +399,21 @@ public sealed class IopExtendedBiosHost
 
             if (!stubReady)
             {
-                sys.Iop.InstallMinimalExceptionStub();
+                // Real INTRMANI/INTRMANP never reload (not part of the game's IOPRP/UDNL image --
+                // they stayed resident, real dispatcher and all, from the original BIOS boot walk).
+                // Unconditionally clobbering VectorGeneral here with the synthetic skip-and-rfe
+                // stub throws away that real, already-installed handler -- and unlike a real
+                // handler, the stub never acks I_STAT, so any hardware interrupt taken through it
+                // refires itself forever (confirmed live: THREADMAN's real _start parks frozen at
+                // pc=0x80000080 the instant a real interrupt lands mid-init). Only install the
+                // fallback stub when no real INTRMAN dispatcher is actually resident.
+                bool hasRealIntrman =
+                    sys.IopModules.SearchModuleByName("INTRMANI") is int im and >= 0 &&
+                        sys.IopModules.TryGetIrx(im, out var intrmanIrx) && intrmanIrx.HasImage ||
+                    sys.IopModules.SearchModuleByName("INTRMANP") is int ip and >= 0 &&
+                        sys.IopModules.TryGetIrx(ip, out var intrmanpIrx) && intrmanpIrx.HasImage;
+                if (!hasRealIntrman)
+                    sys.Iop.InstallMinimalExceptionStub();
                 stubReady = true;
             }
 
@@ -381,7 +422,54 @@ public sealed class IopExtendedBiosHost
             else if (string.Equals(irx.Name, "SIFMAN", StringComparison.OrdinalIgnoreCase))
                 sys.Memory.IopWrite32(0xBF801450, 0);
 
+            ulong irqBefore = sys.Iop.InterruptExceptionCount;
+            ulong excBefore = sys.Iop.ExceptionCount;
             var run = sys.IopModules.StartLoadedModule(sys, mid, maxInsnPerModule);
+            ulong irqDuring = sys.Iop.InterruptExceptionCount - irqBefore;
+            ulong excDuring = sys.Iop.ExceptionCount - excBefore;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_SCHED_HOOKS") == "1" &&
+                string.Equals(irx.Name, "THREADMAN", StringComparison.OrdinalIgnoreCase))
+            {
+                int intrmanId = sys.IopModules.SearchModuleByName("INTRMANI");
+                if (intrmanId < 0) intrmanId = sys.IopModules.SearchModuleByName("INTRMANP");
+                if (intrmanId >= 0 && sys.IopModules.TryGetIrx(intrmanId, out var intrman))
+                {
+                    uint ibase = IopModuleHost.ToIopPhys(intrman.LoadBase);
+                    uint hook1 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + ibase + 0x15a4);
+                    uint hook2 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + ibase + 0x15a0);
+                    uint scratch1de0 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + ibase + 0x1de0);
+                    uint k400 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + 0x400);
+                    uint k404 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + 0x404);
+                    uint k408 = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + 0x408);
+                    uint k40c = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + 0x40c);
+                    Console.Error.WriteLine(
+                        $"[SCHED-HOOKS] intrmanName={intrman.Name} intrmanBase=0x{ibase:X8} " +
+                        $"hook@+15a4=0x{hook1:X8} hook@+15a0=0x{hook2:X8} scratch@+1de0=0x{scratch1de0:X8} " +
+                        $"k0x400=0x{k400:X8} k0x404=0x{k404:X8} k0x408=0x{k408:X8} k0x40c=0x{k40c:X8}");
+                }
+                else
+                {
+                    Console.Error.WriteLine("[SCHED-HOOKS] INTRMANI/INTRMANP not found in module table");
+                }
+                // THREADMAN's own "current thread" / "next thread" globals (file-relative 0x67d0/
+                // 0x67d4 in the real module image) -- FUN_00000010 (_start) should set these to a
+                // real, RUNNING-marked boot-thread TCB before ever installing the 0x940/0xbc4
+                // scheduler hooks into INTRMANI. If still zero here, FUN_000006bc's ready-pick
+                // dereferences address 0xc directly -- garbage, not a real TCB status byte.
+                uint tbase = IopModuleHost.ToIopPhys(irx.LoadBase);
+                // Build-specific: this game-disc THREADMAN's own .bss starts at file-relative
+                // 0x7090 (verified via DETPS2_TRACE_SECTIONS against ITS OWN section table --
+                // the BIOS-bundled build has a different layout, .bss at 0x67d0; reusing that
+                // offset across builds was the earlier session's actual bug, not this field).
+                uint curThread = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + tbase + 0x7090);
+                uint nextThread = sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + tbase + 0x7094);
+                byte curStatus = curThread != 0
+                    ? sys.Memory.IopRead8(SystemMemory.IOP_RAM_BASE + curThread + 0xc)
+                    : (byte)0xFF;
+                Console.Error.WriteLine(
+                    $"[SCHED-CUR] threadmanBase=0x{tbase:X8} bss0x7090(cur)=0x{curThread:X8} " +
+                    $"bss0x7094(next)=0x{nextThread:X8} curStatus=0x{curStatus:X2}");
+            }
             if (run.Success && !run.ReturnedToSentinel &&
                 sys.IopModules.TryGetIrx(mid, out var irxAfter))
                 irxAfter.LastModRes = IopModuleHost.ModuleResidentEnd;
@@ -397,7 +485,7 @@ public sealed class IopExtendedBiosHost
                 Console.Error.WriteLine(
                     $"[BIOS] IOPRP StartLoadedModule name={irx.Name} id={mid} " +
                     $"ok={run.Success} insns={run.InstructionsExecuted} modres={showMod} " +
-                    $"(v0={run.ModRes} ret={run.ReturnedToSentinel}) msg={run.Message}");
+                    $"(v0={run.ModRes} ret={run.ReturnedToSentinel}) finalPc=0x{run.FinalPc:X8} irq={irqDuring} exc={excDuring} msg={run.Message}");
             }
         }
 
@@ -413,11 +501,113 @@ public sealed class IopExtendedBiosHost
         return started;
     }
 
+    /// <summary>
+    /// Ground-truthed 2026-08-03 via byte-for-byte cross-build comparison (Whiplash SLUS_206.84 vs
+    /// Blood Omen 2 LOADCORE.IRX): every real IOP module's own <c>_start</c> calls LOADCORE's real
+    /// <c>RegisterLibraryEntries</c> as its very first action, passing a pointer to its own embedded
+    /// export table (magic 0x41C00000 -- the exact same magic <see cref="IrxLoader.ExportTableMagic"/>
+    /// already keys off for cross-module import/export linking). The real function validates that
+    /// magic, ORs a "registered" flag bit into the table's own version halfword, and prepends the
+    /// table into LOADCORE's real global registry (a singly-linked list rooted at a fixed absolute
+    /// global -- the table's own first word doubles as the "next" pointer once the magic check has
+    /// already happened, since nothing needs to re-verify it after that point).
+    ///
+    /// An EARLIER version of this fix hand-synthesized a *different* list's node structs directly in
+    /// C# to satisfy one already-traced consumer (a THREADMAN self-check) -- that was diagnosed as
+    /// exactly the wrong shape of fix: it fabricated an end state instead of finding why the real
+    /// producer never ran. This version does not synthesize anything -- it locates real
+    /// RegisterLibraryEntries (via cross-build instruction fingerprint, since LOADCORE.IRX is
+    /// relinked per title just like THREADMAN, so its absolute layout is build-specific even though
+    /// its logic is not) and EXECUTES it on the real R3000 core, once per already-loaded module's real
+    /// export table, via the same ModuleReturnSentinel call convention <see cref="StartLoadedModule"/>
+    /// already uses for module _start -- exactly what real hardware's own module-loading sequence
+    /// does, using data (export table addresses) DetPS2 already correctly locates via
+    /// <see cref="IrxLoader.ScanExports"/>. This does not by itself resolve every real-kernel-code
+    /// dependency on LOADCORE bookkeeping (a *separate* module-descriptor list, rooted at a distinct
+    /// global 16 bytes away, is populated by LOADCORE's own internal loading loop rather than by any
+    /// module's _start, and remains a distinct, not-yet-found gap) -- it closes the specific,
+    /// confirmed gap of every module's own first real init call currently doing nothing.
+    /// </summary>
+    private static void RegisterModulesWithLoadCore(Ps2System sys)
+    {
+        int lcId = sys.IopModules.SearchModuleByName("LOADCORE");
+        if (lcId < 0 || !sys.IopModules.TryGetIrx(lcId, out var lc) || !lc.HasImage || lc.Size == 0)
+            return;
+        uint lcBase = IopModuleHost.ToIopPhys(lc.LoadBase);
+        uint scanEnd = lcBase + lc.Size;
+
+        // RegisterLibraryEntries body, anchored at "lw v1,0(a0)" (function entry is 12 bytes
+        // earlier: addiu sp,sp,-24 / beq a0,zero,err / sw ra,16(sp) / <anchor>). Offsets +16
+        // (error-path jump target), +32 (list-head lui/addiu immediate) and +56 (icache-flush jal
+        // target) are build-specific and intentionally skipped -- every other word confirmed
+        // byte-identical across both cross-referenced builds (PC-relative branch encoding makes the
+        // whole sequence position-independent).
+        var fp = new (int Offset, uint Word)[]
+        {
+            (0, 0x8C830000), (4, 0x3C0241C0), (8, 0x10620003), (12, 0x00000000),
+            (20, 0x2402FF2A), (24, 0x9482000A), (28, 0x3C030001),
+            (36, 0x34420001), (40, 0xA482000A), (44, 0x8C620000), (48, 0x00000000),
+            (52, 0xAC820000), (60, 0xAC640000), (64, 0x00001021),
+        };
+        uint? anchor = null;
+        for (uint a = lcBase; a + 68 <= scanEnd; a += 4)
+        {
+            bool ok = true;
+            foreach (var (off, word) in fp)
+            {
+                if (sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + a + (uint)off) != word)
+                { ok = false; break; }
+            }
+            if (ok) { anchor = a; break; }
+        }
+        if (anchor == null)
+            return; // fingerprint absent in this build's LOADCORE -- nothing to call, no worse than before this fix
+        uint entryPc = anchor.Value - 12;
+
+        var iop = sys.Iop;
+        const uint scratchSp = 0x001C0000u; // dedicated scratch stack for these synthetic calls only
+        int registered = 0;
+        foreach (var m in sys.IopModules.GetModuleTable())
+        {
+            if (!m.HasImage || m.Size == 0) continue;
+            uint modBase = IopModuleHost.ToIopPhys(m.LoadBase);
+            uint exportAddr = 0;
+            for (uint a = modBase; a + 0x14 <= modBase + m.Size; a += 4)
+            {
+                if (sys.Memory.IopRead32(SystemMemory.IOP_RAM_BASE + a) == IrxLoader.ExportTableMagic)
+                { exportAddr = a; break; }
+            }
+            if (exportAddr == 0) continue;
+
+            iop.PC = entryPc;
+            iop.SetGpr(4, exportAddr); // a0
+            iop.SetGpr(29, scratchSp); // sp
+            iop.SetGpr(31, IopModuleHost.ModuleReturnSentinel); // ra
+            ulong before = iop.InstructionsExecuted;
+            const ulong callBudget = 500;
+            while (iop.InstructionsExecuted - before < callBudget && iop.Running)
+            {
+                if (iop.PC == IopModuleHost.ModuleReturnSentinel) break;
+                iop.Step(1);
+                if (iop.PC == IopModuleHost.ModuleReturnSentinel) break;
+            }
+            registered++;
+        }
+
+        if (registered > 0 && (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_LITERAL_IRX") == "1"))
+            Console.Error.WriteLine(
+                $"[BIOS] RegisterLibraryEntries@0x{entryPc:X8} executed for {registered} module(s)");
+    }
+
     private int ApplyIopRpImageCore(IopModuleHost modules, SystemMemory mem, byte[] image,
         string? sourceName, bool updateHost)
     {
         if (!TryParseIopRpContainer(image, out var entries) || entries.Count == 0)
             return 0;
+
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_ROMDIR") == "1")
+            Console.Error.WriteLine("[ROMDIR] entries: " + string.Join(", ", entries.Select(e => e.Name)));
 
         var btconf = ExtractIopBtConfNamesFromImage(image, entries);
         var loadList = new List<string>();

@@ -208,6 +208,7 @@ public sealed class Ps2System
         EE.SetCycleSource(() => MasterCycles);
         EE.SetTelemetry(Telemetry);
         Pcrtc.SetIntc(Intc);
+        Pcrtc.AttachIopMemory(Memory);
         Pcrtc.SetVblankCallback(() => Hle?.OnVblank());
         Cdvd.SetIntc(Intc);
         Spu2.SetIntc(Intc);
@@ -437,6 +438,14 @@ public sealed class Ps2System
                 // (those are middleware contracts, not PC-range pokes); only force-jumps/logo
                 // assists are suppressed inside Step when --no-assist is on.
                 ActiveQuirk?.Step(this);
+
+                // General, title-independent last-resort rescue for a genuine whole-system
+                // deadlock (every thread provably Sleeping, none runnable) — see its own doc
+                // comment. Runs for every title, not just the ones with a hand-wired quirk
+                // assist; only fires after a long real grace period and only when nothing else
+                // could make progress, so it never preempts a real, eventually-self-resolving
+                // completion.
+                Hle.Kernel?.MaybeRescueGenericStarvedSema(this);
 
                 bool criHot = pcPhys is (>= 0x0041D0C0UL and <= 0x0041D1E4UL)
                     or (>= 0x00417F80UL and <= 0x00418020UL)

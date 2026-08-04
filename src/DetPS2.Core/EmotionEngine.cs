@@ -122,6 +122,12 @@ public sealed class EmotionEngine : ISchedulable
     /// explaining why the register was bad in the first place.</summary>
     public static readonly bool TraceJrGuard = Environment.GetEnvironmentVariable("DETPS2_TRACE_JRGUARD") == "1";
 
+    /// <summary>Diagnostic-only: logs every JR/JALR whose target has a nonzero upper 32 bits —
+    /// real PS2 game code addresses never legitimately need more than 32 bits, so this is a
+    /// strong garbage-register signal that the low-vector-page guard above does not catch (its
+    /// range check only rejects near-zero targets). Opt-in via DETPS2_TRACE_JRHIGH=1.</summary>
+    public static readonly bool TraceJrHigh = Environment.GetEnvironmentVariable("DETPS2_TRACE_JRHIGH") == "1";
+
     // Cached once at type init — Step() used to call Environment.GetEnvironmentVariable on
     // every instruction for these (even when the PC match later failed). Desktop RunFor burns
     // millions of instr/s; process-env lookups on the hot path are pure overhead when unset.
@@ -1363,6 +1369,29 @@ public sealed class EmotionEngine : ISchedulable
     private static bool IsLegitimateVectorTarget(ulong t) =>
         t is KernelBootstrap.Kseg0Tlb or KernelBootstrap.Kseg0Common or KernelBootstrap.Kseg0Interrupt;
 
+    /// <summary>
+    /// This interpreter represents every legitimate 32-bit EE address zero-extended into its
+    /// 64-bit register slot (confirmed by KSEG0 interrupt-vector return addresses observed live
+    /// as 0x0000000080000200, not the MIPS64-sign-extended 0xFFFFFFFF80000200 -- this codebase
+    /// does not attempt real sign-extension semantics for 32-bit results). So any jump target
+    /// with a nonzero upper 32 bits can never be a real address under this emulator's own
+    /// convention -- it is raw garbage that happened to get treated as a pointer (e.g. a
+    /// corrupted/never-initialized stack slot restored into `ra` by an ordinary function
+    /// epilogue -- confirmed live via DETPS2_TRACE_JRHIGH on Blood Omen 2 --host-present: `jr ra`
+    /// with ra=0x275A0004401A7000, low half not even in the loaded ELF's range, cascading into
+    /// PC wrapping through the low vector page and hundreds of millions of cycles of raw
+    /// stack/heap bytes executed as instructions). Same guard family as
+    /// <see cref="IsLegitimateVectorTarget"/> above -- this only widens what counts as
+    /// "obviously not a real pointer".
+    /// </summary>
+    /// <summary>Root-cause investigation only: temporarily disables the guard above so a
+    /// pre-existing corruption cascade can be reproduced and traced back to its true origin
+    /// instead of being intercepted at the symptom. Never set in normal use.</summary>
+    private static readonly bool DisableGarbage64Guard =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_JRGUARD64") == "1";
+
+    private static bool IsGarbage64JumpTarget(ulong t) => !DisableGarbage64Guard && (t >> 32) != 0;
+
     private bool ExecuteInstruction(uint opcode)
     {
         uint primary = (opcode >> 26) & 0x3F;
@@ -1534,6 +1563,12 @@ public sealed class EmotionEngine : ISchedulable
                             Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping");
                         break; // nop: stay sequential
                     }
+                    if (IsGarbage64JumpTarget(t))
+                    {
+                        if (TraceJrGuard || TraceJrHigh)
+                            Console.Error.WriteLine($"[JRGUARD64] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping");
+                        break; // nop: stay sequential — not a real sign-extended 32-bit address
+                    }
                     _delaySlotTarget = t;
                     return true;
                 }
@@ -1545,6 +1580,12 @@ public sealed class EmotionEngine : ISchedulable
                     {
                         if (TraceJrGuard)
                             Console.Error.WriteLine($"[JRGUARD] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping (jalr)");
+                        break;
+                    }
+                    if (IsGarbage64JumpTarget(t))
+                    {
+                        if (TraceJrGuard || TraceJrHigh)
+                            Console.Error.WriteLine($"[JRGUARD64] pc=0x{PC:X8} rs={rs} target=0x{t:X16} -> falls through instead of jumping (jalr)");
                         break;
                     }
                     _delaySlotTarget = t;

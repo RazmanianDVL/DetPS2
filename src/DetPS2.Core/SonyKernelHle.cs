@@ -1125,6 +1125,10 @@ public sealed class SonyKernelHle
             // ---- Semaphores (Sony: a0 = ee_sema_t*) ----
             case 0x40: // CreateSema
                 result = CreateSemaFromStruct(a0);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[RPC] CreateSema -> id={result} tid={_kernel.CurrentThreadId} pc=0x{ee.PC:X8} " +
+                        $"ra=0x{ee.GetGpr(31).Lo:X8} init={_kernel.GetSemaInitCount((int)result)} max={_kernel.GetSemaMaxCount((int)result)}");
                 break;
             case 0x41: // DeleteSema
                 result = _kernel.DeleteSema((int)a0);
@@ -1158,7 +1162,13 @@ public sealed class SonyKernelHle
                     if (_kernel.LastWaitSemaBlocked)
                     {
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
-                            Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} gp=0x{ee.GetGpr(28).Lo:X8}");
+                        {
+                            Console.Error.WriteLine($"[RPC] WaitSema BLOCKED a0(sema)=0x{a0:X} tid={_kernel.CurrentThreadId} pc=0x{ee.PC:X8} ra=0x{ee.GetGpr(31).Lo:X8} sp=0x{ee.GetGpr(29).Lo:X8} gp=0x{ee.GetGpr(28).Lo:X8}");
+                            foreach (var t in _kernel.AllThreads)
+                                Console.Error.WriteLine(
+                                    $"[RPC]   thread id={t.Id} alive={t.Alive} started={t.Started} sleeping={t.Sleeping} " +
+                                    $"waitVblank={t.WaitVblank} suspend={t.SuspendCount} waitSemaId={t.WaitSemaId} priority={t.Priority}");
+                        }
                         // Stall only when a *queued* real BIND/CALL/RDATA will SignalSema(this
                         // id) via CompleteRpcEnd. Queue depth alone is not enough: GoW/B3
                         // WaitSema(3) on the SIF-cmd poll mutex saw unrelated CDVD/PAD packets

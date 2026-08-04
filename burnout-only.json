@@ -8,6 +8,6 @@
       "kind": "iso"
     }
   ],
-  "bootCycles": 5000000,
+  "bootCycles": 100000000,
   "sampleEvery": 100000
 }
