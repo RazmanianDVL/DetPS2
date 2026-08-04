@@ -174,6 +174,37 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _lastResidualBootLeaveCyc = 0;
     }
 
+
+    /// <summary>
+    /// M8-a quiet plant half for B3 "2800" EE RAM plant (m8a-b3-dual-suppress-results.md).
+    /// Default soft-off: skip PlantIopRpVersion on mount + Step (Prefer stays intentionally OFF).
+    /// M4-b/M4-g tag-if-applied GetVersion supplies digits without the RAM plant at diagnose.
+    /// Rollback: DETPS2_M8A_B3_NO_VERSION_PLANT=0 (or false) opts back into legacy plant.
+    /// </summary>
+    private static bool SkipVersionPlant
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_B3_NO_VERSION_PLANT");
+            return v is null || !(string.Equals(v, "0", StringComparison.Ordinal) ||
+                                   string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// Dual-suppress Prefer hold: force PreferIopRpGetVersion=false so LITERAL_IRX auto-set
+    /// cannot arm Prefer during plant-quiet seat. DETPS2_M8A_B3_HOLD_PREFER_OFF=1.
+    /// </summary>
+    private static bool HoldPreferOff
+    {
+        get
+        {
+            string? v = Environment.GetEnvironmentVariable("DETPS2_M8A_B3_HOLD_PREFER_OFF");
+            return string.Equals(v, "1", StringComparison.Ordinal) ||
+                   string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
@@ -182,7 +213,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // dies n=2–3 and STG never binds. EE IOPRP "2800" plant covers SifLoadModule.
         // FILEIO/LOADFILE classic 0x00020000 matches menu4 residual force@~22M FC00 window
         // when thrash is not pulled forward. Re-enable only with proven residual n≈48.
-        PlantIopRpVersion(sys);
+        if (!SkipVersionPlant)
+            PlantIopRpVersion(sys);
+        if (HoldPreferOff && sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = false;
     }
 
     public void OnHostPresent(Ps2System sys)
@@ -235,12 +269,24 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // Re-plant after ELF PT_LOAD (OnDiscMounted runs before BootDiscFile's ElfLoader).
         if (!_versionPlanted && sys.MasterCycles >= 500_000)
         {
-            PlantIopRpVersion(sys);
-            _versionPlanted = true;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            if (!SkipVersionPlant)
+            {
+                PlantIopRpVersion(sys);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                    Console.Error.WriteLine(
+                        $"[B3] planted IOPRP version \"2800\" @ 0x{IopVersionPlaceholder:X8} cyc={sys.MasterCycles}");
+            }
+            else if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+            {
                 Console.Error.WriteLine(
-                    $"[B3] planted IOPRP version \"2800\" @ 0x{IopVersionPlaceholder:X8} cyc={sys.MasterCycles}");
+                    $"[B3] skip IOPRP version plant (DETPS2_M8A_B3_NO_VERSION_PLANT) cyc={sys.MasterCycles}");
+            }
+            _versionPlanted = true;
         }
+
+        // Dual-suppress Prefer hold: neutralize LITERAL_IRX Prefer auto-set side channel.
+        if (HoldPreferOff && sys.Hle?.Sony?.RealRpc != null)
+            sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = false;
 
         // Residual lgDeviceInit assert sink (0x443A90..A4) if LGDEV RPC version was wrong.
         // Prefer RealSifRpc.HandleLgDev; this is a belt-and-suspenders escape that plants the

@@ -1891,14 +1891,27 @@ public sealed class SonyKernelHle
         // when present, so classic 0x00020000 does not fight disc IOPRP version gates.
         // LITERAL_IRX=0 / unset: leave PreferIopRpGetVersion alone (title assists / smokes).
         // No GameQuirk plants here — only surface the arg SifIopReset already captured.
+        // M8-a B3 dual-suppress: DETPS2_M8A_B3_HOLD_PREFER_OFF=1 skips Prefer auto-set so
+        // plant-quiet seats can hold Prefer false (Burnout3Assist also re-clears in Step).
+        bool holdPreferOffB3 = Environment.GetEnvironmentVariable("DETPS2_M8A_B3_HOLD_PREFER_OFF") is "1"
+            || string.Equals(Environment.GetEnvironmentVariable("DETPS2_M8A_B3_HOLD_PREFER_OFF"),
+                "true", StringComparison.OrdinalIgnoreCase);
         if (IopExtendedBiosHost.IsLiteralIrxEnabled()
-            && !string.IsNullOrEmpty(RealRpc.LastIopRpVersionAscii))
+            && !string.IsNullOrEmpty(RealRpc.LastIopRpVersionAscii)
+            && !holdPreferOffB3)
         {
             RealRpc.PreferIopRpGetVersion = true;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
                 || Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1")
                 Console.Error.WriteLine(
                     $"[LOADFILE] LITERAL_IRX: PreferIopRpGetVersion=1 ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
+        }
+        else if (holdPreferOffB3
+            && (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1"))
+        {
+            Console.Error.WriteLine(
+                $"[LOADFILE] LITERAL_IRX: PreferIopRp auto-set skipped (DETPS2_M8A_B3_HOLD_PREFER_OFF) ioprp=\"{RealRpc.LastIopRpVersionAscii}\"");
         }
 
         // Wake one WaitSema sleeper if any (EESYNC post → EE SifIopSync consumer).
