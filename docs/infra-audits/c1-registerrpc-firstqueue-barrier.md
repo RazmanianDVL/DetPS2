@@ -37,10 +37,11 @@ Filled only when real IOP code runs **`sceSifSetRpcQueue`** (SIFCMD export) and 
 | Multi-thread table | `DETPS2_IOP_THREADS` | on in canaries |
 | Residual start | `DETPS2_IOP_YIELD_START` | on |
 | CreateThread HLE | `DETPS2_IOP_CREATE_THREAD` | **39 legit** creates after storm fix (was 9.5M) |
-| Wait/Signal/Sleep HLE | `DETPS2_IOP_WAIT_YIELD` | **0 trap firings**; LINKIMPORTS shows IOPFILE 3 + SDRDRV 1 patches |
-| Live registry | — | **`firstQueue=0` unchanged** |
+| Wait/Signal/Sleep HLE | `DETPS2_IOP_WAIT_YIELD` | **0 trap firings** pre-S1 (stubs patched); residual drain TRACE after S1 is Claude seat B |
+| Yield-start peer scope | S1 `ba196e6` | Scaffolding false residual **fixed**; 4 modules still divert on real CreateThread peers |
+| Live registry | — | **`firstQueue=0` unchanged** (as of last full-stack canary) |
 
-**Interpretation:** mechanisms are not no-ops (CreateThread fires; WaitYield stubs patched). They are **downstream of the registerRpc call sites** that BO2 never reaches inside measured `_start` budgets.
+**Interpretation:** mechanisms are not no-ops (CreateThread fires; WaitYield stubs patched; S1 fixed false 16k). Live register still blocked by incomplete real `_start` / empty queue head (B1/B2), not by missing prefer-live plumbing (FQ-2 synthetic LiveRpcHits green).
 
 ---
 

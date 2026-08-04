@@ -1,9 +1,9 @@
 # C1 design — yield-start checkpoint peer scoping (precision bug)
 
-**Status:** design only — **ready for dual ACK** — **no Core this turn**  
+**Status:** dual-ACK'd + **S1 landed** (`ba196e6`) + re-canary verified  
 **Date:** 2026-08-04  
-**Tip ref:** `6e5fe86` / stack `27af7d7`  
-**Evidence:** Claude seat C (seq0149): post-yield-start BO2 TRACE — **seven** modules hit identical 16 384 partial residual (LOADCORE, EECONF, SIFCMD, SIFINIT, IOPFILE, SDRDRV, IOPSNDS), including **LOADCORE** before THREADMAN exists  
+**Tip ref:** implement `ba196e6`; design `20e23e8`  
+**Evidence:** Claude seat C (seq0149) seven-module false residual; re-canary seq0154 after S1  
 **Locks:** prefer `SifRpc.cs` / `Iop.cs` only; no Gif/Gs/GameQuirks  
 
 ---
@@ -116,18 +116,29 @@ Update `IopYieldStart_ResidualOnReadyPeer` if it used CreateSecondaryContext pee
 
 ---
 
-## 9. Definition of done (this design seat)
+## 9. Definition of done
 
 - [x] Problem named from Claude C evidence  
 - [x] Options S1–S4 + bias S1  
-- [x] Smokes + dual-ACK YS-Q1..Q4  
-- [ ] Dual-ACK  
-- [ ] **No Core** until ACK  
+- [x] Dual-ACK YS-Q1..Q4  
+- [x] S1 implement `ba196e6` + smoke  
+- [x] Re-canary: LOADCORE/EECONF/SIFCMD no longer divert; 4 remain with real CreateThread peers  
+- [x] **S2 parked** until residual distortion proven (seq0154/0155)  
+
+### Closed outcome (docs seat A)
+
+| Result | Detail |
+|--------|--------|
+| Scaffolding false positive | **Fixed** — entry/boot/rpc slots ignored |
+| Cross-module real workers | **Accepted residual** — SIFINIT/IOPFILE/SDRDRV/IOPSNDS may still divert after earlier CreateThread READY peers; S2 OwnerModuleId if later needed |
+| Product flags | still default **off** |
 
 ---
 
 ```text
-yield-start peer scoping design
-  global FindNextReadyThread false-positive from C1.2 entry slots
-  bias S1: exclude module EntryThreadId + rpc dispatch from checkpoint surface
+yield-start peer scoping S1 CLOSED
+  HasNonEntryReadyPeer: skip boot + EntryThreadId + rpc dispatch
+  canary: 7→4 diversions; scaffolding class gone
+  S2 parked
 ```
+
