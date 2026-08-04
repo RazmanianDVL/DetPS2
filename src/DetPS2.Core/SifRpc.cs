@@ -166,6 +166,24 @@ public sealed class IopModuleHost
     /// <summary>C1 yield-start residual queue (module still in _start after yield surface).</summary>
     private readonly Queue<ResidualModuleStart> _residualModuleStarts = new();
 
+    /// <summary>
+    /// Per-instance smoke scaffolding (mirrors <see cref="Iop.EnableMultiThreadScaffolding"/>).
+    /// Not process-static — cannot leak into later smokes in the same process.
+    /// </summary>
+    private bool _yieldStartScaffolding;
+
+    /// <summary>Enable yield-start for this host only (smokes). No process env mutation.</summary>
+    public void EnableYieldStartScaffolding() => _yieldStartScaffolding = true;
+
+    /// <summary>
+    /// C1 yield-surviving start: residual slices when multi-thread shows a yield surface.
+    /// Default off. Product: <c>DETPS2_IOP_YIELD_START=1</c>. Kill: <c>DETPS2_DISABLE_IOP_YIELD_START=1</c>.
+    /// Smokes: <see cref="EnableYieldStartScaffolding"/> on this instance.
+    /// </summary>
+    public bool YieldStartEnabled =>
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_YIELD_START") != "1"
+        && (_yieldStartScaffolding || YieldStartEnvEnabled);
+
     private struct ResidualModuleStart
     {
         public int ModuleId;
@@ -291,21 +309,13 @@ public sealed class IopModuleHost
         }
     }
 
-    /// <summary>Test scaffolding: force yield-start on without process env (mirrors IOP thread scaffolding).</summary>
-    private static bool _yieldStartScaffolding;
-
-    /// <summary>Enable yield-start for smokes without <c>DETPS2_IOP_YIELD_START</c> env.</summary>
-    public static void EnableYieldStartScaffolding() => _yieldStartScaffolding = true;
-
     /// <summary>
-    /// C1 yield-surviving start: residual slices when multi-thread shows a yield surface.
-    /// Requires multi-thread (env or scaffolding). Default off.
-    /// Kill: <c>DETPS2_DISABLE_IOP_YIELD_START=1</c>.
+    /// Product env gate (process-wide). Kill wins over opt-in.
+    /// Smokes use per-instance <see cref="EnableYieldStartScaffolding"/> instead of env.
     /// </summary>
-    public static bool YieldStartEnabled =>
+    public static bool YieldStartEnvEnabled =>
         Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_YIELD_START") != "1"
-        && (_yieldStartScaffolding
-            || Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") == "1");
+        && Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") == "1";
 
     /// <summary>Default first-call instruction cap (matches historical StartLoadedModule default).</summary>
     public const ulong YieldStartMaxInsnFirstCall = 100_000;

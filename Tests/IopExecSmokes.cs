@@ -517,14 +517,11 @@ public static class IopExecSmokes
     /// </summary>
     public static void IopYieldStart_ResidualOnReadyPeer()
     {
-        // --- Scaffolding off: no residual path ---
+        // --- Scaffolding off: no residual path (per-instance; no process static leak) ---
         {
             var off = new Ps2System();
-            if (IopModuleHost.YieldStartEnabled &&
-                Environment.GetEnvironmentVariable("DETPS2_IOP_YIELD_START") != "1")
-            {
-                // Process may have env from another run — only assert queue empty after short start.
-            }
+            if (off.IopModules.YieldStartEnabled && !IopModuleHost.YieldStartEnvEnabled)
+                throw new Exception("YieldStartEnabled true without env or scaffolding on off host");
             byte[] irx = IrxLoader.BuildMinimalIrx("YSOFF");
             if (!off.LoadIrx(irx, "YSOFF").Success)
                 throw new Exception("LoadIrx YSOFF failed");
@@ -536,13 +533,17 @@ public static class IopExecSmokes
                 throw new Exception("off-path must not enqueue residual");
         }
 
-        // --- Multi-thread + yield scaffolding: residual on READY peer ---
+        // --- Multi-thread + per-instance yield scaffolding: residual on READY peer ---
         {
             var sys = new Ps2System();
             sys.Iop.EnableMultiThreadScaffolding();
-            IopModuleHost.EnableYieldStartScaffolding();
-            if (!IopModuleHost.YieldStartEnabled)
+            sys.IopModules.EnableYieldStartScaffolding();
+            if (!sys.IopModules.YieldStartEnabled)
                 throw new Exception("EnableYieldStartScaffolding did not enable");
+            // Sibling host must not see scaffolding leak.
+            var sibling = new Ps2System();
+            if (sibling.IopModules.YieldStartEnabled && !IopModuleHost.YieldStartEnvEnabled)
+                throw new Exception("yield-start scaffolding leaked to sibling Ps2System");
 
             // READY peer so checkpoint sees FindNextReadyThread >= 0.
             int peer = sys.Iop.CreateSecondaryContext(0x00007000);

@@ -414,7 +414,7 @@ public sealed class Ps2System
             if (IopModuleHost.IsLiteralIrxEnabled && IopModules.HasPendingLiteralEntry)
                 IopModules.TryArmPendingLiteralEntry(Iop);
             // C1 yield-start: continue module _start residuals across quanta (flag-gated).
-            if (IopModuleHost.YieldStartEnabled && IopModules.HasResidualModuleStart)
+            if (IopModules.YieldStartEnabled && IopModules.HasResidualModuleStart)
                 IopModules.DrainResidualModuleStarts(this);
             while (left > 0)
             {
