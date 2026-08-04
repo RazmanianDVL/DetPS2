@@ -839,5 +839,58 @@ public static class IrxLoader
         return patched;
     }
 
+    /// <summary>
+    /// C1 WaitSema phase-2: re-point <c>thsemap</c> WaitSema(8)/SignalSema(6) and optional
+    /// <c>thbase</c> SleepThread(24) stubs to HLE trap PCs. Only when WAIT_YIELD product flag on.
+    /// </summary>
+    public static int OverrideThsemapWaitSignalImports(
+        SystemMemory memory, uint rangeStart, uint rangeEnd,
+        uint waitSemaPc, uint signalSemaPc, uint sleepThreadPc = 0)
+    {
+        int patched = 0;
+        for (uint addr = rangeStart; addr + 0x14 <= rangeEnd; addr += 4)
+        {
+            if (memory.Read32(addr) != ImportStubMagic) continue;
+            byte[] nameBytes = new byte[8];
+            for (int i = 0; i < 8; i++) nameBytes[i] = memory.Read8(addr + 0xC + (uint)i);
+            int nameLen = Array.IndexOf(nameBytes, (byte)0);
+            if (nameLen < 0) nameLen = 8;
+            if (nameLen == 0) continue;
+            string name = Encoding.ASCII.GetString(nameBytes, 0, nameLen);
+            bool isThsemap = string.Equals(name, "thsemap", StringComparison.OrdinalIgnoreCase);
+            bool isThbase = string.Equals(name, "thbase", StringComparison.OrdinalIgnoreCase);
+            if (!isThsemap && !isThbase) continue;
+
+            uint p = addr + 0x14;
+            while (p + 8 <= rangeEnd)
+            {
+                uint word0Addr = p;
+                uint word1 = memory.Read32(p + 4);
+                if ((word1 >> 26) != OpcodeAddiu) break;
+                uint ordinal = word1 & 0xFFFF;
+                uint target = 0;
+                if (isThsemap)
+                {
+                    if (ordinal == 8) target = waitSemaPc;
+                    else if (ordinal == 6) target = signalSemaPc;
+                }
+                else if (isThbase && sleepThreadPc != 0 && ordinal == 24)
+                    target = sleepThreadPc;
+                if (target != 0)
+                {
+                    uint jInstr = ((target >> 2) & 0x03FFFFFFu) | 0x08000000u;
+                    memory.Write32(word0Addr, jInstr);
+                    patched++;
+                    if (Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
+                        Console.Error.WriteLine(
+                            $"[LINKIMPORTS] {name} HLE override stubAt=0x{word0Addr:X8} " +
+                            $"ordinal={ordinal} -> 0x{target:X8}");
+                }
+                p += 8;
+            }
+        }
+        return patched;
+    }
+
     private static LoadResult Fail(string m) => new() { Success = false, Message = m };
 }

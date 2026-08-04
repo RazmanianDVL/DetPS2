@@ -1140,5 +1140,121 @@ public static class IopExecSmokes
             Environment.SetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD", prevKill);
         }
     }
+
+    /// <summary>
+    /// C1 WaitSema phase-2: thsemap Wait(8)/Signal(6) + thbase Sleep(24) override;
+    /// HLE park switches to READY peer; Signal wakes WAIT; flag-off independent of CREATE_THREAD.
+    /// </summary>
+    public static void IopWaitYield_HleParkAndSignal()
+    {
+        // --- Override patches thsemap 6/8 and thbase 24 ---
+        {
+            var mem = new SystemMemory();
+            void PlantLib(uint baseAddr, string libName, params uint[] ords)
+            {
+                mem.Write32(baseAddr + 0x00, IrxLoader.ImportStubMagic);
+                mem.Write32(baseAddr + 0x04, 0);
+                mem.Write8(baseAddr + 0x08, 0); mem.Write8(baseAddr + 0x09, 1);
+                mem.Write8(baseAddr + 0x0A, 0); mem.Write8(baseAddr + 0x0B, 0);
+                byte[] nb = System.Text.Encoding.ASCII.GetBytes(libName.PadRight(8, '\0').Substring(0, 8));
+                for (int i = 0; i < 8; i++) mem.Write8(baseAddr + 0x0C + (uint)i, nb[i]);
+                uint p = baseAddr + 0x14;
+                foreach (uint ord in ords)
+                {
+                    mem.Write32(p, 0x03E00008);
+                    mem.Write32(p + 4, (9u << 26) | (ord & 0xFFFF));
+                    p += 8;
+                }
+                mem.Write32(p, 0);
+            }
+
+            const uint thsemapBase = SystemMemory.IOP_RAM_BASE + 0x040000;
+            const uint thbaseBase = SystemMemory.IOP_RAM_BASE + 0x041000;
+            PlantLib(thsemapBase, "thsemap", 6, 8, 9); // 9 Poll not patched
+            PlantLib(thbaseBase, "thbase", 24, 4);     // 4 Create not WaitYield
+
+            int n = IrxLoader.OverrideThsemapWaitSignalImports(
+                mem, thsemapBase, thsemapBase + 0x200,
+                Iop.HleThsemapWaitSemaPc, Iop.HleThsemapSignalSemaPc, Iop.HleThbaseSleepThreadPc);
+            n += IrxLoader.OverrideThsemapWaitSignalImports(
+                mem, thbaseBase, thbaseBase + 0x200,
+                Iop.HleThsemapWaitSemaPc, Iop.HleThsemapSignalSemaPc, Iop.HleThbaseSleepThreadPc);
+            if (n != 3)
+                throw new Exception($"expected 3 WaitYield overrides (6,8,24), got {n}");
+
+            uint jWait = ((Iop.HleThsemapWaitSemaPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            uint jSig = ((Iop.HleThsemapSignalSemaPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            uint jSleep = ((Iop.HleThbaseSleepThreadPc >> 2) & 0x03FFFFFFu) | 0x08000000u;
+            // thsemap stubs: 6 at +0x14, 8 at +0x1C, 9 at +0x24
+            if (mem.Read32(thsemapBase + 0x14) != jSig) throw new Exception("ord6 Signal patch");
+            if (mem.Read32(thsemapBase + 0x1C) != jWait) throw new Exception("ord8 Wait patch");
+            if (mem.Read32(thsemapBase + 0x24) != 0x03E00008) throw new Exception("ord9 must stay");
+            if (mem.Read32(thbaseBase + 0x14) != jSleep) throw new Exception("ord24 Sleep patch");
+            if (mem.Read32(thbaseBase + 0x1C) != 0x03E00008) throw new Exception("ord4 must stay");
+        }
+
+        // --- HLE: Wait parks current, runs READY peer; Signal wakes waiter ---
+        string? prev = Environment.GetEnvironmentVariable("DETPS2_IOP_WAIT_YIELD");
+        string? prevKill = Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_WAIT_YIELD");
+        try
+        {
+            Environment.SetEnvironmentVariable("DETPS2_IOP_WAIT_YIELD", "1");
+            Environment.SetEnvironmentVariable("DETPS2_DISABLE_IOP_WAIT_YIELD", null);
+            if (!Iop.WaitYieldHleEnvEnabled)
+                throw new Exception("WaitYieldHleEnvEnabled false after set");
+
+            var sys = new Ps2System();
+            sys.Iop.EnableMultiThreadScaffolding();
+            int peer = sys.Iop.CreateSecondaryContext(0x0000D000);
+            if (peer < 1) throw new Exception("peer create failed");
+            // peer already READY from CreateSecondaryContext
+
+            int boot = sys.Iop.CurrentThreadId;
+            uint retPc = 0x0000E000;
+            sys.Iop.PC = Iop.HleThsemapWaitSemaPc;
+            sys.Iop.SetGpr(31, retPc);
+            sys.Iop.SetGpr(16, 0x11111111); // marker on boot
+            int retired = sys.Iop.Step(1);
+            if (retired != 1)
+                throw new Exception($"Wait HLE retired {retired}");
+            if (sys.Iop.CurrentThreadId != peer)
+                throw new Exception($"expected switch to peer={peer} got {sys.Iop.CurrentThreadId}");
+            if (sys.Iop.GetThreadStatus(boot) != IopThreadStatus.Wait)
+                throw new Exception("boot must be WAIT after park");
+            if (!sys.Iop.TryGetThreadContext(boot, out var bctx) || bctx == null || bctx.PC != retPc)
+                throw new Exception($"waiter PC must be ra=0x{retPc:X8} for resume, got 0x{bctx?.PC:X8}");
+
+            // Signal from peer wakes boot
+            sys.Iop.PC = Iop.HleThsemapSignalSemaPc;
+            sys.Iop.SetGpr(31, 0x0000F000);
+            sys.Iop.Step(1);
+            if (sys.Iop.GetThreadStatus(boot) != IopThreadStatus.Ready)
+                throw new Exception("Signal must READY the waiter");
+            if (sys.Iop.GetGpr(2) != 0)
+                throw new Exception("Signal v0 must be 0");
+
+            // Sleep alone: marks WAIT, stays current
+            var alone = new Ps2System();
+            alone.Iop.EnableMultiThreadScaffolding();
+            alone.Iop.PC = Iop.HleThbaseSleepThreadPc;
+            alone.Iop.SetGpr(31, 0x0000A000);
+            alone.Iop.Step(1);
+            if (alone.Iop.CurrentThreadId != 0)
+                throw new Exception("alone Sleep must stay on boot");
+            if (alone.Iop.GetThreadStatus(0) != IopThreadStatus.Wait)
+                throw new Exception("alone Sleep must mark WAIT");
+            if (alone.Iop.PC != 0x0000A000)
+                throw new Exception("alone Sleep must land on ra");
+
+            Console.WriteLine(
+                $"[Smoke] IopWaitYield_HleParkAndSignal OK " +
+                $"(peer={peer} waitPc=0x{Iop.HleThsemapWaitSemaPc:X} sigPc=0x{Iop.HleThsemapSignalSemaPc:X})");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DETPS2_IOP_WAIT_YIELD", prev);
+            Environment.SetEnvironmentVariable("DETPS2_DISABLE_IOP_WAIT_YIELD", prevKill);
+        }
+    }
 }
 

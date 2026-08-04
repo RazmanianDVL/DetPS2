@@ -1291,6 +1291,11 @@ press 3000 Circle 100
     public static void IopCreateThread_HleTrampoline_ReadyPeer() =>
         IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer();
 
+    /// <summary>Forward to <see cref="IopExecSmokes.IopWaitYield_HleParkAndSignal"/> for single-smoke CLI.</summary>
+    public static void IopWaitYield_HleParkAndSignal() =>
+        IopExecSmokes.IopWaitYield_HleParkAndSignal();
+
+
 
     public static void Dmac_LevelCatchup_DefaultOff_NoOp()
     {
@@ -1461,6 +1466,7 @@ press 3000 Circle 100
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
             IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
             IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer();
+            IopExecSmokes.IopWaitYield_HleParkAndSignal();
             IopExecSmokes.RealRpc_DispatchCompose_WithMultiThread();
             IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
             Sif_DmaRoundTrip_UpdatesMemory();

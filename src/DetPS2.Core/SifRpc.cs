@@ -1316,6 +1316,18 @@ public sealed class IopModuleHost
                     $"[LINKIMPORTS] thbase Create/Start/Delete/Exit HLE overrides={n} name=\"{name}\"");
         }
 
+        // C1 WaitSema phase-2: independent flag; thsemap Wait/Signal + thbase Sleep.
+        if (Iop.WaitYieldHleEnvEnabled)
+        {
+            int n = IrxLoader.OverrideThsemapWaitSignalImports(
+                mem, scanStart, scanEnd,
+                Iop.HleThsemapWaitSemaPc, Iop.HleThsemapSignalSemaPc,
+                Iop.HleThbaseSleepThreadPc);
+            if (n > 0 && Environment.GetEnvironmentVariable("DETPS2_TRACE_LINKIMPORTS") == "1")
+                Console.Error.WriteLine(
+                    $"[LINKIMPORTS] thsemap/thbase WaitYield HLE overrides={n} name=\"{name}\"");
+        }
+
         // MODLOAD LoadStartModule: after load, real hardware runs _start. DetPS2 still soft-marks
         // Started for registry/LOADFILE compatibility (games probes must see the module as up).
         // R3000 entry is armed for scheduler quanta (always unless DETPS2_FORCE_HLE_IOP=1).

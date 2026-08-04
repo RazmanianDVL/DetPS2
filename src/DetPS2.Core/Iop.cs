@@ -340,6 +340,11 @@ public sealed class Iop : ISchedulable
     public const uint HleThbaseDeleteThreadPc = 0x0000BF10u;
     public const uint HleThbaseExitThreadPc = 0x0000BF14u;
 
+    /// <summary>C1 WaitSema phase-2 trap PCs. Only when WAIT_YIELD flag on.</summary>
+    public const uint HleThsemapWaitSemaPc = 0x0000BF08u;
+    public const uint HleThsemapSignalSemaPc = 0x0000BF0Cu;
+    public const uint HleThbaseSleepThreadPc = 0x0000BF18u;
+
     // THREADMAN CreateThread error immediates (tools/bios-decomp/THREADMAN_ALL.txt FUN_00000c5c).
     public const uint KeIllegalContext = 0xFFFFFF9Cu;   // -100
     public const uint KeThNoMemory = 0xFFFFFE70u;       // alloc/table full
@@ -355,6 +360,15 @@ public sealed class Iop : ISchedulable
     public static bool CreateThreadHleEnvEnabled =>
         Environment.GetEnvironmentVariable("DETPS2_IOP_CREATE_THREAD") == "1"
         && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_CREATE_THREAD") != "1";
+
+    /// <summary>
+    /// Product: <c>DETPS2_IOP_WAIT_YIELD=1</c> enables thsemap WaitSema/SignalSema + thbase Sleep
+    /// HLE → <see cref="ParkAndYieldToReady"/> / wake-one WAIT. Independent of CREATE_THREAD.
+    /// Kill: <c>DETPS2_DISABLE_IOP_WAIT_YIELD=1</c>. Default off.
+    /// </summary>
+    public static bool WaitYieldHleEnvEnabled =>
+        Environment.GetEnvironmentVariable("DETPS2_IOP_WAIT_YIELD") == "1"
+        && Environment.GetEnvironmentVariable("DETPS2_DISABLE_IOP_WAIT_YIELD") != "1";
 
     /// <summary>
     /// Encode dense slot id as THREADMAN-shaped tid: <c>(slot &lt;&lt; 5) | 1</c>.
@@ -392,6 +406,20 @@ public sealed class Iop : ISchedulable
                     HleThbaseDeleteThread();
                 else
                     HleThbaseExitThread();
+                executed++;
+                InstructionsExecuted++;
+                continue;
+            }
+
+            // C1 WaitSema phase-2: Wait/Signal/Sleep → park-yield / wake-one.
+            if (WaitYieldHleEnvEnabled && _multiThreadEnabled &&
+                (PC == HleThsemapWaitSemaPc || PC == HleThsemapSignalSemaPc ||
+                 PC == HleThbaseSleepThreadPc))
+            {
+                if (PC == HleThsemapSignalSemaPc)
+                    HleThsemapSignalSema();
+                else
+                    HleThsemapWaitOrSleep(); // WaitSema + SleepThread same park
                 executed++;
                 InstructionsExecuted++;
                 continue;
@@ -1550,6 +1578,52 @@ public sealed class Iop : ISchedulable
     /// Same park semantics as WaitSema for this slice (no wakeup-count yet).
     /// </summary>
     public bool SleepThreadYieldHook() => ParkAndYieldToReady();
+
+    /// <summary>First WAIT peer (RR after current), or −1.</summary>
+    public int FindNextWaitingThread(int afterId = -1)
+    {
+        if (!_multiThreadEnabled || _threads == null) return -1;
+        int start = afterId >= 0 ? afterId : _currentThreadId;
+        for (int i = 1; i <= MaxIopThreadSlots; i++)
+        {
+            int id = (start + i) % MaxIopThreadSlots;
+            if (!_threads[id].InUse || id == _currentThreadId) continue;
+            if (_threads[id].Status == IopThreadStatus.Wait)
+                return id;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// WaitSema / SleepThread HLE: set v0=0 and PC=ra before park so a later wake resumes
+    /// after the call (not re-enter trap). Always-park v1 (ignore sema count). Alone: mark WAIT
+    /// but keep running at ra (do not hard-hang).
+    /// </summary>
+    private void HleThsemapWaitOrSleep()
+    {
+        uint ra = GetGpr(31);
+        SetGpr(2, 0);
+        PC = ra;
+        bool switched = ParkAndYieldToReady();
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_WAIT_YIELD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-WAIT-YIELD] park switched={switched} cur={_currentThreadId} ra=0x{ra:X8}");
+    }
+
+    /// <summary>
+    /// SignalSema HLE v1: wake one WAIT peer → READY (no count). Returns 0.
+    /// </summary>
+    private void HleThsemapSignalSema()
+    {
+        int w = FindNextWaitingThread();
+        // Boot is slot 0 — must wake it (not only secondary slots).
+        bool ok = w >= 0 && ReadyThread(w);
+        SetGpr(2, 0);
+        PC = GetGpr(31);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_IOP_WAIT_YIELD") == "1")
+            Console.Error.WriteLine(
+                $"[IOP-WAIT-YIELD] signal wakeSlot={w} ok={ok} ra=0x{GetGpr(31):X8}");
+    }
 
     /// <summary>
     /// Wake a parked context: WAIT (or DORMANT) → READY. No switch. Returns false when
