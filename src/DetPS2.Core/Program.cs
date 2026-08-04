@@ -581,6 +581,8 @@ if (args.Length > 0 && args[0].Equals("blocker-trace", StringComparison.OrdinalI
             foreach (var t in traceSys.Hle.Kernel.AllThreads)
                 Console.WriteLine($"    id={t.Id} alive={t.Alive} started={t.Started} sleeping={t.Sleeping} waitSemaId={t.WaitSemaId}");
             Console.WriteLine($"  currentThreadId={traceSys.Hle.Kernel.CurrentThreadId}");
+            Console.WriteLine(
+                $"  KernelHle: genericStarvedSleepRescues={traceSys.Hle.Kernel.GenericStarvedSleepRescues}");
         }
         Console.WriteLine($"  IOP: pc=0x{traceSys.Iop.PC:X8}");
         if (traceSys.Hle.Sony != null)
@@ -886,6 +888,8 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["liveRpcHits"] = rpc?.LiveRpcHits ?? 0UL,
             ["liveRpcFallbacks"] = rpc?.LiveRpcFallbacks ?? 0UL,
             ["unknownServiceCalls"] = rpc?.UnknownServiceCalls ?? 0UL,
+            // M6-b / G7-3: KernelHle generic SleepThread/Suspend starve rescues (scoreboard scrape; not savestate).
+            ["genericStarvedSleepRescues"] = smSys.Hle.Kernel.GenericStarvedSleepRescues,
             ["exitRequested"] = exitReq,
             ["exitCode"] = smSys.Hle.ExitCode,
             ["cycles"] = smSys.MasterCycles,
