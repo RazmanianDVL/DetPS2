@@ -1885,7 +1885,7 @@ public sealed class SonyKernelHle
         // Pass reboot arg so LOADFILE GetVersion can return the IOPRP ASCII tag
         // (MK:DA "2430", shared SN ProDG gate — see RealSifRpc.ExtractIopRpVersionAscii).
         // This is UDNL-arg handoff into the HLE GetVersion store — not an EE RAM version plant.
-        RealRpc.OnIopReboot(_system.Sif.LastIopRebootArg);
+        RealRpc.OnIopReboot(_system.Sif.LastIopRebootArg, _system.Memory);
 
         // WP-22 prep (DETPS2_LITERAL_IRX=1): prefer GetVersion from the real RESET/UDNL arg
         // when present, so classic 0x00020000 does not fight disc IOPRP version gates.

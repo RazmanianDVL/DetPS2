@@ -410,6 +410,16 @@ public sealed class RealSifRpc
             _lastIopRpVersionAscii = ver;
     }
 
+    /// <summary>
+    /// M4-S4: if EE version-cell mirror is enabled, write <see cref="LastIopRpVersionAscii"/> into
+    /// registered cells. Call after tag updates when <see cref="SystemMemory"/> is available.
+    /// </summary>
+    public void TryMirrorIopRpVersionCells(SystemMemory? mem)
+    {
+        if (mem == null || string.IsNullOrEmpty(_lastIopRpVersionAscii)) return;
+        IopRpEeVersionMirror.TryApply(mem, _lastIopRpVersionAscii);
+    }
+
     // IOP heap window for SidSysmem HLE. Sits above IopModuleHost IRX placement
     // (IrxLoader.DefaultLoadBase … ~0x180000) and below bind-scratch (0x1F0000).
     // Real SYSMEM manages nearly all free IOP RAM via 256-byte page freelists; this is a
@@ -670,7 +680,7 @@ public sealed class RealSifRpc
     /// compare the 4-byte reply against the IOPRP digits (MK:DA "2430", BO2 "2340", B3 "2800")
     /// see a real UDNL-style handoff instead of the bare LOADFILE 0x00020000 placeholder.
     /// </param>
-    public void OnIopReboot(string? rebootArg = null)
+    public void OnIopReboot(string? rebootArg = null, SystemMemory? mem = null)
     {
         // Snapshot for ghost DMA refresh; clear active map so re-OPEN can succeed.
         if (_padAreas.Count > 0)
@@ -691,6 +701,9 @@ public sealed class RealSifRpc
             if (ver.Length > 0)
                 _lastIopRpVersionAscii = ver;
         }
+        // M4-S4: mirror applied tag into registered EE cells (flag-gated inside helper).
+        if (mem != null)
+            TryMirrorIopRpVersionCells(mem);
         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_REBOOT") == "1"
             || Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
             Console.Error.WriteLine(

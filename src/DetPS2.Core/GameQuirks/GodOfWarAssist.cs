@@ -415,16 +415,21 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public void OnDiscMounted(Ps2System sys)
     {
         Reset();
+        // M4-S4: register EE version placeholder for Core mirror (writes only if DETPS2_MIRROR_IOPRP_CELLS=1).
+        IopRpEeVersionMirror.RegisterCell(IopVersionPlaceholder);
         if (sys.Hle?.Sony?.RealRpc != null)
         {
             if (!SkipPreferIopRp)
                 sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = true;
             else
                 sys.Hle.Sony.RealRpc.PreferIopRpGetVersion = false;
+            // If tag already known (re-mount), attempt mirror immediately.
+            sys.Hle.Sony.RealRpc.TryMirrorIopRpVersionCells(sys.Memory);
         }
         // EE RAM "3000" plant only at boot — do NOT SetIopRpVersionAscii early:
         // live claim with GetVersion="3000" from cyc0 regressed binds 16→10 / dmac 463→321
         // (FILEIO-2200 arming / LOADFILE path skew). Post-empty-reboot handoff below sets it.
+        // Product plant stays ON until claim-tier proves mirror can replace it (Claude Q9).
         if (!SkipVersionPlant)
             PlantIopRpVersion(sys);
     }
@@ -453,7 +458,12 @@ public sealed class GodOfWarAssist : IGameQuirkModule
     public static void PlantIopRpVersion(Ps2System sys)
     {
         // All call sites (mount, post-ELF, reboot-gen, FreezeCache) share this gate.
-        if (SkipVersionPlant) return;
+        // When plant is suppressed (evidence) but S4 mirror is on, still apply Core mirror.
+        if (SkipVersionPlant)
+        {
+            sys.Hle?.Sony?.RealRpc?.TryMirrorIopRpVersionCells(sys.Memory);
+            return;
+        }
         // Only overwrite the unfilled "...." placeholder — never clobber a real version.
         uint w = sys.Memory.Read32(IopVersionPlaceholder);
         if (w == 0x2E2E2E2Eu || w == 0) // "...." or zero
@@ -464,6 +474,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
             sys.Memory.Write8(IopVersionPlaceholder + 2, (byte)'0');
             sys.Memory.Write8(IopVersionPlaceholder + 3, (byte)'0');
         }
+        // Also push Core mirror when enabled (same tag source when RPC knows it).
+        sys.Hle?.Sony?.RealRpc?.TryMirrorIopRpVersionCells(sys.Memory);
     }
 
     /// <summary>
@@ -487,6 +499,8 @@ public sealed class GodOfWarAssist : IGameQuirkModule
                 Console.Error.WriteLine(
                     $"[GOW] SetIopRpVersionAscii(\"3000\") reason={reason} cyc={c}");
         }
+        // M4-S4: after tag is known, mirror into registered EE cell when env enabled.
+        rpc.TryMirrorIopRpVersionCells(sys.Memory);
     }
 
     public void Step(Ps2System sys)
