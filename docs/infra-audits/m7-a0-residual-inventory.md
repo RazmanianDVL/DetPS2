@@ -56,3 +56,12 @@ MK: Armageddon (same assist class as DA/Deception, not separately re-verified), 
 ## Next step recommendation (not started here — needs its own design-first ACK, same as M4-S4-MIRROR got)
 
 Per the R1/R5-majority split, the natural next design pick is **Slice 2 (Path2/3 IMAGE delivery hardening in `Gif.cs`)**, targeting the shared gap across GoW/BO2/Whiplash/SotC/MK-DA/MK-Dec: real Path2/3 GIF IMAGE tags not completing/delivering, forcing every one of those titles onto Host→Local assist residual. This is genuinely the "one-fix-many-titles" shape the mission wants — 6 titles share the same primary gap class. Recommend this be scoped as its own design doc (mirroring M4-S4-MIRROR's dual-ACK process) before any Core implementation, per this design doc's own hard ban: "Edit GameQuirks / RealSifRpc in M7-a implement turns without explicit ACK" and its general design-first posture for all Core GFX changes.
+
+
+## Discrepancy note — MK:DA naturalDispfbPx (2026-08-04, Grok dual-ACK Q4)
+
+A0 table row above for **MK: Deadly Alliance** pulls historical docs/title-ports/MK_DEADLY_ALLIANCE.md numbers (
+atural=224016). Fresh claim-class Soft-GS evidence at tip of M7-c-2b / GIF_BISECT-4 shows **
+aturalDispfbPx=0**, compositeSource=LastImageTrx, esidualDispfbPx=46080, with real Path3 IMAGE delivered (imgBytes=98304, gifP3=6) — see docs/infra-audits/m7c-2b-midway-image-stall-rootcause.md and docs/infra-audits/m7c-slice3-dispfb-composite-design.md §1.3.
+
+**Do not build Slice 3 mechanism on either number alone.** Next reconciling seat: single canonical MK:DA claim-tier run at current tip. Until then treat A0 MK:DA natural count as **stale/historical**.
