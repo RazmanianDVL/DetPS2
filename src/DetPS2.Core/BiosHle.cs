@@ -308,8 +308,9 @@ public sealed class BiosHle
                 break;
 
             case SysSifSetDma:
-                // a0 = packet addr (simplified: run one SIF step)
-                _system.Sif.Step(32);
+                // a0 = packet addr. M1-e: defer simplified Sif.Step to ambient scheduler
+                // (busy/retry next slice). DETPS2_DISABLE_M1E_SYSCALL_SIF=1 → Step(32).
+                _system.Sif.StepFromSyscall(32);
                 result = 1;
                 break;
 
@@ -405,8 +406,10 @@ public sealed class BiosHle
                 break;
 
             case SysSifRpcCall:
+                // Homebrew sync ABI: submit then return packet result. M1-e allows one
+                // small Step (M1-d batch=1); kill-switch restores Step(16).
                 _system.Sif.SubmitRpc(a0);
-                _system.Sif.Step(16);
+                _system.Sif.StepFromSyscall(16, needImmediateResult: true);
                 result = _system.Memory.Read32(a0 + 12);
                 break;
 
@@ -418,7 +421,9 @@ public sealed class BiosHle
                 break;
 
             case SysSifRpcSync:
-                _system.Sif.Step(64);
+                // M1-e: do not bulk-complete mid-syscall; report current RpcProcessed
+                // (poller retries after ambient Sif.Step). Kill-switch → Step(64).
+                _system.Sif.StepFromSyscall(64);
                 result = (long)_system.Sif.RpcProcessed;
                 break;
 
@@ -481,7 +486,8 @@ public sealed class BiosHle
                 break;
             case BootBlockerFixes.SonySifSetDma:
             case BootBlockerFixes.SonySifSetDChain:
-                _system.Sif.Step(32);
+                // M1-e: defer simplified Step (commercial path is SonyKernelHle.PerformSifSetDma).
+                _system.Sif.StepFromSyscall(32);
                 result = 1;
                 break;
             case BootBlockerFixes.SonySifSetReg:

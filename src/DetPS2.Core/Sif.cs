@@ -52,6 +52,16 @@ public sealed class Sif : ISchedulable
     private static readonly bool DisableM1dSifBatch =
         Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1D_SIF_BATCH") == "1";
 
+    // M1-e (instant-progress-audit related syscall sites): BiosHle / SonyKernelHle used to
+    // call Sif.Step(16|32|64) mid-syscall so simplified HLE completed inside the same EE
+    // instruction that submitted work. Default defers to ambient scheduler Step (busy /
+    // retry next slice). Home-brew SysSifRpcCall still needs one small Step for its sync
+    // result (M1-d already caps batch to 1). Kill-switch DETPS2_DISABLE_M1E_SYSCALL_SIF=1
+    // restores legacy Step(N) at call sites. Real-RPC LOADFILE/FILEIO use DrainRealRpcQueue
+    // + generation gate — not this simplified queue — and are unchanged.
+    private static readonly bool DisableM1eSyscallSif =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_M1E_SYSCALL_SIF") == "1";
+
     /// <summary>
     /// Real, retail-compiled sifrpc.c bind/call packets (cid 0x80000009/0x8000000A), queued
     /// for the IOP's own scheduler tick to drain instead of being answered synchronously
@@ -652,5 +662,30 @@ public sealed class Sif : ISchedulable
         }
 
         return n > 0 ? n : 0;
+    }
+
+    /// <summary>
+    /// M1-e entry for <b>syscall-time</b> simplified SIF progress (BiosHle / SonyKernelHle).
+    /// Default defers drain to the ambient scheduler <see cref="Step"/> (busy / retry next
+    /// slice). When <paramref name="needImmediateResult"/> is true (homebrew
+    /// <c>SysSifRpcCall</c> ABI that reads the packet result before returning), runs one
+    /// small <see cref="Step"/>(1); M1-d already caps the simplified batch to one packet.
+    /// <para>
+    /// Kill-switch <c>DETPS2_DISABLE_M1E_SYSCALL_SIF=1</c> restores legacy
+    /// <c>Step(legacyCycles)</c>. Real-RPC LOADFILE/FILEIO are not drained here — they use
+    /// <c>DrainRealRpcQueue</c> + the generation gate.
+    /// </para>
+    /// </summary>
+    public void StepFromSyscall(ulong legacyCycles, bool needImmediateResult = false)
+    {
+        if (DisableM1eSyscallSif)
+        {
+            Step(legacyCycles);
+            return;
+        }
+
+        if (needImmediateResult)
+            Step(1);
+        // else: defer — ambient Scheduler.StepComponents → Sif.Step next slice
     }
 }

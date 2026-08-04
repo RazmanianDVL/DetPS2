@@ -1601,9 +1601,14 @@ public sealed class SonyKernelHle
         // than this one — see DrainRealRpcQueue's own doc comment for why a title's own
         // tight bind-retry loop needs this mid-EE.Step() drain, not just the once-per-tick
         // ambient one, to avoid exhausting the real EE-side packet pool.
+        // LOADFILE/FILEIO retail BIND/CALL go through this real-RPC path (generation-gated),
+        // not the simplified Sif.Step queue below.
         DrainRealRpcQueue(_system.SchedulerGeneration);
 
-        _system.Sif.Step(64);
+        // M1-e: do not bulk-complete simplified HLE RPC mid-SifSetDma (audit ~line 1606).
+        // Prefer only DrainRealRpcQueue above; ambient Sif.Step drains _rpcPacketAddrs next
+        // slice. DETPS2_DISABLE_M1E_SYSCALL_SIF=1 restores legacy Step(64).
+        _system.Sif.StepFromSyscall(64);
         // Mark SMFLAG that IOP saw the transfer (retail polls SIFINIT) — but not during a
         // pending IOP reboot, where EE deliberately clears SIFINIT/CMDINIT after this returns.
         if (!_system.Sif.IopRebootPending)
