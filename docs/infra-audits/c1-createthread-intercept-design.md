@@ -42,10 +42,18 @@ When `DETPS2_IOP_THREADS=1` (and optional product flag below):
 
 | Env | Default | Role |
 |-----|---------|------|
-| `DETPS2_IOP_THREADS=1` | off | Prerequisite multi-context table |
-| `DETPS2_IOP_CREATE_THREAD=1` | **off** | Enable Create/StartThread intercept → READY peers |
+| `DETPS2_IOP_THREADS=1` | off | Prerequisite multi-context table (does **not** by itself intercept CreateThread) |
+| `DETPS2_IOP_CREATE_THREAD=1` | **off** | Enable Create/StartThread **import trampoline** → READY peers |
 | `DETPS2_DISABLE_IOP_CREATE_THREAD=1` | unset | Kill intercept |
 | `DETPS2_IOP_YIELD_START=1` | off | Residual start (already landed) |
+
+#### Flag-off / blast-radius clarification (dual-ACK)
+
+**Today (flag-off):** real IRX that calls THREADMAN `CreateThread`/`StartThread` executes **interpreted THREADMAN.IRX** in IOP RAM (import relocation to real module text). There is **no** existing DetPS2 HLE stub for those ordinals — so this design is **not** “filling a no-op”; it is an **opt-in replacement** of that real code path with a C# trampoline that updates `Iop`’s cooperative table.
+
+**Mandatory:** the trampoline is installed **only** when `DETPS2_IOP_CREATE_THREAD=1` **and** kill is unset.  
+- `DETPS2_IOP_THREADS=1` alone → **no** change to CreateThread/StartThread resolution (still real THREADMAN.IRX).  
+- Product default remains **off** → fleet byte-identical for titles that already depend on real THREADMAN CreateThread behavior.
 
 ### 2.3 CreateThread contract (minimal)
 
