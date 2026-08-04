@@ -1295,6 +1295,11 @@ press 3000 Circle 100
     public static void IopWaitYield_HleParkAndSignal() =>
         IopExecSmokes.IopWaitYield_HleParkAndSignal();
 
+    /// <summary>Forward to <see cref="IopExecSmokes.IopYieldStart_EntryThread_NotFalsePeer"/> for single-smoke CLI.</summary>
+    public static void IopYieldStart_EntryThread_NotFalsePeer() =>
+        IopExecSmokes.IopYieldStart_EntryThread_NotFalsePeer();
+
+
     /// <summary>Forward to <see cref="IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits"/> for single-smoke CLI.</summary>
     public static void RealRpc_SyntheticLiveRegister_BindCallHits() =>
         IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits();
@@ -1470,6 +1475,7 @@ press 3000 Circle 100
             IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
             IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
+            IopExecSmokes.IopYieldStart_EntryThread_NotFalsePeer();
             IopExecSmokes.IopCreateThread_HleTrampoline_ReadyPeer();
             IopExecSmokes.IopWaitYield_HleParkAndSignal();
             IopExecSmokes.RealRpc_DispatchCompose_WithMultiThread();

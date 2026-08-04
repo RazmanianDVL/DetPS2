@@ -52,17 +52,17 @@ Flag-off: still byte-identical (yield-start off).
 
 **Bias: S1 first** (smallest blast radius), optional **S2** if S1 insufficient after smoke/canary.
 
-### S1 sketch
+### S1 sketch (landed)
 
 ```text
-at checkpoint:
-  peer = FindNextReadyThread()
-  if peer < 0: continue
-  if IsModuleEntryThread(peer) or peer == RpcDispatchThreadId: continue  // not a yield surface
-  // else: enqueue residual (true worker or orphan READY)
+at checkpoint: HasNonEntryReadyPeer(iop)
+  skip tid 0 (boot — always READY when on an entry context)
+  skip any LoadedIrx.EntryThreadId
+  skip RpcDispatchThreadId
+  accept READY/RUN only on remaining slots (CreateThread / CreateSecondary workers)
 ```
 
-`IsModuleEntryThread(tid)`: walk `IopModuleHost` irx records for `EntryThreadId == tid`.
+**Implement note:** boot exclusion is required — otherwise every multi-thread `StartLoadedModule` sees boot READY after `PrepareModuleEntry` switches to the entry context.
 
 ### S2 sketch (phase 2)
 

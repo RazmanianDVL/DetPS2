@@ -580,6 +580,46 @@ public sealed class IopModuleHost
 
     public bool TryGetIrx(int id, out LoadedIrx irx) => _irxById.TryGetValue(id, out irx!);
 
+    /// <summary>
+    /// True if <paramref name="tid"/> is any loaded module's C1.2 <see cref="LoadedIrx.EntryThreadId"/>
+    /// (PrepareModuleEntry scaffolding — not a CreateThread worker).
+    /// </summary>
+    public bool IsModuleEntryThread(int tid)
+    {
+        if (tid < 1) return false;
+        foreach (var kv in _irxById)
+        {
+            if (kv.Value.EntryThreadId == tid)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// C1 S1 peer scoping: READY/RUN peer that is a real worker surface — not boot (tid 0),
+    /// not any module's C1.2 entry-thread scaffold, not the RealSifRpc dispatch slot.
+    /// Used by yield-start checkpoint only. CreateThread HLE workers (tid≥1, non-entry) count.
+    /// </summary>
+    public bool HasNonEntryReadyPeer(Iop iop)
+    {
+        if (iop == null || !iop.MultiThreadEnabled) return false;
+        int rpcDisp = iop.RpcDispatchThreadId;
+        // Scan RR like FindNextReadyThread but skip scaffolding / primordial slots.
+        int start = iop.CurrentThreadId;
+        for (int i = 1; i <= Iop.MaxIopThreadSlots; i++)
+        {
+            int id = (start + i) % Iop.MaxIopThreadSlots;
+            if (id == 0) continue; // boot / primordial — always READY when on an entry context
+            if (id == iop.CurrentThreadId) continue;
+            if (id == rpcDisp) continue;
+            if (IsModuleEntryThread(id)) continue;
+            var st = iop.GetThreadStatus(id);
+            if (st == IopThreadStatus.Ready || st == IopThreadStatus.Run)
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Snapshot of the module table in ascending id order (LOADCORE image_info walk).</summary>
     public IReadOnlyList<LoadedIrx> GetModuleTable()
     {
@@ -853,8 +893,9 @@ public sealed class IopModuleHost
                 if (done >= nextCheckpoint)
                 {
                     nextCheckpoint += YieldStartCheckpointInsn;
-                    // Yield surface: multi-thread peer READY (worker created). Residual only then.
-                    if (iop.FindNextReadyThread() >= 0)
+                    // Yield surface: READY peer that is NOT another module's C1.2 entry
+                    // context or the RPC dispatch slot (S1 peer scoping — c1-yieldstart-peer-scoping-design).
+                    if (HasNonEntryReadyPeer(iop))
                     {
                         ulong remain = firstCallCap > done ? firstCallCap - done : 0;
                         if (remain > 0)

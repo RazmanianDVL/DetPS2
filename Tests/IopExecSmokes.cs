@@ -1142,6 +1142,52 @@ public static class IopExecSmokes
     }
 
     /// <summary>
+    /// C1 S1: leftover module EntryThreadId + boot must not count as yield-start surface;
+    /// a real CreateSecondary worker must.
+    /// </summary>
+    public static void IopYieldStart_EntryThread_NotFalsePeer()
+    {
+        var sys = new Ps2System();
+        sys.Iop.EnableMultiThreadScaffolding();
+        sys.IopModules.EnableYieldStartScaffolding();
+
+        byte[] irxA = IrxLoader.BuildMinimalIrx("YSFA");
+        if (!sys.LoadIrx(irxA, "YSFA").Success)
+            throw new Exception("LoadIrx YSFA failed");
+        int idA = sys.IopModules.SearchModuleByName("YSFA");
+        var runA = sys.IopModules.StartLoadedModule(sys, idA, maxInstructions: 256);
+        if (!runA.Success)
+            throw new Exception($"YSFA start failed: {runA.Message}");
+        if (!sys.IopModules.TryGetIrx(idA, out var recA) || recA.EntryThreadId < 1)
+            throw new Exception("YSFA EntryThreadId not bound");
+        int entryA = recA.EntryThreadId;
+
+        if (sys.Iop.CurrentThreadId != 0)
+            sys.Iop.SwitchToThread(0);
+        sys.Iop.ReadyThread(entryA);
+
+        if (!sys.IopModules.IsModuleEntryThread(entryA))
+            throw new Exception("entryA must be classified as module entry thread");
+        // Global FindNextReadyThread may still see entryA and/or boot; S1 must not.
+        if (sys.IopModules.HasNonEntryReadyPeer(sys.Iop))
+            throw new Exception(
+                "HasNonEntryReadyPeer must be false with only boot + entry scaffolds " +
+                $"(entryA={entryA} status={sys.Iop.GetThreadStatus(entryA)} " +
+                $"globalPeer={sys.Iop.FindNextReadyThread()})");
+
+        int worker = sys.Iop.CreateSecondaryContext(0x0000E000);
+        if (worker < 1) throw new Exception("worker create failed");
+        if (sys.IopModules.IsModuleEntryThread(worker))
+            throw new Exception("CreateSecondary worker must not be an EntryThreadId");
+        if (!sys.IopModules.HasNonEntryReadyPeer(sys.Iop))
+            throw new Exception("worker must count as non-entry READY peer");
+
+        Console.WriteLine(
+            $"[Smoke] IopYieldStart_EntryThread_NotFalsePeer OK " +
+            $"(entryA={entryA} worker={worker} globalPeer={sys.Iop.FindNextReadyThread()})");
+    }
+
+    /// <summary>
     /// C1 WaitSema phase-2: thsemap Wait(8)/Signal(6) + thbase Sleep(24) override;
     /// HLE park switches to READY peer; Signal wakes WAIT; flag-off independent of CREATE_THREAD.
     /// </summary>
