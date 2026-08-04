@@ -3,6 +3,56 @@ using System;
 namespace DetPS2.Core;
 
 /// <summary>
+/// ps2sdk-style thread status bits for IOP cooperative multi-context (THREADMAN contract).
+/// Combinable: WAIT|SUSPEND = 0x0C. Slice-1 scaffolding only — not a full ready-queue port.
+/// </summary>
+[Flags]
+public enum IopThreadStatus : byte
+{
+    None = 0,
+    /// <summary>THS_RUN — currently executing on the R3000 live register file.</summary>
+    Run = 0x01,
+    /// <summary>THS_READY — runnable, waiting for a switch.</summary>
+    Ready = 0x02,
+    /// <summary>THS_WAIT — SleepThread / WaitSema / etc. (THREADMAN later).</summary>
+    Wait = 0x04,
+    /// <summary>THS_SUSPEND — suspend nest (THREADMAN later).</summary>
+    Suspend = 0x08,
+    /// <summary>THS_DORMANT — never started or exited.</summary>
+    Dormant = 0x10,
+}
+
+/// <summary>
+/// Saved IOP R3000 register context for one cooperative thread.
+/// Live decode loop still uses <see cref="Iop"/>'s active PC/GPR arrays; switch = save active → load target.
+/// See docs/IOP_MULTITHREAD_AND_REAL_RPC.md §2.
+/// </summary>
+public sealed class IopThreadContext
+{
+    public int Id { get; internal set; }
+    public IopThreadStatus Status { get; set; }
+    /// <summary>Resume PC after yield / switch.</summary>
+    public uint PC;
+    /// <summary>Full 32 GPRs; r0 is forced zero on restore.</summary>
+    public readonly uint[] Gprs = new uint[32];
+    public uint HI;
+    public uint LO;
+    /// <summary>Initial top-of-stack (SP at create). Stacks grow downward on R3000.</summary>
+    public uint StackTop;
+    /// <summary>Reserved stack size in bytes (convention for unique SP allocation).</summary>
+    public uint StackSize;
+    /// <summary>True when this slot holds a live context (boot thread 0 is always live when table exists).</summary>
+    public bool InUse;
+
+    /// <summary>$sp = Gprs[29]. Explicit accessor for stack-pointer convention docs.</summary>
+    public uint Sp
+    {
+        get => Gprs[29];
+        set => Gprs[29] = value;
+    }
+}
+
+/// <summary>
 /// IOP R3000A interpreter (Phase 8 / IRX WP-05+06).
 /// Delay slots, LO/HI, expanded loads/stores, minimal COP0, deterministic stepping.
 /// Public <see cref="RunInstructions"/> is the preferred quantum API for IRX module exec.
@@ -14,6 +64,24 @@ public sealed class Iop : ISchedulable
     /// <summary>R3000A general exception vector when Status.BEV=1 (BIOS).</summary>
     public const uint VectorGeneralBev = 0xBFC00180u;
 
+    /// <summary>
+    /// Env <c>DETPS2_IOP_THREADS=1</c> enables multi-context save/restore scaffolding.
+    /// Unset / 0 (default): single flat register file — byte-identical to pre-scaffolding tip.
+    /// </summary>
+    public static readonly bool MultiThreadEnvEnabled =
+        Environment.GetEnvironmentVariable("DETPS2_IOP_THREADS") == "1";
+
+    /// <summary>Dense thread table size (boot = id 0). Full THREADMAN ready queues are later.</summary>
+    public const int MaxIopThreadSlots = 32;
+
+    /// <summary>
+    /// Base of reserved secondary-stack region (IOP phys). Slot N uses
+    /// <c>[base + N*size, base + (N+1)*size)</c> with SP = top. Below THREADMAN entry slots
+    /// (0x1D0000) and RealSifRpc scratch (0x1E0000); not a heap-safe proof — THREADMAN later.
+    /// </summary>
+    public const uint ThreadStackRegionBase = 0x001C0000u;
+    public const uint ThreadStackSlotSize = 0x2000u;
+
     public Intc Intc { get; }
 
     public uint PC { get; set; } = 0xBFC00000;
@@ -21,6 +89,15 @@ public sealed class Iop : ISchedulable
 
     public uint LO { get; private set; }
     public uint HI { get; private set; }
+
+    // --- C1 multi-thread context scaffolding (DETPS2_IOP_THREADS) ---
+    // When disabled: _threads stays null, no allocations, Step path untouched.
+    // When enabled: table of IopThreadContext; live PC/_gprs/HI/LO are the current thread.
+    // RR scheduler / WaitSema yield hooks: THREADMAN later (see IOP_MULTITHREAD_AND_REAL_RPC.md).
+    private bool _multiThreadEnabled = MultiThreadEnvEnabled;
+    private IopThreadContext[]? _threads;
+    private int _currentThreadId;
+    private int _nextThreadSlot = 1;
 
     public uint Cop0Status { get; set; }
     public uint Cop0Cause { get; set; }
@@ -180,6 +257,7 @@ public sealed class Iop : ISchedulable
         _vectorTarget = 0;
         _traceUnkMmioLogged = 0;
         _traceUnkCopLogged = 0;
+        ResetThreadTable();
     }
 
     /// <summary>Full IOP core state for SaveState.cs, including LO/HI (no public setters —
@@ -979,5 +1057,202 @@ public sealed class Iop : ISchedulable
         ExceptionCount = 0;
         LastExceptionCode = 0;
         LastSyscallCode = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // C1 multi-thread context scaffolding (DETPS2_IOP_THREADS)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// True when multi-context save/restore is active for this IOP instance.
+    /// Default follows <see cref="MultiThreadEnvEnabled"/>; tests may call
+    /// <see cref="EnableMultiThreadScaffolding"/>.
+    /// </summary>
+    public bool MultiThreadEnabled => _multiThreadEnabled;
+
+    /// <summary>Current cooperative thread id (always 0 when multi-thread is off).</summary>
+    public int CurrentThreadId => _multiThreadEnabled ? _currentThreadId : 0;
+
+    /// <summary>Number of in-use contexts (1 when multi-thread off = the single flat GPR set).</summary>
+    public int ThreadCount
+    {
+        get
+        {
+            if (!_multiThreadEnabled || _threads == null) return 1;
+            int n = 0;
+            for (int i = 0; i < _threads.Length; i++)
+                if (_threads[i].InUse) n++;
+            return n;
+        }
+    }
+
+    /// <summary>
+    /// Enable multi-context scaffolding after construction (tests / diagnostics).
+    /// Product path: set <c>DETPS2_IOP_THREADS=1</c> before process start.
+    /// Does not start a RR scheduler — only data structures + create/switch.
+    /// </summary>
+    public void EnableMultiThreadScaffolding()
+    {
+        _multiThreadEnabled = true;
+        EnsureThreadTable();
+    }
+
+    /// <summary>
+    /// Create a secondary context with a unique SP in the reserved stack region.
+    /// Returns thread id, or -1 if multi-thread is off / table full.
+    /// Dual-context stub for slice 1; full THREADMAN CreateThread later.
+    /// </summary>
+    public int CreateSecondaryContext(uint entryPc)
+    {
+        if (!_multiThreadEnabled) return -1;
+        EnsureThreadTable();
+        // Find free slot ≥ 1; stack top = base + (slot+1)*size (grows down into the slot).
+        for (int id = 1; id < MaxIopThreadSlots; id++)
+        {
+            if (_threads![id].InUse) continue;
+            uint stackTop = ThreadStackRegionBase + (uint)(id + 1) * ThreadStackSlotSize;
+            return InitThreadSlot(id, entryPc, stackTop, ThreadStackSlotSize, IopThreadStatus.Ready);
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Create a thread context with an explicit stack top (caller owns uniqueness).
+    /// Returns id or -1 when disabled / full. Does not switch to the new context.
+    /// </summary>
+    public int CreateThreadContext(uint entryPc, uint stackTop, uint stackSize = ThreadStackSlotSize)
+    {
+        if (!_multiThreadEnabled) return -1;
+        EnsureThreadTable();
+        for (int id = 1; id < MaxIopThreadSlots; id++)
+        {
+            if (_threads![id].InUse) continue;
+            return InitThreadSlot(id, entryPc, stackTop, stackSize, IopThreadStatus.Ready);
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Save live PC/GPRs/HI/LO into the current context, load <paramref name="tid"/> onto the live set.
+    /// No-op success if already on <paramref name="tid"/>. Returns false if multi-thread off or bad id.
+    /// COP0 / branch-pending state is not switched (shared exception state for slice 1).
+    /// </summary>
+    public bool SwitchToThread(int tid)
+    {
+        if (!_multiThreadEnabled || _threads == null) return false;
+        if ((uint)tid >= (uint)MaxIopThreadSlots || !_threads[tid].InUse) return false;
+        if (tid == _currentThreadId) return true;
+
+        SaveLiveToContext(_threads[_currentThreadId]);
+        if (_threads[_currentThreadId].Status == IopThreadStatus.Run)
+            _threads[_currentThreadId].Status = IopThreadStatus.Ready;
+
+        LoadContextToLive(_threads[tid]);
+        _threads[tid].Status = IopThreadStatus.Run;
+        _currentThreadId = tid;
+        return true;
+    }
+
+    /// <summary>Look up a context by id. False when multi-thread off or slot unused.</summary>
+    public bool TryGetThreadContext(int tid, out IopThreadContext? ctx)
+    {
+        ctx = null;
+        if (!_multiThreadEnabled || _threads == null) return false;
+        if ((uint)tid >= (uint)MaxIopThreadSlots || !_threads[tid].InUse) return false;
+        // Keep current slot's saved view coherent for readers that inspect without switching.
+        if (tid == _currentThreadId)
+            SaveLiveToContext(_threads[tid]);
+        ctx = _threads[tid];
+        return true;
+    }
+
+    private void EnsureThreadTable()
+    {
+        if (_threads != null) return;
+        _threads = new IopThreadContext[MaxIopThreadSlots];
+        for (int i = 0; i < MaxIopThreadSlots; i++)
+            _threads[i] = new IopThreadContext { Id = i };
+        // Boot context 0 = current live single-context state.
+        var boot = _threads[0];
+        boot.InUse = true;
+        boot.Status = IopThreadStatus.Run;
+        SaveLiveToContext(boot);
+        // Match IopModuleHost.DefaultModuleStack (0x1F0000) when live SP is still zero.
+        boot.StackTop = boot.Sp != 0 ? boot.Sp : 0x001F0000u;
+        boot.StackSize = ThreadStackSlotSize;
+        _currentThreadId = 0;
+        _nextThreadSlot = 1;
+    }
+
+    private void ResetThreadTable()
+    {
+        _currentThreadId = 0;
+        _nextThreadSlot = 1;
+        if (!_multiThreadEnabled)
+        {
+            // Drop any table so a later Enable re-captures live state; no alloc when still off.
+            _threads = null;
+            return;
+        }
+        if (_threads == null)
+        {
+            // Lazy: only allocate if still enabled (env was set at start).
+            // Avoid ctor-path alloc until first Create/Switch when env-enabled but unused.
+            return;
+        }
+        for (int i = 0; i < _threads.Length; i++)
+        {
+            var t = _threads[i];
+            t.InUse = false;
+            t.Status = IopThreadStatus.Dormant;
+            t.PC = 0;
+            Array.Clear(t.Gprs);
+            t.HI = t.LO = 0;
+            t.StackTop = 0;
+            t.StackSize = 0;
+        }
+        var boot = _threads[0];
+        boot.InUse = true;
+        boot.Status = IopThreadStatus.Run;
+        SaveLiveToContext(boot);
+        boot.StackTop = 0x001F0000u; // IopModuleHost.DefaultModuleStack
+        boot.StackSize = ThreadStackSlotSize;
+    }
+
+    private int InitThreadSlot(int id, uint entryPc, uint stackTop, uint stackSize, IopThreadStatus status)
+    {
+        var t = _threads![id];
+        t.InUse = true;
+        t.Status = status;
+        t.PC = entryPc;
+        Array.Clear(t.Gprs);
+        t.Gprs[29] = stackTop; // $sp
+        t.Gprs[30] = stackTop; // $fp convention (matches PrepareModuleEntry)
+        t.HI = 0;
+        t.LO = 0;
+        t.StackTop = stackTop;
+        t.StackSize = stackSize;
+        if (id >= _nextThreadSlot) _nextThreadSlot = id + 1;
+        return id;
+    }
+
+    private void SaveLiveToContext(IopThreadContext t)
+    {
+        t.PC = PC;
+        for (int i = 0; i < 32; i++)
+            t.Gprs[i] = _gprs[i];
+        t.Gprs[0] = 0;
+        t.HI = HI;
+        t.LO = LO;
+    }
+
+    private void LoadContextToLive(IopThreadContext t)
+    {
+        PC = t.PC;
+        for (int i = 0; i < 32; i++)
+            _gprs[i] = t.Gprs[i];
+        _gprs[0] = 0;
+        HI = t.HI;
+        LO = t.LO;
     }
 }

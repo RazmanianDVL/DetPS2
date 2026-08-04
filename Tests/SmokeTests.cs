@@ -1419,6 +1419,7 @@ press 3000 Circle 100
             Dmac_GifPath3_UsesStartMadr();
 
             Iop_HandAssembledLoop_Deterministic();
+            IopExecSmokes.IopThreadContext_Scaffolding_FlagAndSwitch();
             Sif_DmaRoundTrip_UpdatesMemory();
             Sif_Bridge_MailboxAndDmaVisibleToIop();
             Timer_CompareRaisesIntc_EeSeesCop0();

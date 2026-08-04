@@ -148,4 +148,97 @@ public static class IopExecSmokes
 
         Console.WriteLine($"[Smoke] Iop_HandAssembled_RunInstructions OK (insns={sys.Iop.InstructionsExecuted})");
     }
+
+    /// <summary>
+    /// C1 scaffolding: default OFF path is no-op (create/switch fail, single context).
+    /// With EnableMultiThreadScaffolding: dual context, unique SP, switch preserves GPRs/PC.
+    /// </summary>
+    public static void IopThreadContext_Scaffolding_FlagAndSwitch()
+    {
+        // --- Flag default OFF: zero path change ---
+        var off = new Ps2System();
+        if (off.Iop.MultiThreadEnabled && !Iop.MultiThreadEnvEnabled)
+            throw new Exception("MultiThreadEnabled true without DETPS2_IOP_THREADS env");
+        if (!Iop.MultiThreadEnvEnabled)
+        {
+            if (off.Iop.CreateSecondaryContext(0x2000) != -1)
+                throw new Exception("CreateSecondaryContext must return -1 when flag off");
+            if (off.Iop.CreateThreadContext(0x2000, 0x1C2000) != -1)
+                throw new Exception("CreateThreadContext must return -1 when flag off");
+            if (off.Iop.SwitchToThread(1))
+                throw new Exception("SwitchToThread must fail when flag off");
+            if (off.Iop.CurrentThreadId != 0 || off.Iop.ThreadCount != 1)
+                throw new Exception("OFF path must report single boot context");
+            if (off.Iop.TryGetThreadContext(0, out _))
+                throw new Exception("TryGetThreadContext must fail when flag off (no table)");
+        }
+
+        // --- ON path via scaffolding enable (does not require process env) ---
+        var sys = new Ps2System();
+        sys.Iop.EnableMultiThreadScaffolding();
+        if (!sys.Iop.MultiThreadEnabled)
+            throw new Exception("EnableMultiThreadScaffolding did not enable");
+
+        // Parent context: plant callee-saved-ish regs + PC
+        sys.Iop.PC = 0x00004000;
+        sys.Iop.SetGpr(16, 0x11111111); // $s0
+        sys.Iop.SetGpr(17, 0x22222222); // $s1
+        sys.Iop.SetGpr(29, 0x001F0000); // $sp parent
+        sys.Iop.SetGpr(31, 0xDEADBEEF); // $ra
+
+        int worker = sys.Iop.CreateSecondaryContext(0x00005000);
+        if (worker < 1)
+            throw new Exception($"CreateSecondaryContext failed: {worker}");
+        if (sys.Iop.ThreadCount != 2)
+            throw new Exception($"expected 2 contexts got {sys.Iop.ThreadCount}");
+        if (!sys.Iop.TryGetThreadContext(worker, out var wctx) || wctx == null)
+            throw new Exception("worker context missing");
+        if (wctx.PC != 0x00005000)
+            throw new Exception($"worker PC 0x{wctx.PC:X8}");
+        if (wctx.Sp == 0 || wctx.Sp == 0x001F0000)
+            throw new Exception($"worker SP must be unique, got 0x{wctx.Sp:X8}");
+        uint workerSp = wctx.Sp;
+
+        // Switch to worker: parent must be saved; live PC/SP become worker's
+        if (!sys.Iop.SwitchToThread(worker))
+            throw new Exception("SwitchToThread(worker) failed");
+        if (sys.Iop.CurrentThreadId != worker)
+            throw new Exception($"CurrentThreadId={sys.Iop.CurrentThreadId}");
+        if (sys.Iop.PC != 0x00005000)
+            throw new Exception($"live PC after switch 0x{sys.Iop.PC:X8}");
+        if (sys.Iop.GetGpr(29) != workerSp)
+            throw new Exception($"live SP after switch 0x{sys.Iop.GetGpr(29):X8}");
+        // Worker starts with clear s-regs
+        if (sys.Iop.GetGpr(16) != 0)
+            throw new Exception("worker s0 should be 0 at create");
+
+        // Mutate worker then return to parent
+        sys.Iop.SetGpr(16, 0xAAAAAAAA);
+        sys.Iop.PC = 0x00005010;
+        if (!sys.Iop.SwitchToThread(0))
+            throw new Exception("SwitchToThread(0) failed");
+        if (sys.Iop.PC != 0x00004000)
+            throw new Exception($"parent PC not restored: 0x{sys.Iop.PC:X8}");
+        if (sys.Iop.GetGpr(16) != 0x11111111 || sys.Iop.GetGpr(17) != 0x22222222)
+            throw new Exception("parent $s* not restored");
+        if (sys.Iop.GetGpr(29) != 0x001F0000 || sys.Iop.GetGpr(31) != 0xDEADBEEF)
+            throw new Exception("parent $sp/$ra not restored");
+
+        // Worker still has its mutation when switched back
+        if (!sys.Iop.SwitchToThread(worker))
+            throw new Exception("re-switch worker failed");
+        if (sys.Iop.PC != 0x00005010 || sys.Iop.GetGpr(16) != 0xAAAAAAAA)
+            throw new Exception("worker state not preserved across switch");
+
+        // Explicit stack create
+        int t2 = sys.Iop.CreateThreadContext(0x6000, 0x001C8000, 0x1000);
+        if (t2 < 1 || t2 == worker)
+            throw new Exception($"CreateThreadContext bad id {t2}");
+        if (!sys.Iop.TryGetThreadContext(t2, out var t2c) || t2c!.Sp != 0x001C8000)
+            throw new Exception("explicit stack top not applied");
+
+        Console.WriteLine(
+            $"[Smoke] IopThreadContext_Scaffolding_FlagAndSwitch OK " +
+            $"(envOn={Iop.MultiThreadEnvEnabled} workerSp=0x{workerSp:X8} threads={sys.Iop.ThreadCount})");
+    }
 }
