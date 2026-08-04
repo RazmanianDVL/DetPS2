@@ -1166,6 +1166,12 @@ public sealed class EmotionEngine : ISchedulable
     /// (already just `eret`), so the handler's own `jr ra` epilogue restores EPC and clears EXL
     /// exactly like the real ISR return path would.
     /// </summary>
+    /// <summary>A2 root-cause/regression investigation only: disables the minimum
+    /// interrupt-dispatch-latency gate below so the pre-A2 zero-latency behavior can be
+    /// reproduced for comparison. Never set in normal use.</summary>
+    private static readonly bool DisableA2IrqLatency =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_A2_IRQ_LATENCY") == "1";
+
     private bool TryDispatchRegisteredIntcHandler()
     {
         var sony = _hle?.Sony;
@@ -1175,6 +1181,22 @@ public sealed class EmotionEngine : ISchedulable
         for (int src = 0; src < 15; src++)
         {
             if ((pending & (1u << src)) == 0) continue;
+
+            // A2: minimum dispatch latency on a freshly-latched source (CpuLatched's own
+            // 0->1 edge, stamped in Intc.Raise/RearmCpuLatch — see Intc.LatchedAtCycle's own
+            // doc comment). Treated identically to "not found this source": no handler
+            // lookup, no moreIntcRemain/DMAC-fallback side effects, just skip to the next
+            // source (or return false if none eligible yet). A source that's been pending
+            // for a while (multi-handler re-Raise chains, steady VBlank cadence) already
+            // paid this once on its own fresh edge and is never re-delayed here. Prevents an
+            // interrupt from landing on the literal first instruction of an arbitrary callee
+            // (confirmed live: Blood Omen 2 SLUS_200.24 DMAC src=14 landing on 0x0048A980's
+            // entry, corrupting an intermediate tail-called function's stack frame — see
+            // IsGarbage64JumpTarget's doc comment for the resulting garbage-jump symptom this
+            // was already defended against; this addresses the actual timing root cause).
+            if (!DisableA2IrqLatency
+                && CurrentCycle() - _intc.LatchedAtCycle(src) < Intc.MinDispatchLatencyCycles)
+                continue;
 
             // Multi-handler chain: real BIOS walks every AddIntcHandler for this cause.
             // TryTakeNext advances the cursor; moreIntcRemain means leave the COP0 latch

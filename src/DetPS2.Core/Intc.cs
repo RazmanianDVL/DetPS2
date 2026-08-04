@@ -67,6 +67,32 @@ public sealed class Intc : ISchedulable
     // (live STAT=0x2008 = VBlankEnd|Sif, no bit2 — 2026-07-29).
     private const ulong StatHoldCycles = 2_000_000;
 
+    /// <summary>
+    /// MasterCycles at which each source's <see cref="CpuLatched"/> bit last made a genuine
+    /// 0→1 transition (armed on the CpuLatched edge itself, not the Stat edge — Raise()
+    /// unconditionally re-arms CpuLatched even when Stat is already sticky, and
+    /// RearmCpuLatch is a second, independent CpuLatched 0→1 path). Used by
+    /// EmotionEngine.TryDispatchRegisteredIntcHandler to impose <see cref="MinDispatchLatencyCycles"/>
+    /// only on a freshly-latched source, never on one that's been pending for a while
+    /// (multi-handler re-Raise chains, steady VBlank cadence) — those already paid the
+    /// latency once, on their own fresh edge.
+    /// </summary>
+    private readonly ulong[] _latchedAtCycle = new ulong[16];
+
+    /// <summary>
+    /// Minimum cycles between a source's CpuLatched 0→1 edge and it becoming eligible for
+    /// TryDispatchRegisteredIntcHandler. Deliberately small/conservative — not a claimed
+    /// hardware-accurate datasheet figure, just enough that "interrupt lands on literal
+    /// instruction 1 of an arbitrary callee" (confirmed live: Blood Omen 2 SLUS_200.24,
+    /// DMAC src=14 landing on 0x0048A980's entry, corrupting an intermediate tail-called
+    /// function's stack frame) becomes structurally rare instead of structurally guaranteed.
+    /// </summary>
+    public const ulong MinDispatchLatencyCycles = 16;
+
+    /// <summary>Cycle of the given source's last genuine CpuLatched 0→1 edge (0 if never latched).</summary>
+    public ulong LatchedAtCycle(int source) =>
+        (uint)source < (uint)_latchedAtCycle.Length ? _latchedAtCycle[source] : 0;
+
     private Action? _onChanged;
 
     public Intc() => Reset();
@@ -100,7 +126,19 @@ public sealed class Intc : ISchedulable
         // dead after the first pre-registration ClearCpuLatch: STAT stayed sticky, every
         // subsequent Pcrtc Raise saw alreadyRaised=true, CpuLatched never came back, and
         // the frame-counter wait at 0x0021FF00 spun forever on a counter that never moved.
+        //
+        // Stamp _latchedAtCycle on CpuLatched's OWN 0->1 edge (cpuEdge), NOT on `edge`
+        // above (which is Stat's edge and only gates the VBlank StatHold logic below) --
+        // CpuLatched re-arms here unconditionally even when Stat was already sticky, so a
+        // source can produce a fresh CpuLatched edge on a Raise where `edge` is false.
+        bool cpuEdge = (CpuLatched & bit) == 0;
         CpuLatched |= bit;
+        if (cpuEdge)
+        {
+            int srcIdx = (int)source;
+            if ((uint)srcIdx < (uint)_latchedAtCycle.Length)
+                _latchedAtCycle[srcIdx] = CurrentCycleForTrace;
+        }
         // Hold only for VBlank sticky-poll assist (Shaolin Monks CRT0 INTC_STAT spin).
         // Applying the 2M-cycle hold to Timer/SIF/etc. makes HLE Acknowledge a no-op while
         // TryDispatchRegisteredIntcHandler still relies on Acknowledge to clear CpuLatched for
@@ -126,6 +164,9 @@ public sealed class Intc : ISchedulable
         if ((Stat & bit) == 0) return;
         if ((CpuLatched & bit) != 0) return;
         CpuLatched |= bit;
+        int srcIdx = (int)source;
+        if ((uint)srcIdx < (uint)_latchedAtCycle.Length)
+            _latchedAtCycle[srcIdx] = CurrentCycleForTrace;
         _onChanged?.Invoke();
     }
 
