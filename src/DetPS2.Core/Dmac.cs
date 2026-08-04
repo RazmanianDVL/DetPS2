@@ -34,6 +34,23 @@ public sealed class Dmac : ISchedulable
     public int ActiveChannelCount { get; private set; }
     public uint DrainCyclesPerQw { get; set; } = 1; // Det cost model
 
+    /// <summary>Cap on the CHCR-write force-pump loop (see its call site) — bounds how much
+    /// DMA progress a single CHCR register write can manufacture synchronously. Pre-A3 this
+    /// was a bare 512, i.e. up to 512*256=131072 cycles of DMA progress inside one MMIO write;
+    /// now that A1 made DrainCyclesPerQw load-bearing in DoNormalTransfer, each Step(256) call
+    /// here is genuinely cycle-costed, so capping the outer count is a real bound rather than a
+    /// vestigial one. Same reduction ratio A1 used for the GIF_STAT poll-pump (512/32=16,
+    /// matching that fix's 16x cut). Does NOT touch the path3Hold/daDisplayVif gate conditions
+    /// themselves — only how many force-steps run once that gate has already decided to fire.</summary>
+    private const int MaxChcrForceSteps = 16;
+
+    /// <summary>A3 root-cause/regression investigation only: restores the pre-A3 512-iteration
+    /// CHCR force-pump bound (the force loop itself still only fires under the same
+    /// path3Hold/daDisplayVif gate — this does not make the loop unconditional). Never set in
+    /// normal use.</summary>
+    private static readonly bool DisableA3ChcrCap =
+        Environment.GetEnvironmentVariable("DETPS2_DISABLE_A3_CHCR_CAP") == "1";
+
     public Dmac(SystemMemory memory)
     {
         _memory = memory ?? throw new ArgumentNullException(nameof(memory));
@@ -714,7 +731,11 @@ public sealed class Dmac : ISchedulable
                         (channel == (int)Channel.VIF1 || channel == (int)Channel.GIF ||
                          channel == (int)Channel.VIF0))
                     {
-                        for (int i = 0; i < 512 && _channels[channel].Active; i++)
+                        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
+                            Console.Error.WriteLine(
+                                $"[DMAC] CHCR force-pump fired ch={(Channel)channel} path3Hold={path3Hold} daDisplayVif={daDisplayVif}");
+                        int maxSteps = DisableA3ChcrCap ? 512 : MaxChcrForceSteps;
+                        for (int i = 0; i < maxSteps && _channels[channel].Active; i++)
                             Step(256);
                     }
                 }
