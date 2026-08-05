@@ -1243,3 +1243,28 @@ template table partially live (28× non-TRX fields)
 TRXDIR consumer 0x219150 / caller 0x1A7750: never entered
 next: what dispatches to 0x1A7750 vs live sibling callers (type gate?)
 ```
+
+### 23.7 Dead TRXDIR path sits in unreferenced mega-fn
+
+Enclosing function of the only `jal 0x219150` (TRXDIR consumer):
+
+| Item | Value |
+|------|-------|
+| Entry | `0x001A6290` (`addiu sp, -3472`) |
+| Contains | loop @ `0x1A6F00`…`0x1A7770` with `jal 0x219150` @ `0x1A7750` |
+| Static `jal`/`j`/data ptrs to entry | **none found** |
+| Runtime entry hits | (implied 0; call site 0x1A7750 already 0) |
+
+Contrast: live field copiers are `jal`'d from many sites including `0x19DFxx` (same object-init neighborhood as the 14.4M builder chain).
+
+**Interpretation:** TRXDIR arming is not merely type-gated inside a live frame loop — the **whole consumer pipeline for that slot lives in a function with no static callers** and zero dynamic hits. Either:
+1. intended to be registered via a function-pointer table we have not found, and never registered; or
+2. leftover / alternate render path not wired for this boot path.
+
+Either way: builder fills TRXDIR template once; nothing in the live graph reads it into a submit.
+
+```text
+0x1A6290 mega-fn: no static callers, contains only TRXDIR consumer jal
+live siblings called from 0x19DFxx / many others
+TRXDIR path structurally unreachable in this binary wiring
+```
