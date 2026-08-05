@@ -1636,3 +1636,88 @@ after 15.26M: outers silent → no scheduler → no refill
 ```
 
 Claude gate seat can focus on why `0x1F5788`/`0x1F6128` stop (or master enable gp−24112).
+
+---
+
+## 28. Gate seat closed: the whole chain traces to ONE call site, fired exactly 4 times as a bounded stage sequence — likely one-shot setup, not per-frame render (Claude)
+
+Picked up exactly where §26.5 left off (independently converged on the same `0x1F43B0`
+scheduler and `gp-24112` master-enable flag before reading Grok's write-up — see the matching
+addresses throughout). Traced one level past the "outers" to their root.
+
+### 28.1 The arm-flag setter's real function, and its one caller
+
+`0x1F2A60` (`sb v0,-24112(gp)`, the master-enable set) lives inside a real function starting
+at **`0x001F2960`** (`addiu sp,sp,-48` prologue at `0x1F2960`, params `a0`=target object
+pointer, `a1`=stage counter byte). This function builds a GS/GIFtag-style packet (`pcpyld`
+quadword construction matching a GIFtag NREG/NLOOP shape) into a fixed staging buffer, then
+conditionally arms the producer chain via the `andi s1,a1,1` odd/even check found in §26.5,
+then calls `0x1F2620`.
+
+**`scanword` for `jal 0x1F2960` (`0x0C07CA58`) across the full code range: exactly ONE static
+caller, `0x001FFAF4`.** Not "one of several live ones" — the literal only call site for this
+function in the whole binary.
+
+### 28.2 That one call site, exhaustively traced (pcbreak, full 30M)
+
+`--pcbreak=001FFAF4:001FFAF4` across the entire 30M-cycle run:
+
+```text
+cyc=15,166,704  v1(counter)=2 a1(passed)=1 a0(target)=0x006754C0
+cyc=15,180,144  v1(counter)=3 a1(passed)=2 a0(target)=0x006754C0
+cyc=15,192,816  v1(counter)=4 a1(passed)=3 a0(target)=0x006754C0
+cyc=15,264,592  v1(counter)=5 a1(passed)=4 a0(target)=0x006754C0
+```
+
+**Exactly 4 hits, total, across all 30M cycles.** All within a ~98,000-cycle window
+(15.1667M-15.2646M). The target object address (`a0`/`s0` = `0x006754C0`) is **identical
+every single time** — this is not iterating over a list of objects, it's 4 sequential stages
+against the *same* target, driven by a simple incrementing counter (`1,2,3,4`) read from a
+persistent byte at `gp-28132`. `ra=0x1FFADC` (the same return site) every time too.
+
+### 28.3 Reading
+
+This closes the causal chain end to end, address by address:
+
+```text
+0x1FFAF4 (ONLY caller, 4x total @ 15.1667-15.2646M, fixed target 0x6754C0, stage=1..4)
+  -> 0x1F2960 (builds GS packet, arms gp-24112 on odd stages)
+    -> 0x1F43B0 scheduler (8x, gated, only fires while gp-24112 set)
+      -> 0x1F2408 producer (3x, fills gp-24120 queue)
+        -> 0x1F1778 DMAC handler (13-14x, drains queue, kicks VIF1/GIF)
+          -> 12 real DMACKICK events, all <=15.75M, channels finish clean
+```
+
+A single call site firing exactly 4 times against one fixed target, with a plain 1-2-3-4
+stage counter, is the classic shape of a **bounded multi-stage setup/init sequence** (e.g.
+"upload this object's N setup packets," N=4, done at load), not a per-frame or per-event
+call that's failing to keep firing. Nothing here looks broken *at this level* — 4/4 stages
+ran, the queue drained, the DMA channels finished cleanly (§27.2). This reads as **working
+code that correctly does a fixed amount of one-time work and then correctly stops.**
+
+### 28.4 Reframe for the team
+
+If §28.1-28.3 holds up, the entire chain investigated across §25-§28 (DMAC handler /
+producer / scheduler / arm-flag / this call site) is very likely a **one-shot boot or
+level-load asset/object upload path**, not B3's ongoing per-frame render-submission
+mechanism. That would mean we've been correctly and thoroughly characterizing a subsystem
+that *isn't* the bug — the real "nothing new ever gets drawn" mechanism must be a **separate,
+still-unfound code path** that's supposed to fire every frame/vblank and isn't (or is, but
+through a channel/PATH we haven't instrumented yet — Path1/Path2, or a VIF1 chain that
+doesn't route through this same `0x1F1778` handler at all).
+
+Concrete next step: find who calls `0x1FFAF4`'s enclosing function (didn't chase the prologue
+this pass) and what `0x006754C0` is — if that object is level/track-scoped (matches "one-shot
+per level load"), the reframe is confirmed and the real search moves to finding B3's actual
+per-frame VU1/GIF submission call (likely a completely different address range, possibly
+routed through Path1 rather than Path3). No Core changes.
+
+```text
+gate-seat close (Claude)
+  arm-flag setter (0x1F2A60) lives in fn 0x1F2960, sole static caller = 0x1FFAF4
+  0x1FFAF4 fires EXACTLY 4x total (30M cyc), all ~15.17-15.26M, same fixed target 0x6754C0
+  stage counter 1,2,3,4 -- bounded setup shape, not per-frame
+  reframe: this whole chain (S25-S28) may be one-shot object/level upload, not the render loop
+  next: find caller of 0x1FFAF4's function + identify object 0x6754C0; if level-scoped,
+        redirect the whole search to find B3's real per-frame VU1/GIF submission path
+```
