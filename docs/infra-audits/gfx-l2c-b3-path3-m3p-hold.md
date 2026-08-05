@@ -11982,3 +11982,17 @@ S273: FRAME_1 FBP=0x46 set at cyc=0 -- disproves timing-mismatch theory (S272 op
       all-zero args. Real gap: a different, real-data-carrying caller of 0x1E2D10 that we
       haven't found yet -- not a "too early" problem, not a "call again later" problem.
 ```
+
+## 275. Strong lead: s4=0 (null) at 0x1FD490's entry — if it's the FBP-source base pointer, this directly explains the FBP0 plant (Claude)
+
+From the already-captured live trace of `0x1FD490`'s entry (cyc=14,332,640, the same one-shot call established in S270): **`s4=0x0`** at the moment execution enters the function. Full register state at entry: `a0=0x1FE398 a1=0 a2=0 a3=0 ... s4=0x0`.
+
+If `0x1FD490`'s real FBP source is `s4+4`/`s4+8` (per S273's hint — "t2 path / s4+4/+8 / 0x675E40 fields"), a **null `s4`** would mean it's reading from near address `0x4`/`0x8` — garbage or zero, not real framebuffer state — regardless of whether the intended source object ever held FBP=0x46. This could directly explain the FBP0 plant without needing `0x675E40` itself to be examined at all: the object pointer that should carry real state simply isn't being passed/set up for this call in the first place.
+
+Worth checking: (1) is `s4` supposed to be non-null here — i.e., does the caller chain (`0x227FB8`/`0x1E2D10`/switch dispatch) ever set `s4` to a real object before reaching `0x1FD490`, and if so why is it 0 at this specific live call; (2) if `s4` genuinely should be non-zero, that's the actual missing wiring — not the FBP data itself, but the object pointer that would let the FBP-OR logic find it.
+
+```text
+S275: s4=0 (null) at 0x1FD490's live entry (cyc=14,332,640). If FBP source is s4+4/+8 as S273
+      suggests, this alone explains FBP0 -- reading near-null, not real state. Next: does the
+      caller chain ever set s4 to a real object, or is a null s4 itself the missing wiring.
+```
