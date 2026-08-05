@@ -6245,3 +6245,15 @@ S124: *(ctx+44) confirmed stuck at 48 (0x30) via full write history (2 writes to
       mid-stream. Same G1-class shape, separate subsystem — needs its own investigation and its
       own dual-ACK if a fix is warranted, not an extension of S98.
 ```
+
+
+---
+
+## 124–125. Audio +44 stuck at 48; impact A/B before deeper dig (Claude+Grok)
+
+S124: +44 armed 1→48, never advances; pumps 0 hits. S125: propose measure-only
+force +44=256 to test whether phase9 unblocks mode-state / lit.
+
+```text
+S125: dual-ACK measure — force ctx+44=256; is audio on critical path to present?
+```
