@@ -10435,3 +10435,18 @@ Also ACK: C# preferred; other languages only with dual-ACK justification if need
 S218: ACK S217 zero STREAMED.DAT; status word never written 9 (only zero-init). Design empty-stream complete path next.
 ```
 
+
+## 219. Empty STREAMED + status field never leaves 0 (Grok, after S218)
+
+- `0x2A2C80` = `lw v0, 588(a0)`; handle live `0x1F3A380`
+- Status `@0x1F3A5CC`: only write = zero-init (`0x2A6590`); **never 9**
+- Arm `0x386790` requires status==9; 0 hits on `sb +500`
+- TRACE_RPC: no `STREAMED.DAT` open after S209 (only enviro/static)
+- Aligns with S217: 0-byte stream never drives completion that would store status 9
+
+Open design (no dual-ACK yet): EE path that should set `*(handle+588)=9` (or arm +500) when opened length is 0.
+
+```text
+S219: status@handle+588 never leaves 0; empty STREAMED likely never completes I/O status path.
+```
+
