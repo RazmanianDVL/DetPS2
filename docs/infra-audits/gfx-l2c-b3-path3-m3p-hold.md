@@ -4546,3 +4546,48 @@ S76: Ring slots at 0x6754C0+0x330/0x340/0x3A0/0x3B0 are fully zero (not selectiv
      950-byte band) — same class as 0x1FE600. Still need: the real writer that's supposed to
      push FRAME_1's live Fbp (currently 70) into the ring, or into DISPFB2 directly.
 ```
+
+## 77. Found the real source: `0x6754C0+0x350`/`+0x378` (PutDispEnv's actual GsDispEnv slots) hold identical baked data — both fields point at page 0 (Claude)
+
+Grok's correction (seq0481): my S76 dump targeted the wrong offsets — `+0x330` etc. is a
+separate "direct DISPFB1 overlay" path, not what feeds `PutDispEnv`. The real input is
+`base+848(+0x350)+40*field`. Temp one-shot dump (`DETPS2_DUMP_B3_ENV350=1`, reverted — `git
+diff --stat` 17 insertions, `git checkout --`, clean) of both 40-byte `GsDispEnv` halves at
+`0x6754C0+0x350` and `+0x378`, at the same 20M-cycle mark:
+
+```
+slot=0x350 (field 0):                    slot=0x378 (field 1):
+  +0x00 = 0x00000066  (PMODE)              +0x00 = 0x00000066
+  +0x08 = 0x00000001                       +0x08 = 0x00000001
+  +0x10 = 0x00051400  <== DISPFB            +0x10 = 0x00051400  <== DISPFB
+  +0x18 = 0x0183227C  (DISPLAY lo)          +0x18 = 0x0183227C
+  +0x1C = 0x001BF9FF  (DISPLAY hi)          +0x1C = 0x001BF9FF
+```
+
+**Both fields are byte-identical**, and the DISPFB word (`0x51400`) matches the live DISPFB2
+register exactly (S71/S72: `FBW=10(640px)/PSM=10/FBP=0`). This is the real source — confirmed,
+not inferred. The VBlank ISR (S75) reads this slot verbatim each field and writes it straight to
+the GS priv register; that's the entire mechanism, fully closed now. The `+0x330` ring overlay
+(S76, all zero) is a separate, apparently-unused alternate path that doesn't touch this.
+
+**What this settles:** this was never a "live update path is broken" bug — there is no live
+update path to break. The `GsDispEnv` struct was populated **once**, presumably during the same
+boot-time init that sets up `FRAME_1` (S73's `fbp=0` write #1), with a DISPFB pointing at page 0
+for both double-buffer slots. Then `FRAME_1` independently moved to page 70 (`0x8C000`) once
+real drawing started (S73's write #2 onward) — and nothing was ever wired to also update the
+`GsDispEnv` object's DISPFB word to follow it. Both slots agreeing exactly makes an "only one
+slot got the update" explanation impossible; this reads as "the second half of a two-step init
+(point display at draw target) was either never written, or intentionally deferred to a later
+boot stage this session hasn't reached yet."
+
+Handing the "who's supposed to write this, and why doesn't it" question fully to Grok's parallel
+static search (seq0481: "who writes `0x6754C0+0x350`/`+0x360`") — this confirms their target
+offsets are exactly right and gives them the concrete baseline values to match against.
+
+```text
+S77: CONFIRMED — 0x6754C0+0x350/+0x378 (both GsDispEnv double-buffer halves) are byte-identical,
+     DISPFB=0x51400 (page 0) in both. This is the literal, direct source of the live DISPFB2
+     register (S71). No live "refresh" mechanism was ever broken — the struct was written once
+     at init and never touched again. Real open question: what's supposed to write a second,
+     later value here once FRAME_1 moves to page 70, and does it exist anywhere in B3's code.
+```
