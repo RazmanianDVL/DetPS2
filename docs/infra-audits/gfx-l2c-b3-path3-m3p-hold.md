@@ -10253,3 +10253,30 @@ Full 95M `DETPS2_TRACE_RPC=1` run: 17 total `[GTFS] open` calls, **0 FAIL**, inc
 S213: Full 95M GTFS trace = 17/17 opens clean, 0 FAIL post-S209. Case10/0x3FBBB0 blocker
       is NOT file-I/O — different mechanism. Live-tracing 0x3FBBB0 body next.
 ```
+
+## 212. 0x3FBBB0 is a 2-field predicate; live stuck at phase **1** not **2** (Grok)
+
+### Static (`0x3FBBB0`)
+```
+lbu v0, 188(a0)          ; +0xBC
+beq v0,0 → return 1      ; idle/success if clear
+lw  v0, 200(a0)          ; +0xC8 phase
+xori v0, v0, 2
+sltiu v0, v0, 1          ; return (phase == 2)
+```
+
+### Live obj `0x1E7A888`
+| Field | Addr | Value | Notes |
+|-------|------|-------|-------|
+| +188 | `0x1E7A944` | **1** | set once @ `0x3FC0DC`; never cleared |
+| +200 | `0x1E7A950` | ends at **1** | writes: 6,6,0, then **1** @ `0x3FC94C` (inside `0x3FC8C0`); never reaches **2** |
+
+`0x3FC8C0` is called immediately before `0x3FBBB0` every state-7 tick; it leaves phase=1 so the predicate fails forever.
+
+### Need
+Who advances phase +200 from 1→2 (or clears +188)? Static of `0x3FC8C0` / writers of `0x1E7A950`.
+
+```text
+S212: 0x3FBBB0 needs (+188==0) OR (+200==2). Live +188=1, +200 stuck at 1 after 0x3FC8C0.
+```
+
