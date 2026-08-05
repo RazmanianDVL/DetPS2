@@ -1155,11 +1155,14 @@ public static class IopExecSmokes
         if (!sys.LoadIrx(irxA, "YSFA").Success)
             throw new Exception("LoadIrx YSFA failed");
         int idA = sys.IopModules.SearchModuleByName("YSFA");
-        var runA = sys.IopModules.StartLoadedModule(sys, idA, maxInstructions: 256);
-        if (!runA.Success)
-            throw new Exception($"YSFA start failed: {runA.Message}");
+        // Bind entry thread without finishing start (table full / free-on-return tests separate).
+        sys.Iop.EnableMultiThreadScaffolding();
+        if (!sys.IopModules.TryGetIrx(idA, out var recPre) || recPre.Entry == 0)
+            throw new Exception("YSFA entry missing");
+        if (!sys.IopModules.PrepareModuleEntry(sys.Iop, idA, sys.Memory))
+            throw new Exception("PrepareModuleEntry YSFA failed");
         if (!sys.IopModules.TryGetIrx(idA, out var recA) || recA.EntryThreadId < 1)
-            throw new Exception("YSFA EntryThreadId not bound");
+            throw new Exception("YSFA EntryThreadId not bound after PrepareModuleEntry");
         int entryA = recA.EntryThreadId;
 
         if (sys.Iop.CurrentThreadId != 0)
@@ -1182,9 +1185,21 @@ public static class IopExecSmokes
         if (!sys.IopModules.HasNonEntryReadyPeer(sys.Iop))
             throw new Exception("worker must count as non-entry READY peer");
 
+        // First-call complete without residual frees entry slot (table pressure relief).
+        var runA = sys.IopModules.StartLoadedModule(sys, idA, maxInstructions: 256);
+        if (!runA.Success)
+            throw new Exception($"YSFA start failed: {runA.Message}");
+        if (!sys.IopModules.TryGetIrx(idA, out var recDone))
+            throw new Exception("YSFA missing after start");
+        if (recDone.EntryThreadId >= 1 && !runA.PartialYieldStart)
+            throw new Exception(
+                "first-call done without residual should free EntryThreadId " +
+                $"(got tid={recDone.EntryThreadId})");
+
         Console.WriteLine(
             $"[Smoke] IopYieldStart_EntryThread_NotFalsePeer OK " +
-            $"(entryA={entryA} worker={worker} globalPeer={sys.Iop.FindNextReadyThread()})");
+            $"(entryA={entryA} worker={worker} afterFreeTid={recDone.EntryThreadId} " +
+            $"globalPeer={sys.Iop.FindNextReadyThread()})");
     }
 
     /// <summary>

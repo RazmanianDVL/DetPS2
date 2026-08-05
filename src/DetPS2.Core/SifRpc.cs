@@ -900,22 +900,36 @@ public sealed class IopModuleHost
                     nextCheckpoint += YieldStartCheckpointInsn;
                     // Yield surface: READY peer that is NOT another module's C1.2 entry
                     // context or the RPC dispatch slot (S1 peer scoping — c1-yieldstart-peer-scoping-design).
+                    // Residual resume requires EntryThreadId >= 1 (BindModuleEntryContext slot).
+                    // Table-full path sets EntryThreadId=-1 and runs on a fallback stack — enqueue
+                    // would be silently dropped in DrainOneResidualSlice (Claude C post-D4 boot-walk).
                     if (HasNonEntryReadyPeer(iop))
                     {
-                        ulong remain = firstCallCap > done ? firstCallCap - done : 0;
-                        if (remain > 0)
+                        if (m.EntryThreadId < 1)
                         {
-                            _residualModuleStarts.Enqueue(new ResidualModuleStart
-                            {
-                                ModuleId = id,
-                                RemainingInsn = remain + YieldStartMaxInsnFirstCall, // extra residual budget
-                                SlicesLeft = 32,
-                            });
-                            partialYield = true;
+                            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_YIELD_START") == "1")
+                                Console.Error.WriteLine(
+                                    $"[YIELD-START] skip residual enqueue name=\"{m.Name}\" " +
+                                    "reason=no-entry-thread (table full or bind fail) — continue first-call budget");
+                            // Fall through: keep running toward firstCallCap (honest pre-yield-start shape).
                         }
-                        break;
+                        else
+                        {
+                            ulong remain = firstCallCap > done ? firstCallCap - done : 0;
+                            if (remain > 0)
+                            {
+                                _residualModuleStarts.Enqueue(new ResidualModuleStart
+                                {
+                                    ModuleId = id,
+                                    RemainingInsn = remain + YieldStartMaxInsnFirstCall, // extra residual budget
+                                    SlicesLeft = 32,
+                                });
+                                partialYield = true;
+                            }
+                            break;
+                        }
                     }
-                    // No yield surface: continue same call toward firstCallCap (Y2).
+                    // No yield surface (or unbound entry): continue same call toward firstCallCap (Y2).
                 }
             }
         }
@@ -1018,6 +1032,22 @@ public sealed class IopModuleHost
         if (iop.MultiThreadEnabled && prevThreadId != iop.CurrentThreadId)
             iop.SwitchToThread(prevThreadId);
 
+        // Free entry slot when first-call finished without residual (table pressure for late
+        // IOPFILE/SDRDRV). Residual path keeps EntryThreadId for DrainOneResidualSlice.
+        if (iop.MultiThreadEnabled && !partialYield && m.EntryThreadId >= 1 &&
+            (returned || residentSpin || bootQuantaResident))
+        {
+            int freed = m.EntryThreadId;
+            if (iop.FreeThreadSlot(freed))
+            {
+                m.EntryThreadId = -1;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_YIELD_START") == "1")
+                    Console.Error.WriteLine(
+                        $"[YIELD-START] free entry slot tid={freed} name=\"{m.Name}\" " +
+                        "(first-call done, no residual)");
+            }
+        }
+
         bool ok = insns > 0 && (returned || budget || residentSpin || bootQuantaResident || partialYield);
         return new ModuleRunResult
         {
@@ -1094,6 +1124,10 @@ public sealed class IopModuleHost
         else
         {
             // No bound thread: cannot residual-resume without clobbering boot PC.
+            // Should be rare after enqueue guard (EntryThreadId>=1 required).
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_YIELD_START") == "1")
+                Console.Error.WriteLine(
+                    $"[YIELD-RESIDUAL] DROP unbound name=\"{m.Name}\" entryThreadId={m.EntryThreadId}");
             _residualModuleStarts.Dequeue();
             return 0;
         }
