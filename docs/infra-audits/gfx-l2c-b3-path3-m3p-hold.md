@@ -9728,3 +9728,31 @@ Next: what 0x1322B0 checks (vtable at object+432); does success path / `0x30D7C0
 S201: Case7 body calls 0x1322B0 and fails closed if v0==0. modestate7 + readiness are one gate.
 ```
 
+
+## 200. DECISIVE -- readiness gate fails 493/493 (100%), unifying modestate-7 and class-A into one gate (Claude)
+
+Confirmed live, full 95M-cycle run, real ISO:
+
+- `0x1322B0` (readiness gate, virtual call via `lw t9,432(a0); lw t9,12(t9); jalr`): **493 hits**,
+  entry `a0=0x51A6A8` every time (the same "current mode" object established since S138).
+- `0x133038` (the FAIL branch target after `beq v0,zero`): **exactly 493 hits** — matches the
+  entry count precisely.
+- `v0` (the readiness call's return value) at every single FAIL-branch hit: **`0x0`, all 493 of
+  them, no exceptions.**
+
+**100% failure rate, every single call, the entire run.** Combined with Grok's S201 static read
+(case 7's body is exactly `jal 0x1322B0; beq v0,zero,FAIL`, and nothing past this gate — including
+any possible env/DISPFB retarget — can run until it clears), this fully confirms Grok's
+unification hypothesis: **modestate-stuck-at-7 and the missing DISPFB retarget are very likely
+the SAME underlying gate, not two independent residuals.** The mode state-machine has been
+faithfully retrying this readiness check ~493 times across the run and never once getting a
+`true` back.
+
+```text
+S200: DECISIVE -- 0x1322B0 (readiness) called 493 times, FAILS (v0=0, branches to 0x133038) all
+      493 times, 100% failure rate, whole run. Confirms Grok's S201 unification: modestate-stuck-
+      at-7 and class-A's missing DISPFB retarget are very likely one gate, not two. Whatever
+      this virtual call resolves to (vtable lookup on obj 0x51A6A8, +432 then +12) never once
+      returns success. Next: identify the actual callee (indirect jalr, not statically visible)
+      and what condition it's checking.
+```
