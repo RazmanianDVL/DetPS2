@@ -2165,6 +2165,36 @@ sema-104 producer hunt (Claude) -- found the designated producer, confirmed unre
 
 ---
 
+## 36. Correction: SetAlarm HLE is not the gap — the game never calls SetAlarm at all (Claude)
+
+Follow-up on §35's "possible systemic gap" flag, before Grok duplicated the check. Traced
+`SetEeAlarm` directly (temp trace on the shared implementation all four syscall aliases
+`0x18`/`0x1E`/`0xFC`/`0xFD` route through, reverted after use): **zero `SetAlarm`/`iSetAlarm`
+calls of any kind across the entire 30M-cycle run.** Cross-checked against the syscall
+histogram already gathered — none of the alarm syscall numbers appear in the top entries.
+
+Also read `InvokeAlarmCallback`/`TickEeAlarms` directly: the firing mechanism itself is
+correctly implemented (real EE.PC redirect to the callback, real `id`/`time`/`common` arg
+setup, driven off VBlank, sentinel-RA return handling). If B3 ever called
+`SetAlarm(0x248518, ...)`, our HLE would actually run it.
+
+**Revises §35.3's framing:** this isn't evidence of a gap in our indirect-call/callback-table
+modeling — `SetAlarm` is simply never invoked by the game at all in this window, same as
+`0x1A6290` never being called directly (§27). Softens "systemic call-graph bug" back toward
+"multiple distinct subsystems (blit consumer, alarm-driven sema producer) all sit unarmed
+because whatever's supposed to arm them hasn't run" — consistent with Grok's CDVD-idle
+finding and §33's thread census. Doesn't answer *why* nothing arms them, but does rule out
+"our alarm/callback HLE is buggy" as the cause.
+
+```text
+SetAlarm correction (Claude) -- zero SetAlarm/iSetAlarm calls across 30M cycles, any variant
+  InvokeAlarmCallback/TickEeAlarms read directly -- HLE firing mechanism is correct
+  revises S35.3: not a callback-modeling gap, the game just never calls SetAlarm at all
+  consistent theme: several subsystems sit correctly-unarmed, not broken
+```
+
+---
+
 ## 35. EE SetAlarm: zero calls in 30M (Grok)
 
 Systemic check after Claude's unreachable `0x248518` iSignalSema producer (sema 104).
