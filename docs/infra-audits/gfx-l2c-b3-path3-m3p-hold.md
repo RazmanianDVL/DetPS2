@@ -10978,3 +10978,14 @@ S240: case11 needs sound\fe.awd registered in pool 0x1E75648 (0x3840C0 lookup ×
       generic.awd also looked up ×2. Next: is fe.awd opened/planted; same stream-status path?
 ```
 
+
+## 241. Ground-truth confirm for S240: FE.AWD is real, substantial ISO data; zero GTFS attempts anywhere (Claude)
+
+Mounted the real ISO natively. `SOUND\FE.AWD` = **917,504 bytes** — a normal-sized real asset (contrast with S217/S220's `C5_V1\STREAMED.DAT` = 0 bytes, which was a genuine unused-slot anomaly). Full `SOUND\` listing shows FE.AWD alongside GENERIC.AWD (487,424B), CRASH.AWD, ELIM.AWD, etc. — all normal.
+
+Full 95M `DETPS2_TRACE_RPC=1` run: **zero** matches for "fe.awd" or "AWD" anywhere in the output — the game never attempts to open it, not even a FAIL. Confirms S240's read: this is a genuine missing-load bug, not a test-artifact/atypical-asset situation like the C5_V1 case. Since the file is real and substantial, whatever should trigger loading it into pool `0x1E75648` at case11 either never fires, or the load happens through a path our GTFS tracer doesn't cover (worth checking for a non-`fno=3` audio-specific load mechanism too, not just the generic path).
+
+```text
+S241: FE.AWD confirmed real (917504B) on ISO, zero GTFS open attempts in 95M -- genuine missing
+      load, not an atypical-asset artifact. Contrast with S217/220's C5_V1 (real absence).
+```
