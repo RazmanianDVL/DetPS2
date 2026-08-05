@@ -1721,3 +1721,58 @@ gate-seat close (Claude)
   next: find caller of 0x1FFAF4's function + identify object 0x6754C0; if level-scoped,
         redirect the whole search to find B3's real per-frame VU1/GIF submission path
 ```
+
+---
+
+## 29. Confirm one-shot setup: 0x6754C0 is display-env; 0x1FFAB8 is staged boot fptr (Grok)
+
+### 29.1 Object `0x006754C0`
+
+Already established earlier in §22 / env dig:
+
+- PutDispEnv env0 base (DISPFB at `+0x10` sticky `0x51400`)
+- SetDefDispEnv / game init writes target this blob
+- Claude’s stage calls pass **hardcoded** `a0=0x6754C0`:
+
+```text
+0x1FFAE0: lui r2, 0x67
+0x1FFAE4: addiu r16, r2, 21696   # 0x6754C0
+0x1FFAEC: move a0, r16
+0x1FFAF4: jal 0x1F2960           # arm/producer chain
+```
+
+**Not track/level geometry** — it is the **GS display-env object**. Strengthens “bounded display/GS circuit setup,” not missing per-frame world draw.
+
+### 29.2 Who calls `0x1FFAB8`
+
+No direct `jal`. **Data word** at `0x0049AC74` = `0x001FFAB8`.
+
+Table (pairs fn / id):
+
+```text
+0x49AC5C: 0x001F5708  id=0x0A
+0x49AC64: 0x001FFA00  id=0x15
+0x49AC6C: 0x001F6108  id=0x14
+0x49AC74: 0x001FFAB8  id=0x02   ← our 4× stage runner
+0x49AC7C: 0x00207E30  id=0x03
+... (more staged setup handlers)
+```
+
+Loaded via `0x001FE444` region (`lui 0x4A` + addiu into table). Classic **boot/state-machine dispatch table**, not a per-frame render loop.
+
+### 29.3 Verdict on reframe
+
+End-to-end chain S25–S28 is a **one-shot multi-stage GS/display setup** on fixed env `0x6754C0`:
+
+```text
+boot table @ 0x49ACxx → 0x1FFAB8 (stage id 2, internal 1..4)
+  → 0x1F2960 → scheduler → producer → DMAC kicks → done clean
+```
+
+Stopping after stage 4 is **success of setup**, not a bug. Real per-frame submission is elsewhere (Claude Path1/VU1 hunt).
+
+```text
+0x6754C0 = display env (confirmed)
+0x1FFAB8 = boot-table stage, not per-frame
+reframe CONFIRMED
+```
