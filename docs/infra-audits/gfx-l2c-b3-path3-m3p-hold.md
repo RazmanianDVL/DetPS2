@@ -10785,3 +10785,27 @@ Even a real returned tick + status=9 does **not** advance case10. Checklist need
 ```text
 S231: Combined force ran real 0x28AF10 (returned once); case10/phase/present unchanged.
 ```
+
+## 233. Arm fail with status=9: **+500 already 1** (Grok)
+
+### Live after combined force
+| Field | Addr | Value |
+|-------|------|-------|
+| stream obj | `0x1F36450` | live (path bytes at +0) |
+| handle @+460 | `0x1F3A380` | matches forced status handle |
+| arm @+500 | `0x1F36644` | **1** (already armed) |
+| status @handle+588 | `0x1F3A5CC` | **9** |
+| phase | `0x1E7A950` | **1** |
+
+### Why `0x3865A0` returns 0 with status=9
+When **+500≠0**, arm takes the “already armed” branch and only accepts status **3/5/6**. Status **9** is for the **unarmed** path (`0x386790` when +500==0). With +500=1 and status=9 → fallthrough return 0 → no `sw 2, +200` at `0x3FC9B8`.
+
+### Phase=2 writer
+`0x3FC9B8`: after `jal 0x3865A0` returns nonzero → `sw 2, phase`. Never reached.
+
+### Implication
+Partial arm left +500=1 without phase advance (possibly during host tick EE call). Probe should clear +500 when forcing status=9 (attempted) and/or force phase=2. Real fix still regular tick + correct arm sequencing.
+
+```text
+S233: +500 already 1 so status=9 rejected by armed-branch; phase stays 1.
+```

@@ -1513,6 +1513,28 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
             // Replay 0x2A6470 type-6 first store only (0x2A5BA0 → 9; sw +328).
             mem.Write32(h + StatusOff, StatusReady);
+
+            // S232: stream resource objs (e.g. 0x1F36450) hold handle at +460 and arm at +500.
+            // If +500 is already 1, 0x3865A0 takes the "armed" branch and only accepts status
+            // 3/5/6 — status 9 falls through to return 0, so phase never reaches 2.
+            // Clear +500 so 0x386790 can re-arm with status==9 (live: +500 was 1, status 9).
+            const uint StreamScanLo = 0x01F00000;
+            const uint StreamScanHi = 0x02000000;
+            const uint HandleOff = 460;
+            const uint ArmOff = 500;
+            for (uint so = StreamScanLo; so + ArmOff + 4 <= StreamScanHi; so += 4)
+            {
+                if (mem.Read32(so + HandleOff) != h)
+                    continue;
+                if (mem.Read8(so + ArmOff) == 0)
+                    continue;
+                mem.Write8(so + ArmOff, 0);
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[B3] FORCE_STREAM_PUMP clear +500 on stream=0x{so:X8} h=0x{h:X8}");
+            }
+
             _forceStreamPumps++;
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
