@@ -955,3 +955,21 @@ RR does not fix DISPFB stall
   FRAME 0x46 / DISPFB2 page0 still
   next: DISPFB write timeline under RR (temp) or EE code that programs DISPFB
 ```
+
+### 21.1 DISPFB write log under RR (temp, reverted)
+
+`DETPS2_TEMP_B3_DISPFB=1` + `DETPS2_RR_SCHED=1` 50M. All privileged DISPFB1/2/PMODE writes logged.
+
+- **DISPFB2** only ever `raw=0x51400` → fbp=**0**, psm=0xA (PSMCT16S). Never fbp=0x46.
+- **DISPFB1** only ever `0`.
+- **PMODE** sticky `0x66` after early setup (plus a few dual-half write artifacts at cyc=0).
+- No write in the log selects draw page 0x46 for display.
+
+Confirms: under high-throughput RR the game still **never programs a DISPFB flip** to the FRAME target in 50M. Stall is not “waiting for more frames of geo.”
+
+```text
+DISPFB write census RR 50M
+  only page0 / 0x51400 + DISPFB1=0
+  zero writes with fbp=0x46
+  flip code path not reached (or not writing privileged DISPFB)
+```
