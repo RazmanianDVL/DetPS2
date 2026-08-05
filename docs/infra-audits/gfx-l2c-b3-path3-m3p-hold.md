@@ -544,6 +544,34 @@ stays 1 and almost never reaches clear.
 
 `0x01D80700`: words **3, 4, 5, 6** (tids for slots 0–3). Flags word `0x004E2964` =
 `0x00010101` → bytes **1,1,1,0** (slots 0–2 set, slot3 clear) at end of run.
+
+### 14.3 Poll-success path does **not** clear the flag (Grok disasm)
+
+After `lbu` / `beq v1,zero` poll loop, **non-zero** flag falls through to:
+
+```
+2371A0..B0  table_base = 0x1D80700; a1 = -1
+2371B4      b  0x2371E0          ; jump to function epilogue
+2371B8      sw a1, 0(table+s1*4) ; delay: free slot (tid := -1)
+; 2371E0: restore ra/s0/s1; jr ra
+```
+
+**No `sb zero` on this path.** Flag clear lives only on the **registration** arm:
+
+```
+237154  beq v0, -1, 0x2371BC     ; free table slot found while scanning
+2371BC  v0 = flag_base + s1
+2371C4  jal 0x0010BD10           ; (kernel helper)
+2371C8  sb  zero, 0(v0)          ; CLEAR flag  ← only clear site in this function
+```
+
+So: **ISR sets flag → waiter eventually sees non-zero → frees table entry and returns with flag still 1.** A later **re-registration** is what clears. That reframes 98 set / 3 clear: slots 1/2 may complete the wait rarely re-register (or re-enter register+clear only 3×), while still generating many poll READs if they re-enter the wait path differently — or the high READ count is spin-before-success. Open: count how often poll-success epilogue (`0x2371B4`) runs per slot vs register-clear (`0x2371C8`).
+
+```text
+Poll success = free table + return; flag stays 1
+Clear only on register-free-slot path @ 0x2371C8
+SET/CLEAR imbalance may be re-registration gap, not "read sees 1 but branch fails"
+```
 ### 13.3 Next (no Core, continuing — not parking)
 
 1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
