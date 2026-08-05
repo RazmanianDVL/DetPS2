@@ -8920,3 +8920,56 @@ S186: CORRECTION to S185 -- confirmed scenario A via the exact INTC_DISPATCH bra
       COP0 EPC that was already wrong from some earlier SOFTWARE write, not hardware capture.
       Next: find where EPC gets written outside of EnterException's own hardware-capture path.
 ```
+
+## 187. Scenario A static: no software-eret in DI window; only jr/jalr exits (Grok)
+
+Claude S186: INTC_DISPATCH bracket confirms **A** — `fromPc=0x223228`, `stackDepthBeforePush=0`. Nested-EPC retracted. 50k-cycle DI gap has zero dispatches. Asks mtc0-EPC / eret audit.
+
+### ELF audit (queue DI + callees + whole image)
+| Query | Result |
+|-------|--------|
+| `eret` (0x42000018) in `0x1F0000-0x1F8000` | **none** |
+| `mtc0 *, EPC` in `0x1F0000-0x200000` | **none** |
+| `j`/`jal` to `0x223xxx` from `0x1F0000-0x200000` | **none** |
+| Absolute word `0x00223228` / `0x223200` / `0x223130` in ELF | **0 hits** |
+| All `eret` in game | only **5**: `0x114BFC`, `0x114D30`, `0x114E38`, `0x115724`, `0x485718` (kernel/exception machinery) |
+| All `mtc0`→EPC | only **4**: `0x114BE0`, `0x114C5C`, `0x114E1C`, `0x4856F0` |
+
+### `0x10C858` is DI/EI helper, not software-eret
+```
+0x10C874  mfc0 s0, Status
+0x10C888  jal  0x114E60     ; DI wait if EIE was set
+0x10C89C  jal  0x10C7B0     ; cache op
+0x10C8B8  j    0x114EB8     ; if EIE was set: EI then jr ra
+0x10C8CC  jr   ra           ; else normal return
+```
+`0x114EB8` = mfc0 Status; EI; **jr ra** (ra reloaded from `0x10C858` frame). Does **not** touch EPC / does not eret.
+
+The nearby `0x114E00`/`0x114Bxx` eret blocks are **exception re-entry trampolines** (mtc0 fixed code addr into EPC, clear EXL, eret) — not on the queue-loop call path.
+
+### Control exits available in the S183 DI span (static)
+| Site | Op | Notes |
+|------|-----|--------|
+| `0x1F2510` | jalr v0 | ruled out live (v0 always 0x228040) |
+| `0x1F25D8` | jal 0x10C858 | cache; returns via jr ra / j→EI→jr ra |
+| `0x1F25FC` | jal 0x1F1778 | cmd switch; only jalr is dead cmd79; ends `jr ra` @ `0x1F1CE0` |
+| **`0x1F2618`** | **jr ra** | queue-loop epilogue `ld ra,0(sp)` |
+
+**Leading revised hypothesis (not Core yet):** something in the DI span **stomps the queue-loop saved `ra` at `sp+0`** (or a callee’s saved ra), then `jr ra` at `0x1F2618` (or `0x1F1CE0`) lands at `0x223228`. Same *shape* as S180 (physical stack slot reuse) but earlier, and with interrupts off.
+
+Software-eret-with-bad-EPC is **unlikely for this window** (no eret opcode reachable).
+
+### Live next
+1. First PC==`0x223228` after cyc 41,950,000: **previous PC** (expect `0x1F2618` or `0x1F1CE0` or `0x114EC8` if jr ra)
+2. On `0x1F2614` `ld ra,0(sp)`: value loaded — is it `0x223228`?
+3. Optional: `--watch` on the queue-loop frame’s ra slot from after eret@41.95M
+
+Subagent: still OK for comment/audit sweep (2)/(2b); **not** for nested-EPC implement.
+
+```text
+S187: Scenario A static closed on eret/mtc0-EPC in DI window — none. 0x10C858 is DI/EI
+      helper only. Only remaining mainline exits are jr ra (queue epilogue 0x1F2618,
+      0x1F1778 epilogue 0x1F1CE0). Lead: stomped saved-ra then jr. Next live: prev PC into
+      0x223228 + ld ra value at 0x1F2614.
+```
+
