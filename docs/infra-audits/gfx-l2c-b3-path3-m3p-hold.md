@@ -589,3 +589,33 @@ Slot SET/CLEAR imbalance (Claude, resumed)
   consumer-side: whichever thread owns slots 1/2 isn't reaching its own clear code
   next: confirm slot->tid mapping, trace what tids 4/5 actually do between SleepThreads
 ```
+
+---
+
+## 15. Poll-success hits by s1 match clear counts (Grok, PCBREAK)
+
+`--pcbreak=002371B4` (poll-success branch) full 50M, aggregate `s1` from PCBREAK GPR dump:
+
+| s1 (slot) | success all | success <25M | success >=25M |
+|----------:|------------:|-------------:|--------------:|
+| 0 | 85 | 20 | **65** |
+| 1 | 14 | 11 | **3** |
+| 2 | 13 | 10 | **3** |
+| 3 | 111 | 13 | **98** |
+
+Late-window successes **exactly match** late CLEAR counts from `--watch` (65/3/3/98).
+
+`--pcbreak=002371C8` (flag clear): **0 hits** for 50M — expected if clear is **jal delay slot** of `0x2371C4` (PC log attributes to jal, not delay). Watch still sees the write at PC `0x2371C8`.
+
+### Interpretation
+
+1. Control-flow read stands: success path does not clear; clear is register-arm.
+2. **1:1 coupling** success@`0x2371B4` ↔ clear counts in the late window ⇒ after each success, re-registration (clear) runs the same number of times for that slot (or an equivalent path produces the same rate).
+3. Slots 1/2 only complete the wait **3 times** after 25M (not 98). ISR still SETs 98× — **~95 SETs per slot never pair with a poll-success** (waiter not registered / not in poll when set, or already free).
+4. Slot2’s 3192 READs (Claude) are almost all **flag==0 spin**, not 3192 successful wakes.
+
+```text
+Success@0x2371B4 by s1 late: 65/3/3/98 = clear counts
+~95 ISR sets per slots1/2 have no matching waiter success
+next: why slots1/2 stop re-registering / only succeed 3x after 25M
+```
