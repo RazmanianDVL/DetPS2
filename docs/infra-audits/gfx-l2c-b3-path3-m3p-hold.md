@@ -2258,3 +2258,36 @@ boot-table full dump (Claude) -- one-shot subsystem registry, not sequential sta
   toward: a flag checked by the main loop AFTER all boot-table init finishes,
     or set by one specific subsystem init among the ~20 -- needs a sharper filter
 ```
+
+---
+
+## 38. 14 of 20 boot-table subsystems never fire at all — this is request-driven, not "run everything once" (Claude)
+
+Ran the census proposed in §37 (temp `--pc-census=` on all 20 fnptrs, reverted after use):
+
+```text
+fired:     0x1F5708(id=0xA)  4x   0x1FFA00(id=0x15) 4x   0x1F6108(id=0x14) 4x
+           0x1FFAB8(id=0x02) 4x   0x1F7E08(id=0x04) 10x  0x1F9DC0(id=0x0C) 2x
+never:     0x207E30(id=3) 0x1FA168(id=5) 0x205E68(id=9) 0x1FFB50(id=8)
+           0x1FB0B0(id=0xF) 0x1FB960(id=0x10) 0x1FFB60(id=0x17) 0x1FFC18(id=0x18)
+           0x205DE8(id=0xE) 0x200578(id=0xD) 0x201108(id=0x11) 0x202CC0(id=0x12)
+           0x204320(id=0x13) 0x205E30(id=0xB)
+```
+
+**Only 6 of 20 registered subsystem-inits ever fire, all 4x/10x/2x during the same 15.17-
+15.75M setup window already mapped repeatedly tonight. 14 never fire once, in 30M cycles.**
+
+This settles §37's open question: the table is **not** "walk everything once at boot" — it's
+genuinely request-driven, and only ids `{2, 4, 0xA, 0xC, 0x14, 0x15}` are ever requested. The
+other 14 ids (`3, 5, 8, 9, 0xB, 0xD, 0xE, 0xF, 0x10, 0x11, 0x12, 0x13, 0x17, 0x18`) are simply
+never asked for. If any of those 14 corresponds to "begin continuous rendering" / "enter
+gameplay," that's a direct hit on the real question — worth checking which of these 14
+functions look graphics/gameplay-shaped (vs audio/save/physics-only) before doing a deeper
+static trace on all of them blind.
+
+```text
+boot-table fire census (Claude) -- 6/20 fire, 14/20 never fire, all in the 15.17-15.75M window
+  confirms: request-driven registry, not run-everything-once
+  fired ids: 2,4,0xA,0xC,0x14,0x15  |  never-fired ids: 3,5,8,9,B,D,E,F,10,11,12,13,17,18
+  next: which of the 14 never-fired ids is graphics/gameplay-relevant (vs audio/save/physics)
+```
