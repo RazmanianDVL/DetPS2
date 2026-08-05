@@ -221,3 +221,38 @@ Descriptor `@0x5A6E20` double-indirects to the `gameart.ssf` table record (`0x50
 4. Only after EE-proven palette source: plan Core to either run real consumer further or load CLUT from that source — dual-ACK before Core.
 
 Still **no Core** this seat.
+
+---
+
+## 11. Special-kind path + honesty bound on “open”
+
+### 11.1 `FUN_0036dd80` (called from type-1 SEC for post-special entries)
+
+Stream reader (not a palette blitter):
+
+1. Read `u8` name length + name bytes  
+2. Read two `u32`  
+3. `FUN_00229da0` → object alloc  
+4. Flag byte low bits set to **2** or **4** via `FUN_001b16c0`  
+5. `FUN_001b2930` copies name into object  
+
+So “special” kinds drive **named sub-object materialization** from a sequential stream, not an obvious 256-entry CLUT DMA.
+
+### 11.2 `FUN_00478da0` / package bind
+
+Post-SEC cleanup + freelist; async bind queue via `FUN_00478e10` / `FUN_00478f30` / `FUN_00266f40` (name lookup in current package, optional completion callback `FUN_00479100`). **No GS/TEX0/CLUT constants** in this chain.
+
+### 11.3 Honest bound
+
+| Mapped | Not yet mapped |
+|--------|----------------|
+| Disc path → package open → SEC instantiate → kind taxonomy | **Where PSMT8 tiles get a palette into GS** (draw/upload / TEX0-cld path) |
+| Why PL-029 is incomplete vs EE | Live TOC kinds **after** real EE open (may differ from Host→Local-only view) |
+
+**CLUT is not sitting in the package-open prologue.** Next productive EE seats:
+
+1. Live TRACE: after frontend calls `FUN_001a44d0(0x10005,…)`, dump in-memory SEC TOC kinds/sizes (compare to PL-029).  
+2. Static: find writers of GS CLUT-related paths / `sceGs` load-image callers that take SEC tile payloads (xref from `sceGsExecLoadImage` string or known BITBLT helpers).  
+3. Only then Core dual-ACK.
+
+Park open-path dig here unless new evidence appears.
