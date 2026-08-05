@@ -6819,6 +6819,63 @@ mapping, case 3's check is `if *(u8*)(s2+0x14C)==0 → return 0`, i.e. a single 
 byte flag), and each level has been a real, live-confirmed transition partway through a real
 ladder, not a broken/dead code path.
 
+## 143. Major connection: the case-3 byte flag is written by `0x13D340` — the exact same generic async-load completion pump instruction as G1/S89-98's GTFS fix, and it DOES eventually reach 1 — but timing needs reconciling with why inner state still reads 3 (Claude)
+
+Full write history via `--watch=01E85A4C --watch-after=0` (real, permanent tooling, no temp
+code), full 95M-cycle run:
+
+```
+watch 0x01E85A4C: 8 accesses
+  sq zero                                    (boot zero-init)
+  READ  @ 0x2BCA8C  lbu v1, 332(s2)           (case 1/24 read — 332 dec = 0x14C, confirms address)
+  WROTE 0x00000000 @ 0x2BCA9C  sb zero, 332(s2)   (explicit clear, part of arming)
+  WROTE 0x00000000 @ 0x0013D160  sb zero, 0(v0)   (SAME generic per-attempt-reset site as S89)
+  READ  @ 0x2BCB50  lbu v0, 332(s2)  -> 0        (case 3 check #1: fail)
+  READ  @ 0x2BCB50  lbu v0, 332(s2)  -> 0        (case 3 check #2: fail)
+  WROTE 0x00000001 @ 0x0013D340  sb a1, 0(v1)     (SAME completion-pump site as S89-98!)
+  READ  @ 0x2BCB50  lbu v0, 332(s2)  -> 1        (case 3 check #3: sees 1!)
+```
+
+**`0x13D340` is the exact instruction S89-90 identified and S98 already fixed for Global.txd's
+completion** (`sb 1, 0(v1)`, the GTFS-family async-queue's generic "mark this pending slot
+done" pump). This byte flag isn't part of a separate, unrelated mechanism — **it's driven by the
+same generic loader queue** (`0x13CFA0`/`0x13D250`/`0x13D340`) that S98's fix already generalized
+(S98 completes *any* matching EE file object on fno=5 EOF, not just Global.txd specifically).
+Whatever file/resource this specific queue slot corresponds to, its completion got picked up by
+the same landed fix.
+
+**The flag genuinely reaches `1`** — the third and final observed read at `0x2BCB50` sees `1`,
+not `0`. Per Grok's case-3 polarity (`==0 → fail`, so nonzero should mean "advance"), this read
+should have let the SM leave state 3. **But my S142 snapshot at cyc=90M still read inner state
+as `3`, not further.** This is a real discrepancy to flag plainly, not smooth over: either (a)
+case 3 requires more than just this one byte (a second condition after the flag check that also
+needs satisfying, not yet found), (b) the state write to advance past 3 happens on a *later* poll
+that hasn't occurred yet (this SM, like case 7's own outer poll, might only be re-entered when
+something re-triggers the whole chain — and if the outer climber/mode-state genuinely stopped
+retrying after landing at modestate=7, per S131's "hard plateau, zero movement 40M-94M," this
+inner SM would never get a chance to observe its own flag turning to 1 and act on it), or (c)
+my two checks (S142's state snapshot and this watch) sample at different exact moments and the
+true sequence needs a single combined trace to resolve cleanly.
+
+**(b) is the most consistent with tonight's overall pattern**: S131 already found modestate
+frozen solid from 40M through 94M with zero movement, and phase frozen at 23 the same way. If
+the entire outer retry mechanism has stopped polling by the time this flag resolves, then
+*nothing* downstream ever gets to notice — not because any single check is broken, but because
+the retry loop itself gave up. This would mean the missing piece isn't another async completion
+fix, but finding why the outermost retry (climber / host-present-driven wake cycle) stops
+retrying instead of continuing to poll periodically like it did earlier in the run (37-38 real
+retries observed pre-plateau, per S83).
+
+```text
+S143: Case-3 flag IS driven by the same 0x13D340 completion pump S98 already fixed, and it DOES
+      reach 1 by the end of the observed access history. But inner state (S142) still reads 3 at
+      90M, not advanced. Real discrepancy — leading theory: the outer retry chain (climber/
+      mode-state, frozen solid 40M-94M per S131) stopped polling before this flag resolved, so
+      nothing downstream ever gets a chance to observe it and advance. Needs Grok's read on
+      whether case 3 has a second condition, or whether the real remaining gap is "why does the
+      outer retry loop stop retrying" rather than any specific async completion.
+```
+
 ```text
 S142: Inner state confirmed 3 (real progression 1->2->3, each hit once, case3 retried 3x).
       Per Grok's case-3 body, the exact next target is *(u8*)0x1E85A4C — a single byte flag.
