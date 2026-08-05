@@ -8380,3 +8380,63 @@ S181-live: 0x223130 (Grok's identified prologue) and its sd ra @ 0x223138 NEVER 
       re-verification of the real prologue address before choosing between "frame still live
       from way earlier" vs "this path skips the prologue entirely."
 ```
+
+## 182. STATIC re-ID — `0x223130` is the only real entry; `0x223200+` is fall-through body (Grok)
+
+Claude S181-live: pcbreak `0x223130-0x2231FF` = 0 hits whole run; `0x223200+` hot. Asked to re-verify prologue.
+
+### What static re-scan shows
+| Check | Result |
+|-------|--------|
+| `addiu sp,-8640` in entire ELF | **only** `0x223130` |
+| `addiu sp,+8640` | **only** `0x2253B0` |
+| `sd ra,160(sp)` in `0x222000-0x226000` | **only** `0x223138` |
+| External `jal` into `0x223130-0x2253B0` | **4× `jal 0x223130`** only (`0x275F34`, `0x276388`, `0x3B3234`, `0x3D2FF8`) |
+| External branch/`j` into `0x223200-0x223300` | **none** |
+| `lui`/`addiu`/`ori` building `0x223xxx` code addrs | **none** |
+| Absolute words == `0x00223130` | **none** (no fn-ptr table to entry) |
+| Absolute words into body range | mostly unaligned junk (`0x002252AB` ×12) — not usable entry ptrs |
+| `j 0x223C30` @ `0x49105C` | **data false-positive** (surrounding words are not real code) |
+
+### Body at `0x223200` is not a second entry
+Continuous fall-through from prologue:
+
+```
+0x2231F8  sq   v0, 8624(sp)     ; uses the 8640 frame
+0x2231FC  addiu a0, s4, 1136    ; s4 = a0 saved in prologue
+0x223200  jal  0x225B30
+0x223204  daddu a1, s0, zero    ; s0 loaded in prologue @ 0x223178
+0x22320C  beq  s1, -1 -> epilogue 0x225378
+0x223224  beq  ... -> 0x2243E0  ; identity/VU0 path (S prior)
+0x223228  sw   zero, 252(sp)    ; Claude's earliest hot PC
+```
+
+`0x223200+` **depends on prologue-set `s0`/`s1`/`s4` and the 8640-byte frame** (e.g. `lq …,8624(sp)`). It is not a free-standing entry.
+
+### a1==-1 path still enters at `0x223130`
+Callers `0x3B3234` / `0x3D2FF8` pass `a1=-1`, then `jal 0x223130`. Inside: `beq s1,-1 -> 0x2231FC` **skips mid-prologue setup only** — still runs `addiu sp,-8640` + full `sd ra` / `sq s*` / `swc1 f*` first. Does **not** jump to `0x223200` from outside.
+
+### How to read the live discrepancy
+Static: **sole legal entry = `0x223130`**. No alternate mid-body entry edge exists in the binary.
+
+So either:
+1. **Tooling miss** — prologue *does* run but pcbreak/`--watch` did not see `0x223138` (range syntax, phys vs cached VA, first-hit before watch window, etc.); or
+2. **True non-static entry** (jalr / bad EPC restore into body) with **no data-word footprint** we can find — possible but unsupported by pointer scan; or
+3. **First entry far earlier** than assumed with self-referential `ra` at 42M only showing re-loop — but Claude reported **zero** prologue hits from cycle 0, which if tooling is perfect would force (2).
+
+### Live asks (prefer 1 before inventing mid-entry Core story)
+1. Single-address break: `--pcbreak=00223130` and `00223138` alone (not a range); also try if tool needs `0x` / uncached form.
+2. At **first ever** hit of `0x223228` (or `0x223200`): dump `sp`, `s0`, `s1`, `s4`, `ra`, and `*(sp+160)`.  
+   - If `sp` is deep and `s0`/`s4` look like real object ptrs and `*(sp+160)` is a code ra → **prologue ran (tool miss)**.  
+   - If `sp` is shallow (~`0x1FFFE40` family) and `s0`/`s4` junk → **true mid-entry / no frame** (bigger deal).
+3. Still want order: any write to `0x1FFFE40` that is `sd ra` (value in code range) vs only the float `0x3C888889`.
+
+```text
+S182: RE-ID — 0x223130 is the UNIQUE static entry (only -8640, only sd ra+160 in band,
+      only 4 inbound jals). 0x223200+ is fall-through body needing prologue s0/s1/s4 +
+      8640 frame; zero external edges into 0x223200-0x223300. Live cold-prologue is
+      either tooling miss or jalr/EPC mid-entry with no static footprint. Next live:
+      first-hit dump at 0x223200/228 (sp/s0/s4/ra/slot) + single-addr pcbreak on
+      0x223130/138.
+```
+
