@@ -1745,21 +1745,35 @@ public sealed class Burnout3Assist : IGameQuirkModule
         uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
 
         ulong savedPc = ee.PC;
+        uint savedStatus = ee.COP0_Status;
         var savedGpr = new EmotionEngine.Gpr128[32];
         for (int i = 0; i < 32; i++)
             savedGpr[i] = ee.GetGpr(i);
 
         // Boot case-2 path leaves a1/a2/a3 zero into the switch; leaf uses fixed bases.
+        // Ensure gp matches known B3 live gp (function uses gp-relative loads).
+        const uint B3Gp = 0x004E8670;
         ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 }); // a0
         ee.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // a1
         ee.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2
         ee.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 }); // a3
+        ee.SetGpr(28, new EmotionEngine.Gpr128 { Lo = B3Gp }); // gp
         ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ReturnSentinel }); // ra
+        // Mask IE+EIE so VBlank STAT pulses do not COP0-dispatch into kernel.
+        // (Status IE=bit0, EIE=bit16 — both required for IRQ take; S271f only cleared IE.)
+        ee.COP0_Status = savedStatus & ~0x10001u;
         ee.PC = FbpOrFn;
 
         bool returned = false;
         int steps = 0;
-        const int MaxSteps = 500_000; // leaf should be far smaller than switch
+        // S271c: 2M budget + stuck PC. S271d: stuck at 0x10C2F8 = INTC_STAT bit2
+        // (VBlankStart) poll — nested EE-only Step never raises VBlank. Pulse VBlank
+        // STAT (sticky, IE off) so wait loops complete without ISR steal.
+        const int MaxSteps = 2_000_000;
+        uint lastPc = FbpOrFn;
+        uint stuckPc = 0;
+        int vblankPulses = 0;
+        int lastPulseAt = -4096;
         try
         {
             while (steps < MaxSteps)
@@ -1768,6 +1782,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 if (n <= 0) n = 1;
                 steps += n;
                 uint pc = (uint)(ee.PC & 0x1FFFFFFFu);
+                lastPc = pc;
+                // S271i: surgical unstick of INTC_STAT bit2 poll at 0x10C2F0..0x10C310
+                // (S271c parked here). Force v0 bit2 so the beq exits without Raise/ISR.
+                if (pc is >= 0x0010C2F0 and <= 0x0010C310)
+                {
+                    ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 4 }); // v0 & 4 != 0
+                    vblankPulses++;
+                }
                 if (pc == ReturnSentinel || pc == (ReturnSentinel & 0x1FFFFFFFu))
                 {
                     returned = true;
@@ -1776,11 +1798,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 if (pc < 0x1000)
                     break;
             }
+            if (!returned)
+                stuckPc = lastPc;
         }
         finally
         {
             for (int i = 0; i < 32; i++)
                 ee.SetGpr(i, savedGpr[i]);
+            ee.COP0_Status = savedStatus;
             ee.PC = savedPc;
         }
 
@@ -1789,8 +1814,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         uint dispfb2After = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
         Console.Error.WriteLine(
             $"[B3] FORCE_DISP_CASE2 fn=0x{FbpOrFn:X8} (FBP-OR leaf) returned={returned} steps={steps} " +
-            $"FRAME1=0x{frame1:X} env+10 0x{envBefore:X}->0x{envAfter:X} " +
-            $"DISPFB2 0x{dispfb2Before:X}->0x{dispfb2After:X} cyc={sys.MasterCycles}");
+            $"stuckPC=0x{stuckPc:X8} vblankPulses={vblankPulses} FRAME1=0x{frame1:X} " +
+            $"env+10 0x{envBefore:X}->0x{envAfter:X} DISPFB2 0x{dispfb2Before:X}->0x{dispfb2After:X} " +
+            $"cyc={sys.MasterCycles}");
     }
 
     /// <summary>

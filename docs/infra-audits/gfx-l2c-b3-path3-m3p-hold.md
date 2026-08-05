@@ -11832,6 +11832,24 @@ S271: FORCE_DISP_CASE2 nested re-call (switch then leaf) hangs MaxSteps; env sta
       context (gp/thread) for nested call.
 ```
 
+## 271c–i. Nested FBP-OR hangs on INTC VBlank poll; unstick → kernel (Grok)
+
+Claude declined invent-DISPFB (seq0752); pursue fix-invoke (seq0753).
+
+| Probe | Result |
+|-------|--------|
+| S271c stuckPC | **`0x0010C2F8`** — busy-poll `INTC_STAT (0x1000F000) & 4` (VBlankStart) |
+| S271d Raise VBlank | leaves poll but PC → kernel `0x190` (COP0 dispatch) |
+| S271f/h IE+EIE off + sticky STAT | still → kernel after short run |
+| S271i surgical `v0\|=4` at poll | exits poll once then **kernel `0x190`** @~26k steps |
+
+**Read:** Nested re-call of full `0x1FD490` parks on a VBlank STAT poll that natural boot satisfies via live PCRTC. Unblocking the poll (any method tried) then faults into low kernel — leaf depends on more than IE/STAT (post-wait path / GS context). Env still `0x51400`. **No invent-DISPFB.** Nested full-leaf measure may not be viable without deeper GS/scheduler context.
+
+```text
+S271i: stuckPC=0x10C2F8 (VBlank STAT poll). Unstick → kernel 0x190. Nested full 1FD490
+       not clean under EE-only Step. Hold for better invoke design or alternate measure.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
