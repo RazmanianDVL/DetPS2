@@ -3446,3 +3446,51 @@ real game code confirmed (Claude) -- open() succeeds cleanly, gap is one level f
     as S27/S35/S41-43's dead-code pattern
   next: find what SHOULD re-invoke this loader (or a read-issuing sibling) to advance past state=1
 ```
+
+---
+
+## 55. Struct-consumer side: found the "state" flag's sole reader and a candidate dispatch loop (Claude, split with Grok's vtable hunt)
+
+Grok found the `fno=5` sibling function (`0x1D3280`, the real multi-chunk `Global.txd` DMA
+reader) via the vtable at `0x4DDFC8`, confirmed `--pcbreak` shows **zero hits** — fully wired,
+never called, same shape as §27/§35/§41-43. Took the complementary struct-consumer angle.
+
+Watched the "state" field directly (`s1+24` from §54's trace, real address `0x0066E138`):
+**exactly one read across the entire 40M-cycle run**, from a trivial getter at `0x001D3824`
+(`lw v0,24(a0); jr ra`) — clearly meant to be polled repeatedly, called exactly once.
+
+Traced that getter's caller context and found a real `jalr`-based dispatch loop nearby
+(`0x00212A24-0x00212A4C`):
+
+```text
+0x212A24: lw t9, 0(s0)      # load vtable ptr from object s0
+0x212A28: daddu a0, s0, zero
+0x212A2C: lw t9, 16(t9)     # load method ptr from vtable+16
+0x212A30: jalr t9           # call obj->vtable[16](obj, index=s1)
+0x212A34: daddu a1, s1, zero
+0x212A38: sw zero, 24(v0)   # clear offset+24 of the call's return value
+0x212A3C: addiu s1, s1, 1
+0x212A40: lw v0, 12(s0)     # count = *(s0+12)
+0x212A44: sltu v0, s1, v0
+0x212A48: bne v0, zero, 0x212A24  # loop while index < count
+```
+
+Classic indexed vtable-dispatch pattern (`for i in 0..count: obj->vtable[16](obj, i)`), and
+the offset it clears after each call (`+24`) matches the loader's own "state" field exactly.
+**Not yet confirmed** whether this loop's `s0` resolves to the same object family as Grok's
+`0x4D5990` vtable-install site, or whether the item pointer it clears is actually our specific
+loader's struct — flagged to Grok directly given they have the install-site context to check
+this quickly. If confirmed, this would be a genuine race: the per-frame dispatch loop clearing
+`state` back to 0 immediately after calling each item's handler, potentially before anything
+else gets a chance to observe `state==1` and issue the `fno=5` read.
+
+```text
+struct-consumer side (Claude) -- state flag's sole reader found, candidate reset-race flagged
+  state field (0x66E138) read exactly once in 40M cycles, by a trivial polled getter (0x1D3824)
+  found a real jalr-t9 indexed dispatch loop (0x212A24-0x212A4C) that clears offset+24
+    (matches state field exactly) immediately after calling each item's vtable[16] method
+  not yet confirmed this is the SAME object/state -- handed to Grok (has install-site context)
+    to check whether s0 here matches the 0x4DDFC8 vtable's owning object
+  if confirmed: a per-frame reset race, not a missing call -- state never survives long enough
+    for anything to see it and issue the fno=5 read
+```
