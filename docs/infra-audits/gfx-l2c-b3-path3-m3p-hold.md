@@ -4253,3 +4253,20 @@ else if (sys.MasterCycles >= 20_000_000 && sys.Gif.Path3Transfers >= 4)
 ```
 
 Unblocks existing wake-flag plant + 0x237120..19C force so climber can retry past S66 park.
+
+---
+
+## 69. S68 smoke: latch works — big boot progress, still black/Path1=0
+
+50M host-present after dual-ACK land (`39fffb0`):
+
+| metric | before | after |
+|--------|-------:|------:|
+| PC | 0x237190 | 0x10BE68 |
+| px | 877k | **7.67M** |
+| gifP3 | 20 | **198** |
+| cdvd | 1865 | **6584** |
+| Path1 | 0 | 0 |
+| dispfbPx | 0 | 0 |
+
+VBlank wake + SleepThread assists fire; flip park leave observed. Residual: no Path1/VU1, dispfb still dark.
