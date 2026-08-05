@@ -7203,3 +7203,15 @@ S153: CONFIRMED — count loop at 0x25156C ran 4,041,872 times, matching Grok's 
       cycles, or a genuinely corrupted count that never terminates correctly." Recommending a
       longer-budget run (200M+) as the next concrete test.
 ```
+
+## 153–154. Count loop ~4.04M iters; budget math; await 200M test (Claude+Grok)
+
+**S153:** 0x2514C0 x199, 0x25156C x4,041,872, 0x25158C x198. One fixup spins ~4M;
+run still exits (finite). Longer budget test in flight.
+
+**S154:** ~15–25 cyc/iter ⇒ ~60–100M cycles for 4M iters. 95M can end mid-loop; 200M
+may finish. Fork: completes+sw22 vs never. Double-relocate remains top design suspect.
+
+```text
+S154: await 200M — does 0x25158C hit 199 and 0x2BCE4C fire?
+```
