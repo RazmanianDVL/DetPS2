@@ -3760,3 +3760,57 @@ mode/state hunt started (Claude) -- full 90M-cycle PC profile
   redirects the mode/state hunt: find what the 4-slot wait's real PRODUCER is gated on
     (same "go one level up" method as S52-S55), rather than assuming active-but-silent simulation
 ```
+
+---
+
+## 58. Real mode/render-object identity check found — a singleton that's never constructed on either end (Grok + Claude)
+
+Grok found a real "current mode/render object" identity check at `0x223224` (reached from the
+presentation-continue path after §57's VBlank-park loop): loads a current-object pointer,
+compares against a fixed constant, branches to `0x2243E0` on match (confirmed real VU0/`cop2`
+matrix-transform code — chained `cop2`, `lwc1`/`swc1`, `sq`/`lq` pulling float fields at offsets
+16-72 from a source object, matching a 4x4-matrix-shaped layout) or falls through otherwise.
+(Both Grok's and Claude's independent disasm of the actual fall-through path, `0x223228`+,
+also show real matrix/float work on a *different* source object — so this specific branch is
+"use object A's transform vs object B's transform," not cleanly "render vs no-render"; noted as
+an open caveat, not yet fully resolved which downstream effect matters more.)
+
+**The real addresses (corrected after an initial off-by-`0x10000` sign-extend slip from a
+`lui`+`addiu` pair — caught and fixed):**
+
+- Current pointer: `*(0x0051BA88)`
+- Expected/target singleton: `0x0051A688`
+
+### 58.1 Both ends confirmed dead
+
+**Current pointer, watched across the full 90M-cycle run (Claude):** exactly 4 accesses,
+ever — boot zero-init, one syscall-context read, **one real write that's an explicit re-zero**
+(`sw zero,-9656(v1)` at `0x133EBC` — deliberately clearing something already zero, not an
+assignment), and one real consumer read (`0x131E54`). **The pointer is never assigned a
+non-null value at any point in the entire run.**
+
+**Target singleton, checked by Grok:** `0x51A688` sits as all-zero BSS — never constructed
+(no writer found yet from Grok's static pass; likely a fixed singleton object that should be
+placement-constructed once, then have its address written into `0x51BA88`).
+
+### 58.2 Reading
+
+This is now a clean "singleton never constructed" story on both ends, not a "pointing at the
+wrong thing" story: the object that should represent whatever mode/state enables this specific
+identity-gated branch never gets built, and the pointer that should reference it never gets
+set. Same shape as everything else found tonight (registered-but-never-dispatched), one level
+higher up — this may be *the* real gate for whatever downstream rendering difference the
+`0x2243E0` branch represents, though the exact downstream consequence (given both branches do
+real matrix work) still needs pinning down before claiming this explains the black screen.
+
+```text
+mode/render singleton (Grok+Claude) -- never constructed on either end
+  current pointer *(0x51BA88): exactly 4 accesses in 90M cycles, NEVER assigned non-null
+    (boot zero-init, one syscall read, one deliberate re-zero at 0x133EBC, one consumer read)
+  target singleton 0x51A688: all-zero BSS, no constructor/writer found yet (Grok, in progress)
+  identity check at 0x223224 (beq -> 0x2243E0 real VU0/cop2 matrix code) never matches -> always
+    falls through to a DIFFERENT matrix path (0x223228+, also real work, not yet fully traced)
+  open caveat: both branches do real float/matrix work -- exact downstream consequence of
+    taking 0x2243E0 instead of the fall-through not yet confirmed
+  next: who should construct 0x51A688 (Grok, in progress); what 0x133EBC's re-zero context is
+```
