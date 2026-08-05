@@ -1396,3 +1396,49 @@ DMAC handler = VIF1+GIF completions
 ~14 fires clustered in setup; RR spreads slightly later, not continuous
 re-arm needs sustained GIF/VIF1 completion stream
 ```
+
+---
+
+## 26. DMAC completion-interrupt logic is unconditional (Claude) — refutes an HLE-hold hypothesis, redirects to game-side issuance
+
+Independently confirmed the same channel registration (`DETPS2_TRACE_HANDLERS=1`:
+`[ADDDMAC] channel=1 handler=0x1F1778` / `channel=2 handler=0x1F1778` — VIF1 and GIF,
+matching Grok's finding exactly). Before accepting "GIF completions stop because PATH3 is
+held" as the mechanism, checked whether our own HLE might be *suppressing* the DMAC
+completion interrupt for held Path3 transfers (a real, plausible-looking Core bug candidate,
+similar in shape to tonight's earlier findings).
+
+**Read `Dmac.cs`'s `Step`/`DeliverSegment`/`FinishChannel` directly:** `FinishChannel` (which
+calls `RaiseDmacIrq`) is invoked **unconditionally** right after `DeliverSegment` whenever a
+channel's `QWC` reaches 0, regardless of what `DeliverSegment` did internally — including the
+GIF case, where `DeliverSegment` calls `Gif.ReceivePath3Data`, which internally holds the
+data (`EnqueueHeldPath3`) when Path3 is masked. **The DMAC layer doesn't know or care whether
+GIF held or processed the payload — it raises its own completion interrupt either way**,
+correctly matching real hardware semantics (DMAC completion = "I finished moving these
+bytes," not "the downstream consumer finished processing them").
+
+**This refutes the hypothesis that HLE is suppressing completion interrupts for held
+transfers.** The interrupt-raising code is correct. So the reason handler `0x1F1778` stops
+being entered after ~15.75M isn't a missing/suppressed interrupt for existing work — it's
+that **the DMAC channels (VIF1/GIF) simply have no new segments to complete**, i.e. the game
+stops *issuing new* DMA kicks on these channels at all. Consistent with everything else
+found tonight: PATH3's own held-queue pattern shows the same shape (three real batches, the
+third left held forever, no fourth batch ever submitted).
+
+### 26.1 Redirects the real question
+
+Not "why doesn't the completion interrupt fire" (it would, if there were new work) — but
+**"why does the game's own code stop submitting new VIF1/GIF DMA transfers after
+~15.5-15.75M."** That's a game-logic-side question, the same shape as the MSKPATH3
+write-site tracing already done successfully tonight (§9 of this doc) — find the real code
+that issues new DMA kicks (writes `D2_CHCR`/`D2_QWC`/`D2_MADR` or the VIF1 equivalent with
+the STR/start bit) and check whether/how often it's reached after the critical window,
+mirroring the exact methodology that already worked for finding the MSKPATH3 builder.
+
+```text
+DMAC completion-interrupt check (Claude) -- refutes HLE-suppression hypothesis
+  FinishChannel/RaiseDmacIrq fires unconditionally, regardless of GIF hold state
+  interrupt-raising logic itself is correct, matches real hardware semantics
+  real question redirects to: why does the GAME stop issuing new VIF1/GIF kicks
+  next: find the real DMA-kick-issuing code (same method as the MSKPATH3 write-site trace)
+```
