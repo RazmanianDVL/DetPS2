@@ -5213,3 +5213,68 @@ S68 Assist latch fixed (_flipEverUnblocked)
 S91: synthesis — black present = mode never ready because Global.txd load never completes
      (phase3 flag); root remains G1 fno=5 never dispatched. Full chain now closed end-to-end.
 ```
+
+## 92. UPDATE to G1: post-S68, `0x1D3280` (fno=5 read) now fires ONCE — not zero. The read is dispatched; the object gets stuck at state=2 and never completes (Claude)
+
+Ran Grok's requested live split before their seq0499 landed (independent, overlapping targets)
+— `blocker-trace --host-present`, `--pc-census=00212A24,00212890,001D36E0,001D3280,001D30B0,`
+`001D3820` + `--watch=0066E138` (`0x66E120+24`, the state field) + a one-shot object dump at
+90M cyc. Temp code reverted after use (`git diff --stat` 20 insertions across `PcProfiler.cs`/
+`Program.cs`, `git checkout --`, clean).
+
+```
+pc-census:
+  0x00212A24 x1     (container tick — one-shot, matches original doc note)
+  0x00212890 x1     (dispatch orchestrator — one-shot, not re-entered)
+  0x001D36E0 x1     (open — as always)
+  0x001D3280 x1     (READ — FIRES ONCE. Historically documented as 0 hits.)
+  0x001D30B0 x0     (seek — dead)
+  0x001D3820 x37    (status-check function — matches climber's ~37-38 retry count exactly)
+```
+
+**`0x1D3280` (the fno=5 read) is no longer zero — it fires exactly once.** This is a real,
+material update to G1's status under the post-S68 boot trajectory: the historical "0 hits"
+characterization (documented in §0.4/§91's table, from earlier tonight before the S68 fix landed)
+is now out of date. Under more boot execution, the dispatch that was never reached before is now
+reached once.
+
+**Object `0x66E120` dump at 90M cyc:**
+
+```
++0x00 vtable ptr = 0x004DDFC0   <- NOT 0x4DDFC8 (the documented raw GTFS vtable) — 8 bytes off.
+                                   Confirms Grok's seq0499 hypothesis: this is a WRAPPER vtable,
+                                   not the raw GTFS one.
++0x18 (=+24, state) = 0x00000002
+```
+
+**Full write history of the state field (`--watch=0066E138`, 43 total accesses, all shown):**
+
+```
+sq zero  (zero-init)
+sw zero, 24(v0)     @ 0x212A38   (container tick clears it — matches Grok's "consume" note)
+lw v0, 24(a0)        @ 0x1D3824  (getter reads 0)
+sw v1, 24(s1) = 1    @ 0x1D37E4  (open success — state: 0 -> 1)
+lw v0, 24(a0)        @ 0x1D3824  (getter reads 1)
+sw v0, 24(s4) = 2    @ 0x1D3590  (state: 1 -> 2 — this write happens at/around the read dispatch)
+...35 more reads, all via 0x1D3824, all seeing 2, through to the end of the 95M-cycle run...
+```
+
+**State genuinely progresses 0→1→2 (real forward motion — open succeeds, then something advances
+it to 2, correlating with the single `0x1D3280` dispatch) and then stalls at 2 permanently.**
+Every one of the 37 climber-retry-driven polls (`0x1D3820` × 37, `0x1D3824` getter reads) sees
+the same `2` and never observes a further transition to whatever value would mean "complete."
+
+**Reframing G1**: this is no longer "the read is never dispatched." It's now "the read *is*
+dispatched exactly once, advances state to 2 (presumably 'read in progress' or similar), and
+then never receives whatever signals completion" — the same shape as the DMA-credit-back class
+of bug already fixed once tonight in a different subsystem (S49-51's iovec/hugeCopy work). Next
+question: what does `0x1D3280` actually kick off (a DMA request? an async IOP RPC?), and what's
+supposed to credit its completion back to advance state past 2 — matches Grok's own framing in
+seq0499 almost exactly, now with the "read fires once" fact confirmed rather than assumed.
+
+```text
+S92: G1 status update — 0x1D3280 fires 1x now (was 0x historically), state 0->1->2 confirmed
+     real, stalls at 2 forever after. Object uses a wrapper vtable (0x4DDFC0), not raw GTFS
+     (0x4DDFC8) — confirms Grok's hypothesis. Next: what 0x1D3280 kicks off and what's supposed
+     to credit its completion (same shape as S49-51's DMA-credit class of bug).
+```
