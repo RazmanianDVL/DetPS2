@@ -198,7 +198,49 @@ Per-tile header palette refuted. **Root sibling walk is not empty** — see §4d
 
 **Findings:** Root `kind=1` is normal (unlike nested TOC). Shared palette is **more plausible in e=1 or e=8–13** than in identical tile headers. Not a negative result.
 
-**Next:** walk e=1 nested SEC TOC; sample e=8 as 512/1024-byte CLUT-shaped tables; then dual-ACK `MaybeLoadClut` if source confirmed.
+**Next:** walk e=1 nested SEC TOC; sample e=8 as 512/1024-byte CLUT-shaped tables — **done §4e**.
+
+---
+
+## 4e. e=1 nest TOC + e=8..13 CLUT sample (Grok)
+
+**Capture:** `DETPS2_TEMP_DEC_E1_E8=1` (fully reverted). Artifact: `out/canaries/gfx-dec-header/e1-e8-sample.txt`.
+
+### e=1 nested SEC (`@0x248000`, sz=`0x22C00`)
+
+| Field | Value |
+|-------|--------|
+| magic | `SEC ` |
+| `+0x10` | `0x18` → **24** TOC entries |
+| `+0x18` | `0x22C00` (matches member size) |
+
+Nested TOC **ne=0..23**: all **kind=2**, **sz=0x1700**, first=`0x4000`, mark=`\x18PS2` — **same PAD128 tile slabs as e=0**, not palettes.  
+ne≥24: parse runs into **ASCII name table** (`ENDING`, `ON_ENDING`, `GIG`, `PAD128` strings visible as u32 garbage) — not real TOC.
+
+**Verdict:** e=1 is a **second texture nest** (~24 more UI tiles), not a CLUT bank. PL-029 only feeding e=0 means half (or more) of gameart tiles never Host→Local — separate issue from gray indices.
+
+### e=8..13 samples (first 512B)
+
+| Metric | Observation |
+|--------|-------------|
+| first u32 | `0x0000000A` (10) all six |
+| hex head | `0A 00 00 00  00 00 00 00  01 00 00 00  7F 00 00 00  0C 00 00 00 …` structured records |
+| uniq / nz | ~45–50 unique, ~90/512 non-zero — **sparse**, not dense CLUT |
+| “alpha” stride (+3) | **aFf=0/128, a00=128/128** — never 0xFF; **not** RGBA32 palette with solid alpha |
+
+**Verdict:** e=8–13 are **record/script/param blobs**, not PAD128 CLUT tables.
+
+### Investigation status after §4e
+
+| Hypothesis | Result |
+|------------|--------|
+| Nested kind=1 palettes | Refuted (nested) |
+| Per-tile 0x100 header = palette | Refuted |
+| In-payload leftover = palette | Refuted (Claude) |
+| Root e=1 = palette SEC | **Refuted — more tiles** |
+| Root e=8–13 = CLUT blobs | **Refuted — sparse records** |
+
+**Remaining paths (harder):** EE SSF/texture consumer decompile for CLUT upload; search gameart for `PAD128` string + following 512B tables; TEX0/TEXCLUT GS register traces when natural menu draws.
 
 ---
 
@@ -219,9 +261,8 @@ Per-tile header palette refuted. **Root sibling walk is not empty** — see §4d
 ```text
 GFX Dec CLUT investigation
   gray = honest PSMT8-without-CLUT; PL-029 never loads CLUT
-  nested kind=1 palette: refuted; per-tile header palette: refuted
-  header: 64x64 (dim<<8), \x18PS2, PAD128, skip=0x100
-  root TOC: 14 entries; e=0 tiles SEC; e=1 sibling SEC 139KiB unvisited
-  e=2..13 other kind=1 blobs (~30KiB / ~5KiB) — palette bank candidates
-  next: e=1 nest walk + e=8..13 CLUT-shaped sample; leftover entropy (Claude)
+  header: 64x64 (dim<<8), \x18PS2, PAD128
+  root e=1 = more kind=2 tiles (not CLUT); e=8..13 = sparse records not palettes
+  all quick TRACE palette hypotheses refuted
+  next: EE SSF consumer / PAD128 string+table search / TEXCLUT trace
 ```
