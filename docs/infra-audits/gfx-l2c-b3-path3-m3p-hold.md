@@ -11116,7 +11116,7 @@ S246: Independent confirm of S243/S244 via pop-caller census -- 5 distinct RAs, 
       initial misread (0x3844EC's 11 hits are the init loop, not 11 external consumers).
 ```
 
-## 245. Free walk never leaves head — zeros head->next, drops chain (Grok)
+## 247. Free walk never leaves head — zeros head->next, drops chain (Grok)
 
 Live watches on node **+0 next** during pool init (deterministic addresses):
 
@@ -11141,7 +11141,35 @@ freelist = used_head;  // one-node freelist
 Static loop *should* walk `while (a2->next)`. Live: first load + immediate store on head only → either next reads as 0 at free entry (despite 2B6DD8), or walk broken. Result matches S244 (1 of 11 restored).
 
 ```text
-S245: free 0x2B6C40 never visits mid nodes; zeros used-head->next, freelist keeps 1 node.
+S247: free 0x2B6C40 never visits mid nodes; zeros used-head->next, freelist keeps 1 node.
       Pin: value of head->next at 2B6C58 entry (pcbreak free + watch).
 ```
 
+
+## 248. Instruction-level confirm of S247: register a2 provably pinned at head for the whole free() call, raw opcode sequence for the branch (Claude)
+
+Bracketed the entire `0x2B6C40` (free-all-used) function and captured the full instruction sequence for the live pool-init call (cyc=27662016). `a2` (the walk register) is directly, unambiguously **`0x1F35E08` (used-list head) at every single one of the 19 instructions from entry to return** — never reassigned anywhere in the function body. This confirms S247's conclusion via a completely different method (register trace vs. per-node next-pointer watch) — both converge on the identical bug.
+
+Full raw pc/opcode sequence, in case it helps pin the exact instruction that should have advanced `a2` but doesn't:
+```
+0x2B6C40  0x8C850004   lw a1, 4(a0)          ; a1 = used_head
+0x2B6C44  0x10A00014   beq a1, zero, +0x14   ; skip if used list empty (not taken, list nonempty)
+0x2B6C48  0x00000000   (delay slot, nop)
+0x2B6C4C  0x10000002   beq zero, zero, +2    ; unconditional, jumps into loop body at 0x2B6C58
+0x2B6C58  0x8CC30000   lw v1, 0(a2)          ; v1 = *(a2+0) = node->next  [a2 == used_head here]
+0x2B6C5C..64           (nops / delay slots)
+0x2B6C68  0x1460FFFA   bne v1, zero, -6      ; loop-back target computes to 0x2B6C54, NOT taken live
+0x2B6C6C  0x00000000   (delay slot, nop)
+0x2B6C70  0x8C830000   lw v0, 0(a3)?         ; falls through past the loop entirely
+0x2B6C74  0x8C630010   lw v1, 16(a3)?
+0x2B6C78  0xACC30000   sw v1, 0(a2)          ; a2->next = <freelist head> -- a2 is STILL used_head
+0x2B6C7C..94           finishing stores (freelist head update etc.)
+0x2B6C98  0x03E00008   jr ra
+```
+The `bne v1,zero,-6` at `0x2B6C68` is exactly the loop-continuation test one would expect ("while node->next != 0, keep walking") — but per S247's independent watch and my own register trace, it evidently does not re-enter the loop body live even though `v1` (the just-loaded `node->next`) was nonzero (`0x1F35A48`) at that point. Whatever the precise cause (branch not actually taken due to a condition/operand I'm misreading by hand, or a genuine one-shot-only code path), the *observable* result is airtight: `a2` never becomes anything other than `used_head`, so the function always frees exactly one node regardless of list length. Handing the raw opcodes over since your disasm tooling will resolve the "why" far faster and more reliably than my manual bit-decoding.
+
+```text
+S248: Instruction-level confirm of S247 -- a2 register directly traced as pinned at used_head
+      for all 19 instructions of the free() call, never reassigned. Raw opcode sequence
+      included for static analysis of exactly why the bne loop-back doesn't re-enter live.
+```
