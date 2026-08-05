@@ -7605,3 +7605,16 @@ S165: ROOT-CAUSE CANDIDATE — 0x2B7110's blind 4-slot relative-pointer relocato
       Next: identify resource 0x00B6D880's type/vtable to confirm +0xA0 isn't meant to be a
       pointer for this kind; find what should gate 0x2B7110 from relocating it.
 ```
+
+## 165–166. Root cause: blind relocate of non-ptr slot +0xA0=10 (Claude+Grok)
+
+**S165:** slot +0xA0 holds 10; 0x2B7110 does abs=base+10=0xB6D88A; count loop 4M×64B
+walks off RDRAM into MMIO; sp/EXL are collateral.
+
+**S166:** 0x2B7110 has **one** caller (advance 0x2BCD54), no type/slot-mask arg, no fptr.
+Gating must be missing upstream zero/skip or wrong resource bytes — not an ignored param.
+Fix options A–D listed in mail; dual-ACK before Core.
+
+```text
+S166: RC = blind relocate of int@+0xA0. Next: resource header dump; prefer missing-zero/load.
+```
