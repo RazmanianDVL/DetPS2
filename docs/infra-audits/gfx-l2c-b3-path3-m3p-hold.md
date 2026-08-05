@@ -3377,3 +3377,72 @@ THE MISSING LINK (Claude) -- ties the whole night together into one causal chain
   single remaining question: why no read() RPC call for the already-opened Global.txd (fd=4)
   next: find the real game-code caller above the SifCallRpc library wrapper, and its continuation
 ```
+
+---
+
+## 54. Reached real game code: the open completes cleanly, state advances correctly — caller is table-dispatched (Claude)
+
+Tested both remaining hyp3 sub-questions from §52/Grok's follow-up directly against the saved
+trace: `grep "empty path"` on both the 40M and 100M-cycle `DETPS2_TRACE_RPC` logs — **zero
+hits**. The observed open used a real, non-empty 64-byte send buffer with the genuine
+`"Data\Global.txd"` path decoded from real bytes (`send=64 arg=0x1C1F6000: 61746144
+6F6C475C...`) — not the HLE empty-path fallback. Rules out Grok's hypothesis 1 (HLE-invented
+open) directly: the game genuinely intended this open.
+
+Continued the stack walk with `--watch` on the real recv buffer (`0x0066E080`, taken from the
+`[RPC] HandleCall ... recvBuf=0x0066E080` line) instead of guessing library `ra` chains — found
+a **real, non-library** read at `pc=0x001D37B4: lw v0,0(a1)`, address `0x001D3xxx` being well
+outside the `0x0010xxxx` system-library range that swallowed the earlier stack-walk attempts.
+
+Disassembled the enclosing function (real entry at **`0x001D36E0`**, standard
+`addiu sp,sp,-144` prologue) and traced its exact execution live via `--pcbreak`:
+
+```text
+0x1D3780: addiu a1,zero,3            # fno = 3 (open)
+0x1D379C: jal 0x0010F1E8             # issue the RPC call (library)
+0x1D37A4: jal 0x0010BE40             # wait for completion (library)
+0x1D37B4: lw v0,0(a1)                # a1 = 0x66E080 (recvBuf) -- read status word
+0x1D37B8: bltz v0,0x1D3800           # NOT taken (v0=0, success)
+0x1D37D0: lwu a1,4(a1)               # read handle word -> a1=5 (matches fd=4, handle=fd+1)
+          ... stores handle/state into a persistent struct at s1, sets state=1 ...
+0x1D3804: jr ra                      # returns cleanly, v0=0
+```
+
+**This confirms end to end: the open() call is issued correctly, completes successfully
+(status=0), the handle (5, matching real fd=4) is correctly extracted and stored, and the
+function returns cleanly with no error.** Nothing is broken in this specific leg — the game's
+own open-and-wait logic works exactly as it should.
+
+The enclosing function (`0x1D36E0`) is itself gated by two conditions from its own caller-
+supplied flags parameter (`a3`): a nonzero result from `jal 0x00212A80` and `(flags & 0xE) ==
+0`, both satisfied in the observed run (confirmed by the fact we reached the open at all).
+
+**`scanword` for `jal 0x001D36E0` (`0x0C074DB8`): zero static callers.** Same shape as
+essentially everything else found tonight (§27, §35, §41-43) — this loader function is reached
+via an **indirect call** (table/vtable dispatch), not a direct `jal`. Given how much of tonight
+was spent characterizing exactly this kind of id-keyed dispatch table architecture (§37-§44),
+this is very likely another instance of the same pattern: a resource-loader table where this
+specific slot got dispatched exactly once (matching the single observed `fno=3` open) and
+whatever should dispatch the *next* step (a second call into this same function, or a sibling
+handling `fno=5`) never happens.
+
+### 54.1 Where this leaves it
+
+Not a broken open, not an HLE-fabricated call, not a reply-format mismatch, not fno=3↔4
+thrashing. The open genuinely succeeds and the game's own state advances to "state=1,
+handle=5" correctly. The gap is one level further out: **whatever should invoke this loader
+function again (or invoke a sibling "issue the read" function) to advance past state=1 never
+does.** Same "find the missing real trigger" shape as §25-§53's whole arc, now narrowed to a
+single, real, well-identified function (`0x1D36E0`) and its still-unknown table/dispatch
+caller.
+
+```text
+real game code confirmed (Claude) -- open() succeeds cleanly, gap is one level further out
+  ruled out: HLE empty-path fallback (grep confirms real path both trace runs)
+  reached real function 0x1D36E0 (real prologue, not library) via recvBuf watch, not blind stack walk
+  traced its exact execution: fno=3 issued, RPC completes, status=0, handle=5 (=fd+1) captured,
+    state advances to 1, returns cleanly -- nothing broken in this specific leg
+  0x1D36E0 has ZERO static (jal) callers -- reached via indirect/table dispatch, same shape
+    as S27/S35/S41-43's dead-code pattern
+  next: find what SHOULD re-invoke this loader (or a read-issuing sibling) to advance past state=1
+```
