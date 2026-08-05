@@ -4314,3 +4314,55 @@ S70: VU1/Path1 dead is likely non-bug (2D-chrome stage, not yet needing VU1) —
      Real next thread: FBP=0x0 (draw) vs DISPFB2=0x51400 (display) never converge post-S68 —
      tracing DISPFB2/FBP writers next.
 ```
+
+## 71. Live DISPFB2/DISPFB1 writer trace: 106 real writes, always the same values — and a live/static discrepancy with Grok's PutDispEnv map (Claude)
+
+Temp `DETPS2_TRACE_DISPFB_WRITES=1` hook in `Gs.SetPrivilegedDisplay` (the real MMIO write path
+for GS priv regs 0x1200_00xx), logging every write to DISPFB1 (0x0070) / DISPFB2 (0x0090) over
+the same 95M-cycle run. Reverted after use (`git diff --stat` 6 insertions, `git checkout --`,
+clean).
+
+**106 total writes**, not a one-shot:
+
+```
+n=1..4:  which=0x0090 value=0x0000000000051400   (four DISPFB2 writes)
+n=5..6:  which=0x0070 value=0x0000000000000000   (two DISPFB1 writes)
+n=7..8:  which=0x0090 value=0x0000000000051400
+n=9..10: which=0x0070 value=0x0000000000000000
+...repeating in a steady 2-and-2 cadence all the way to n=106...
+```
+
+Every single DISPFB2 write is the exact same value (`0x51400`); every DISPFB1 write is the exact
+same value (`0x0`). So this is a genuinely live, periodically-firing writer — not a stale
+one-shot init that never runs again — but it never varies the value, ever, across the whole run.
+
+**This directly bears on Grok's static PutDispEnv finding (seq0470/0471):** Grok mapped
+`PutDispEnv` (`0x1029B0`) with exactly 3 static call sites (`0x103B88` one-shot, `0x1F1D84` +
+`0x1F1DA0` in a path-sync/flip band), then found the *containing function* of the 0x1F1Dxx call
+sites has **zero static jals and zero word-refs to its own entry** — same shape as tonight's
+dead islands. That's a live/static discrepancy worth resolving: 106 writes over 95M cycles is
+clearly not just the one-shot `0x103B88` path (that pattern was already established as a bounded
+4-stage init, see the very early display-env findings from §26-28). So either (a) `0x103B88`
+itself is *not* actually one-shot and is what's firing repeatedly here, or (b) the 0x1F1Dxx band
+is reached via `jalr`/computed fptr (Grok's hypothesis B), or (c) there's a fourth writer neither
+of us has mapped yet. Worth a quick reconciliation before deciding where the real bug is.
+
+**Framing the actual bug candidate, regardless of which writer it is:** DISPFB2=0x51400 is being
+freshly, repeatedly asserted as the intended display target — that looks deliberate, not stale.
+Meanwhile `FRAME_1=0xA0046` (decoded FBP=0x0) has been byte-identical since the earliest ~20M
+snapshot through 95M — never rewritten once, the whole run. Soft-GS's own composite-source
+fallback comment (`Gs.cs:2262-2266`, "Copy DISPFB1/2 (else FRAME_1, else FBP=0 IMAGE)") should
+prefer DISPFB2 since DISPFB1=0 and DISPFB2≠0 — but the summary shows `compositeSource=None`,
+meaning DISPFB2=0x51400 points at VRAM with no actual drawn content, while the real content
+(prims=1934) is landing at FBP=0x0, a page neither DISPFB1 nor DISPFB2 ever points at. So the
+candidate bug is now narrowed to one of: (i) the draw path should be targeting 0x51400 to match
+DISPFB2 and isn't, or (ii) DISPFB2 should be following the draw target (0x0) each flip and something
+is feeding it a stale/fixed 0x51400 instead of the live FBP value.
+
+```text
+S71: DISPFB2/DISPFB1 confirmed live (106 writes, steady 2:2 cadence), values never vary
+     (DISPFB2 always 0x51400, DISPFB1 always 0x0) — real writer, not stale. Live/static
+     discrepancy with Grok's PutDispEnv zero-caller find needs reconciling. Bug is narrowed to:
+     draw target (FBP=0x0) vs asserted display target (DISPFB2=0x51400) — one of the two is
+     wrong and needs to track the other.
+```
