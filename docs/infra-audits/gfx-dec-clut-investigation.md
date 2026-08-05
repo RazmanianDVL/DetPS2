@@ -244,6 +244,44 @@ ne≥24: parse runs into **ASCII name table** (`ENDING`, `ON_ENDING`, `GIG`, `PA
 
 ---
 
+## 4f. Real EE TEX0/TEXCLUT trace (Claude) — decisive negative
+
+**Capture:** `DETPS2_TEMP_CLUT_TRACE=1`, instrumented `Gs.MaybeLoadClut` (called only from `ApplyTex0`/
+`ApplyTex2`, i.e. real GS `TEX0`/`TEX2` register writes — **not** PL-029's BITBLT path, which never
+touches these registers). Fully reverted after use; `git diff --stat src/DetPS2.Core/Gs.cs` confirmed
+empty before rebuild.
+
+100M-cycle Dec trace (`user-media-deception.json`, `--host-present`):
+
+```
+Total MaybeLoadClut invocations: 1 (entire 100M-cycle run)
+[CLUT-TRACE] MaybeLoadClut tex0=0x0000000220011000 cld=0 texBase=0x40000 psm(tex0field)=0
+```
+
+**One single `TEX0`/`TEX2` write in the whole run, and it requests `cld=0`** (no CLUT load at
+all). Real EE code essentially **never engages the GS's native indexed-texture/CLUT pipeline**
+during this trace window — not "loads the wrong palette," not "loads a palette we can't find" —
+it doesn't attempt a CLUT-backed texture draw at all.
+
+**This changes the conclusion.** The missing piece was never a static palette blob sitting
+somewhere in `gameart.ssf` waiting to be located by file-layout guessing (five hypotheses on that
+front are now refuted: nested `kind=1`, tile header, in-payload leftover, root `e=1`, `e=8–13`).
+It is that **the real EE draw code path for this indexed content does not run at all** within the
+traced budget/menu state — the same shape of gap as Whiplash's stalled stream producer, just
+surfacing differently (a silent no-op instead of a visible stall). PL-029's Host→Local BITBLT feed
+was built specifically because the natural path doesn't produce this content — that was already
+documented (`MK_DECEPTION.md`: "natural GIF `image=` still 1"); this trace confirms the CLUT side
+of that same gap, not a separate problem.
+
+**Recommendation:** park this specific lead. Finishing it for real needs either (a) a longer/later
+trace window in case the real texture draw happens further into actual gameplay past the menu
+(untested — would need a claim-tier run well past 100M, and even then may not trigger without
+deeper interactive state), or (b) an actual EE decompile of the SSF texture consumer to find why
+the natural draw path is gated out — the same class of work Whip's MP2 problem needs, at smaller
+scope. Not a quick-TRACE-tier question anymore.
+
+---
+
 ## 5. Non-goals
 
 - Do not invent a synthetic/procedural palette to make the gray strip "look better" — that is
@@ -259,10 +297,14 @@ ne≥24: parse runs into **ASCII name table** (`ENDING`, `ON_ENDING`, `GIG`, `PA
 ---
 
 ```text
-GFX Dec CLUT investigation
-  gray = honest PSMT8-without-CLUT; PL-029 never loads CLUT
-  header: 64x64 (dim<<8), \x18PS2, PAD128
-  root e=1 = more kind=2 tiles (not CLUT); e=8..13 = sparse records not palettes
-  all quick TRACE palette hypotheses refuted
-  next: EE SSF consumer / PAD128 string+table search / TEXCLUT trace
+GFX Dec CLUT investigation — CLOSED for this wave, honest park
+  gray = honest PSMT8-without-CLUT fallback; real infra; not fabricated
+  PL-029 never loads a CLUT for its 48 fed tiles
+  5 static-layout palette hypotheses refuted: nested kind=1, tile header,
+    in-payload leftover, root e=1 (more tiles), root e=8-13 (sparse records)
+  decisive dynamic check: real EE code issues exactly 1 TEX0/TEX2 write in
+    100M cycles, cld=0 — native CLUT-texture draw path does not run at all
+  conclusion: not a findable static blob; real draw path is gated out,
+    same class of gap as Whip's MP2 (smaller scope) — needs EE decompile
+  park pending real demand for that investment; not a TRACE-tier fix
 ```
