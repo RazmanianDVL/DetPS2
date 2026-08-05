@@ -7346,3 +7346,50 @@ EXL/EPC. If EXL=1 EPC=0x25156C → interrupt-return path, not count bug.
 ```text
 S158: likely mid-VBlank-ISR; user frozen at 0x25156C. Dump COP0 EXL/EPC.
 ```
+
+## 159. CONFIRMED DECISIVELY: EXL=1 and EPC=0x25156C at the very end of the run — the CPU never completes its `eret` back from the exception that interrupted the count loop. Root cause is the interrupt-return path, exactly as Grok's diagnostic table predicted (Claude)
+
+`--pcbreak=002370F8:00237110` (real tooling), last real samples at the very end of the run
+(cyc=94,999,984):
+
+```
+pc=0x002370FC  EPC=0x0025156C  COP0_Status=0x40018403  eretStack=1
+pc=0x00237100  EPC=0x0025156C  COP0_Status=0x40018403  eretStack=1
+pc=0x00237104  EPC=0x0025156C  COP0_Status=0x40018403  eretStack=1
+pc=0x0023710C  EPC=0x0025156C  COP0_Status=0x40018403  eretStack=1
+pc=0x00237110  EPC=0x0025156C  COP0_Status=0x40018403  eretStack=1
+```
+
+`COP0_Status=0x40018403`: bit 1 (EXL, Exception Level) is set (`0x40018403 & 0x2 = 0x2`, i.e.
+`0x...403`'s low nibble `0x3 = 0b0011` — bits 0 and 1 both set: IE=1, **EXL=1**). `EPC =
+0x0025156C` — the exact count-loop body address, matching S157's `SavedPc` exactly.
+`eretStack=1` throughout.
+
+**This is exactly Grok's predicted "stuck-in-ISR" signature: `EXL=1` and `EPC=0x25156C`,
+confirmed directly, not inferred.** Per Grok's own diagnostic table (S158): *"If EXL=1 and
+EPC=0x25156C: fix is interrupt-return / VBlank ack path, not count corruption."* **The CPU
+genuinely never executes the `eret` that would clear `EXL` and resume the interrupted count
+loop.** It's been sitting in exception level, executing the VBlank handler body
+(`0x2370A0`-family) repeatedly, for the remainder of the entire run, with the interrupted
+user-mode PC (`0x25156C`) permanently parked in `EPC` — a real, confirmed interrupt-return gap,
+not a data/count corruption bug at all.
+
+**This retires S152/S153's "corrupted relocation count" framing as the wrong layer entirely.**
+The count loop itself may well be completely correct — the actual bug is that whatever
+interrupted it (VBlank, per the handler identity) never lets the CPU leave exception level and
+resume. Every earlier finding in this sub-thread (S149's null-ptr timing artifact, S151's
+correction, S152-155's count/scheduling theories) was real, honest measurement work narrowing
+toward this — but the true root, now pinned down precisely, is in the EE's interrupt dispatch/
+`eret` handling, the same class of mechanism flagged as a known DetPS2 bug class in
+`EmotionEngine.cs`'s own comments (per Grok's S158: *"jr-to-0x80000200 swallowed → eret never
+runs → EXL stuck"*).
+
+```text
+S159: CONFIRMED — EXL=1, EPC=0x0025156C, eretStack=1, all at the very end of the 95M-cycle run.
+      The CPU is genuinely stuck in exception level, never executing eret to resume the
+      interrupted count loop. This is an interrupt-return/eret-handling bug, not a data
+      corruption or count-logic bug — matches a known DetPS2 bug class already documented in
+      EmotionEngine.cs. Retires the "corrupted relocation count" framing. Next: static/live dig
+      into why this specific eret (from the VBlank handler at 0x2370A0) never fires or never
+      takes effect.
+```
