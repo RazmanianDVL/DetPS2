@@ -324,3 +324,9 @@ Menu/gameart chrome is **not** going through this simple `sceGsExecLoadImage` wr
 3. Or live `scanword` for jal to Midway upload helpers once candidates named.
 
 Park this first-cut; no Core.
+
+### 13.5 Tile magic `\x18PS2` (0x32535018)
+
+Static ELF search: **no** data occurrence of the magic bytes and **no** `lui 0x3253` + low-half construct. The three `0x5018` immediates found are unrelated resource IDs (`FUN_00271730` etc.), not marker compares.
+
+Conclusion: EE validates Midway tile headers only against **loaded package memory**, not a compile-time constant in the boot ELF image — next dig needs live TRACE (pcbreak on readers of tile header +0x14) or broader Midway renderer RE, not more open-path Ghidra alone.
