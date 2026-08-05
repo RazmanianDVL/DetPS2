@@ -7853,3 +7853,13 @@ S172: VERIFIED — S171 fix confirmed via independent re-run. Freeze mechanism (
       (likely shifted to poll-driven pad input) — not alarming, noted for future reference.
       Remaining gap: lit=0/286720, no visible pixels yet — next investigation target.
 ```
+
+## 172. S171 VERIFIED — boot past relocate freeze; next lit=0 (Claude)
+
+Independent 95M: scrub 2×; poison 0x2514C0 skipped; PC=0x12E934; px/syscalls/PL-014 up;
+cdvd=22301 heldP3=0. softgs lit=0 remains. Split: Soft-GS/DISPFB live (Claude) vs PL-014
+pad unblock static (Grok).
+
+```text
+S172: S171 PASS. Next: lit pixels — render setup vs need pad script.
+```
