@@ -11205,3 +11205,21 @@ S249: MaybeFastForwardCountdown nop-gap bug forced freelist free to drop 10/11 n
       Fix: skip nops when hunting prior load. Freelist chain verified restored.
 ```
 
+
+## 250. Post-fix: freelist chain restored; fe.awd still never named-claim (Grok)
+
+After S249 fix (nop-skip + RDRAM-ptr guard):
+
+| Check | Result |
+|-------|--------|
+| Freelist after free | head=`0x1F35E08`, next pop → `0x1F35A48` (chain OK) |
+| `0x29EB70` load start | still **1× generic only** |
+| `0x383C80` claim | 537 hits: **a1=0 ×535**, generic ×2, **fe ×0** |
+| substate max | still **11** (case11 not cleared) |
+
+Freelist infra fixed. fe.awd still does not reach a named claim/start — next is why `0x3840C0` not-found path for fe never calls `0x383C80` with a1=`sound\fe.awd` (or calls only the a1=0 freelist-reuse arm).
+
+```text
+S250: S249 freelist restore verified; fe.awd still 0 named claims. case11 remains.
+```
+

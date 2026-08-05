@@ -1885,25 +1885,31 @@ public sealed class EmotionEngine : ISchedulable
             //   lw v1, 0(a2); nop; nop; nop; bne v1, zero, loop
             // Looking only at PC-4 sees a nop and wrongly snaps v1 (next-node ptr) to 0,
             // so the walk never advances and only 1 of N nodes is returned to the freelist
-            // (sound\fe.awd pool permanently empty → case11 stuck). Skip leading nops
-            // (and a short window of non-clobbering delay fillers) when hunting the load.
+            // (sound\fe.awd pool permanently empty → case11 stuck). Skip leading nops when
+            // hunting the load. Require the live value to look like an EE user-RDRAM
+            // pointer so nop-padded software delays that load a huge count still snap.
             if (rt == 0 || rs == 0)
             {
                 uint ptrReg = rt == 0 ? rs : rt;
-                // Look back up to 8 instructions for a load into ptrReg, skipping nops.
-                for (int back = 1; back <= 8; back++)
+                ulong ptrVal = rt == 0 ? a : b;
+                // Phys RDRAM window used for heap/list nodes (excludes tiny counts and
+                // multi-million delay counters that sit in the same numeric band as KSEG).
+                bool looksLikeEeHeapPtr = ptrVal >= 0x00100000UL && ptrVal < 0x02000000UL;
+                if (looksLikeEeHeapPtr)
                 {
-                    uint prev = _memory.Read32((uint)(PC - (uint)(4 * back)));
-                    if (prev == 0)
-                        continue; // nop
-                    uint prevOp = prev >> 26;
-                    uint prevRt = (prev >> 16) & 0x1F;
-                    // lw=0x23, lwu=0x27, ld=0x37
-                    if ((prevOp is 0x23 or 0x27 or 0x37) && prevRt == ptrReg)
-                        return;
-                    // Hit a real (non-nop) instruction that is not a load into ptrReg —
-                    // stop; countdown loops have addiu immediately before bne.
-                    break;
+                    for (int back = 1; back <= 8; back++)
+                    {
+                        uint prev = _memory.Read32((uint)(PC - (uint)(4 * back)));
+                        if (prev == 0)
+                            continue; // nop
+                        uint prevOp = prev >> 26;
+                        uint prevRt = (prev >> 16) & 0x1F;
+                        // lw=0x23, lwu=0x27, ld=0x37
+                        if ((prevOp is 0x23 or 0x27 or 0x37) && prevRt == ptrReg)
+                            return;
+                        // Non-nop that is not a load into ptrReg — countdown uses addiu.
+                        break;
+                    }
                 }
             }
             // memcpy/memset unaligned tails commonly do:
