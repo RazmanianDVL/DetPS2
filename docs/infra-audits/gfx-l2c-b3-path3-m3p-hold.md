@@ -6959,3 +6959,18 @@ S145: Ordering confirmed precisely — the 3rd case-3 poll (cyc=40,579,504) IS a
       threads now: (1) what fails inside 0x2BCD50-0x2BCE4C, (2) why the climber/mode-SM retry
       cadence stops after ~9 calls (same open question as S131).
 ```
+
+## 145–146. Advance entered once, sw22 never; path linear → hang in jal (Claude+Grok)
+
+**S145:** flag write cyc=40.55M; case3 #3 after it; 0x2BCD50 x1 but 0x2BCE4C x0.
+Mode SM x9 = climber x9; 0x51BA90 always 0. Split: advance internals vs climber cadence.
+
+**S146:** advance 0x2BCD50→0x2BCE4C is **linear** (no skip branch). Not reaching sw22 =
+hung/faulted inside `jal 0x2B7110` (free) or copy or `jal 0x2223C0` (release id=4),
+or bad `*(obj+0x148)`. 0x51BA90 always 0 ⇒ mode-SM spin never flag-exits; climber
+stops re-entering 0x12ECE0.
+
+```text
+S146: split locked. Advance hang suspects 0x2B7110 / 0x2223C0 / null +0x148.
+      Climber: why only ~9 mode-SM entries then dead.
+```
