@@ -16,6 +16,7 @@
 | M5-a S6 CATCHUP | **PARKED** (B3 collapse) |
 | M7 residual honesty | rollup closed; R1 only with named title |
 | **M7-L1 Whip IMAGE** | **measured** — product imgBytes=0; MENU-WHIP-2 already off → **R1 honest residual** (`m7-l1-whip-assist-off-image-results.md`) |
+| **M7-L1 BO2 IMAGE** | **measured** — product imgBytes=0; MENU-BO2/PL-027 already off → **R1 honest residual** (`m7-l1-bo2-assist-off-image-results.md`) |
 | M8 Prefer fleet | audit + soft-off canary |
 | M4-g FILEIO GetVersion | already Core |
 | M6-b1 Sleep rescue | already Core |
@@ -31,7 +32,7 @@
 | **M1 residual** | CHCR single-round force-pump | Med | Design ready: `m1-residual-chcr-single-round-design.md` — dual-ACK before Core |
 | **M6-b3** | post-SignalSema fairness | Med | Design shelf; only if GoW SwitchTo soft-disable goal |
 | **M6-b4** | JREXIT main-revive scaffold | Med | Design-first; env off default |
-| **M7-L1 BO2/Haven** | assist-off IMAGE TRACE other titles | Med | Whip closed honest; optional peers |
+| **M7-L1 Haven** | assist-off IMAGE TRACE | Med | Whip+BO2 closed honest; optional peer |
 | **C1-TP** | Table pressure T1 slots=64 | Med | Only if live register demand |
 | **M3-b/c** | Dual-path formalization | Low–Med | Needs non-empty live registry |
 
@@ -52,10 +53,10 @@
 
 1. **M1 residual** dual-ACK → Core Opt A (or measure-first env cap=1)  
 2. Or **M6-b3** if GoW fairness is the active product goal  
-3. Or **M7-L1 BO2** same honesty bar (measure only)
+3. Or **M7-L1 Haven** same honesty bar (measure only)
 
 ```text
-next-free-seats post M7-L1 Whip honesty close
+next-free-seats post M7-L1 Whip+BO2 honesty close
   prefer M1 CHCR residual or M6-b3 on demand
   dual-idle = propose, never mutual-hold
 ```
