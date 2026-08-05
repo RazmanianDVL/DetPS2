@@ -117,6 +117,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _resourceRelPtrScrubs;
     /// <summary>S226 dual-ACK: force type-6 stream status→9 when pump never runs (env-gated).</summary>
     private int _forceStreamPumps;
+    /// <summary>S230 dual-ACK: host-call stream-system tick 0x28AF10 once (env-gated).</summary>
+    private int _forceStreamTicks;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -174,6 +176,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _audioStreamCompletes = 0;
         _resourceRelPtrScrubs = 0;
         _forceStreamPumps = 0;
+        _forceStreamTicks = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -347,11 +350,16 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
 
-        // S226 dual-ACK: track stream type already 6 but class-method pump never runs
-        // (0x2A3150 / 0x2A6470 = 0 hits). Replay type-6→status-9 store so arm can proceed.
-        if (sys.MasterCycles >= 40_000_000 && _forceStreamPumps < 4
+        // S226/S230 dual-ACK combined probe (DETPS2_B3_FORCE_STREAM_PUMP=1):
+        // (1) status 0→9 on type-6 handles; (2) one real EE call 0x28AF10(0x1E75640).
+        if (sys.MasterCycles >= 40_000_000
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_PUMP") == "1")
-            MaybeForceStreamStatusPump(sys);
+        {
+            if (_forceStreamPumps < 4)
+                MaybeForceStreamStatusPump(sys);
+            if (_forceStreamTicks < 2)
+                MaybeForceStreamSystemTick(sys);
+        }
 
         // S170 dual-ACK: gate SM state 3 holds a GTFS resource whose +0xA0 can be a small
         // int (ISO-truth 10), not a relative pointer. 0x2B7110 blindly relocates four slots
@@ -1513,6 +1521,67 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     $"n={_forceStreamPumps} cyc={sys.MasterCycles}");
             return; // one handle per Step
         }
+    }
+
+    /// <summary>
+    /// S230 dual-ACK: host-invoke the orphaned stream-system tick <c>0x28AF10(a0=0x1E75640)</c>
+    /// which is the only path to arm/pump. Same env as status force. Runs a real EE call
+    /// (save PC/GPRs, set a0+ra+PC, Step until return sentinel, restore). Diagnostic only.
+    /// </summary>
+    private void MaybeForceStreamSystemTick(Ps2System sys)
+    {
+        const uint TickFn = 0x0028AF10;
+        const uint StreamSys = 0x01E75640;
+        const uint ReturnSentinel = 0x00B3F001; // not a real code addr; detect jr ra land
+
+        var ee = sys.EE;
+        // Don't re-enter if already mid-forced-call (shouldn't happen).
+        if ((ee.PC & 0x1FFFFFFFu) == TickFn)
+            return;
+
+        ulong savedPc = ee.PC;
+        var savedGpr = new EmotionEngine.Gpr128[32];
+        for (int i = 0; i < 32; i++)
+            savedGpr[i] = ee.GetGpr(i);
+
+        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = StreamSys }); // a0
+        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ReturnSentinel }); // ra
+        ee.PC = TickFn;
+
+        bool returned = false;
+        int steps = 0;
+        const int MaxSteps = 2_000_000;
+        try
+        {
+            while (steps < MaxSteps)
+            {
+                int n = ee.Step(64);
+                if (n <= 0) n = 1;
+                steps += n;
+                uint pc = (uint)(ee.PC & 0x1FFFFFFFu);
+                if (pc == ReturnSentinel || pc == (ReturnSentinel & 0x1FFFFFFFu))
+                {
+                    returned = true;
+                    break;
+                }
+                // Bail if we jumped to null / kernel reset
+                if (pc < 0x1000)
+                    break;
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < 32; i++)
+                ee.SetGpr(i, savedGpr[i]);
+            ee.PC = savedPc;
+        }
+
+        _forceStreamTicks++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[B3] FORCE_STREAM_TICK fn=0x{TickFn:X8} a0=0x{StreamSys:X8} " +
+                $"returned={returned} steps={steps} n={_forceStreamTicks} cyc={sys.MasterCycles}");
     }
 
     /// <summary>

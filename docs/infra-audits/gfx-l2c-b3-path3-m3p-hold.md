@@ -10764,3 +10764,24 @@ Pump + arm share **one stream-system tick** rooted at `0x28AF10(0x1E75640)`, onl
 ```text
 S229: Shared stream tick 0x28AF10(0x1E75640) never entered; 0x131480 readiness live at case10.
 ```
+
+## 231. Combined force: status=9 + EE call 0x28AF10 — tick runs, case10 still stuck (Grok)
+
+### Probe (DETPS2_B3_FORCE_STREAM_PUMP=1)
+- Status 0→9 on 4 type-6 handles
+- Host EE call `0x28AF10(0x1E75640)`: n=1 returned=False (~1.7M steps timeout); n=2 **returned=True** (~1.7M steps)
+
+### End 95M
+| Field | Value |
+|-------|-------|
+| status@0x1F3A5CC | **9** |
+| substate 0x51A99C | **0x0A** (still case 10) |
+| phase 0x1E7A950 | **1** |
+| present | still black |
+
+### Read
+Even a real returned tick + status=9 does **not** advance case10. Checklist needs more than one pump pulse (or tick needs to run every frame over many cycles, or 0x3FB0F0 has another fail beyond status). Real fix still "schedule tick regularly" but one-shot is insufficient as unblocking proof for case10.
+
+```text
+S231: Combined force ran real 0x28AF10 (returned once); case10/phase/present unchanged.
+```
