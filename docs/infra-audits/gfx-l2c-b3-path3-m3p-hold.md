@@ -6974,3 +6974,45 @@ stops re-entering 0x12ECE0.
 S146: split locked. Advance hang suspects 0x2B7110 / 0x2223C0 / null +0x148.
       Climber: why only ~9 mode-SM entries then dead.
 ```
+
+## 147. Thread #2 answered: `0x51BA90` has exactly 2 writes in the entire run, both at boot (zero-init) — never written again. The spin loop's flag-based exit is structurally unreachable; something halts the thread itself, same shape as S66's original SleepThread finding (Claude)
+
+`--watch=0051BA90 --watch-after=0`, full 95M-cycle run, real tooling:
+
+```
+watch 0x0051BA90: 26 access(es)
+  WROTE 0x00000000 @ 0x00100160  sq zero, 0(v0)     (boot zero-init)
+  WROTE 0x00000000 @ 0x00133EB0  sb zero, -9648(v0) (mega-init explicit zero)
+  ...then 24 accesses, ALL READS — 9 at 0x0012ECEC (the spin-loop re-check, matching mode
+  SM's own 9-call count exactly), the rest generic syscall-probe reads at 0x0010BE64 (same
+  false-lead PC class as S81/S89) and one at 0x0012ECC0 (the loop's initial entry check).
+  ZERO further writes, anywhere, by anything, the entire run.
+```
+
+**Confirmed directly, not inferred: the mode-SM spin's exit condition
+(`while(*(u8*)0x51BA90==0): jal mode_sm`) is never satisfied by a real write — the flag is
+written exactly twice, both during boot, both to `0`.** Per the disassembly at
+`0x12ECC0-0x12ECF8` (read via `disasm`, static code bytes only, not a live-value snapshot —
+safe per the S87 lesson): this is a textbook `while(flag==0) { call(); }` loop with no other
+exit path in the loop body itself. If evaluated honestly with the flag permanently `0`, this
+loop mathematically cannot terminate on its own.
+
+**Yet mode SM only ran 9 times, not indefinitely — so something outside the loop's own logic
+stopped it.** Given the loop's *only* other way to stop is the thread executing it never running
+again, this is very likely **the exact same class of event as S66's original finding**: the
+thread executing this climber code calls `SleepThread` (or is otherwise descheduled) partway
+through — plausibly from *inside* `jal 0x132600` (mode SM) itself on its 9th call, or from
+whatever `0x2BCD54`'s `jal 0x2B7110` / `0x2BCE18`'s `jal 0x2223C0` do (Grok's own S146 hang
+suspects for thread #1) — and is simply never woken. This would mean **threads #1 and #2 may
+collapse into the same root cause**: whatever hangs inside the advance path (S146's suspects)
+could be the very same event that halts the thread and explains why the spin loop stops
+iterating, rather than two independent problems.
+
+```text
+S147: 0x51BA90 confirmed — exactly 2 writes total, both boot-time zero-inits, never touched
+      again. The spin loop's flag exit is mathematically unreachable given this; the only way
+      it stops at 9 calls is if the executing thread itself stops running — same shape as S66's
+      original SleepThread/never-woken finding. Proposing threads #1 and #2 may be the SAME
+      event: whatever hangs inside the S146 advance-path suspects (0x2B7110/0x2223C0) could be
+      exactly what halts the thread, explaining both "sw22 never reached" and "spin stops at 9."
+```
