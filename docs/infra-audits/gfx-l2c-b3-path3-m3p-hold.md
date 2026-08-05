@@ -11904,6 +11904,24 @@ S273: FRAME FBP=0x46 @cyc0 (Claude). 1E2D10 only 2 jal sites; wrapper zeros a1-a
       FBP not in call args — dig internal source 1FD490 reads (0x675E40 / s4).
 ```
 
+## 274. After case 2: display-env DISPFB=0x51400, draw-env FRAME=0xA0046 side-by-side (Grok)
+
+Dump `0x6754C0`..`+0x400` @15M (post case-2):
+
+| Addr | Value | Role |
+|------|-------|------|
+| `0x6754D0` / `0x675820` / `0x675848` | **`0x00051400`** | display-env +0x10 DISPFB (FBP=**0**) |
+| `0x675520`, `0x6755A0`, `0x675690`, `0x675710` | **`0x000A0046`** | draw-env FRAME (FBP=**0x46**, PSMCT16S) |
+
+So at the one-shot case-2 epoch the game **already has both pages encoded** in adjacent env blobs: draw targets 0x46, display binds 0. Case 2 did not copy FRAME FBP into DISPFB — display stays format-only page 0. Matches PutDispEnv always replaying `0x51400`.
+
+**Class-A:** not “forgot FBP was 0x46,” but **display path never selects the draw page** already present in sibling env structs. Open: is a later mode supposed to swap which env PutDispEnv uses, or patch DISPFB from the FRAME slots, or is present-from-0 intentional until a menu surface is blitted to page 0?
+
+```text
+S274: Post-case2 env dump — DISPFB slots 0x51400, FRAME slots 0xA0046 coexist.
+      Case2 did not retarget display to draw page. Class-A = display/draw page split.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
