@@ -9767,3 +9767,54 @@ S200: DECISIVE -- 0x1322B0 (readiness) called 493 times, FAILS (v0=0, branches t
 S202: 0x1322B0 100% fail. Next: t9 method address at jalr.
 ```
 
+
+## 201. FULL CHAIN CLOSED -- readiness resolves to the S165 resource-completion chain; still never completes post-S171 (Claude)
+
+Temp diagnostic (env-var gated, reverted+rebuilt) dumping the readiness gate's vtable resolution
+at every jalr, full 95M-cycle run, real ISO:
+
+```
+[B3-READY] cyc=39868112 a0=0x0051A6A8 vtable=0x004DDAC0 t9=0x00131480
+```
+
+**All 493 calls resolve to the identical method: `t9=0x00131480`, `vtable=0x004DDAC0`.** This is
+not a new function — it is the *exact same* vtable method identified much earlier this session
+(pre-dating the whole freeze investigation): "the vtable method at `current+0x1B0 → +12`,
+install site `0x4D40B4 → table 0x4DDAC0`" — a nested state-machine dispatch on
+`*(mode_obj+0x2F4)`, which cascades through `0x131670` (case 7) → `jal 0x2BCA20(0x1E85900)` →
+the inner SM on `*(0x1E85900+0x140)` → case 3 → the GTFS-completion-driven advance path
+(`0x2BCD50`-`0x2BCE4C`) — **the exact same chain S165's OOB relocation bug, and S171's fix, both
+live inside.**
+
+**Checked whether that chain's completion state is reached now, post-S171: `0x2BCE4C` (the
+"advance complete", state=22 write) — zero hits, full run.** Unchanged from before the fix.
+
+**This closes the full causal chain, start to finish**: S171's scrub prevents the catastrophic
+crash by *zeroing* the resource's implausible `+0xA0` slot rather than resolving it to a valid
+value — which means the relocate/advance sequence for that resource now safely *skips* the slot,
+but as a direct consequence **never reaches its own "complete" state either.** The resource
+never finishes initializing → the inner nested SM never advances → `0x131480`'s readiness check
+(reading state indirectly through this whole chain) never returns success → case 7's gate
+(`0x1322B0`) fails 493/493 → modestate never leaves 7 → nothing past case 7 (including any
+DISPFB retarget) ever runs → the display page is never updated → black screen.
+
+**This means S171, while completely correct and necessary (it stops the freeze/crash), is not
+sufficient on its own to reach playability** — it converts a hard crash into a graceful stall.
+The resource that was corrupted (implausible `+0xA0`) needs to actually finish initializing
+correctly, not just avoid crashing, for B3 to get further. This is a distinct, much more
+precisely scoped next design question: how should this specific resource actually complete when
+its `+0xA0` slot isn't a valid pointer — is there a legitimate default/fallback behavior, or does
+the *real* bug lie even further upstream (why does this resource have `+0xA0=10` in the first
+place, if some other resource-loading path was supposed to populate it correctly)?
+
+```text
+S201: FULL CHAIN CLOSED -- the readiness gate (0x1322B0, 100% failure) resolves via vtable to
+      0x131480, the exact same nested-SM method chain already traced back in S138-165, which
+      terminates in the S165/S171 resource-completion bug. Confirmed: the resource's own
+      "advance complete" state (0x2BCE4C) still never fires post-S171 -- the scrub avoids the
+      crash by skipping the bad slot, but the resource then never finishes initializing, so the
+      whole chain (resource -> inner SM -> 0x131480 -> case-7 readiness -> modestate -> DISPFB
+      retarget) stays permanently blocked. S171 is necessary but not sufficient for playability.
+      Next real question: what should this resource do when +0xA0 isn't a valid pointer to
+      actually complete, or is the true bug upstream of where +0xA0=10 comes from at all.
+```
