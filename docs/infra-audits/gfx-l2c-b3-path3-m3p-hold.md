@@ -7938,3 +7938,59 @@ VBlank death @43M ⇒ PutDispEnv stops ⇒ DISPFB stuck page 0 while FRAME=70 (c
 ```text
 S175: PutDispEnv post-init = VBlank only. 43M VBlank death freezes display path.
 ```
+
+## 174–175. PutDispEnv is VBlank-gated (Grok); final VBlank invocation has uniquely out-of-bounds sp (Claude)
+
+**S174 (Grok, static):** `PutDispEnv` (`0x1029B0`) has exactly 3 callers: one early/init path
+(`0x103B88`), and **two inside the VBlank ISR band** (`0x1F1D84`, `0x1F1DA0`, near `0x1F1CE8`).
+After boot init, `PutDispEnv` only ever runs from inside VBlank. **This fully explains the
+class-A DISPFB/FRAME page mismatch (S173)**: once `0x2370A4` stops firing at cyc=43,000,000,
+`PutDispEnv` never replays the display-env again, so DISPFB stays frozen at whatever page was
+last programmed (page 0) forever, regardless of what page the game keeps actually drawing to.
+This collapses the two S173 threads into one: fix VBlank-stopping-at-43M, and the class-A
+mismatch should resolve as a direct consequence — no separate DISPFB-side fix needed.
+
+**S175 (Claude, live):** disassembled the VBlank handler's dispatch precisely (`0x2370A0`-
+`0x2370F8`) to identify exactly what's passed to the inner handler call:
+
+```
+002370C0: lw   v1, 0(a0)         ; v1 = table[s0]
+002370C8: bne  v1, -1, 0x2370F0  ; dispatch if table[s0] != -1
+002370F0: jal  0x0010CCD0
+002370F4: lw   a0, 0(a0)         ; delay slot: a0 = table[s0] (same value as v1)
+```
+
+At the final (never-returning) invocation, `table[0]=3` — **identical to the known-good value
+seen on every prior successful call**, ruling out a garbage-argument theory (the oddly large
+`a1=0xFFFFFFFFFFFFB0C5` seen in the raw trace is a stale, untouched register — this handler
+never writes `a1` before the call — not the actual dispatch parameter).
+
+**What IS unique to this final invocation: `sp=0x2001E60`.** Checked all 96 real `0x2370A4`
+entries across the full run for any `sp` value at or above the 32MiB RDRAM boundary
+(`0x02000000`) — **exactly one match, and it's this exact final invocation** (`0x2001E60`,
+~7.7KB past the boundary). Every other entry, including ones using clearly different threads'
+stacks (e.g. `0x4E35A0`), stayed within RDRAM. `jal 0x0010CCD0` is called with this
+marginally-out-of-bounds `sp` still active, and never returns — no further hits anywhere in the
+`0x2370A4`-`0x237114` range for the rest of the 50M-cycle run.
+
+This is a different, much smaller-scale anomaly than the old S163 finding (41MB off) but shares
+the same shape: whatever thread owns this stack has its `sp` sitting just past the end of valid
+RDRAM at the exact moment it's asked to run real code (`0x10CCD0` and whatever it calls), which
+is a plausible mechanism for a silent hang (out-of-bounds local-variable writes/reads inside the
+callee corrupting its own control flow, or the emulator's own OOB-access handling swallowing
+something silently rather than a clean fault).
+
+**Next**: identify which thread/stack this is and where its `sp` comes from at this specific
+point — is it the same thread whose stack legitimately sits near the RDRAM ceiling normally
+(and just barely tips over here), or is this yet another instance of something writing past a
+buffer end and encroaching on this thread's stack allocation.
+
+```text
+S174-175: PutDispEnv is VBlank-ISR-gated (2 of 3 callers inside the ISR) — collapses the class-A
+      DISPFB mismatch and the cyc43M VBlank stop into ONE root cause, not two. At the final
+      never-returning VBlank invocation, the dispatch argument (table[0]=3) is clean/normal,
+      matching history — ruling out a garbage-argument cause. But sp=0x2001E60 is the ONLY
+      out-of-RDRAM-bounds sp value across all 96 real entries, unique to this exact invocation,
+      right where it calls into 0x10CCD0 and never returns. Next: identify the owning
+      thread/stack and how sp got there.
+```
