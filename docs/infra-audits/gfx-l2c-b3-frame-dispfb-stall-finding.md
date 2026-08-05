@@ -113,3 +113,41 @@ B3 L2c finding
   open: does it ever flip past 50M? what is the EE actually waiting on?
   next: 100M comparison, then PC/syscall trace if still static -- no Core yet
 ```
+
+---
+
+## 7. 100M comparison (Grok, 2026-08-04) — still static
+
+**Method:** same temp gate `DETPS2_TEMP_B3_BLIT_TRACE=1` (FRAME_1 GIF write, DISPFB1/2 privileged, L2L blit entry) on tip after C1; `scoreboard-metrics burnout-only.json --cycles=100000000 --host-present`; **fully reverted** (`git status` clean on `Gs.cs`).
+
+**Trace (20 lines total, 4 unique patterns):**
+
+```
+FRAME_1 write fbp=0x0  psm=0x0 raw=0x100000     x1
+FRAME_1 write fbp=0x46 psm=0x0 raw=0xA0046       x4
+DISPFB2 write fbp=0x0  psm=0xA raw=0x51400       x8
+DISPFB1 write fbp=0x0  psm=0x0 raw=0x0           x6
+```
+
+**Zero** `L2L blit` lines.
+
+**Scoreboard 100M vs Claude 50M:**
+
+| Metric | 50M (Claude) | 100M (Grok) |
+|--------|--------------|-------------|
+| px | 877187 | **877187** (flat) |
+| fragTest | ~2.8M | 2825979 |
+| gifP2/P3 | 12 / 20 | 12 / 20 |
+| presentLit | 0 | 0 |
+| frame1 | 0xA0046 | 0xA0046 |
+| dispfb2 | 0x51400 | 0x51400 |
+| exitRequested | false | false |
+| syscalls | 62716 | 65639 (+~3k) |
+
+### Verdict
+
+**Not "just needs more time" through 100M.** DISPFB never moves; FRAME stays at 0x46; no local→local blit; **px stops growing after the early window** (identical 877187 at 50M and 100M). EE still alive (syscalls continue, no exit) but draw progress is plateaued.
+
+Candidate (1) closed: escalate to candidate (2) **PC/syscall histogram** for the stall window — no Core.
+
+Artifacts (gitignored): `out/canaries/b3-l2c-100m/`.
