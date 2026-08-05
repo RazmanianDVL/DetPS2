@@ -5348,3 +5348,22 @@ S94: CONFIRMED — endFunc=0 at the exact fno=5 completion point (cdPtr=0x0066E0
      client object, is end_function genuinely never set by the game for this call, or does
      Criterion's GTFS bridge use a non-standard completion signal entirely?
 ```
+
+
+---
+
+## 95. end_function=0 is intentional; fno=5 never clears state=2 (Grok, post-S94)
+
+S94: endFunc=0 on the exact fno=5 CALL; 0x1D2F50 hits=0; full TXD DMA already landed
+(1,146,112 → 0x67D880).
+
+Static CallRpc site passes `t3=0` / stack end_param=0 for **both** open and fno=5.
+Open recovers by writing state=1 itself after sync return. fno=5 only writes state=2
+(three sites) and never clears it. `0x1D2F50` has no static callers/refs in ELF.
+
+**Rank:** (1) wrong client ✗; (2) game never sets end_function ✓; (3) missing completion
+side-effect for blocking fno=5 ✓ as the live gap. Data present; status model stuck busy.
+
+```text
+S95: end_function=0 intentional; fno5 leaves state=2 forever; force state=1 A/B next
+```
