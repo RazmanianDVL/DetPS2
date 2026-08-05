@@ -7805,3 +7805,51 @@ resource in RDRAM, zero +0x98..+0xA4 if rel unaligned / &lt;0x10 / &gt;16MB. Pre
 ```text
 S171: Assist landed tip below. Claude independent verify: freeze clear, mode progress, S126 bar.
 ```
+
+## 172. INDEPENDENT VERIFICATION — S171 fix confirmed: freeze cleared, real progress resumes (Claude)
+
+**Verification against Grok's checklist (same bar as S98/S128), full 95M-cycle run, fix active:**
+
+**1. Freeze gone.** `--pcbreak=0025158C:0025158C` (the shared loop-exit) across the full run:
+still exactly 198 hits — matching the pre-fix "198 of 199 succeed" count exactly. The broken
+call's slot (`+0xA0`) is now zeroed by the scrub before `0x2B7110` runs, so `beq v1,zero` skips
+the relocate+call entirely — there's no 199th call to hang on anymore (not "succeeds and adds a
+199th exit," correctly "never attempted"). Scrub trace confirms exactly 2 events, targeting the
+known resource: `res=0x00B6D880 slots=4 cyc=40450000` (mid-fill transient state — harmless, any
+legitimately-filled slot gets overwritten by the GTFS fill's own later write regardless) then
+`res=0x00B6D880 slots=1 cyc=40500000` (settled state, correctly catching only `+0xA0`).
+
+**2. EXL/EPC not stuck.** Final `EE.PC=0x0012E934` at cyc=95,000,000 — nowhere near `0x25156C`.
+Run summary shows continuous forward progress the entire way: `syscalls=112658` (was 83539),
+`px=9,441,101` (was 7,667,531), `prims=1558` (was 1436), and the B3-internal `PL-014 logo-pad
+edge` counter climbs steadily from `n=576` (cyc≈62M) to `n=1216` (cyc≈94.45M) — no flatline
+anywhere in the back half of the run (previously flatlined completely from ~cyc73M onward).
+Thread 2 now shows `sleeping=True waitSemaId=3` (normal semaphore-blocking) instead of the
+uniform `sleeping=False waitSemaId=0` non-progress pattern seen pre-fix.
+
+**3. cdvd/heldP3 vs S126 bar.** `cdvdSectors=22301` (matches), `heldP3n=0 heldP3qwc=0` (matches).
+
+**One new observation, not alarming but worth recording:** `--pcbreak=002370A4:002370A4`
+(VBlank handler entry) now shows only 96 hits total, last one at cyc=43,000,000 — i.e. this
+specific interrupt path stops firing well before the run ends, even post-fix. Given the run
+demonstrably keeps making real progress for another ~52M cycles after that (PL-014 counter
+climbing, syscalls dominated by `0x32` at 94,721 hits — almost certainly a pad-status poll
+syscall), this looks like the game legitimately shifting to a poll-driven pad-input loop at the
+logo/frontend screen rather than a new interrupt-starvation bug, but it's a loose end worth
+keeping in mind if a future freeze investigation turns up near this area.
+
+**Remaining gap (separate, downstream thread):** `softgs-present: lit=0/286720 mostlyBlack=1` —
+still zero visible pixels even now. The boot sequence has clearly progressed further than ever
+observed this session (extensive PL-014 pad-edge activity that was previously unreachable), but
+actual on-screen rendering still hasn't started. This is the natural next investigation target,
+distinct from today's fix.
+
+```text
+S172: VERIFIED — S171 fix confirmed via independent re-run. Freeze mechanism (0x25156C runaway
+      loop) is gone: broken resource's slot now correctly skipped, not hung. Real continued
+      execution resumes past the old ~cyc73M ceiling all the way to 95M (syscalls/px/prims/
+      PL-014-edges all climbing, no flatline). cdvd/heldP3 match S126 bar. New observation:
+      VBlank-via-0x2370A4 stops at cyc43M even post-fix, but system clearly still progresses
+      (likely shifted to poll-driven pad input) — not alarming, noted for future reference.
+      Remaining gap: lit=0/286720, no visible pixels yet — next investigation target.
+```
