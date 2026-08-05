@@ -4642,3 +4642,31 @@ S79: Setter chain confirmed fully dead (0/0/0 hits) — "stage never entered" se
      other "wired but unreached" findings (VU1, ring overlay, five islands) rather than treating
      each as independent.
 ```
+
+## 80. S64-66's mode/phase machinery is still completely untouched post-S68 — supports a shared root gate (Claude)
+
+Quick complementary live check while waiting on Grok's static answer to S79: re-read the exact
+S64-66 mode/phase addresses (current mode ptr `0x51BA88`, pending mode ptr `0x51BA8C`, phase
+field `0x51BAA0`, plus the surrounding word range) at **90M cycles**, i.e. well after the S68
+latch fix landed and unblocked 8x more pixels / 3.5x more cdvd sectors:
+
+```
+0x0051BA80..0x0051BABC: all zero, every word, no exceptions
+```
+
+**Every single word in this range is still exactly zero** — identical to how it read before S68
+existed. So a fix that produced a massive, measurable downstream behavior change (px 877k→7.6M,
+cdvd 1865→6584) had **zero effect whatsoever** on the S64-66 phase/mode machinery. That's
+consistent with — though not proof of — the hypothesis in S79: whatever's gating the phase
+ladder from S64-66 is upstream of everything S68 touched, and is plausibly the same single gate
+blocking the DISPFB retarget stage (and VU1, and the ring overlay) from ever being entered. If
+Grok's static check (S79 ask) confirms `0x424C40` dispatches through the same phase/mode
+machinery, this stops being 4-5 separate mysteries and becomes one: what satisfies phase/mode
+advancement past its current stuck point.
+
+```text
+S80: Confirmed live — 0x51BA80..0x51BABC (mode-state/phase region) is still all-zero at 90M
+     cycles, completely unmoved by the S68 fix despite S68's large downstream effect elsewhere.
+     Supports treating S64-66's gate as the likely shared root cause pending Grok's static
+     confirmation.
+```
