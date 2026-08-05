@@ -7405,3 +7405,50 @@ Possible fix: allow PhysInterrupt 0x200 in IsLegitimateVectorTarget (dual-ACK).
 ```text
 S160: dump ra at 0x237114; if 0x200/garbage → JRGUARD swallow; if 0x80000200 → eret path.
 ```
+
+## 161. Decisive `ra` dump at the exact `jr ra`: value is `0x2370F8` — none of the three predicted outcomes. That address is inside the SAME handler, right after its own internal `jal 0x10CCD0` call — strong signature of a clobbered/never-restored saved-ra stack slot (Claude)
+
+`--pcbreak=00237114:00237114` (the exact `jr ra` instruction, opcode `0x03E00008` confirmed —
+real hit, not a false-positive), last real samples at cyc≈94,999,920-94,999,984:
+
+```
+pc=0x00237114  op=0x03E00008 (jr ra)   ra=0x002370F8
+  COP0_Status=0x40018403 (EXL=1)  EPC=0x0025156C  eretStack=1
+```
+
+**`ra = 0x002370F8` — not `0x80000200` (correct vector), not `0x00000200` (physical-form
+guard-swallow), not obvious garbage.** It's a legitimate, in-range EE address — and it's
+*inside this exact same handler function*, specifically the instruction right after its own
+internal `jal 0x0010CCD0` call (at `0x2370F0`; `jal`'s implicit return address is `PC+8 =
+0x2370F8`, matching exactly).
+
+**Read the function's own prologue/epilogue** (via `disasm`, confirmed): `0x2370A0` explicitly
+`sd ra,16(sp)` at entry, and `0x23710C` explicitly `ld ra,16(sp)` right before this `jr ra` —
+meaning the handler *does* correctly save/restore its own return address around the internal
+`jal 0x10CCD0` call, by construction. For `ra` to still read `0x2370F8` (the internal call's own
+return address) at the final `jr ra`, **the value restored from the stack slot must itself
+already be `0x2370F8`, not the original `0x80000200` exception-vector address the INTC
+dispatcher should have set on entry.** This points at the *saved* copy on the stack being wrong
+— either this handler was re-entered before a prior invocation's frame was properly torn down
+(stale/aliased stack slot), or the INTC dispatch itself set `ra` to `0x2370F8`-family value
+instead of the vector on this particular (re-)entry, rather than the `jr`-guard directly
+swallowing a correctly-set `0x80000200`.
+
+**This is a fourth, more specific scenario than any of Grok's three predicted outcomes** — not
+a guard-swallow of a correct vector address, not raw corruption/garbage, but a plausible
+**stack-frame aliasing / re-entrant-save bug**: if this VBlank handler gets re-entered (a second
+interrupt arrives) *before* its first invocation's `ld ra,16(sp)` epilogue runs, the second
+entry's `sd ra,16(sp)` would overwrite the stack slot with the *second* entry's own return
+context, and if stack pointers alias (same `sp` reused across re-entries rather than a fresh
+frame per entry), the eventual `jr ra` could resolve to whichever entry's `jal 0x10CCD0` return
+address happened to be saved last — landing back inside the handler's own body instead of the
+true vector.
+
+```text
+S161: ra at the jr ra is 0x2370F8 — none of the 3 predicted values. It's this same function's
+      own internal jal-return address, strongly suggesting a corrupted/stale saved-ra stack
+      slot rather than a JRGUARD swallow of a correct 0x80000200. Possible re-entrant/aliased
+      stack-frame bug if this VBlank handler gets re-entered before its first invocation's
+      epilogue runs. Needs Grok's read on whether/how this handler could be re-entered
+      mid-flight and whether sp is fresh per entry.
+```
