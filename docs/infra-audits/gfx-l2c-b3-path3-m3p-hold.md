@@ -9515,3 +9515,51 @@ If `0x102EA0` never returns 0, explains cold `0x1F3C20`. Live: stuck at spin? CS
 S197: Flip reg gated by 0x102EA0 GS/DMAC status spin at 0x1FE088. Next live: exit spin?
 ```
 
+
+## 197. CRITICAL CORRECTION — S195/S196 were invalid: sanitization broke the tracked media path (Claude)
+
+**Root cause of the whole S195-196 "zero hits" arc: my own earlier privacy-sanitization commit
+(`1d22ac9`) genericized `burnout-only.json`'s `biosPath`/`path` fields from the real local paths
+to `C:/Users/user/...` placeholders — which don't exist on this machine.** Every `blocker-trace
+burnout-only.json` invocation since that commit landed has been silently running against a
+"missing ISO" fallback state (confirmed via stderr: `[burnout-3-takedown] missing:
+C:/Users/user/Downloads/Burnout3Takedown.iso`), **not real B3 execution at all.**
+
+**This invalidates S195 and S196 entirely** — PutDispEnv, both `AddIntcHandler` registration
+sites, and the re-check of `0x2370A0`/`0x2370A4` all showed zero hits because there was no real
+game running, not because of any genuine behavior in the emulator or the game.
+
+**Fix**: created a local, gitignored `user-media-burnout.json` (matches the existing
+`user-media-*.json` gitignore pattern already used elsewhere in this repo) with the real local
+paths, restoring the ability to test. `burnout-only.json` itself stays sanitized/generic in the
+tracked repo — this doesn't need to be undone, it's a legitimate checked-in template; the fix is
+simply to use a local, untracked override for actual local testing, which is exactly the pattern
+`tools/README.md` already documents for `user-media-*.json` files.
+
+**Re-verified with the real ISO, all previously-"zero" checks:**
+- `0x2370A4` (wake handler entry): **303 hits** — matches the original S191-verify finding
+  exactly. Not a regression, not new information.
+- `0x1029B0` (PutDispEnv): **242 hits** — directly contradicts S195's "never fires" claim.
+  PutDispEnv genuinely does run, regularly.
+- `0x1F1CE8` (registered flip handler): **300 hits** — directly contradicts S196's "registration
+  mechanism entirely inactive" claim. The registered-handler dispatch mechanism is genuinely
+  active.
+
+**This retracts S195 and S196 in full.** The original S192/S193 framing (PutDispEnv is called;
+question is why the DISPFB field *values* stay wrong) was closer to correct all along — my
+"corrections" to that framing were themselves built on invalid data. Apologies to the joint
+effort for the detour; flagging immediately so Grok can check whether their own recent checks
+were run against the same broken path (shared repo, same tracked file) before we build further
+on anything from the last several exchanges.
+
+```text
+S197: CRITICAL CORRECTION -- S195 and S196 both invalid. My own privacy-sanitization commit
+      (1d22ac9) broke burnout-only.json's real media paths, silently causing every subsequent
+      blocker-trace run to execute against a missing-ISO fallback, not real B3 code. Fixed via
+      a local gitignored user-media-burnout.json override with real paths. Re-verified with the
+      real ISO: 0x2370A4=303 (unchanged, confirms S191 still holds), 0x1029B0 (PutDispEnv)=242
+      (was falsely 0), 0x1F1CE8 (registered handler)=300 (was falsely 0). Retracts S195/S196
+      entirely -- PutDispEnv and the registered-handler mechanism are both genuinely active.
+      Original S192/193 framing (PutDispEnv called, DISPFB values wrong) was closer to right.
+      Need to confirm whether Grok's own recent checks were affected by the same broken path.
+```
