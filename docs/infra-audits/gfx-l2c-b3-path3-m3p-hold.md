@@ -6257,3 +6257,56 @@ force +44=256 to test whether phase9 unblocks mode-state / lit.
 ```text
 S125: dual-ACK measure — force ctx+44=256; is audio on critical path to present?
 ```
+
+## 126. LANDMARK measure-only A/B: forcing `ctx+44=256` produces `mode-state ≠ 0` for the first time in the entire investigation — audio is confirmed load-bearing on the critical path (Claude)
+
+Ran the measure-only force myself (same pattern as S96): temp hook, gated
+`DETPS2_FORCE_B3_AUDIO_DONE=1`, writing `*(0x1F3621C) = 256` exactly once, the first time it's
+observed at `48`. No SignalSema, no other memory touched. Reverted after use (`git diff --stat`
+16 insertions, `git checkout --`, clean).
+
+```
+[B3-FORCE-AUDIO] cyc=36,000,000 forced *(0x1F3621C) 48->256
+[B3-FORCE-AUDIO-CHECK] cyc=90,000,000  phase=0x00000017 (23)  modestate=0x000002E2 (738)  gate=0x00000006
+```
+
+**`modestate` (`0x51BAD0`) is non-zero — `738` — for the first time anywhere in this entire
+investigation.** Every single measurement all night (and, per the doc's own history, likely
+every session before tonight) found this field stuck at exactly `0`. It moving to a real,
+specific value is unambiguous confirmation that the mode state-machine (`0x132600`, S64-66)
+genuinely started running as a direct result of this one forced write. Phase also climbed to
+`23` (`0x17`), well past the phase-9 stall and past S110's debunked phase-12 illusion — this
+time for real, confirmed by the same live-checkpoint method that caught the false positive
+before.
+
+**Product metrics at 95M**, compared against the S99 baseline (last real, non-illusory
+checkpoint before this force):
+
+| metric | S99 baseline | this A/B |
+|---|---:|---:|
+| cdvdSectors | 6,822 | **22,301** (highest of the entire investigation) |
+| m3p | True | **False** |
+| heldP3n/qwc | 5/2124 | **0/0** (fully drained) |
+| final PC | 0x0010BE68 (boot loop) | **0x00251570** (genuinely new code) |
+| spu2Writes | 0 | **16** |
+| modestate (0x51BAD0) | 0 | **738** |
+| **gate (0x01E90424)** | 6 | **6 — still unchanged** |
+| lit | 0 | **0 — still black** |
+
+**Gate stays at 6 and the present is still black — so this is not full resolution**, but it's a
+decisive, unambiguous "yes" on Grok's question: **the audio-load stall genuinely was the
+climber's current stopper**, exactly as G1 was before it. Mode-state finally moving confirms
+this thread is squarely on the critical black-screen path, not a side quest — matching Grok's
+S125 framing exactly. What's still needed: `gate` requires exactly `5` (S82-84), and `modestate`
+reaching `738` didn't produce it — meaning `738` is presumably some intermediate SM state that
+hasn't yet reached whichever case writes `gate=5`. That's the natural next thread once a real
+fix (not this raw force) is designed for the audio load itself.
+
+```text
+S126: LANDMARK — force ctx+44=256 (measure-only, reverted) produces modestate=738, the FIRST
+      non-zero mode-state value in the whole investigation. cdvd sectors reach 22,301 (highest
+      ever), m3p clears, held PATH3 fully drains, PC reaches new code. Gate stays 6, present
+      stays black — not full resolution, but decisively confirms the audio-load gap (S122-124)
+      is the real, current critical-path stopper, same class as G1. Real fix (not force) is the
+      next design target once a design doc + dual-ACK are ready.
+```
