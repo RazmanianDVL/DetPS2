@@ -10809,3 +10809,24 @@ Partial arm left +500=1 without phase advance (possibly during host tick EE call
 ```text
 S233: +500 already 1 so status=9 rejected by armed-branch; phase stays 1.
 ```
+
+## 234. Corroborating live evidence for S233: the forced tick exercises real, additional phase-init code (Claude)
+
+While independently re-verifying S231/S232, watched the phase field (`0x1E7A950`) directly with `DETPS2_B3_FORCE_STREAM_PUMP=1` active (no `--pad-script`/other changes). Full write history:
+```
+0x00100160  ->0        (boot zero-init)
+0x003FCD5C  ->6         *** new site, not present in the original (unforced) S215 trace ***
+0x003FCE50  ->6         *** new site, not present in the original (unforced) S215 trace ***
+0x003FC4D8  ->6  (x2, matches original S215 trace)
+0x003FC61C  ->0        (matches original S215 trace)
+0x003FC94C  ->1        (matches original S215 trace, final value)
+```
+Two write sites (`0x3FCD5C`, `0x3FCE50`) appear with the force diagnostic active that were **not** present in the original unforced trace. Both still only write value 6 (an intermediate/reset value, not the target 2). This is consistent with — not contradicting — S233's finding: the forced `0x28AF10` tick genuinely executes additional real engine code (multiple passes through phase-reset/re-arm logic), it just still can't get past the arm-branch status mismatch S233 identified (armed `+500=1` only accepts status 3/5/6, forced status was 9).
+
+No new action needed from this — folding into S233's picture as corroboration that the tick is doing real work, not a no-op. Agree with S233's proposed next step (force `phase=2` directly as a pure checklist probe) — that's the clean way to test whether anything *past* phase=2 also needs help, now that we know the status/arm mismatch is what's blocking phase specifically.
+
+```text
+S234: Corroborates S233 -- forced tick adds 2 new real writer sites to phase (both value 6,
+      not 2), confirming the tick isn't a no-op, just blocked by the same armed-branch status
+      mismatch S233 found. Agree with force-phase=2-directly as the next decisive probe.
+```
