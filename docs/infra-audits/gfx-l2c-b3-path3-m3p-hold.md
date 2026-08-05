@@ -1268,3 +1268,62 @@ Either way: builder fills TRXDIR template once; nothing in the live graph reads 
 live siblings called from 0x19DFxx / many others
 TRXDIR path structurally unreachable in this binary wiring
 ```
+
+---
+
+## 25. 14.4M-15.5M heatmap: real bounded work, not a hang — plus a refuted pad-input test (Claude)
+
+### 25.1 Narrow-window heatmap
+
+Profiled `[14.4M, 15.6M)` (temp `PcProfiler` tool, gated, fully reverted — the exact gap
+between §23's blit-builder firing once and this doc's flag-cluster start). Dominant hotspots,
+all disassembled directly:
+
+- `0x0012409C-0x001240B0`: standard PS2 SIMD `memset` (128-bit `sq` fast path), called from
+  `0x00167C04` with `a1=0` (zero-fill), `a2=20320` bytes (~20 KB).
+- `0x00167BC0-0x00167C3C` (the caller): a real, bounded init routine — loops **exactly 254
+  times** (`slti v0,s0,254`) calling a 128-byte-stride per-item initializer, then the 20 KB
+  memset, then loops **254 more times** calling a 64-byte-stride per-item initializer at the
+  same base the memset just cleared. Reads as legitimate object/particle-pool
+  (re)initialization — 254 is a specific, finite bound, not runaway.
+- `0x0010C680-0x0010C704`: real R5900 cache-management code (`sync`/`cache`/`mfc0 $c0_28`
+  TagLo reads) — a standard "invalidate this memory range from cache" routine, iterating a
+  4096-byte range in 64-byte (cache-line) steps.
+
+**None of this is a hang or spin.** It's real, bounded, purposeful low-level work (pool init,
+memset, cache flush) that completes in this window — refutes "the stall is literally inside
+14.4-15.5M." The setup work here finishes normally; whatever prevents further progress must
+be about what does or doesn't happen *after* this point, consistent with Grok's §23-§24
+finding that the actual consumer pipeline is structurally unreachable rather than merely
+slow.
+
+### 25.2 Pad-input test — refuted
+
+Given the above, tried a cheap, different hypothesis: is the game legitimately parked on a
+menu/attract screen waiting for real player input our automated harness never provides
+(matching this project's own established need for `--pad-script` on interactive titles)?
+Built a pad-script pressing `Start`/`Cross` at cyc 16M/17M/18M/20M (product `--pad-script=`,
+confirmed applied: "4 event(s)... applied 8 press/release action(s)"), re-ran the full 50M
+trace.
+
+**Result: `px=877187`, byte-identical to the no-input baseline.** Simulated Start/Cross
+presses at these specific times produce zero observable effect. Doesn't rule out a different
+button, different timing, or a held-vs-tapped distinction, but refutes the simple "just
+needs a Start press" version of this hypothesis.
+
+### 25.3 Combined read
+
+Setup work in the critical window is real and completes; simulated player input doesn't
+unstick anything; Grok's static analysis independently shows the actual blit-consumer
+pipeline has no static callers anywhere in the binary. Converging picture: this isn't a
+timing race or a missing player action — it's structurally disconnected code, consistent
+with Grok's own two hypotheses (unregistered via an undiscovered fptr table, or a genuinely
+unused alternate render path for this boot configuration).
+
+```text
+14.4-15.5M heatmap + pad test (Claude)
+  real bounded work in the gap window (254-item pool init x2, 20KB memset, cache flush) --
+    not a hang, refutes "stuck inside this window"
+  pad-input test (Start/Cross @ 16-20M): REFUTED, px identical to baseline
+  combined with Grok's static findings: structurally disconnected code, not a timing/input gap
+```
