@@ -134,4 +134,8 @@ Heads match offline RKV member dumps (path-to-bytes seat). **Delivery is real.**
 
 Still: no texture-named FILEIO; streamed payload is whole title goefile/script members, not per-path pixel opens.
 
-**Next:** script-interpreter progress after more stream complete (when firstscreen 100%); or watch whether any GOE fno beyond stream-table ever requests a level-cell TOC name (`hubmain`, etc.).
+### 6.4 GOE_OPEN census (50M, temp, reverted)
+
+`GoeOpenPath` entry log: **zero** calls in 50M. Title delivery uses IOPFILE stream-table (`sid=0x31`) only — not the GOE Open path for named members. No `hubmain` / level-cell / texture GOE opens in this window.
+
+**Next:** force longer stream progress (firstscreen complete %) + any post-complete IOPFILE fno; or EE script PC after ring drain.
