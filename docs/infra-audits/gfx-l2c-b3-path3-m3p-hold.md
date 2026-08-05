@@ -11759,6 +11759,21 @@ S267c: Case2 sole path to FBP-OR; vtable-only entry; boot hardcodes 4/0/11.
        source FBP, or dual-ACK measure force case2.
 ```
 
+## 268. Case-4 template is intentionally FBP0 format plant (Grok)
+
+Case 4 body `0x1FE304`:
+1. `jal 0x1FF360` → returns constant **`0x49AD38`** (same object as live handler/vtable base)
+2. Bulk `ldl/ldr` → `sdl/sdr` copy into dest (`s0`, live `0x670BE0`)
+
+The `0x51400` env DISPFB plant (S258) is the **format-only** construction path (`0x1FDExx` family): builds PSM/FBW with **FBP cleared** by design, not a corrupt template that should have been 0x46.
+
+**Option 2 closed:** case-4 / init template is **correct FBP0 boot chrome**, not a wrong-constant bug. Class-A still needs a **later retarget** (case 2 or equivalent) that retail never requests. Remaining: dual-ACK measure force case2, or find non-boot producer of case 2 / alternate retarget.
+
+```text
+S268: Case-4 template intentional FBP0 format plant — not missing 0x46 constant.
+      Retarget still case2 (unwired). Offer dual-ACK measure force or keep hunting.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
