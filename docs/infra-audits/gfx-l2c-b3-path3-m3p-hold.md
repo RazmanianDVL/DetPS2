@@ -6557,3 +6557,47 @@ S135: a0+484 confirmed == 0x01E90424 exactly. Case-5 hits are the shared idle/OO
       reset this cell into 0x30D7C0's valid {0,2,5} range, or was mega-init's 6 meant for a
       different, unimplemented mode entirely?
 ```
+
+---
+
+## 135–136. Gate=6 is intentional terminal idle; re-arm exists but never hits this object (Grok)
+
+S135 ask: dead mode vs missing reset?
+
+**Verdict: intentional terminal, NOT dead/unimplemented.** Nested SM fully implements
+cases 0..5; `sltiu v1,6` sends >=6 to shared epilogue `0x30D9A8`. Jump table `0x4C4AD0`:
+
+| case | body | gate write |
+|------|------|------------|
+| 0 | `0x30D878` | →2 @ `0x30D890` |
+| 1 | `0x30D960` | float work |
+| 2 | `0x30D8C8` | →5 @ `0x30D8E4` (WRITE-5) |
+| 3/4 | `0x30D910` | →1 @ `0x30D948` |
+| 5 | `0x30D9A8` | idle; may →6 @ `0x30D9F8` if phase==23 & v0≠0 |
+| ≥6 | OOB | same epilogue |
+
+Valid range is **{0,1,2,3,4,5}**, not only {0,2,5}. State **6 = designed idle/done**.
+
+**Re-arm writers (object family, not stack):**
+
+| PC | value | callers |
+|----|-------|---------|
+| `0x30D4B0` | 3 | 4 (0x42460C family) |
+| `0x30D500` | 4 | 100+ |
+| `0x30D560` | 3 | 100+ |
+| `0x30D5C0` | 0 / 2 / 6 | **1: `0x318548`** |
+| `0x30DD70` | 6 teardown | 22 |
+| `0x30DE10` | 6 (+23 @ +500) | 1: `0x133638` |
+| `0x30DF10` | 6 mega-init | 1: `0x133E28` (live) |
+
+S82 live: only boot-zero + mega-init-6 on `0x01E90424`. Zero re-arm hits on this object.
+Re-arm code is real and heavily referenced; it just never targets `a0=0x1E90240` in our window.
+
+Also: `0x1322B0` v0=0 still blocks mode-state 7→4 (stacked, independent).
+
+```text
+S136: gate=6 = intentional terminal idle, not dead mode. Full 0..5 SM + many re-arm
+      sites exist. Live: re-arm never hits obj 0x1E90240 (only mega-init write-6).
+      Next live: census 0x30D4B0/500/560/5C0 hits + a0==0x1E90240?
+      Static next: sole 0x30D5C0 caller 0x318548 gate.
+```
