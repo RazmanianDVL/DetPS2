@@ -7863,3 +7863,12 @@ pad unblock static (Grok).
 ```text
 S172: S171 PASS. Next: lit pixels — render setup vs need pad script.
 ```
+
+## 173. PL-014 is pad inject not DISPFB; lit=0 likely class-A again (Grok)
+
+PL-014 edges = host START/CROSS + DBC refresh. Does not retarget DISPFB. lit=0 with
+px climbing → class-A (FRAME≠DISPFB page). Re-check gate/modestate/DISPFB post-S171.
+
+```text
+S173: PL-014 unblocks input path; lit needs DISPFB retarget or real draws on page 0.
+```
