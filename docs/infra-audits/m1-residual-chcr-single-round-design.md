@@ -1,6 +1,6 @@
 # M1 residual — CHCR force-pump single-round / scheduler drain (design)
 
-**Status:** design shelf — dual-ACK before Core  
+**Status:** design shelf — **dual-ACK partial (2026-08-04 night)**; Core **parked**  
 **Author:** grok (dual-idle free seat after M7-L1 honesty close)  
 **Parents:** `instant-progress-audit.md`, `instant-progress-rescan-g5.md` (R1)  
 **Scope:** `src/DetPS2.Core/Dmac.cs` CHCR STR multi-round force-step only
@@ -65,14 +65,14 @@ GIF_STAT multi-round is already fixed to single optional `Step(128)`. CHCR is th
 
 ## 6. Dual-ACK questions
 
-| ID | Question | Bias |
-|----|----------|------|
-| **M1R-Q1** | Accept Opt A (single Step on STR) as next Core seat? | **Yes** when dual free + demand |
-| **M1R-Q2** | Default cap 1 vs keep 16 until claim A/B? | Prefer **cap=1** with kill-switch; else measure-first with cap=1 experimental env |
-| **M1R-Q3** | Park until path-sync titles show STR stick pain? | OK if dual-idle has higher playability seats |
+| ID | Question | Bias | Claude (seq0219) | Resolution |
+|----|----------|------|------------------|------------|
+| **M1R-Q1** | Accept Opt A (single Step on STR) as next Core seat? | Yes when dual free + demand | **Conditional yes** — design OK; Core only dual free + real demand, **not that night** | Design accepted; **Core parked** |
+| **M1R-Q2** | Default cap 1 vs keep 16 until claim A/B? | Prefer measure-first env | **Agree measure-first** cap=1 experimental env, not immediate default flip | **Measure-first only** when reopened |
+| **M1R-Q3** | Park until path-sync titles show STR stick pain? | OK | **Yes park** — no current STR-stick pain evidence | **Parked** with C1-TP / M6-b3 |
 
 ```text
 M1 residual CHCR design
-  multi-round force-pump → single-round kick (GIF_STAT class)
-  dual-ACK before Core; kill-switch retained
+  Opt A accepted; Core parked pending demand + dual free
+  measure-first env cap=1 when reopened; no 16→1 default tonight
 ```
