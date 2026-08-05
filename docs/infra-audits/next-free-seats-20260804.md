@@ -1,8 +1,8 @@
-# Next free seats inventory (updated 2026-08-04 late)
+# Next free seats inventory (updated 2026-08-04 night — dual-idle)
 
-**Author:** grok (dual-orch standing: dual-idle → propose next, no mutual-hold)  
-**Tip:** `a8ae0aa` / designs `99087d3`  
-**Purpose:** non-empty free-seat list after C1 arc close.
+**Author:** grok (standing: dual-idle → propose next, **no mutual-hold**)  
+**Tip at write:** post M7-L1 results  
+**Purpose:** non-empty free-seat list; closed seats not re-opened without evidence.
 
 ---
 
@@ -10,12 +10,17 @@
 
 | Stream | Status |
 |--------|--------|
-| **C1** full arc | storm fix + S1 scoping + D4 drain + EntryThreadId bind; firstQueue still 0 for **honest table pressure**; table-pressure design parked pending demand |
-| M4 S4 mirror + GoW plant | plant ON residual; next doc `m4-gow-plant-residual-next.md` |
-| M7 residual honesty | rollup `m7-residual-honesty-rollup-2026-08-04.md` — reopen only R1 with named title |
-| M5-a S6 | **PARKED** CATCHUP |
-| M8 Prefer fleet | audit landed; GoW plant intentional residual |
-| M4-g FILEIO GetVersion | **already Core** (`m4g-fileio-getversion-landed.md`) |
+| **C1** full arc | storm + S1 + D4 + EntryThreadId; firstQueue 0 = honest table pressure |
+| C1 table pressure | design shelf; dual-ACK on demand only |
+| M4 S4 mirror + GoW plant | plant ON residual; `m4-gow-plant-residual-next.md` |
+| M5-a S6 CATCHUP | **PARKED** (B3 collapse) |
+| M7 residual honesty | rollup closed; R1 only with named title |
+| **M7-L1 Whip IMAGE** | **measured** — product imgBytes=0; MENU-WHIP-2 already off → **R1 honest residual** (`m7-l1-whip-assist-off-image-results.md`) |
+| M8 Prefer fleet | audit + soft-off canary |
+| M4-g FILEIO GetVersion | already Core |
+| M6-b1 Sleep rescue | already Core |
+| M6-b2 starvation counters | already Core |
+| Fleet flag-off identity | BO2+Whip+B3+GoW 20M match |
 
 ---
 
@@ -23,13 +28,12 @@
 
 | ID | Seat | Risk | Notes |
 |----|------|------|-------|
-| **M6-b1** | Shared SleepThread starve rescue | Med | `m6b-next-items.md` P0 — clear GAP; flag-gated |
-| **M6-b2** | Starvation counters in scoreboard | Low | Observability first |
-| **M1 residual** | A3.1 CHCR / M1-f GIF_STAT | Med | Backlog design-first |
-| **M7-L1** | Whip/BO2 assist-off IMAGE TRACE | Med | Named bar from M7 rollup |
-| **C1-TP** | Table pressure T1 slots=64 | Med | Design ready; only if live register demand |
-| **M3-b/c** | Dual-path formalization | Low–Med | Needs non-empty live registry to matter |
-| **Fleet flag-off identity** | Scoreboard after recent Core | Low | Cheap confidence |
+| **M1 residual** | CHCR single-round force-pump | Med | Design ready: `m1-residual-chcr-single-round-design.md` — dual-ACK before Core |
+| **M6-b3** | post-SignalSema fairness | Med | Design shelf; only if GoW SwitchTo soft-disable goal |
+| **M6-b4** | JREXIT main-revive scaffold | Med | Design-first; env off default |
+| **M7-L1 BO2/Haven** | assist-off IMAGE TRACE other titles | Med | Whip closed honest; optional peers |
+| **C1-TP** | Table pressure T1 slots=64 | Med | Only if live register demand |
+| **M3-b/c** | Dual-path formalization | Low–Med | Needs non-empty live registry |
 
 ---
 
@@ -38,17 +42,20 @@
 - Promote CATCHUP default-on  
 - Gs.cs composite without oracle  
 - GoW plant soft-off without S0 TRACE  
+- Re-enable MENU-WHIP-2 goefile paint  
+- Invent Path2 IMAGE for Whip without real MAP/\*.MP2 path  
 - Mutual-hold / “wait for signal” without a proposed next course  
 
 ---
 
 ## Suggested next dual-idle pick
 
-1. **M6-b2 counters** (cheap) or **M6-b1 Sleep rescue design dual-ACK**  
-2. Or **M1 residual** design-first  
-3. Or **M7-L1** measure plan for one title  
+1. **M1 residual** dual-ACK → Core Opt A (or measure-first env cap=1)  
+2. Or **M6-b3** if GoW fairness is the active product goal  
+3. Or **M7-L1 BO2** same honesty bar (measure only)
 
 ```text
-next-free-seats updated post C1 close
-  prefer M6-b or M1 residual; C1-TP only on demand
+next-free-seats post M7-L1 Whip honesty close
+  prefer M1 CHCR residual or M6-b3 on demand
+  dual-idle = propose, never mutual-hold
 ```

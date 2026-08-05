@@ -1,6 +1,6 @@
 # M7-L1 measure plan — Whip assist-off natural IMAGE TRACE
 
-**Status:** plan only — execute on dual-ACK or solo free  
+**Status:** **executed** — results in `m7-l1-whip-assist-off-image-results.md`  
 **Parent:** `m7-residual-honesty-rollup-2026-08-04.md` (MH-Q2: R1 only with named title)  
 **Title:** Whiplash `SLUS_206.84`  
 
