@@ -4146,3 +4146,24 @@ Stuck phase-2 = resource slot +8 at `0x1D6D880` never becomes ready.
 ```text
 S65: ret0=retry; phase2 waits *(0x1D6D888) ready (id14)
 ```
+
+---
+
+## 66. Execution "stops" at 0x12EC78 → 0x237120 SleepThread forever (Grok+Claude)
+
+Claude: PC range 0x12EC70–0x12ED50 only hits climber-loop PCs once; never 0x12ECBC+.
+
+Grok: `0x12EC78 = jal 0x237120`. That function is the known PL-014 wait:
+
+```
+0x237180: SleepThread (0x10BD40)
+          while (*(gp-23820 + slot)==0) SleepThread;
+```
+
+`VblankWakeFlagBase = 0x4E2964` (Assist). Climber returned **0** (retry) → enter VBlank wait →
+flags never non-zero → sleep forever → never retry climber → never `0x132560` →
+mode-state stays 0.
+
+```text
+S66: park is 0x237120 SleepThread; dual gate resource-id14 + VBlank wake flags
+```
