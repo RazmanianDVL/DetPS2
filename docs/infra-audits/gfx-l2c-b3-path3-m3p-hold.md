@@ -6882,3 +6882,17 @@ S142: Inner state confirmed 3 (real progression 1->2->3, each hit once, case3 re
       Level 5 of the nested-SM chain, same "runs partway, stalls at a specific case" shape
       throughout. Ready to dump that byte the moment it's confirmed as the right address.
 ```
+
+## 142–144. Flag reaches 1 via GTFS pump; case3 no 2nd gate; mode SM only from climber (Claude+Grok)
+
+**S142/S143:** *(0x1E85A4C) driven by same 0x13D340 completion pump as Global.txd (S98). Flag reaches 1; case3 can see it. Inner state still 3 at 90M — discrepancy.
+
+**S144:**
+- Case3 has **no second condition** — only the byte. Advance → state 22 + fall into case22.
+- Mode SM `0x132600` has **one** caller: `0x12ECE0` (climber path). Spin while `*(u8*)0x51BA90==0`; not forever host-tick.
+- If last mode-SM poll is before flag=1, outer retry stop is the gap (not another Assist).
+
+```text
+S144: case3 = flag only; mode SM sole caller climber@0x12ECE0 gated on 0x51BA90.
+      Next live: order flag-write-1 vs last 0x2BCB50/0x132600; census 0x2BCD50/0x2BCE4C.
+```
