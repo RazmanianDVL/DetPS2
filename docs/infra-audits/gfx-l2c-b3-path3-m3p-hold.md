@@ -1,6 +1,6 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** **PARKED** (honest bound, 2026-08-05) — real mechanisms documented; no Core; flip gate still open  
+**Status:** **RESUMED** (2026-08-05, user direction: no parking for "needs more tooling" — build the tooling) — see §12  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
 **Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`), Claude forced-unmask A/B (`f8b5db8`)  
@@ -379,4 +379,72 @@ B3 L2c PATH3/M3P chain -- PARKED (honest bound)
   real hold + real held data + static mask/unmask template + force-drain insufficient
   flip gate after drain still open; no Core proposed
   resume only with fresh angle or dual-ACK new seat
+```
+
+---
+
+## 12. Forced-drain leaves the EE's own PC trace byte-for-byte unchanged (Claude, resumed)
+
+Built the needed tooling rather than parking: extended the forced-unmask harness
+(`Tests/TempB3PostDrainPc.cs`, temp, gated, fully reverted — `git status` clean) with
+`PcProfiler` (existing product infra, `DETPS2_PROFILE_PC`), reset right after the force call
+so it profiles *only* the post-drain window, compared against the same window with no force.
+
+### 12.1 Result
+
+Two windows compared, `[25M, 50M)`, baseline vs. forced:
+
+- `px` in the forced run is **already at its final value (1,172,419) the instant
+  `SetMskPath3(false)` is called** — `DrainHeldPath3` runs synchronously inside the call, not
+  spread across cycles. (This also explains why the earlier §10 A/B test's px delta showed up
+  as a single jump rather than gradual growth — missed at the time.)
+- The **PC profile for the entire following 25M-cycle window is byte-for-byte identical**
+  between forced and baseline — same top-30 addresses, same exact counts down to the last
+  digit (`0x00237188` → `857033` in both, every other address matching too). `diff` on the
+  two full logs shows zero difference outside the header lines (px/m3p/held state).
+
+### 12.2 What this establishes
+
+**Draining PATH3 does not perturb the EE's own executed instruction stream at all.** The
+dominant loop (`0x237180-0x237198`, the VBlank-flag poll characterized in the parent doc) is
+not gated on PATH3/GIF_STAT/M3P in any way the EE currently checks — forcing the drain
+doesn't wake it, doesn't redirect it, doesn't even shift its iteration count by one. This
+**decisively separates the two findings**: the PATH3 hold and the VBlank-flag-poll wedge are
+fully independent blockers, not sequentially linked as the original hypothesis in §6 framed
+them ("Game masks PATH3, queues display/scene PATH3 DMA, expects a condition... so unmask
+never runs"). That framing implied a causal chain; this measurement shows there isn't one —
+PATH3's state genuinely doesn't factor into what the EE's currently-dominant thread is doing
+at all.
+
+### 12.3 Implication
+
+Fixing "why does the final MSKPATH3 never get its unmask" would very likely have **zero**
+effect on the visible symptom, independent of §10's finding that force-draining doesn't fix
+the flip either — two separate confirmations converging on the same conclusion via different
+methods (composite-state comparison in §10, full PC-trace comparison here). **PATH3 is very
+likely a real but ultimately unrelated finding** — worth fixing on its own merits eventually
+(real load-bearing data sitting stuck is still a correctness gap), but not the lever that
+unblocks B3's visible rendering. The actual blocker is squarely in whatever gates the
+VBlank-flag-setting mechanism for the threads whose polls dominate this trace — back to
+`0x2370A0`'s real per-slot behavior (§10 of the parent doc already showed all 4 slots DO get
+set correctly over a full run) or a *different*, not-yet-identified condition entirely.
+
+### 12.4 Next (no Core, tooling exists — do not park on this)
+
+1. Since PATH3 is now decoupled, drop it as the primary lead. Refocus on: **why does the
+   specific thread/slot whose SleepThread calls dominate this PC trace never see its own
+   flag go non-zero**, even though §10 showed flags DO get set 71-times-each over a full
+   run — reconcile per-thread timing (is THIS window's dominant thread's specific flag set
+   late, rarely, or never relative to its own poll cadence?).
+2. Correlate `RA=0x00237188`'s call stack (which specific thread/slot) against the flag-SET
+   timeline from §10 to see if there's a timing mismatch (sets happening, but not fast enough
+   / not for this specific thread) rather than a binary works/doesn't-work split.
+
+```text
+Forced-drain PC-trace diff (Claude, resumed -- not parked)
+  px jumps to final value INSTANTLY at the force call -- DrainHeldPath3 is synchronous
+  PC profile for the full post-drain window is byte-identical to baseline, no exceptions
+  PATH3 hold and VBlank-poll wedge are fully INDEPENDENT -- not a causal chain
+  PATH3 fix would very likely NOT fix the visible symptom -- redirect focus to per-thread
+    flag-set timing instead
 ```
