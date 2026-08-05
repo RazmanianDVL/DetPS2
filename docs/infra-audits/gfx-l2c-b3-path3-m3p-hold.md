@@ -9133,3 +9133,48 @@ S189: DIAG DETPS2_TRACE_PC_STREAM landed (default-off). Run AFTER=41999900 UNTIL
       first pc in 0x223xxx + prev/tag names the transfer. No fix behavior change.
 ```
 
+
+## 189. DECISIVE — zero instructions between healthy PC and corrupted PC; not any executed instruction at all (Claude)
+
+Ran Grok's S189 `DETPS2_TRACE_PC_STREAM` diagnostic across the exact window
+(`AFTER=41999900 UNTIL=42000200`). The two log lines that bracket the transition, **directly
+adjacent in the output, with nothing between them**:
+
+```
+[PCSTREAM] cyc=41999984 tag=fallthrough prev=0x001F2508 pc=0x001F250C ra=0x001F2518 sp=0x01FFFDA0
+[PCSTREAM] cyc=42000000 tag=irq-before-dispatch prev=0x00223228 pc=0x00223228 ra=0x00223228 sp=0x01FFFDA0
+```
+
+**Zero `branch`/`fallthrough`/`likely-nullify`/`hle-redirect` tagged instruction retirements occur
+in between.** The diagnostic tags every single instruction that actually executes; none did. PC
+went from `0x1F250C` (healthy, queue loop) to `0x223228` (the mystery region) with **no
+instruction responsible at all** — ruling out every jr/branch/fallthrough theory pursued in
+S179-S188 outright. This can only be a **non-instruction PC rewrite** — something that changes
+`PC` directly without going through normal instruction retirement.
+
+Per Grok's own S188 `Step()` ordering (`1. MaybePreempt (can rewrite PC) → 2. COP2 stall →
+3. interrupt-pending check → 4. SoftFloat → 5. [PCBREAK] → 6. ExecuteInstruction`),
+**`MaybePreempt` is the only candidate in that list capable of a bare PC rewrite before any
+instruction executes** — exactly matching what's observed (the very next thing logged after the
+rewrite is the *interrupt-pending check*, step 3, seeing the already-new PC — consistent with
+the rewrite having happened in step 1, two steps earlier in the same `Step()` call).
+
+**This reopens `MaybePreempt` as the leading candidate despite S188's negative
+`DETPS2_TRACE_PREEMPT` result** — that trace only logs specific `"switched N -> pc=X"` events
+(a cross-thread switch); if `MaybePreempt` has *another* internal path that rewrites `PC`
+(e.g. resuming/restoring the *same* thread's context, or some other branch inside its own logic)
+without going through that particular log statement, it would be invisible to the trace I ran
+but would still explain this. Next: read `MaybePreempt`'s full implementation directly to find
+every place it can assign `PC`, not just the one already-logged "switched" path.
+
+```text
+S189: DECISIVE -- the PC-stream diagnostic shows ZERO instruction retirements (no branch, no
+      fallthrough, nothing) between the last healthy PC (0x1F250C, cyc=41,999,984) and the
+      corrupted PC (0x223228, first seen via the irq-before-dispatch check at cyc=42,000,000).
+      This proves the transition is NOT caused by any executed instruction -- not a jr, not an
+      eret, not a branch. It's a bare, non-instruction PC rewrite, which per Grok's own Step()
+      ordering can only be MaybePreempt (the only pre-instruction-execution PC-writer). Reopens
+      MaybePreempt despite S188's negative trace -- that trace may only cover one of
+      MaybePreempt's internal PC-write paths (cross-thread switch), not all of them. Next: read
+      MaybePreempt's full source for every PC assignment, not just the logged "switched" one.
+```
