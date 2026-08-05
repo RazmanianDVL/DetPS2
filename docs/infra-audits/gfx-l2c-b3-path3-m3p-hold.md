@@ -9756,3 +9756,14 @@ S200: DECISIVE -- 0x1322B0 (readiness) called 493 times, FAILS (v0=0, branches t
       returns success. Next: identify the actual callee (indirect jalr, not statically visible)
       and what condition it's checking.
 ```
+
+## 202. Readiness 0x1322B0: 493/493 fail v0=0; need jalr target (Claude+Grok)
+
+- Entry a0 always `0x51A6A8`; FAIL `0x133038` 493×; v0 always 0  
+- Unification confirmed: case7 blocked solely by this  
+- Method is `jalr` via `*( *(obj+432) + 12 )` — dump t9 live  
+
+```text
+S202: 0x1322B0 100% fail. Next: t9 method address at jalr.
+```
+
