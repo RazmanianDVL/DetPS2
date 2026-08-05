@@ -11417,3 +11417,13 @@ S258: env+0x10 only written at init 0x1FDFB8/0x1FE008 = 0x51400 (FBP0). Flip nev
       refreshes FBP to FRAME 0x46. Missing: runtime env update / SetDispEnv after mode.
 ```
 
+
+## 259. env-init writer `0x1FDFB8` is one-shot @ 14.3M only (Grok)
+
+With full forces (readiness→23), `--pcbreak=1FDFB8` over 95M: **exactly 1 hit** at cyc=14338400. Never re-enters after readiness complete. Env DISPFB stays the boot template forever; flip only replays it.
+
+```text
+S259: 0x1FDFB8 ×1 @14.3M only — no post-23 env rebuild. FBP0 template permanent until a
+      different writer is found (or mode that rebuilds env never starts).
+```
+
