@@ -11738,6 +11738,27 @@ S267b: 1E33D0 a1 live={0,4,11} only; zero a1=2. No ELF call site plants case 2.
        whether case 2 is truly dead on this title.
 ```
 
+## 267c. Case 2 is sole path to FBP-OR; only vtable entry; boot hardcodes {4,0,11} (Grok)
+
+| Fact | Evidence |
+|------|----------|
+| Sole code call of `0x1FD490` | `jal` only at `0x1FE398` (case 2 body) |
+| Sole data ptr to `0x1FE1A0` | vtable word at **`0x49AD3C`** (`*(0x49AD38+4)`) — matches live handler |
+| Boot setup `0x1E2EA8` | Hardcodes `a1=4` then `0` then `11` into `0x1E33D0` — **never 2** |
+| Callers of `0x1E2EA8` | `0x227F1C`, `0x291004` only |
+
+**Honest bound:** On the wired retail path, display env is built with **case 4 bulk template (FBP0)** and never retargeted. Case 2 FBP-OR is **implemented but unwired** (no caller requests it). Class-A open options without invent-DISPFB:
+
+1. Find a **non-boot** path that should re-dispatch case 2 when FRAME FBP becomes 0x46 (mode/level) — currently none found.
+2. Confirm whether case 4's **template source** should already carry FBP=0x46 (wrong template / missing prior plant) rather than needing case 2.
+3. Dual-ACK **measure-only** force: call case 2 once post-FRAME to see if lit climbs (diagnostic, not product).
+
+```text
+S267c: Case2 sole path to FBP-OR; vtable-only entry; boot hardcodes 4/0/11.
+       Unwired, not missing HLE. Next options: non-boot re-dispatch, template
+       source FBP, or dual-ACK measure force case2.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
