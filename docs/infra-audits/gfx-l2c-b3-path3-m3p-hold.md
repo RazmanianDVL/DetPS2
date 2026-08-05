@@ -12045,3 +12045,19 @@ S276: s4 confirmed meaningful (varies by case, real pointer 0x670000 for a0=4) b
       s4 is very likely meant to point there for the merge, and whatever sets up case 2's call
       never populates it. Narrows target to: who should set s4 before 0x1FE1A0(a0=2).
 ```
+
+## 277. s4 at 1FE1A0 is case-dependent; case2 leaf rebuilds s-regs (Grok + Claude)
+
+Claude (their S276 / 9b9d3d4): live s4 at `0x1FE1A0` entry — case4 gets s4=`0x670000`, case2 gets s4=`0`.
+
+Static refine:
+- Switch sets `s0=a1`, `s1=a2` only; **does not touch s4** (caller-preserved).
+- Case2 body `jal 0x1FD490`; leaf **immediately** `sq s0..` then reloads s0/s4 from constants / `jal 0x1F4600` return — caller's s4 is **not** the FBP merge source inside the leaf.
+- Case4 bulk-copy **does** use switch `s0` (=a1) as dest — there a1/s0 wiring matters.
+
+So s4=0 on case2 is real and may indicate incomplete caller context, but FBP-OR leaf FBP source is still **internal** (`0x675E40` / buffers it builds), not s4-from-caller. Aligns with env dump: display DISPFB stays 0x51400 while FRAME 0xA0046 sits in sibling structs never selected by PutDispEnv (S274–S276).
+
+```text
+S277: s4 case-dependent at switch (Claude) — case2 leaf rebuilds s-regs; FBP source
+      internal. PutDispEnv still only FBP0 trio. Page split is the lit wall.
+```
