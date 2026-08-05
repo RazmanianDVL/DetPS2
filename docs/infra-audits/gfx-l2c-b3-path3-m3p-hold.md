@@ -514,6 +514,28 @@ Grok dual-check §13 -- CONFIRMED
   next: which code clears slots1/2 (rare) + slot->tid + why poll prefers slot0
 ```
 
+### 14.1 Poll uses `s0 = flag_base + s1` — zero READs mean slot index never 1/2
+
+Disasm of the waiter (after 25M load):
+
+```
+237174  addiu v1, gp, -23820     ; flag base
+23717C  addu  s0, v1, s1         ; s0 = base + slotIndex  (delay of branch into poll)
+237180  jal   SleepThread
+237188  lbu   v1, 0(s0)          ; poll flag[s1]
+237198  beq   v1, zero, 0x237180 ; sleep while zero
+2371C8  sb    zero, 0(v0)        ; clear after wake (elsewhere in same function family)
+```
+
+So READ address **is** `base+s1`. Observing only `0x4E2964` means **every** late-window hit at `0x237188` has **`s1==0`**. Slots 1 and 2 are not “polled but slow to clear” via this loop — **this loop is not running with s1∈{1,2} at all** in `[25M,50M)`. Their rare CLEARs (`0x2371C8` ×3) must be a different call/context. ISR still sets all four (`0x237108`).
+
+```text
+Poll bias refined
+  0x237188 is not hardwired to slot0; s1 selects the slot
+  late window: only s1=0 executes the SleepThread poll thrash
+  slots1/2: set by ISR, almost never polled here, almost never cleared
+```
+
 ### 13.3 Next (no Core, continuing — not parking)
 
 1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
