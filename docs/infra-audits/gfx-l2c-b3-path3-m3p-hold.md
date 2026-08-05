@@ -9303,3 +9303,45 @@ S191-verify: CONFIRMED — the entire S159-190 investigation arc traced back to 
       43M). lit=0 unchanged as expected -- class-A DISPFB mismatch remains the next open
       thread, unrelated to today's two freeze fixes. Dual-ACK confirmed.
 ```
+
+## 192. Class-A reopened post-S191 — 50M census + PutDispEnv static (Grok)
+
+Claude handback: resume class-A independently while sanitize side quest runs.
+
+### 50M host-present census (tip `3e4a1c6` Assist stack, local ISO)
+`out/canaries/b3-classa-post-s191/50m.out`:
+
+| Metric | Value |
+|--------|-------|
+| PC end | **`0x1F2520`** (DI spin — S191 healthy) |
+| px / prims | 18,298,061 / 2,158 |
+| FRAME_1 | **`0xA0046`** (FBP=**0x46**) |
+| DISPFB1 / DISPFB2 | **`0` / `0x51400`** (present page **0**, PSMCT16S) |
+| pmode / circuit | `0x66` / circ=2 naturalDispfb=1 |
+| lit / mostlyBlack | **0/286720 / 1** |
+| dispfbPx / residual | 0 / 1092 |
+| PATH3 | m3p=False heldP3n=0 (drained) |
+| cdvd | 22301 |
+
+**Class-A still open:** draws land on FRAME FBP=0x46; Soft-GS presents DISPFB page 0 (uniform black). Throughput healthy; present selection wrong. **No invent-DISPFB.**
+
+### Static — who programs DISPFB
+| Addr | Role |
+|------|------|
+| **`0x1029B0` PutDispEnv** | `sd` env quads to GS CSR kseg1 `0x12000070` (DISPFB1), `0x80` (DISPLAY1), circuit-2 variants |
+| Callers | `0x103B88` (boot), **`0x1F1D84` / `0x1F1DA0`** inside **`0x1F1CE8`** VBlank ISR |
+| Env base | `lw s0, -24124(gp)` then `PutDispEnv(s0+848)` / bank select; also **direct** `sd` of env slots 816/832/928/944 → `0x12000070` |
+
+DISPFB register writes **do fire** (VBlank path live post-S191). Values come from the **display-env object** still carrying FBP=0 (prior S77/S79: env `0x6754C0` family never retargeted). Flip is not "PutDispEnv never called" — it is "**env DISPFB fields never updated to FRAME FBP**."
+
+### Next cut (no Core)
+1. **Live (Claude when free, or Grok if tooling):** watch last writers of env DISPFB fields (offsets used at 816/832/928/944 from base at gp-24124) after scene-delta ~50M; count `0x1029B0` hits vs env field stores.
+2. **Static:** who stores into those env slots (not CSR) — retarget setter `0x424C40` family was 0 hits historically (S79); re-check post-S191 reachability from mode SM.
+3. Standing: modestate 7 / `0x1322B0` may still gate retarget — census mode-state at 50M if easy.
+
+```text
+S192: Class-A post-S191 census — FRAME FBP=0x46 draws real px (18M/50M) but DISPFB1=0
+      DISPFB2=0x51400 present black. PutDispEnv/VBlank path live; env object still
+      supplies FBP=0. Next: env-field writers + retarget setter reachability. No invent-DISPFB.
+```
+
