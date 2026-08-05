@@ -8596,3 +8596,62 @@ S183: Bounded the transition to a specific, already-known 50,000-cycle window: t
       logic, ei at 0x1F2558, jal 0x1F1778 at 0x1F25FC) is the natural place to keep looking --
       static call-graph tracing through 0x1F1778 and the buffer-swap body is the next step.
 ```
+
+## 184. STATIC — queue DI-exit path: no direct edge to 0x223130; two `jalr v0` dispatches (Grok)
+
+Claude S183-live: transition bounded to DI window after EPC@0x1F2520; no KernelHle restore; ask trace 0x1F1778 / buffer-swap forward.
+
+### Queue loop structure (0x1F24E0+)
+```
+0x1F24E0  loop head (gp queue ptrs)
+0x1F2504  lw   v0, -28312(gp)     ; callback slot
+0x1F2508  beq  v0, zero, skip
+0x1F2510  jalr ra, v0             ; *** INDIRECT #1 ***
+0x1F2518  bne  s0, zero, loop
+0x1F2520  di + spin on Status     ; Claude's EPC@41.95M
+0x1F253C  buffer-swap (table via s1, gp heads)
+0x1F2558  ei
+0x1F25D8  jal  0x10C858           ; cache/sync helper only (no path to 0x223xxx)
+0x1F25E0  di + spin again
+0x1F25FC  jal  0x1F1778           ; a0 = -1
+0x1F2604  ei
+0x1F2614  ld ra / jr ra           ; return from queue-loop frame
+```
+
+### 0x1F1778 (frame 288) — command switch on queue packet
+- `a1 = *(gp-24120)` queue head
+- `cmd = *(u8*)a1` (low byte of word0)
+- **cmd == 79 (0x4F)** → `0x1F1C2C`:
+  ```
+  0x1F1C30  lw   v0, 4(a1)        ; *** fn ptr from packet word1 ***
+  0x1F1C48  jalr ra, v0           ; *** INDIRECT #2 ***
+  0x1F1C4C  sq   t9, 112(sp)
+  ```
+- Other cmds (1,2,33,64,65,67,127,…) do DMA/reg side effects; **no direct `jal 0x223130`**
+- Function ends `ld ra,128(sp); jr ra; addiu sp,+288` — normal return to 0x1F2604
+
+### BFS (direct jals only, depth 6 from seeds)
+- **0 hits** into `0x223000-0x226000`
+- Explored nodes only include queue helpers + 0x10C858 — never the four static callers of 0x223130
+
+### Implication
+The only *plausible* static edges from this DI window into arbitrary code are the two **`jalr v0`** sites:
+1. **`0x1F2510`** — `v0 = *(gp-28312)` (global callback)
+2. **`0x1F1C48`** — `v0 = *(a1+4)` when queue cmd **== 79**
+
+If either holds `0x223200`/`0x223228` (or any mid-body addr), that is the mid-entry with **no prologue**.
+
+### Note on self-ref `ra==pc`
+A true `jalr` to 0x223228 would set **`ra = link`** (`0x1F2518` or `0x1F1C50`), not `ra = target`. If first-hit really has `ra==pc`, either:
+- arrival was **`jr`** not jalr, or dump is mid-body after ra was clobbered, or
+- first observed PC in-band is not the jalr landing instruction.
+
+**Live should re-check `ra` at the *jalr delay slot* or first instruction after transfer, and dump `v0` / `a1` / `*(a1+4)`.**
+
+```text
+S184: Queue DI-exit has no direct jal to 0x223130. Two jalr v0 sites can jump anywhere:
+      (1) 0x1F2510 via *(gp-28312); (2) 0x1F1C48 via *(queue_pkt+4) when cmd==79.
+      0x10C858 is cache-only. Next live: in the 50k window, does 0x1F1C48 or 0x1F2510
+      fire with v0 in 0x2232xx? Dump v0, a1, pkt[0]/pkt[1], and post-jalr ra (expect link).
+```
+
