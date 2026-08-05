@@ -879,3 +879,56 @@ Soft-GS RR mix
   PATH3 drained; still black present (DISPFB page0 vs FRAME 0x46)
   noise band = thin survivors of reject storm, not full FB scene
 ```
+
+---
+
+## 20. Noise-band structure: isolated single-pixel survivors, not coherent fills (Claude)
+
+Took the handed-off structural question. Temp analysis (`Tests/TempNoiseAnalyze.cs`, gated,
+fully reverted — `git status` clean) reading the already-dumped `b3-page46-rr.ppm` directly,
+no new run needed.
+
+### 20.1 Result
+
+- **Nonzero row range: [117, 128]** — an 11-row band out of 448 (~2.5% of frame height),
+  matching the visual location exactly.
+- **5,734 same-color runs, 6,283 total nonzero pixels, average run length 1.10.**
+  Run-length histogram: **5,402 of 5,734 runs (94%) are a single isolated pixel** — only 231
+  runs of length 2, dropping off fast (59 of length 4, 26 of length 3, a handful longer).
+
+### 20.2 Interpretation
+
+An average run length of 1.10 is **not** what coherent triangle rasterization looks like,
+even a mostly-successful one — real scanline-coherent fills produce runs of many adjacent
+pixels sharing a triangle's interpolated color. What this pattern **does** match, combined
+with Grok's §19 finding (`rejDepth` ≈ 69% of all fragment tests): **many overlapping/
+z-fighting triangles competing for the same thin band of screen space**, where the depth
+test's per-pixel winner effectively looks random at this scale — a real, if currently
+degenerate, rendering outcome, not a memory-format misread. Confined to an 11-row band out
+of 448 is consistent with (not proof of) a camera/projection setup that hasn't reached its
+real final state yet, collapsing 3D geometry into a near-flat sliver.
+
+### 20.3 Still not established
+
+Whether this specific hypothesis (badly-conditioned/incomplete camera transform) is correct,
+versus some other explanation for why real geometry commands land in such a narrow vertical
+band. Would need real vertex/transform data inspection (VU1 output, not just fragment
+counts) to confirm — a further step, not attempted here.
+
+### 20.4 Combined conclusion (with §19)
+
+Real command flood (PRIM/XYZ2) + heavy depth-reject + isolated-pixel survivor pattern in a
+narrow band, together, are consistent with **real but incomplete/degenerate rendering**
+(most likely a transform/projection issue collapsing geometry into a thin strip) rather than
+either "finished frame" or "reading unrelated memory as pixels." Not proposing any Core
+change — this needs real transform-data inspection before any fix hypothesis, and is squarely
+still "no Core until dual-ACK on a design," same as every other B3 finding tonight.
+
+```text
+Noise-band structure (Claude)
+  rows [117,128] only (11 of 448) -- matches visual band location exactly
+  94% of runs are single isolated pixels, avg run length 1.10
+  NOT coherent triangle fills -- consistent with many z-fighting triangles in a thin band
+  combined with rejDepth~69% (Grok): real but incomplete/degenerate rendering, not garbage memory
+  open: is this a collapsed/incomplete camera transform -- needs real vertex data, not attempted
+```
