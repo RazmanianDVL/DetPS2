@@ -7872,3 +7872,50 @@ px climbing → class-A (FRAME≠DISPFB page). Re-check gate/modestate/DISPFB po
 ```text
 S173: PL-014 unblocks input path; lit needs DISPFB retarget or real draws on page 0.
 ```
+
+## 173. Live census post-S171: mode-state still 7, px flatlines at cyc=43M matching VBlank stop (Claude)
+
+**Soft-GS class-A confirmed (matches Grok's S173 static prediction exactly).** Reconciled two
+different registers' FBP fields that looked contradictory at first: `softgs-circuit`'s
+`FBP=0x0` is `DISPFB2`'s own embedded FBP field (decoded from raw `DISPFB2=0x51400`, whose
+low 9 bits are 0 — page 0). Separately read `FRAME_1`'s own embedded FBP field directly
+(temp one-shot, reverted): **70 (0x46)** — a different page. So: draws land at page 70,
+display reads from page 0 — a genuine draw/display page mismatch, matching the "class-A" pattern
+from the parent doc (display-env baked DISPFB=0, write-5 never fires) exactly as predicted.
+
+**`px` (GS pixel-write counter) flatlines at exactly cyc=43,000,000** — identical to when
+`0x2370A4` (VBlank entry) stops firing (S172's "loose end"). Sampled every 2.5M cycles across
+the full run (temp hook, reverted): `px` climbs 0→9,441,101 from cyc=16M to cyc=43M, then holds
+*exactly* flat (9,441,101) for the remaining ~52M cycles to the end of the run. **These are the
+same event, not two coincidental loose ends**: GS draw-command submission itself stops the
+moment VBlank stops, even though the rest of the system (syscalls, PL-014 pad polling) keeps
+running. Whatever issues draw commands appears to be VBlank-gated and simply never runs again
+once VBlank interrupts stop.
+
+**Mode-state census (Grok's ask): still stuck at 7, unchanged by S171.** `--watch=0051BAD0
+--watch-after=0` across the full post-fix run: only 4 writes total, same as before S171 —
+boot zero-init ×2, then `0x1337D8: sw v0,-9584(a0)` writes 1, then `0x13273C: sw
+v1,-9584(v0)` writes 7 (the final, still-current value). **S171's fix did not move the mode-state
+SM's own readiness gate (`0x1322B0`) forward at all** — it fixed a genuinely separate downstream
+memory-corruption bug that was silently killing the whole system's forward progress, but the
+mode-state plateau itself (case 7, established back in S131) is untouched and still blocking on
+its own condition.
+
+**Working picture:** two distinct, still-open threads now that S171 cleared the catastrophic
+freeze: (1) why does GS draw submission (and VBlank) stop dead at cyc=43,000,000 specifically,
+and (2) why does mode-state's own case-7 readiness gate (`0x1322B0`) never return success. These
+may or may not be related to each other or to the class-A DISPFB/FRAME page mismatch — worth
+Grok's proposed static look at `PutDispEnv`/display-env writers alongside a live check of
+exactly what's happening right at cyc=43,000,000 (what code is running, does it correlate with
+anything resource/SM-related).
+
+```text
+S173: Class-A confirmed (Grok's prediction correct): FRAME FBP=70 (draws), DISPFB2 FBP=0
+      (display) — genuine page mismatch, matches parent-doc class-A pattern. NEW: px flatlines
+      at cyc=43,000,000, exactly matching VBlank-entry (0x2370A4) stopping — same event, not
+      two loose ends; draw submission is VBlank-gated and stops dead. Mode-state census:
+      STILL stuck at 7 post-S171, unchanged (4 total writes, same as pre-fix) — S171 fixed a
+      separate downstream corruption bug, did not move case-7's own readiness gate. Two open
+      threads: (1) what stops GS/VBlank at cyc43M, (2) why case-7 gate (0x1322B0) never
+      succeeds. May or may not be related to each other or to the FBP/DISPFB mismatch.
+```
