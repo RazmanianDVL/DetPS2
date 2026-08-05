@@ -3690,6 +3690,15 @@ missing piece.** Everything in this document's G1/G2/G3 was about *unblocking a 
 backlog*, not about finding or arming the game's ongoing per-frame draw submission, which this
 whole night converges on being a separate, still-unlocated mechanism.
 
+**Triple-confirmed (Grok, seq0428, temp-only, canary `out/canaries/b3-requester/
+force-global-dma-50m.txt`, not committed to Core):** a combined probe — real `GLOBAL.TXD`
+bytes host-DMA'd into EE (not just credited), *plus* the direct `SetMskPath3(false)` unmask,
+*plus* the natural `FRONTEND.TXD` plant cascade (cdvd→6160) — still produces `lit=0
+mostlyBlack=1`, `gifPath1=0` (no VU1/Path1 activity), `interactive=False`/`scene=False` in the
+PL-014 scene-delta fingerprint. Even the maximal combination of everything G1/G2/G3 could give
+does not light the screen. This is the strongest form of the negative result: not just "one
+link missing," but "even simulating every fix in this thread landing at once isn't sufficient."
+
 ```text
 G3 answered (Claude) -- force-unmask A/B, independent of postTxd heuristic
   forced SetMskPath3(false) directly at cyc=16M when heldP3n=5 first observed
