@@ -7016,3 +7016,16 @@ S147: 0x51BA90 confirmed — exactly 2 writes total, both boot-time zero-inits, 
       event: whatever hangs inside the S146 advance-path suspects (0x2B7110/0x2223C0) could be
       exactly what halts the thread, explaining both "sw22 never reached" and "spin stops at 9."
 ```
+
+## 147–148. Unified hang possible; advance jals are non-blocking (Claude+Grok)
+
+**S147:** 0x51BA90 never written after boot (always 0). Mode-SM spin cannot exit via flag;
+9 calls then stop ⇒ thread stopped. Hyp: same event as advance non-completion.
+
+**S148:** 0x2B7110→0x2514C0 freelist only; 0x2223C0(id=4)→0x3E8BA0 trivial store.
+**No SleepThread/WaitSema on direct advance path.** Unified non-return still possible
+(bad +0x148 / fault / stuck copy). Live: midpoint census + climber thread PC at plateau.
+
+```text
+S148: advance jals non-blocking. Next: midpoints + climber PC; null +0x148?
+```
