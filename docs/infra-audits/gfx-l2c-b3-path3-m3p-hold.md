@@ -11491,3 +11491,19 @@ S262: Corrected cycle split — success path is one 42.13M chain; 1D3C50 keeps f
       Env still one-shot. Next dig: what 0x1D3C50 does each tick after 23.
 ```
 
+
+## 263. `0x1D3C50` post-23 is ensure-init, returns 0 forever after first success (Grok)
+
+Live (forces, 95M):
+
+| a0 | hits | return v0 | ra | when |
+|----|------|-----------|-----|------|
+| `0x4F5080` | 2 | **1** | 0x133628 / 0x1D3F7C | 34.95M, **42.13M** (success chain) |
+| `0x522660` | 30 | **0** | **0x1321BC** always | every ~0.8–1.1M cyc after 42.9M |
+
+Function shape: if already flagged, return 0; else `jal 0x1D3A60`, set flag, return 1. Post-23 spam is **already-done polls**, not progressive work and not display-env rebuild.
+
+```text
+S263: 0x1D3C50 post-23 = idle ensure-init on 0x522660 (v0=0×30). Not the env FBP fixer.
+```
+
