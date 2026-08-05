@@ -8235,3 +8235,50 @@ S179: PINNED — ld ra,160(sp) at 0x2243DC (branch delay slot) loads garbage (0x
       stack-relative store offset scribbles over the saved-ra slot. Next: watch sp+160's live
       address across this function's execution to catch the exact writing instruction.
 ```
+
+## 180. FOUND THE WRITER — a legitimate float store from an unrelated function collides with the saved-ra slot (Claude)
+
+`--watch=01FFFE40 --watch-after=41900000` (the exact corrupted stack address from S179) across
+the run up to the transition. Full access sequence right before the fatal read:
+
+```
+pc=0x00222274 WROTE 0x00000000  sq s0, 0(sp)        (a save, in one context)
+pc=0x002222C0 READ  0x00000000  lq s0, 0(sp)         (matching restore, same context — consistent)
+pc=0x0038912C WROTE 0x3C888889  swc1 f20, 0(sp)      (unrelated function, own local float store)
+pc=0x00389370 READ  0x3C888889  lwc1 f20, 0(sp)      (same function reads its own float back — consistent)
+pc=0x001F2508 READ  ...                              (queue-loop context)
+pc=0x002243DC READ  0x3C888889  ld ra, 160(sp)        <- THE FATAL READ (S179)
+```
+
+**The write that plants `0x3C888889` is `swc1 f20, 0(sp)` at `pc=0x0038912C`** — a completely
+different, distant function (`0x389xxx`, nowhere near the `0x223xxx`/`0x225xxx` trampoline/
+epilogue region from S178-179) storing what looks like a perfectly legitimate float value to
+what *it* believes is its own private local-variable slot at `sp+0`. Confirmed self-consistent:
+the same function reads its own float straight back a few instructions later with no issue.
+
+**This is not corruption inside any single function — it's a physical-address collision between
+two functions' stack frames that shouldn't overlap.** `0x389128`'s frame believes `sp+0` is its
+own scratch slot; the trampoline/epilogue at `0x2243DC` believes the *same physical byte range*
+(at a different point, different effective `sp`) is its own saved-`ra` slot at `sp+160`. Both
+uses are individually correct in isolation — the bug is that these two logically-unrelated stack
+regions are landing on the same physical bytes, meaning somewhere in this call chain a stack
+frame is smaller than it needs to be, or a call happens at a shallower depth than the code
+expects, letting a callee's locals stomp on a still-live caller's saved register.
+
+**This closes the live-tracing arc for now** (S159→S178): the whole chain — count-loop freeze
+(S165, fixed), then this session's newly-found cyc42M/43M black-screen blocker — bottoms out at
+a genuine stack-frame-overlap bug between two specific functions (`0x389128`'s float store vs.
+the `0x2243D8` trampoline's saved-ra slot at `+160`). Finding the actual fix (why these two
+frames overlap — an incorrectly-sized `addiu sp,-N` somewhere upstream, a missing frame in
+between, or a genuine reentrancy/recursion case that wasn't accounted for) is the natural next
+step, but the mechanism itself is now fully pinned end-to-end.
+
+```text
+S180: FOUND THE WRITER — swc1 f20,0(sp) at pc=0x0038912C (an unrelated, distant function) writes
+      the exact garbage value (0x3C888889) into the stack slot the trampoline at 0x2243DC later
+      reads as ra. Both uses are individually legitimate/self-consistent in isolation — this is
+      a genuine stack-frame overlap between two functions that shouldn't share this physical
+      address, not corruption within either function's own logic. Closes the live-trace arc:
+      full mechanism from count-loop freeze (S165) through this session's black-screen blocker
+      is now pinned end-to-end. Remaining: find why these two frames' stack depths collide.
+```
