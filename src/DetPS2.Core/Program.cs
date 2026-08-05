@@ -805,6 +805,24 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         // (black full-FB prims after IMAGE leave merge cache stale without this).
         _ = smSys.Gs.GetPresentSpan();
 
+        // GFX-L2b C5 (dual-ACK): sample final present FB only — no composite behavior change.
+        // residualDispfbPx counters can be mid-run; these fields are dump/Desktop truth.
+        int presentLit = 0, presentGray = 0, presentColor = 0;
+        int presentFbTotal;
+        {
+            var span = smSys.Gs.GetFramebufferSpan();
+            presentFbTotal = span.Length;
+            for (int i = 0; i < span.Length; i++)
+            {
+                uint p = span[i] & 0x00FFFFFFu;
+                if (p == 0) continue;
+                presentLit++;
+                byte r = (byte)(p >> 16), g = (byte)(p >> 8), b = (byte)p;
+                if (r == g && g == b) presentGray++;
+                else presentColor++;
+            }
+        }
+
         long px = smSys.Gs.PixelsWritten;
         long prims = smSys.Gs.PrimitivesDrawn;
         long imgBytes = smSys.Gs.ImageBytesWritten;
@@ -908,6 +926,13 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
             ["naturalDispfbPx"] = naturalDispfbPx,
             ["residualDispfbPx"] = residualDispfbPx,
             ["compositeSource"] = compositeSource,
+            ["presentLit"] = presentLit,
+            ["presentGray"] = presentGray,
+            ["presentColor"] = presentColor,
+            ["presentLitPct"] = presentFbTotal > 0
+                ? Math.Round(100.0 * presentLit / presentFbTotal, 3) : 0.0,
+            ["presentColorPct"] = presentFbTotal > 0
+                ? Math.Round(100.0 * presentColor / presentFbTotal, 3) : 0.0,
             ["expandHits"] = expandHits,
             ["gifCompleted"] = gifCompleted,
             ["gifAborted"] = gifAborted,
