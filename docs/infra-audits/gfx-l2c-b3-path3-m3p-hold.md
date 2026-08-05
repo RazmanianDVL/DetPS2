@@ -5982,3 +5982,15 @@ S114: All three "always fail" signatures (null name / empty list / dead grow) ru
       pool populated, grow function called 14x. Failure is deeper inside 0x2B6DA0 itself, or
       this pool is shared across callers and needs a phase-9-specific correlated sample next.
 ```
+
+
+---
+
+## 114–115. Phase9 name is sound\generic.awd; grow is freelist pop (Claude+Grok)
+
+S114: shared pool, name sound\generic.awd, list non-null, grow×14. S115: 0x2B6DA0
+returns 0 when `*(*(pool+52)+16)` freelist empty. Phase9 = claim audio name slot.
+
+```text
+S115: Fail B = freelist empty for sound\generic.awd pool claim
+```
