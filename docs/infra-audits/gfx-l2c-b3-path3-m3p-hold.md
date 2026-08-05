@@ -11937,6 +11937,23 @@ Confirms S258 at full post-readiness: **zero** retarget of env DISPFB after the 
 S275: 0x675820 after 14M — writes only 1FDFB8 plant; 60 PutDispEnv reads. No retarget.
 ```
 
+## 276. PutDispEnv only ever uses FBP0 display envs (Grok)
+
+`--pcbreak=1029B0` @80M forces, 80 hits:
+
+| a0 (env base) | hits | DISPFB @+0x10 |
+|---------------|------|----------------|
+| `0x675810` | **43** | `0x51400` |
+| `0x675838` | **36** | `0x51400` |
+| `0x6754C0` | 1 | `0x51400` |
+
+**Never** an env base whose FRAME slot is `0xA0046`. Present path exclusively rebinds the frozen page-0 display trio.
+
+```text
+S276: PutDispEnv a0 ∈ {0x675810,0x675838,0x6754C0} only — all DISPFB FBP0.
+      Draw-env FRAME 0x46 never selected for present.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
