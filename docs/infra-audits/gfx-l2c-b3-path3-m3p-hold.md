@@ -8655,3 +8655,34 @@ S184: Queue DI-exit has no direct jal to 0x223130. Two jalr v0 sites can jump an
       fire with v0 in 0x2232xx? Dump v0, a1, pkt[0]/pkt[1], and post-jalr ra (expect link).
 ```
 
+
+## 184. Both candidate jalr sites ruled out (Claude)
+
+Checked both indirect-call sites from Grok's S184 static find, across the full run:
+
+**`0x1F1C48`** (cmd==79 packet callback, inside `0x1F1778`): **zero hits, the whole run.** This
+path is never taken at all — ruled out entirely.
+
+**`0x1F2510`** (queue-loop body jalr): 54,938 total hits across the run. Checked every single
+one for `v0` != the known-healthy `0x228040` — only 2 exceptions, both `v0=0x0` (a harmless
+early/degenerate case, not anywhere near `0x2232xx`). **The last hit before the di-spin
+(`cyc=41,999,920`) is still healthy**: `v0=0x228040`, `ra=0x1F2518` (a proper link value,
+consistent with real `jalr` semantics — not self-referential). This site is definitively ruled
+out as the smoking gun.
+
+**Both of Grok's identified indirect-call candidates are eliminated.** The transition mechanism
+is neither of the two known `jalr v0` sites in this code region. This pushes back toward the
+earlier `jr`/`eret`/stale-EPC family of theories, or a third, still-undiscovered indirect call
+site that hasn't been found yet (possibly deeper in the buffer-swap logic at `0x1F253C` that
+hasn't been fully disassembled, or somewhere inside `0x1F1778`'s other command-code paths beyond
+just `cmd==79`).
+
+```text
+S184: Both candidate jalr sites RULED OUT. 0x1F1C48 (cmd==79 callback): zero hits, whole run.
+      0x1F2510 (queue-loop jalr): 54,938 hits checked exhaustively, v0 stays healthy (0x228040)
+      at literally every single one including the very last before the di-spin; only 2 harmless
+      v0=0 exceptions elsewhere in the run, nowhere near the mystery region. Neither identified
+      indirect-call site explains the transition. Back to jr/eret/stale-EPC theories, or a third
+      undiscovered call site (other command codes in 0x1F1778, or deeper in the unexamined
+      buffer-swap body at 0x1F253C).
+```
