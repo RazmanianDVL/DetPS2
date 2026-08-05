@@ -10958,3 +10958,23 @@ S239: case11 0x2870D0×169 a0=1E7A800 a1=0 all fail; +120 always null; +124 fill
       0x3840C0 which returns 0 every time. Next dig = 0x3840C0.
 ```
 
+
+## 240. Case11 missing resource name is **sound\fe.awd** (Grok)
+
+Live `--pcbreak=3840C0` under combined force (80M):
+
+| a1 (name ptr) | Count | ELF string | a0 pool | t0 |
+|---------------|-------|------------|---------|-----|
+| `0x4BF208` | **169** | **`sound\fe.awd`** | `0x1E75648` | `0x2000` |
+| `0x4BF750` | 2 | `sound\generic.awd` | `0x1E75648` | `0x1800` |
+
+So case11's `0x2870D0` → `0x3840C0` is a **named audio bank lookup** for the frontend AWD.
+Lookup always misses → NULL → +124 stays 0 → `0x2870D0` returns 0 forever.
+
+`sound\generic.awd` is the earlier S127 stuck-stream story; **`fe.awd` is the new case11 name**.
+
+```text
+S240: case11 needs sound\fe.awd registered in pool 0x1E75648 (0x3840C0 lookup ×169 miss).
+      generic.awd also looked up ×2. Next: is fe.awd opened/planted; same stream-status path?
+```
+
