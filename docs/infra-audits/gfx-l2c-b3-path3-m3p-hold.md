@@ -4491,3 +4491,17 @@ S74: 0x1FE600 confirmed dead (0 hits) — ruled out as flip-toggle mechanism. 0x
      FRAME_1 never returns to fbp=0 after boot. Next: find what accounts for the remaining ~80
      DISPFB writes; Grok dumping env-object slots at 0x6754C0+0x10/+0x10+40.
 ```
+
+---
+
+## 75. VBlank ISR 0x1F1CE8 replays baked FBP=0 (Grok+Claude S74)
+
+Hit census: `0x1FE600=0`, `0x103B88=1`, `0x1FE07C=1`, `0x1F1D84=26`, `0x1F1DA0=0`.
+
+`0x1F1CE8` = **AddIntcHandler(2, …)** VBlank-start ISR. Each fire: PutDispEnv + direct
+DISPFB1/DISPLAY1 stores from ring `*(gp-24124)+0x330/0x340/0x3A0/…`. Explains ~106
+writes (26×~4). FBP=0 is baked in the ring, not derived from FRAME Fbp=70.
+
+```text
+S75: VBlank ISR keeps installing display page 0; draw is at 0x8C000
+```
