@@ -11924,3 +11924,16 @@ S270b: Confirms S270's expectation exactly -- 0x1FD490 and 0x1E2D38 both fire on
       cyc=14,332,640, no second occurrence anywhere in 95M including post-readiness-23.
       Case 2 is a true one-shot; no natural re-dispatch to find.
 ```
+
+## 273. FRAME_1's FBP=0x46 is set at cycle 0 — disproves a timing-mismatch theory; the boot-time case-2 call passing zero args is the real gap, not late FBP availability (Claude)
+
+Traced every FBP-field change in `FRAME_1` across the full run (temp diagnostic on the register setter, reverted after). Result: **exactly one change, at `cyc=0`** — `0x100000 -> 0xA0046`, `FBP=0x46`. The real draw-target page has been known since the very first cycle of the run, roughly **14.3 million cycles before** case 2's one-shot flip-commit call even executes (cyc=14,332,640 per S270/270b).
+
+This rules out a "FBP wasn't known yet when case 2 ran" timing-mismatch explanation for S272's option 2. The data was available the whole time; the caller we've found (`0x227FB8 -> 0x1E2D10`, S270/272) simply never reads/passes it — it calls with `a1=a2=a3=0` regardless. So the gap isn't about *when* case 2 fires relative to FBP settling — it's that **the one caller we've found for case 2 never was the one meant to carry real FBP data**. Redirects S272's option 1 ("who should call 0x227ED0/0x290FC0 again") toward: is there a genuinely *different*, not-yet-found caller of the case-2 wrapper (`0x1E2D10`) that passes non-zero args, rather than expecting the existing one-shot call to somehow fire twice with different data.
+
+```text
+S273: FRAME_1 FBP=0x46 set at cyc=0 -- disproves timing-mismatch theory (S272 option 2 framing).
+      FBP data was available ~14.3M cycles before case 2's one-shot call, which still passes
+      all-zero args. Real gap: a different, real-data-carrying caller of 0x1E2D10 that we
+      haven't found yet -- not a "too early" problem, not a "call again later" problem.
+```
