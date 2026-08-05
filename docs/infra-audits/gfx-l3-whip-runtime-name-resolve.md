@@ -120,4 +120,18 @@ These are **ELF static** PT_LOAD strings, not RKV stream delivery. Reinforces: n
 
 `imgBytes=0` still; px only doubled clear (573440). **Through 100M, still no texture-shaped FILEIO.** Temp fully reverted after run.
 
-Next tooling: mid-stream ring watch (prove dest writes) or EE-side string scan for path **during** stream (not only at end); or script-interpreter PC once firstscreen 100% (producer progress issue).
+### 6.3 Mid-stream ring write prove (20M, temp, reverted)
+
+Immediately after each `FileRead` into EE ring `0x0045BC94`:
+
+| First chunk | head (LE words) | nonzero/256 |
+|-------------|-----------------|------------:|
+| `Code` @pos0 | `0930005A_09310065_…` | 104 |
+| `firstscreen` @pos0 | `447A0000_FFFF0012_…` | 151 |
+| `frontend` @pos0 | `FFFF0008_42340000_…` | 122 |
+
+Heads match offline RKV member dumps (path-to-bytes seat). **Delivery is real.** End-of-run ring zeros = consumer drained/overwrote the 4 KiB ring, not “never wrote.”
+
+Still: no texture-named FILEIO; streamed payload is whole title goefile/script members, not per-path pixel opens.
+
+**Next:** script-interpreter progress after more stream complete (when firstscreen 100%); or watch whether any GOE fno beyond stream-table ever requests a level-cell TOC name (`hubmain`, etc.).
