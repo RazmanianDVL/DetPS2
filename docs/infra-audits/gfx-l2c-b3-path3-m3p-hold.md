@@ -9591,3 +9591,37 @@ S198: Missing-ISO false zeros retracted. PutDispEnv+0x1F1CE8 active. Grok S192 c
       (local ISO) remains valid class-A: FRAME 0x46 / DISPFB page0. Resume env-field writers.
 ```
 
+
+## 198. Env-object quad dump at first PutDispEnv (real ISO) -- DISPFB fields are genuinely zero (Claude)
+
+Real data, using the restored local media config. Temp one-shot diagnostic (env-var gated,
+reverted+rebuilt after use) firing at the first `0x1029B0` (PutDispEnv) hit after cyc>=40M:
+
+```
+[B3-ENV] cyc=40000192 envBase=0x006754C0
+    +816 (0x006757F0): 0x00000000 0x00000000
+    +832 (0x00675800): 0x00000000 0x00000000
+    +848 (0x00675810): 0x00000066 0x00000000
+    +928 (0x00675860): 0x00000000 0x00000000
+    +944 (0x00675870): 0x00000000 0x00000000
+```
+
+Contemporaneous (same run): `FRAME_1=0xA0046` (FBP=0x46, matches established draw target),
+`DISPFB2=0x51400` (decodes to FBP=0/page 0, matches established present target).
+
+**All the requested env-object DISPFB-candidate fields (+816/832/928/944) are genuinely zero** —
+not a misread, not garbage, just zero. Only `+848` holds anything nonzero (`0x66`), which doesn't
+obviously correspond to FBP=0x46 or any DISPFB encoding directly (could be an unrelated field —
+PMODE-adjacent, a flag, or something else entirely; needs identification, not obviously the
+FBP-carrying slot). **This confirms class-A precisely as "the env object's DISPFB field(s) are
+never populated with the real draw-target page" — not a read/decode bug, a genuine
+never-written-correctly data problem in this specific object.**
+
+```text
+S198: Real env-object dump (restored media config) at first PutDispEnv (cyc=40,000,192,
+      envBase=0x6754C0): DISPFB-candidate quad fields (+816/832/928/944) are all genuinely
+      zero -- not misread, not garbage. Only +848 has a nonzero value (0x66), not an obvious
+      FBP match. Confirms class-A as "these fields are never written with the real page," not a
+      decode/read bug. Next: find the setter that SHOULD write FBP=0x46 (or similar) into one
+      of these slots, and why it never does.
+```
