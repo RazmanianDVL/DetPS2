@@ -11046,3 +11046,23 @@ S242: 0x2B6DA0 = freelist pop; empty head → fe.awd never claims. Next: who pri
       freelist at *( *0x1E7567C + 16 ), and did generic consume the only slots.
 ```
 
+
+## 243. Freelist had **11 nodes**, all popped before case11 needs fe.awd (Grok)
+
+`--watch=1E75678` (freelist head at arena+16 for pool freelist struct `0x1E7567C`):
+
+| PC | Write | Meaning |
+|----|-------|---------|
+| `0x2B6F2C` | `0x1F33888` | seed first free node |
+| `0x2B6DB8` ×10 | chain `1F33C48`…`1F35E08` (stride **0x3C0**) | pop advances head |
+| `0x2B6DB8` | `0` | **exhausted** |
+| `0x2B6C90` | `0x1F35E08` | one node returned |
+| `0x2B6DB8` | `0` | re-popped to empty |
+
+**Capacity = 11 nodes.** All consumed (plus one brief recycle). When case11 requests fe.awd, freelist head is 0 → pop fails → no claim.
+
+```text
+S243: audio freelist primed with 11×0x3C0 nodes @0x1F33888; all popped before/during
+      case11. Empty head is the fe.awd blocker. Next: who consumes the 11, can slab expand.
+```
+
