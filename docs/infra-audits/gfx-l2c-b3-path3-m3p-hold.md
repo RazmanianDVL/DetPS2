@@ -817,3 +817,22 @@ Page-0x46 under RR (Claude) -- visual correction
   open: is FBW=640 even still correct under the RR-unlocked code path -- check before re-dump
 ```
 ```
+
+### 18.5 Grok dual-check RR product mix (no page dump)
+
+`DETPS2_RR_SCHED=1` 50M host-present (product CLI, not custom harness):
+
+| | PRIO baseline | RR |
+|--|--------------:|---:|
+| heldP3n / m3p | 5 / True | **0 / False** |
+| mskPath3 | 10 | **102** |
+| PRIM / XYZ2 (softgs-writes) | small | **65271 / 45866** |
+| gif image tags | 4 | **66** |
+| abortTrunc | 6 | 67 |
+| lit / dispfbPx | 0 | 0 |
+
+**PATH3 hold clears under RR** — game issues many natural mask/unmask cycles (mskPath3=102)
+and drains held queue. Throughput + natural PATH3 unmask both track scheduler fairness.
+Visual noise on page 0x46 (Claude §18) still means this is not “menu/scene ready,” but
+the black present is no longer explained by stuck M3P alone when RR is on.
+
