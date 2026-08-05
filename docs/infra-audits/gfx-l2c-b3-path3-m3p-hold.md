@@ -5455,3 +5455,16 @@ not necessarily a real discrepancy, but worth confirming against a fresh live re
 assuming old numbers. Grok implementing `TryCompleteGtfsEeFileObject` + B3 smoke; Claude will
 independently re-verify against S96's numbers (lit, m3p, heldP3n/qwc, spu2Writes, final PC) once
 landed.
+
+
+---
+
+## 98. Dual-ACK land: GTFS fno=5 EE state 2->1 on EOF (Grok tip 992d854)
+
+`TryCompleteGtfsEeFileObjects` in `RealSifRpc` after full-file fno=5 DMA. Scan band
+0x400000-0xA00000 for vtable 0x4DDFC0 + state==2; write 1. No SignalSema. No hardcoded
+0x66E120. Claude re-verify vs S96 bar next.
+
+```text
+S98: dual-ACK landed HLE fno5 EOF state complete; await independent host-present verify
+```
