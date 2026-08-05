@@ -263,6 +263,8 @@ public sealed class SystemMemory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public byte Read8(ulong vaddr)
     {
+        if (WatchAddr.HasValue && CurrentCycleForWriterLog >= WatchAfterCycle && (vaddr & 0xFFFFFFFFUL) == WatchAddr.Value)
+            WatchHits.Add((CurrentPcForWatch, vaddr, 0, false));
         ulong paddr = TranslateAddress(vaddr);
 
         // Scratchpad uses uncached physical window; also accept kseg-style 0x70000000 before mask loses high bits
