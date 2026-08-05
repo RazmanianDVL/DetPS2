@@ -83,3 +83,22 @@ Whip runtime name->pixel (30M)
   path strings not resolved as separate loads in this window
   next: longer run / find-string on path in EE RAM / after more stream progress
 ```
+
+---
+
+## 6. Follow-up: EE RDRAM string search @ 30M (no temp)
+
+| Needle | Hits |
+|--------|------|
+| `levels/frontend/arrow` | **none** |
+| `objects/particle/textures/rutherford/smoke` | **none** |
+| `levels/commontextures/white` | **none** |
+| `goefile` | **2** — `0x00416070`, `0x0041F8F8` |
+| `symlist` | **none** |
+| `firstscreen` | **none** |
+| `frontend` | **2** — `0x0040F540`, `0x0041A778` |
+| Ring dump `0x0045BC94` (256 B) | **all zeros** at end of run |
+
+Interpretation: title path strings are **not retained** as live C-strings in RDRAM after 30M (ring is 4 KiB class and likely overwritten/consumed). `goefile`/`frontend` hits are sparse and may be ELF/static or partial stream residue — not a full resident firstscreen/frontend image. Reinforces: no active “texture name table → open → pixels” stage in this window.
+
+Next: `--find-writer` on the two `goefile` addresses; and/or 100M+ with WHIP-TEX re-instrument to catch any post-title FILEIO; and/or dump ring **during** stream (watch dest writes) rather than only at end.
