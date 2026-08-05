@@ -7673,3 +7673,15 @@ S167: CONFIRMED — 0x00B6D920 (+0xA0 of the broken resource) has ZERO prior EE 
       at all. Next: diff this resource's header shape against a successfully-processed one to
       find the real kind-discriminating field.
 ```
+
+## 167–168. ISO field real; sole advance path; layout/load suspect (Claude+Grok)
+
+**S167:** +0xA0=10 from ISO land (no EE writer). Slots 0x9C/A4 zero; +0x98 relocated OK.
+
+**S168:** Only case2 fills +0x148 for this SM; only advance calls 0x2B7110. No alternate
+"successful 0x2B7110 with +0xA0!=0" sample likely exists. Prefer wrong base/layout vs
+missing type gate. Possible Assist: skip unaligned/small rel — dual-ACK only.
+
+```text
+S168: unique path; 10 is ISO. Next: when 10 lands; compare other id=4; dual-ACK before Core.
+```
