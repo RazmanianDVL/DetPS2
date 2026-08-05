@@ -7464,3 +7464,46 @@ alone. MaybePreempt blocked during EXL. Next: dump *(sp+16) at prolog sd vs epil
 ```text
 S162: more cycles won't help; stack 16(sp) stomped 0x80000200→0x2370F8. Watch that slot.
 ```
+
+## 163. MAJOR NEW LEAD: `sp` itself is wildly different between the entry sample and the final stuck sample — `0x1FFFD30` (healthy, cyc≈72-73M) vs `0x478A6A6` (final, cyc≈95M), a ~41MB discrepancy. The stack pointer register itself looks corrupted, not just the saved-ra slot (Claude)
+
+Two live checks, both real `pcbreak` (no temp code):
+
+```
+Entry (0x2370A4, right after "sd ra,16(sp)"), multiple real hits cyc=72,000,000-73,000,000:
+  sp = 0x01FFFD30  (constant, sane, small stack-region address)
+  ra = 0x80000200  (CORRECT vector — dispatch sets this properly, every single entry sampled)
+
+Epilogue (0x23710C "ld ra,16(sp)" through 0x237114 "jr ra"), final real hits cyc≈94,999,920-984:
+  sp = 0x0478A6A6  /  0x0478A6C6  (wildly different — off by ~41,000,000 bytes from 0x1FFFD30)
+  ra = 0x002370F8  (still the same self-referential value from S161)
+```
+
+**`sp` at the final stuck point is not a plausible stack address relative to `0x1FFFD30` at
+all** — the difference is roughly 41 million bytes, far beyond any conceivable single-frame or
+even deep-recursion growth. Earlier entries into this exact same handler (sampled at cyc≈72-73M)
+show a perfectly healthy, small, constant `sp` and the *correct* `ra=0x80000200` every time —
+meaning **this handler ran correctly, repeatedly, for most of the run.** Only in the final stuck
+invocation does `sp` show this enormous, implausible value.
+
+**This reframes S161's "stack slot stomped" theory once more: it may not be specific to this
+handler's re-entrancy at all.** If `sp` itself has drifted/been corrupted to a garbage value by
+the time this final invocation runs, then `ld ra,16(sp)` would legitimately load *whatever
+happens to sit* at that bogus computed address — which could easily be `0x2370F8` by pure
+coincidence (stale data left over from an earlier, unrelated write to that same physical
+location) rather than evidence of a specific re-entrant stomp. **The real question shifts one
+level further upstream: what corrupts `sp` (or makes it appear corrupted) sometime between the
+last healthy invocation (~cyc 73M+) and the final stuck one (~cyc 95M)?** This could be a
+genuine wild-pointer/stack-corruption bug happening elsewhere in the game or emulator (a stray
+write through a bad pointer, a stack-depth/recursion issue, or a genuinely different kind of
+register-state corruption specific to how this particular interrupt got dispatched) that just
+happens to surface here, in the VBlank handler, as its next victim.
+
+```text
+S163: MAJOR — sp itself differs by ~41MB between a healthy early entry (0x1FFFD30, cyc~72-73M,
+      correct ra=0x80000200 every time) and the final stuck invocation (0x478A6A6/C6, cyc~95M).
+      This isn't necessarily a VBlank-handler-specific re-entrancy bug — sp may be genuinely
+      corrupted/garbage by the time this last invocation runs, and ra=0x2370F8 could just be
+      whatever stale data sits at that bogus address. Real question moves upstream: what
+      corrupts sp between the last known-healthy entry and the final stuck one?
+```
