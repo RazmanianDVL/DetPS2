@@ -484,3 +484,57 @@ B3 root-cause chain (Claude, deepest layer so far)
     remaining instructions for non-slot-0 wakes -- EE-side mechanism, not B3-specific
   next: find WakeupThread's C# HLE impl, check its interaction with ISR-return
 ```
+
+---
+
+## 13. Flag re-measure (Grok) — **refutes "slots 1–3 never written"**
+
+**Method:** product `--watch=4E2964 --watch-after=13000000 --cycles=35000000 --host-present`  
+Per-hit log includes **exact** `wvaddr` (not only word-aligned trigger). Full log: `out/canaries/b3-flag-remeasure/watch-flags-full.txt`.
+
+### 13.1 SET flag=1 from ISR PC `0x00237108` (delay-slot `sb`)
+
+| Vaddr (slot) | Count |
+|--------------|------:|
+| `0x004E2964` (0) | **71** |
+| `0x004E2965` (1) | **71** |
+| `0x004E2966` (2) | **71** |
+| `0x004E2967` (3) | **51** |
+
+**All four slots receive `sb 1` from the ISR.** pcbreak on delay slots remains unreliable (Claude §0287); `--watch` sees the stores.
+
+### 13.2 CLEAR flag=0 (waiter / init paths)
+
+| Vaddr | Count |
+|-------|------:|
+| `0x4E2964` | 49 |
+| `0x4E2965` | 16 |
+| `0x4E2966` | 15 |
+| `0x4E2967` | 53 |
+
+### 13.3 Correction to §12.5 / H1
+
+§12.5 claimed zero writes at `0x4E2965/66/67`. **That is false under full watch dump.**  
+Hypothesis "WakeupThread abandons ISR before flag store for slots 1–3" is **refuted**: store runs for all slots (with s0=3 slightly less often).
+
+Design note §6 H1/H2: H2 (watch attribution) was the right caution; H1 mid-ISR abandon is **out** for the flag-store symptom.
+
+### 13.4 What remains open for B3 black
+
+Flags **do** get set and cleared. 45k SleepThread is largely **legitimate VBlank wait thrash** (sleep → poll → sleep until next set), not a permanent zero-flag wedge for slots 1–3.
+
+Still open (unchanged from earlier):
+
+- DISPFB stuck at page 0 while FRAME draws 0x46 (honest black compositor)
+- PATH3 held (`m3p`, `heldP3qwc`) / flip never fires through 100M
+- Why draw px plateaus at 877187
+
+**ISR-Q3:** no Core for mid-ISR abandon — mechanism not confirmed; flag path works.
+
+```text
+Flag re-measure
+  0x237108 sets ALL four slots (71/71/71/51)
+  mid-ISR abandon for flag-store REFUTED
+  SleepThread thrash ≠ permanent zero-flag for slots 1-3
+  B3 black lead returns to DISPFB/PATH3 flip stall
+```

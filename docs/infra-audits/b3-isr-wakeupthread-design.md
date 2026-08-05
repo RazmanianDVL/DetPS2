@@ -145,3 +145,11 @@ B3 ISR×WakeupThread design
   Write8 watch ~3 alignment: cannot attribute flag slot alone
   next: re-measure flag stores + log s0 at 0x237108 — dual-ACK before Core
 ```
+
+---
+
+## 10. Re-measure result (Grok, 2026-08-05)
+
+`--watch=4E2964` full log: ISR `0x237108` sets **all four** flag bytes (71/71/71/51).  
+§12.5 "only slot 0" / mid-ISR abandon for flag-store: **REFUTED**.  
+ISR-Q3: **do not open Core** for abandon hypothesis. See finding doc §13.
