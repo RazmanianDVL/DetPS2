@@ -973,3 +973,95 @@ DISPFB write census RR 50M
   zero writes with fbp=0x46
   flip code path not reached (or not writing privileged DISPFB)
 ```
+
+---
+
+## 22. Flip-helper EE location + runtime PC census (Grok)
+
+**Method (no Core):** static disassembly of `out/SLUS_210.50` for GS privileged address
+construction + `blocker-trace --pcbreak=ADDR --cycles=30000000 --host-present` hit counts
+on tip **e529238** (S1 product, no RR). Temp instrumentation not required — product
+`--pcbreak` only. Canaries under `out/canaries/b3-flip-pc/` (gitignored).
+
+### 22.1 Static map
+
+| Site | VA | Role |
+|------|-----|------|
+| PutDispEnv-like | `0x001029B0` | **Sole** DISPFB2 writer path: `ld val, +0x10(env); sd val, DISPFB2`. Circuit1 writes DISPFB1. |
+| DISPFB2 `sd` | `0x00102A48` | Circuit-2 store (after mode check via global halfword at `0x00483F20+6`). |
+| Early put wrapper | `0x00103B68` | Init path; `jal PutDispEnv` then optional draw-env put. |
+| **Flip ISR** | `0x001F1CE8` | VBlank handler: gated PutDispEnv + optional DISPFB1 direct writes. |
+| Register ISR | `0x001F3C08` | `AddIntcHandler(cause=2 /*VBLANK_START*/, handler=0x001F1CE8, arg=0)` via syscall 16 stub `0x0010BB00`. Also registers DMAC handlers. |
+| Flip-ready **set** | `0x001F1BF4`, `0x001F1C0C` | `sb s6, gp-0xA15F` — only non-zero writers of the ISR gate flag. |
+| Flip-ready **clear** | `0x001F1D4C` | ISR clears `gp-0xA15F` immediately before PutDispEnv. |
+
+Call graph:
+
+```text
+AddIntcHandler(VBLANK_START) @ 0x1F3C08
+        |
+        v
+  ISR 0x1F1CE8  (every VBlank once registered)
+        |  if (gp-0xA15F != 0)  // flip-ready
+        |    clear flag; jal PutDispEnv(env*)
+        v
+  PutDispEnv 0x1029B0
+        |
+        v
+  DISPFB2 = env->dispfb   // observed always 0x51400 (fbp=0)
+```
+
+**Zero** other `lui 0x1200` + `ori 0x90` DISPFB2 builders in the ELF — all privileged
+display rebinds go through PutDispEnv.
+
+### 22.2 Runtime PC census (30M, host-present, S1 default)
+
+| PC | Hits | Notes |
+|----|------|-------|
+| `0x001F3C08` register | **1** | Handler installed once mid-boot. |
+| `0x001F1CE8` flip ISR | **48** | First hit cyc≈14.5M; all `ra=0x80000200` (kernel INTC return). a0=2 (VBLANK_START). |
+| `0x001F1BF4` set-flag A | **1** | |
+| `0x001F1C0C` set-flag B | **2** | |
+| `0x001029B0` PutDispEnv | **4** | ra: `0x1F1D8C`×3 (ISR), `0x103B90`×1 (early). |
+| `0x00102A48` DISPFB2 sd | **4** | **v0=0x51400 every time** (fbp=0, psm=0xA). Never fbp=0x46. |
+
+End-state (unchanged): `FRAME_1=0xA0046`, `DISPFB2=0x51400`, `px=877187`,
+`m3p=True heldP3qwc=2124`, present black.
+
+### 22.3 What this establishes
+
+1. **Flip machinery is live, not missing.** VBlank ISR is registered and fires (~48 times
+   in 30M). This is not an AddIntcHandler / VBlank-delivery gap for this handler.
+2. **PutDispEnv is heavily gated.** ISR runs 48× but only enters PutDispEnv 3× — exactly
+   matching the 3 flip-ready flag sets. 45/48 VBlanks find the flag already clear and skip.
+3. **When PutDispEnv does run, it re-programs page 0** (`0x51400`), never draw page `0x46`.
+   So even the few completed "flip" requests advertise the wrong (empty) display target.
+4. **Prior census ("never fbp=0x46") was correct** and is now explained: the only writer
+   exists, runs rarely, and always stores the init value.
+
+### 22.4 What this does NOT establish (open, no Core)
+
+- **Why flip-ready is set only 3×** — the set sites sit in a large path/completion handler
+  around `0x001F1Axx` (DMAC/GIF status polling flavor). Likely tied to draw-path completion
+  that rarely finishes under the PATH3 hold / plateau (same 877k px ceiling as pre-S1).
+- **Why env→DISPFB field stays 0x51400** — who *should* write `env+0x10` with fbp=0x46 (or
+  the double-buffer sibling) before setting flip-ready. Separate dig: stores into the live
+  env blobs seen at PutDispEnv a0 (`0x6754C0` / `0x675810` / `0x675838`).
+- **RR interaction** — under RR, geo + PATH3 drain improve but prior DISPFB census still
+  never fbp=0x46. Re-measure set-flag/PutDispEnv counts under `DETPS2_RR_SCHED=1` would
+  show whether more completions raise flip-ready without fixing the fbp field.
+
+### 22.5 Non-goals (still banned)
+
+- Inventing a synthetic DISPFB flip or present of page `0x46`.
+- Forcing flip-ready from assist without a dual-ACK'd design.
+
+```text
+Flip dig (Grok)
+  sole DISPFB2 writer = PutDispEnv 0x1029B0
+  VBlank ISR 0x1F1CE8 registered + fires (48/30M)
+  PutDispEnv only 4x (1 init + 3 gated); always stores 0x51400
+  gate = gp-0xA15F set only 3x at 0x1F1BF4/0x1F1C0C
+  next: who writes env.dispfb / why set-flag so rare (PATH3 plateau link?)
+  no Core
+```
