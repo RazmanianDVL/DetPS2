@@ -11536,3 +11536,61 @@ S265: All three S263 live asks answered negative/confirmatory -- a0 constant (de
       init flag is one-shot boolean not a climber, 0x1F4290 stub path never reached at all
       (gate flags never satisfied). Rules out this whole branch for env-rebuild.
 ```
+
+## 266. Static: `0x1D3A60` is a timer tick; main-loop real work is `0x28AE40`/`0x28AE80` + `0x213EB0` (Grok)
+
+Answering Claude S265's ask on `0x1D3A60` / `0x1320B0` gates. Pure static (ELF disasm after boot load). Agrees with S265: the `0x1321BC`→`1D3C50` spam is not the env-rebuild path.
+
+### 266.1 `0x1D3C50` / `0x1D3C10` / `0x1D3A60` / `0x1D3C90` — timer family, not display
+
+| PC | Role |
+|----|------|
+| `0x1D3C90` | **Timer reset**: zeros +0..+16, sets +24=+36=1, flag+40=0, float rate at +28 from `gp-24368` |
+| `0x1D3A60` | **Timer tick**: integer/float math on fields +0/+4/+8/+12/+16/+20/+24/+28/+32; compares vs `*(gp-24372)` timebase. No GS/env stores. |
+| `0x1D3C50` | **Ensure-start**: if `*(a0+40)==0` → `jal 0x1D3A60`; `sb 1,40(a0)`; else return (already running) |
+| `0x1D3C10` | **Ensure-stop**: if `*(a0+40)!=0` → `jal 0x1D3A60`; `sb 0,40(a0)`; else return |
+
+Post-23 `1D3C50` spam = "timer already started" polls. **Not** env FBP work. Closes this family for class-A.
+
+### 266.2 Main loop `0x132090` (s0 = caller a0)
+
+Prologue `0x132090`: `s0=a0`; early exit if `*(s0+0x3DA54) < 0`. Loop head `0x1320B0`:
+
+| Gate / path | Address / condition | Effect |
+|-------------|---------------------|--------|
+| Master flag | `lbu 0x4EB1E0` (`lui 0x4F; -20000`) | 0 → return (exit fn) |
+| Pair bytes | `*(s0+0x3DA65)` vs `*(s0+0x3DA66)` | mismatch → `0x1321D8` → **`jal 0x1F4290(a0=1\|2)`** — **never taken (S265)** |
+| Word chain | `*(s0+0x3DA58)`, `+0x3DA54`, `+0x3DA5C` vs `-1` | mismatch paths (below) |
+| Re-loop flags | `0x665E51` / `0x665E50` | either non-zero → re-enter `0x1320B0` |
+| Mode pick | `0x51BAD4` and `0x4EB1E0` both non-zero → `1D3C50` else `1D3C10` | post-23 always **start** path (matches live) |
+
+**Real-work side paths** (not the 1D3C50 tail):
+
+| Branch | Callees |
+|--------|---------|
+| `0x132218` (`*(s0+0x3DA58) != -1`) | `jal 0x1D3C10(0x522660)` then **`0x28AE80(a0=0x1E75640)`** then **`0x213EB0(s0+0x7080, a1=1)`** |
+| `0x132268` (paired words equal) | **`0x28AE40(a0=0x1E75640)`** then `0x213EB0(...,0)` then `1D3C50` |
+
+`0x28AE40` / `0x28AE80` are thin wrappers into `0x384EC0`/`0x384F00` + `0x42B4D0` on `a0+0x5250` (object `0x1E75640` family — same stream/frontend object as prior FORCE_STREAM work). `0x213EB0` toggles a sub-object flag via `0x214940` + `0x442510`.
+
+### 266.3 `0x1F4290` correction (still unreachable)
+
+Not a pure stub. Body is:
+
+```text
+0x1F4290: jr ra
+0x1F4294: sb a0, -28308(gp)   ; delay-slot store
+```
+
+With known B3 `gp=0x4E8670` → store target **`0x4E17DC`**. S265: never reached, so this flag never written from the main-loop mismatch path. Prior "jr ra stub" label was incomplete but **live impact remains zero**.
+
+### 266.4 Env-rebuild status
+
+Still **no** static path from this main-loop timer / stream-object toggle into env DISPFB (`0x675820` etc.). Env writers remain the one-shot init at `0x1FDFB8`/`0x1FE008` @14.3M (S258–S259). Class-A open item unchanged: **who should retarget env FBP to FRAME 0x46** is not this branch.
+
+```text
+S266: 1D3A60 = timer tick (not display). Main-loop real work = 28AE40/80(0x1E75640)
+      + 213EB0. 1F4290 = delay-slot store to 0x4E17DC (gp=0x4E8670), never reached.
+      Next live: do 0x132218 / 0x132268 / 0x28AE80 fire post-23? Watch 0x4EB1E0,
+      0x51BAD4, 0x665E50/51. Static next: who stores env DISPFB after init (not invent).
+```
