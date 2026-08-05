@@ -9410,3 +9410,25 @@ S194: CORRECT S192 — PutDispEnv and 0x1F1CE8 are ZERO hits post-S191. Alive VB
       not re-entered after boot, not bad env fields under active PutDispEnv.
 ```
 
+
+## 195. PutDispEnv never fires at all -- not boot-one-shot, literally zero (Claude)
+
+Checked the S194 ask #1 (confirm boot-one-shot) directly. **`0x1029B0` (PutDispEnv) shows zero
+hits at every checkpoint** — 1M, 5M, 10M, 20M, 30M, and (already established) the full 95M run.
+Not a boot-one-shot that then stops — it never executes at all, anywhere in the run.
+
+Given `DISPFB2` genuinely holds a real, non-zero, meaningful value (`0x51400`) at every census
+this session despite `PutDispEnv` never running even once, **the actual write establishing that
+value must come from a completely different mechanism** we haven't identified — most likely a
+direct MMIO/privileged-register write to the GS display-control address space during early boot/
+display setup, entirely bypassing this "PutDispEnv" subroutine. This reframes S194's picture
+again: it's not "PutDispEnv ran once at boot then stopped," it's "whatever sets DISPFB2 was never
+this function at all."
+
+```text
+S195: PutDispEnv (0x1029B0) has ZERO hits anywhere in the full run, checked incrementally from
+      1M cycles up -- not a boot-one-shot, never executes at all. DISPFB2's real observed value
+      (0x51400) must come from a different, not-yet-identified write path entirely (likely a
+      direct MMIO/privileged-register write during early setup, bypassing PutDispEnv). Need to
+      find the actual writer of DISPFB2's live value, since it isn't this function.
+```
