@@ -11376,3 +11376,22 @@ S254: 0x29F1E0 returns 0 (null/empty ctx); natural 16→256 never runs. Force no
 S256: post-23 DISPFB2=0x51400 but present FBP=0 SyntheticFbp0 lit=0. Display circuit next.
 ```
 
+
+## 257. DISPFB2=0x51400 is **FBP=0** (format only) — not a second page (Grok)
+
+Decode `DISPFB2=0x00051400`:
+| Field | Value |
+|-------|--------|
+| FBP | **0** (bytes 0x0) |
+| FBW | 10 × 64 = **640** |
+| PSM | **10** (PSMCT16S) |
+
+`FRAME_1=0xA0046` → FBP=**0x46**. Draw and display pages **still mismatch**: present correctly samples programmed DISPFB (FBP0), which is empty RGB → SyntheticFbp0 / lit=0. Residual from FRAME adds only ~1092 px.
+
+**Not invent-DISPFB.** Game wrote a real DISPFB2 after readiness 23, but left FBP at page 0 while drawing at 0x46. Next: who should set DISPFB FBP=FRAME FBP (flip / PutDispEnv after SM 23).
+
+```text
+S257: DISPFB2=0x51400 means FBP=0 FBW=640 PSM=10 — present FBP0 is correct decode;
+      draw still at FRAME FBP 0x46. Page mismatch remains the class-A lit wall.
+```
+
