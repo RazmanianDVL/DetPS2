@@ -1,6 +1,6 @@
 # Design — EE thread scheduler fair tie-break among equal-priority threads
 
-**Status:** **LANDED** `36a1ccb` (S1, dual-ACKed `702505c`/seq0339) — full fleet smoke green, permanent regression coverage added (`KernelHle_TiedPriorityFairRotation`)
+**Status:** **LANDED** `36a1ccb` (S1, dual-ACKed `702505c`/seq0339) — full fleet smoke green, permanent regression coverage added (`KernelHle_TiedPriorityFairRotation`). Post-land B3 re-check (S1 alone, no RR): `px=877187`, `m3p=True heldP3n=5 heldP3qwc=2124` — **identical to the pre-fix baseline**. Confirms the fix is precisely scoped: it does not grant RR's "ignore priority entirely" throughput boost, only fixes fairness among genuinely tied threads — tid1's real dominance (priority=1) is untouched, exactly as predicted. RR's much larger effect (§17) came from ignoring priority altogether, not from tie-break fairness alone.
 **Date:** 2026-08-05
 **Discovered via:** Burnout 3 (SLUS_210.44) B3 L2c investigation chain (`gfx-l2c-b3-path3-m3p-hold.md` §14, §17)
 **Scope:** `KernelHle.cs`'s `FindNextRunnable` — general EE cooperative scheduler, not B3-specific
