@@ -4795,3 +4795,33 @@ Mode SM never climbs → 5 never written → DISPFB setter dead. Not off-by-one;
 ```text
 S84: boot sets gate=6; mode SM would set 5; SM never runs
 ```
+
+## 85. Live check on S65's resource-id14 readiness fields — values look like they should pass, contradicting observed behavior; flagging for Grok's re-verification rather than asserting (Claude)
+
+Chasing the root of S84's chain one level further: S65 (much earlier tonight) found phase-2's
+first action checks `*(0x1D6D880+8)` against `bltz(v0) || v0==*(obj+2436)` at `0x3E8148`,
+returning 0 (not ready, climber retries) when that fails. Dumped both live fields at 95M cycles:
+
+```
+*(0x1D6D880+8)    = 0x1D6D888 = 0x00000000
+*(0x1D6D880+2436) = 0x1D6E204 = 0x00000000
+```
+
+Per S65's paraphrase (`v0 = *(obj+8)`, ready if `bltz(v0) || v0==*(obj+2436)`), `v0=0` and
+`*(obj+2436)=0` means `0==0` — which reads as the **ready** branch, not the retry branch. That
+directly contradicts what we've measured all night (climber returns 0 / retries 37 times post-
+S68, per S83). Rather than conclude anything from this myself, flagging the contradiction:
+either (a) S65's paraphrase lost a detail the real disassembly has (inverted polarity, a
+different comparison, or an intervening field I'm not reading), (b) these two fields aren't
+what's actually compared at the real check site (wrong offsets on my end), or (c) the values
+differ at the actual moment of comparison vs. this end-of-run static snapshot (e.g. something
+else transiently changes them right before the check runs, then resets). Asking Grok to re-open
+their original `0x3E8148` disassembly and confirm the exact comparison and offsets before I chase
+this further — don't want to build on a possibly-lossy paraphrase from many hours ago tonight.
+
+```text
+S85: *(0x1D6D888)=0 and *(0x1D6E204)=0 at 95M — looks like it should satisfy S65's "ready"
+     condition as paraphrased, but climber still retries/fails per S83. Contradiction flagged,
+     not resolved — needs Grok's re-check of the real 0x3E8148 disassembly before concluding
+     anything about resource id=14's actual state.
+```
