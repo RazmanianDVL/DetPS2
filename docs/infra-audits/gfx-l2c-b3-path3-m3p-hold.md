@@ -11611,3 +11611,50 @@ Forces `FORCE_STREAM_PUMP` + `FORCE_AWD_NODE_STATE`, `--cycles=80000000 --pcbrea
 S266b: 0x132218..0x132270 zero hits @80M forces — 28AE real-work never arms.
        Next: watch s0+0x3DA54 at 0x132090 entry (why always <0 / never leaves -1?).
 ```
+
+## 266c. Absolute gate map: s0=`0x4EE040`; all ELF writers of +0x2DA54/58/5C store **-1** only (Grok)
+
+### Object base
+
+Known modestate `0x51BAD0` = `s0 + 0x2DA90` (imm path: `lui 0x3; sw/lw -9584` → +0x2DA90).  
+⇒ **`s0 = 0x4EE040`**.
+
+| Field (s0+off) | Absolute | Role in `0x132090` |
+|----------------|----------|---------------------|
+| +0x2DA54 | **`0x51BA94`** | entry `bltz` → timer-only if &lt;0; real-work needs ≥0 |
+| +0x2DA58 | **`0x51BA98`** | must be ≠-1 to take `0x132218` → `0x28AE80` |
+| +0x2DA5C | **`0x51BA9C`** | paired with +54 for `0x132268` → `0x28AE40` |
+| +0x2DA64 | **`0x51BAA4`** | readiness byte from `0x19A950` |
+| +0x2DA8C / +0x2DA90 | `0x51BACC` / **`0x51BAD0`** | mode-state cells (case4 writes **5** here) |
+
+Sole ELF caller of `0x132090`: **`0x132D14`** inside case4 path `0x132C80` (after `0x19A950(0x522660)` readiness and state=5 plant).
+
+### Writer census (ELF text scan, `sw` imm DA54/DA58/DA5C)
+
+Every store site writes **`a?= -1`** (init/clear at `0x132894`, `0x132980`, `0x132B4C`, `0x1336E8`, `0x1341E0`, and loop clears at `0x13213C`/`0x132258`).  
+The only non-literal is `0x13222C` which **copies** `*(+0x2DA58) → *(+0x2DA54)` — but +58 is only ever written as -1 in ELF.
+
+**Structural read:** real-work branches require +0x2DA58 ≠ -1, yet **no ELF store plants a non-(-1) value**. Either a non-imm writer exists (block copy / different base) or the 28AE arm is **dead under retail code** and the live path is intentionally timer-only after readiness.
+
+```text
+S266c: s0=0x4EE040; gates 0x51BA94/98/9C; all ELF sw to them are -1 only.
+       28AE path needs non-(-1) at 0x51BA98 — no ELF producer found.
+       Live: --watch=51BA94 (and 51BA98) for any non-(-1) surprise.
+```
+
+### 266c live confirm (`--watch=51BA94`, 80M forces)
+
+286 accesses. **Writes only:**
+
+| PC | Value |
+|----|-------|
+| boot `sq` | `0` |
+| `0x1341E0` | **`0xFFFFFFFF`** |
+| `0x1336E8` | **`0xFFFFFFFF`** |
+
+No non-(-1) productive plant. Entry `0x1320A4` always sees -1 → bltz timer tail; loop re-entry via `0x1321BC→0x1320B0` then `0x132104` also sees -1 → return. **28AE arm confirmed unreachable on this run.**
+
+```text
+S266c-live: 0x51BA94 write set = {0, -1} only @80M. Real-work dead. Leave main-loop;
+            env FBP retarget remains the class-A open (not invent-DISPFB).
+```
