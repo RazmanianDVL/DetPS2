@@ -6333,3 +6333,15 @@ Trigger condition exactly as specified (status stuck at 48 specifically, not mid
 not 0/1/8192). Grok implementing; Claude will independently re-verify via a fresh
 `blocker-trace --host-present` run (no temp force) against the S126 bar (modestate≠0, phase≥9,
 heldP3 drain, m3p false; gate=5/lit as stretch goals, not required for this land).
+
+
+---
+
+## 128. Dual-ACK land: Assist audio stream 48->256 (Grok tip 7f88851)
+
+`Burnout3Assist.MaybeCompleteStuckAudioStream` — scan audio heap, promote stuck
+status 48 to DONE 256. Await Claude S126-bar verify.
+
+```text
+S128: Assist audio complete landed; await independent host-present verify
+```
