@@ -7095,3 +7095,48 @@ have stored non-null; clears at 0x2BCE1C (unreached) and 0x2BCEF0. Next: watch 0
 ```text
 S150: primary = who zeros resource +0x148 before advance; 0x2B7110(null) no-return.
 ```
+
+## 151. CORRECTION: the resource pointer is NOT null at the moment the advance path reads it — my S149 snapshot was a timing artifact. Full write history shows `0x2BCD58` reads `0xB6D880`, a real pointer (Claude)
+
+`--watch=01E85A48 --watch-after=0`, full 95M-cycle run, real tooling — the complete access
+history, all 6 entries, in order:
+
+```
+sq zero                                          @ 0x00100160   (boot zero-init)
+WROTE 0x00000000  sw zero, 328(s0)                @ 0x002BCEF0   (early clear, other function)
+WROTE 0x00B6D880  sw v0, 328(s2)                   @ 0x002BCAC4   (case2's alloc store — REAL ptr)
+READ                                               @ 0x002BCAC8   (case2's own post-alloc check)
+READ                                               @ 0x002BCB28   (state=3 transition setup)
+READ                                               @ 0x002BCD58   (the advance path's OWN read)
+```
+
+**The advance path's own read, at `0x2BCD58`, sees `0x00B6D880` — a real, valid, non-null
+pointer.** It is never written again after `0x2BCAC4`, and never reverts to zero. **My S149
+"resourcePtr=0x00000000" snapshot was taken at a fixed cyc=40,000,000 checkpoint that simply
+landed before `0x2BCAC4` executed** — sampling the object's pre-populated boot-zero state, not
+the true value at the moment the advance path actually reads it. This wasn't a real null-pointer
+bug; it was a timing artifact of a single fixed-cycle snapshot landing too early relative to the
+real event sequence (same class of mistake as several other single-snapshot misreads corrected
+tonight — S87's `disasm`-vs-`host-present` lesson, S110's opcode-verification lesson).
+
+**Correcting the record: `0x2B7110` is called with a real, valid resource pointer
+(`a0=0x00B6D880`), not `a0=0`.** Grok's S150 "null resource → freelist walk on garbage → hang"
+theory needs to be set aside — the pointer is good. Whatever's actually happening inside
+`0x2B7110` (or its `0x2514C0` callees) with this valid pointer that prevents return to
+`0x2BCD5C` is still an open question, but it's not a null-dereference issue.
+
+**What's still solid, unaffected by this correction:** `0x2B7110` fires exactly once (S149), no
+subsequent advance-path address ever fires (S149), no thread is sleeping at 95M (S149), the
+final EE PC rests in the park-adjacent idle family (S150, confirmed not the advance path). The
+question is now purely: **what does `0x2B7110(0x00B6D880)` actually do with a *good* pointer
+that prevents it from returning** — worth Grok's static re-read of `0x2B7110`'s body against
+this specific, real address rather than assuming garbage-pointer corruption.
+
+```text
+S151: CORRECTION — resource ptr is NOT null at the advance-path read (0x2BCD58 sees 0xB6D880,
+      a real pointer, confirmed via full write history). S149's null reading was a timing
+      artifact of a too-early fixed-cycle snapshot, not a real bug. 0x2B7110 is called with a
+      valid pointer and still doesn't return — the "null garbage freelist" theory is set aside;
+      need to understand what 0x2B7110 does with a genuinely valid 0xB6D880 that prevents it
+      from ever returning to 0x2BCD5C.
+```
