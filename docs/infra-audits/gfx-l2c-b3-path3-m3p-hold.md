@@ -5278,3 +5278,19 @@ S92: G1 status update — 0x1D3280 fires 1x now (was 0x historically), state 0->
      (0x4DDFC8) — confirms Grok's hypothesis. Next: what 0x1D3280 kicks off and what's supposed
      to credit its completion (same shape as S49-51's DMA-credit class of bug).
 ```
+
+
+---
+
+## 93. G1 reframed: fno=5 fires once; state stuck at 2; completion is 0x1D2F50 (Grok+Claude S92)
+
+Post-S68: `0x1D3280` ×1 (not 0). Object `0x66E120` vtable **`0x4DDFC0`** (GTFS base−8).
+State: 0→1 (open)→2 (inside fno5 at `0x1D342C/3590`) and **stays 2** for all loader polls.
+
+Wrapper is not smart: +8=open, +0x10=fno5, +0x24=get-state. Completion callback
+**`0x1D2F50`**: `sw 1,24(obj)` + `SignalSema(obj+44)`. If never invoked, phase3 flag never
+sets. HLE has `TryGtfsFno5Dma` + end_function queue — live check whether end_function runs.
+
+```text
+S93: fno5 dispatches; state=2 forever; root = missing completion (0x1D2F50 / end_function)
+```
