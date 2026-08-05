@@ -1931,3 +1931,30 @@ ISR 0x1F1CE8: entered 48x; only flip+DMA-drain
 post-setup both drains are no-ops (no flip-ready, empty queue)
 VU1/Path1 submit is elsewhere — not an ISR-internal gate we missed
 ```
+
+---
+
+## 32. CDVD/streaming state 15–50M (Grok)
+
+`scoreboard-metrics` product path, host-present:
+
+| cycles | cdvdSectors | sifBytes | px | gifP3 | syscalls |
+|--------|-------------|----------|-----|-------|----------|
+| 15M | **0** | 1,920 | 286,720 | 2 | 424 |
+| 20M | **425** | 33,660 | **877,187** | **20** | 42,461 |
+| 30M | **1,865** | **36,372** | 877,187 | 20 | 85,160 |
+| 50M | **1,865** | **36,372** | 877,187 | 20 | **918,536** |
+
+### Reading
+
+1. **Disc is not frozen at setup.** Sectors 0→425→1865 across 15–30M — real streaming continues **after** the GS/DMA setup cliff (~15.75M).
+2. **By 30M disc and SIF both go idle** (byte-identical at 50M). Not “blocked forever on pending CDVD.”
+3. **EE keeps thrashing** (syscalls 85k→918k with no new I/O or GS) — alive but not loading and not drawing.
+4. So post-30M black is **not** explained by unfinished disc streaming. 15–30M may still be load/attract with progressive sector reads; after that, no I/O and no GS.
+
+```text
+CDVD: streams 15-30M then idle
+SIF: same
+EE: spins without I/O or GS after 30M
+not blocked on disc after 30M; may still be pre-gameplay state earlier
+```
