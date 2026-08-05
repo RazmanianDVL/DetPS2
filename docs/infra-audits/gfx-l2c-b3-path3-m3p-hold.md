@@ -3890,3 +3890,32 @@ mode common-thread (Grok S59 / seq0448)
   class A (linked-never-reached) shares mode entry; class B (pure unlinked) still open
   next: state==5 producer + whether request/commit ever hit
 ```
+
+### 59.6 Both discrepancies resolved by Claude (seq0449/0450)
+
+**Identity immediate confirmed correct, no address slip:** re-disassembled `0x223214-0x223224`
+directly and hand-computed `0x520000 + (-22872)` = **`0x51A6A8`**, not `0x51A688` as §59's
+correction stated (a small arithmetic slip in that message, easy to make this late — not a real
+code-level discrepancy). The identity check at `0x223224` compares `current` against exactly
+`0x51A6A8`, the *same* object every one of the 19 live mode-request call sites targets. The
+whole causal chain is coherent end to end, no address ambiguity left: `request(0x51A6A8)` →
+stage pending → commit pump → `current` should become `0x51A6A8` → identity check matches →
+real `cop2`/VU0 work at `0x2243E0` runs. Currently broken at "state never reaches 5."
+
+**Pending pointer watched across the full 90M-cycle run:** exactly 3 accesses, ever — boot
+zero-init, one syscall-context read, and the sibling boot-time re-zero (`0x133EC4`, right next
+to `0x133EBC`, same mega-init function `0x133BB0`). **Never assigned to anything — not
+`0x51A6A8`, not any other mode object, not once.** This is a *total* confirmation, not a
+partial one: the mode-request API doesn't just fail for this specific request, it never
+successfully stages *any* pending transition for *any* mode across the entire run. Directly
+confirms §59's "state never reaches 5" hypothesis with hard evidence rather than inference.
+
+```text
+discrepancies resolved (Claude, seq0449/0450)
+  identity imm at 0x223224 = 0x51A6A8 confirmed (hand-computed 0x520000-22872) -- matches
+    every live mode-request target exactly, no address slip, chain is fully coherent
+  pending pointer (0x51BA8C) watched full 90M cycles: NEVER assigned, any value, ever --
+    total confirmation that state==5 never happens, not a partial/intermittent failure
+  remaining question, precisely scoped: who should write state=5, and why doesn't it
+```
+```
