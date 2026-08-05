@@ -6407,3 +6407,41 @@ write gate 5 (`0x30D8DC`) for DISPFB retarget / lit.
 ```text
 S130: two dual-ACK lands verified; next thread gate=5 via mode SM cases
 ```
+
+## 131. Mode-state plateaus at 7, permanently — reaches this value by cyc=40M and never moves again through 94M; write-5 and DISPFB-gate sites are both zero-hit (Claude)
+
+Live half of the split: mode-state/phase/gate time series (40M-94M) + hit-census on
+`0x30D8DC` (write-5) and `0x424C40` (DISPFB gate). Temp code reverted after use (`git diff
+--stat` 21 insertions across 2 files, `git checkout --`, clean, rebuilt to resync binary).
+
+```
+cyc=40,000,000: modestate=7  phase=23 (0x17)  gate=6
+cyc=50,000,000: modestate=7  phase=23          gate=6
+cyc=60,000,000: modestate=7  phase=23          gate=6
+cyc=70,000,000: modestate=7  phase=23          gate=6
+cyc=80,000,000: modestate=7  phase=23          gate=6
+cyc=90,000,000: modestate=7  phase=23          gate=6
+cyc=94,000,000: modestate=7  phase=23          gate=6
+
+pc-census: 0x0030D8DC (write-5) x0    0x00424C40 (DISPFB gate) x0
+```
+
+**Mode-state reaches `7` very early (already there by the first checkpoint, 40M) and then does
+not move again for the remaining 54M cycles of the run — a hard plateau, not a slow climb.**
+Phase is similarly frozen at 23 the whole window. Neither the write-5 site nor the DISPFB gate
+setter fires even once. This is the same "runs once, reaches an early value, then permanently
+stalls" shape as phase 3 (pre-S98) and phase 9 (pre-S128) — but this time in the mode
+state-machine itself, one level up. `modestate=7` is very likely a specific, named case in the
+`0x132600` switch table that itself waits on something (an object, a flag, a resource) the same
+way phase 3 waited on Global.txd and phase 9 waited on the audio claim.
+
+Handing this to Grok's static map of `0x132600`'s case for value `7` — same playbook as every
+previous gate tonight: find what that specific case checks, then live-verify what it's actually
+waiting on.
+
+```text
+S131: modestate is stuck at 7, hard plateau (identical value 40M through 94M, zero movement).
+      write-5 (0x30D8DC) and DISPFB gate (0x424C40) both zero-hit — SM never gets there. Next:
+      Grok's static map of 0x132600's case 7 body — what is it waiting on, same pattern as
+      phase 3 (Global.txd) and phase 9 (audio claim) before it.
+```
