@@ -151,3 +151,58 @@ DISPFB1 write fbp=0x0  psm=0x0 raw=0x0           x6
 Candidate (1) closed: escalate to candidate (2) **PC/syscall histogram** for the stall window — no Core.
 
 Artifacts (gitignored): `out/canaries/b3-l2c-100m/`.
+
+---
+
+## 8. PC / syscall histogram (Grok, 50M, candidate 2)
+
+**Method:** product `DETPS2_PROFILE_PC=1` + `blocker-trace burnout-only.json --cycles=50000000 --host-present`  
+No Core, no temp instrumentation.
+
+### 8.1 Top syscalls
+
+| # | Name (HLE) | Count |
+|---|------------|------:|
+| **0x32** | **SleepThread** | **45437** |
+| **0x64** | **FlushCache** | **14701** |
+| 0x2F | (see kernel map) | 1141 |
+| 0x34 | | 503 |
+| 0x44 | WaitSema | 301 |
+| 0x42 | SignalSema | 217 |
+
+**Not** a WaitSema livelock (genericStarvedSemaRescues=0; WaitSema only 301). Dominant cost is **SleepThread thrash** + FlushCache.
+
+### 8.2 PcProfiler top (39M samples, 50k unique)
+
+| Band | Role (disasm) |
+|------|----------------|
+| **0x00100158–0x00100170** (~1.7M each) | **memset / bulk zero**: `sq zero,0(v0); addiu +16; j loop` until end |
+| **0x0012DF90–0x0012DFB0** (~314k each) | IEEE754-style **double unpack** helpers (`ld`, `dsrl32`, branch on exp) |
+| **0x0012DFC8+** | same helper family |
+| Final PC **0x0012DF54** | same float helper prolog (`lui/ori/dsll` mask build) |
+
+So most EE time is **memory clear + float decode**, not a single tight spin on a wait flag address — but **SleepThread×45k** means cooperative yield is the control-flow backbone of the plateau.
+
+### 8.3 GIF / PATH3 (same run)
+
+```
+m3p=True heldP3n=5 heldP3qwc=2124 heldSubmits=18 mskPath3=10
+gifCompleted=92 gifAborted=6 lastAbort=DIRECT-end-truncated
+gif-last: nloop=26624 nreg=3 (large pending tag residual)
+```
+
+**PATH3 is held / M3P asserted** with multi-QW backlog while present stays black. This is a stronger “why no flip” lead than DISPFB alone: the display path may be waiting for PATH3 drain / unmask that never completes under our GIF model.
+
+### 8.4 Next (still no Core)
+
+1. Dual-ACK whether to prioritize **PATH3 hold / M3P / DIRECT-end-truncated** investigation vs SleepThread producer (what wakes the sleeper).  
+2. Optional: dump page 0x46 contents for visual “is the backbuffer real chrome?” (read-only dump, not present bypass).  
+3. Still ban: page-mismatch present of 0x46, synthetic DISPFB flip.
+
+```text
+B3 L2c candidate 2
+  SleepThread 45k + FlushCache 14k dominate (not WaitSema)
+  PC heat: memset 0x100158 + float helpers 0x12DFxx
+  PATH3 held (m3p, heldP3qwc=2124) + DIRECT-end-truncated aborts
+  flip still absent at 100M; next: PATH3 hold mechanism, not more cycle budget
+```
