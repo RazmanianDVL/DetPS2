@@ -4409,3 +4409,38 @@ S72: CORRECTION — draw target really is 0x8C000 (FRAME_1 Fbp=70), display targ
      (DISPFB2 Fbp=0), not the 0x0/0x51400(raw) pair quoted in S70/S71. Mismatch conclusion
      unchanged; numbers were backwards. Grok's PutDispEnv-caller thread (seq0473) still valid.
 ```
+
+## 73. FRAME_1's real value confirmed live, doubly cross-checks S72: fbp=70 (0x8C000) for 35/36 writes, never once matches DISPFB2's fbp=0 (Claude)
+
+Temp `DETPS2_TRACE_FRAME_WRITES=1` hook at the actual `case 0x4C` register-write site in
+`Gs.WriteGsRegister` (reverted after use — `git diff --stat` 6/1, `git checkout --`, clean),
+same 95M-cycle run:
+
+```
+n=1:     value=0x0000000000100000  fbp=0    (early/boot value)
+n=2..36: value=0x00000000000A0046  fbp=70   (every write for the rest of the run, identical)
+```
+
+So the draw target starts at `fbp=0` for exactly one write, then switches to `fbp=70`
+(byte address `0x8C000`) on write #2 and **stays there, unchanged, for all 35 remaining writes**
+across the whole 95M-cycle run — a real, stable, non-flickering draw target. Cross-checked
+against the DISPFB2 trace from S71 (106 samples, `Fbp` always `0`, i.e. address `0x0`, every
+single sample): **the two addresses never coincide, not once, across the entire run.** This
+doubly confirms S72's corrected numbers weren't a one-sample fluke — draw=0x8C000 and
+display=0x0 are each individually rock-stable, just stable at two different places.
+
+Given DISPFB2 briefly *starts* the run pointed at the same place FRAME_1 briefly starts (both
+`fbp=0` at the very first sample, before FRAME_1 moves to 70 on write #2) — this looks like: the
+display circuit's target was correct for whatever the very first frame was, and then the real
+draw target moved to `0x8C000` (presumably once actual scene content — logo/chrome — started
+rendering) while nothing ever moved DISPFB2 to follow it. That's consistent with Grok's
+`0x1FE600` toggle candidate (seq0473) being the intended "point display at wherever we just
+drew" call that either isn't firing, or is firing but not picking up FRAME_1's live value.
+
+```text
+S73: FRAME_1 confirmed stable at fbp=70 (0x8C000) for the entire run after one initial write;
+     DISPFB2 stays at fbp=0 (0x0) for the entire run — draw and display never converge, not
+     once, in 95M cycles. Both sides individually confirmed live/stable, not a sampling
+     artifact. Next: does 0x1FE600 (Grok's PutDispEnv-adjacent toggle) have a path to read
+     FRAME_1's live Fbp and feed it into the DISPFB2 write, and why doesn't it fire/work?
+```
