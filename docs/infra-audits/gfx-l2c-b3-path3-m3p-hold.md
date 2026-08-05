@@ -4125,3 +4125,24 @@ Boot tail `0x12ED14 → 0x132560` sets mode-state=2 once climber returns 0.
 S64: IRX OK → phase=2; mode-state still 0 until climber done + boot tail / SM
   next: does 0x133190 ever return 0? final stuck phase? 0x132560 hits?
 ```
+
+---
+
+## 65. Climber return polarity + phase-2 resource id=14 (Grok)
+
+Boot loop at `0x12ECA4`: **ret==0 → retry** (via `0x12EC78`); **ret!=0 → done**, fall
+through to mode SM / `0x132560`.
+
+Phase-2 first action: `0x2224C0(0x1D6D880, id=14)` → table `0x3E7D40` case 14 at
+`0x3E8148`:
+```
+v0 = *(obj+8)
+if bltz(v0) or v0==*(obj+2436): ready path
+else return 0  // not ready → climber returns 0 → boot retries
+```
+
+Stuck phase-2 = resource slot +8 at `0x1D6D880` never becomes ready.
+
+```text
+S65: ret0=retry; phase2 waits *(0x1D6D888) ready (id14)
+```
