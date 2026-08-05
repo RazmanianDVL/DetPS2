@@ -1,6 +1,6 @@
 # GFX L1 design — present black despite Soft-GS activity (CP2 dual-ACK)
 
-**Status:** design shelf — **dual-ACK before Core**  
+**Status:** **Core C1+C2 landed** — CP3 B3 still fails Tier A → escalate **L2** (H3/H4)  
 **Plan:** `gfx-plan-v0.md`  
 **Baseline:** `gfx-baseline-2026-08-04.md`  
 **Primary title:** Burnout 3 (Dec secondary)
@@ -75,8 +75,20 @@ Invalidate present composite cache when a **full-FB black stamp** is detected (e
 | **L1-Q2** | Defer C3 / H3–H4 to L2 if B3 still black? | **Yes** |
 | **L1-Q3** | Ban goefile re-enable still holds? | **Yes** |
 
+## 6. CP3 result (post C1+C2)
+
+Canary `out/canaries/gfx-baseline/20260804-201537/` @ Core land:
+
+| Title | present lit% | color% | Tier A |
+|-------|-------------:|-------:|:------:|
+| B3 | 0 | 0 | **FAIL** (still pure black) |
+| Dec | 11.4 | 0 | **FAIL** (gray strip only) |
+| Whip | 0 | 0 | expected L3 |
+
+Smokes Gs composite set: **pass**.  
+**Verdict:** C1+C2 correct path hygiene; **insufficient** for B3 Tier A. residualDispfbPx counters mid-run ≠ final present RGB. Escalate **L2** (H3 FRAME FBP≠DISPFB, H4 page/PSM load).
+
 ```text
-GFX L1 present-black design
-  H1 merge cache + H2 GetPresentSpan parity
-  dual-ACK before Core; B3 Tier A bar + visual PPM
+GFX L1 C1+C2 landed
+  smokes OK; B3 present still black → L2
 ```

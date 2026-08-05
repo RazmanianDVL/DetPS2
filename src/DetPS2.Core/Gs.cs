@@ -2180,8 +2180,8 @@ public sealed class Gs : ISchedulable
         {
             CompositeDispfbToFramebuffer();
             // Black full-FB prims (BO2 class: px=full FB lit=0) stamp Soft-GS while logo
-            // lives only in local IMAGE. Force one re-merge when still mostly black;
-            // _mergeBlackBypassArmed prevents per-present thrash when IMAGE is truly empty RGB.
+            // lives only in local IMAGE. ForceRefresh resets cache keys and re-merges when
+            // still black and empty-RGB bypass is not armed (proved no presentable RGB).
             if (IsPresentMostlyBlack() && !_mergeBlackBypassArmed)
                 ForceRefreshPresentComposite();
         }
@@ -2280,27 +2280,26 @@ public sealed class Gs : ISchedulable
         // Avoid re-scanning every host-present once a full merge already ran and IMAGE
         // has not grown (1M-slice OnHostPresent). Invalidate when DISPFB/DISPLAY/PMODE
         // generation advances so natural DISPFB programmed after residual still binds (GX-041).
-        // Keep Soft-GS claim determinism: skip only when present already has chrome.
-        // When px>0 but FB is mostly black and local IMAGE exists, ignore merge cache once
-        // (commercial logos live in IMAGE; Clear/wrong-FBP can stamp cache while FB is black).
+        // Skip only when present already has chrome.
+        // GFX-L1 (CP2 dual-ACK): commercial black full-FB prims wipe Soft-GS FB after a
+        // residual composite without calling Clear() — do NOT treat a prior composite as
+        // still valid while present is mostly black. Re-merge until chrome lands or we prove
+        // local/DISPFB has no presentable RGB (arm bypass only AFTER written==0 while black).
         if (mergeMode && DispfbPixelsComposited > 0
             && ImageBytesWritten <= _lastCompositeImageBytes
             && DisplayCircuitGeneration == _lastCompositeCircuitGen)
         {
             bool hasImage = _localMemHasImage || ImageBytesWritten > 0;
-            if (hasImage && IsPresentMostlyBlack())
+            if (!IsPresentMostlyBlack())
             {
-                if (_mergeBlackBypassArmed)
-                    return 0;
-                _mergeBlackBypassArmed = true;
-                // Fall through — re-merge into black Soft-GS pixels once.
-            }
-            else
-            {
-                // Present has chrome — re-arm black bypass for a future FB wipe.
+                // Present has chrome — safe to skip; clear empty-RGB bypass for a future wipe.
                 _mergeBlackBypassArmed = false;
                 return 0;
             }
+            // Mostly black: re-merge unless we already proved IMAGE under DISPFB has no RGB.
+            if (hasImage && _mergeBlackBypassArmed)
+                return 0;
+            // Fall through — re-merge into black Soft-GS pixels (do not arm until written==0).
         }
 
         var circuit = GetDisplayCircuitInfo();
@@ -2479,6 +2478,14 @@ public sealed class Gs : ISchedulable
             else
                 ResidualDispfbPixels += written;
             LastCompositeSource = source;
+            // Lit present — clear empty-RGB bypass so a later black-clear wipe re-merges.
+            _mergeBlackBypassArmed = false;
+        }
+        else if (IsPresentMostlyBlack() && (_localMemHasImage || ImageBytesWritten > 0))
+        {
+            // Proved local/DISPFB has no presentable RGB this gen — skip thrash until IMAGE
+            // grows, circuit changes (cache keys above), or Clear()/Invalidate resets the arm.
+            _mergeBlackBypassArmed = true;
         }
         return written;
     }

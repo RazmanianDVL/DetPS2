@@ -800,8 +800,10 @@ if (args.Length > 0 && args[0].Equals("scoreboard-metrics", StringComparison.Ord
         {
             smSys.RunFor(smCycles);
         }
-        // Headless Soft-GS DISPFB residual (IMAGE/local may hold logo without prim px).
-        smSys.Gs.CompositeDispfbToFramebuffer();
+        // GFX-L1 C2: present path parity with Desktop/EmulationWorker — GetPresentSpan runs
+        // composite + black re-merge. Do not rely on a single CompositeDispfbToFramebuffer call
+        // (black full-FB prims after IMAGE leave merge cache stale without this).
+        _ = smSys.Gs.GetPresentSpan();
 
         long px = smSys.Gs.PixelsWritten;
         long prims = smSys.Gs.PrimitivesDrawn;
