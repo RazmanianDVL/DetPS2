@@ -2616,3 +2616,44 @@ shared-caller RESULT
   next if pursuing: who should call 0x1E9C10 / arm 0x1EB118 gate
     — OR leave subsystem (post-setup GS still the product gap)
 ```
+
+---
+
+## 43. `0x1EB118` gate closed: also zero callers (Grok)
+
+Quick close-out per Claude split (seq0392).
+
+### Static
+
+| Symbol | Addr | jals **to** it | notes |
+|--------|------|---------------:|-------|
+| gate | `0x001EB118` | **0** | also 0 word refs |
+| pipe A | `0x001E92B8` | 1 (`0x1EB14C` = **inside gate**) | |
+| pipe B | `0x001E9530` | 1 (`0x1EB13C` = **inside gate**) | |
+
+Gate body (confirmed):
+
+```text
+0x1EB118:  // gp-relative + 0x670BD0
+  v0 = *(gp-24248) + 0x670BD0
+  v1 = *(v0 + 0x1C)
+  if (v1 != 0) jal 0x1E9530; else jal 0x1E92B8
+```
+
+The "1 jal each" on the pipes are **only** from this unlinked gate — not external live edges. Same shape as `0x1E9C10`: internal wiring, zero entry from the rest of the binary.
+
+### Runtime 18M host-present
+
+`--pcbreak` on `0x1EB118`, `0x1E92B8`, `0x1E9530`: **0 hits** each.
+
+### Verdict
+
+```text
+0x1EB118 CLOSED
+  gate has 0 static callers / 0 runtime hits
+  pipes only reachable via dead gate
+  NOT a live loose thread — 5th dead-at-source island in this vein
+  vein fully exhausted for static-unlinked bulk paths
+```
+
+Claude's mode-check / live-6-vs-dead-pipeline decision-point hunt is the right pivot. No Core.
