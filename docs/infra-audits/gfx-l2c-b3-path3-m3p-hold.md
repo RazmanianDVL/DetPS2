@@ -9981,3 +9981,49 @@ S205: LIVE CORRECTION — post-S171 advance completes (2BCE48 x1, v1=22); 2BCE4C
       Stall is NOT incomplete advance. Next: readiness/modestate after state 23.
 ```
 
+
+## 206. LIVE — after S171, readiness stuck on **case8 / 0x332E00**, not incomplete resource (Grok)
+
+**Canary:** `out/canaries/b3-s205-readiness-post23`
+
+### Readiness return still 100% fail
+`--pcbreak=00132AAC` (beq after jal 0x1322B0): **493 hits, v0=0 every time** (pre and post state-23).
+
+### Substate machine inside `0x131480` (static)
+
+`*(mode_obj+756)` substate switch. Case 7:
+
+```
+0x131670  jal 0x2BCA20(0x1E85900)   ; nested resource SM
+0x13167C  beq v0,0 → fail
+0x131684  sw 8, 756(s1)             ; fall through into case8
+0x13168C  jal 0x332E00(0x64C990)
+0x131698  beq v0,0 → fail
+0x1316A0  sw 9, 756(s1)             ; never reached
+```
+
+### Live census
+
+| PC | Hits | Note |
+|----|------|------|
+| `0x131670` case7 | **7** | only early; advances once nested SM starts returning 1 |
+| `0x13168C` case8 | **483** | almost all remaining readiness calls |
+| `0x131698` after 0x332E00 | **483** | **v0=0 all 483** |
+| `0x1316A0` substate→9 | **0** | never |
+
+### Chain (corrected again)
+
+```
+S171 scrub → advance completes → nested state 22→23
+  → case7 0x2BCA20 returns 1 (few times) → substate 7→8
+  → case8 jal 0x332E00(0x64C990) returns 0 forever (483×)
+  → readiness v0=0 forever → modestate stuck 7 → no DISPFB retarget
+```
+
+**Resource completion is no longer the limiter.** Next live target: **why `0x332E00(0x64C990)` returns 0**.
+
+```text
+S206: Post-S171 readiness fails on case8 0x332E00 (483/483 v0=0), not on resource complete.
+      Case7 only 7× then substate sticks at 8. Next: disasm/live 0x332E00.
+```
+
