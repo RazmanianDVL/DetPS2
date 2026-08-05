@@ -5057,3 +5057,31 @@ S89: CONFIRMED — completion flag 0x51868C never set (0 writes of 1 in 95M cycl
      phase/mode-state/DISPFB-retarget chain traced through S66-88. One root cause for the
      night's second half of findings.
 ```
+
+## 90. Queue object status confirms: slot is actively occupied, load genuinely pending forever (Claude)
+
+Closing out Grok's S88 ask #3 — dumped `0x4F6100`'s status fields at 90M (`DETPS2_DUMP_B3_QUEUE=1`
+temp hook, reverted — `git diff --stat` 10 insertions, `git checkout --`, clean):
+
+```
++1920 (0x4F6880) = 0x0066E120   <- real slot/load-handle pointer, actively occupied
++1924 (0x4F6884) = 0x00000000
++1925 (0x4F6885) = 0x00000000
++1928 (0x4F6888) = 0x00000000
++1932 (0x4F688C) = 0x00000000
+```
+
+The slot holds a real pointer (`0x66E120`, same address family as the other live objects tonight
+— not a stale/garbage value), confirming the load genuinely got queued and occupies a real
+tracking slot. All four status/done bytes are zero — no error flag, no completion flag, nothing.
+This is "queued and perpetually pending," not "queue rejected it" or "queue lost track of it" —
+consistent with S89 and with the original pre-S49 finding that Global.txd's fno=5 multi-chunk
+DMA read is the specific missing dispatch. The load sits in the slot forever because whatever
+would advance its status byte and eventually reach `0x13D340`'s completion write never runs.
+
+```text
+S90: Queue slot 0x4F6100+1920 holds a real, active pointer (0x66E120) — the load IS tracked, not
+     lost or rejected. All status bytes (+1924/1925/1928/1932) stay zero forever. Confirms: this
+     is a genuinely stuck pending load, root-caused to the same fno=5 dispatch gap from earlier
+     tonight, not a queueing failure.
+```
