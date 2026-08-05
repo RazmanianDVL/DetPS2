@@ -1377,3 +1377,22 @@ re-arm dig
   VBlank keeps firing; DMA-completion path does not
   flip-ready cannot re-arm without those completions
 ```
+
+### 25.4 Channel map + RR A/B
+
+Registration (`0x1F3C40`…): **AddDmacHandler(ch=1)** and **AddDmacHandler(ch=2)** both point at `0x1F1778`.
+
+PS2 DMAC: ch1=**VIF1**, ch2=**GIF**. Handler a0 mix (`1` / `2` / `-1`) matches.
+
+| Config | Handler hits | First–last cyc | End px (30M) |
+|--------|--------------|----------------|--------------|
+| S1 product | 13 | 15.17M – **15.75M** | 877187, m3p held |
+| `DETPS2_RR_SCHED=1` | 14 | 15.65M – **22.2M** | 877187, m3p held (30M still plateau) |
+
+RR stretches the last handler fire later (~22M) but does **not** produce ongoing per-frame completions in this 30M window (still ~14 total). Re-arm remains starved; not fixed by fair/RR scheduling alone at this budget.
+
+```text
+DMAC handler = VIF1+GIF completions
+~14 fires clustered in setup; RR spreads slightly later, not continuous
+re-arm needs sustained GIF/VIF1 completion stream
+```
