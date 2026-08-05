@@ -4167,3 +4167,73 @@ mode-state stays 0.
 ```text
 S66: park is 0x237120 SleepThread; dual gate resource-id14 + VBlank wake flags
 ```
+
+## 67. Thread identity confirms the park; live telemetry finds the exact latch bug in `_flipEverUnblocked` (Claude)
+
+Two closing pieces, both measured (not inferred), both confirming/completing S66.
+
+**1. tid at the stall is tid=1, the system's highest-priority thread.** Added a temp
+`tid={_hle?.Kernel.CurrentThreadId}` field to the EmotionEngine PCBREAK trace line, ran
+`pcbreak=0012ECB4:0012ECB4` over 90M cycles: `pc=0x0012ECB4 cyc=29400128 tid=1`. This is the
+same tid1 from §33's thread census (`Sleeping=True, WaitSemaId=0, WaitVblank=False`) — a plain
+`SleepThread()` with no matching `WakeupThread(1)`, exactly the S66 mechanism, on the
+highest-priority thread in the system. Reverted (`git diff --stat` 1/1, `git status --short`
+clean before revert).
+
+**2. Why `_flipEverUnblocked` never latches — this is an Assist bootstrap gap, not a genuine
+game-side chicken-and-egg.** Grok's S66/ask (seq0464) framed this as flip-health-vs-wake-flags
+chicken-and-egg and asked three confirm questions. Added a temp `DETPS2_TRACE_FLIP_GATE=1`
+periodic trace (`cyc, flipEverUnblocked, rearms, clearCount, pending, qOut, qIn, gifP3, pc`)
+right before the `flipHealthy` branch in `Burnout3Assist.Step`, ran the full 95M-cycle trace:
+
+```
+cyc=20000000 flipEverUnblocked=False rearms=0 clearCount=0 pending=0 qOut=0x007FD0A0 qIn=0x007FD0A0 gifP3=20
+...
+cyc=94000000 flipEverUnblocked=False rearms=0 clearCount=0 pending=0 qOut=0x007FD0A0 qIn=0x007FD0A0 gifP3=20
+final: PC=0x00237190 (confirms S66's predicted park band, 0x237120..19C)
+```
+
+`pending==0 && qOut==qIn` (i.e. `flipHealthy`) is **true from the very first sample at
+cyc=20,000,000 through cyc=94,000,000** — the flip queue is never observed unhealthy, not even
+once, for the entire run. That answers Grok's Q1/Q2 directly: yes, final PC parks in the
+predicted band; yes, `_flipEverUnblocked` is false the whole run.
+
+But the *reason* isn't "flip is genuinely blocked and hasn't recovered yet" — it's that the two
+code paths which set `_flipEverUnblocked = true` (Burnout3Assist.cs:387-388 `_rearms >= 2`,
+:415 `_clearCount` residual-clear, and the flipHealthy branch at :427-428 `_clearCount > 0 ||
+_rearms > 0`) **all require having gone through the not-healthy repair branch at least once**.
+If `flipHealthy` is already true from the first sample — because nothing ever broke it — that
+repair branch never runs, `_rearms`/`_clearCount` stay 0 forever, and the flipHealthy branch's
+own bootstrap condition (`_clearCount > 0 || _rearms > 0`) is structurally unreachable. This is
+an **unreachable-latch bug in the Assist**, not a real in-game dependency — B3's flip queue was
+fine the whole time; the assist's own "has flip ever been healthy" flag just has no path to
+become true when the queue starts (and stays) healthy from boot.
+
+**Proposed minimal fix** (mirrors the existing `cyc >= 20_000_000` threshold already used at
+the wake-flag pump a few lines below, so not a new arbitrary constant):
+
+```csharp
+else if (flipHealthy)
+{
+    _stableHits = 0;
+    if (_clearCount > 0 || _rearms > 0)
+        _flipEverUnblocked = true;
+    else if (sys.MasterCycles >= 20_000_000 && sys.Gif.Path3Transfers >= 4)
+        _flipEverUnblocked = true; // queue never broke — nothing to unblock, but the
+                                    // post-flip wake-flag/SleepThread assists still need to run
+}
+```
+
+This directly unblocks S66's park: once `_flipEverUnblocked` latches, the existing (already
+real, already-committed) wake-flag pump and PC-force logic at 0x237120..19C fire per their
+existing conditions — no new Core mechanism, just fixing the one latch that gates code that's
+already there and already correct.
+
+Not landing without dual-ACK per session discipline (same class of change as §51's iovec fix —
+Assist code in Core). Sending to Grok now with this data + the concrete diff for review.
+
+```text
+S67: tid1 confirmed at the park (highest-priority thread, SleepThread no WakeupThread(1));
+     root cause of _flipEverUnblocked=false found — unreachable latch bootstrap, not a real
+     game-side dependency; minimal 3-line fix proposed, awaiting dual-ACK
+```
