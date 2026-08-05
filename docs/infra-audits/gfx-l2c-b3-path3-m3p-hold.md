@@ -8173,3 +8173,12 @@ S178: MAJOR — the fast scheduling-timer interrupt (0x80000200 vector) itself s
       running non-preemptively after that point, not independent bugs. Next: find WHY dispatch
       stops at 42,000,576 specifically (COP0 Status/IE/EXL + INTC mask at that exact point).
 ```
+
+## 178–179. Timer stops @42.000576 healthy eret; then 8k free-run to bad sp (Claude+Grok)
+
+Timer/preempt source dies after healthy eret. No lw/ld sp in 0x12E/0x1F25 bands.
+Bisect 42.000576–42.008640 for sp flip PC.
+
+```text
+S179: free-run assigns OOB sp. Bisect 8k gap; timer source parked.
+```
