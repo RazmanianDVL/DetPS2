@@ -2291,3 +2291,34 @@ boot-table fire census (Claude) -- 6/20 fire, 14/20 never fire, all in the 15.17
   fired ids: 2,4,0xA,0xC,0x14,0x15  |  never-fired ids: 3,5,8,9,B,D,E,F,10,11,12,13,17,18
   next: which of the 14 never-fired ids is graphics/gameplay-relevant (vs audio/save/physics)
 ```
+
+### 38.1 Surface-level pass on the 14: no obvious graphics candidate popped out
+
+Disassembled the first ~15-25 instructions of all 14 never-fired functions, looking for an
+obvious tell (GS/VIF/DMAC MMIO `lui 0x1000/0x1200`, `MSCAL`, `XGKICK`-shaped code) versus
+audio/save-only code. **No such signal — the opposite, in fact.** Most of the 14
+(`0x1FA168, 0x205E68, 0x1FFB50, 0x1FFB60, 0x1FB0B0, 0x1FB960, 0x1FFC18, 0x205DE8, 0x200578,
+0x201108, 0x202CC0, 0x204320, 0x205E30`) share a near-identical prologue shape: load a byte
+flag from a fixed small offset (32-35 or 54) of a struct pointer, mask against small bit
+patterns (`0x6, 0x7, 0x60, 0x80, 0xF8`), branch on state. This reads as **one homogeneous
+family of per-object/entity message handlers** (consistent struct layout, generic
+type/flags-byte dispatch) rather than 14 unrelated subsystems — plausibly a shared
+actor/entity-component message dispatcher reused across many object *kinds*, not
+graphics-vs-audio-vs-physics separated by id. `0x207E30` is the one outlier (dispatches on a
+`(a2 & 0xF00)` "message type" field read from a raw buffer — looks like a lower-level RPC/
+message-decode router, not an entity handler).
+
+**No sharp filter emerged from surface inspection alone.** Given the homogeneity, picking one
+of the 14 to deep-trace without a better signal risks being arbitrary. Leaving this exact
+point open for whoever picks it up next — worth comparing against Grok's independent census
+(in flight as of this write) in case a different angle (e.g. what argument/id each of the 14
+*would* need to be requested with, or who holds the request queue that only ever asks for
+`{2,4,0xA,0xC,0x14,0x15}`) sharpens it faster than reading 14 near-identical bodies cold.
+
+```text
+surface pass on the 14 never-fired (Claude) -- no sharp graphics/audio filter found
+  13 of 14 share one homogeneous entity/object message-handler shape (type+flags byte dispatch)
+  1 outlier (0x207E30) looks like a lower-level message-type router
+  leaving open: better to find the REQUEST QUEUE that only ever asks for {2,4,A,C,14,15}
+    than to keep reading near-identical handler bodies cold
+```
