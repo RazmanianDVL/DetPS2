@@ -3124,3 +3124,65 @@ iovec consumer CONFIRM
   n=2 never = progression broken after first plant
   design: multi-entry ≤64KiB chain in one plant (or working slice cursor)
 ```
+
+---
+
+## 50. hugeCopy "live blocker" is a false positive on memcpy a2=-1 sentinel (Grok)
+
+Claude S1 implemented (chain plant) but never fired; pcbreak `0x124044` showed s2=0x3, a2 cycling 1/0/0xFFFFFFFF in tight loop. Asked for disasm of that range.
+
+### 50.1 What `0x124020`–`0x124050` actually is
+
+Plain **memcpy byte-tail** of `0x123F58` (after lq/sq and ld/sd bulk):
+
+```text
+0x124028: a2--
+0x12402C: v0 = -1
+0x124030: if a2 == -1 goto done     # exit when count underflows past 0
+0x124038: lbu; a2--; a1++
+0x124044: sb ...                    # Claude's hit
+0x12404C: bne a2, a0, loop          # a0=-1; continue while a2 != -1
+0x124054: jr ra
+```
+
+After a **small** legitimate copy finishes, `a2` goes `… → 1 → 0 → 0xFFFFFFFF`. That is **normal**, not a multi-megabyte request.
+
+### 50.2 Assist mis-detect
+
+```csharp
+bool hugeCopy = pc is >= 0x00124020 and <= 0x00124050
+    && (uint)a2 > 0x10000;
+```
+
+`(uint)(-1) == 0xFFFFFFFF > 0x10000` → **true on every normal memcpy completion** that ends in this tail. Combined with `!empty && !absurdS4 && !hugeCopy` early-return logic: when hugeCopy fires, assist does **not** return early, skips empty-plant (`empty` is false mid-memcpy), and falls through to **empty-epi snap `PC=0x122CBC`** — the TRACE line Claude still sees as `escape empty iovec n=1`.
+
+So the "live n=1 escape" is **not** proof the empty-iovec plant path ran; it is often/always this **false-positive abort of a finishing small memcpy**.
+
+### 50.3 Implications
+
+| Claim | Revised |
+|-------|---------|
+| S1 chain plant wrong | **No** — correct for empty path; never reached live |
+| Live blocker is hugeCopy of >64KiB STAGEHED | **No** — a2=-1 sentinel in byte tail |
+| Why plant line never prints | Escape taken via hugeCopy→fallback, not empty→plant |
+| cdvd 609→1865 | Still from `MaybePlantStageAssets` full-file `NoteHostReadSectors`, not iovec consume |
+
+### 50.4 Fix shape (design, dual-ACK if touching Core/assist)
+
+Tighten hugeCopy to **positive** sizes only, e.g.:
+
+```csharp
+uint a2u = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
+bool hugeCopy = pc is >= 0x00124020 and <= 0x00124050
+    && a2u > 0x10000u && a2u < 0x80000000u; // exclude a2=-1 and other negatives
+```
+
+Or drop PC-tail hugeCopy entirely and only gate **plant entry size** (already ≤0x10000 in S1). After fix: re-measure whether empty path plants, whether multi-entry chain is walked, whether natural I/O past 1865 appears.
+
+```text
+hugeCopy FALSE POSITIVE
+  0x124044 = normal memcpy byte-tail; a2→0xFFFFFFFF is done-sentinel
+  assist treats a2>0x10000 unsigned → aborts to empty-epi (n=1 TRACE)
+  S1 empty-plant never reached; not a failed multi-entry test
+  next: tighten hugeCopy (signed/positive bound) then re-run S1 before/after
+```
