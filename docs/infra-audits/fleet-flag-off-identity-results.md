@@ -33,10 +33,24 @@
 
 **Match:** identity.
 
+## B3 (`SLUS_210.50`) @ 20M
+
+| Field | This run | m8a dual-suppress diagnose baseline |
+|-------|----------|--------------------------------------|
+| pc | `0x00123E84` | `0x00123E84` |
+| px | 877187 | 877187 |
+| prims | 172 | 172 |
+| syscalls | 806 | 806 |
+| calls | 42 | 42 |
+| cdvd | 425 | 425 |
+| binds | 11 | 11 |
+
+**Match:** identity (diagnose-class floor; not claim 100M baseline).
+
 ## Verdict
 
-Flag-off product path **unchanged** on BO2/Whip diagnose after C1 Core tips. M6-b2 JSON key `genericStarvedSemaRescues` present (0). B3/GoW optional later.
+Flag-off product path **unchanged** on BO2/Whip/B3 diagnose after C1 Core tips. M6-b2 JSON keys present (0). GoW optional later.
 
 ```text
-fleet flag-off identity: BO2+Whip 20M match prior soft-off canary
+fleet flag-off identity: BO2+Whip+B3 20M match prior diagnose baselines
 ```
