@@ -10027,3 +10027,51 @@ S206: Post-S171 readiness fails on case8 0x332E00 (483/483 v0=0), not on resourc
       Case7 only 7× then substate sticks at 8. Next: disasm/live 0x332E00.
 ```
 
+
+## 207. LIVE — case8 object 0x64C990 stuck state=3 waiting for flag byte that is **never written 1** (Grok)
+
+**Canary:** `out/canaries/b3-s206-332e00`
+
+### 0x332E00 live state
+`--pcbreak=00332E00:00332E20` (60M): obj always `s1=0x64C990`.
+- state(+8) = **1 once**, then **3 for 159/160** remaining hits.
+
+### Case3 static (0x333004)
+```
+lbu v0, 0(s1)           ; flag byte at 0x64C990
+bne v0, zero, advance
+return v0=0             ; flag clear → fail forever
+```
+
+Case2 (0x332F5C) arms load then parks state=3:
+```
+jal 0x2224C0(a0=0x1D6D880, a1=5)   ; resource id=5
+… jal 0x13CFA0 …                    ; GTFS-style path (same family as S89)
+sw state=3; return 0
+```
+
+### Watch `0x64C990` (179 accesses, 60M)
+**Writes of the flag byte — all zero, never 1:**
+| PC | Op | Value |
+|----|-----|-------|
+| `0x100160` | sq zero | boot |
+| `0x333120` | sb zero | init |
+| `0x332F54` | sb zero | case1/2 clear |
+| `0x13D160` | sb zero | **same per-attempt reset site as S89/S144** |
+
+Hundreds of `0x333004` READs all see 0. **No writer ever stores 1 into the completion flag.**
+
+### Family
+This is the **same GTFS completion-flag pattern** as the nested resource SM's +0x14C flag (S89–S98 / S144): case2 starts a load, case3 waits for async complete bit, bit never set (or reset and never re-set for this id).
+
+### Next
+1. What is **id=5** load (path/filename via 0x13CFA0 args / GTFS slot)?
+2. Does completion pump `0x13D340` fire for this object, and with what result?
+3. Compare to S98 Global.txd fix shape — may need another bounded assist or fix missing complete for id=5.
+
+```text
+S207: case8 0x332E00(0x64C990) stuck state=3; flag *0x64C990 never written 1
+      (only zeros from boot/init/0x13D160). Same GTFS-complete-flag family as S89.
+      Next: id=5 file identity + 0x13D340 pump for this object.
+```
+
