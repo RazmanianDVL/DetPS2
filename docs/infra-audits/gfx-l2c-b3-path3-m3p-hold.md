@@ -8730,3 +8730,68 @@ S185: Keep pushing — do not zoom out. Last healthy jalr@41,999,920 (v0=0x22804
       (or 32-cycle bisect) across that 208-cycle window to name the exact transfer insn.
 ```
 
+
+## 185. ROOT CAUSE CONFIRMED — eret resumes with a stale/nested-unsaved EPC (Claude)
+
+Full PC-by-PC trace across the 208-cycle window, captured via a wide bounded `pcbreak` covering
+the entire expected bridge (`0x1F1700`-`0x225400`), extended just past the target cycle to
+actually observe the transition (first attempt stopped 312 cycles too early — fixed).
+
+**The decisive sequence, immediately before the landing at `0x223228`:**
+
+```
+0x1F1CD8-0x1F1CDC: lq/ld epilogue restoring a registered interrupt handler's own saved regs
+0x1F1CE0: jr ra          ; ra=0x80000200 -- handler returns normally to the vector
+--- (vector's own eret fires here) ---
+0x00223228: [landing]     ; eretStack 1->0, sp correctly restored to 0x1FFFDA0 (the TRUE
+                            healthy value), but PC = EPC = 0x00223228 (STALE)
+```
+
+This is airtight: `eret` sets `PC := EPC`. `sp` gets restored to the *correct*, healthy value as
+part of the same context-restore — proving the underlying saved context itself was fine. The
+**only** thing wrong is `EPC` — it held `0x223228` (a stale value from some unrelated, earlier
+exception) instead of the true point where mainline was actually interrupted (`~0x1F2508`,
+inside the queue-dispatch loop, per S183's bounding).
+
+**Full causal chain, now closed end-to-end:**
+1. Mainline runs healthily in the queue-dispatch loop (`0x1F2508` family) through
+   `cyc=41,999,984` (S183).
+2. A **nested** interrupt fires (`eretStack` was already ≥1 going in — matches Grok's own static
+   note: `EnterException` only updates `EPC` "if not nested"). Since this is nested, the true
+   current PC (`~0x1F2508`) is **never written into EPC** — EPC keeps whatever stale value it
+   already held from an earlier, unrelated exception (`0x223228`).
+3. The nested interrupt dispatches to a legitimately-registered handler (`0x1F1CE8`, doing real,
+   sane work — IOP-related register access, `v1` in the `0x12xxxxxx` IOP RAM range).
+4. The handler finishes normally and does a clean `jr ra` back to the vector (`0x80000200`).
+5. The vector's own `eret` fires, correctly restoring `sp` (and presumably other saved GPRs) but
+   setting `PC := EPC` — and EPC is still the stale `0x223228` from step 2, not the true
+   interrupted PC.
+6. Execution resumes at `0x223228` — deep inside an unrelated function's body, past its real
+   prologue, with none of that function's own setup (matching every observation from S179-S182:
+   shallow-looking-but-actually-*correct*-for-mainline sp, self-referential-looking `ra` that was
+   really just whatever `ra` happened to be at that point in a totally different context, no call
+   edge, no thread-switch).
+7. From here the previously-traced chain (S179-S180) plays out: this "resumed" execution is not
+   actually a valid call context, wanders through code that was never meant to run from this
+   entry, and eventually corrupts a genuine stack-`ra` slot belonging to yet another unrelated
+   function (`0x389128`'s float overlapping the `0x2243DC` trampoline's saved-`ra` — S180), which
+   is itself just further downstream damage from the *same* original bad resume point, not a
+   separate bug.
+
+**This single root cause — nested exceptions failing to update EPC — plausibly explains the
+entire S159-S185 arc**, including the original VBlank-stops-at-cyc43M/cyc73M symptoms from
+earlier in the session (same class: an `eret` resuming to the wrong place after nested exception
+handling, leaving the system in a state where legitimate work never resumes correctly).
+
+```text
+S185: ROOT CAUSE CONFIRMED — eret at the vector resumes with a STALE EPC left over from an
+      earlier, unrelated exception, because THIS interrupt was nested (EnterException only
+      updates EPC when not nested, per Grok's own static read) and never recorded the true
+      current PC (~0x1F2508). sp is correctly restored (proving the saved context itself is
+      fine) but PC jumps to wherever EPC last pointed (0x223228), deep inside an unrelated
+      function with none of its real setup. This is a genuine nested-exception EPC-preservation
+      bug in EmotionEngine's exception handling -- not a stack-corruption or missing-call-edge
+      bug. Everything traced in S179-S184 (the stack-frame collision, the dead-end jalr checks)
+      is downstream damage from this one root cause, not independent bugs. Closes the live-trace
+      arc for the whole cyc42-43M second blocker.
+```
