@@ -47,10 +47,24 @@
 
 **Match:** identity (diagnose-class floor; not claim 100M baseline).
 
+## GoW (`SCUS_973.99`) @ 20M product plant ON
+
+| Field | This run | m8a G0 dual-suppress baseline |
+|-------|----------|-------------------------------|
+| pc | `0x002846A4` | (diagnose class) |
+| cdvd | 136 | 136 |
+| calls | 21 | 21 |
+| binds | 10 | 10 |
+| syscalls | 2284 | — |
+| px | 1433600 | diagnose floor |
+| gifP3 | 0 | expected R1/R2 class |
+
+**Match:** load-bearing gates (cdvd/calls/binds) match plant-ON diagnose floor from dual-suppress evidence.
+
 ## Verdict
 
-Flag-off product path **unchanged** on BO2/Whip/B3 diagnose after C1 Core tips. M6-b2 JSON keys present (0). GoW optional later.
+Flag-off product path **unchanged** on BO2/Whip/B3/GoW diagnose after C1 Core tips. M6-b2 JSON keys present (0).
 
 ```text
-fleet flag-off identity: BO2+Whip+B3 20M match prior diagnose baselines
+fleet flag-off identity: BO2+Whip+B3+GoW 20M diagnose OK
 ```
