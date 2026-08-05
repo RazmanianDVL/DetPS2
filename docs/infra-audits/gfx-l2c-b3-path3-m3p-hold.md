@@ -4670,3 +4670,15 @@ S80: Confirmed live — 0x51BA80..0x51BABC (mode-state/phase region) is still al
      Supports treating S64-66's gate as the likely shared root cause pending Grok's static
      confirmation.
 ```
+
+---
+
+## 80. DISPFB setter shares mode-ready gate class (Grok+Claude S79)
+
+`0x424C40` requires `*(0x1E90424)==5`, lives in `0x51A6A8` mode-object code, tabled at
+`0x4E0098`. Same magic **5** as mode-state request gate. Not independent — downstream of
+incomplete mode/boot arming (S64–66). No invent-DISPFB.
+
+```text
+S80: one shared "ready=5" class; display retarget waits on mode arming
+```
