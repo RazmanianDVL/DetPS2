@@ -7,8 +7,11 @@
 ## Library path (this machine)
 
 ```text
-\\192.168.0.17\ND\Emulation\Playstation 2
+\\Home_NAS\ND\Emulation\Playstation 2
 ```
+
+(Also try the `HOME_NAS`/`Home_NAS` hostname forms or your operator NAS's own address —
+see `tools/nas-media.ps1 -Probe`.)
 
 (~353 files, ~1 TB). Prefer **UNC** media JSON — **do not copy ISOs to C:**.
 

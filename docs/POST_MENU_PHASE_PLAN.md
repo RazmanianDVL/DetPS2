@@ -185,7 +185,7 @@ When a title seat is idle:
 
 ```text
 SEAT: S{n} {CODENAME}
-WORKTREE: C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s{n}
+WORKTREE: C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s{n}
 BRANCH: agent/seat-s{n}/{season}-{wave}
 TIP BASE: {main sha}
 OWNED FILES: {list}

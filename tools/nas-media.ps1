@@ -64,8 +64,6 @@ Set-Location $repoRoot
 $defaultRoots = @(
     "\\Home_NAS\ND\Emulation\Playstation 2",
     "\\Home_NAS\ND\Emulation\PlayStation 2",
-    "\\192.168.0.17\ND\Emulation\Playstation 2",
-    "\\192.168.0.17\ND\Emulation\PlayStation 2",
     "\\HOME_NAS\ND\Emulation\Playstation 2"
 )
 

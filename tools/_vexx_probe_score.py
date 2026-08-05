@@ -1,5 +1,5 @@
 import struct, zlib, re
-iso = r"C:/Users/xxraz/Downloads/Vexx(USA).iso"
+iso = r"C:/Users/user/Downloads/Vexx(USA).iso"
 
 def crc32(s):
     return zlib.crc32(s.encode("latin1")) & 0xffffffff

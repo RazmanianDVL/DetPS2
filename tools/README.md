@@ -154,7 +154,7 @@ Default roots tried (in order):
 
 - `\\Home_NAS\ND\Emulation\Playstation 2`
 - `\\Home_NAS\ND\Emulation\PlayStation 2`
-- `\\192.168.0.17\ND\Emulation\Playstation 2` (and PlayStation spelling)
+- `\\HOME_NAS\ND\Emulation\Playstation 2` (and PlayStation spelling)
 
 BIOS for templates: first match under `Documents\PCSX2\bios` containing `scph70008` / `SCPH70008`. Prefer UNC `path` entries — do not bulk-copy ISOs to `C:`.
 

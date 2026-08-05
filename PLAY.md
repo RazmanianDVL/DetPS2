@@ -3,13 +3,13 @@
 Work from the **Grok worktree** (not necessarily your original clone):
 
 ```text
-C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+C:\Users\user\.grok\worktrees\windows-detps2\detps2
 ```
 
 ## Launch
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2
 pwsh ./launch.ps1
 ```
 

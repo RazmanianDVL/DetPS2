@@ -153,15 +153,15 @@ No product scoreboard validation needed for this seat — it produces a diagnosi
 
 | Artifact | Path |
 |---|---|
-| M4-S4 timing follow-up (what led here) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-gow-claim-timing-followup.md` |
-| M4-S4-MIRROR design (Q4 hedge, Q9 claim-tier bar) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
-| UDNL/GetVersion unification (S0 stage definition) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\UDNL_GETVERSION_UNIFICATION.md` |
-| GoW assist (force-tag/force-UDNL/mirror call sites) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` (lines 353-434, 481-573) |
-| BO2 assist (confirmed path-combine fix, reference mechanism) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` (lines 185-217) |
-| Whiplash assist (confirmed UsingCD fix, reference mechanism) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
-| Generic RESET_CMD handler (confirmed not the bug) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\SonyKernelHle.cs` (lines 1717-1743) |
-| Generic reboot-arg storage (confirmed not the bug) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Sif.cs` (lines 303-354) |
-| M7-c (structural precedent: "read code first, two of four guesses were already wrong, investigate before fixing") | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7c-path23-image-delivery-design.md` |
+| M4-S4 timing follow-up (what led here) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-gow-claim-timing-followup.md` |
+| M4-S4-MIRROR design (Q4 hedge, Q9 claim-tier bar) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
+| UDNL/GetVersion unification (S0 stage definition) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\UDNL_GETVERSION_UNIFICATION.md` |
+| GoW assist (force-tag/force-UDNL/mirror call sites) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` (lines 353-434, 481-573) |
+| BO2 assist (confirmed path-combine fix, reference mechanism) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` (lines 185-217) |
+| Whiplash assist (confirmed UsingCD fix, reference mechanism) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
+| Generic RESET_CMD handler (confirmed not the bug) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\SonyKernelHle.cs` (lines 1717-1743) |
+| Generic reboot-arg storage (confirmed not the bug) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Sif.cs` (lines 303-354) |
+| M7-c (structural precedent: "read code first, two of four guesses were already wrong, investigate before fixing") | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7c-path23-image-delivery-design.md` |
 
 ---
 

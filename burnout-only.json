@@ -1,10 +1,10 @@
 {
-  "biosPath": "C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin",
+  "biosPath": "C:/Users/user/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin",
   "titles": [
     {
       "id": "burnout-3-takedown",
       "title": "Burnout 3 - Takedown (USA)",
-      "path": "C:/Users/xxraz/Downloads/Burnout3Takedown.iso",
+      "path": "C:/Users/user/Downloads/Burnout3Takedown.iso",
       "kind": "iso"
     }
   ],

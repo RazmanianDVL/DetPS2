@@ -128,12 +128,12 @@ Not applicable to this seat (no mechanism proposed), but recorded for whatever `
 
 | Artifact | Path |
 |---|---|
-| Parent M7-a design (Slice 3 spec, Q4) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7a-path23-image-dispfb-design.md` |
-| A0 residual inventory (MK:DA discrepancy source) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7-a0-residual-inventory.md` |
-| Forcing evidence (IMAGE delivery proven correct) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7c-2b-midway-image-stall-rootcause.md` |
-| Composite selector (read in full) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Gs.cs` (`CompositeDispfbToFramebuffer`, `CompositeLocalToFb`, ~lines 2270-2560) |
-| MK:DA title-port historical data | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\title-ports\MK_DEADLY_ALLIANCE.md` |
-| Correctness doctrine | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\CORRECTNESS.md` |
+| Parent M7-a design (Slice 3 spec, Q4) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7a-path23-image-dispfb-design.md` |
+| A0 residual inventory (MK:DA discrepancy source) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7-a0-residual-inventory.md` |
+| Forcing evidence (IMAGE delivery proven correct) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7c-2b-midway-image-stall-rootcause.md` |
+| Composite selector (read in full) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Gs.cs` (`CompositeDispfbToFramebuffer`, `CompositeLocalToFb`, ~lines 2270-2560) |
+| MK:DA title-port historical data | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\title-ports\MK_DEADLY_ALLIANCE.md` |
+| Correctness doctrine | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\CORRECTNESS.md` |
 
 ---
 

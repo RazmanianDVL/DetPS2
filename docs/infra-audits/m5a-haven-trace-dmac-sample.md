@@ -4,7 +4,7 @@
 **Tip:** `aaf3294`  
 **Budget:** **diagnose (20M)** via `blocker-trace` + `--host-present`  
 **Env:** `DETPS2_TRACE_DMAC=1` (print only; zero DMA behavior change)  
-**Media:** `user-media-haven.json` → `C:/Users/xxraz/Downloads/HavenCalloftheKing(USA).iso` (**present**); serial **SLUS_205.17**  
+**Media:** `user-media-haven.json` → `C:/Users/user/Downloads/HavenCalloftheKing(USA).iso` (**present**); serial **SLUS_205.17**  
 **Build:** Release → `out/scoreboard-build/DetPS2.Core.dll`  
 **Design:** `docs/infra-audits/m5a-dmac-vif-gif-completion-design.md` §1.2 Haven oracle / §8 Q2  
 **B3 peer:** `docs/infra-audits/m5a-b3-trace-dmac-sample.md`  

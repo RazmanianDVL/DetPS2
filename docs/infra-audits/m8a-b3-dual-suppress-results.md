@@ -3,7 +3,7 @@
 **Date:** 2026-08-04  
 **Tip:** `2701533` (+ local GameQuirks / SonyKernelHle gates; no push)  
 **Budget:** **diagnose (20M)** via `scoreboard-metrics` + `--host-present`  
-**Media:** `burnout-only.json` → `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` (**present**)  
+**Media:** `burnout-only.json` → `C:/Users/user/Downloads/Burnout3Takedown.iso` (**present**)  
 **Seed:** `docs/infra-audits/m8a-b3-gow-evidence-seed.md`  
 **Build:** Release → `out/scoreboard-build`
 

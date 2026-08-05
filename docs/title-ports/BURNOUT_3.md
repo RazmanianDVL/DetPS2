@@ -4,7 +4,7 @@
 |-------|--------|
 | **Id** | `burnout-3-takedown` |
 | **Serial** | `SLUS_210.50` |
-| **ISO** | `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` |
+| **ISO** | `C:/Users/user/Downloads/Burnout3Takedown.iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Worktree / seat** | `detps2` · seat **MENU-B3-2** |
 | **Agent date** | 2026-07-31 |

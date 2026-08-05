@@ -11,7 +11,7 @@
 
 Added a throwaway env-gated boolean (`NoCreditAssistProbe`, `DETPS2_M5A_B3_NO_CREDIT_ASSIST=1`) wrapping only the three `CreditOwedHandlerCall` call pairs — left the residual-pending soft-clear fallback (a separate mechanism, a direct memory write) untouched, since suppressing that too would have conflated two different compensations.
 
-Ran `burnout-only.json` (`C:/Users/xxraz/Downloads/Burnout3Takedown.iso`) at claim tier (100M cycles, `--host-present`, `DETPS2_TRACE_DMAC=1`), Release build, twice: once with the probe unset (product baseline) and once with it set (assist fully silenced).
+Ran `burnout-only.json` (`C:/Users/user/Downloads/Burnout3Takedown.iso`) at claim tier (100M cycles, `--host-present`, `DETPS2_TRACE_DMAC=1`), Release build, twice: once with the probe unset (product baseline) and once with it set (assist fully silenced).
 
 ## 2. Result — surprising, not what "creditAssist=391" alone suggested
 

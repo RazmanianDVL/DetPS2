@@ -359,15 +359,15 @@ Not implemented in this seed. Intended touch list when coding:
 
 | Artifact | Path |
 |----------|------|
-| UDNL port | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\bios-ports\UDNL.md` |
-| LOADFILE port | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\bios-ports\LOADFILE.md` |
-| UDNL IOPRP track | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\irx\UDNL_IOPRP.md` |
-| EE LOADFILE track | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\irx\EE_LOADFILE.md` |
-| Quirks debt audit | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\gamequirks-infra-debt.md` |
-| IRX phase plan | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\IRX_EXECUTION_PHASE_PLAN.md` |
-| GameQuirks | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\` |
-| RealSifRpc GetVersion | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\RealSifRpc.cs` |
-| UDNL host | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\IopExtendedBiosHost.cs` |
+| UDNL port | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\bios-ports\UDNL.md` |
+| LOADFILE port | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\bios-ports\LOADFILE.md` |
+| UDNL IOPRP track | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\irx\UDNL_IOPRP.md` |
+| EE LOADFILE track | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\irx\EE_LOADFILE.md` |
+| Quirks debt audit | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\gamequirks-infra-debt.md` |
+| IRX phase plan | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\IRX_EXECUTION_PHASE_PLAN.md` |
+| GameQuirks | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\` |
+| RealSifRpc GetVersion | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\RealSifRpc.cs` |
+| UDNL host | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\IopExtendedBiosHost.cs` |
 
 ---
 

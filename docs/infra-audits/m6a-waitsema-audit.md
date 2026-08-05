@@ -247,17 +247,17 @@ Doc comment origin: generalizes Midway’s starved WaitSema for **SotC-class** �
 
 | File |
 |------|
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\KernelHle.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Ps2System.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\SonyKernelHle.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\EmotionEngine.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\TeamIcoAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\MidwayFamilyAssist.cs` |
-| `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\KernelHle.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Ps2System.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\SonyKernelHle.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\EmotionEngine.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\TeamIcoAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\MidwayFamilyAssist.cs` |
+| `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` |
 
 **Related debt map:** `docs/infra-audits/gamequirks-infra-debt.md` §3 (EE thread / WaitSema theme).

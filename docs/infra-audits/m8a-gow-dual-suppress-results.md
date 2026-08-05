@@ -3,7 +3,7 @@
 **Date:** 2026-08-04  
 **Tip:** `e68ed88` (+ local `GodOfWarAssist` / `SonyKernelHle` gates; **no push**)  
 **Budget:** **diagnose (20M)** via `scoreboard-metrics` + `--host-present`  
-**Media:** `user-media-god-of-war.json` → `C:/Users/xxraz/Downloads/GodofWar(USA).iso` (**present**)  
+**Media:** `user-media-god-of-war.json` → `C:/Users/user/Downloads/GodofWar(USA).iso` (**present**)  
 **Seed:** `docs/infra-audits/m8a-b3-gow-evidence-seed.md`  
 **Build:** Release → `out/scoreboard-build`  
 **Related:** `docs/infra-audits/m8a-b3-dual-suppress-results.md` (B3 plant soft-off; Prefer already off)

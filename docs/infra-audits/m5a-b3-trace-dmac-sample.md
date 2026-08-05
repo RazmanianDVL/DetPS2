@@ -4,7 +4,7 @@
 **Tip:** `f19144e`  
 **Budget:** **diagnose (20M)** via `blocker-trace` + `--host-present`  
 **Env:** `DETPS2_TRACE_DMAC=1` (print only; zero DMA behavior change)  
-**Media:** `burnout-only.json` → `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` (**present**)  
+**Media:** `burnout-only.json` → `C:/Users/user/Downloads/Burnout3Takedown.iso` (**present**)  
 **Build:** Release → `out/scoreboard-build/DetPS2.Core.dll`  
 **Design:** `docs/infra-audits/m5a-dmac-vif-gif-completion-design.md` §4.2 Phase 0 / §8 Q1–Q5  
 **Scope:** measurement only. **No Core code changes. No push.**

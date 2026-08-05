@@ -2,7 +2,7 @@
 
 **Source image:** `Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` (4 MiB)  
 **Method:** `RomdirExtractor` → extract IRX ELFs → Ghidra 12.1.2 headless (`MIPS:LE:32:default`)  
-**Scripts:** `C:\Users\xxraz\ghidra\scripts\BiosModuleDecomp.java`  
+**Scripts:** `C:\Users\user\ghidra\scripts\BiosModuleDecomp.java`  
 **Artifacts:** `tools/bios-extract/*.bin`, `tools/bios-decomp/*_ALL.txt`  
 **Do not commit BIOS blobs.** Extracted modules are local diagnostics only.
 

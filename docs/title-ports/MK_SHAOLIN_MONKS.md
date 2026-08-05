@@ -5,10 +5,10 @@
 | Title | Mortal Kombat - Shaolin Monks (USA) |
 | Serial | `SLUS_210.87` |
 | Media id | `mk-shaolin-monks` |
-| ISO | `C:/Users/xxraz/Downloads/MortalKombatShaolinMonks(USA).iso` |
-| BIOS | `C:/Users/xxraz/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
+| ISO | `C:/Users/user/Downloads/MortalKombatShaolinMonks(USA).iso` |
+| BIOS | `C:/Users/user/Documents/PCSX2/bios/Sony PlayStation 2 BIOS (E)(v2.0)(2004-06-14)[SCPH70008].bin` |
 | Config | `user-media-mk.json` |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` |
+| Worktree | `C:\Users\user\.grok\worktrees\windows-detps2\detps2` |
 | Agent date | 2026-07-31 (MENU-SM free-ride residual + pad queue) |
 | ROMDIR gate | **CLOSED** |
 | Branch | main worktree `detps2` |

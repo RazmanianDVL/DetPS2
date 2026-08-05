@@ -123,7 +123,7 @@ Bucket rules from `docs/infra-audits/m7c-path23-image-delivery-design.md` §3–
 
 | Title | out | err | json |
 |-------|-----|-----|------|
-| GoW | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\traces\user-media-god-of-war-claim-20260804-130624-out.txt` | `…-err.txt` | `…json` |
+| GoW | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\traces\user-media-god-of-war-claim-20260804-130624-out.txt` | `…-err.txt` | `…json` |
 | BO2 | `…\user-media-bloodomen2-claim-20260804-130652-out.txt` | `…-err.txt` | `…json` |
 | DA | `…\user-media-da-claim-20260804-130709-out.txt` | `…-err.txt` | `…json` |
 | Dec | `…\user-media-deception-claim-20260804-130730-out.txt` | `…-err.txt` | `…json` |

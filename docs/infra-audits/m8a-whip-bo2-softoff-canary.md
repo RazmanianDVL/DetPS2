@@ -29,8 +29,8 @@
 
 ISO paths (both **present** this host):
 
-- Whip: `C:/Users/xxraz/Downloads/Whiplash(USA).iso`
-- BO2: `C:/Users/xxraz/Downloads/Blood Omen 2 - The Legacy of Kain Series (USA).iso`
+- Whip: `C:/Users/user/Downloads/Whiplash(USA).iso`
+- BO2: `C:/Users/user/Downloads/Blood Omen 2 - The Legacy of Kain Series (USA).iso`
 
 ---
 

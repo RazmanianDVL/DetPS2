@@ -67,8 +67,8 @@ See `ROMDIR_GATE.md` rows 1–26 + PADMAN/SIO2MAN/EESYNC.
 |----------|----------|
 | Extracted IRX | `tools/bios-extract/*.irx` (**local; do not commit BIOS blobs**) |
 | Prior full decomp | `tools/bios-decomp/*_ALL.txt` |
-| This pass | `C:\Users\xxraz\ghidra\bios_module_audit\{SECRMAN,UDNL,CLEARSPU,LIBSD}_ALL.txt` |
-| Ghidra projects | `C:\Users\xxraz\ghidra\projects\PS2Bios.gpr`, `BiosAudit_*` |
+| This pass | `C:\Users\user\ghidra\bios_module_audit\{SECRMAN,UDNL,CLEARSPU,LIBSD}_ALL.txt` |
+| Ghidra projects | `C:\Users\user\ghidra\projects\PS2Bios.gpr`, `BiosAudit_*` |
 
 ---
 

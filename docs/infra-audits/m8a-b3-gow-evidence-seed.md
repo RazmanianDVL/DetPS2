@@ -43,8 +43,8 @@ Haven/Vexx are the quiet-retire **checklist** seats. **B3 and GoW remain open** 
 
 Absolute assist paths:
 
-- `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs`
-- `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs`
+- `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs`
+- `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs`
 - Registry: `GameQuirkRegistry.cs` — `SLUS_210.50` → B3; `SCUS_973.99` → GoW
 
 ### 2.1 Burnout 3 — **RAM plant only** (Prefer intentionally OFF)

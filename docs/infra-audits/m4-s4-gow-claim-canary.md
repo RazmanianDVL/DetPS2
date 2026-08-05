@@ -5,7 +5,7 @@
 **Mode:** ops claim A/B only — **no Core changes**, **no plant default flip**, **no push**.  
 **Budget:** **claim (100M)** via `scoreboard-metrics` + `--host-present`  
 **Fleet id:** `god-of-war` (`tools/scoreboard-fleet.json`)  
-**Media:** `user-media-god-of-war.json` → `C:/Users/xxraz/Downloads/GodofWar(USA).iso` (**present**)  
+**Media:** `user-media-god-of-war.json` → `C:/Users/user/Downloads/GodofWar(USA).iso` (**present**)  
 **Build:** Release → `out/scoreboard-build`  
 **Related:**  
 - `docs/infra-audits/m4-s4-ee-mirror-design.md` §6.2 G-S4 / Q9  

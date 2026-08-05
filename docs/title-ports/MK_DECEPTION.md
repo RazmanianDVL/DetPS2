@@ -5,12 +5,12 @@
 | **Title** | Mortal Kombat - Deception (USA) |
 | **user-media id** | `mk-deception` |
 | **Serial / BOOT2** | `SLUS_208.81` |
-| **ISO** | `C:/Users/xxraz/Downloads/MortalKombatDeception(USA).iso` |
+| **ISO** | `C:/Users/user/Downloads/MortalKombatDeception(USA).iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-deception.json` |
 | **Assist** | `MidwayFamilyAssist` **REGION DEC** (`IsDeception`) |
 | **Seat** | **S2 MIDWAY-DEC** / residual main worktree `detps2` |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2` (live pad residual) |
+| **Worktree** | `C:\Users\user\.grok\worktrees\windows-detps2\detps2` (live pad residual) |
 | **Branch** | main worktree `detps2` (historical seat: `agent/seat-s2/s2-g2`) |
 | **ROMDIR gate** | **CLOSED** |
 | **Status** | **MENU YES** hold · **P1 INTERACTIVE YES** (pad free-ride remeasure) · **G-GFX-3 partial** Host→Local — PL-012 + PL-029 + MENU-DEC-2 + freelist rehome |
@@ -242,7 +242,7 @@ EE idle pump @0x1B6A68 / process wrapper @0x1B5D10
 ## Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s2
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s2
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s2 --nologo
 $env:DETPS2_TRACE_BIOS='1'

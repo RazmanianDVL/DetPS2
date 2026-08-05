@@ -24,16 +24,16 @@
 
 | File | Absolute path | Classification (one line) |
 |------|---------------|---------------------------|
-| `IGameQuirkModule.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\IGameQuirkModule.cs` | **SDK** — extension contract; documents that quirks exist because HLE/IOP is incomplete, not performance. |
-| `GameQuirkRegistry.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GameQuirkRegistry.cs` | **SDK** — serial→factory table only; no timing/SIF/DMA behavior. |
-| `MidwayBootAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` | **INFRA-heavy (SM)** — SIF force-init, starved WaitSema/Sleep, real SIF CD synthesis, CRI/ADXF plants, resource-stream force, PATH3/logo residual; not pure perf. |
-| `MidwayFamilyAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\MidwayFamilyAssist.cs` | **INFRA** — IOPRP/PADMAN version policy + SN FILEIO + MFL/MSL path/ring bridges + display-queue/lock escapes; Host→Local gameart is **PRESENT**. |
-| `BloodOmen2SnAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` | **INFRA** — SN ProDG scan stubs + cdrom short-name + IOPRP `"2340"`/UDNL arg (UDNL/path HLE); chrome/pad are **PRESENT**/**INTERACTIVE**. |
-| `Burnout3Assist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` | **INFRA** — IOPRP `"2800"` plant + GS flip pending via **CreditOwedHandlerCall** (DMA IRQ timing) + LGDEV/SIF thrash stubs; stage plant/pad **SECONDARY**/**INTERACTIVE**. |
-| `GodOfWarAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` | **INFRA** — IOPRP `"3000"`/FreezeCache + empty-SIF poll + worker SwitchTo/SignalSema + sticky GIF DMA tags; heap/BST escapes **SECONDARY**; R_SHELL feed **PRESENT**. |
-| `TeamIcoAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\TeamIcoAssist.cs` | **INFRA** (good pattern) — PreferIopRpGetVersion only for SotC/Ico; Haven adds VIF busy/IRQ, JREXIT/`$ra` rescue, WaitSema pulse; soft-float register is **PERF**; Host→Local **PRESENT**. |
-| `VexxAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` | **INFRA** — IOPRP + host-served CD I/O (FILEIO/SIF never binds) + STREE CRC stream + AAAIOP sid HLE + freelist/list escapes; pad **INTERACTIVE**. |
-| `WhiplashAssist.cs` | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` | **INFRA** — UsingCD force + IOPRP `"2550"` + FlushCache JREXIT/WaitSema rescue + GOE/RKV warm; Host→Local firstscreen **PRESENT**; pad **INTERACTIVE**. |
+| `IGameQuirkModule.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\IGameQuirkModule.cs` | **SDK** — extension contract; documents that quirks exist because HLE/IOP is incomplete, not performance. |
+| `GameQuirkRegistry.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GameQuirkRegistry.cs` | **SDK** — serial→factory table only; no timing/SIF/DMA behavior. |
+| `MidwayBootAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` | **INFRA-heavy (SM)** — SIF force-init, starved WaitSema/Sleep, real SIF CD synthesis, CRI/ADXF plants, resource-stream force, PATH3/logo residual; not pure perf. |
+| `MidwayFamilyAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\MidwayFamilyAssist.cs` | **INFRA** — IOPRP/PADMAN version policy + SN FILEIO + MFL/MSL path/ring bridges + display-queue/lock escapes; Host→Local gameart is **PRESENT**. |
+| `BloodOmen2SnAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` | **INFRA** — SN ProDG scan stubs + cdrom short-name + IOPRP `"2340"`/UDNL arg (UDNL/path HLE); chrome/pad are **PRESENT**/**INTERACTIVE**. |
+| `Burnout3Assist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` | **INFRA** — IOPRP `"2800"` plant + GS flip pending via **CreditOwedHandlerCall** (DMA IRQ timing) + LGDEV/SIF thrash stubs; stage plant/pad **SECONDARY**/**INTERACTIVE**. |
+| `GodOfWarAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` | **INFRA** — IOPRP `"3000"`/FreezeCache + empty-SIF poll + worker SwitchTo/SignalSema + sticky GIF DMA tags; heap/BST escapes **SECONDARY**; R_SHELL feed **PRESENT**. |
+| `TeamIcoAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\TeamIcoAssist.cs` | **INFRA** (good pattern) — PreferIopRpGetVersion only for SotC/Ico; Haven adds VIF busy/IRQ, JREXIT/`$ra` rescue, WaitSema pulse; soft-float register is **PERF**; Host→Local **PRESENT**. |
+| `VexxAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` | **INFRA** — IOPRP + host-served CD I/O (FILEIO/SIF never binds) + STREE CRC stream + AAAIOP sid HLE + freelist/list escapes; pad **INTERACTIVE**. |
+| `WhiplashAssist.cs` | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` | **INFRA** — UsingCD force + IOPRP `"2550"` + FlushCache JREXIT/WaitSema rescue + GOE/RKV warm; Host→Local firstscreen **PRESENT**; pad **INTERACTIVE**. |
 
 **None of the runtime modules are “pure performance only.”** Closest to PERF: Haven soft-float host registration (cycle cost of interpreter soft-double), which still unblocks FILEIO/DLL.DAT timing rather than shaving FPS for its own sake.
 
@@ -234,8 +234,8 @@ Intentionally **does not** run SM CRI/logo plants — narrower than MidwayBootAs
 
 | Artifact | Path |
 |----------|------|
-| Quirks dir | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\` |
-| SM assist (lives outside folder, registered as module) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` |
+| Quirks dir | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\` |
+| SM assist (lives outside folder, registered as module) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\MidwayBootAssist.cs` |
 | Policy | `docs/TITLE_HACKS.md`, `docs/DEVELOPER_GUIDE.md` §7 |
 | Related IRX/SIF notes | `docs/irx/SIF_BRIDGE.md`, `docs/irx/UDNL_IOPRP.md`, `docs/bios-ports/SIFINIT_EESYNC.md` |
 

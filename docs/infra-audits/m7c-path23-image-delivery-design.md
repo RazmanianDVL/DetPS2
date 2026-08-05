@@ -201,12 +201,12 @@ Deferred. Whatever mechanism Slice 2a's data motivates will need its own diagnos
 
 | Artifact | Path |
 |---|---|
-| Parent M7-a design | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7a-path23-image-dispfb-design.md` |
-| A0 inventory | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7-a0-residual-inventory.md` |
-| PATH3 mask matrix | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\graphics\PATH3_MASK_MATRIX.md` |
-| M4-S4-MIRROR (structural template) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
-| Gif.cs packet state machine | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Gif.cs` |
-| MK:DA title port (gifP3=6 signature) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\title-ports\MK_DEADLY_ALLIANCE.md` |
+| Parent M7-a design | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7a-path23-image-dispfb-design.md` |
+| A0 inventory | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m7-a0-residual-inventory.md` |
+| PATH3 mask matrix | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\graphics\PATH3_MASK_MATRIX.md` |
+| M4-S4-MIRROR (structural template) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
+| Gif.cs packet state machine | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\Gif.cs` |
+| MK:DA title port (gifP3=6 signature) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\title-ports\MK_DEADLY_ALLIANCE.md` |
 
 ---
 

@@ -2,7 +2,7 @@
 import struct
 import sys
 
-iso = r"C:/Users/xxraz/Downloads/Vexx(USA).iso"
+iso = r"C:/Users/user/Downloads/Vexx(USA).iso"
 lba = 0x156E32
 size = 3432732
 with open(iso, "rb") as f:

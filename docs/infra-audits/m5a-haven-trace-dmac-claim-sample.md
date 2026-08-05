@@ -6,7 +6,7 @@
 **Env:** `DETPS2_TRACE_DMAC=1` (print only; zero DMA behavior change)  
 **Fleet id:** `haven` (`tools/scoreboard-fleet.json`)  
 **Serial:** `SLUS_205.17`  
-**Media:** `user-media-haven.json` → `C:/Users/xxraz/Downloads/HavenCalloftheKing(USA).iso` (**present**)  
+**Media:** `user-media-haven.json` → `C:/Users/user/Downloads/HavenCalloftheKing(USA).iso` (**present**)  
 **Assist class:** TeamIco / `TeamIcoAssist` (loaded by title path; not modified this seat)  
 **Build:** Release → `out/scoreboard-build/DetPS2.Core.dll`  
 **Design:** `docs/infra-audits/m5a-dmac-vif-gif-completion-design.md` §1.2 Haven oracle / §8 Q2  

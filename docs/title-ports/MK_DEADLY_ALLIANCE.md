@@ -5,11 +5,11 @@
 | Title | Mortal Kombat - Deadly Alliance (USA) |
 | Serial | `SLUS_204.23` |
 | Media id | `mk-deadly-alliance` |
-| ISO | `C:/Users/xxraz/Downloads/MortalKombatDeadlyAlliance(USA).iso` |
+| ISO | `C:/Users/user/Downloads/MortalKombatDeadlyAlliance(USA).iso` |
 | BIOS | SCPH-70008 (E) v2.0 2004-06-14 |
 | Config | `user-media-da.json` |
 | Seat | **S3 MIDWAY-DA** |
-| Worktree | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3` |
+| Worktree | `C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s3` |
 | Branch | `agent/seat-s3/s2-g2` |
 | Owned | `MidwayFamilyAssist.cs` **REGION DA**, DA docs |
 | Forbidden | Dec-only regions thrash; Gs/Gif ownership; WaitSema fabricate global; Dmac END gate break |
@@ -228,7 +228,7 @@ Build: Core Release (`src/DetPS2.Core/bin/Release/net9.0`). Host-present. **No**
 ### Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release --nologo -v q
 # queue (preferred):
@@ -290,7 +290,7 @@ PL-045 host publish from force-dec gameart was correct (STFM@0x7F000), but broad
 ### Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 $env:DETPS2_TRACE_BIOS = "1"
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/menu-da2 --nologo -v q
@@ -342,7 +342,7 @@ Build: `out/seat-s3` Release. Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
 ### Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s3
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 $env:DETPS2_TRACE_BIOS = "1"
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
@@ -398,7 +398,7 @@ Build: `out/seat-s3` Release. Host-present. **No** `DETPS2_SEMA_STALL_YIELD`.
 ### Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s3
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 $env:DETPS2_TRACE_BIOS = "1"
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
@@ -421,7 +421,7 @@ pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget claim -BuildOut out
 ## Reproduce
 
 ```powershell
-cd C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s3
+cd C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s3
 Remove-Item Env:DETPS2_SEMA_STALL_YIELD -ErrorAction SilentlyContinue
 dotnet build src/DetPS2.Core/DetPS2.Core.csproj -c Release -o out/seat-s3 --nologo -v q
 pwsh ./tools/run-title.ps1 -Media user-media-da.json -Budget diagnose -BuildOut out/seat-s3 -SkipBuild -HostPresent

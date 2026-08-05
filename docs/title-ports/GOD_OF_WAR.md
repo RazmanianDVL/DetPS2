@@ -5,10 +5,10 @@
 | **Title** | God of War (USA) |
 | **user-media id** | `god-of-war` |
 | **Serial / BOOT2** | `SCUS_973.99` |
-| **ISO** | `C:/Users/xxraz/Downloads/GodofWar(USA).iso` |
+| **ISO** | `C:/Users/user/Downloads/GodofWar(USA).iso` |
 | **BIOS** | SCPH-70008 (E) v2.0 2004-06-14 |
 | **Media config** | `user-media-god-of-war.json` |
-| **Worktree** | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2-seat-s6` |
+| **Worktree** | `C:\Users\user\.grok\worktrees\windows-detps2\detps2-seat-s6` |
 | **Branch** | `agent/seat-s6/s2-g2` |
 | **Seat** | **S6 GOW** (PL-016 pad + **PL-023** thrash leave; owned `GodOfWarAssist.cs` + this doc) |
 | **ROMDIR gate** | **CLOSED** |

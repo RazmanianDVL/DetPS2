@@ -81,11 +81,11 @@ Three ways to "fix" this were considered and rejected as violating the M4-S4 des
 
 | Artifact | Path |
 |---|---|
-| Parent claim canary | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-gow-claim-canary.md` |
-| M4-S4 design (Q4 hedge) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
-| Original diagnose dual-suppress | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-gow-dual-suppress-results.md` |
-| GoW assist (plant/mirror/force-tag call sites) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` (see lines 353-434, 481-573) |
-| Raw trace artifacts (this investigation) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s4-timing-followup\` |
+| Parent claim canary | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-gow-claim-canary.md` |
+| M4-S4 design (Q4 hedge) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s4-ee-mirror-design.md` |
+| Original diagnose dual-suppress | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-gow-dual-suppress-results.md` |
+| GoW assist (plant/mirror/force-tag call sites) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` (see lines 353-434, 481-573) |
+| Raw trace artifacts (this investigation) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s4-timing-followup\` |
 
 ---
 

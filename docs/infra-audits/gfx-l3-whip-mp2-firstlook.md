@@ -8,7 +8,7 @@
 ## Method
 
 Read the real `WHIPLASH/MAP/*.MP2` files directly off the real ISO
-(`C:/Users/xxraz/Downloads/Whiplash(USA).iso`) via the existing real `Iso9660` reader
+(`C:/Users/user/Downloads/Whiplash(USA).iso`) via the existing real `Iso9660` reader
 (`Iso9660.OpenFile`/`FindFile`/`ReadFileRange` — the same code the real boot path uses, not a
 simulated/synthetic parse). Temp diagnostic (`Tests/TempMp2FirstLook.cs`, gated on
 `DETPS2_TEMP_MP2_ISO`) added, run, fully reverted (`git status` clean after, confirmed).

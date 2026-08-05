@@ -3413,24 +3413,24 @@ tool.
 
 ### 7.7 Ghidra + real R5900 decompilation — a new, permanent tool for this investigation
 
-Installed Ghidra 12.1.2 (`C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC`) plus the community
+Installed Ghidra 12.1.2 (`C:\Users\user\ghidra\ghidra_12.1.2_PUBLIC`) plus the community
 `chaoticgd/ghidra-emotionengine-reloaded` extension (real R5900 Sleigh spec — `sq`/`lq`/MMI/COP2,
 which stock Ghidra's generic MIPS spec doesn't implement at all and dies on immediately). Processor
 ID: `r5900:LE:32:default`. A `ShaolinMonks` project already exists at
-`C:\Users\xxraz\ghidra\projects` with `shaolin_boot.elf` (extracted via `extract-file` from the ISO,
+`C:\Users\user\ghidra\projects` with `shaolin_boot.elf` (extracted via `extract-file` from the ISO,
 `SLUS_210.87` per `SYSTEM.CNF`'s `BOOT2` line — **not** the first ISO file matching a loose `SLUS`
 substring search, which pulled a different, unrelated executable, `SURREAL/SLUS_211.89`, the first
 time) imported and fully auto-analyzed. Drive it headlessly (no GUI control available in this
 environment):
 
 ```
-cd C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC\support
-./analyzeHeadless.bat "C:/Users/xxraz/ghidra/projects" ShaolinMonks -process shaolin_boot.elf -noanalysis -scriptPath "C:/Users/xxraz/ghidra/scripts" -postScript DecompileTargets.java
+cd C:\Users\user\ghidra\ghidra_12.1.2_PUBLIC\support
+./analyzeHeadless.bat "C:/Users/user/ghidra/projects" ShaolinMonks -process shaolin_boot.elf -noanalysis -scriptPath "C:/Users/user/ghidra/scripts" -postScript DecompileTargets.java
 ```
 
-`C:\Users\xxraz\ghidra\scripts\DecompileTargets.java` is a small reusable GhidraScript — edit its
+`C:\Users\user\ghidra\scripts\DecompileTargets.java` is a small reusable GhidraScript — edit its
 `targets` list (hex addresses) and rerun; it writes pseudo-C for each containing function to
-`C:\Users\xxraz\ghidra\decompiled_targets.txt`. This is dramatically faster than hand-disassembling:
+`C:\Users\user\ghidra\decompiled_targets.txt`. This is dramatically faster than hand-disassembling:
 what follows was found in minutes, not hours.
 
 **`0x00475BA8` is `vsscanf`.** The switch on format-specifier characters (`%d %f %s %[ %x %o %c %n
@@ -3748,7 +3748,7 @@ pushed to 400M and it's frozen too, just later than everything else.
 **New tool: PCSX2's PINE interface, enabled and verified working this session.** The user gave
 explicit permission to edit PCSX2's own config and run it from this admin console directly (no
 GUI/computer-use needed for this part). `EnablePINE = true` in
-`C:\Users\xxraz\Documents\PCSX2\inis\PCSX2.ini` (`PINESlot = 28011` already present, just off).
+`C:\Users\user\Documents\PCSX2\inis\PCSX2.ini` (`PINESlot = 28011` already present, just off).
 Verified end-to-end: `pcsx2-qtx64.exe -batch -- <iso path>` (⚠ `-nogui` specifically hung
 indefinitely with a real ISO in this version — memory stayed flat at ~64MB and the PINE port never
 opened; `-batch` with a visible window works fine and is what actually got used) then a raw TCP
@@ -4420,7 +4420,7 @@ Follow-up, same session. §7.19 guessed VSync as the likely mechanism; wrong gue
 the right tool the right question instead of continuing to speculate. A `ShaolinMonks.gpr` Ghidra
 project for the real `shaolin_boot.elf` already existed from earlier work — wrote three small headless
 scripts (`FindFlagXrefs.java`, `FindCallers.java`/`FindCallers2/3/4.java`, all in
-`C:\Users\xxraz\ghidra\scripts\`) to walk `ReferenceManager.getReferencesTo()` instead of guessing from
+`C:\Users\user\ghidra\scripts\`) to walk `ReferenceManager.getReferencesTo()` instead of guessing from
 raw disassembly, and cross-checked every step live against `disasm`/`--pcbreak`.
 
 **Found real, unconditional writers.** `0x5341D8` (and five neighboring flags, `0x5341E8`
@@ -5158,13 +5158,13 @@ surface. Don't build on them; if you need similar tooling for a new title, write
 generalize `blocker-trace`'s options instead.
 
 **Ghidra (installed 2026-07-27, see §7.7 for the full setup)** at
-`C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC`, with the `chaoticgd/ghidra-emotionengine-reloaded`
+`C:\Users\user\ghidra\ghidra_12.1.2_PUBLIC`, with the `chaoticgd/ghidra-emotionengine-reloaded`
 extension for real R5900 support (stock Ghidra's generic MIPS spec doesn't know `sq`/`lq`/MMI and
 dies immediately on function prologues that use them — nearly all of them). Reach for this **before**
 hand-disassembling anything non-trivial — decompiling to pseudo-C answers "what does this do" in
 seconds instead of hours of manual opcode reading, as demonstrated in §7.7 (identified `0x00475BA8`
 as `vsscanf` and proved its one real caller can never produce the observed bug, both in one pass).
-Drive it headlessly via `analyzeHeadless.bat` + a `GhidraScript` (`C:\Users\xxraz\ghidra\scripts\
+Drive it headlessly via `analyzeHeadless.bat` + a `GhidraScript` (`C:\Users\user\ghidra\scripts\
 DecompileTargets.java` is a ready-made, reusable one — edit its address list and rerun) since there's
 no GUI control in this environment. The `ShaolinMonks` project (import of the real boot ELF,
 extracted via `extract-file` using the exact `SYSTEM.CNF` `BOOT2` path, not a loose substring match)

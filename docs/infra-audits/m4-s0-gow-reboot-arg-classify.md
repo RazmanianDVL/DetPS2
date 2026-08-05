@@ -190,13 +190,13 @@ There is **no** "first real UDNL" event to timestamp under either arm.
 
 | File | Path |
 |------|------|
-| Baseline err | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-err.txt` |
-| Baseline out | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-out.txt` |
-| Plant-off err | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-plantoff-err.txt` |
-| Plant-off out | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-plantoff-out.txt` |
-| Filtered extract | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\reboot-relevant-extract.txt` |
-| This note | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s0-gow-reboot-arg-classify.md` |
-| Design parent | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s0-gow-udnl-arg-design.md` |
+| Baseline err | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-err.txt` |
+| Baseline out | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-out.txt` |
+| Plant-off err | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-plantoff-err.txt` |
+| Plant-off out | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\claim-100m-plantoff-out.txt` |
+| Filtered extract | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\out\canaries\m4-s0-gow-trace\20260804-131359\reboot-relevant-extract.txt` |
+| This note | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s0-gow-reboot-arg-classify.md` |
+| Design parent | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4-s0-gow-udnl-arg-design.md` |
 
 ---
 

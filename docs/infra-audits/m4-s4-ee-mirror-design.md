@@ -84,7 +84,7 @@ FILEIO-2200 **arm** still uses Prefer + iopVer ≥ 3000 (M4-g freeze list). **S4
 ## 2. Current per-title plants inventory
 
 Grep surface: `PlantIopRpVersion` / `IopVersion*` / PreferIopRp in  
-`C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\*.cs`  
+`C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\*.cs`  
 (+ policy-only rows for contrast).
 
 ### 2.1 Legend
@@ -462,18 +462,18 @@ With `DETPS2_TRACE_REBOOT=1` + `DETPS2_TRACE_MIRROR=1`:
 
 | Artifact | Path |
 |----------|------|
-| M4 unification seed (S4 row) | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\UDNL_GETVERSION_UNIFICATION.md` |
-| M4-g FILEIO packing | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4g-fileio-getversion-tag-if-applied.md` |
-| GoW dual-suppress | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-gow-dual-suppress-results.md` |
-| B3 dual-suppress | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-b3-dual-suppress-results.md` |
-| B3/GoW evidence seed | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-b3-gow-evidence-seed.md` |
-| Quirks debt | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\gamequirks-infra-debt.md` |
-| GoW assist | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` |
-| B3 assist | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` |
-| BO2 assist | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` |
-| Vexx assist | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` |
-| Whip assist | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
-| RealSifRpc tag store | `C:\Users\xxraz\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\RealSifRpc.cs` |
+| M4 unification seed (S4 row) | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\UDNL_GETVERSION_UNIFICATION.md` |
+| M4-g FILEIO packing | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m4g-fileio-getversion-tag-if-applied.md` |
+| GoW dual-suppress | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-gow-dual-suppress-results.md` |
+| B3 dual-suppress | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-b3-dual-suppress-results.md` |
+| B3/GoW evidence seed | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\m8a-b3-gow-evidence-seed.md` |
+| Quirks debt | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\docs\infra-audits\gamequirks-infra-debt.md` |
+| GoW assist | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\GodOfWarAssist.cs` |
+| B3 assist | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\Burnout3Assist.cs` |
+| BO2 assist | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\BloodOmen2SnAssist.cs` |
+| Vexx assist | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\VexxAssist.cs` |
+| Whip assist | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\GameQuirks\WhiplashAssist.cs` |
+| RealSifRpc tag store | `C:\Users\user\.grok\worktrees\windows-detps2\detps2\src\DetPS2.Core\RealSifRpc.cs` |
 
 ---
 

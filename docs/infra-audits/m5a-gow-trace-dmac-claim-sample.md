@@ -4,7 +4,7 @@
 **Tip (docs):** `2dab89b`+  
 **Budget:** **claim 100M** via `blocker-trace` + `--host-present`  
 **Env:** `DETPS2_TRACE_DMAC=1` (print only; zero DMA behavior change)  
-**Media:** `user-media-god-of-war.json` → `C:/Users/xxraz/Downloads/GodofWar(USA).iso` (**present**)  
+**Media:** `user-media-god-of-war.json` → `C:/Users/user/Downloads/GodofWar(USA).iso` (**present**)  
 **Build:** Release → `out/scoreboard-build/DetPS2.Core.dll`  
 **Design:** `docs/infra-audits/m5a-dmac-vif-gif-completion-design.md` §8 **Q3**  
 **Rollup:** `docs/infra-audits/m5a-q1-q5-evidence-rollup.md`  

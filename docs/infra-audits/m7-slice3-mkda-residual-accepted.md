@@ -36,7 +36,7 @@ dotnet exec out/scoreboard-build/DetPS2.Core.dll blocker-trace user-media-da.jso
 Remove-Item Env:DETPS2_TRACE_GIF_BISECT
 ```
 
-**Media:** `user-media-da.json` → `C:/Users/xxraz/Downloads/MortalKombatDeadlyAlliance(USA).iso`  
+**Media:** `user-media-da.json` → `C:/Users/user/Downloads/MortalKombatDeadlyAlliance(USA).iso`  
 **Wall:** ~19.4 s, EXIT=0
 
 ---

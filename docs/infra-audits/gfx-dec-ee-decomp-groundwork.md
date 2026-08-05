@@ -19,9 +19,9 @@
 
 | Piece | Path / note |
 |-------|-------------|
-| Ghidra | `C:\Users\xxraz\ghidra\ghidra_12.1.2_PUBLIC` |
+| Ghidra | `C:\Users\user\ghidra\ghidra_12.1.2_PUBLIC` |
 | R5900 language | `ghidra-emotionengine-reloaded` → **`r5900:LE:32:default`** |
-| Scripts | `C:\Users\xxraz\ghidra\scripts\` (`DecompileTargets`, `BiosModuleDecomp`, new Dec helpers) |
+| Scripts | `C:\Users\user\ghidra\scripts\` (`DecompileTargets`, `BiosModuleDecomp`, new Dec helpers) |
 | CLI extract | `detps2 extract-file <iso> <path> <out>` |
 | CLI sections | `detps2 elf-sections` |
 | Prior EE projects | ShaolinMonks, Burnout3, Whiplash (same recipe) |
@@ -37,7 +37,7 @@ Local-only machine paths: see gitignored `TOOLING.local.md`.
 | ISO | `MortalKombatDeception(USA).iso` |
 | SYSTEM.CNF | `BOOT2 = cdrom0:\SLUS_208.81;1` |
 | Boot ELF | **`SLUS_208.81`**, 5,072,296 bytes |
-| Local scratch (never commit) | `C:\Users\xxraz\ghidra\dec_ee\dec_boot.elf` + `SYSTEM.CNF` |
+| Local scratch (never commit) | `C:\Users\user\ghidra\dec_ee\dec_boot.elf` + `SYSTEM.CNF` |
 | ELF identity | `e_machine=8` (MIPS), `e_entry=0x00100008`, single large PT_LOAD `@0x00100000` size `0x4D6280` |
 
 ---
@@ -52,7 +52,7 @@ analyzeHeadless … MkDeception -import dec_boot.elf
 
 | Check | Result |
 |-------|--------|
-| Project | `C:\Users\xxraz\ghidra\projects\MkDeception` program **`dec_boot.elf`** |
+| Project | `C:\Users\user\ghidra\projects\MkDeception` program **`dec_boot.elf`** |
 | Language | `r5900:LE:32:default` (postScript confirmed) |
 | Auto-analysis | **succeeded** (~97s): Disassemble, Function, R5900 Constant Ref, Stack, Decompiler Switch, etc. |
 | Import | **REPORT: Import succeeded** |
@@ -103,7 +103,7 @@ count?, pad, name_ptr, other_ptr, …
 **Implication for CLUT:** consumers almost certainly walk this table (or a loader keyed by these paths), not hardcode `"gameart.ssf"` in a single `jal`. Next step is **find table base + walkers** (Ghidra refs to table base / `lui`+`addiu` half-immediates for `0x0050ADxx`), then decompile open/read → decode → GS upload chain.
 
 Artifacts (gitignored machine-local):  
-`C:\Users\xxraz\ghidra\dec_ee\gameart-xrefs.txt`, `gameart-inspect.txt`, `string-scan.txt`, `ghidra-import.log`.
+`C:\Users\user\ghidra\dec_ee\gameart-xrefs.txt`, `gameart-inspect.txt`, `string-scan.txt`, `ghidra-import.log`.
 
 ---
 
@@ -133,7 +133,7 @@ Artifacts (gitignored machine-local):
 
 - No Core, no Host→Local invent, no re-opening refuted SEC e=1 / e=8–13 as CLUT without new EE evidence.  
 - Do not commit `dec_boot.elf` / BIOS / ISO extracts.  
-- Ghidra project stays on local machine under `C:\Users\xxraz\ghidra\`.
+- Ghidra project stays on local machine under `C:\Users\user\ghidra\`.
 
 ---
 
