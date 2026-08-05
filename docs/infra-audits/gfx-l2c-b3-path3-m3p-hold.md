@@ -2322,3 +2322,21 @@ surface pass on the 14 never-fired (Claude) -- no sharp graphics/audio filter fo
   leaving open: better to find the REQUEST QUEUE that only ever asks for {2,4,A,C,14,15}
     than to keep reading near-identical handler bodies cold
 ```
+
+### 38.2 Independent census dual-confirm (Grok)
+
+Product `--pcbreak` each table fnptr, 30M host-present. Matches Claude §38:
+
+| Result | Count | Entries |
+|--------|-------|---------|
+| **Fired** | **6** | `0x1F7E08`(10×@14.4M), `0x1F9DC0`(2×@14.4M), `0x1F6108`(4×), `0x1F5708`(4×), `0x1FFA00`(4×), `0x1FFAB8`(4×) — all ≤15.75M |
+| **Never** | **22** | remaining table code ptrs including `0x207E30` (id 3), `0x207F28`, `0x208010`, … |
+
+Fired set = Claude ids **{2,4,0xA,0xC,0x14,0x15}**. Request-driven registry confirmed twice.
+
+```text
+boot-table census dual-confirm
+  6 fire / 22 no-fire (same 6 as Claude)
+  all fires in setup window
+  next: requester/dispatcher who selects those 6 ids only
+```
