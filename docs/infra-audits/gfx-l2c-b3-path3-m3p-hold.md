@@ -2966,3 +2966,90 @@ state RESULT
   IS black post-setup plateau: cdvd flat 1865, gifP1=0, held third batch, EE thrash
   next: mode/load phase after display-env stage4 (not 4th unmask inside finished chain)
 ```
+
+---
+
+## 49. Found existing prior-campaign machinery: an IOP/FILEIO escape chain, and a likely real limiter — a single 64KB iovec slice with a hard terminator (Claude)
+
+Before starting a fresh static hunt for "what advances mode/load after stage 4," checked
+whether this repo already has prior work on B3 specifically — it does, extensively.
+`src/DetPS2.Core/GameQuirks/Burnout3Assist.cs` (2496 lines, dated 2026-07-30) is an entire
+prior campaign's worth of named, staged IOP/IRX/LGDEV/CDVD boot-progress assists, already
+wired into `OnHostPresent` and active during every run tonight. It already defines the exact
+sector-count buckets we've been feeling around for blind: `irxOnly` (400-600),
+`stagePlantOnly` (600-2000), `postTxd` (>=2000, triggers `MaybePlantFrontendTxd`),
+`frontendEra` (>=6000) — our whole night's `cdvdSectors=1865` final state sits squarely in
+`stagePlantOnly`, one bucket short of `postTxd`.
+
+### 49.1 Live trace of this machinery (temp `DETPS2_TRACE_BIOS=1`, no Core, just enabling existing tracing)
+
+Ran the standard 30M-cycle command with this **already-existing** trace flag on (not new
+instrumentation — just reading output the codebase already produces):
+
+```text
+cyc=18.0M-20.0M   LGDEV entry/CallRpc stub plants
+cyc=22.3M-26.5M   boot-wait-flag plants ×12 (cdvd still 425 throughout)
+cyc=28.0M         plant STAGEHED @ 0x01900000 size=374784 (real DATA/STAGEHED.BIN off the ISO)
+cyc=28.85M        escape empty iovec  n=1  cdvd=609 -> jumps to cdvd=1865 shortly after
+cyc=34.7M-47.5M   boot-wait-flag plants continue (n=32, n=64) -- cdvd stays flat at 1865
+```
+
+**This confirms Grok's flat-1865 finding directly from the source, and narrows it to one
+specific event: the single "escape empty iovec" firing (`n=1`) is what produces the whole
+609→1865 jump, and it never fires a second time (`_ioQueueEscapes` caps at 256, but nothing
+after `n=1` ever re-enters the scanning PC range that would trigger `n=2`).**
+
+### 49.2 The likely limiter: a 64KB single-slice plant with an immediate terminator
+
+Read `MaybeEscapeEmptyIoQueue`/`MaybePlantStageAssets` directly. `STAGEHED.BIN` is read in
+full from the real mounted ISO (374,784 real bytes, genuinely off-disc — this is not
+fabricated data) and placed correctly in RDRAM. But the iovec entry the escape assist plants
+for the game's own iovec-walk loop is:
+
+```csharp
+uint plantSize = Math.Min(_stageHedSize, 0x10000u); // first 64KiB slice
+sys.Memory.Write32(s4 + 0, _stageHedEeAddr);
+sys.Memory.Write32(s4 + 4, plantSize);
+// Terminator after one entry.
+sys.Memory.Write32(s4 + 8, 0);
+sys.Memory.Write32(s4 + 12, 0);
+```
+
+**Only the first 64KB of the 374,784-byte real asset is ever exposed to the game's own
+consume loop (`jal 0x123F58` at the redirect target `0x122A18`/`0x122A40`), followed
+immediately by a hard `{0,0}` terminator entry.** If the real game logic expects to walk a
+multi-entry iovec list (one entry per chunk) until it has consumed the whole 374,784-byte
+asset — which is the natural read of "iovec queue," and consistent with `_ioQueueEscapes`
+being designed to support up to 256 separate escape events — then this single-shot,
+hard-terminated plant would explain *exactly* the observed shape: one real unlock (609→1865)
+then a permanent stop, because the loop is told "there is nothing more" after just the first
+17.5% of the real asset.
+
+### 49.3 Why this is worth prioritizing over more static tracing
+
+This isn't a hypothesis built from scratch tonight — it's a concrete, already-identified
+mechanism, already reading real ISO bytes, that stops one step short of what its own design
+(`_ioQueueEscapes` cap of 256, multi-chunk framing) suggests it was meant to do. Per this
+project's standing doctrine (find the missing real mechanism, don't hand-synthesize the
+end state), the fix shape — if this is confirmed — would be: **plant the full iovec chain
+across as many 64KB-capped entries as `STAGEHED.BIN`'s real size requires (ceil(374784/65536)
+= 6 entries), terminating only after the last real chunk**, rather than always stopping at
+one. Not yet implemented or even fully confirmed (haven't verified the consumer at `0x123F58`
+actually re-enters the scan loop for a second entry rather than doing something else with a
+multi-entry list) — flagging this now because it's the sharpest, most concrete lead of the
+whole night and directly explains the exact plateau number (1865) rather than requiring more
+guessing.
+
+```text
+existing B3 quirk machinery (Claude) -- found real prior work, a likely concrete limiter
+  Burnout3Assist.cs (2026-07-30): full staged IOP/CDVD boot-assist chain, already active
+  DETPS2_TRACE_BIOS=1 (existing flag) shows exactly ONE "escape empty iovec" firing (n=1)
+    produces the whole 609->1865 jump, then permanent silence through 50M
+  STAGEHED.BIN (374,784 real ISO bytes) loaded correctly, but iovec plant exposes only
+    the FIRST 64KB with a hard terminator right after -- likely why n=2 never fires
+  proposed fix shape (not yet implemented): plant the full 6-entry chain instead of 1,
+    terminate only after the real last chunk -- matches the "find the real mechanism,
+    don't hand-synthesize" doctrine
+  next: confirm the 0x123F58 consumer actually wants to re-enter the scan for more entries
+    before touching Core -- this needs dual-ACK + design doc like any other Core change
+```
