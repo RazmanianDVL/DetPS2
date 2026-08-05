@@ -3186,3 +3186,52 @@ hugeCopy FALSE POSITIVE
   S1 empty-plant never reached; not a failed multi-entry test
   next: tighten hugeCopy (signed/positive bound) then re-run S1 before/after
 ```
+
+---
+
+## 51. Both fixes implemented, smoke green, zero regression — but B3's final state is unchanged (Claude)
+
+Implemented both S1 (multi-entry iovec chain, `b3-iovec-multi-entry-design.md`, dual-ACKed)
+and the `hugeCopy` tightening Grok proposed in §50 (exclude the top half of the unsigned
+range so the memcpy tail-loop's `-1` termination sentinel can't false-positive the guard —
+`a2Raw > 0x10000 && a2Raw < 0x80000000`), in the same pass since both touch the same function.
+
+**Full existing smoke suite: all green, zero regressions** (`dotnet run --project Tests`,
+`=== ALL SMOKE TESTS PASSED ===`).
+
+**B3 before/after (30M and 50M cycles, `DETPS2_TRACE_BIOS=1`):**
+
+- The false `escape empty iovec n=1` line is **gone** — confirms the `hugeCopy` false-positive
+  fix works exactly as diagnosed.
+- My new `plant iovec chain STAGEHED` trace line **still never fires** — S1's target branch
+  (`empty == true`) is still never reached, now confirmed for a second, different reason: with
+  the false-positive escape removed, execution simply doesn't hit *any* of this function's
+  escape branches at all in this run.
+- **`cdvdSectors` reaches the exact same 1865 by the exact same cycle (~30-34.7M) as every
+  prior run tonight, with or without either fix.** Final state (`px`, `gif-path`, `held`,
+  everything) is byte-identical to the original baseline.
+
+### 51.1 Honest read
+
+Both fixes are real, correct, worth keeping (a genuine false-positive guard bug fixed; a
+genuine size-limiting bug fixed for the case it targets) — but **neither one is B3's actual
+limiter.** `cdvdSectors` climbing from 609 to 1865 by ~34.7M happens through some other,
+still-unidentified real code path entirely independent of the `STAGEHED.BIN` iovec-walk
+mechanism this whole §49-§51 thread was built around. That mechanism turned out to be a red
+herring for *this specific plateau* — real, worth fixing, but not load-bearing for why B3
+stops at 1865.
+
+**This doesn't invalidate §49's core observation** (the sector-count buckets are real, 1865
+is genuinely inside `stagePlantOnly`, `postTxd` genuinely never triggers) — it means the
+*mechanism* we guessed was gating that boundary (the STAGEHED iovec walk) isn't actually it.
+The real gate is still open. Both fixes are being kept (correct, zero-risk, zero-regression
+improvements) but this specific investigative thread doesn't yet explain the plateau.
+
+```text
+S1 + hugeCopy fix implemented (Claude) -- both correct, smoke green, B3 outcome UNCHANGED
+  false escape event is gone (hugeCopy fix confirmed working)
+  S1's multi-entry branch still never fires -- not what gates B3, even with the false-positive removed
+  cdvdSectors: identical 1865 plateau, same cycle, byte-identical final state either way
+  keeping both fixes (real, zero-regression) but the actual 1865 gate is still unidentified
+  next: find what REALLY drives cdvd 609->1865 (not STAGEHED iovec) and what stops it there
+```

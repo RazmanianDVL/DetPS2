@@ -1975,24 +1975,46 @@ public sealed class Burnout3Assist : IGameQuirkModule
 
         bool empty = s2 == 0 && sizeWord == 0;
         bool absurdS4 = s4 < 0x00100000 || s4 >= 0x02000000 || (s4 & 3) != 0;
+        // 0x00124020-0x124050 is the generic memcpy's byte-tail loop (see 0x123FA0+): its own
+        // normal termination decrements a2 down to -1 (0xFFFFFFFF) as a sentinel, which always
+        // satisfies a naive (uint)a2 > 0x10000 check -- false-positiving on every ordinary small
+        // tail-copy completion, not just genuine huge/runaway copies. Exclude the top half of
+        // the unsigned range (anything that reads negative as int32) so the sentinel can't trip
+        // this guard; genuine huge copies stay well under 0x80000000.
+        uint a2Raw = (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL);
         bool hugeCopy = pc is >= 0x00124020 and <= 0x00124050
-            && (uint)(sys.EE.GetGpr(6).Lo & 0xFFFFFFFFUL) > 0x10000;
+            && a2Raw > 0x10000 && a2Raw < 0x80000000;
 
         if (!empty && !absurdS4 && !hugeCopy) return;
 
-        // Prefer planting a real {ptr,size} iovec so the non-empty body at 0x122A40 runs
-        // (jal 0x123F58 consume) instead of skipping with empty-epi v0=0.
-        if (empty && !absurdS4 && _stageHedSize > 0 && _stageHedEeAddr != 0
-            && s4 is >= 0x00100000 and < (uint)SystemMemory.RDRAM_SIZE - 16)
+        // Prefer planting a real {ptr,size} iovec chain so the non-empty body at 0x122A40 runs
+        // (jal 0x123F58 consume) instead of skipping with empty-epi v0=0. The real walker
+        // (0x122988) loops across multiple entries until its read budget is satisfied, so a
+        // single 64KiB-capped entry undersells the real 374,784-byte STAGEHED.BIN by ~82% —
+        // plant the FULL chain (each entry still ≤0x10000 to respect the hugeCopy memcpy-size
+        // guard elsewhere in this function), terminate only after the real last chunk.
+        const uint EntrySize = 0x10000u;
+        uint entryCount = (_stageHedSize + EntrySize - 1) / EntrySize; // ceil
+        uint chainBytes = (entryCount + 1) * 8u; // + terminator entry
+        if (empty && !absurdS4 && _stageHedSize > 0 && _stageHedEeAddr != 0 && entryCount > 0
+            && s4 is >= 0x00100000 && s4 < (uint)SystemMemory.RDRAM_SIZE - chainBytes)
         {
-            uint plantSize = Math.Min(_stageHedSize, 0x10000u); // first 64KiB slice
-            sys.Memory.Write32(s4 + 0, _stageHedEeAddr);
-            sys.Memory.Write32(s4 + 4, plantSize);
-            // Terminator after one entry.
-            sys.Memory.Write32(s4 + 8, 0);
-            sys.Memory.Write32(s4 + 12, 0);
-            sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = plantSize }); // s2 = size
-            sys.EE.SetGpr(19, new EmotionEngine.Gpr128 { Lo = _stageHedEeAddr }); // s3 = ptr
+            uint remaining = _stageHedSize;
+            uint firstSize = 0, firstPtr = 0;
+            for (uint i = 0; i < entryCount; i++)
+            {
+                uint ptr = _stageHedEeAddr + i * EntrySize;
+                uint size = Math.Min(EntrySize, remaining);
+                sys.Memory.Write32(s4 + i * 8 + 0, ptr);
+                sys.Memory.Write32(s4 + i * 8 + 4, size);
+                if (i == 0) { firstPtr = ptr; firstSize = size; }
+                remaining -= size;
+            }
+            // Terminator after the real last chunk.
+            sys.Memory.Write32(s4 + entryCount * 8 + 0, 0);
+            sys.Memory.Write32(s4 + entryCount * 8 + 4, 0);
+            sys.EE.SetGpr(18, new EmotionEngine.Gpr128 { Lo = firstSize }); // s2 = size
+            sys.EE.SetGpr(19, new EmotionEngine.Gpr128 { Lo = firstPtr }); // s3 = ptr
             // Re-enter scan head so bne s2,zero takes the non-empty path.
             sys.EE.PC = 0x00122A18;
             sys.EE.COP0_Status &= ~0x6u;
@@ -2000,9 +2022,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
             if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
                 && (_ioQueueEscapes <= 16 || _ioQueueEscapes % 16 == 0))
                 Console.Error.WriteLine(
-                    $"[B3] plant iovec STAGEHED @ s4=0x{s4:X8} ptr=0x{_stageHedEeAddr:X8} " +
-                    $"size=0x{plantSize:X} n={_ioQueueEscapes} cdvd={sys.Cdvd.SectorsRead} " +
-                    $"cyc={sys.MasterCycles}");
+                    $"[B3] plant iovec chain STAGEHED @ s4=0x{s4:X8} ptr=0x{_stageHedEeAddr:X8} " +
+                    $"entries={entryCount} totalSize=0x{_stageHedSize:X} n={_ioQueueEscapes} " +
+                    $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
             return;
         }
 
