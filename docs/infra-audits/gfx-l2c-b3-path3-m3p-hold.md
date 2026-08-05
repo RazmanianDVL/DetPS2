@@ -8118,3 +8118,12 @@ S177: Ruled out the queue-loop's own body/DI-spin/inline-calls as containing the
       machinery already established this session. Needs COP0-state instrumentation at the exact
       transition cycle to confirm.
 ```
+
+## 177–178. Solo tid1; PC leaves queue without exit; EnterException no sp (Claude+Grok)
+
+Async divert plausible; SaveOut fromSyscall is real switch not INTC label.
+EnterException does not set sp. Need COP0 + syscall num at sp transition.
+
+```text
+S178: interrupt may divert; sp poison not from EnterException. COP0+syscall at 42.0M.
+```
