@@ -1,16 +1,97 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** **RESUMED** (2026-08-05, user direction: no parking for "needs more tooling" — build the tooling) — see §12  
+**Status:** **IN PROGRESS** (2026-08-05 night) — executive scoreboard below; force-unmask A/B in flight (Claude)  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
 **Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`), Claude forced-unmask A/B (`f8b5db8`)  
-**Author:** Grok + Claude (split seats; dual-ACK park)
+**Author:** Grok + Claude (split seats; dual-ACK before Core)  
+**Related design:** `b3-iovec-multi-entry-design.md` (S1 landed + hugeCopy tighten; not the 1865 limiter)
 
 ---
 
-## 0. One-line
+## 0. Executive scoreboard (2026-08-05 night)
 
-At 50M, **M3P is left asserted** with a **held PATH3 queue of 5 entries / 2124 QW** that never drains, because the game’s **last MSKPATH3 is a mask with no matching unmask**. That is real stuck DMA payload under HLE hold (not Path2-sticky block). Combined with page 0x46 being 100% black, the backlog is a strong candidate for “geometry never lands / never flips,” not a compositor lie.
+### 0.1 One-line (updated)
+
+B3 finishes a **correct one-shot display-env + GTFS open** of `Global.txd`, then **never dispatches the fno=5 DMA read**. Sector counter plateaus at **1865** (`stagePlantOnly`), so the existing post-TXD PATH3-unmask assist never arms; **held PATH3 stays 5/2124** and the present stays **black**. Completing “cdvd≥2000” alone unlocks more boot activity but **does not** drain the hold or light the framebuffer.
+
+### 0.2 Causal chain (load-bearing)
+
+```text
+display-env setup (0x1FFAF4 ×4 on 0x6754C0) ──OK, finished──►
+GTFS fno=3 open Global.txd (0x1D36E0) ──OK, state=1──►
+vtable sibling fno=5 DMA (0x1D3280) ──NEVER DISPATCHED (0 hits)──►
+cdvd stuck 1865 (<2000) ──blocks──► MaybeEscapePostTxdHang
+  (needs cdvd≥2000, cyc≥40M, M3P, px==0, gifP3≥30)
+held PATH3 5/2124 never drains ──► lit=0 / mostlyBlack
+```
+
+### 0.3 What is proven correct (not the bug)
+
+| Area | Verdict | Refs |
+|------|---------|------|
+| Held-queue **drain policy** | Unmask fully drains sync; Path2 sticky idle | §3, §46 |
+| Mask/unmask buffer | 3× real VIF delivery; layout re-masks each round | §45 |
+| Display-env / DMAC / scheduler chain | One-shot setup, finishes clean | §25–§31, §47 |
+| Boot-table 6-of-28 | Install-all dense vtable; specialized callers only | §38–§39 |
+| 5 “dead islands” (blit/alarm/id2/pipeline/gate) | Unlinked / unarmed, not HLE broken | §41–§43 |
+| Object creators | Bounded one-shots, complete | §44 |
+| HLE `SetMskPath3` / `DrainHeldPath3` | Matches EE commands | §5, §46 |
+| iovec multi-entry S1 + hugeCopy tighten | Correct bugs fixed; **not** 1865 limiter | §49–§51 |
+| Empty-path Global default | Ruled out (real path in TRACE) | §54 |
+
+### 0.4 Open gaps (fix priority)
+
+| # | Gap | Evidence | Status |
+|---|-----|----------|--------|
+| **G1** | **fno=5 never dispatched** after successful open | Open `0x1D36E0` ×1; read `0x1D3280` ×0; same vtable `0x4DDFC8` | Open — need dispatcher / re-tick |
+| **G2** | **postTxd unmask heuristic never arms** even when cdvd forced ≥2000 | gifP3 caps **26&lt;30**; px becomes ≠0 → self-defeating | Open — heuristic rewrite or alternate unmask |
+| **G3** | Does draining held 2124 QW light anything? | Not cleanly measured yet | **Claude force-unmask A/B (S7.2) in flight** |
+
+### 0.5 Force-cdvd A/B (S56) — negative for “single missing link”
+
+At cyc=30M forced `NoteHostReadSectors` 1865→2065 (temp, reverted):
+
+| Metric | Before | After force |
+|--------|--------|-------------|
+| cdvd | 1865 | **→6784** (FRONTEND plant + natural climb) |
+| px / prims | 877187 / 172 | 1172419 / 234 |
+| gifP2 / gifP3 / msk | 12 / 20 / 10 | 16 / 26 / 13 |
+| **heldP3n / qwc** | 5 / 2124 | **5 / 2124** (unchanged) |
+| lit / mostlyBlack | 0 / 1 | **0 / 1** |
+| post-TXD unmask TRACE | — | **0 lines** |
+
+**Read:** sector gate unlocks real cascade; **does not** drain hold or present. Completing G1 alone is **not proven** sufficient for lit chrome.
+
+### 0.6 Key PCs / objects (quick index)
+
+| Item | Address |
+|------|---------|
+| Display-env object | `0x6754C0` |
+| Stage runner (×4) | `0x1FFAF4` → … → PutDispEnv |
+| GTFS open (fno=3) | `0x001D36E0` (vtable `0x4DDFC8`) |
+| GTFS close (fno=4) | `0x001D3670` |
+| GTFS DMA read (fno=5) | `0x001D3280` (vtable `0x4DDFD0`) — **0 hits** |
+| Open state field | struct **+24** (=1 on success); handle **+40** |
+| State getter | `0x001D3824` (×1) |
+| One-shot container tick | `0x00212A24` (s0=`0x66E100`) |
+| Recv buffer (open) | `0x0066E080` |
+| postTxd unmask assist | `Burnout3Assist.MaybeEscapePostTxdHang` (cdvd≥2000) |
+| Dense boot registry | `0x49AC58` {id,fn} → dense `0x670C18` |
+
+### 0.7 Product end-state (unchanged plateau shape)
+
+```text
+gif-path: p3=20 p3qws=6408 m3p=True heldP3n=5 heldP3qwc=2124  (force-cdvd: p3=26, held same)
+claim:    px~877k (force: ~1.17M) lit=0 dispfbPx=0 frame1=0xA0046 dispfb2=0x51400
+cdvd:     1865 natural plateau (force: 6784)
+```
+
+---
+
+## 0b. Original one-line (session start)
+
+At 50M, **M3P is left asserted** with a **held PATH3 queue of 5 entries / 2124 QW** that never drains, because the game’s **last MSKPATH3 is a mask with no matching unmask**. That is real stuck DMA payload under HLE hold (not Path2-sticky block). Combined with page 0x46 being 100% black, the backlog is a strong candidate for “geometry never lands / never flips,” not a compositor lie. *(Still true; mechanism of “why no later unmask” is now G1+G2 above, not broken drain HLE.)*
 
 ---
 
