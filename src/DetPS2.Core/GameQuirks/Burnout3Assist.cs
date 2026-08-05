@@ -119,6 +119,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _forceStreamPumps;
     /// <summary>S230 dual-ACK: host-call stream-system tick 0x28AF10 once (env-gated).</summary>
     private int _forceStreamTicks;
+    /// <summary>S233: one-shot +500 clear after force ticks (not every frame).</summary>
+    private bool _forceStreamArmCleared;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -177,6 +179,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _resourceRelPtrScrubs = 0;
         _forceStreamPumps = 0;
         _forceStreamTicks = 0;
+        _forceStreamArmCleared = false;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -350,8 +353,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
 
-        // S226/S230 dual-ACK combined probe (DETPS2_B3_FORCE_STREAM_PUMP=1):
-        // (1) status 0→9 on type-6 handles; (2) one real EE call 0x28AF10(0x1E75640).
+        // S226/S230/S233 dual-ACK combined probe (DETPS2_B3_FORCE_STREAM_PUMP=1):
+        // (1) status 0→9 on type-6 handles; (2) EE call 0x28AF10; (3) clear stream +500
+        // after tick so armed-branch doesn't reject status 9 (S233).
         if (sys.MasterCycles >= 40_000_000
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_PUMP") == "1")
         {
@@ -359,6 +363,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 MaybeForceStreamStatusPump(sys);
             if (_forceStreamTicks < 2)
                 MaybeForceStreamSystemTick(sys);
+            // Once after ticks: clear +500 so status=9 can re-arm (not every frame — that fights arm).
+            if (!_forceStreamArmCleared && _forceStreamTicks >= 2 && _forceStreamPumps > 0)
+            {
+                MaybeClearStreamArmBytes(sys);
+                _forceStreamArmCleared = true;
+            }
         }
 
         // S170 dual-ACK: gate SM state 3 holds a GTFS resource whose +0xA0 can be a small
@@ -1542,6 +1552,42 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     $"[B3] FORCE_STREAM_PUMP h=0x{h:X8} type=6 status 0->9 " +
                     $"n={_forceStreamPumps} cyc={sys.MasterCycles}");
             return; // one handle per Step
+        }
+    }
+
+    /// <summary>
+    /// S233: clear arm byte +500 on stream resources whose handle has status==9 so
+    /// <c>0x3865A0</c> takes the unarmed path that accepts status 9.
+    /// </summary>
+    private void MaybeClearStreamArmBytes(Ps2System sys)
+    {
+        const uint Manager = 0x01E7DE10;
+        const uint TypeOff = 268;
+        const uint StatusOff = 588;
+        const uint HandleOff = 460;
+        const uint ArmOff = 500;
+        const uint ScanLo = 0x01F00000;
+        const uint ScanHi = 0x02000000;
+
+        var mem = sys.Memory;
+        for (uint so = ScanLo; so + ArmOff + 4 <= ScanHi; so += 4)
+        {
+            if (mem.Read8(so + ArmOff) == 0)
+                continue;
+            uint h = mem.Read32(so + HandleOff);
+            if (h < ScanLo || h + StatusOff + 4 > ScanHi)
+                continue;
+            if (mem.Read32(h) != Manager)
+                continue;
+            if (mem.Read32(h + TypeOff) != 6)
+                continue;
+            if (mem.Read32(h + StatusOff) != 9)
+                continue;
+            mem.Write8(so + ArmOff, 0);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[B3] FORCE_STREAM clear +500 stream=0x{so:X8} h=0x{h:X8} cyc={sys.MasterCycles}");
         }
     }
 
