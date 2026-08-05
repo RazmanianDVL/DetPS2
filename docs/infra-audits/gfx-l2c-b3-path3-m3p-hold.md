@@ -1,10 +1,10 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** measure complete (hold dig + FQC refute + data-flow writer) — **no Core this seat**; dual-ACK before any fix  
+**Status:** **PARKED** (honest bound, 2026-08-05) — real mechanisms documented; no Core; flip gate still open  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
-**Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`)  
-**Author:** Grok (claimed seat after Claude seq0290 split; §9 continues after Claude seq0292)
+**Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`), Claude forced-unmask A/B (`f8b5db8`)  
+**Author:** Grok + Claude (split seats; dual-ACK park)
 
 ---
 
@@ -337,4 +337,46 @@ Forced-unmask A/B (Claude) -- measure only, reverted
   FRAME_1/DISPFB1/DISPFB2 unchanged; page 0x46 still exactly 0xFF000000 uniform
   PATH3 hold is real but NOT sufficient alone to explain/fix the black present
   next: what gates the flip AFTER a successful drain -- separate, still-open question
+```
+
+---
+
+## 11. Parking summary (dual-ACK, Grok) — B3 L2c PATH3/M3P sub-chain
+
+**Decision:** park this sub-investigation tonight. Not closed as "solved"; closed as
+**honestly bounded**. Multiple real mechanisms found; each alone fails to explain the
+visible black present. Diminishing returns without a fresh angle.
+
+### 11.1 What is solid (do not re-litigate without new evidence)
+
+| Finding | Tip | One-liner |
+|---------|-----|-----------|
+| DISPFB stuck page 0 vs FRAME `0x46` | parent L2c doc | Compositor honest — not a present-selection lie |
+| Page `0x46` 100% opaque black | `b7048b1` | No hidden real frame in draw target |
+| SleepThread / VBlank flags | `ffe5da3` / `4bf8bd3` | ISR sets all 4 slots; mid-ISR abandon refuted |
+| Final MSKPATH3 = mask, held 2124 QW | `5226dda` | HLE M3P hold correct; no peer unmask |
+| FQC path-sync @ `0x1F1A28` | `bc239a9` | Zero hits in stuck window — not the gate |
+| Static VIF list writer | `175e8a4` | Unmask word still correct in RAM; missing re-submit |
+| Forced unmask A/B | `f8b5db8` | +295k real px; FRAME/DISPFB/page46 unchanged |
+
+### 11.2 What remains open (resume only with a fresh angle)
+
+1. **What gates DISPFB/FRAME flip after a successful Path3 drain?** (forced drain proves
+   Path3 alone is insufficient.)
+2. **Why the game never re-submits the unmask slot** of the static list after mask #10
+   (submit/TADR/FIFO path — TransferLog insufficient for mid-chain MADR).
+3. **What the drained +295k fragments actually were** (clear/setup vs geometry) if that
+   informs the flip gate.
+
+### 11.3 Bans that still hold
+
+- No invent DISPFB flip / present page `0x46`
+- No permanent force-unmask Core without dual-ACK + design
+- No re-opening FQC-honesty or page-46-hidden-frame without new contradictory evidence
+
+```text
+B3 L2c PATH3/M3P chain -- PARKED (honest bound)
+  real hold + real held data + static mask/unmask template + force-drain insufficient
+  flip gate after drain still open; no Core proposed
+  resume only with fresh angle or dual-ACK new seat
 ```

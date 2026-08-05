@@ -1,8 +1,9 @@
 # GFX L2c — B3 finding: FRAME/DISPFB registers stop updating entirely after early setup
 
-**Status:** finding, code-verified via real trace — no Core, needs dual-ACK on next step
+**Status:** **PARKED** (2026-08-05 dual-ACK) — honest black + real Path3 hold confirmed; force-unmask insufficient for flip. See `gfx-l2c-b3-path3-m3p-hold.md` §11.
 **Title:** Burnout 3 (SLUS_210.50)
 **Parent:** `gfx-l2-frame-page-composite-design.md` (open problem, §2)
+**Child:** `gfx-l2c-b3-path3-m3p-hold.md` (PATH3/M3P chain through forced-unmask A/B)
 
 ---
 
