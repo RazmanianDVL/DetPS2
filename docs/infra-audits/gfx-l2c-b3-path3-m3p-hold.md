@@ -7140,3 +7140,16 @@ S151: CORRECTION — resource ptr is NOT null at the advance-path read (0x2BCD58
       need to understand what 0x2B7110 does with a genuinely valid 0xB6D880 that prevents it
       from ever returning to 0x2BCD5C.
 ```
+
+## 151–152. Resource is real 0xB6D880; 0x2B7110 is relocate + counted loop (Claude+Grok)
+
+**S151:** watch 0x1E85A48: case2 stores 0xB6D880; advance reads same; never re-zeroed.
+S149 null was pre-case2 snapshot artifact.
+
+**S152:** 0x2B7110 = relative→absolute fixup of +0x98/9C/A0/A4 then 0x2514C0 on each.
+0x2514C0 fixups more rels then `for (i=0; i < **(obj+0x24); i++)`. Huge/corrupt count
+⇒ never returns, no sleep. Live: dump resource slots + count; census 0x2514C0 vs 0x25158C.
+
+```text
+S152: 0x2B7110 relocate not free; count loop at 0x25156C can spin. Dump 0xB6D880 fields.
+```
