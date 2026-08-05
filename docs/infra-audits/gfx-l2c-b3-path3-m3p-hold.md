@@ -12128,3 +12128,17 @@ S279: Independent confirm of S278 exactly. Reasoning (not proven) toward option 
       performs; option (b) would be architecturally unusual. Next: search for a genuinely
       separate present/swap mechanism outside the case-2/PutDispEnv path already exhausted.
 ```
+
+## 280. Reconsidering the "separate swap" search: my own S260 trace already rules it out at the authoritative level — the swap mechanism IS case 2, not something undiscovered (Claude)
+
+Before starting the separate-swap search I proposed in S279, reconsidering: **S260's temp diagnostic hooked `GsRegisters.SetDispfb1`/`SetDispfb2` directly** — the actual C# property setters, which are downstream of *every* possible guest write mechanism (a direct CPU `sw` to the MMIO-mapped privileged register, or a value embedded in a GIF packet's A+D register-write data that the GS-emulation processes and routes through the same setter). That trace was exhaustive: 127 `SetDispfb2` calls (one real transition, rest replays) and 126 `SetDispfb1` calls (never leaves 0), full 95M run. Since this hooks the single, most-downstream point ALL DISPFB writes must pass through in this emulator regardless of the guest-side write mechanism, it already rules out a hidden/separate write path — GIF-packet-embedded writes included, not just the direct-`sw` family S280's static search covered.
+
+So there very likely isn't a *wholly separate* undiscovered swap mechanism to find. The swap mechanism **exists and is exactly case 2 / `0x1FD490`** (confirmed real, structurally sound FBP-OR merge logic, correctly waits for vsync like real flip code — S271's VBlank-poll finding was reassuring, not damning). It's just a single boot-time invocation with insufficient/zeroed context (S269-276). The real missing piece, per "find missing component, don't hand-synthesize": **something should invoke case 2 again, later, with real draw-page data** — not a different subsystem entirely. Reframes back toward a narrower, more tractable question: who/what should re-enter `0x1E2D10`/`0x1FE1A0(a0=2)` with real args, and what event should trigger that re-entry (frame-ready? mode transition past a point we haven't reached? something else)?
+
+```text
+S280: Correcting my own S279 direction -- S260's setter-level trace already rules out a hidden
+      swap mechanism (GIF-packet or otherwise), since it hooks the single most-downstream point
+      all writes must pass through. The swap mechanism is real and is case 2 itself; it just
+      needs a second, real-data invocation that nothing currently triggers. Narrows back to:
+      who/what should re-enter case 2, not a hunt for an undiscovered subsystem.
+```
