@@ -2781,3 +2781,80 @@ mask/unmask buffer re-check (Claude) -- corrects an over-hasty first read, real 
   real open question: why doesn't the PRE-EXISTING held backlog drain during these transient
     unmask windows -- held-queue-during-transient-unmask policy, not a missing DMA event
 ```
+
+---
+
+## 46. Held-queue drain policy during transient unmask — already works; final hold is post-last-unmask (Grok)
+
+Took Claude S45's drain-policy question (seq0395). Read `Gif.cs` + reconciled against §3 timeline. **No Core.**
+
+### 46.1 What `Gif.cs` does on unmask (load-bearing)
+
+```csharp
+// Vif.cs MSKPATH3 → Gif.SetMskPath3((imm & 0x8000) != 0)
+public void SetMskPath3(bool masked)
+{
+    _m3p = masked;
+    if (!masked)
+        DrainHeldPath3();   // synchronous, before VIF continues to next code
+}
+
+private void DrainHeldPath3()
+{
+    if (_heldPath3Count == 0) return;
+    if (_pktActive && _pktPath == 2) return;  // Path2-sticky only gate
+    // snapshot queue, clear held, ProcessTransfer(addr,qwc) each entry FULLY
+    // (not ProcessTransferBudgeted — no mid-drain budget split)
+}
+```
+
+Policy properties:
+
+| Property | Behavior |
+|----------|----------|
+| Trigger | Every `SetMskPath3(false)` (MSKPATH3 unmask or M3R clear) |
+| Timing | **Synchronous** inside the VIF command that unmasks — next VIF code (e.g. re-mask) cannot run until drain returns |
+| Path2 gate | Only if `_pktActive && _pktPath==2`; §3 measured **BLOCKED_PATH2_STICKY ×0** |
+| Completeness | Held entries use `ProcessTransfer` (full QWC), not budgeted residual |
+| Incoming under mask | `ReceivePath3Data` → `EnqueueHeldPath3` while `Path3Masked` |
+
+⇒ There is **no** HLE policy that "skips held backlog during a brief unmask" or only processes new data. Unmask drains **all** currently held entries, then VIF may re-mask from the same segment (S45 layout).
+
+### 46.2 Reconcile S45 with §3 timeline
+
+S45: unmask@`0x7FC8FC` + mask@`0x7FCA80` in one forward VIF segment, 3× lockstep with DMACKICK rounds → each round briefly unmasks then re-masks by buffer layout. Correct and important.
+
+§3 already logged the drain effect of those unmasks:
+
+| MSK event | masked | heldN before | Action |
+|----------:|:------:|-------------:|--------|
+| 6 | False | **6** | **Drain START** → empties |
+| 7 | True | **0** | re-mask (held empty) |
+| 8 | True | 5 | already masked; queue refilled under mask |
+| 9 | False | **6** | **Drain START** → empties |
+| 10 | True | **0** | **final mask** |
+| after 10 | True | →5 / 2124 | third batch enqueued; **no event 11 unmask** |
+
+**The three transient unmask windows do drain.** §3 `DrainHeldPath3 START ×3` + heldN=0 on the following mask events are the proof. End-state `heldP3n=5 heldP3qwc=2124` is a **new third batch** filled **after** the last unmask/re-mask pair — not a pre-existing backlog that survived the three windows.
+
+Product metrics match: `p3=20 p3qws=6408` (earlier batches processed) + final held 2124 (third batch never unmasked) + `px=877187` plateau from prior drains.
+
+### 46.3 What S45 still sharpens (without changing drain policy)
+
+1. **Re-mask is by design of the template buffer**, not a dropped unmask kick — S9.5 framing correctly revised.
+2. **Within each of the 3 rounds**, order is unmask → (sync drain) → mask → later PATH3 under M3P refills held.
+3. **Missing piece is still EE-side:** after the third refill under final mask, **no 4th MSKPATH3 unmask** is ever issued (through 50M/100M). Not "drain policy ignores held during brief unmask."
+
+### 46.4 Verdict
+
+```text
+drain-policy RESULT (Gif.cs + S3 reconcile)
+  SetMskPath3(false) fully drains held queue synchronously (ProcessTransfer, no budget cut)
+  Path2-sticky gate idle (S3 BLOCKED×0)
+  S45 3× unmask windows DID drain (S3 Drain START×3; heldN=0 after)
+  end-state held 5/2124 = third batch AFTER last re-mask; no 4th unmask
+  NOT an HLE held-vs-new discrimination bug
+  open: why EE never issues MSKPATH3 unmask after third refill (back to S7.1, sharpened)
+```
+
+Next (Claude's S44.2 still valid, re-scoped): find who should issue the **4th** unmask / what condition arms another MSKPATH3-unmask after the third DMACKICK round — not more entity-msg, not drain-policy Core. Optional measure-only force-unmask A/B remains dual-ACK (§7.2).
