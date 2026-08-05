@@ -11695,3 +11695,45 @@ Missing env retarget is not "no writer exists" — writer is **`0x1FD490` via sw
 S267: Env switch 0x1FE1A0 — live only a0=4 (bulk FBP0 @14.3M). Case2→1FD490 FBP-OR
       never dispatched. Next: who calls 0x1FE1A0 / what should pass a0=2.
 ```
+
+## 267b. Dispatcher never requests case 2 (Grok)
+
+### Call chain
+
+```text
+0x1E2EA8 (boot display setup on 0x670BD0 family)
+  → jal 0x1E33D0(a0=handler, a1=CASE, …)   // 5 ELF call sites
+       → jalr *(handler+4) with a0=CASE
+            → 0x1FE1A0 switch(CASE)
+```
+
+### Static a1 at every `jal 0x1E33D0`
+
+| Site | a1 (case) |
+|------|-----------|
+| `0x1E03BC` | **22** |
+| `0x1E04E0` | **22** |
+| `0x1E2F14` | **4** ← bulk FBP0 (live) |
+| `0x1E2F2C` | **0** |
+| `0x1E2F4C` | **11** |
+
+**No site plants a1=2.**
+
+### Live `--pcbreak=1E33D0` 80M forces — 3 hits
+
+| a1 | count |
+|----|-------|
+| `0x4` | 1 |
+| `0x0` | 1 |
+| `0xB` (11) | 1 |
+| **`0x2`** | **0** |
+
+### Read
+
+FBP-OR (case 2 / `0x1FD490`) is **implemented but never requested** by any retail call site of the display dispatcher. Class-A is not a broken PutDispEnv — it is **missing the message/case that would retarget FBP**. Options: (a) dead retail path (case 2 unused on B3), (b) another entry to `0x1FE1A0` not via `0x1E33D0`, (c) dynamic case id we have not found. No invent-DISPFB.
+
+```text
+S267b: 1E33D0 a1 live={0,4,11} only; zero a1=2. No ELF call site plants case 2.
+       FBP-OR exists but is never asked for. Next: other entries to 1FE1A0, or
+       whether case 2 is truly dead on this title.
+```
