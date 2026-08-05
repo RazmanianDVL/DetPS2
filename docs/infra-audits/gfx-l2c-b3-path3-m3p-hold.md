@@ -836,3 +836,46 @@ and drains held queue. Throughput + natural PATH3 unmask both track scheduler fa
 Visual noise on page 0x46 (Claude §18) still means this is not “menu/scene ready,” but
 the black present is no longer explained by stuck M3P alone when RR is on.
 
+---
+
+## 19. Soft-GS under RR: real geo flood, depth-reject dominated (Grok)
+
+Seat: softgs prim/XYZ/frag under `DETPS2_RR_SCHED=1` (Claude owns page-byte noise decode).
+
+### 19.1 Product CLI 50M RR (host-present)
+
+| Metric | Value |
+|--------|------:|
+| PRIM / XYZ2 writes | 65 271 / 45 866 |
+| px / prims (claim) | 9 752 122 / 23 639 |
+| fragTest / rejDepth / rejAlpha | 31 188 876 / **21 436 754** / 885 827 |
+| imgBytes / image tags | 1 084 512 / 66 |
+| path3 qws / held / mskPath3 | ~10.8M / 0 / 102 |
+| gif abortTrunc / lastAbort | 67 / new-DIRECT |
+| gif-last | mid-packet nloop=29184 progress=4817 |
+| TEST | `0x5140B` (ZTE on) |
+| lit / dispfbPx | 0 |
+
+Depth reject is **~69% of fragments**. So most of the “geo flood” never becomes color pixels — consistent with a **sparse noise band** on page 0x46 (Claude visual) while claim px is still multi-million (many fragments pass some tests or write elsewhere before reject accounting).
+
+### 19.2 vs PRIO baseline (same 50M)
+
+| | PRIO | RR |
+|--|-----:|---:|
+| prims | 172 | 23 639 |
+| heldP3 | 5 | 0 |
+| fragTest | ~2.8M | ~31M |
+| rejDepth | ~1.9M | ~21M |
+
+RR multiplies work ~10×; reject mix stays depth-heavy. Not inventing a Core depth fix from this alone.
+
+### 19.3 Hand-off
+
+Noise-band **structure** (stride / garbage color vs wrong memory) stays Claude’s dump seat. This seat: **commands are real PRIM/XYZ2 at scale; depth test kills most fragments; PATH3 unmasked; present still DISPFB≠FRAME.**
+
+```text
+Soft-GS RR mix
+  PRIM/XYZ flood real; ~69% frag depth-reject
+  PATH3 drained; still black present (DISPFB page0 vs FRAME 0x46)
+  noise band = thin survivors of reject storm, not full FB scene
+```
