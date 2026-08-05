@@ -143,6 +143,9 @@ public static class Iso9660
         // CRI paths often start with '\'; strip leading separators.
         name = name.TrimStart('\\', '/');
         name = name.Replace('\\', '/');
+        // ISO 9660 version ";1" is stripped at parse time — strip here so FindFile matches.
+        int semi = name.IndexOf(';');
+        if (semi >= 0) name = name[..semi];
         return name;
     }
 

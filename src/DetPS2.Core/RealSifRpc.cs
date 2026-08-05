@@ -4403,19 +4403,41 @@ public sealed class RealSifRpc
             return -1;
         }
 
-        uint fsz = 0;
-        if (iopModules.TryGetOpenFileSize(fd, out fsz) && fsz > 0)
+        // S209 dual-ACK (Claude S208): IoMan has 16 fds. GTFS fno=3 left every distinct open
+        // live forever, so the 17th open (B3 track enviro/static.dat) always failed as
+        // "out of descriptors" and looked like file-not-found. Close the previous GTFS-
+        // tracked fd on path/fd swap. FRONTEND multi-chunk continues on the same fd without
+        // re-open, so same-fd continuation is untouched.
+        if (_gtfsLastPathFd >= 0 && _gtfsLastPathFd != fd)
         {
-            // Same path re-open keeps multi-chunk cursor (FRONTEND multi-call stream).
-            bool same = _gtfsLastPathFd == fd && _gtfsLastPathSize == fsz;
-            openedSize = fsz;
-            _gtfsLastPathFd = fd;
-            _gtfsLastPathSize = fsz;
-            if (!same)
+            try { iopModules.FileClose(_gtfsLastPathFd); } catch { /* ignore */ }
+            if (_gtfsFrontendFd == _gtfsLastPathFd)
             {
-                _gtfsReadOffset = 0;
-                _gtfsTotalDmaBytes = 0;
+                _gtfsFrontendFd = -1;
+                _gtfsFrontendSize = 0;
             }
+            if (_gtfsStageHedFd == _gtfsLastPathFd)
+            {
+                _gtfsStageHedFd = -1;
+                _gtfsStageHedSize = 0;
+            }
+        }
+
+        uint fsz = 0;
+        iopModules.TryGetOpenFileSize(fd, out fsz);
+        // Same path re-open keeps multi-chunk cursor (FRONTEND multi-call stream).
+        bool same = _gtfsLastPathFd == fd && _gtfsLastPathSize == fsz && fsz > 0;
+        if (fsz > 0)
+            openedSize = fsz;
+        _gtfsLastPathFd = fd;
+        _gtfsLastPathSize = fsz;
+        if (!same)
+        {
+            _gtfsReadOffset = 0;
+            _gtfsTotalDmaBytes = 0;
+        }
+        if (fsz > 0)
+        {
             // Track FRONTEND / STAGEHED by name so fno=5 can fall back correctly.
             string upPath = (resolved.Length > 0 ? resolved : path).ToUpperInvariant();
             if (upPath.Contains("FRONTEND") && (_gtfsFrontendFd < 0 || _gtfsFrontendSize != fsz))

@@ -10138,3 +10138,31 @@ S208: ROOT CAUSE (general infra): IopModuleHost.FileOpen fd table maxes at 16 (S
       Directly explains S207's case8 id=5 flag-never-set. Fix: close-on-path-swap in GTFS handler,
       careful not to break FRONTEND/STAGEHED multi-chunk stream tracking. No code change — dual-ACK needed.
 ```
+
+## 209. DUAL-ACK + LANDED — GTFS close-on-path-swap (Grok; Claude S208)
+
+**Dual-ACK** Claude S208 fd-exhaustion RC. Independent confirm: TRACE_RPC open FAIL was
+enviro/static after 16 live opens; ISO has files; FindFile works without `;1`.
+
+### Code (Core infra, not B3 Assist)
+1. **`RealSifRpc` GTFS fno=3:** on successful open, if `_gtfsLastPathFd` differs from new fd,
+   `FileClose` the previous; clear frontend/stagehed trackers if they pointed at the closed fd.
+2. **`Iso9660.NormalizePath`:** strip ISO version `;1` so `cdrom0:\…;1` matches parsed paths
+   (secondary; reduces wasted open attempts).
+
+### Live verify 50M (`out/canaries/b3-s209-fd-fix`)
+```
+[GTFS] open path="tracks\US\C5_V1\enviro.dat" fd=2 size=196608
+[GTFS] open path="tracks\US\C5_V1\static.dat" fd=5 size=753664
+watch 0x64C990: … pc=0x0013D340 WROTE 0x00000001 …  ← completion pump
+               … pc=0x00333004 READ (sees 1) …
+               … pc=0x003330F0 WROTE +1 byte …
+```
+**No open FAIL** for track paths. Case8 flag **set to 1**.
+
+Residual at 50M: still `lit=0` / class-A DISPFB (may need longer budget or next gate past case8).
+
+```text
+S209: LANDED GTFS close-on-path-swap + ;1 strip. Track opens OK; 0x64C990 flag=1 via 0x13D340.
+```
+
