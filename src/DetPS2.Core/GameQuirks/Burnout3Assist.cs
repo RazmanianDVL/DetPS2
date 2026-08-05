@@ -123,6 +123,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _forceStreamArmCleared;
     /// <summary>S234 dual-ACK: force phase field to 2 for case10 gate probe.</summary>
     private bool _forcePhase2Done;
+    /// <summary>S252 dual-ACK: force AWD node state 16→256 (env-gated).</summary>
+    private int _awdNodeStateCompletes;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -183,6 +185,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _forceStreamTicks = 0;
         _forceStreamArmCleared = false;
         _forcePhase2Done = false;
+        _awdNodeStateCompletes = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -355,6 +358,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // pumps (0x29EF00/0x2B4C00 never run). Promote stuck 48→256 so climber advances.
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
+
+        // S252 dual-ACK: AWD node state sticks at 16 (loading); free-test (state&0x100)
+        // treats it as free → anonymous reuse path forever; fe.awd never named-claims.
+        // Env DETPS2_B3_FORCE_AWD_NODE_STATE=1: promote stuck 16→256 on pool list.
+        if (sys.MasterCycles >= 35_000_000
+            && _awdNodeStateCompletes < 8
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_AWD_NODE_STATE") == "1")
+            MaybeForceAwdNodeStateComplete(sys);
 
         // S237: phase2-only clean probe (DETPS2_B3_FORCE_PHASE2_ONLY=1).
         // No status=9, no +500 clear, no nested EE tick — isolates "does sticky phase=2
@@ -1691,6 +1702,47 @@ public sealed class Burnout3Assist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[B3] FORCE_STREAM_TICK fn=0x{TickFn:X8} a0=0x{StreamSys:X8} " +
                 $"returned={returned} steps={steps} n={_forceStreamTicks} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S252 dual-ACK: AWD resource nodes on pool <c>0x1E75648</c> list (+56) stick at
+    /// state <c>*(node+940)==16</c> (loading). Free-test at <c>0x38420C</c> is
+    /// <c>state &amp; 0x100</c>; 16 keeps the bit clear so nodes stay "free" and every
+    /// later miss takes anonymous reuse (<c>0x384240</c> a1=0) — <c>sound\fe.awd</c>
+    /// never named-claims. Real completion path: state-16 probes <c>0x29F1E0</c> and on
+    /// 256 writes state 256 at <c>0x383D94</c>. Env <c>DETPS2_B3_FORCE_AWD_NODE_STATE=1</c>
+    /// only — diagnostic, not a product fix.
+    /// </summary>
+    private void MaybeForceAwdNodeStateComplete(Ps2System sys)
+    {
+        const uint Pool = 0x01E75648;
+        const uint ListOff = 56;
+        const uint StateOff = 940; // node+940; construct 0x383F10 via a0=node+8 writes +932
+        const uint StateLoading = 16;
+        const uint StateDone = 256;
+        const int MaxWalk = 32;
+
+        var mem = sys.Memory;
+        uint node = mem.Read32(Pool + ListOff);
+        int walked = 0;
+        while (node != 0 && walked++ < MaxWalk)
+        {
+            if (node < 0x00100000 || node >= 0x02000000)
+                break;
+            uint state = mem.Read32(node + StateOff);
+            if (state == StateLoading)
+            {
+                mem.Write32(node + StateOff, StateDone);
+                _awdNodeStateCompletes++;
+                if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                    || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                    Console.Error.WriteLine(
+                        $"[B3] FORCE_AWD_NODE_STATE node=0x{node:X8} +940 16->256 " +
+                        $"n={_awdNodeStateCompletes} cyc={sys.MasterCycles}");
+                return; // one node per present
+            }
+            node = mem.Read32(node); // next
+        }
     }
 
     /// <summary>

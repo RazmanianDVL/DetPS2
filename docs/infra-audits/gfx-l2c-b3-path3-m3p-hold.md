@@ -11283,3 +11283,28 @@ S252: node state stuck at 16; free-test bit 0x100 clear → eternal reuse path; 
       Propose dual-ACK: force stuck state 16→256 (with stream complete), measure named fe claims.
 ```
 
+
+## 253. FORCE_AWD_NODE_STATE 16→256: readiness advances to **substate 23** (Grok)
+
+Dual-ACK probe landed: `DETPS2_B3_FORCE_AWD_NODE_STATE=1` + existing FORCE_STREAM_PUMP.
+
+### Force log
+```
+FORCE_AWD_NODE_STATE node=0x1F35E08 16->256 n=1 cyc=35M
+FORCE_AWD_NODE_STATE node=0x1F35A48 16->256 n=2 cyc=42.1M
+```
+
+### Substate (`0x51A99C`) post-watch-after
+```
+2→3→4→5→6→7→8→9→10→11→12→23
+```
+**First time past case11 (12) and to success state 23** (readiness method returns complete).
+
+### Present
+Still `lit=0/286720 mostlyBlack=1` — checklist complete is necessary not sufficient for chrome;
+display/path3 class-A work remains, but the nested readiness SM is no longer the wall.
+
+```text
+S253: FORCE node state 16→256 unblocks case11→12→23 readiness success. lit still 0.
+```
+
