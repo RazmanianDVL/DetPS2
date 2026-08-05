@@ -1032,10 +1032,12 @@ public sealed class IopModuleHost
         if (iop.MultiThreadEnabled && prevThreadId != iop.CurrentThreadId)
             iop.SwitchToThread(prevThreadId);
 
-        // Free entry slot when first-call finished without residual (table pressure for late
-        // IOPFILE/SDRDRV). Residual path keeps EntryThreadId for DrainOneResidualSlice.
+        // Free entry slot only on pure first-call budget exhaust without residual.
+        // Do NOT free on clean returned / residentSpin / bootQuantaResident — C1.2 smokes and
+        // BindModuleEntryContext re-arm expect the entry context to survive ordinary completion
+        // (Claude seq0196 regression: PrepareModuleEntry_UniqueStacks_WhenMultiThread).
         if (iop.MultiThreadEnabled && !partialYield && m.EntryThreadId >= 1 &&
-            (returned || residentSpin || bootQuantaResident))
+            budget && !returned && !residentSpin && !bootQuantaResident)
         {
             int freed = m.EntryThreadId;
             if (iop.FreeThreadSlot(freed))
@@ -1044,7 +1046,7 @@ public sealed class IopModuleHost
                 if (Environment.GetEnvironmentVariable("DETPS2_TRACE_YIELD_START") == "1")
                     Console.Error.WriteLine(
                         $"[YIELD-START] free entry slot tid={freed} name=\"{m.Name}\" " +
-                        "(first-call done, no residual)");
+                        "(budget exhaust, no residual)");
             }
         }
 

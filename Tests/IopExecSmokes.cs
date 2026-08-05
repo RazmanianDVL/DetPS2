@@ -1185,20 +1185,18 @@ public static class IopExecSmokes
         if (!sys.IopModules.HasNonEntryReadyPeer(sys.Iop))
             throw new Exception("worker must count as non-entry READY peer");
 
-        // First-call complete without residual frees entry slot (table pressure relief).
+        // Clean return keeps EntryThreadId (C1.2 re-arm / UniqueStacks smoke).
         var runA = sys.IopModules.StartLoadedModule(sys, idA, maxInstructions: 256);
         if (!runA.Success)
             throw new Exception($"YSFA start failed: {runA.Message}");
         if (!sys.IopModules.TryGetIrx(idA, out var recDone))
             throw new Exception("YSFA missing after start");
-        if (recDone.EntryThreadId >= 1 && !runA.PartialYieldStart)
-            throw new Exception(
-                "first-call done without residual should free EntryThreadId " +
-                $"(got tid={recDone.EntryThreadId})");
+        if (runA.ReturnedToSentinel && recDone.EntryThreadId < 1)
+            throw new Exception("clean return must keep EntryThreadId for re-arm");
 
         Console.WriteLine(
             $"[Smoke] IopYieldStart_EntryThread_NotFalsePeer OK " +
-            $"(entryA={entryA} worker={worker} afterFreeTid={recDone.EntryThreadId} " +
+            $"(entryA={entryA} worker={worker} afterStartTid={recDone.EntryThreadId} " +
             $"globalPeer={sys.Iop.FindNextReadyThread()})");
     }
 

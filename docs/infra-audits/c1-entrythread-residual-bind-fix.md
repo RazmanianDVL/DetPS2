@@ -8,9 +8,10 @@
 
 1. **Enqueue guard:** residual only if `EntryThreadId >= 1`; else TRACE skip and continue first-call budget.  
 2. **Drain TRACE:** log DROP unbound (should be rare after #1).  
-3. **Free entry slots** when first-call finishes without residual (returned / resident spin / boot quanta) so late modules can bind.
+3. **Free entry slots only on pure budget exhaust** without residual — **not** on clean `returned` / residentSpin / bootQuanta (C1.2 re-arm + UniqueStacks smoke).
 
 ```text
 no residual without resumable entry thread
-  free completed entry slots to reduce table pressure
+  free only budget-exhaust dead ends (not clean return)
 ```
+

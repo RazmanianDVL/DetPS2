@@ -1299,6 +1299,11 @@ press 3000 Circle 100
     public static void IopYieldStart_EntryThread_NotFalsePeer() =>
         IopExecSmokes.IopYieldStart_EntryThread_NotFalsePeer();
 
+    /// <summary>Forward to <see cref="IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread"/> for single-smoke CLI.</summary>
+    public static void PrepareModuleEntry_UniqueStacks_WhenMultiThread() =>
+        IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
+
+
 
     /// <summary>Forward to <see cref="IopExecSmokes.RealRpc_SyntheticLiveRegister_BindCallHits"/> for single-smoke CLI.</summary>
     public static void RealRpc_SyntheticLiveRegister_BindCallHits() =>
