@@ -1598,3 +1598,41 @@ producer dig
   handler self-stores while draining 2-3 entry pool
   no refill after 15.25M → no kicks → no re-arm
 ```
+
+### 26.5 Only live producer path: scheduler `0x1F43B0` (setup-only)
+
+Of 21 static `jal 0x1F2408` sites, only **two** fire at runtime:
+
+| Caller site | Hits | Cycles |
+|-------------|------|--------|
+| `0x001F440C` | 1 | 15,167,536 |
+| `0x001F4478` | 2 | 15,180,912 / 15,193,584 |
+
+Both sit in **`0x001F43B0`** (producer *scheduler*):
+
+```text
+0x1F43B0:
+  if (gp-24112 == 0) return;          // master enable
+  // queue-empty / flip-ready (-24225) / cursor checks
+  jal 0x1F2408                        // producer @ 0x1F440C
+  ...
+  jal 0x1F1778 (a0=-1)                // optional direct handler kick
+  jal 0x1F2408                        // producer @ 0x1F4478
+```
+
+| PC | Hits 30M | Window |
+|----|----------|--------|
+| `0x1F43B0` scheduler entry | **8** | 15.155–15.256M **only** |
+| Outer `0x1F5788` | 4 | setup |
+| Outer `0x1F6128` | 4 | setup |
+| Outer `0x132F38` / `0x1D3E24` / `0x26F89C` | 0 | |
+
+**8 scheduler entries → 3 producer fills** (gates skip 5). After ~15.26M the **scheduler itself is never called** — not merely failing gates mid-function. Upstream outers `0x1F5788`/`0x1F6128` also go silent.
+
+```text
+outers 0x1F5788/0x1F6128 → scheduler 0x1F43B0 (8× setup)
+  → gated → producer 0x1F2408 (3×) → queue → DMA kicks
+after 15.26M: outers silent → no scheduler → no refill
+```
+
+Claude gate seat can focus on why `0x1F5788`/`0x1F6128` stop (or master enable gp−24112).
