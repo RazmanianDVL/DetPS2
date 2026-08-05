@@ -2919,3 +2919,50 @@ synthesis (Claude) -- the "missing 4th unmask" question is already answered, not
   still missing: a SEPARATE per-frame/per-vblank mechanism, never located tonight, that
     should drive ongoing MSKPATH3 cycling + VU1 execution + Path1 traffic during real gameplay
 ```
+
+---
+
+## 48. State question: not lit frontend waiting for Start — black post-setup plateau; pad no-ops (Grok)
+
+Claude S47 synthesis accepted: S9–S46 chain is one bounded correct display-env init. Open = game state / ongoing per-frame trigger.
+
+### 48.1 Agree synthesis
+
+- `0x1FFAF4` ×4 stages on fixed `0x6754C0` = finished setup, not starved
+- Drain policy correct (S46); object creators one-shot complete (S44)
+- Missing piece is **not** inside that chain
+
+### 48.2 State probe (tip ~2346be1 / current main)
+
+| Run | cyc | cdvd | px | gifP1 | heldP3qwc | lit | mostlyBlack | notes |
+|-----|----:|-----:|---:|------:|----------:|----:|:-----------:|-------|
+| baseline | 30M | **1865** | 877187 | 0 | 2124 | 0 | 1 | tid5 current; plateau |
+| +`b3-menu-interactive.pad` | 50M | **1865** | 877187 | 0 | 2124 | 0 | 1 | Start/Cross @28–50M; **identical GS** |
+| older 50M profile (prior tip) | 50M | 609 | 877187 | 0 | 2124 | 0 | 1 | same gfx plateau |
+
+Pad script comment targets Soft-GS FRONTEND ~40M with **cdvd≈6584**. We plateau at **1865** (or 609 on older tip) — well short of that spine. Richer START/CROSS does **not** move cdvd, gif paths, held queue, or lit.
+
+### 48.3 What state this is / is not
+
+| Hypothesis | Verdict |
+|------------|---------|
+| Lit title/frontend chrome waiting for Start | **No** — `lit=0` / `mostlyBlack=1` / no DISPFB paint; Start/Cross no-op on GS |
+| Race gameplay / VU1 active | **No** — `gifPath1=0`, `MscalRuns=0` (S30), forever |
+| Mid-stream truncated disc load still progressing | **Unlikely at 30–50M** — cdvd flat after setup window; no further sectors |
+| Post display-env setup, EE thrash, no continuous GS | **Yes** — matches S29.4 transfer census (SIF-only post-setup) |
+
+So: **not** "sitting correctly on a real menu waiting for a button we haven't pressed." Closer to **post-one-shot-setup idle with black display-env**, where something that should both (a) pull more assets / advance mode and (b) arm per-frame MSKPATH3+VU1 never starts. Pad is not the missing trigger for *this* plateau.
+
+### 48.4 Implications for next hunt
+
+1. **State-first still right**, but the state is "black post-setup", not "frontend interactive."
+2. Code-side target reframe: who advances **mode / load phase** after display-env stage 4 — the thing that would request more CDVD (toward 6584) **or** arm continuous render — not more of the finished S25–S31 chain.
+3. Pad A/B at 100M with the interactive script is low value while cdvd/gif are frozen at 1865/held-2124; only re-try if a load/mode advance is restored first.
+
+```text
+state RESULT
+  agree S47: setup chain finished correctly
+  NOT lit menu waiting for Start (pad 50M no-ops; lit=0)
+  IS black post-setup plateau: cdvd flat 1865, gifP1=0, held third batch, EE thrash
+  next: mode/load phase after display-env stage4 (not 4th unmask inside finished chain)
+```
