@@ -9178,3 +9178,50 @@ S189: DECISIVE -- the PC-stream diagnostic shows ZERO instruction retirements (n
       MaybePreempt's internal PC-write paths (cross-thread switch), not all of them. Next: read
       MaybePreempt's full source for every PC assignment, not just the logged "switched" one.
 ```
+
+## 190. MaybePreempt ruled out by source+periodicity; two new candidates found in Step()'s other continue paths (Claude)
+
+Read `Step()` (`EmotionEngine.cs:559`) and `MaybePreempt`/`RestoreContext`/`RestoreFullContext`
+(`KernelHle.cs`) directly.
+
+**MaybePreempt further ruled out, this time by source inspection, not just trace absence.** It
+has exactly one PC-write path (`RestoreFullContext`, logged as `"PreemptIn"`) plus a second one
+reachable via `RestoreContext(fromSyscall:false)` (logged as `"SwitchToFull"`). Checked *both*
+tags in the already-captured thread log: last entries for each are `cyc=41,942,240`
+(`PreemptOut`/`PreemptIn`, tid1→tid8, healthy) and `cyc=41,942,304` (`SwitchToFull`, tid1,
+healthy `pc=0x1F2508`) — nothing after, for either. **Also checked the periodicity**: real
+switch attempts recur roughly every ~85,584 cycles in this stretch (`41,856,656` →
+`41,942,240`); the *next* one wouldn't be due until ~`cyc=42,027,824` — well *after* the
+`cyc=42,000,000` corruption point. MaybePreempt's own tick schedule means it likely wasn't even
+due to attempt anything at the critical moment. `HleRedirectPc`'s application site (line 994-999)
+is also fully covered by the PCSTREAM diagnostic's own `"hle-redirect"` tag, which never
+appeared — ruled out too.
+
+**Two more `continue` paths in `Step()` found that write PC and aren't covered by PCSTREAM**,
+both gated behind state flags I haven't checked the live value of yet:
+- `_pendingThreadStall` (line 616): calls `_hle.Kernel.SwitchToNext(this)`, which can succeed and
+  change PC. Precondition per the code's own comment: set when "a thread implicitly exited via
+  `jr ra` (`ra==0`)" — doesn't obviously match our context (we've confirmed `ra` stayed sane,
+  `0x1F2518`, right up to the last healthy point), but worth checking the flag's actual live
+  value rather than assuming from the precondition description.
+- `_pendingSemaStall` (line 637): can call `_hle.Kernel.TryYieldToOtherRunnable(this)` (line 655)
+  or, if `SemaStallYield` is set, another yield path (line 666) — either could rewrite PC via a
+  thread switch, off the beaten path of the switches already checked.
+
+Neither of these has an obvious "why would it be true right now" story yet, but they're the only
+remaining PC-write paths in `Step()` I can find that aren't already ruled out. Handing back —
+this needs checking `_pendingThreadStall`/`_pendingSemaStall`'s actual live state right at the
+critical cycle (would need a small temp diagnostic, since neither currently has trace output),
+or a static read of what sets these two flags to see if either has a plausible path into this
+specific queue-loop/DI-span context.
+
+```text
+S190: MaybePreempt ruled out via direct source read (both PC-write paths' trace tags confirmed
+      clean, PLUS its own tick periodicity means the next attempt wasn't even due until well
+      after the corruption point). HleRedirectPc also ruled out (its own PCSTREAM tag never
+      fired). Found two remaining candidates in Step()'s other continue paths that write PC
+      without PCSTREAM coverage: _pendingThreadStall (via SwitchToNext, precondition is ra==0
+      which doesn't obviously match) and _pendingSemaStall (via TryYieldToOtherRunnable/other
+      yield). Neither flag's live state has been checked yet -- needs either a small temp
+      diagnostic or a static read of what sets them to see if either has a plausible path here.
+```
