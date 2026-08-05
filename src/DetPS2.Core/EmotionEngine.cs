@@ -1877,18 +1877,34 @@ public sealed class EmotionEngine : ISchedulable
             // `bne zero, rs`). Next-node pointers in RDRAM have |ptr-0| >> 50k, so the
             // dist snap forced ptr→0 after the first node — Midway type registry install
             // (0x1AB810) returned -1 for every id after the head (live Dec SLUS_208.81
-            // type 0x510 / 0x1F factory @ ~188M). Refuse only when the prior instruction
+            // type 0x510 / 0x1F factory @ ~188M). Refuse when a recent prior instruction
             // is a load into the compared register — pure countdown loops use addiu -1,
             // not lw, so Midway software delays still snap.
+            //
+            // B3 S248/S249: freelist free-all-used at 0x2B6C40 is
+            //   lw v1, 0(a2); nop; nop; nop; bne v1, zero, loop
+            // Looking only at PC-4 sees a nop and wrongly snaps v1 (next-node ptr) to 0,
+            // so the walk never advances and only 1 of N nodes is returned to the freelist
+            // (sound\fe.awd pool permanently empty → case11 stuck). Skip leading nops
+            // (and a short window of non-clobbering delay fillers) when hunting the load.
             if (rt == 0 || rs == 0)
             {
                 uint ptrReg = rt == 0 ? rs : rt;
-                uint prev = _memory.Read32((uint)(PC - 4));
-                uint prevOp = prev >> 26;
-                uint prevRt = (prev >> 16) & 0x1F;
-                // lw=0x23, lwu=0x27, ld=0x37
-                if ((prevOp is 0x23 or 0x27 or 0x37) && prevRt == ptrReg)
-                    return;
+                // Look back up to 8 instructions for a load into ptrReg, skipping nops.
+                for (int back = 1; back <= 8; back++)
+                {
+                    uint prev = _memory.Read32((uint)(PC - (uint)(4 * back)));
+                    if (prev == 0)
+                        continue; // nop
+                    uint prevOp = prev >> 26;
+                    uint prevRt = (prev >> 16) & 0x1F;
+                    // lw=0x23, lwu=0x27, ld=0x37
+                    if ((prevOp is 0x23 or 0x27 or 0x37) && prevRt == ptrReg)
+                        return;
+                    // Hit a real (non-nop) instruction that is not a load into ptrReg —
+                    // stop; countdown loops have addiu immediately before bne.
+                    break;
+                }
             }
             // memcpy/memset unaligned tails commonly do:
             //   addiu a2, a2, -1; lbu; sb; bne a2, -1, loop

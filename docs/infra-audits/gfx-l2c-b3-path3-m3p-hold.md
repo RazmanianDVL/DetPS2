@@ -11173,3 +11173,35 @@ S248: Instruction-level confirm of S247 -- a2 register directly traced as pinned
       for all 19 instructions of the free() call, never reassigned. Raw opcode sequence
       included for static analysis of exactly why the bne loop-back doesn't re-enter live.
 ```
+
+## 249. ROOT CAUSE + FIX: BNE countdown snap ignored nops between `lw` and `bne` (Grok)
+
+### Cause (matches S248 live: v1 nonzero, branch not taken)
+`EmotionEngine.MaybeFastForwardCountdown` snaps `bne rs, zero, -N` when `|rs| > 50k` to finish software delay loops. It refused to snap when `PC-4` was a load into `rs` (list-walk guard).
+
+B3 freelist free `0x2B6C40`:
+```
+lw v1, 0(a2)   ; next ptr
+nop
+nop
+nop
+bne v1, zero, loop
+```
+`PC-4` is **nop**, so the guard missed, `v1` (0x1F35A48) was snapped to **0**, loop exited, free restored **1 of 11** nodes.
+
+### Fix
+Look back up to 8 instructions, **skipping nops**, for `lw`/`lwu`/`ld` into the compared register before allowing the snap.
+
+### Verify (40M, freelist head `0x1E75678`)
+```
+... construct pops to empty ...
+2B6C90 WROTE freelist=0x1F35E08   ; free restores head
+2B6DB8 WROTE freelist=0x1F35A48   ; next pop follows CHAIN (was 0 before fix)
+```
+Chain intact after free.
+
+```text
+S249: MaybeFastForwardCountdown nop-gap bug forced freelist free to drop 10/11 nodes.
+      Fix: skip nops when hunting prior load. Freelist chain verified restored.
+```
+
