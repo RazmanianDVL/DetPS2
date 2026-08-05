@@ -894,13 +894,26 @@ public partial class MainWindow : Window, IOptionsHost
 
             // Status chrome: update ~4×/s (not every UI tick) to cut string/UI churn.
             // Prefer snapshot metrics when available so we do not chase mid-RunFor GS.
+            // GFX C5 HUD: honest present class (black / gray residual / % color) from Soft-GS FB.
             if ((_detailLogCounter % 15) == 0)
             {
+                string presentClass = "present: ?";
+                if (_emuWorker.TryGetPresent(out var snapPx, out _, out _, out _, out _, out _, out _, out _)
+                    && !snapPx.IsEmpty)
+                {
+                    presentClass = SoftGsAvaloniaBlit.FormatPresentClass(
+                        snapPx.Span, out _, out _, out _);
+                }
+                else if (!workerDriving && _system != null)
+                {
+                    presentClass = SoftGsAvaloniaBlit.FormatPresentClass(
+                        _system.Gs.GetPresentSpan(), out _, out _, out _);
+                }
                 _gameWindow.SetStatus(
                     $"PC=0x{statusPc:X8}  c={statusCycles:N0}  " +
                     $"{FormatThroughput(_lastCyclesPerSec)}  px={statusPx:N0}  " +
-                    $"lit={statusLit:N0}  q={_emuWorker.Quantum:N0}  " +
-                    $"Hz={_emuWorker.PresentHz:F0}  present={_gameWindow.HostPresentName}  " +
+                    $"lit={statusLit:N0}  {presentClass}  q={_emuWorker.Quantum:N0}  " +
+                    $"Hz={_emuWorker.PresentHz:F0}  host={_gameWindow.HostPresentName}  " +
                     $"ee={_emuWorker.Status}");
             }
         }

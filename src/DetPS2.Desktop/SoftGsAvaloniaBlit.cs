@@ -18,6 +18,35 @@ namespace DetPS2.Desktop;
 /// </summary>
 public static class SoftGsAvaloniaBlit
 {
+    /// <summary>
+    /// C5-aligned present class for Desktop HUD: black / gray residual / % color.
+    /// Matches scoreboard presentLit/presentGray/presentColor discipline (honest residual).
+    /// </summary>
+    public static string FormatPresentClass(ReadOnlySpan<uint> fb, out int lit, out int gray, out int color)
+    {
+        lit = 0;
+        gray = 0;
+        color = 0;
+        for (int i = 0; i < fb.Length; i++)
+        {
+            uint p = fb[i] & 0x00FFFFFFu;
+            if (p == 0) continue;
+            lit++;
+            byte r = (byte)(p >> 16), g = (byte)(p >> 8), b = (byte)p;
+            if (r == g && g == b) gray++;
+            else color++;
+        }
+        int total = fb.Length;
+        if (total <= 0 || lit == 0)
+            return "present: black";
+        double litPct = 100.0 * lit / total;
+        double colorPct = 100.0 * color / total;
+        // Mostly gray residual (index-without-CLUT strip class) — honest, not Tier A color.
+        if (color * 4 < lit)
+            return $"present: gray residual lit={lit:N0} ({litPct:F1}%)";
+        return $"present: {colorPct:F1}% color (lit={lit:N0})";
+    }
+
     /// <summary>True when <c>DETPS2_VFLIP=1</c> (or <c>true</c>/<c>yes</c>).</summary>
     public static bool EnvFlipY => ParseEnvFlag("DETPS2_VFLIP");
 
