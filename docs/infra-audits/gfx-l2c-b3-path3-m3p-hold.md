@@ -8555,3 +8555,44 @@ S183: No static fn-ptr table to 0x223130/body (0 aligned code ptrs in image). Se
       Next live: catch inbound edge (prev PC + thread event + COP0) at first 0x2232xx.
 ```
 
+
+## 183. Bounded the inbound-edge window to a specific DI-protected 50,000-cycle span (Claude)
+
+Ran the full S183 checklist (previous PC, transfer class, thread log, COP0).
+
+**Thread log (ask #4)**: no `SwitchToFull`/`PreemptIn`/`Restore`/`SaveOut` event anywhere between
+tid=1's last healthy point (cyc=41,942,304) and well past the mystery landing — confirmed via
+the same `--trace-threads` capture used in S176. **Rules out KernelHle PC-restore as the
+mechanism** (Grok's candidate #2).
+
+**COP0 at the landing (ask #5)**: `EPC=0x00223228` exactly equals current `pc`, `EXL=0`,
+`eretStack=0`. Consistent with either a genuinely bare `jr`/fallthrough, or an `eret` that had
+just cleared `EXL` back to 0 on the way out.
+
+**Previous PC (asks #1-2) — the real find**: checked the exception-vector log (`vector_check.log`
+from S178) for the interrupt immediately *before* the first `EPC=0x223228` appears. It shows
+`EPC=0x001F2520` at `cyc=41,950,000` — **exactly the `di` instruction inside the queue-dispatch
+loop's COP0-status spin** (`0x1F251C`-`0x1F2538`, already identified in S177). Between that
+interrupt and the next one (`cyc=42,000,128`, the first with `EPC=0x223228`) there is a **full
+50,000-cycle gap with zero interrupt-vector hits at all** — fully explained: this spin executes
+`di` (interrupts explicitly off) and doesn't `ei` again until `0x1F2558`, so of course nothing
+fires while thread 1 is inside it.
+
+**This tightly bounds the whole mystery transition to a single, already-identified 50,000-cycle
+window**: thread 1 enters the `di`-protected spin at `0x1F2520` (cyc≈41,950,000-ish), and by
+cyc=42,000,128 it's executing `0x223228` — a completely unrelated function, per every check so
+far with no call edge and no thread switch. The spin's own visible exit path (`0x1F253C`
+onward — a "buffer swap" sequence I partially disassembled in S176/S177, ending in `ei` at
+`0x1F2558` then further calls including `jal 0x1F1778` at `0x1F25FC`) is the natural remaining
+candidate for where the actual jump happens, but I haven't traced deep enough into `0x1F1778` or
+the buffer-swap body to find it — that's static-tooling territory (following calls several
+levels deep) rather than more live pcbreak guessing.
+
+```text
+S183: Bounded the transition to a specific, already-known 50,000-cycle window: thread 1 enters
+      the di-protected COP0 spin at 0x1F2520 (part of the queue-dispatch loop, S177) around
+      cyc~41,950,000, and by cyc=42,000,128 is executing 0x223228 with no call edge, no thread
+      switch (ruling out KernelHle restore). The spin's own exit path (0x1F253C buffer-swap
+      logic, ei at 0x1F2558, jal 0x1F1778 at 0x1F25FC) is the natural place to keep looking --
+      static call-graph tracing through 0x1F1778 and the buffer-swap body is the next step.
+```
