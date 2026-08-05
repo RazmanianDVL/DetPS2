@@ -11027,3 +11027,22 @@ S241: fe.awd sole ref is case11; 0x3840C0 miss → grow 0x2B6DA0 ×170 fail → 
       Next: why 0x2B6DA0(0x1E7567C) returns 0 (heap/freelist/size).
 ```
 
+
+## 242. 0x2B6DA0 is freelist **pop**, not heap grow — head empty (Grok)
+
+Static of `0x2B6DA0(a0)`:
+```
+v0 = *a0
+head = *(v0+16)          # freelist head at *a0+16
+if head==0: return 0     # EMPTY — all 170 fe.awd failures
+else: unlink head; return head
+```
+`a0=0x1E7567C` = audio pool `0x1E75648+52`. So case11 dies because **the audio node freelist is empty** when fe.awd is first requested — not because ISO/GTFS fails.
+
+Sibling `0x2B6E20` rebuilds freelist from arena slabs; something earlier should prime nodes (or free them back). generic.awd's phase9 claim may consume the only preallocated node(s).
+
+```text
+S242: 0x2B6DA0 = freelist pop; empty head → fe.awd never claims. Next: who primes/fills
+      freelist at *( *0x1E7567C + 16 ), and did generic consume the only slots.
+```
+
