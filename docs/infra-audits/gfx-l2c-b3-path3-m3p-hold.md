@@ -1796,3 +1796,38 @@ So the open “per-frame path” is not merely Path1 vs Path3 preference — it 
 post-setup: SIF only; gifP1=0 forever; P2/P3 only in setup
 hunt = who should start continuous GS submit after boot table stage 2 completes
 ```
+
+---
+
+## 30. VIF1 command-type breakdown confirms: not a routing gap, VU1 is never fed at all (Claude)
+
+Complementary angle to §29.4's transfer census — checked VIF1's own command-type counters
+(`CommandsProcessed`/`UnpackWords`/`MpgWords`, `Vu1.MscalRuns`, all pre-existing fields, no new
+Core code) rather than GIF-side transfer counts, to rule out "maybe VU1 gets its data some
+other way we're not counting on the GIF side."
+
+```text
+at cyc=16,000,000 and cyc=30,000,000 (byte-identical, confirms the freeze is total):
+  gif-path: p1=0 p1qws=0 p2=12 p3=20 ...
+  vu1: mscalRuns=0
+  vif1: cmds=745 unpackWords=0 mpgWords=0 mscal=0
+```
+
+**VIF1 processes 745 commands total (frozen by 16M, unchanged through 30M) — and not one of
+them is UNPACK, MPG, or MSCAL.** Whatever those 745 commands are (STCYCL/STMASK/FLUSH/DIRECT-
+class, consistent with the p2=12 Path2-passthrough count), VU1 never once receives a VU data
+upload, a microcode upload, or a microcode-run trigger, in the entire 30M-cycle run. Combined
+with `mscalRuns=0`: **VU1 never executes a single instruction this whole run.**
+
+This rules out a Path1-specific routing bug (e.g. XGKICK firing but Gif.ReceivePath1Data
+somehow dropping it) — the problem is upstream of GIF entirely: the EE-side code that should
+feed VU1 real geometry/microcode via VIF1 UNPACK+MPG+MSCAL never runs those command types at
+all, consistent with Grok's §29.4 finding that no post-setup GS kick stream exists on any path.
+One unified freeze, not two separate bugs.
+
+```text
+VIF1 command-type check (Claude) -- rules out Path1-specific routing bug
+  cmds=745 total, frozen identical at 16M and 30M -- confirms total freeze, not just GIF-side
+  unpackWords=0 mpgWords=0 mscal=0 mscalRuns=0 -- VU1 never fed, never runs, entire run
+  same root as S29: whatever should drive continuous per-frame submission never starts
+```
