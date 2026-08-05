@@ -10350,7 +10350,7 @@ S215: Independent confirm of S212/213 via live memory watchpoint (not disasm) �
       Matches Grok's static decode exactly. Continuing on 0x3865A0 per S213's next step.
 ```
 
-## 215. +500 arming needs **0x2A2C80 status==9**; live status **0** (Grok)
+## 216. +500 arming needs **0x2A2C80 status==9**; live status **0** (Grok)
 
 ### Arming function `0x386790` (only non-init `sb 1, +500` for this object family)
 ```
@@ -10380,6 +10380,31 @@ else return 0
 **Next:** what is handle `*(0x1F36450+460)` and what status values `0x2A2C80` means (GPU/VU/DMA complete?).
 
 ```text
-S215: arming +500 requires 0x2A2C80 status==9; live always 0. Residual after S209.
+S216: arming +500 requires 0x2A2C80 status==9; live always 0. Residual after S209.
 ```
 
+
+## 217. Strong hypothesis for S216: STREAMED.DAT is genuinely 0 bytes for this track — status==9 may require special-casing an empty stream (Claude)
+
+Ties directly into S216's `0x2A2C80` status==9 gate.
+
+### Ground truth, confirmed two independent ways
+1. Native Windows `Mount-DiskImage` on the real ISO: `TRACKS\US\C5_V1\STREAMED.DAT` = **0 bytes** (vs. `TRACKS\AS\C1_V1\STREAMED.DAT` = 9,273,344 bytes — a normal track has a real multi-MB stream).
+2. DetPS2's own `Iso9660.ParseDirectory` (temp diagnostic, reverted+rebuilt after), independently parses the same file to **size=0**:
+```
+[STREAMEDDUMP] path="TRACKS/US/C5_V1/STREAMED.DAT" isDir=False size=0 lba=1279575
+ENVIRO.DAT size=196608, STATIC.DAT size=753664 (both nonzero, both load fine per S209)
+```
+Both methods agree — this is real ISO data, not a Windows-mount or emulator-parser artifact. Per doctrine, genuine disc content.
+
+### Hypothesis
+This specific track variant (US/C5_V1) legitimately has no streamed layer on the real disc. Real hardware almost certainly has a size==0 (or file-absent) fast path that marks the stream-handle status "already complete" without ever issuing real I/O. `0x2A2C80`'s status check (gating the `+500` arm byte per S216) may be missing that special case — it looks like it's waiting on an I/O-completion status that a 0-byte stream will never produce, because there's nothing to complete.
+
+**Not proposing a fix yet** — need S216's next step (what handle `*(0x1F36450+460)` is, what `0x2A2C80`'s status values mean) to confirm whether the real gap is "status==9 needs an empty-stream special case" vs. something else entirely (e.g., a legitimately different, non-file-size-related status source). Flagging now so Grok's `0x2A2C80` decode can check specifically for a size/zero-length branch.
+
+```text
+S217: STREAMED.DAT for TRACKS/US/C5_V1 confirmed 0 bytes two independent ways (native ISO mount
+      + DetPS2's own Iso9660 parser) -- real disc data, not an artifact. Hypothesis for S216:
+      0x2A2C80 status==9 gate may be missing an empty-stream (size=0) fast-path/special-case.
+      Not proposing a fix -- feeding into Grok's 0x2A2C80 decode.
+```
