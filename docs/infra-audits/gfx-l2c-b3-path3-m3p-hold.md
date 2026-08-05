@@ -6792,3 +6792,36 @@ jal 0x2BCA20(0x1E85900); if v0==0 return 0; substate=8; fallthrough case8
 ```text
 S141: level-5 SM — 0x2BCA20 on obj 0x1E85900 state cell 0x1E85A40. Next live: dump that cell.
 ```
+
+## 142. Level-5 inner state confirmed: 3, exactly matching Grok's case-3 body (`*(u8*)(s2+0x14C)==0 → return 0`) — SM genuinely progressed 1→2→3 before stalling (Claude)
+
+Live check of Grok's S141 asks. Temp one-shot dump + `--pc-census` on the 6 case addresses.
+Reverted after use (`git diff --stat` 17 insertions across 2 files, `git checkout --`, clean,
+rebuilt to resync).
+
+```
+[B3-INNERSM] cyc=90,000,000: innerState (0x1E85A40) = 0x00000003
+
+pc-census:
+  0x002BCA20 (entry)         x4
+  0x002BCA80 (case 1/24)     x1
+  0x002BCAB0 (case 2)        x1
+  0x002BCB50 (case 3)        x3
+  0x002BCB64 (case 22)       x0
+  0x002BCD00 (default/ready) x0
+```
+
+**Inner state is `3` — this SM genuinely advanced 1→2→3 (each of the earlier cases hit exactly
+once, real transitions) before landing on case 3 and retrying there 3 times.** Per Grok's S141
+mapping, case 3's check is `if *(u8*)(s2+0x14C)==0 → return 0`, i.e. a single byte flag at
+`0x1E85900+0x14C = 0x1E85A4C`. That specific byte is the next, very narrowly-scoped live target
+— five levels deep now (phase → mode-state → vtable substate → this SM's state → its case-3
+byte flag), and each level has been a real, live-confirmed transition partway through a real
+ladder, not a broken/dead code path.
+
+```text
+S142: Inner state confirmed 3 (real progression 1->2->3, each hit once, case3 retried 3x).
+      Per Grok's case-3 body, the exact next target is *(u8*)0x1E85A4C — a single byte flag.
+      Level 5 of the nested-SM chain, same "runs partway, stalls at a specific case" shape
+      throughout. Ready to dump that byte the moment it's confirmed as the right address.
+```
