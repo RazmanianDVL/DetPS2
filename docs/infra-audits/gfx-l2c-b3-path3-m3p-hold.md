@@ -10304,3 +10304,29 @@ S213: phase1 jal 0x3865A0 always v0.lo==0 → no +200:=2 → 0x3FBBB0 fail forev
       Next: 0x3865A0 purpose / why zero (async? bad resource @+192?).
 ```
 
+
+## 214. 0x3865A0: **byte +500 never set** → always return 0 (Grok)
+
+Obj `a0=0x1F36450` (from phase1; `*(0x1E7A888+192)`).
+
+```
+0x3865CC  lbu v0, 500(a0)     ; +0x1F4
+0x3865D0  beq v0,0 → 0x386744 ; LIVE always (v0=0 all samples)
+0x386744  jal 0x386790
+          return v0=0
+```
+
+Status path via `0x2A2C80` (**0 hits** — never reached).
+
+| Check | Live |
+|-------|------|
+| +500 on `0x1F36450` | **always 0** |
+| `0x386744` | 88 hits (all calls) |
+| `0x2A2C80` status branch | 0 |
+
+**Need:** who should set `*(u8*)(0x1F36450+500)=1` (arm/upload ready).
+
+```text
+S214: 0x3865A0 fails because +500 on stream obj 0x1F36450 is never set; skips 0x2A2C80 path.
+```
+
