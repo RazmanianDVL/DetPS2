@@ -7507,3 +7507,14 @@ S163: MAJOR — sp itself differs by ~41MB between a healthy early entry (0x1FFF
       whatever stale data sits at that bogus address. Real question moves upstream: what
       corrupts sp between the last known-healthy entry and the final stuck one?
 ```
+
+## 163–164. Final handler sp is garbage 0x0478A6A6; count loop does not touch sp (Claude+Grok)
+
+**S163:** healthy entries sp=0x01FFFD30 ra=0x80000200; stuck epilogue sp≈0x0478A6A6 (past RDRAM).
+
+**S164:** 0x2514C0 / count loop: **no sp register uses**. 0x2B7110 only balanced frame.
+sp corruption is upstream of final VBlank entry, not the relocate loop writing $sp.
+
+```text
+S164: count loop does not clobber sp. Find when sp leaves 0x01FFxxxx; dump SavedSp.
+```
