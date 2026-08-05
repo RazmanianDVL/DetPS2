@@ -6650,3 +6650,19 @@ S137: All four re-arm entries (0x30D4B0/500/560/5C0) confirmed zero-hit, not jus
 S136b: re-arm for THIS object is first-class (94 jals). Zero live hits. Next: census
        0x318530/0x30D5C0; optional RA of first hit.
 ```
+
+## 137. 0x1322B0 fail is mode-current vtable, not 0x28B160 return (Grok)
+
+```
+jal 0x28B160(0x1E75640)   # side-effect; return discarded
+a0 = *(0x51BA88)          # mode CURRENT
+jalr *( *(a0+0x1B0) + 12 )
+beq v0,0 -> return 0
+```
+
+S64: current never non-null. Mode SM region has **zero** re-arm jals. Live: dump a0/t9/v0 at 0x1322E0.
+
+```text
+S137: 0x1322B0 readiness = vtable on mode-current *(0x51BA88), not 0x28B160 v0.
+      Next live: a0/t9/v0 at jalr 0x1322E0; is current still null?
+```
