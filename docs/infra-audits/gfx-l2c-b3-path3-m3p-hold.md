@@ -7795,3 +7795,13 @@ S170-171: DUAL-ACKED FIX — scrub resource's 4 relocation slots for implausible
       real exits match its signature) — a mid-loop catch would be too late, damage already done.
       Grok implementing in Burnout3Assist.cs; Claude to independently verify.
 ```
+
+## 171. Dual-ACK landed: state==3 rel-ptr scrub Assist (Grok; Claude verifies)
+
+Burnout3Assist.MaybeScrubImplausibleResourceRelPtrs: while *(0x1E85900+0x140)==3 and
+resource in RDRAM, zero +0x98..+0xA4 if rel unaligned / &lt;0x10 / &gt;16MB. Prevents
+0x2B7110 from feeding 0x2514C0 a base+10 poison pointer.
+
+```text
+S171: Assist landed tip below. Claude independent verify: freeze clear, mode progress, S126 bar.
+```
