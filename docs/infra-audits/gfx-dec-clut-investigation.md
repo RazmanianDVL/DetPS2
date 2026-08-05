@@ -282,6 +282,21 @@ scope. Not a quick-TRACE-tier question anymore.
 
 ---
 
+## 4g. Full-file PAD128 / `\x18PS2` scan (Grok) — no tags outside nests
+
+**Capture:** `DETPS2_TEMP_DEC_PAD128_SCAN=1` (fully reverted).  
+`loaded=2836480`.
+
+| Pattern | e0-nest | e1-nest | e2plus / root / other |
+|---------|--------:|--------:|------------------------|
+| ASCII `PAD128` | 9307 | 867 | **0** |
+| Magic `\x18PS2` | 404 | **24** | **0** |
+
+e1 `PS2=24` matches 24 kind=2 tiles. `PAD128` inflated by repeated format string in headers.  
+**Zero** hits outside the two texture nests — confirms no separate PAD128-tagged palette bank.
+
+---
+
 ## 5. Non-goals
 
 - Do not invent a synthetic/procedural palette to make the gray strip "look better" — that is
@@ -300,8 +315,7 @@ scope. Not a quick-TRACE-tier question anymore.
 GFX Dec CLUT investigation — CLOSED for this wave, honest park
   gray = honest PSMT8-without-CLUT fallback; real infra; not fabricated
   PL-029 never loads a CLUT for its 48 fed tiles
-  5 static-layout palette hypotheses refuted: nested kind=1, tile header,
-    in-payload leftover, root e=1 (more tiles), root e=8-13 (sparse records)
+  5 static-layout palette hypotheses refuted + full PAD128/PS2 scan (only e0/e1 nests)
   decisive dynamic check: real EE code issues exactly 1 TEX0/TEX2 write in
     100M cycles, cld=0 — native CLUT-texture draw path does not run at all
   conclusion: not a findable static blob; real draw path is gated out,
