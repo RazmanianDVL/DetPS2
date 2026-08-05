@@ -2162,3 +2162,34 @@ sema-104 producer hunt (Claude) -- found the designated producer, confirmed unre
     callers" -- possibly a systematic indirect-call/callback-table modeling gap, not
     coincidence
 ```
+
+---
+
+## 35. EE SetAlarm: zero calls in 30M (Grok)
+
+Systemic check after Claude's unreachable `0x248518` iSignalSema producer (sema 104).
+
+### Method
+
+Product `blocker-trace` 30M with `DETPS2_TRACE_ALARM=1` (logs every `SetEeAlarm` / syscalls `0x18/0x1E/0xFC/0xFD`).
+
+### Result
+
+**`[ALARM]` lines: 0.**  
+Top-syscalls dump also has **no** alarm nums (`0xFC/0xFD/0x18/0x1E/0xFE/0xFF`) in the listed ranks.
+
+HLE path `SetEeAlarm` / `TickEeAlarms` / `InvokeAlarmCallback` exists and is wired on VBlank — but **B3 never registers an EE soft alarm** in this window.
+
+### Implication
+
+- The dead `0x248518` producer is **not** "registered via SetAlarm but our fire is broken" — **registration never happens**.
+- Same class as blit consumer: plausible callback body, **no live arm path** in the run we see.
+- Does **not** yet prove a systematic HLE gap (we never got a SetAlarm to mishandle). Does prove B3's continuous path is not waiting on EE SetAlarm callbacks we failed to fire.
+
+Next (if pursuing systemic): IOP SetAlarm / TIMEMAN; or who *should* call EE SetAlarm before gameplay and why that code is unreached (same shape as boot-table vs per-frame).
+
+```text
+EE SetAlarm: 0 registrations / 30M
+0x248518 cannot fire via alarm HLE — never armed
+not a TickEeAlarms bug for this title in this window
+```
