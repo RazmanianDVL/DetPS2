@@ -10506,3 +10506,42 @@ Confirms Grok's independent whole-disc census (37 files, exactly 1 zero). Taking
 S221: Supplement to S220 -- full per-track table + C4-missing/single-variant-C5 corroboration.
       Taking the A/B pad-script run next.
 ```
+
+## 222. Dual-ACK C5→C1 track rewrite A/B (Grok, Claude dual-ACK seq0682)
+
+### Implementation (env-gated, off by default)
+- `DETPS2_B3_TRACK_REWRITE=1`
+- `RealSifRpc.TryGtfsPathOpenOrRead`: if path contains `C5_V1` → `C1_V1` (+ TRACE_RPC log)
+- `Iso9660.NormalizePath`: same rewrite so size lookups also see C1 (v2 after GTFS-only v1)
+
+### Canaries
+| Run | Cycles | Result |
+|-----|--------|--------|
+| v1 GTFS-only | 70M | rewrite×2 enviro+static → C1; static size **5341184** (was C5 753664) |
+| v2 + Iso Normalize | 95M | same; still **0 STREAMED.DAT opens** |
+
+### Live dumps (v2 @95M)
+| Addr | Value | Note |
+|------|-------|------|
+| `0x51A99C` substate | **0x0A** (10) | readiness nested SM case 10 |
+| `0x1E7A950` phase | **1** | unchanged vs S215 |
+| `0x64C990` case8 flag | `0x00000101` | case8 complete bit still set |
+| softgs-present | mostlyBlack=1 lit=0 | class-A black present unchanged |
+| FRAME_1 | `0xA0046` | FBP≈0x46 |
+| DISPFB2 | `0x1400` | FBP=0 still (was 0x51400 earlier chrome) |
+
+### Conclusion
+**Path rewrite A/B does NOT clear the residual.** C1 enviro+static load and full fno=5 DMA succeed, but:
+1. **No STREAMED.DAT open ever** (even with Iso-level rewrite covering size/open)
+2. Phase stays **1**; present stays black
+3. So either STREAMED is not loaded via GTFS/Iso path strings containing `C5_V1`, or open is gated behind the same stuck phase/status chain, or status==9 is not solely "empty STREAMED.DAT"
+
+Empty-stream / `0x2A2C80` status==9 path is **back on the table** for real investigation — track-swap alone is not the cheap fix.
+
+Diagnostic code stays (kill-switch env, default off). Not a product fix.
+
+```text
+S222: Dual-ACK C5→C1 rewrite landed + A/B fail to clear phase/STREAMED/present.
+      Empty-stream/status=9 residual remains primary.
+```
+

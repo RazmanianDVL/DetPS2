@@ -4334,6 +4334,19 @@ public sealed class RealSifRpc
         }
         if (path.Length == 0) return -1;
 
+        // S222 dual-ACK: B3 diagnostic only — blind PulseLogoPad lands on US/C5_V1 whose
+        // STREAMED.DAT is the sole 0-byte of 37 on the ISO (unused/dev slot). Env-gated
+        // rewrite to C1_V1 (nonzero STREAMED) for one canary A/B. Off by default; not a fix.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_TRACK_REWRITE") == "1"
+            && path.Contains("C5_V1", StringComparison.OrdinalIgnoreCase))
+        {
+            string before = path;
+            path = path.Replace("C5_V1", "C1_V1", StringComparison.OrdinalIgnoreCase);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] B3_TRACK_REWRITE C5→C1 path=\"{before}\" → \"{path}\"");
+        }
+
         // Dest + size heuristics: scan words for EE pointer + plausible size.
         uint dest = 0, size = 0;
         uint scan = Math.Min(sendSize, 48u);

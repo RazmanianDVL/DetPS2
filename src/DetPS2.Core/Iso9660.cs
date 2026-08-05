@@ -146,6 +146,11 @@ public static class Iso9660
         // ISO 9660 version ";1" is stripped at parse time — strip here so FindFile matches.
         int semi = name.IndexOf(';');
         if (semi >= 0) name = name[..semi];
+        // S222 dual-ACK diagnostic: US/C5_V1 is the sole 0-byte STREAMED slot (dev/unused).
+        // Env-gated path rewrite so size lookups and opens both see C1_V1. Off by default.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_TRACK_REWRITE") == "1"
+            && name.Contains("C5_V1", StringComparison.Ordinal))
+            name = name.Replace("C5_V1", "C1_V1", StringComparison.Ordinal);
         return name;
     }
 
