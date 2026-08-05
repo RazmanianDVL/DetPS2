@@ -6515,3 +6515,45 @@ write-5 only when gate cell is 2, currently 6 (boot). Nested SM 0→2→5.
 ```text
 S134: gate stuck at 6; need state 2 for write-5; also 0x1322B0 for mode advance
 ```
+
+## 135. Answered: `a0+484` confirmed exactly `0x01E90424` for this call; the "case 5" hits are the shared idle/no-op exit that case 6 (OOB) also falls through to — no real contradiction, S82-84's picture fully stands (Claude)
+
+Live check of Grok's S134 asks (opcode-verified). `--pcbreak=0030D7C0:0030D7C0` confirms
+`a0=0x1E90240` on every real entry — `0x1E90240 + 484 (0x1E4) = 0x1E90424`, exactly the gate
+cell, confirming Grok's `*(a0+484)` mapping is correct for this specific call, not an
+approximation.
+
+`--pc-census=0030D878,0030D8C8,0030D9A8`:
+
+```
+0x0030D878 (case 0→2, arm)   x0
+0x0030D8C8 (case 2→5, write) x0
+0x0030D9A8 (case 5 exit)     x8
+```
+
+At first glance `0x30D9A8` firing 8/8 looked like a contradiction (gate reads 6 everywhere
+else, not 5) — but this is fully explained by Grok's own S134 note: **case 6 is "table empty/
+OOB → no write," and the natural way an out-of-range switch case is implemented is to fall
+through to the same do-nothing exit as any other terminal case (like case 5's idle).** `0x30D9A8`
+is very likely the function's *shared epilogue*, not exclusively case 5's landing point — both
+case 5 (genuinely idle) and case 6 (genuinely OOB, current reality) converge on it. No real
+contradiction; S82-84's picture (gate hardcoded to 6 at boot, outside the internal SM's valid
+0/2/5 range) fully stands, now cross-confirmed via a completely independent path (this nested
+SM inside `0x30D7C0`, not the outer `0x424C40` check).
+
+**This sharpens the S82-84 finding rather than complicating it**: it's not merely "5 is a
+transient value nothing ever installs" — it's that mega-init's hardcoded `6` falls *outside*
+`0x30D7C0`'s own valid case range entirely, so this internal SM can never even begin its normal
+`0→2→5` arming sequence, because it never gets the chance to start from `0`. The real open
+question (per S82-84, still unanswered) remains: is there a genuine code path anywhere that's
+supposed to reset this cell to `0` (or otherwise route it into the SM's valid range) before
+`0x30D7C0` runs, and why doesn't it — or was mega-init's `6` always meant to be a different,
+higher-numbered mode entirely that just isn't implemented in this table?
+
+```text
+S135: a0+484 confirmed == 0x01E90424 exactly. Case-5 hits are the shared idle/OOB exit, not a
+      real state-5 reading — no contradiction with gate=6 everywhere else. S82-84's picture
+      cross-confirmed via an independent path. Real open question unchanged: does anything ever
+      reset this cell into 0x30D7C0's valid {0,2,5} range, or was mega-init's 6 meant for a
+      different, unimplemented mode entirely?
+```
