@@ -1223,3 +1223,23 @@ builder once @14.4M → write 0x53 to 0x67CDD0 → never read, never DMA
 object 0x665EC0 still lightly touched later
 next: who should walk/submit (starved after 15.5M?); Claude 14.4-15.5M heatmap
 ```
+
+### 23.6 Template field consumers: TRXDIR path dead, siblings live
+
+Static readers of the builder's `0x68xxxx` table (lui 0x68 + large negative offs):
+
+| Slot | Addr | Reader site | Fn entry | 30M hits |
+|------|------|-------------|----------|----------|
+| first field `-12864` | `0x67CDC0` | `0x0021990C` | `0x00219830` | **28** |
+| mid field `-12856` | `0x67CDC8` | `0x00219668` | `0x00219530` | (live callers exist) |
+| **TRXDIR `-12848`** | `0x67CDD0` | `0x00219298` | `0x00219150` | **0** entry; caller `0x1A7750` also **0** |
+
+So the global GS-template table **is** read for some fields (28×), but the **TRXDIR-specific consumer is never entered**. That is sharper than "buffer never touched": siblings consume; transfer-arm path is dead code in this window.
+
+Matches zero L2L / zero DMA of the range: nothing walks the TRXDIR slot into a GIF/DMAC submit.
+
+```text
+template table partially live (28× non-TRX fields)
+TRXDIR consumer 0x219150 / caller 0x1A7750: never entered
+next: what dispatches to 0x1A7750 vs live sibling callers (type gate?)
+```
