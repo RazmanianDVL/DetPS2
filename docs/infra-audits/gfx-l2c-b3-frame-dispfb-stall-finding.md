@@ -307,6 +307,64 @@ Multi-handler chain is **already append** (not last-wins). Plateau persists ⇒ 
 3. If no: INTC STAT/mask / TakeExceptions / multi-handler walk bug for cause=2.  
 4. Still ban: invent DISPFB flip; present page 0x46 mismatch.
 
+---
+
+## 11. CD/RPC-async flatness (Claude) — thread 1's RPC chain completes normally, not the blocker
+
+**Method:** `DETPS2_TRACE_RPC=1` + `blocker-trace`/`scoreboard-metrics burnout-only.json`, real
+product trace flag, no temp instrumentation. Cross-checked a timeline of intermediate cycle
+budgets (8M/10M/15M/20M/30M/35M/40M/50M) to find exactly when forward progress stops.
+
+### 11.1 Growth timeline
+
+| cycles | px | cdvdSectors | binds | calls | syscalls |
+|-------:|---:|------------:|------:|------:|---------:|
+| 8-10M | 0 | 0 | 0 | 0 | 0 |
+| 15M | 286720 | 0 | 5 | 6 | 424 |
+| 20M | 877187 (final) | 425 | 11 | 59 | 42461 |
+| 30M | 877187 | 609 (final) | 12 (final) | 62 (final) | 61548 |
+| 40M-100M | 877187 | 609 | 12 | 62 | slowly climbing (spin only) |
+
+**Everything** (`px`, `cdvdSectors`, `binds`, `calls`) reaches its exact terminal value by
+~30M and then stays byte-identical through Grok's 100M run — only the syscall counter keeps
+moving (pure SleepThread/FlushCache spin, matches §10).
+
+### 11.2 What thread 1 was doing right at the freeze point
+
+`DETPS2_TRACE_RPC=1` trace is byte-identical from a 35M run through a 50M run for the first
+937 lines, then exactly **one more line** appears at 50M:
+
+```
+[RPC] HandleCall sid=CD_SCMD fno=0x1 recvBuf=0x00486A40 eePC=0x00000000
+```
+
+`fno=0x1` = `ScmdReadClock` (`RealSifRpc.cs:8676`) — a simple, synchronous handler
+(`WriteCdClock`) with `CompleteRpcEnd` called in the same statement block right after. **This
+call is not itself stuck** — it's an ordinary bookkeeping read that completes immediately,
+same as the ~60 RPC calls before it in the chain (GTFS, SYSMEM, etc., all seen completing
+normally in the trace leading up to this one).
+
+### 11.3 Conclusion
+
+**Refutes** "thread 1 is blocked on an unanswered CD/RPC reply" as the blocker — the RPC
+chain runs cleanly through its last call (`ReadClock`) and then produces **zero further RPC
+trace output** for the remaining ~15-65M cycles, not because a reply never arrives, but
+because thread 1 apparently has nothing further to *ask* — consistent with §10's picture:
+after this point the game's real control flow moves into worker threads 3-6 polling a
+VBlank-set flag that never gets set, i.e. thread 1 finishes its init/RPC chain normally and
+hands off to a steady-state loop gated on the same wedge Grok found. Not a second,
+independent blocker — corroborates §10 rather than competing with it.
+
+**No Core.** Agree with §10.4's proposed next measure (does cause=2 ever dispatch
+`0x2370A0`) — that's the decisive test now, my angle came back clean.
+
+```text
+CD/RPC flatness (Claude)
+  px/cdvdSectors/binds/calls all reach final value by ~30M, frozen through 100M
+  last RPC event: CD_SCMD ReadClock (fno=1) -- completes normally, not stuck
+  refutes "unanswered RPC reply" -- corroborates Grok's VBlank-ISR wedge (10.4) instead
+```
+
 ```text
 B3 SleepThread correlation
   99.8% RA=0x237188 — flag poll (gp-23820)+slot after SleepThread
