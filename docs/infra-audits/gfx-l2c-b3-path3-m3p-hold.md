@@ -6345,3 +6345,50 @@ status 48 to DONE 256. Await Claude S126-bar verify.
 ```text
 S128: Assist audio complete landed; await independent host-present verify
 ```
+
+## 129. Independent verification: S128 PASSES the S126 bar in full — real fix reproduces the landmark result cleanly (Claude)
+
+`blocker-trace --host-present`, 95M cycles, no temp force, `DETPS2_TRACE_BIOS=1`.
+
+```
+[B3] audio stream complete ctx=0x01F361F0 +44 48->256 chunk=2048 buf=0x007EB880 n=1 cyc=35650000
+```
+
+The Assist's bounded EE-heap scan found the *exact same* context address my live investigation
+identified (`0x01F361F0`, S122-124) — good sign the match logic (`obj+44==48` and a plausible
+buffer shape) is targeting the right object, not a coincidental heap hit.
+
+**Product summary at 95M, matching S126's numbers closely:**
+
+```
+cdvdSectors=22301   (identical to S126's force-A result — highest of the investigation)
+m3p=False           (matches S126)
+heldP3n/qwc=0/0     (matches S126, fully drained)
+spu2Writes=16       (matches S126)
+```
+
+**Temp one-shot dump of phase/modestate/gate at 90M** (reverted after use — `git diff --stat`
+8 insertions, `git checkout --`, clean, rebuilt to resync binary):
+
+```
+phase=0x17 (23)        modestate=0x00000007 (7)        gate=0x00000006
+```
+
+**All required S126-bar criteria pass:** `modestate ≠ 0` ✓ (7, not the same value as S126's raw
+force — 738 — which is expected since the real fix triggers via a different code path/timing
+than a hardcoded one-shot write, but the load-bearing criterion is non-zero, confirmed), `phase
+≥ 9` ✓ (23), held-PATH3 drain ✓, `m3p=False` ✓. `gate=5`/`lit>0` remain unmet, exactly as
+flagged as stretch goals in S127 — not a failure, matches the documented expectation that gate=5
+requires further mode-SM progress sequential to this fix, not part of it.
+
+**S127/S128 confirmed working, real fix, reproducible without any temp force.** This is the
+second real Core/Assist fix landed and independently verified tonight (after S98), following
+the same design→dual-ACK→land→independent-verify discipline throughout.
+
+```text
+S129: CONFIRMED — S128's Assist fix passes every required S126-bar criterion under independent
+      verification (no temp force): modestate=7 (nonzero), phase=23, heldP3=0/0, m3p=False,
+      cdvd=22301 (matches S126 exactly). gate=6/lit=0 remain, as expected (stretch goals,
+      sequential further SM work). Second real fix landed and verified tonight, same discipline
+      as S98.
+```
