@@ -8282,3 +8282,57 @@ S180: FOUND THE WRITER — swc1 f20,0(sp) at pc=0x0038912C (an unrelated, distan
       full mechanism from count-loop freeze (S165) through this session's black-screen blocker
       is now pinned end-to-end. Remaining: find why these two frames' stack depths collide.
 ```
+
+## 181. STATIC — frame IDs + geometry: nested call cannot explain collision (Grok)
+
+ELF static on `out/SLUS_210.50` (writer + victim + call graph).
+
+### Writer (S180 store)
+| Item | Value |
+|------|-------|
+| Function | **`0x389100`** |
+| Frame | **`addiu sp,-96`** / epilogue `+96` @ `0x38937C` |
+| RA slot | `sd ra, 80(sp)` @ `0x389104` |
+| Store | `swc1 f20, 0(sp)` @ **`0x38912C`** (plus f21..f23 at +4..+12) |
+| Self-consistent | `lwc1 f20, 0(sp)` @ `0x389370` before `jr ra` |
+| Callers | `jal 0x389100` @ `0x385068` (parent **`0x385010`**, frame 64) and `0x3894B0` |
+| Parents of `0x385010` | `0x28AFFC`, `0x28B0D0`, `0x28B1E0` |
+
+### Victim (S179 load / fatal jr)
+| Item | Value |
+|------|-------|
+| Function | **`0x223130`** |
+| Frame | **`addiu sp,-8640`** / epilogue `+8640` @ `0x2253B0` |
+| RA save | `sd ra, 160(sp)` @ **`0x223138`** (prologue) |
+| Fatal load | `ld ra, 160(sp)` @ `0x2243DC` (trampoline delay) and `0x225378` (epilogue) |
+| Fatal use | `jr ra` @ `0x2253AC` |
+| Mid-body `addiu sp` | **NONE** — only ±8640 at entry/exit |
+| Direct `jal` targets | only **`0x11E388`**, **`0x225440`**, **`0x225B30`** |
+| Path to float family | **none** (0 direct, 0 one-hop to `0x385010` / `0x389100`) |
+
+### Geometry (why this is not "undersized callee frame")
+- Live values: victim `sp = 0x1FFFDA0`, ra slot `sp+160 = 0x1FFFE40`; writer `sp = 0x1FFFE40` at the `swc1`.
+- Stack grows down. Nested callees of `0x223130` allocate at addresses **`< big_sp`**. The saved-`ra` lives at **`big_sp+160`** (addresses **`> big_sp`**).
+- A well-nested `0x389100` under `0x223130` would have `float_sp ≈ big_sp - (parent frames) - 96` and would **never** place `sp+0` on the caller's `+160` slot.
+- Observed `float_sp = big_sp + 160` (entry to float at `big_sp + 256`) is a **shallower** SP than the live 8640-byte frame base — not explainable by missing `addiu sp,-N` inside `0x223130` (there is no mid-frame SP adjust at all).
+
+### Value identity
+- `0x3C888889` as IEEE-754 LE float ≈ **`0.016666667` = 1/60** — NTSC frame delta constant. Writer is storing a **legitimate game constant**, not a scrambled pointer.
+
+### Implication (mechanism class)
+S180 "stack-frame overlap" is real as a **physical collision**, but the static picture rules out "callee frame too small inside `0x223130`'s call tree." Prefer:
+
+1. **`0x223130` frame still live** (`sd ra` already done, epilogue not yet) while a **separate call chain** (`0x28AFxx → 0x385010 → 0x389100`) runs with SP near stack top / into that live frame; or
+2. **SP temporarily elevated** into the live 8640-byte region (bad restore / pivot / free-run path after timer stop S178), then restored to `0x1FFFDA0` for the trampoline `ld ra`.
+
+Not a dual-ACK Core candidate yet — still need the temporal ownership proof.
+
+```text
+S181: STATIC closed on IDs — writer=0x389100 (frame 96, f20@sp+0); victim=0x223130
+      (frame 8640, ra@sp+160); big has no mid-frame sp adjust and never calls float
+      family (only 3 jals). Nested geometry cannot put float sp+0 on big's ra slot;
+      collision requires shallower SP while 8640 frame is still live (separate chain or
+      SP pivot). 0x3C888889 ~= 1/60f. Next live: order sd@0x223138 vs swc1@0x38912C;
+      ra/sp stack walk at the swc1.
+```
+
