@@ -7393,3 +7393,15 @@ S159: CONFIRMED — EXL=1, EPC=0x0025156C, eretStack=1, all at the very end of t
       into why this specific eret (from the VBlank handler at 0x2370A0) never fires or never
       takes effect.
 ```
+
+## 159–160. EXL stuck; jr-ra guard may fall into park (Claude+Grok)
+
+**S159:** EPC=0x25156C, Status EXL=1, eretStack=1. Infra interrupt-return, not count bug.
+
+**S160:** If `jr ra` at 0x237114 is swallowed by low-vector JRGUARD, fall-through enters
+0x237120 park with EXL still set — matches live PC family. Need ra dump at 0x237114.
+Possible fix: allow PhysInterrupt 0x200 in IsLegitimateVectorTarget (dual-ACK).
+
+```text
+S160: dump ra at 0x237114; if 0x200/garbage → JRGUARD swallow; if 0x80000200 → eret path.
+```
