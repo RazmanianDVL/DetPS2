@@ -3995,3 +3995,31 @@ state stuck at zero (Claude) -- pushes the real question upstream of case 4
   case 4's 0x19A950 readiness byte is moot until state gets past 0 -- redirects upstream
   next: does the state-machine dispatcher (0x132600) ever execute at all
 ```
+
+
+---
+
+## 61. Mega-init arms phase=1; climber case-1 worker is the gate (Grok)
+
+Claude: state field `0x51BAD0` also never leaves 0 in 90M (same 3-access shape).
+
+### 61.1 Mega-init is one function through `0x13424C`
+
+`0x133BB0` runs (re-zeros seen live) and **ends** by:
+- `0x134208`: phase `0x51BAA0` = **1**
+- `0x134214`: field `0x51BAB0` = **1**
+- `0x134238`: state current+desired = **0**
+
+### 61.2 Climber `0x133190` therefore takes case 1, not default
+
+Default (phase 0) would fall through to state=1 + pending stage at `0x1337B4`.
+After mega-init, phase=1 → `0x13328C` → `jal 0x1D41E0`; **return 0 = climber done, state stays 0**.
+
+### 61.3 Worker `0x1D41E0`
+
+Dispatches on `0x51BAB0`; value 1 → work path using `0x113028` / loop `0x113F78` (load/IOP-shaped). Failure → climber exits with state stuck at 0. Matches all watches.
+
+```text
+S61: mega-init sets phase=1; 0x133190 case1 -> 0x1D41E0 must succeed to climb
+  next: success conditions of 0x1D41E0 / 0x113028 / 0x113F78
+```
