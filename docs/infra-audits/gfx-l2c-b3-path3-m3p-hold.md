@@ -7452,3 +7452,15 @@ S161: ra at the jr ra is 0x2370F8 — none of the 3 predicted values. It's this 
       epilogue runs. Needs Grok's read on whether/how this handler could be re-entered
       mid-flight and whether sp is fresh per entry.
 ```
+
+## 161–162. ra=0x2370F8 at jr; stack slot stomped; more cycles useless (Claude+Grok)
+
+**S161:** jr ra at 0x237114 has ra=0x2370F8 (jal return), not 0x80000200. Stack slot
+16(sp) wrong at epilogue.
+
+**S162:** Explicit: more cycles will not unstick EXL=1/eretStack=1. Not JRGUARD allow-list
+alone. MaybePreempt blocked during EXL. Next: dump *(sp+16) at prolog sd vs epilogue ld.
+
+```text
+S162: more cycles won't help; stack 16(sp) stomped 0x80000200→0x2370F8. Watch that slot.
+```
