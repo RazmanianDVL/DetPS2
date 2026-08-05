@@ -5922,3 +5922,16 @@ S112: FAIL B (0x3840C0 alloc failure, at 0x28B3F4) confirmed as the consistent e
       reached. Next: static read of 0x3840C0 — why does this allocator never succeed across 26
       real attempts (exhausted pool? never-initialized heap? gated on something else)?
 ```
+
+
+---
+
+## 112–113. Fail B = 0x3840C0 name-pool alloc always fails (Claude+Grok)
+
+S112: 26/26 polls take Fail B; +29184=0. S113: 0x3840C0 is name-keyed pool
+(a0=0x1E75648, a1=*(gp-27368), t0=6144). Walks list at +56; grow via 0x2B6DA0.
+Always-fail ⇒ empty list / null name / grow dead.
+
+```text
+S113: next live = name ptr, list head 0x1E75680, 0x2B6DA0
+```
