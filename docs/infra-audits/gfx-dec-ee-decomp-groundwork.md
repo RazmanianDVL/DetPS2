@@ -256,3 +256,40 @@ Post-SEC cleanup + freelist; async bind queue via `FUN_00478e10` / `FUN_00478f30
 3. Only then Core dual-ACK.
 
 Park open-path dig here unless new evidence appears.
+
+---
+
+## 12. Live TRACE — in-memory SEC TOC (50M host-present)
+
+**Method:** `blocker-trace user-media-deception.json --cycles=50000000 --host-present --dump=…`  
+**Present residual:** gray strip still `lit=32768/286720 s0=0xFF808080` (unchanged honesty).
+
+### 12.1 Nested gameart tiles (`0x01800800`)
+
+| Field | Value |
+|-------|--------|
+| Magic | `SEC ` |
+| Count `@+0x10` | **404** (`0x194`) |
+| TOC `@+0x1C` stride `0x10` | **kind histogram: kind=2 × 404** (zero non-2) |
+
+EE special-kind path (kind 9 / stream `FUN_0036dd80`) **does not fire** for this nested container. PL-029’s kind=2-only walk matches the live nested TOC.
+
+### 12.2 Root SEC (`0x01800000`)
+
+| Field | Value |
+|-------|--------|
+| Count | **14** kind=**1** entries |
+| e0 | off=`0x800` sz=`0x247580` → nested tile SEC above |
+| e1 | off=`0x248000` → **another `SEC `** of kind=2 tiles (more textures, not palette) |
+| e8–e13 | ~5–6.7 KiB blobs starting `0x0000000A…` — sparse param/record shape, **not** 256×RGBA32 CLUT layout (reconfirms prior SS4e-class refutation with live addresses) |
+
+### 12.3 CLUT status after live TRACE
+
+| Hypothesis | Status |
+|------------|--------|
+| Nested non-2 kinds hide CLUT | **Refuted** (all 404 kind=2) |
+| Root kind=1 siblings are palettes | **Refuted for e1** (more SEC tiles); e8–13 not CLUT-shaped |
+| Open-path EE SEC parse loads CLUT | **Not supported** by open-path decomp + this TOC |
+| **Still open** | Draw-side / TEX0-cld / GS upload path; or CLUT inside **per-tile** payload (not TOC kind) |
+
+Artifacts (gitignored): `out/canaries/dec-ee-live-toc/`.
