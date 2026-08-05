@@ -9691,3 +9691,17 @@ S199: DECISIVE -- SetDispEnv (0x102B38) fires exactly twice in the whole 95M-cyc
       after boot. Real question: what's SUPPOSED to call SetDispEnv again (or patch +864
       directly) once real rendering starts, and why is that path never reached.
 ```
+
+## 200. Flip runs; env FBP never updates (Claude+Grok)
+
+- SetDispEnv: 2× boot, a1=0 only  
+- env+864: one write `0x51400` @ `0x1FDFB8`, then PutDispEnv read-only  
+- PutDispEnv ~242 / `0x1F1CE8` ~300 — **flip is active**, content stuck at boot FBP=0  
+
+Not waiting to flip. Missing **env DISPFB FBP update** when draws use FRAME 0x46.
+
+```text
+S200: PutDispEnv fires; env+864 frozen at 0x51400 from boot. Need path that writes FBP=0x46
+      into env (or second SetDispEnv). No invent-DISPFB.
+```
+
