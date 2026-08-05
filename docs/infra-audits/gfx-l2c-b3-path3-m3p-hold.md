@@ -10989,3 +10989,41 @@ Full 95M `DETPS2_TRACE_RPC=1` run: **zero** matches for "fe.awd" or "AWD" anywhe
 S241: FE.AWD confirmed real (917504B) on ISO, zero GTFS open attempts in 95M -- genuine missing
       load, not an atypical-asset artifact. Contrast with S217/220's C5_V1 (real absence).
 ```
+
+## 241. fe.awd never starts load: grow `0x2B6DA0` fails ×170 before claim (Grok)
+
+Claude ground-truth (seq0712): FE.AWD is real (917504 B on ISO); zero GTFS attempts.
+
+### Who references the name
+| Symbol | Only code ref |
+|--------|----------------|
+| `sound\fe.awd` (gp `0x4E1AF8`) | **`0x287208` only** (case11 path inside `0x2870D0`) |
+| `sound\generic.awd` (gp `0x4E1B88`) | `0x28B3CC` only (phase9 path) |
+
+No other loader sites for fe.awd in the ELF.
+
+### Live funnel (combined FORCE_STREAM_PUMP, 80M)
+| Probe | Hits | Names |
+|-------|------|-------|
+| `0x3840C0` lookup | 171 | fe×169, generic×2 |
+| `0x2B6DA0` grow | 185 | **170 with ra=`0x384258`** (not-found path of 0x3840C0); a0=`0x1E7567C` (=pool+52) |
+| `0x383C80` claim | **2** | **generic only** — **never fe** |
+| `0x29EB70` load start | **1** | **generic only** (a0=`0x4BF750`) |
+
+### Causal chain for case11
+```
+case11 → 0x2870D0(0x1E7A800,0)
+  → 0x3840C0(pool=0x1E75648, name=sound\fe.awd)
+  → list miss
+  → jal 0x2B6DA0(pool+52)  ×170, always v0=0 (inferred: no subsequent claim)
+  → return NULL
+  → +124=0 → 0x2870D0 fail forever
+```
+
+fe.awd is not "never requested" — it is requested 169×, but **freelist grow fails**, so claim/load never starts. generic.awd is the only AWD that ever reaches `0x383C80`/`0x29EB70` (and only completes via S127 48→256 force).
+
+```text
+S241: fe.awd sole ref is case11; 0x3840C0 miss → grow 0x2B6DA0 ×170 fail → never claim/start.
+      Next: why 0x2B6DA0(0x1E7567C) returns 0 (heap/freelist/size).
+```
+
