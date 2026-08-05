@@ -10581,3 +10581,51 @@ S224: Live census negative x2 -- 0x2A2C80 has exactly one caller/handle in the w
       doesn't cleanly match the same field layout. No live breakthrough this round --
       deferring to Grok's static disasm for the writer site.
 ```
+
+## 224. Status==9 writer hunt — static geometry (Grok) + live census negative (Claude)
+
+### Claude S224 live (tip 232759e)
+- `0x2A2C80` hit 211× — **all same handle `0x1F3A380`** (no sibling to diff)
+- Sibling alloc `0x1F36250` → handle `0x1F38180`: only zero-init via `328(a0)`, never polled — inconclusive
+
+### Static: field geometry (corrects S218 attribution)
+| Absolute (handle H) | Inner (H+260) | Meaning |
+|---------------------|---------------|---------|
+| H+588 | +328 | **status word** read by `0x2A2C80` |
+| H+268 | +8 | **type** |
+| H+352 | +92 | flags (bit0 skips update) |
+
+- Create/init `0x2A31F0` → `jal 0x2A6550` with `a0 = outer+260`
+- Pump `0x2A3150` → `jal 0x2A6470` with `a0 = outer+260`
+- Update `0x2A6470`: `jal 0x2A5BA0` then **`sw v0, 328(s1)`** → absolute **H+588**
+- Zero-init `0x2A6590` `sw zero, 328(created)` **is** the status field when created is the inner object — Claude's sibling observation matches; S218 PC attribution was right, offset-on-outer wording was wrong
+
+### How status becomes 9
+`0x2A5BA0` maps type@+8 → status:
+| type | status |
+|------|--------|
+| 6 | **9** (ready) |
+| 5 | deep path via `0x2A5D40` |
+| 2,3,4 | 2 |
+| other | 0 |
+
+Create success path `0x2A62B8`: **`sw 6, 8(s5)`** — new streams start type=6.
+Transition `0x2A3868`: if `0x2A2220` > 0 → type=6; else can fall to type=5.
+
+### Residual (not yet live-confirmed)
+1. Does our handle's **type@H+268** ever become 6? (if 0, create incomplete)
+2. Does **pump `0x2A3150` / update `0x2A6470` ever run** on handle `0x1F3A380`? (0 direct jal callers — likely jalr/vtable; 0 data refs to address either)
+3. Is flag **bit0 @ H+352** set, skipping update?
+4. `0x2A2220` — buffer/IO readiness that gates type 6 vs 5
+
+### Proposed live (Claude or Grok)
+- dump `H+268` (type), `H+588` (status), `H+352` (flags) at end of 95M
+- `--pcbreak` / watch: `0x2A6470`, `0x2A3150`, `0x2A62B8`, `0x2A3868`
+- if type==6 but status==0 → pump never ran
+- if type!=6 → stuck earlier in create/transition (`0x2A2220`)
+
+```text
+S224: status@H+588 written by update 0x2A6470 (inner+328); status9 needs type==6.
+      Pump 0x2A3150 may never run. Live: type/flags/pump hits next.
+```
+
