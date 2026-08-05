@@ -5824,3 +5824,47 @@ phase9 `0x28B380` on 0x1E75640.
 ```text
 S109: still phase9 / 0x28B380; EALogin not yet reached
 ```
+
+## 110. Opcode-level proof: the entire "phase 10-12" observation was one anomalous event, not real execution — all 26 hits across 0x1334A8-0x13350C are the identical fake NOP-sled at cyc=86,024,128 (Claude)
+
+Ran `--pcbreak=001334A8:0013350C` (the whole phase-10-through-12 span in one pass) to
+opcode-verify Grok's suspicion directly. Result: **26 PCBREAK lines, one per 4-byte address in
+the range, every single one with `op=0x00000000`, identical garbage register state
+(`v0=0x7FF8007FB0001000`, `s2=0x1CB34C`, `s6=0x674CC0`, etc.), all at the exact same cycle
+`86,024,128`.**
+
+This is not 26 separate real hits — it's PC walking straight through this entire address range
+as a sequence of `0x00000000` words (the MIPS NOP encoding) during one single anomalous event,
+almost certainly PC having wandered into unmapped/zero-filled memory (a wild jump or corrupted
+control-flow state, not normal execution) rather than genuinely running phase 10/11/12's real
+code. This is the same event, same cycle, same register fingerprint as the fake hits already
+caught in S108 (`0x13CFA0`/`0x13D340`'s 7th "call") and the `UnknownMmioWrite` burst flagged as
+suspect back in S96 — all one and the same anomaly, now conclusively identified as *not* real
+progress through the climber's phase ladder.
+
+**Correcting the record plainly: S102's "phase 9→12 confirmed" and S104's "object populated,
+chain fires" were built on this same false-positive class for the *write* sites (`0x1334A8`,
+`0x13350C`), even though S104's *object dump* (`0x1E75640` populated, `+29188` nonzero) and the
+*live phase-field reads* (`0x51BAA0`=9 at every real checkpoint) were genuinely correct
+measurements — those parts still stand. What doesn't stand: the climber never actually reaches
+phase 10, 11, or 12 for real. Phase 9's own gate (`0x28B380` on `0x1E75640`, confirmed 26 real
+polls in S102/S104, all presumably returning 0) is still the live, unresolved blocker — exactly
+where Grok's S109 correction places it. `Data/EALogin.ico` is not yet reached at all; that whole
+sub-thread (S105-108) was chasing a real static code path that the live trace hasn't gotten to
+yet, not a live bug in it.
+
+**Worth flagging as a standing caution for the rest of this investigation**: this cyc≈86M
+region has now produced *three separate* false-positive artifacts (S96's MMIO burst, S108's
+fake 7th call, this one) — anything sampled at or after that specific cycle on this exact run
+should be treated as suspect until opcode-verified, not just address-verified. Earlier-cycle
+hits (everything through phase 9's real 26 polls, all confirmed with real opcodes and sane
+register values) are not affected by this caution.
+
+```text
+S110: CONFIRMED via opcode inspection — all 26 hits across 0x1334A8-0x13350C are one fake
+      NOP-sled event at cyc=86,024,128, not real phase 10/11/12 execution. Climber genuinely
+      never leaves phase 9; 0x28B380/0x1E75640 remains the live blocker (Grok's S109 read
+      confirmed exactly). S102/S104's object-dump and phase-field data stand; their write-site
+      hit-counts do not. Treat anything sampled at/after ~86M cycles on this run as suspect
+      until opcode-verified — third false-positive artifact from this same region tonight.
+```
