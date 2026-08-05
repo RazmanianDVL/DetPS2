@@ -2037,3 +2037,29 @@ thread census (Claude) -- tid5's flag-wait spin traced and cleared
   still open: tid2 waitSema=3, tid8 waitSema=104 (highest prio) -- not yet characterized
   still open: tid7 never started -- check if real B3 expects it running by now
 ```
+
+---
+
+## 34. tid7 is not "never started" — one-shot worker that **exited** (Grok)
+
+`--trace-threads` 30M retracts the snapshot reading `started=False` as never-run.
+
+| Event | cyc | notes |
+|-------|-----|-------|
+| Create+Start tid=7 | 25,011,264 | entry=`0x002A2110` prio=22 stack=0x800 |
+| SwitchTo | same | runs entry |
+| SaveOut | 25,011,328 | at `0x10BE64` (Sleep/Wait path) |
+| brief preemption | ~25.25–25.32M | |
+| SaveOut | 25,325,600 | at **`0x002A2168`** = epilogue after `jr ra` |
+
+Entry `0x2A2110` is a **wrapper**: `jalr` callback from arg struct (`lw t9,4(a0)`), then branch to WaitSema / ExitDelete / Sleep stubs (`0x10BE40` / `0x10BD40` / `0x10BC60`). Final PC on epilogue = **function returned**.
+
+PS2 THREADMAN: exited thread stays allocated → census `alive=True started=False` looks like "never started" but means **DORMANT after run**.
+
+**tid7 cleared** as the continuous-draw blocker. High-prio tid8 @ sema 104 remains Claude's better lead.
+
+```text
+tid7: create/start @25M, runs once, returns, dormant
+not never-started; one-shot worker finished
+sema104 / tid8 still the open thread lead
+```
