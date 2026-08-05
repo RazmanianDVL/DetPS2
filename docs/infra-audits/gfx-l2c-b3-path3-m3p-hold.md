@@ -7685,3 +7685,53 @@ missing type gate. Possible Assist: skip unaligned/small rel — dual-ACK only.
 ```text
 S168: unique path; 10 is ISO. Next: when 10 lands; compare other id=4; dual-ACK before Core.
 ```
+
+## 168–169. CORRECTION on S167's "zero writes" claim; 0x2B7110 fires exactly once ever (Claude+Grok)
+
+**S167 correction:** the earlier "0x00B6D920 (+0xA0) has zero prior writes" claim was a `tail -60`
+truncation artifact — the summary stats block at the end of `blocker-trace` output pushed the
+real watch history off the visible tail. Re-ran without truncation. **Full corrected history for
+`+0xA0` (`0x00B6D920`) is structurally identical to `+0x98` (`0x00B6D918`, the slot that DOES
+relocate correctly):**
+
+```
++0x98:  sq zero,0(v0) zero-init  ->  syscall-mediated bulk writes (0x40,0xC9,0x08,0x00 final)
+        -> raw value 0x0008C940 -> relocates to 0x00BFA1C0 (sane, used successfully)
++0xA0:  sq zero,0(v0) zero-init  ->  syscall-mediated bulk writes (0x0A,0x00,0x00,0x00 final)
+        -> raw value 0x0000000A (10) -> relocates to 0x00B6D88A (garbage)
+```
+
+Both slots: same allocator zero-init, same syscall-driven fill pipeline, same timing shape. The
+**only** difference is the payload value itself — `+0x98` legitimately holds a large,
+pointer-shaped relative offset; `+0xA0` holds a small int (10) that arrived through the exact
+same, unremarkable, correctly-functioning fill mechanism. This *strengthens* (not weakens) the
+original conclusion: there is nothing anomalous about how the "10" got there — it's ordinary
+resource content, and the bug is entirely that `0x2B7110` treats both slots as pointers
+unconditionally when only one of them actually is one for this resource.
+
+**S168 (Grok, static, independent convergence):** found the same shape from the other direction —
+`0x2B7110` has exactly one call site (`0x2BCD54`) and, critically, **this is the only time in the
+whole run that this advance path is ever reached at all** (case2's alloc at `0x2BCAC4` is the
+sole non-zero producer of `+0x148` for this SM). So there is no prior/parallel "successful
+0x2B7110 invocation with +0xA0 nonzero" to compare against — this resource is the *first and only*
+one to reach this specific finalizer this run. Grok's read: either (1) all id=4 resources through
+this path are supposed to have `+0xA0` be a real rel-ptr-or-zero and "10" reflects a genuine
+load/fill mismatch, or (2) `0x2B7110` is a blind 4-slot relocator that's fine for retail data
+where unused slots are always exactly 0, and this blob's true resource-kind layout doesn't
+actually place a pointer at `+0xA0` at all — i.e. the resource base/type interpretation feeding
+`0x2B7110` may itself be wrong, not just the relocator's lack of a guard.
+
+**Proposed fix posture (Grok, still needs dual-ACK + verification before landing):** an
+Assist-level guard in the relocation step — skip treating a slot as a pointer when
+`(base+rel)` would be non-4-aligned or `rel < 0x10` (too small to be a plausible sub-object
+offset). This would skip exactly the `+0xA0=10` case without inventing per-type resource tables.
+
+```text
+S168-169: CORRECTED — +0xA0's "10" arrived via the ordinary syscall-mediated resource-fill
+      pipeline, identical in shape to the successfully-relocated +0x98 slot (zero-init then
+      bulk write). Nothing anomalous about the data path. 0x2B7110 fires exactly ONCE in the
+      whole run (Grok, independent) — this resource is the first/only one ever reaching this
+      finalizer, so no prior successful-with-nonzero-+0xA0 sample exists to compare against.
+      Proposed Assist guard (not yet landed): skip 0x2514C0 when relocated (base+rel) is
+      non-4-aligned or rel<0x10. Needs dual-ACK + verification before landing.
+```
