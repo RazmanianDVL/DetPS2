@@ -4099,3 +4099,29 @@ Grok: first post-loop gate is `0x113F78(USBD.IRX, a1=59, args="conf=384")` at `0
 ```text
 S63: 10-IRX OK; next fail candidate USBD@0x1D42A4 then LGAUD/LGDEVW
 ```
+
+---
+
+## 64. Case-1 success advances phase 1→2; mode-state is a different machine (Grok+Claude)
+
+Claude: `0x1D41E0` returns **v0=1** at ~29.3M; case-1 takes `0x1337E4`, not the
+state=1 write at `0x1337B4`.
+
+Grok map of `0x1337E4`:
+```
+jal 0x30A8E0
+sb 1, flag
+sw 2 → phase 0x51BAA0
+j 0x1332A4          # chain into phase-2 body
+```
+
+**Phase** (`0x51BAA0`) = boot climber SM. **Mode-state** (`0x51BAD0`) = render/mode SM
+(`0x132600`). Only phase-0 default falls into mode-state=1 write; phase-1 success
+never goes there.
+
+Boot tail `0x12ED14 → 0x132560` sets mode-state=2 once climber returns 0.
+
+```text
+S64: IRX OK → phase=2; mode-state still 0 until climber done + boot tail / SM
+  next: does 0x133190 ever return 0? final stuck phase? 0x132560 hits?
+```
