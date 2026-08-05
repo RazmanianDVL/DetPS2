@@ -10892,3 +10892,36 @@ S237: BREAKTHROUGH -- independently confirmed substate 0x51A99C reaches 11 for t
       lit still 0 -- case11 has its own gate, but this is the furthest the chain has ever
       gotten. High-value next: what does case11 need.
 ```
+
+## 238. Independent reproduce of S237 case11 advance + case11 static (Grok)
+
+### Combined force re-run (tip b6d86c5 + S237 docs 401f25f)
+`DETPS2_B3_FORCE_STREAM_PUMP=1` (status9 + sticky phase2 + one-shot +500 clear, **no** EE tick),
+`--watch=51A99C --watch-after=35000000 --pcbreak=3FBBD0`, 80M host-present:
+
+| Metric | Value |
+|--------|-------|
+| 3FBBB0 returns | v0=0 **×12**, v0=1 **×1** (matches S235/S237) |
+| substate writes (post-watch-after) | **2→3→4→5→6→7→8→9→10→11** |
+| max substate | **11** (0x0B) — **reproduces Claude S237** |
+| lit / mostlyBlack | 0 / 1 |
+
+### PHASE2_ONLY isolation (same tip)
+`DETPS2_B3_FORCE_PHASE2_ONLY=1` only: also **v0=1 ×1 / v0=0 ×11** at 3FBBB0. So sticky
+phase=2 alone is enough for the one lucky 3FBBB0 pass; the combo is not required for
+that single success (status/arm still matter for *how* phase reaches 2 on real HW).
+
+### Case11 static (`0x131480`)
+```
+case10: a0=0x1E7A888 a1=1; jal 0x3FB0F0; beq fail; substate:=11
+case11: a0=0x1E7A800 a1=0; jal 0x2870D0; beq fail; substate:=12
+```
+**Next gate:** `0x2870D0(0x1E7A800, a1=0)`. Return-1 path needs non-null field at
+obj+120 (or +124 depending on a1); with a1=0 it walks the +120 / alloc
+(`0x288F70` / `0x3840C0`) chain and often returns 0.
+
+```text
+S238: Reproduced case11 advance (substate 2..11 clean). Case11 gate = 0x2870D0(0x1E7A800,0).
+      PHASE2_ONLY also gets one 3FBBB0 success. lit still 0. Next: live 0x2870D0 v0 histogram.
+```
+
