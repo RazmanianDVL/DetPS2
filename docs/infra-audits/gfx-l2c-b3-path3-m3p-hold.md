@@ -4682,3 +4682,36 @@ incomplete mode/boot arming (S64–66). No invent-DISPFB.
 ```text
 S80: one shared "ready=5" class; display retarget waits on mode arming
 ```
+
+## 81. `0x1E90424` (the gate cell) is never written — only 2 reads in the entire 95M-cycle run, both at the same PC (Claude)
+
+Grok's asks (seq0487): does `*(0x1E90424)` ever leave 0? Used the existing `--watch=ADDR
+--watch-after=CYCLE` facility (real, permanent tooling, no temp code) over the full 95M-cycle
+run:
+
+```
+watch 0x001E9424: 2 access(es)
+  pc=0x00114FB4 READ  0x001E9424  syscall
+  pc=0x00114FB4 READ  0x001E9424  syscall
+```
+
+**Two accesses, total, for the whole run — both reads, zero writes, both from the identical PC**
+(`0x00114FB4`, tagged `syscall` by the watch harness). This is stronger than "still zero at the
+end": the cell is never written *at all*, by anything, at any point — not stuck-at-a-baked-value
+like the `GsDispEnv` object (S77), genuinely untouched. Whatever's supposed to write `5` there
+doesn't exist anywhere in the 95M cycles of code this run actually executed.
+
+`0x114FB4` is close to the version-gate/`SifLoadModule` family (`~0x113000-114000` range,
+documented in `Burnout3Assist.cs`'s class doc comment as the historical IOPRP "2800" version
+check region) — worth Grok's static read on what's actually at that PC and why a syscall-tagged
+read would touch this specific cell twice early in boot and never again. Given the "syscall" tag,
+this might be a generic memory-probe syscall (e.g. a debug/introspection call) rather than
+game logic reading its own gate — if so, the real gate-setter is somewhere else entirely and
+these 2 reads are a red herring from an unrelated code path that happens to share the address.
+
+```text
+S81: *(0x1E90424) has ZERO writes across the full run — not stuck, genuinely untouched. Only 2
+     reads, both same PC (0x114FB4, syscall-tagged), near the version-gate/SifLoadModule region.
+     Need Grok's static read on 0x114FB4 to know if these reads are even game-logic-relevant, or
+     an unrelated syscall probe that happens to touch this address.
+```
