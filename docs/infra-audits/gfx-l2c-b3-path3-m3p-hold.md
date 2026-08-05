@@ -1,6 +1,6 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** **IN PROGRESS** (2026-08-05 night) — executive scoreboard below; force-unmask A/B in flight (Claude)  
+**Status:** **IN PROGRESS** (2026-08-05 night) — executive scoreboard below; G1/G2/G3 all confirmed real, G3 answered NO (§56.4) — real gap is B3's ongoing per-frame render path (VU1/Path1), never located tonight  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
 **Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`), Claude forced-unmask A/B (`f8b5db8`)  
@@ -46,7 +46,7 @@ held PATH3 5/2124 never drains ──► lit=0 / mostlyBlack
 |---|-----|----------|--------|
 | **G1** | **fno=5 never dispatched** after successful open | Open `0x1D36E0` ×1; read `0x1D3280` ×0; same vtable `0x4DDFC8` | Open — need dispatcher / re-tick |
 | **G2** | **postTxd unmask heuristic never arms** even when cdvd forced ≥2000 | gifP3 caps **26&lt;30**; px becomes ≠0 → self-defeating | Open — heuristic rewrite or alternate unmask |
-| **G3** | Does draining held 2124 QW light anything? | Not cleanly measured yet | **Claude force-unmask A/B (S7.2) in flight** |
+| **G3** | Does draining held 2124 QW light anything? | Forced unmask: **fully drains (heldP3n/qwc 5/2124→0/0), lit stays 0** | **Answered: NO — see §56.4** |
 
 ### 0.5 Force-cdvd A/B (S56) — negative for “single missing link”
 
@@ -3643,4 +3643,60 @@ forced-completion A/B (Claude) -- crossing postTxd unlocks real activity, screen
     AND px becomes nonzero from other activity, defeating its px==0 heuristic
   settles: fixing the fno=5 dispatch alone would likely NOT clear the black screen by itself --
     postTxd's unmask heuristic has its own separate unmet preconditions needing attention too
+```
+
+### 56.4 G3 answered: force-unmask A/B — the held payload itself is not visible either (Claude)
+
+Ran the direct, independent test (bypassing `MaybeEscapePostTxdHang`'s heuristic entirely):
+temp env-gated hook (reverted after use) that calls `sys.Gif.SetMskPath3(false)` directly the
+moment the original `heldP3n>=5` backlog is observed (cyc≈16M, well before the postTxd gate
+would ever open on its own).
+
+```text
+[FORCEUNMASK] heldP3n=5 heldP3qwc=2124 cyc=16000000 -> unmasking
+final: m3p=False heldP3n=0 heldP3qwc=0   (fully drained, confirms §46's drain-policy finding again)
+       lit=0/286720 mostlyBlack=1        (UNCHANGED)
+       DISPFB1=0x0000000000000000        (UNCHANGED, still the sticky-zero value)
+       FRAME_1=0xA0046                   (UNCHANGED)
+```
+
+**The unmask+drain mechanism works perfectly — the entire original 2124-QW held backlog fully
+drains — and it changes literally nothing visible.** `DISPFB1` stays exactly zero, the
+presented framebuffer stays exactly 100% black, pixel counters don't reflect any new visible
+content from this specific drain.
+
+**G3 is answered: no.** The held Path3 payload itself was never going to be the thing that
+lights the screen, even under perfect conditions (immediate, clean unmask+drain, no other
+preconditions in the way). This is consistent with the very early §18 finding (RR-mode
+"unlocked" content turned out to be noise, not real geometry, on visual inspection) — the held
+backlog is very likely GS state-setup/register packets rather than actual draw commands with
+visible framebuffer effect, or targets a part of GS memory that isn't part of the displayed
+buffer.
+
+### 56.5 Updated picture: three real, independently-confirmed gaps, none sufficient alone
+
+```text
+G1 (fno=5 never dispatched)      -- real, open, root-cause-worthy
+G2 (postTxd unmask never arms)   -- real, open, heuristic-level
+G3 (drain the held backlog)      -- ANSWERED NO, doesn't light anything even when forced
+```
+
+None of G1, G2, or G3 individually explain the visible black screen — closing G1+G2 (the real
+fix path) would let the *assist's own* unmask fire, but §56.4 now shows that even a perfect,
+immediate unmask+drain of the specific backlog that's been sitting there all night produces zero
+visible change. **The real per-frame render path (VU1 execution, Path1 traffic, continuous new
+Path3 submissions) — never once observed running at all tonight (§30) — remains the actual
+missing piece.** Everything in this document's G1/G2/G3 was about *unblocking a one-shot setup
+backlog*, not about finding or arming the game's ongoing per-frame draw submission, which this
+whole night converges on being a separate, still-unlocated mechanism.
+
+```text
+G3 answered (Claude) -- force-unmask A/B, independent of postTxd heuristic
+  forced SetMskPath3(false) directly at cyc=16M when heldP3n=5 first observed
+  drain confirmed perfect: heldP3n/qwc 5/2124 -> 0/0 (matches S46's drain-policy finding)
+  lit/DISPFB1/FRAME_1: ALL UNCHANGED -- the held payload itself has zero visible effect
+  G3 = NO: the original held backlog was never going to light the screen, even ideally drained
+  updated picture: G1+G2+G3 all real but none alone (or together) explain the black screen --
+    the actual missing piece is B3's ongoing per-frame render path (VU1/Path1), never observed
+    running at all tonight, structurally separate from everything G1-G3 traced
 ```
