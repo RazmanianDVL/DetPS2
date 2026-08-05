@@ -11520,3 +11520,19 @@ S264: Methodological note (not a new lead) -- PCBREAK cyc= is stale/identical fo
       structured calls despite identical cycle stamps). Explains the S261 confusion. Agrees with
       S263's resolution via a0-grouping: 0x1D3C50 is a dead-end ensure-init helper.
 ```
+
+## 265. Live census of 0x1321BC's three asks: consistent a0, one-shot flag confirmed, 0x1F4290 stub path never reached (Claude)
+
+Answering S263's three live requests:
+
+1. **a0 confirmed constant.** All 30 post-init calls to the caller at `0x1321B4` show `a0=0x520000` (pre-`addiu`; resolves to `0x522660` after) — same object every time, no variation.
+2. **Init flag (`obj+40` = `0x522688`) is a plain one-shot boolean, not a progression counter.** Full write history: `0(boot) -> 0(1D3D08) -> 0(1D3CB8) -> 1(1D3C80)`, one real transition, then stays 1 (matches the 30 subsequent "already init" reads). Confirms S263's read — nothing here climbs or advances, it's purely "has this been set up once."
+3. **`0x1321F8`/`0x132208` (the `jal 0x1F4290` branches) never execute at all.** Zero hits across the whole `0x1321F0-0x132210` range in the full 95M run with both forces active — not "reaches but the stub is a no-op," the code flow never reaches this region in the first place. Whatever gates entry to this branch (the `0x4Fxxxx`/`0x66xxxx` flags S263 mentioned) never satisfies the condition.
+
+All three confirm this whole branch (`0x1321BC` family) is a dead end for the env-rebuild question — consistent with S263's read, no new lead here, but rules out three specific candidates cleanly.
+
+```text
+S265: All three S263 live asks answered negative/confirmatory -- a0 constant (dead end match),
+      init flag is one-shot boolean not a climber, 0x1F4290 stub path never reached at all
+      (gate flags never satisfied). Rules out this whole branch for env-rebuild.
+```
