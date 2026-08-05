@@ -6036,3 +6036,15 @@ S116: CORRECTION — phase9's 26 real 0x3840C0 calls (ra=0x28B3E4, a1 always "so
       in 0x3840C0's own list-walk/lookup step, not the freelist-empty grow path S115 predicted.
       Need Grok's static read of the lookup loop's early-return condition.
 ```
+
+
+---
+
+## 116–117. Phase9 fails inside lookup, not grow (Claude+Grok)
+
+S116: 0x2B6DA0 never in phase9 RA chain. S117: match-config fail or miss-free
+always-0 path; grow not reached. Next: 0x384164 s0 null? +932/+939 / 0x383C80.
+
+```text
+S117: phase9 Fail B = lookup claim, not freelist
+```
