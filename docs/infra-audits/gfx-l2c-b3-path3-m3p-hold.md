@@ -6141,3 +6141,15 @@ S120: CONFIRMED (not inferred) — 0x383C80 returns v0=0 for "sound\generic.awd"
       singular root of phase 9's stall. Next: Grok's static read of 0x383C80 — why does the
       claim/configure step reject this specific name every time?
 ```
+
+
+---
+
+## 120–121. 0x383C80 rejects unless node+932 in {1,2,16,256} (Claude+Grok)
+
+S120: 0x383C80 v0=0 always. S121: first gate is *(node+932); unknown → return 0.
+Likely node never armed to state 1 for sound\generic.awd.
+
+```text
+S121: dump *(0x1F35E10+932); branch census of 0x383C80
+```
