@@ -168,3 +168,56 @@ Real EE code loads Midway packages through **`FUN_00267090` → open → `FUN_00
 4. Compare package-open path vs PL-029 residual: is palette expected from a **sibling resource id** under the same package?
 
 No Core this extension either — still docs/TRACE.
+
+---
+
+## 10. EE-native SEC parser (CLUT-adjacent breakthrough)
+
+### 10.1 Load chain (confirmed by decomp)
+
+```text
+FUN_00267090(desc)                 // set current package
+  → FUN_00222790(name,1)           // path builder: often "/art/" + name → "/art/gameart.ssf"
+  → FUN_0021d810(mount, path)      // normalize cdrom0:/host0:, then open via FUN_0023a180
+FUN_001a44d0(resourceId)           // lookup
+  → FUN_001a4960 → FUN_00478950    // bind/load
+  → FUN_001a4830                   // instantiate resources
+       if type==2: FUN_0036c630    // SEC parse (simple)
+       if type==1: FUN_0036da90    // SEC parse (full)
+```
+
+Magic check in both parsers: `*payload == 0x53454320` (**`"SEC "`**).
+
+### 10.2 Type-1 SEC walk (`FUN_0036da90`) — kinds that matter
+
+TOC entry stride **0x10**. Kind = `entry[0] & 0x3fffffff`.
+
+| Kind | EE behavior |
+|------|-------------|
+| **2, 3** | Treated as “normal” payload tiles (not tracked as last-special) |
+| **9** | Nested pointer block: relocates `count` pointer words relative to nested base |
+| **other** | Updates `lastSpecialIndex`; may drive follow-on `FUN_001ab750` / `FUN_0036dd80` processing for **later** TOC entries |
+
+After TOC fixups: **`FUN_00478da0`**, mark ready.
+
+PL-029 only feeds **kind=2** Host→Local tiles and never runs this EE instantiate path. That is a structural gap vs real game code — not proof of CLUT location yet, but it explains why container-only TRACE (no EE consumer) can exhaust while chrome stays gray.
+
+### 10.3 Path names (string dump)
+
+| VA | String |
+|----|--------|
+| `0x5A6DE8` | `sysart.sec` |
+| `0x5A6E00` | `fightingart.sec` |
+| `0x5A6E10` | **`gameart.ssf`** |
+| `0x5A6E50+` | `permanent_strings_*.mko` / `.ssf` |
+
+Descriptor `@0x5A6E20` double-indirects to the `gameart.ssf` table record (`0x50AD28` → name `0x5A6E10`).
+
+### 10.4 Next EE dig (ordered)
+
+1. **`FUN_0036dd80` / `FUN_001ab750`** — what “special” kinds produce (palette blob? decompress?).  
+2. **`FUN_00478da0`** — post-SEC registration; any GS/CBP/TEX path.  
+3. Live TRACE: when frontend hits `FUN_001a44d0(0x10005, …)`, dump SEC TOC kinds from the **in-memory** package after EE parse (compare to PL-029’s kind=2-only view).  
+4. Only after EE-proven palette source: plan Core to either run real consumer further or load CLUT from that source — dual-ACK before Core.
+
+Still **no Core** this seat.
