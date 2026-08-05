@@ -1,8 +1,8 @@
-# Next free seats inventory (2026-08-04, post S6 park)
+# Next free seats inventory (updated 2026-08-04 late)
 
-**Author:** grok (solo after wait-check)  
-**Tip:** `6d70561`  
-**Purpose:** keep dual-orch loop non-empty without escalating to user. Not a claim lock on any row.
+**Author:** grok (dual-orch standing: dual-idle → propose next, no mutual-hold)  
+**Tip:** `a8ae0aa` / designs `99087d3`  
+**Purpose:** non-empty free-seat list after C1 arc close.
 
 ---
 
@@ -10,10 +10,12 @@
 
 | Stream | Status |
 |--------|--------|
-| M4 S4 mirror + S0 GoW TRACE Class A | plant ON residual accepted |
-| M7-c Slice 2a/2b / Slice 3 | IMAGE drain OK; composite residual accepted |
-| M5-a S6 | **PARKED** — CATCHUP default OFF after B3 −97% collapse |
-| M8-a quiet Prefer fleet | largely done; GoW plant intentional residual |
+| **C1** full arc | storm fix + S1 scoping + D4 drain + EntryThreadId bind; firstQueue still 0 for **honest table pressure**; table-pressure design parked pending demand |
+| M4 S4 mirror + GoW plant | plant ON residual; next doc `m4-gow-plant-residual-next.md` |
+| M7 residual honesty | rollup `m7-residual-honesty-rollup-2026-08-04.md` — reopen only R1 with named title |
+| M5-a S6 | **PARKED** CATCHUP |
+| M8 Prefer fleet | audit landed; GoW plant intentional residual |
+| M4-g FILEIO GetVersion | **already Core** (`m4g-fileio-getversion-landed.md`) |
 
 ---
 
@@ -21,36 +23,32 @@
 
 | ID | Seat | Risk | Notes |
 |----|------|------|-------|
-| **C1-next** | Why live `sceSifRegisterRpc` table still empty under `IOP_THREADS`+`IOP_REAL_RPC` | Med | C1.1–C1.5 scaffolding landed; LiveRpcHits still 0 on fleet paths — see `c1-registerrpc-growth-next.md` |
-| **M3-b/c** | Dual-path denylist / counters formalization | Low–Med | Design exists (`real-sif-rpc-dual-path.md`); depends on C1 registry growth to matter |
-| **M5-a redesign** | CATCHUP redesign (rate-limit / Finish-only owed) | High | Only if reopening S6; dual-ACK required |
-| **M1 residual** | A3.1 CHCR loop retirement / M1-f GIF_STAT nudge | Med | Backlog; design-first |
-| **M4-S0** | GoW reboot-arg fidelity (after TRACE Class A) | Med | Design docs exist; plant stays ON until reboot-gen data |
-| **Playability canaries** | Re-run scoreboard identity after S6.1 dormant in tree | Low | Flag-off should be identical; cheap confidence |
+| **M6-b1** | Shared SleepThread starve rescue | Med | `m6b-next-items.md` P0 — clear GAP; flag-gated |
+| **M6-b2** | Starvation counters in scoreboard | Low | Observability first |
+| **M1 residual** | A3.1 CHCR / M1-f GIF_STAT | Med | Backlog design-first |
+| **M7-L1** | Whip/BO2 assist-off IMAGE TRACE | Med | Named bar from M7 rollup |
+| **C1-TP** | Table pressure T1 slots=64 | Med | Design ready; only if live register demand |
+| **M3-b/c** | Dual-path formalization | Low–Med | Needs non-empty live registry to matter |
+| **Fleet flag-off identity** | Scoreboard after recent Core | Low | Cheap confidence |
 
 ---
 
-## Explicit non-seats (blocked / wrong class)
+## Explicit non-seats
 
-- Promote `DETPS2_DMAC_LEVEL_CATCHUP` default-on  
-- B3 CreditOwed product soft-off without dual-ACK  
-- Gs.cs composite “prefer natural harder” without oracle  
-- GoW END-tag Core writes  
-
----
-
-## Suggested parallel partition
-
-| Owner | Prefer |
-|-------|--------|
-| Either | **C1-next** audit → design if code path clear |
-| Either | M3 dual-path formalization (docs/code flag-gated) |
-| Either | Fleet flag-off identity smoke after recent Core landings |
+- Promote CATCHUP default-on  
+- Gs.cs composite without oracle  
+- GoW plant soft-off without S0 TRACE  
+- Mutual-hold / “wait for signal” without a proposed next course  
 
 ---
+
+## Suggested next dual-idle pick
+
+1. **M6-b2 counters** (cheap) or **M6-b1 Sleep rescue design dual-ACK**  
+2. Or **M1 residual** design-first  
+3. Or **M7-L1** measure plan for one title  
 
 ```text
-next-free-seats 2026-08-04 tip 6d70561
-  C1-next registerRpc growth highest infra leverage post-S6 park
-  no user escalate
+next-free-seats updated post C1 close
+  prefer M6-b or M1 residual; C1-TP only on demand
 ```
