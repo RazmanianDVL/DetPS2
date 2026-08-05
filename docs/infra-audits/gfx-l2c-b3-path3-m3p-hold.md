@@ -6778,3 +6778,17 @@ S140: CONFIRMED — t9=0x131480, tblPtr=0x4DDAC0, exact match to Grok's static r
       tonight, now four levels deep (phase -> mode-state -> vtable substate -> this). Next:
       Grok's static map of case 7's specific body to find what it's waiting on.
 ```
+
+## 140–141. Substate=7; case7 is 0x2BCA20(0x1E85900) nested SM (Claude+Grok)
+
+**S140:** t9=0x131480 exact; substate *(0x51A99C)=7; abort=0.
+
+**S141:** case7 body @ 0x131670:
+```
+jal 0x2BCA20(0x1E85900); if v0==0 return 0; substate=8; fallthrough case8
+```
+0x2BCA20: SM on *(0x1E85900+0x140)=*(0x1E85A40); cases 1/2/3/22/24; default return 1.
+
+```text
+S141: level-5 SM — 0x2BCA20 on obj 0x1E85900 state cell 0x1E85A40. Next live: dump that cell.
+```
