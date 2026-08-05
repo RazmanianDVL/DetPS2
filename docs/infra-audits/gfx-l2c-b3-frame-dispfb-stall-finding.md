@@ -254,3 +254,63 @@ DIRECT-end-truncated bug
   PATH3-hold-abort is refuted as the SleepThread-plateau's cause
   open: what condition is polled between each of the 45k SleepThread calls
 ```
+
+---
+
+## 10. SleepThread call-site correlation (Grok) — **VBlank flag poll**
+
+**Method:** temp `DETPS2_TEMP_B3_SLEEP_RA=1` RA histogram on syscall 0x32 only; fully reverted after measure.
+
+### 10.1 RA histogram (50M, n=45340)
+
+| RA | Count | Share |
+|----|------:|------:|
+| **0x00237188** | **45246** | **99.8%** |
+| 0x0022E248 | 92 | 0.2% |
+| 0x002A214C | 1 | — |
+| 0x002B2590 | 1 | — |
+
+Syscall PC always **0x0010BD44** (SleepThread trampoline). Threads **3/4/5/6** dominate early; tid 1 rarely.
+
+### 10.2 What 0x237188 is doing (disasm)
+
+Waiter function starts **0x00237120**:
+
+1. Scan table **`0x01D80700`** for a free slot (word == `-1`); up to 4 slots.
+2. `s0 = (gp - 23820) + slot` — flag byte array (same offset cited in `SonyKernelHle` AddIntcHandler comment).
+3. Loop:
+   - `jal 0x0010BD40` → SleepThread  
+   - **RA = 0x00237188**: `lbu v1, 0(s0)`  
+   - `beq v1, zero, sleep_again` — **spin until flag ≠ 0**
+
+Producer side is the INTC handler at **0x002370A0** (the VBlankStart chain entry already named in HLE comments):
+
+1. Scan same table `0x01D80700` for slots ≠ `-1`.
+2. `jal 0x0010CCD0` (WakeupThread path) with that tid.
+3. **`sb 1, (gp-23820)+slot`** — sets the flag the waiter polls.
+4. EI / return.
+
+Live dump at 25M: table holds **`3,4,5,6`** (registered waiter tids) — **not** cleared to `-1`. So waiters **are** registered; flags never go non-zero → 45k SleepThread.
+
+### 10.3 Link to prior knowledge
+
+`SonyKernelHle.cs` AddIntcHandler already documents this exact wedge:
+
+> Burnout 3 registers three VBlankStart handlers; keeping only the last left the VBlank thread-wakeup at **0x2370A0** dead and wedged boot on a SleepThread flag poll at **0x23719x** (flags @ **gp-23820** never set).
+
+Multi-handler chain is **already append** (not last-wins). Plateau persists ⇒ either **0x2370A0 is not running**, or it runs but **never reaches `sb flag=1`** (e.g. table scan always sees -1 under ISR GP/context, or Wakeup path fails before store).
+
+### 10.4 Next (still no Core without dual-ACK)
+
+1. **Measure:** does cause=2 (VBlankStart) ever dispatch **0x2370A0** during the plateau? (handler-entry temp counter / DETPS2_TRACE_HANDLERS-class).  
+2. If yes: dump flag bytes + table under ISR GP when handler runs.  
+3. If no: INTC STAT/mask / TakeExceptions / multi-handler walk bug for cause=2.  
+4. Still ban: invent DISPFB flip; present page 0x46 mismatch.
+
+```text
+B3 SleepThread correlation
+  99.8% RA=0x237188 — flag poll (gp-23820)+slot after SleepThread
+  producer INTC 0x2370A0 should sb flag=1 + WakeupThread
+  table 0x1D80700 has tids 3/4/5/6 live; flags never set
+  next: prove whether 0x2370A0 runs on VBlank during plateau
+```
