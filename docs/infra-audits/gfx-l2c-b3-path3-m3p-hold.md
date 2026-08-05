@@ -4237,3 +4237,19 @@ S67: tid1 confirmed at the park (highest-priority thread, SleepThread no WakeupT
      root cause of _flipEverUnblocked=false found — unreachable latch bootstrap, not a real
      game-side dependency; minimal 3-line fix proposed, awaiting dual-ACK
 ```
+
+---
+
+## 68. Dual-ACK land: `_flipEverUnblocked` healthy-from-boot bootstrap (Grok+Claude)
+
+Claude S67: flipHealthy true from cyc=20M with rearms=clearCount=0 forever; latch
+unreachable. Final PC `0x237190`, tid=1 SleepThread.
+
+**Dual-ACK Grok:** land Assist-only bootstrap in `flipHealthy` branch:
+
+```csharp
+else if (sys.MasterCycles >= 20_000_000 && sys.Gif.Path3Transfers >= 4)
+    _flipEverUnblocked = true;
+```
+
+Unblocks existing wake-flag plant + 0x237120..19C force so climber can retry past S66 park.

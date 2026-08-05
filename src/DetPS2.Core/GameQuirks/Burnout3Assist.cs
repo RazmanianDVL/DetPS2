@@ -426,6 +426,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
             // Once queues are truly healthy, keep post-flip path alive.
             if (_clearCount > 0 || _rearms > 0)
                 _flipEverUnblocked = true;
+            // S67 dual-ACK (Grok+Claude): B3's flip queue is often healthy from the first
+            // sample (pending==0, out==in) so the repair paths never run and rearms/clearCount
+            // stay 0 — latch was structurally unreachable. Bootstrap after the same 20M
+            // threshold already used for the wake-flag pump, once Path3 has moved a little.
+            else if (sys.MasterCycles >= 20_000_000 && sys.Gif.Path3Transfers >= 4)
+                _flipEverUnblocked = true;
         }
 
         // --- Post-flip progress (MUST run when flip has ever been live) ---
