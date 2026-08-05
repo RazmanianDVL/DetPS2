@@ -514,28 +514,36 @@ Grok dual-check §13 -- CONFIRMED
   next: which code clears slots1/2 (rare) + slot->tid + why poll prefers slot0
 ```
 
-### 14.1 Poll uses `s0 = flag_base + s1` — zero READs mean slot index never 1/2
+### 14.1 RETRACTED: “zero READs on slots 1/2” was a Read8-watch artifact (Claude)
 
-Disasm of the waiter (after 25M load):
+`Read8` watch matches **exact vaddr** (commit `9878499`), not word-aligned. Watching only
+`0x004E2964` can never log `lbu` at `0x4E2965/66/67`. Claude re-measured each slot
+separately in `[25M,50M)`:
 
-```
-237174  addiu v1, gp, -23820     ; flag base
-23717C  addu  s0, v1, s1         ; s0 = base + slotIndex  (delay of branch into poll)
-237180  jal   SleepThread
-237188  lbu   v1, 0(s0)          ; poll flag[s1]
-237198  beq   v1, zero, 0x237180 ; sleep while zero
-2371C8  sb    zero, 0(v0)        ; clear after wake (elsewhere in same function family)
-```
+| Slot | READs (own addr) |
+|-----:|-----------------:|
+| 0 | 229 |
+| 1 | 21 |
+| 2 | **3192** (most traffic) |
+| 3 | 321 |
 
-So READ address **is** `base+s1`. Observing only `0x4E2964` means **every** late-window hit at `0x237188` has **`s1==0`**. Slots 1 and 2 are not “polled but slow to clear” via this loop — **this loop is not running with s1∈{1,2} at all** in `[25M,50M)`. Their rare CLEARs (`0x2371C8` ×3) must be a different call/context. ISR still sets all four (`0x237108`).
+**Retracts** §14’s “s1 never equals 1/2” / “poll only runs s1=0.” Disasm still shows
+`s0 = base + s1` (that part stands), but slot2 **is** polled heavily. SET/CLEAR imbalance
+(98 set vs 3 clear for slots 1/2) remains the real finding: slot2 spins reading a flag that
+stays 1 and almost never reaches clear.
 
 ```text
-Poll bias refined
-  0x237188 is not hardwired to slot0; s1 selects the slot
-  late window: only s1=0 executes the SleepThread poll thrash
-  slots1/2: set by ISR, almost never polled here, almost never cleared
+§14.1 RETRACTED (tooling) -- Claude per-slot READ watch
+  Read8 exact-vaddr: watching only 0x4E2964 hides slots1-3 reads
+  real READs: slot0=229 slot1=21 slot2=3192 slot3=321
+  SET/CLEAR 98 vs 3 for slots1/2 STILL REAL
+  puzzle: slot2 polls hard but almost never clears after set
 ```
 
+### 14.2 Table dump @ 50M (Grok)
+
+`0x01D80700`: words **3, 4, 5, 6** (tids for slots 0–3). Flags word `0x004E2964` =
+`0x00010101` → bytes **1,1,1,0** (slots 0–2 set, slot3 clear) at end of run.
 ### 13.3 Next (no Core, continuing — not parking)
 
 1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
