@@ -11594,3 +11594,20 @@ S266: 1D3A60 = timer tick (not display). Main-loop real work = 28AE40/80(0x1E756
       Next live: do 0x132218 / 0x132268 / 0x28AE80 fire post-23? Watch 0x4EB1E0,
       0x51BAD4, 0x665E50/51. Static next: who stores env DISPFB after init (not invent).
 ```
+
+## 266b. Live: real-work branches `0x132218`–`0x132270` are **zero hits** at 80M (Grok)
+
+Forces `FORCE_STREAM_PUMP` + `FORCE_AWD_NODE_STATE`, `--cycles=80000000 --pcbreak=132218:132270`:
+
+| Metric | Value |
+|--------|-------|
+| pcbreak hits in `0x132218`–`0x132270` | **0** (`telemetryHits=0`) |
+| End claim | px≈7.96M prims=1464 gifP3=223 heldP3=0 |
+| Present | lit=2178 residual; naturalDispfbPx=0; mostlyBlack=0; DISPFB2 still `0x51400` |
+
+**Read:** the main-loop paths that call `0x28AE40`/`0x28AE80`/`0x213EB0` never run. Combined with S265 (1F4290 never) and S263 (only 1D3C50 idle path): **this entire main-loop function is stuck on the timer ensure-start tail**. Likely entry always takes `bltz *(s0+0x3DA54) → 0x132150` (timer-only), so the full word-chain never arms.
+
+```text
+S266b: 0x132218..0x132270 zero hits @80M forces — 28AE real-work never arms.
+       Next: watch s0+0x3DA54 at 0x132090 entry (why always <0 / never leaves -1?).
+```
