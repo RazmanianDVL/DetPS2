@@ -1958,3 +1958,82 @@ SIF: same
 EE: spins without I/O or GS after 30M
 not blocked on disc after 30M; may still be pre-gameplay state earlier
 ```
+
+---
+
+## 33. Thread census + one spin-loop traced and cleared (Claude, thread/RPC seat)
+
+Split with Grok: Grok took CDVD/streaming state (§32, disc streams then idles by 30M — not
+blocked on I/O), I took EE thread state.
+
+### 33.1 Full thread snapshot at cyc=30M
+
+Added a temp `SnapshotThreads()` accessor to `KernelState` (revert after use) — no new
+behavior, just reads existing per-thread fields:
+
+```text
+tid=1 alive=T started=T sleeping=T  waitSema=0   prio=50
+tid=2 alive=T started=T sleeping=T  waitSema=3   prio=64
+tid=3 alive=T started=T sleeping=T  waitSema=0   prio=54
+tid=4 alive=T started=T sleeping=T  waitSema=0   prio=54
+tid=5 alive=T started=T sleeping=F  waitSema=0   prio=54   <- the running/current thread
+tid=6 alive=T started=T sleeping=T  waitSema=0   prio=33
+tid=7 alive=T started=F                          prio=22   (never started)
+tid=8 alive=T started=T sleeping=T  waitSema=104 prio=1    (highest real priority)
+currentThreadId=5
+```
+
+Live `EE.PC=0x0010BD48` matches `tid5`'s position exactly — confirms tid5 is genuinely the
+one executing at end-of-run, not a stale snapshot artifact.
+
+### 33.2 tid5 traced: a real, actively-progressing wait — not the stuck point
+
+`0x0010BD48` is the return address of the generic BIOS syscall trampoline for syscall `0x32`
+(`SleepThread`) — `0x32` is also the single largest entry in the syscall histogram (74,162
+hits total, all threads combined). Register dump (`--pcbreak=0010BD48:0010BD48`) gives a
+stable `ra=0x00237188`, i.e. the real caller loop is at `0x237180-0x237198`:
+
+```text
+0x237180: jal 0x0010BD40        # SleepThread()
+0x237188: lbu v1, 0(s0)         # s0 = gp-23820 + index (index 0..3)
+0x237198: beq v1, zero, 0x237180  # byte still 0 -> sleep again
+```
+
+A textbook 4-slot flag-wait: `while (flags[i]==0) SleepThread();` for `i` in `0..3`.
+`gp-23820` resolves to `0x004E2964` (gp confirmed `0x4E8670` earlier this session) — matches
+the `s0` values seen in the register dump exactly.
+
+**Watched all 4 bytes (`0x4E2964..0x4E2967`) across the full 30M-cycle run: NOT a one-shot.**
+Each slot gets SET (`0x237108`, `sb v1,0(v0)` → 1) and CONSUMED/cleared (`0x2371C8`,
+`sb zero,0(v0)` → 0) **repeatedly — 22-48 times each, spread across the whole run**, unlike
+every other flag traced tonight (`gp-24112`, `gp-24225`, the boot-stage chain) which fired a
+small fixed number of times only during the 15.17-15.75M setup window and then went
+permanently silent.
+
+**This rules tid5's wait out as the stuck point.** Whatever sets these 4 bytes is alive and
+producing work throughout the entire run — this is a real, correctly-functioning
+worker-sync primitive (roughly one full 4-slot cycle every ~625K cycles, plausible per-frame-
+ish cadence), not evidence of the freeze. My earlier read of the raw 74,162 SleepThread count
+as "one thread spinning uselessly" was too hasty — that count is a whole-system syscall
+histogram, most of it presumably normal idle-thread scheduling unrelated to this one loop.
+
+### 33.3 What's still open
+
+- `tid2` (`waitSema=3`) and `tid8` (`waitSema=104`, highest real priority in the system) are
+  both parked on real semaphores that haven't been characterized yet — worth checking
+  whether these are legitimate long-lived waits (e.g. an IOP-RPC completion sema that's
+  correctly idle) or a starved producer, same shape as everything else tonight.
+- `tid7` never started at all (`started=False`) — worth a quick check on whether real B3
+  expects it to be started by this point.
+- Given tid5's specific spin cleared, the search for "what should trigger continuous
+  per-frame GS submission" is still open — this was one candidate thread, ruled out with
+  real evidence rather than assumed.
+
+```text
+thread census (Claude) -- tid5's flag-wait spin traced and cleared
+  8 threads: 6 sleeping (0 real wait-id), tid5 running (SleepThread spin), tid7 never started
+  tid5's spin-wait (gp-23820, 4 flag bytes) IS actively serviced (22-48x each, whole run)
+    -- NOT the stuck point, rules this thread out with evidence
+  still open: tid2 waitSema=3, tid8 waitSema=104 (highest prio) -- not yet characterized
+  still open: tid7 never started -- check if real B3 expects it running by now
+```
