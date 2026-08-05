@@ -11353,3 +11353,26 @@ S254: 0x29F1E0 returns 0 (null/empty ctx); natural 16→256 never runs. Force no
       bypass; product fix = wire stream ctx + pump so probe sees 256.
 ```
 
+
+## 256. Post-readiness-23 display dump (forces on) — DISPFB2 non-zero, present still FBP0 (Grok)
+
+95M with `FORCE_STREAM_PUMP` + `FORCE_AWD_NODE_STATE` (substate reaches 23):
+
+| Field | Value |
+|-------|--------|
+| FRAME_1 | `0xA0046` (FBP≈0x46) |
+| DISPFB1 | `0` |
+| **DISPFB2** | **`0x51400`** (non-zero — real PutDispEnv activity) |
+| circuit | pmode=0x66 circ=2 naturalDispfb=1 enNatural=1 |
+| present FBP | **0** (Soft-GS out still page 0) |
+| composite | SyntheticFbp0 |
+| lit / mostlyBlack | 0 / 1 |
+| heldP3 | 0 |
+| cdvd | 19070 |
+
+**Read:** readiness complete unblocks some display-env writes (DISPFB2=0x51400). Present path still composites/reads FBP 0 — class-A mismatch, not invent-DISPFB. Next: circuit selection / why natural DISPFB path yields dispfbPx=0 despite DISPFB2.
+
+```text
+S256: post-23 DISPFB2=0x51400 but present FBP=0 SyntheticFbp0 lit=0. Display circuit next.
+```
+
