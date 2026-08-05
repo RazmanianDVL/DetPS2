@@ -372,3 +372,115 @@ B3 SleepThread correlation
   table 0x1D80700 has tids 3/4/5/6 live; flags never set
   next: prove whether 0x2370A0 runs on VBlank during plateau
 ```
+
+---
+
+## 12. 0x2370A0 DOES dispatch; loop DOES reach every slot; flag store DOES NOT land for slots 1-3 (Claude)
+
+Directly answered §10.4 point 1, then went further using real disasm + the real `--watch`/
+`--pcbreak`/`--dump-ee-ram` CLI tooling (all real product infra, no temp code needed for any
+of this section).
+
+### 12.1 The ISR does dispatch (refutes §10.4 point 3)
+
+`DETPS2_TRACE_INTC_DISPATCH=1` over the 35M window: **`handler=0x002370A0` fires 74 times**,
+alongside 3 other chained handlers (`0x001F1CE8`, `0x0022B830`, `0x0010E688`) — src=2
+(VBlankStart) dispatches all 4 in a chain, consistently, right up to the last sample in the
+window. The multi-handler append (already landed per the `AddIntcHandler` comment) **is
+walking correctly** — this is not an INTC/multi-handler-walk bug.
+
+### 12.2 Full disasm of 0x2370A0 — the loop logic itself is correct
+
+```
+2370A0-2370AC: prologue, s0 = 0
+2370B0 (loop head): v0 = table_base(0x01D80700) + s0*4; a0 = &table[s0]
+2370C0: v1 = table[s0]  (lw)
+2370C8: bne v1, -1, 0x2370F0        ; if registered, go wake it
+2370D0: s0++ ; if s0<4 goto 2370B0  ; otherwise fall through to ei/return
+...
+2370F0: jal 0x0010CCD0              ; WakeupThread(tid) -- delay slot loads a0=table[s0]
+2370F8-00237104: v0 = (gp-23820)+s0 ; unconditional branch back to 2370D0
+00237108 (delay slot of that branch): sb v1(=1), 0(v0)   ; sets flag[s0]=1
+```
+
+Loop structure is correct: after waking a slot, it unconditionally jumps back to the
+increment/continue point (`2370D0`), so it should visit and process all 4 slots every call,
+not stop after the first hit.
+
+### 12.3 Confirmed via PC/register trace: it does visit all 4 slots, every time
+
+`--pcbreak=0x002370B0:0x002370B0` (loop head) over the same 35M window: `s0=0x0/0x1/0x2/0x3`
+each hit **exactly 74 times** — one full pass through all 4 slots on every one of the 74 real
+ISR dispatches. Not an early-exit bug.
+
+### 12.4 Table contents confirmed real and non-`-1` for all 4 slots
+
+`--dump-ee-ram=01D80700:20` at 35M: `03 00 00 00 | 04 00 00 00 | 05 00 00 00 | 06 00 00 00`
+— table[0..3] = tids {3,4,5,6}, exactly matching Grok's live dump. None are `-1`; the
+`bne v1,-1,0x2370F0` branch should fire for every slot on every ISR call.
+
+### 12.5 The actual break: flag store only ever lands for slot 0
+
+`--watch=0x004E2964` (word-aligned flag array base — **note:** `Write8`'s watch match is
+`vaddr & ~3`, so the watch address must be word-aligned or byte writes at unaligned offsets
+in the same word are silently missed; also note `Read8` has **no** watch instrumentation at
+all, only `Read32`/`Write8` — a real tooling gap worth fixing separately, unrelated to this
+bug) over the 13M-35M window: **398 hits, every single one at exactly `0x004E2964` (slot
+0)**. Zero hits at `0x4E2965`/`0x4E2966`/`0x4E2967` (slots 1/2/3) — despite `0x4E2966` being
+the address **99.8% of all SleepThread polls are checking** (§10.1).
+
+`--watch=0x01D80704` (table slot 1, tid 4) over the same window shows the wake path **is**
+taken repeatedly: `pc=0x002370F4 lw a0,0(a0)` (the `jal 0x0010CCD0`/WakeupThread delay slot)
+fires, followed by a real deregister (`pc=0x002371B8 WROTE 0xFFFFFFFF`) and re-register
+(`pc=0x002371DC WROTE 0x00000004`) cycle — **so `WakeupThread(4)` is genuinely being called**,
+and the table bookkeeping around it works. But the flag-set instruction back in the ISR loop
+(`0x00237108`) that should follow right after `WakeupThread` returns **never fires for this
+slot** (confirmed via the flag-address watch in the same paragraph above).
+
+### 12.6 Working hypothesis (not yet proven, no Core)
+
+Slot 0's full cycle (wake → flag-set → clear → re-register) completes normally every time.
+Slots 1-3's wake call (`jal 0x0010CCD0`) executes and the *table* bookkeeping around it
+completes, but the ISR's own remaining instructions after that `jal` returns (`2370F8`
+onward, including the `0x00237108` flag store) appear not to execute for those slots.
+
+The most consistent explanation: `WakeupThread` (`0x0010CCD0`, real BIOS/HLE routine) for
+slots 1-3 (tids 4/5/6) causes something — an immediate thread-context switch, a
+higher-priority preemption, or a similar real scheduling side effect — that diverts the
+interpreter away from returning control to the interrupted ISR's remaining instructions,
+while slot 0's `WakeupThread(3)` call does not (perhaps because thread 3 has different
+relative priority, or is the thread already-running / already-highest-priority so no switch
+is triggered). This is speculative — **not yet confirmed** which of our EE
+interrupt-return/thread-switch mechanisms is responsible, only that the observable symptom
+(wake call fires, table updates, flag store silently skipped, only for non-slot-0 tids)
+strongly narrows the search to "something in how a mid-ISR real thread-switch interacts with
+resuming the interrupted ISR's remaining code," which is a real, novel, EE-side mechanism
+question — a different mechanism than any of tonight's other findings (Whip's fabricated
+IOP semaphore, the Gif.cs string typo), and potentially broader blast radius since
+`WakeupThread`/ISR-return interaction isn't B3-specific machinery.
+
+### 12.7 Recommended next step (not started, no Core, wider review warranted)
+
+1. Find the C# HLE implementation behind BIOS address `0x0010CCD0` (WakeupThread) and check
+   whether/how it can cause the interpreter to abandon the interrupted ISR's remaining
+   instruction stream — likely something in `EmotionEngine`'s exception-return/thread-switch
+   plumbing (`TryDispatchRegisteredIntcHandler`, `_savedGprAcrossIntcDispatch`, or a kernel
+   HLE `WakeupThread`/priority-preempt path), not this title's own game code.
+2. Specifically check: does thread 3 (slot 0, the one that DOES work) differ in priority or
+   "already running" state from threads 4/5/6 at the moment of wake, in a way that would
+   explain why only its wake call lets the ISR finish?
+3. Given this could affect **any title** using AddIntcHandler + WakeupThread from within an
+   ISR (not B3-specific), this needs the same dual-ACK-before-Core rigor as the C1/graphics
+   work tonight, plus probably a broader regression check across other titles once a fix
+   direction exists — this is a bigger lever than a single-title present fix.
+
+```text
+B3 root-cause chain (Claude, deepest layer so far)
+  ISR dispatches (74x), loop visits all 4 slots (74x each) -- both confirmed correct
+  table holds real tids {3,4,5,6}, none -1 -- confirmed via real memory dump
+  WakeupThread call fires for slot 1 (table bookkeeping proves it) -- but flag store
+    after it never lands, for slots 1-3 only; slot 0 completes its full cycle normally
+  hypothesis: WakeupThread triggers a real thread-switch that abandons the ISR's
+    remaining instructions for non-slot-0 wakes -- EE-side mechanism, not B3-specific
+  next: find WakeupThread's C# HLE impl, check its interaction with ISR-return
+```
