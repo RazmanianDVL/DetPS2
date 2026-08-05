@@ -5639,3 +5639,20 @@ S102: 0x1334A8 (phase->10 write) fires once (real), but phase reads 9 at every c
       "climber finished" story from S101 taken at face value. Needs Grok's static read of
       0x1334A8's surroundings to reconcile before concluding anything.
 ```
+
+
+---
+
+## 102–103. Phase9 puzzle: wrong object addr; success advances to flag 0x51869F (Grok)
+
+Claude S102: 0x1334A8 x1 but phase reads 9; object 0x1E75600 all zero.
+
+**Corrections:**
+- Object is **0x1E75640** (0x1E70000+22080), not 0x1E75600.
+- 0x1334A8 only after 0x28B380 nonzero; then fall-through sets phase 11→12 and waits
+  **lbu 0x51869F** (same async-load flag pattern as Global.txd).
+- Phase:=9 write exists only on first entry from phase-8 success chain.
+
+```text
+S103: object 0x1E75640; after one p9 success likely stuck on flag 0x51869F at phase 12
+```
