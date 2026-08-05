@@ -29,6 +29,7 @@ public interface IOptionsHost
     void Log(string message);
     void OnLibraryPathsChanged();
     void LoadBiosPath(string path);
+    Task<string?> PromptBiosFileAsync();
     Task<string?> PromptLibraryPathAsync(string initial);
     void ApplyFolderScan(string path);
     void ApplyPresentModeFromConfig();
@@ -53,8 +54,9 @@ public partial class OptionsWindow : Window
     private OptionsAudioPage? _audioPage;
     private OptionsAdvancedPage? _advancedPage;
 
-    // General extras: library path (not yet on OptionsGeneralPage itself)
+    // General extras: library path, BIOS (not yet on OptionsGeneralPage itself)
     private TextBlock? _libraryExtraLabel;
+    private TextBlock? _biosExtraLabel;
 
     public OptionsWindow()
     {
@@ -150,7 +152,48 @@ public partial class OptionsWindow : Window
     {
         _generalPage = new OptionsGeneralPage();
         _generalPage.LoadFrom(_host.Config);
-        // BIOS dump picker removed: Desktop boots via LoadBiosNative (commercial HLE).
+
+        // BIOS: optional dump selection. Default remains native HLE (no dump required) —
+        // LoadBios() falls back to LoadBiosNative() automatically when no path is set.
+        // Loading a dump here re-inits the running session immediately; it does not
+        // auto-load on the next app start (session-scoped choice, not a default).
+        _biosExtraLabel = new TextBlock
+        {
+            Text = _host.Config.HasBiosFile ? _host.Config.BiosPath : "Native HLE (no BIOS dump)",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 11,
+            Foreground = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC))
+        };
+        var setBios = new Button
+        {
+            Content = "Browse…",
+            Padding = new Thickness(12, 6),
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+        setBios.Click += async (_, __) =>
+        {
+            string? path = await _host.PromptBiosFileAsync();
+            if (string.IsNullOrWhiteSpace(path)) return;
+            _host.LoadBiosPath(path);
+            _host.PersistConfig();
+            if (_biosExtraLabel != null)
+                _biosExtraLabel.Text = _host.Config.HasBiosFile ? _host.Config.BiosPath : path;
+            _host.Log($"BIOS dump loaded: {path}");
+        };
+        var clearBios = new Button
+        {
+            Content = "Use native HLE",
+            Padding = new Thickness(12, 6),
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+        clearBios.Click += (_, __) =>
+        {
+            _host.LoadBiosPath("");
+            _host.PersistConfig();
+            if (_biosExtraLabel != null)
+                _biosExtraLabel.Text = "Native HLE (no BIOS dump)";
+            _host.Log("Reverted to native HLE (no BIOS dump)");
+        };
 
         // Library path controls (toolbar removed from main — live here)
         _libraryExtraLabel = new TextBlock
@@ -198,6 +241,15 @@ public partial class OptionsWindow : Window
             Margin = new Thickness(16, 0, 16, 16),
             Children =
             {
+                new Separator(),
+                new TextBlock { Text = "BIOS", FontWeight = FontWeight.SemiBold },
+                _biosExtraLabel,
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 8,
+                    Children = { setBios, clearBios }
+                },
                 new Separator(),
                 new TextBlock { Text = "Library path", FontWeight = FontWeight.SemiBold },
                 _libraryExtraLabel,

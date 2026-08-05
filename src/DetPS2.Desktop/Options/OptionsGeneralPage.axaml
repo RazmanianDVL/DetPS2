@@ -9,12 +9,6 @@
 
             <Separator />
 
-            <TextBlock Text="BIOS" FontWeight="SemiBold" />
-            <TextBlock Text="Commercial services use built-in native HLE (no BIOS dump required)."
-                       FontSize="12" Foreground="#ccc" TextWrapping="Wrap" />
-
-            <Separator />
-
             <TextBlock Text="Library" FontWeight="SemiBold" />
             <TextBlock x:Name="GamesFolderText" Text="(not set)" FontSize="12"
                        TextWrapping="Wrap" Foreground="#ccc" />

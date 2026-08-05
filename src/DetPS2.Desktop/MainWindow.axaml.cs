@@ -110,9 +110,20 @@ public partial class MainWindow : Window, IOptionsHost
     }
     void IOptionsHost.LoadBiosPath(string path)
     {
-        if (!string.IsNullOrWhiteSpace(path))
-            _system?.LoadBios(path);
+        // LoadBios(path) falls back to LoadBiosNative() internally when path is empty/missing,
+        // so always call it — an empty path here means "revert to native HLE", not "no-op".
+        _system?.LoadBios(path);
         _config.BiosPath = path ?? "";
+    }
+    async Task<string?> IOptionsHost.PromptBiosFileAsync()
+    {
+        var files = await this.StorageProvider.OpenFilePickerAsync(new()
+        {
+            Title = "Select PS2 BIOS dump",
+            AllowMultiple = false,
+            FileTypeFilter = new[] { new FilePickerFileType("BIOS dump") { Patterns = new[] { "*.bin", "*.BIN" } } }
+        });
+        return files.Count > 0 ? files[0].Path.LocalPath : null;
     }
     Task<string?> IOptionsHost.PromptLibraryPathAsync(string initial) => PromptLibraryPathAsync(initial);
     void IOptionsHost.ApplyFolderScan(string path) => ApplyFolderScan(path);
@@ -208,15 +219,24 @@ public partial class MainWindow : Window, IOptionsHost
             else
                 Log("No library path yet — Options → General → Set library path…");
 
-            // Desktop always uses built-in native HLE — no BIOS dump required.
+            // Native HLE is the default (no BIOS dump required); honor a previously
+            // selected dump (Options → General → BIOS) if one was saved and still exists.
             try
             {
-                _system?.LoadBiosNative();
-                Log("Native BIOS HLE ready (no BIOS dump required)");
+                if (_config.HasBiosFile)
+                {
+                    _system?.LoadBios(_config.BiosPath);
+                    Log($"BIOS dump loaded from saved setting: {_config.BiosPath}");
+                }
+                else
+                {
+                    _system?.LoadBiosNative();
+                    Log("Native BIOS HLE ready (no BIOS dump required)");
+                }
             }
             catch (Exception ex)
             {
-                Log($"Native BIOS HLE init warning: {ex.Message}");
+                Log($"BIOS init warning: {ex.Message}");
             }
 
             if (_config.EnableVirtualHdd && !string.IsNullOrEmpty(_config.VirtualHddPath) && _system != null)
@@ -415,17 +435,19 @@ public partial class MainWindow : Window, IOptionsHost
         {
             if (ext == ".rom")
             {
-                // BIOS dumps are ignored — Desktop uses built-in native HLE only.
-                Log("BIOS dump ignored (native HLE is always used). Drop an .iso / .bin disc or .elf instead.");
+                // Drag-and-drop stays disc/ELF-only to avoid ambiguous guessing.
+                // BIOS dumps are selected explicitly via Options → General → BIOS.
+                Log("Drop ignored (native HLE is the default). Select a BIOS dump via Options → General → BIOS, or drop an .iso / .bin disc or .elf here.");
             }
             else if (ext == ".bin")
             {
-                // Large .bin ≈ disc image; small files are treated as non-disc (not BIOS).
+                // Large .bin ≈ disc image; small files are treated as non-disc (not BIOS —
+                // use Options → General → BIOS to pick a BIOS dump explicitly).
                 var info = new FileInfo(path);
                 if (info.Length > 2_000_000)
                     await BootMediaPathAsync(path, autoRun: _config.AutoRunAfterBoot);
                 else
-                    Log("Small .bin ignored (not treated as BIOS). Drop a disc image (.iso / large .bin) or .elf.");
+                    Log("Small .bin ignored (not treated as BIOS). Use Options → General → BIOS to pick a BIOS dump, or drop a disc image (.iso / large .bin) or .elf here.");
             }
             else if (ext is ".elf" or ".iso")
             {
@@ -1257,8 +1279,11 @@ public partial class MainWindow : Window, IOptionsHost
             _system.SetAudioSink(_audioSink);
             _emuWorker.Attach(_system);
 
-            // Always bring up native commercial HLE — no BIOS dump required on Desktop.
-            _system.LoadBiosNative();
+            // Native HLE remains the default (no BIOS dump required). LoadBios() falls back
+            // to LoadBiosNative() internally when the path is empty/missing, so this is safe
+            // to call unconditionally — it only picks up a real dump when the user explicitly
+            // selected one in Options → General → BIOS.
+            _system.LoadBios(_config.HasBiosFile ? _config.BiosPath : null);
 
             if (ext is ".elf")
             {
@@ -1303,7 +1328,9 @@ public partial class MainWindow : Window, IOptionsHost
             RefreshLibraryList();
 
             _sessionLog.WriteSystemSnapshot(_system, "post-boot");
-            Log("Note: DetPS2 fast-boots the disc ELF with native HLE (no BIOS dump).");
+            Log(_config.HasBiosFile
+                ? $"Note: booted with BIOS dump ({_config.BiosPath})."
+                : "Note: DetPS2 fast-boots the disc ELF with native HLE (no BIOS dump).");
             string quirkName = _system.ActiveQuirk?.DisplayName
                 ?? _system.ActiveQuirk?.Serial
                 ?? "(none)";

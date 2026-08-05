@@ -6,7 +6,8 @@ namespace DetPS2.Desktop.Options;
 
 /// <summary>
 /// General options: library path display, auto-run, media verify.
-/// BIOS dump selection is intentionally absent — Desktop always uses native HLE.
+/// BIOS dump selection lives in the host-built "extras" panel (OptionsWindow.BuildGeneralHost),
+/// not on this page directly — native HLE remains the default; a dump is opt-in only.
 /// Host (UI-1 shell) should call <see cref="LoadFrom"/> / <see cref="ApplyTo"/> around show/save.
 /// </summary>
 public partial class OptionsGeneralPage : UserControl
