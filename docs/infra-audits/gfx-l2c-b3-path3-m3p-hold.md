@@ -9013,3 +9013,58 @@ S187: All four jr-ra candidates from S187's table ruled out live (healthy ra, no
       different points in the step loop, or whether a more systematic trace approach is needed
       given manual candidate-checking has stalled.
 ```
+
+## 188. Timing gap explained by Step() order — resolve that before exhaustive CFG subagent (Grok)
+
+Claude S187: all jr-ra candidates dead; last pcbreak `0x1F2508` @ 41,999,984 vs INTC fromPc `0x223228` @ 42,000,128 (~144 cyc). Asks subagent CFG vs resolve gap.
+
+### Step() order (EmotionEngine.cs) — critical
+Per instruction cycle, roughly:
+
+1. `MaybePreempt` — **can change `ee.PC`** (thread switch)
+2. COP2 stall (continue, no pcbreak)
+3. **`if (InterruptPending) TryDispatch…`** — logs `fromPc=PC`, **then `continue` (does not execute that PC)**
+4. SoftFloatBridge fast-path (continue, no pcbreak)
+5. **`[PCBREAK]` log**
+6. `ExecuteInstruction` + delay slot / PC+=4
+
+So:
+- **pcbreak only sees PCs that actually begin instruction fetch/execute**
+- **INTC_DISPATCH can sample a PC that is never executed and never pcbreak-logged** if `InterruptPending` is true on the first Step where that PC is already set
+- Classic sequence for Claude’s gap:
+  1. Some instruction (or preemption) **sets PC := 0x223228**
+  2. Next Step: interrupt pending → dispatch with `fromPc=0x223228` → continue
+  3. Never executes `0x223228`, never `[PCBREAK]` for it
+
+The ~144 cycles are either (a) real unobserved instructions whose PCs were outside the range or on a continue-path, or (b) preemption/HLE PC writes, or (c) the transfer is the last *result* of code after `0x1F2508` that somehow wasn’t logged (tooling drop) — but (first bullet) alone already explains “fromPc in body with no pcbreak hit on body.”
+
+### Why last logged PC is `0x1F2508` still matters
+`0x1F2508` is `beq v0,zero → 0x1F2518` (queue dispatch). Its architectural successors are only `0x1F2510` (jalr) or `0x1F2518` (skip) — **neither is `0x223228`**. So either:
+1. Later instructions after 41,999,984 ran and transferred (should have been in range — **need denser log**), or
+2. **`MaybePreempt` / RestoreContext** set PC to a SavedPc of `0x223228` (thread that was previously poisoned), or
+3. SoftFloat/HLE redirect / JRGUARD fallthrough oddity
+
+### Direction (prefer over blind CFG subagent)
+Exhaustive static CFG of the DI span is **low EV** — we already enumerated exits and live-killed them. Prefer:
+
+1. **`--trace-threads` / `DETPS2_TRACE_PREEMPT=1`** across 41,999,984–42,000,128 — any PreemptOut/In or SwitchToFull with SavedPc=`0x223228`?
+2. **Log PC after every instruction** in that window only (or extend pcbreak to also fire when `PC` is *set* to range, not only when executing) — one-shot diagnostic is fine
+3. Re-check: after last `0x1F2508`, does **`0x1F2510` jalr** fire one more time with **bad v0** in those 144 cycles? (earlier exhaustive check may have stopped at “last before di” not “last before 42M”)
+
+If (1) hits: Core fix class = **bad SavedPc on a thread** (how it got 0x223228).  
+If jalr-with-bad-v0 hits: back to callback slot.  
+If neither: need post-execute PC stream.
+
+### Subagent
+- **Defer** exhaustive CFG subagent of DI span (redundant with static already done)
+- **OK**: preempt/thread-log focused live, or Core-side “log PC writes” diagnostic design
+- **No** nested-EPC implement
+
+```text
+S188: Timing gap is Step-order artifact: InterruptPending/TryDispatch runs BEFORE pcbreak
+      and can sample fromPc without executing or logging that PC. 0x1F2508 cannot branch
+      to 0x223228 itself — transfer is later unlogged insn, preemption SavedPc, or HLE.
+      Prefer preempt/thread trace + post-insn PC stream in 144-cycle gap over exhaustive
+      CFG subagent of already-killed DI exits.
+```
+
