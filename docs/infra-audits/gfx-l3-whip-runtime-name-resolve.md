@@ -99,6 +99,15 @@ Whip runtime name->pixel (30M)
 | `frontend` | **2** — `0x0040F540`, `0x0041A778` |
 | Ring dump `0x0045BC94` (256 B) | **all zeros** at end of run |
 
-Interpretation: title path strings are **not retained** as live C-strings in RDRAM after 30M (ring is 4 KiB class and likely overwritten/consumed). `goefile`/`frontend` hits are sparse and may be ELF/static or partial stream residue — not a full resident firstscreen/frontend image. Reinforces: no active “texture name table → open → pixels” stage in this window.
+Interpretation: title path strings are **not retained** as live C-strings in RDRAM after 30M (ring is 4 KiB class and likely overwritten/consumed).
 
-Next: `--find-writer` on the two `goefile` addresses; and/or 100M+ with WHIP-TEX re-instrument to catch any post-title FILEIO; and/or dump ring **during** stream (watch dest writes) rather than only at end.
+### 6.1 `find-writer` on residual `goefile`/`frontend` hits
+
+| Address | Last writer | Current word (LE ASCII) |
+|---------|-------------|-------------------------|
+| `0x00416070` / `0x0041F8F8` | **NEVER WRITTEN** | `goefile\0` |
+| `0x0040F540` | **NEVER WRITTEN** | `frontend` |
+
+These are **ELF static** PT_LOAD strings, not RKV stream delivery. Reinforces: no active “texture name table → open → pixels” stage; streamed title members do not leave durable path-name tables in RDRAM by 30M.
+
+Next: 100M+ with WHIP-TEX re-instrument for any post-title FILEIO; and/or instrument ring writes mid-stream (watch dest) to prove what lands before consume.
