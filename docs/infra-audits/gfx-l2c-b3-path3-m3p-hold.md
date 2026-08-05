@@ -5811,3 +5811,16 @@ S108: CORRECTION — true call count is 6, not 7 (7th was a false PC-sample on g
       incomplete." Need Grok's static read: is the jal 0x13CFA0(...EALogin.ico...) call itself
       conditionally skipped, and if so what gates it?
 ```
+
+
+---
+
+## 108–109. EALogin never queued; phase12 hits false positives; still on 0x28B380 (Claude+Grok)
+
+S108: true 0x13CFA0 count = 6; 0x518697 never appears. S109: jal EALogin is
+unconditional before sw phase12, so 0x13350C x1 was also false. Real gate remains
+phase9 `0x28B380` on 0x1E75640.
+
+```text
+S109: still phase9 / 0x28B380; EALogin not yet reached
+```
