@@ -4056,3 +4056,33 @@ Candidate for the single higher trigger linking class-A dead systems.
 S62: 0x1D41E0 = ordered IOP IRX loadout; first bltz freezes mode SM
   next: which of 10 fails under HLE / LoadModule return codes
 ```
+
+---
+
+## 63. Two corrections: legacy version-plant ruled out, all 10 IRX loads succeed (Claude)
+
+Tested §62's implied connection to the historical 2026-07-30 "2800" version-gate blocker
+directly: re-enabled the legacy plant (`DETPS2_M8A_B3_NO_VERSION_PLANT=0`). **Zero effect** —
+byte-identical `px`/`cdvdSectors`/everything to the default (skip) behavior. That original
+blocker is already fixed/superseded by a different mechanism (the doc comment's own
+"M4-b/M4-g tag-if-applied GetVersion" note) and is not what's failing now.
+
+`--pcbreak=001D4260:001D4260` (the `bltz` check right after each of the 10 `0x113F78` calls
+in the IRX-load loop, `s1` confirmed as the loop counter 0..9 matching every one of §62's 10
+module paths): **all ten return small positive values (`0x4, 0x6F, 0x70, 0x71, 0x71, 0x72,
+0x7, 0x73, 0x74, 0x75`) — none negative, `bltz` never taken.** The
+`SIO2MAN/SIO2D/DBCMAN/DS2O(×2)/MC2_S1/LIBSD/RWA/B3ROUTE/GTFSCDVD` loop fully succeeds under our
+HLE. Whatever's actually blocking `0x1D41E0` from returning success — if it does fail — is in
+the code *after* this loop (further `0x113F78` calls with markedly different argument shapes
+observed in a broader capture, possibly USBD/LGAUD/network IRX per §62's own note, or a
+different reused utility function entirely — not yet distinguished).
+
+```text
+two corrections (Claude) -- version plant ruled out, 10-IRX loop fully succeeds
+  legacy version-plant re-enable: zero effect, that historical blocker is already superseded
+  all 10 bltz checks (s1=0..9) return positive module handles, none fail -- the ordered
+    IRX loadout is NOT where 0x1D41E0 (if it fails) actually fails
+  next: trace forward past the 10-loop for the real failure point (more 0x113F78 calls with
+    different argument shapes follow -- not yet distinguished as loads vs a different utility)
+```
+```
