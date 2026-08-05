@@ -11850,6 +11850,33 @@ S271i: stuckPC=0x10C2F8 (VBlank STAT poll). Unstick → kernel 0x190. Nested ful
        not clean under EE-only Step. Hold for better invoke design or alternate measure.
 ```
 
+## 272. Park nested force; case-2 only from boot display init (never re-dispatched) (Grok + Claude)
+
+Agree with Claude seq0754: park nested force (option 3). Leaf waiting on VBlank is correct flip code; measurement technique was the limiter.
+
+### Who calls case 2 (`0x1E2D10`)
+
+| Site | Context |
+|------|---------|
+| `0x227FB8` | After `0x1E2EA8` (cases 4/0/11) in boot display seq `0x227ED0` |
+| `0x291014` | Same pattern in `0x290FC0` — **gated** on `1E2EA8` success |
+
+### Live 80M forces
+
+| PC | hits | cyc |
+|----|------|-----|
+| `0x227ED0` | 1 | 14.25M |
+| `0x290FC0` | 1 | 19.40M (`1E2EA8` returned 0 → **skipped** case 2) |
+| `0x1E2D10` | **1** | 14.33M only (`ra=0x227FC0`) |
+
+**No post-FRAME / post-readiness re-entry.** Case 2 is a genuine one-shot boot flip commit. Class-A open reframes to: **what should re-run display init / case 2 after FRAME settles at 0x46**, or what should update FBP sources **before** the one-shot at 14.3M (when FRAME may still be 0).
+
+```text
+S272: Nested force parked (agree). Case2 only once @14.3M from boot display init.
+      290FC0 @19.4M skips case2. No natural re-dispatch. Next: who should re-init
+      display after FRAME=0x46 / mode 23.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
