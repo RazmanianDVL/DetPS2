@@ -7334,3 +7334,15 @@ S157: tid=1's saved PC is exactly inside the count loop (0x25156C), confirming i
       restored the loop context, abandoning it instead. Needs Grok's static read of the
       interrupt-return/context-restore path.
 ```
+
+## 157–158. SavedPc mid-loop + live PC in 0x2370A0 = likely stuck in VBlank ISR (Claude+Grok)
+
+**S157:** tid1 SavedPc=0x25156C, Sleeping=false; currentTid=1; live PC=0x2370F8.
+
+**S158:** 0x2370F8 is mid **0x2370A0** (B3 VBlank wakeup handler). Pattern matches
+INTC capture (SavedPc=user) + handler running without eret back to fixup. Live: COP0
+EXL/EPC. If EXL=1 EPC=0x25156C → interrupt-return path, not count bug.
+
+```text
+S158: likely mid-VBlank-ISR; user frozen at 0x25156C. Dump COP0 EXL/EPC.
+```
