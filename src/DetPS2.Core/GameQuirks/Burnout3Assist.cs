@@ -111,6 +111,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _stageAssetsPlanted;
     private uint _stageHedEeAddr;
     private uint _stageHedSize;
+    /// <summary>S127: completed stuck sound\generic.awd stream status 48→256.</summary>
+    private int _audioStreamCompletes;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -165,6 +167,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _stageAssetsPlanted = false;
         _stageHedEeAddr = 0;
         _stageHedSize = 0;
+        _audioStreamCompletes = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -332,6 +335,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
             && (_lgDevEscapes >= 1 || sys.Cdvd.SectorsRead >= 2000)
             && sys.Cdvd.SectorsRead >= 400)
             MaybePlantStageAssets(sys);
+
+        // S127 dual-ACK: phase9 claims sound\generic.awd; stream arms +44=48 then never
+        // pumps (0x29EF00/0x2B4C00 never run). Promote stuck 48→256 so climber advances.
+        if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
+            MaybeCompleteStuckAudioStream(sys);
 
         // Post full-TXD presentation: leave GIF flush MMIO thrash so Soft-GS can draw
         // FRONTEND/logo chrome. Does not touch residual force timing / STG bind.
@@ -1440,6 +1448,45 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _frontendPlanted;
     private uint _frontendEeAddr;
     private uint _frontendSize;
+
+    /// <summary>
+    /// S127 dual-ACK (2026-08-05): EE audio stream for <c>sound\generic.awd</c> is armed by
+    /// <c>0x29EB70</c> writing status <c>*(ctx+44)=48</c>, then abandoned (no <c>0x29EF00</c>
+    /// / <c>0x2B4C00</c> pump). Phase-9 claim probe needs <c>*(ctx+44)==256</c> to finish.
+    /// Measure force-A proved this unblocks mode-state. Scan the audio heap band for stream
+    /// objects stuck at 48 with the live setup shape (+36 chunk size 2048) and promote to 256.
+    /// Title-scoped Assist only — not Core stream HLE.
+    /// </summary>
+    private void MaybeCompleteStuckAudioStream(Ps2System sys)
+    {
+        const uint StatusBusy = 48;
+        const uint StatusDone = 256;
+        const uint ChunkSize = 2048;
+        // Live S124 ctx 0x1F361F0; freelist/node band around 0x1F35xxx.
+        const uint ScanLo = 0x01F00000;
+        const uint ScanHi = 0x02000000;
+
+        var mem = sys.Memory;
+        for (uint obj = ScanLo; obj + 48 <= ScanHi; obj += 4)
+        {
+            if (mem.Read32(obj + 44) != StatusBusy)
+                continue;
+            // Heuristic from 0x29EC38 setup path: sw 2048,36(s1); sw 48,44(s1).
+            uint chunk = mem.Read32(obj + 36);
+            uint buf = mem.Read32(obj + 16);
+            if (chunk != ChunkSize && (buf == 0 || buf >= 0x02000000u))
+                continue;
+
+            mem.Write32(obj + 44, StatusDone);
+            _audioStreamCompletes++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[B3] audio stream complete ctx=0x{obj:X8} +44 48->256 " +
+                    $"chunk={chunk} buf=0x{buf:X8} n={_audioStreamCompletes} cyc={sys.MasterCycles}");
+            return; // one object per Step
+        }
+    }
 
     /// <summary>
     /// After STG + full Global.txd (cdvd>=2000). Wave-9: sticky PATH3 M3P unmask,
