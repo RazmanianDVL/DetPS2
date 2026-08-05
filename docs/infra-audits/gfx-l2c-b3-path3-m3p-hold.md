@@ -9225,3 +9225,28 @@ S190: MaybePreempt ruled out via direct source read (both PC-write paths' trace 
       yield). Neither flag's live state has been checked yet -- needs either a small temp
       diagnostic or a static read of what sets them to see if either has a plausible path here.
 ```
+
+## 190–191. ROOT CAUSE = Burnout3Assist presentation leave hop (Grok)
+
+Claude S189 PCSTREAM: zero guest insns between `0x1F2508` fallthrough and `fromPc=0x223228`.
+Not nested-EPC, not jr/eret, not preempt.
+
+### Smoking gun (`Burnout3Assist.MaybeLeavePresentationPark`)
+```csharp
+inFlipWait = pc in [0x1F24E0, 0x1F251C]  // includes 0x1F2508
+if (deadRa && inFlipWait) plant ra = 0x223228
+// OLD BUG: if (ra is good code) resume = ra  // uses planted 0x223228 as PC!
+// else if (inFlipWait) resume = 0x1F2520
+sys.EE.PC = resume;  // host write — no guest insn, no PCSTREAM branch tag
+```
+Matches every observation: PCSTREAM gap, ra==pc==0x223228, stackDepth 0, no call edge.
+
+### Fix (Assist, S191)
+Park-specific resumes **first**: flip-wait → `0x1F2520`, VBlank park → `0x2371E0`, then healthy ra, then logo-draw → `0x223228`. Still plants ra for dead-ra safety; does not use that plant as flip-wait PC.
+
+```text
+S191: ROOT = B3 Assist MaybeLeavePresentationPark resume-order bug. Planted ra=0x223228
+      on flip-wait deadRa then selected resume=ra before inFlipWait fallback → host PC
+      write to mid-body. Fixed: park resumes first. Dual-ACK verify requested.
+```
+

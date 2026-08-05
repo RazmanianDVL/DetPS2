@@ -750,6 +750,14 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // Live freeze: $ra collapses to 0x200 mid logo-draw (0x253F64) after ~85M — plant a
         // presentation-graph continue (0x223228 after pad-era beq @0x223224) so jr ra cannot
         // jump to null page. No DISPFB plant.
+        //
+        // S190 (2026-08-05): park-specific PC resumes MUST be chosen before treating the
+        // planted presentation-continue $ra as an immediate hop target. Old order planted
+        // ra=0x223228 on deadRa while inFlipWait (queue loop 0x1F24E0-0x1F251C), then
+        // `if (ra is good code) resume = ra` fired first and set PC=0x223228 mid-DI-span —
+        // exactly the non-instruction PC rewrite PCSTREAM saw (fallthrough 0x1F2508 ->
+        // irq fromPc 0x223228, zero guest insns in between). Flip-wait must resume at the
+        // DI spin (0x1F2520); only logo-draw may hop to the presentation graph.
         bool deadRa = ra < 0x00100000 || ra >= 0x00400000 || !sys.Memory.IsLikelyEeCode(ra)
             || ra is (>= 0x00237120 and <= 0x002371E8)
             || ra is (>= 0x001F24E0 and <= 0x001F2520);
@@ -761,19 +769,18 @@ public sealed class Burnout3Assist : IGameQuirkModule
         }
 
         uint resume = 0;
-        if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
+        if (inFlipWait)
+            resume = 0x001F2520u; // DI spin — never hop to presentation-continue mid-queue
+        else if (inVblankPark)
+            resume = 0x002371E0u; // epilogue once per cadence (not every Step)
+        else if (ra is >= 0x00100000 and < 0x00400000 && sys.Memory.IsLikelyEeCode(ra)
             && ra is not (>= 0x00237120 and <= 0x002371E8)
             && ra is not (>= 0x001F24E0 and <= 0x001F2520)
             && ra is not (>= 0x00253F00 and <= 0x00254200))
             resume = ra;
-        else if (inFlipWait)
-            resume = 0x001F2520u;
-        else if (inVblankPark)
-            resume = 0x002371E0u; // epilogue once per cadence (not every Step)
         // Logo draw with dead ra fixed above: hop to presentation continue so pad can advance.
         else if (inLogoDraw && (deadRa || !queuesHealthy || _presentationLeaves >= 4))
             resume = 0x00223228u;
-
         if (resume != 0)
         {
             sys.EE.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 0 });
