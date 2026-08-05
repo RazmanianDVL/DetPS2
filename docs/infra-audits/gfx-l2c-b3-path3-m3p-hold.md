@@ -7269,3 +7269,16 @@ S155: 300M-cycle result CONTRADICTS "just needs more cycles" — count loop iter
       scheduling issue, not the relocation/count logic itself. Next: identify the executing
       thread ID and its Sleeping/WaitSemaId state at freeze time.
 ```
+
+## 155–156. Count loop FROZEN not growing; scheduling starvation suspect (Claude+Grok)
+
+**S155:** 300M census identical to 95M (0x25156C still 4,041,872). Not slow — frozen.
+Other threads run (PC moves in park family).
+
+**S156:** Tight loop only yields on interrupt. Victim may be READY but never rescheduled
+(priority starvation / VBlank park monopolize — known B3 shape). Live: all-thread PC +
+sleep flags after freeze; look for PC in 0x25156C band.
+
+```text
+S156: frozen mid-fixup loop → scheduling. Dump all thread PCs/sleep at plateau.
+```
