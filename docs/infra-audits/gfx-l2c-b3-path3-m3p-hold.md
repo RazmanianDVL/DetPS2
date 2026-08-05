@@ -9432,3 +9432,37 @@ S195: PutDispEnv (0x1029B0) has ZERO hits anywhere in the full run, checked incr
       direct MMIO/privileged-register write during early setup, bypassing PutDispEnv). Need to
       find the actual writer of DISPFB2's live value, since it isn't this function.
 ```
+
+## 196. Neither AddIntcHandler registration site ever fires -- registration question is moot (Claude)
+
+Checked both of S194's proposed registration call sites, live, full 95M run: **`0x1F3C20` (would
+register `0x1F1CE8`/PutDispEnv on src=2) — zero hits. `0x237240` (would register `0x2370A0`/wake
+on src=2) — zero hits.** Neither registration site ever executes at all.
+
+Combined with S195 (zero `INTC_DISPATCH` events, any handler, whole run): **the entire
+`AddIntcHandler`/`TryDispatchRegisteredIntcHandler` registered-handler mechanism is a complete
+non-factor in this run.** `0x2370A0` firing 303 times (S191-verify) cannot be via that mechanism
+at all — it must be reached through the plain vector path (`EnterException` → `0x80000200`),
+which per earlier session history (way back, pre-this-session's establishment) is where B3's own
+vector code directly branches to `0x2370A0` as a hardwired/baked-in jump, not a dynamically
+game-registered callback. So the "registration order between two competing src=2 handlers"
+framing doesn't apply — there's no registration happening for src=2 at all in this run, by either
+candidate site.
+
+**Refined open question**: why do `0x1F3C20`/`0x237240` (and by extension, whatever code is
+supposed to reach them) never execute? Is there an even earlier gate/condition preventing this
+whole registration sequence from ever running, or is `0x2370A0`'s dispatch genuinely independent
+of this registration machinery entirely (meaning chasing "why doesn't 0x1F1CE8 get registered"
+is the wrong question — it was maybe never meant to be needed for THIS specific wake path, and
+the real gap is purely "what/who is supposed to call PutDispEnv, full stop, regardless of the
+registration mechanism").
+
+```text
+S196: Neither AddIntcHandler registration call site (0x1F3C20 for PutDispEnv/1F1CE8, 0x237240
+      for wake/2370A0) fires even once across the full 95M-cycle run. Combined with S195's zero
+      INTC_DISPATCH count, the whole registered-handler mechanism is inactive this run -- 0x2370A0
+      must reach execution via the plain vector path, not via this registration system at all.
+      The "registration order between two src=2 handlers" framing doesn't apply since neither
+      registers. Real open question: why doesn't this registration sequence ever run, or is it
+      simply irrelevant to how PutDispEnv is supposed to get called at all.
+```
