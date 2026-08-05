@@ -7735,3 +7735,15 @@ S168-169: CORRECTED — +0xA0's "10" arrived via the ordinary syscall-mediated r
       Proposed Assist guard (not yet landed): skip 0x2514C0 when relocated (base+rel) is
       non-4-aligned or rel<0x10. Needs dual-ACK + verification before landing.
 ```
+
+## 169–170. Intervention design: prefer state==3 slot scrub (Claude+Grok)
+
+**S169:** +0xA0 fill path same as good +0x98; only payload differs. Designing Assist
+timing: PC window too tight; mid-loop maybe after damage.
+
+**S170:** Prefer scrub implausible rel-ptrs at slots +0x98..+0xA4 while gate SM
+state==3 (wide window case2→advance). Dual-ACK before Core. Not hardcode addresses.
+
+```text
+S170: propose state==3 rel-ptr scrub Assist; await dual-ACK + loop/freeze timing.
+```
