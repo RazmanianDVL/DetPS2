@@ -6724,3 +6724,18 @@ S138: CONFIRMED — current=0x51A6A8 (mode object itself) at every real jalr, v0
       finding is retired as stale (pre-S98/S128). Real object, real vtable call, legitimate
       "not ready" answer. Next: what does the vtable method at current+0x1B0→+12 actually check?
 ```
+
+## 138–139. current==mode object; vtable method is 0x131480 nested SM (Claude+Grok)
+
+**S138 live:** at 0x1322E0 a0=0x51A6A8 (mode object) 8/8; after return v0=0 7/7.
+*(0x51BA88)=0x51A6A8; both 0x51BACC and 0x51BAD0 = 7. S64 null retired.
+
+**S139 static:**
+- 0x1323FC is **post-success only** (after v0≠0). 0x1322E0 always runs first; special path never reached while method returns 0.
+- `*(mode+0x1B0)=0x4DDAC0`; slot+12 → **method 0x131480**.
+- 0x131480: if `*(u8*)0x1E91C3C` → return 0; else switch `*(obj+0x2F4)` (=0x51A99C) cases 1..12,24; success sets substate 23 and returns 1.
+
+```text
+S139: readiness method = 0x131480, nested SM on *(0x51A99C). Next live: substate value
+      + abort flag 0x1E91C3C + confirm t9==0x131480.
+```
