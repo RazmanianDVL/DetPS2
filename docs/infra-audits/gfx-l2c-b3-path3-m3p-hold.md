@@ -1090,3 +1090,67 @@ env.dispfb sticky-init
   PutDispEnv correctly re-applies stale page0
   next: who *should* update env.dispfb (or L2L blit 0x46→page0) before set-flag
 ```
+
+---
+
+## 23. L2L / blit-path reachability (Grok, split seat)
+
+**Working model (dual-ACK with Claude, not Core):** DISPFB sticky page0 may be correct by
+design (PSMCT16S present). Real draw at FRAME `0x46`. Missing piece = local→local
+downconvert (or equivalent) never executes. Claude: zero L2L all night; set-flag cluster
+only ~15.17–15.50M then silence.
+
+### 23.1 Static
+
+| Item | Finding |
+|------|---------|
+| DISPFB fbp=0x46 constants (`0x1446` / `0x51446`) | **Zero** in ELF — game never packs "display page 0x46" |
+| libgraph `SetDefLoadImage`-like `0x001031B8` | Builds AD regs BITBLTBUF/TRXPOS/TRXREG/TRXDIR (`0x50..0x53`). Callers `0x1FB2B8`, `0x1FB514` |
+| `sceGsExecStoreImage` / SyncPath error strings | Present (libgraph), StoreImage path exists |
+| Data words looking like `TRXDIR=2` AD at `0x4CB708`/`0x4CBA28` | Embedded in UI/resource tables with float mesh ptrs — **not** a live FB blit path |
+
+### 23.2 Runtime 30M S1 host-present
+
+| PC | Hits | Notes |
+|----|------|-------|
+| `0x001031B8` SetDefLoadImage | **0** | Standard load-image helper never entered |
+| `0x001FB2B8` its caller | **0** | |
+| `0x0021A304` `addiu r5,r0,0x53` (TRXDIR reg-id into packet buf) | **1** | **cyc=14429376**, `a1=0x46`, `ra=0x0019EE64` |
+
+Sole hit sits in the same early window as flip-ready (≈14.4–15.5M). GPR snapshot:
+`a1=0x46` (draw page), large BITBLT-shaped immediates in a0/a2/t0, writing reg-id
+sequence into a packet buffer under `0x68xxxx`. **Builder runs once then never again.**
+
+Combined with zero L2L BITBLT events for the whole night: either the packet is built but
+**never DMA'd/submitted** to GIF, or TRXDIR.XDIR is not 2 / path aborts before
+`BeginTrxFromDir`. Soft-GS L2L also same-PSM-only (`RunLocalToLocalBlit`); cross-PSM
+32→16S would still need a real TRXDIR=2 arrival first (never observed).
+
+### 23.3 Convergence with Claude stall seat
+
+```text
+~14.4M  TRXDIR packet builder once (a1=0x46)
+~15.2M  flip-ready set ×3 + PutDispEnv ×3 (still env.dispfb=0x51400)
+~15.5M  set-flag / blit-arm activity ends
+  later  VBlank ISR keeps firing; no more set-flag; no L2L; px plateau
+```
+
+Same stalled control flow after ~15.5M starves both flip-ready re-arm and any further
+blit/submit. Claude's main-thread heatmap after 15.5M should name the wait; this seat
+says the **blit/load-image arming code is reachable once then abandoned**, not missing
+from the binary.
+
+### 23.4 Next (this seat)
+
+1. Disasm `0x0021A284` / caller `0x0019EE64` — confirm XDIR=2 vs 0/1 and submit path.
+2. Optional: GIF/DMAC submit pcbreak on that packet buffer.
+3. Still ban: invent L2L, present page 0x46, force flip-ready.
+
+```text
+Blit dig
+  no DISPFB fbp=0x46 packing in ELF (page0 present likely by design)
+  libgraph LoadImage helper 0 hits / 30M
+  custom TRXDIR packet builder 0x21A304 hits 1× @14.4M with a1=0x46 then never
+  zero L2L all night still holds
+  next: submit path after builder; dual-read Claude post-15.5M heatmap
+```
