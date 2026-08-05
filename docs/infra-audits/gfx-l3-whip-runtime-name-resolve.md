@@ -110,4 +110,14 @@ Interpretation: title path strings are **not retained** as live C-strings in RDR
 
 These are **ELF static** PT_LOAD strings, not RKV stream delivery. Reinforces: no active “texture name table → open → pixels” stage; streamed title members do not leave durable path-name tables in RDRAM by 30M.
 
-Next: 100M+ with WHIP-TEX re-instrument for any post-title FILEIO; and/or instrument ring writes mid-stream (watch dest) to prove what lands before consume.
+### 6.2 100M re-instrument (same WHIP-TEX, TRACE_RPC off)
+
+| FIO_OPEN | Count |
+|----------|------:|
+| `GAME.INI` only | **2** (re-open) |
+| texture / levels / objects / mp2 / hubmain | **0** |
+| RKV_HIT / RKV_MISS (asset-shaped) | **0** |
+
+`imgBytes=0` still; px only doubled clear (573440). **Through 100M, still no texture-shaped FILEIO.** Temp fully reverted after run.
+
+Next tooling: mid-stream ring watch (prove dest writes) or EE-side string scan for path **during** stream (not only at end); or script-interpreter PC once firstscreen 100% (producer progress issue).
