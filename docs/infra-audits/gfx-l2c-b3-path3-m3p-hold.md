@@ -5428,3 +5428,20 @@ S96: LANDMARK — force state 2->1 (measure-only, temp, reverted) produces lit=2
      completion (S94/S95) is the real root blocking the whole chain. Not a fix — a measurement.
      Next: design the real HLE-side completion write for GTFS fno=5, then dual-ACK + land.
 ```
+
+
+---
+
+## 96–97. S96 force state=1 → LIT; dual-ACK HLE design (Claude+Grok)
+
+**S96 (Claude):** force `*(0x66E120+24) 2→1` once → **lit=2**, PATH3 held 5/2124→0,
+m3p False, spu2Writes 3318, prims↑, PC 0x289AC8. Proof: state=1 unblocks full chain.
+
+**S97 design (Grok, awaiting dual-ACK):** On GTFS fno=5 full DMA (`_gtfsReadOffset>=maxSz`),
+find EE object (vtable 0x4DDFC0, state==2, fd match) and `sw 1, +24` — mirror open's
+self-complete. Optional SignalSema later. No hardcoded 0x66E120. Core HLE needs dual-ACK.
+
+```text
+S96: force state=1 → first lit pixels of the investigation
+S97: dual-ACK proposed — HLE complete GTFS EE file object on fno5 EOF
+```
