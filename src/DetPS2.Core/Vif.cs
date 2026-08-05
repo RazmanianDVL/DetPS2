@@ -330,7 +330,7 @@ public sealed class Vif : ISchedulable
                     // DIRECT exhausted: if GIF still mid-packet the stream was truncated —
                     // drop sticky so the next DIRECT's GIFtag is not treated as body data.
                     if (_directRemaining == 0 && (_gif?.PacketInFlight ?? false))
-                        _gif.AbortIncompletePacket("DIRECT-end-truncated");
+                        _gif.AbortIncompletePacket("DIRECT-end-truncate");
                     continue;
                 }
                 // Partial QW left — wait for more words on next ProcessStream
