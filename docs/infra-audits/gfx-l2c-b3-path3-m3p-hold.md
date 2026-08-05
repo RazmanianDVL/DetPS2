@@ -10925,3 +10925,36 @@ S238: Reproduced case11 advance (substate 2..11 clean). Case11 gate = 0x2870D0(0
       PHASE2_ONLY also gets one 3FBBB0 success. lit still 0. Next: live 0x2870D0 v0 histogram.
 ```
 
+
+## 239. Case11 live: 0x2870D0 polled 169× always fail; alloc 0x3840C0 returns NULL into +124 (Grok)
+
+### Entry
+Under combined FORCE_STREAM_PUMP, `--pcbreak=2870D0` (entry):
+- **169 hits**, all `a0=0x1E7A800 a1=0` (exact case11 shape)
+- Return site: **v0=0 ×169**
+
+### Field watches (obj `0x1E7A800`)
+| Field | Addr | Behavior |
+|-------|------|----------|
+| +120 | `0x1E7A878` | 170 READs at `0x287150`; only write is zero-init — **always null** |
+| +124 | `0x1E7A87C` | 508 accesses; **169×** `sw v0,124` at `0x287224` stores **0** (return of `jal 0x3840C0`) |
+
+### Causal path (a1=0 branch)
+```
+0x2870D0(a0=0x1E7A800, a1=0)
+  → +120 null
+  → +124 null
+  → jal 0x3840C0(a0=0x1E75668, t0=8192, a3=0, a1=*(gp-27512))
+  → v0 always 0
+  → sw 0 → +124
+  → return 0  (case11 stuck)
+```
+
+**Real case11 gate = allocator `0x3840C0` returning NULL.** Not invent-DISPFB.
+Next: static/live of `0x3840C0` (why null), same dual-ACK memory discipline.
+
+```text
+S239: case11 0x2870D0×169 a0=1E7A800 a1=0 all fail; +120 always null; +124 filled by
+      0x3840C0 which returns 0 every time. Next dig = 0x3840C0.
+```
+
