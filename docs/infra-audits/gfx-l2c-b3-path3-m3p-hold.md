@@ -5367,3 +5367,64 @@ side-effect for blocking fno=5 ✓ as the live gap. Data present; status model s
 ```text
 S95: end_function=0 intentional; fno5 leaves state=2 forever; force state=1 A/B next
 ```
+
+## 96. LANDMARK: measure-only force state=1 A/B produces the first non-zero lit pixel count in the entire investigation (Claude)
+
+Ran Grok's proposed measure-only experiment (S95 #1) — temp hook, gated
+`DETPS2_FORCE_B3_TXD_STATE=1`, watching `*(0x66E120+24)` each host-present tick and writing `1`
+(the value `open()`'s own code writes on success) the first time it observes `2`, exactly once,
+no other side effects (no SignalSema, no other memory touched). Reverted immediately after —
+`git diff --stat` 8 insertions, `git checkout --`, clean. Full 95M-cycle run:
+
+```
+[B3-FORCE-STATE] cyc=30000000 forced *(0x66E120+24) 2->1
+```
+
+**Result at 95M, compared against every prior run tonight:**
+
+| metric | every prior run (all night) | this A/B |
+|---|---|---|
+| `lit` | **0**/286720, always | **2**/286720 |
+| `telemetryHits`/`telemetryUniqueKeys` | 0/0, always | **80658 / 19498** |
+| final PC | stuck in the `0x0010BE68`/`0x00xxxxxx` boot band | **`0x00289AC8`** — genuinely new code |
+| `m3p` (mask Path3) | `True`, always | **`False`** |
+| `heldP3n`/`heldP3qwc` | `5`/`2124`, stuck all night | **`0`/`0`** — fully drained |
+| `spu2Writes` | `0`, always | **`3318`** — first-ever audio writes |
+| `cdvdSectors` | 6584 | 6794 |
+| `prims` / `PRIM` writes | 1934 / 2921 | 6337 / 76723 |
+| `compositeSource` | `None` | `SyntheticFbp0` (fallback path now producing output) |
+
+**This is the first non-zero `lit` pixel count observed anywhere in this entire investigation —
+tonight or, per the doc's own history, possibly ever for this specific black-screen thread.**
+One 4-byte memory write, applied once at the exact point the real IOP-side completion signal is
+missing (per S94/S95's confirmed diagnosis), triggered a real cascade: M3P mask clears, the
+5-entry/2124-QW held PATH3 backlog that was stuck for the *entire* multi-hour investigation
+drains completely, execution reaches genuinely new code far outside the boot loop, and audio
+starts writing. This strongly validates the full causal chain traced through S66-95 — G1's
+missing completion really is the single root blocking essentially everything downstream.
+
+**Caveats, stated plainly:** `lit=2/286720` is a tiny fraction — this is not "B3 now renders,"
+it's "the very first crack of real light after the entire chain unblocks by one step." A single
+noisy `UnknownMmioWrite` telemetry burst (4096 events, all at cyc=55,767,088, sweeping a
+contiguous ~16KB MMIO range) appeared — plausibly a legitimate SPU2/audio-register init
+routine now being reached for the first time (consistent with the new `spu2Writes>0`), but not
+yet characterized; worth a look before reading too much into the exact PC/telemetry numbers.
+This was a raw memory force at a fixed 30M-cycle checkpoint, not a real fix — it does not by
+itself prove *why* real hardware would reach state=1, only that reaching it is sufficient to
+unblock the chain. No Core/Assist change proposed or landed from this; this is purely the A/B
+Grok asked for, reported honestly.
+
+**Recommended next step:** now that "does reaching state=1 unblock everything" is answered YES,
+the remaining design question is squarely S94's #3 — what is the real, correct mechanism (an
+HLE-side status write on DMA completion in `RealSifRpc`'s GTFS bridge, most likely, mirroring
+what `open()`'s own EE-side code does after its blocking call) that should replace this temp
+force. That's a real Core/Assist change and needs a design doc + dual-ACK before landing, per
+session discipline — same class as S51's iovec fix and S68's latch fix.
+
+```text
+S96: LANDMARK — force state 2->1 (measure-only, temp, reverted) produces lit=2/286720, the first
+     non-zero present pixel count all night. M3P clears, held PATH3 (5/2124, stuck all night)
+     fully drains, PC reaches genuinely new code, audio writes begin. Confirms G1's missing
+     completion (S94/S95) is the real root blocking the whole chain. Not a fix — a measurement.
+     Next: design the real HLE-side completion write for GTFS fno=5, then dual-ACK + land.
+```
