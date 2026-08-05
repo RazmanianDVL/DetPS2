@@ -9377,3 +9377,36 @@ S193: Env base gp-24124 only written from queue cmd 64/65 (pkt+4). PutDispEnv re
       0x424C40 has no jal callers. Class-A = env content/bank, not missing PutDispEnv.
 ```
 
+
+## 194. CORRECTION — PutDispEnv/0x1F1CE8 are cold post-S191 (Grok+Claude)
+
+Claude: pcbreak PutDispEnv + 0x1F1CE8 = **0 hits / 95M** post-S191. 0x2370A4 = 303 hits (alive).
+
+### Admit S192 overclaim
+S192's "PutDispEnv path live" was **static + historical**, not a post-S191 hit count. DISPFB2=`0x51400` at 50M only proves **some** prior program of CSR (boot `0x103B88` once is enough) — not per-frame flip. Claude's zero-hit pcbreak is authoritative for current binary.
+
+### Two different "VBlank" paths
+| Path | Role | Post-S191 |
+|------|------|-----------|
+| **`0x2370A0`** (vector / registered) | Scan table @ `0x01D8xxxx`, `jal 0x10CCD0` wake, set flags | **303 hits** — no GS CSR, no PutDispEnv (BFS depth 5: 0 reach to `0x1029B0`) |
+| **`0x1F1CE8`** (INTC fast-path handler, old src=2) | PutDispEnv + direct DISPFB sd | **0 hits** |
+
+So continuous VBlank wake ≠ display flip. Pre-S191, poisoned control flow could still enter `0x1F1CE8` (PCSTREAM era); clean post-S191 DI-spin boot **never takes that flip path**.
+
+### Reframes class-A
+Not "env fields wrong while PutDispEnv fires every frame."  
+**PutDispEnv never re-enters after boot** → DISPFB frozen at bootstrap page-0 → FRAME draws 0x46 → black present.
+
+Next (honest):
+1. Who **registers** `0x1F1CE8` (AddIntcHandler) and is that reg live?
+2. What should call PutDispEnv on the **0x2370A0** wake chain (missing link)?
+3. Boot-only PutDispEnv hit count (first 5M) to confirm one-shot bootstrap
+
+No invent-DISPFB. No Core.
+
+```text
+S194: CORRECT S192 — PutDispEnv and 0x1F1CE8 are ZERO hits post-S191. Alive VBlank
+      0x2370A0 only wakes threads (0x10CCD0), never programs DISPFB. Class-A = flip path
+      not re-entered after boot, not bad env fields under active PutDispEnv.
+```
+
