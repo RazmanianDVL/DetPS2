@@ -756,3 +756,64 @@ RR A/B (existing DETPS2_RR_SCHED)
   scheduler tie-break is a real lever for B3 waiters; not a full flip fix
   dual-ACK design before any default Core sched change
 ```
+
+---
+
+## 18. Page 0x46 under RR: numerically "varied" but visually noise, not real content (Claude)
+
+Followed up §17 directly: if RR unlocks 11x more `prims`/`px`, does the real draw target
+(page `0x46`, per §14 of the parent doc — same page confirmed 100% uniform black under
+priority scheduling) now show real content? Added a temp `--dump-gs-page=FBP:W:H[:path]`
+flag to `blocker-trace` (`Program.cs`, gated, fully reverted after — `git diff --stat`
+empty) reusing the existing `Gs.ReadLocalMem` accessor, read-only, bypasses present/composite
+entirely — same method as the original page-0x46 dump (`b7048b1`).
+
+### 18.1 Numeric result (looked promising)
+
+`DETPS2_RR_SCHED=1`, same 50M run as §17: `nonZeroRgbPixels=6283/286720
+distinctColors(cap20000)=4087` — a dramatic change from the baseline's "1 distinct color,
+100% black."
+
+### 18.2 Visual result (the numbers were misleading)
+
+Converted the dump to PNG and looked at it directly, per this project's own repeated lesson
+tonight (and historically — `3bcedb2`'s stripe noise, Dec's pre-coherence-check RGB static)
+that numeric variety alone does not prove real content. **The image is a thin horizontal
+band of high-frequency, randomly-colored speckle noise** — red/green/blue/white static
+concentrated in a narrow strip near the top of the frame, not a coherent scene, sprite, or
+UI element. This is the same *class* of fabricated-looking noise this session has explicitly
+banned and rejected twice already (visually, not just by pattern-matching the description).
+
+### 18.3 Corrected conclusion
+
+**Retracting the implied "RR unlocks real visible content" reading.** RR scheduling
+genuinely unlocks more real GS *activity* (§17's px/prims/imgBytes numbers are real —
+independently reproduced via the actual product CLI, not fabricated), but what lands at
+page `0x46` under this specific dump is not recognizable graphics. Plausible explanations,
+none confirmed: (a) this is genuine but still-early/partial rasterization — real triangles
+being drawn with wrong/uninitialized vertex or color data because some other prerequisite
+(the still-never-flipped DISPFB pipeline, or data the still-mostly-inert PATH3 hold would
+have supplied) hasn't run yet; (b) the dump is reading a boundary/stride mismatch — my
+640-width assumption may not match whatever real FBW the game is now using under the
+RR-unlocked code path, so this could be reading a genuinely different, unrelated memory
+region as if it were image data; (c) real but format-shaped noise from a partially-completed
+z-buffer or stencil operation, not a color buffer at all.
+
+### 18.4 Not proposing anything
+
+No Core, no claim of progress toward a visible frame from this specific sub-result. §17's
+throughput numbers stand as real; this page-46 visual does not support "graphics are close."
+`FRAME_1=0xA0046` is identical between the baseline and RR runs (confirmed in both traces'
+output), so (b) a changed real FBW is unlikely — the register itself didn't move. Leans
+more toward (a) partial/early rasterization or (c) non-color-buffer data than a stride
+mismatch, but none of the three is confirmed.
+
+```text
+Page-0x46 under RR (Claude) -- visual correction
+  numeric result looked like real content: 4087 distinct colors, 6283 nonzero pixels
+  VISUAL result: thin band of high-frequency random-color noise, not real graphics
+  same fabricated-looking-noise class already banned twice tonight (3bcedb2, Dec pre-fix)
+  retracts "RR unlocks real content" -- throughput numbers (px/prims) still stand as real
+  open: is FBW=640 even still correct under the RR-unlocked code path -- check before re-dump
+```
+```
