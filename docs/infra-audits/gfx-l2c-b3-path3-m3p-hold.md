@@ -10644,3 +10644,29 @@ Create via `0x2A3670`@`0x3868E8` does not install methods.
 ```text
 S225: type already 6; status stays 0 because pump vtable slot is null — install path missing.
 ```
+
+## 226. Corrected: pump vtable lives on **manager**, not handle; pump still never **called** (Grok)
+
+### Live layout (50–55M)
+| Object | Addr | Key fields |
+|--------|------|------------|
+| Manager/class | `0x1E7DE10` | +40=`0x2A31F0` init, **+48=`0x2A3150` pump**, +52=`0x2A3180`, +60=`0x2A3130` |
+| Handle H | `0x1F3A380` | **+0 → manager `0x1E7DE10`**; +40/+48 = 0 (not a method table) |
+| Inner | H+260 = `0x1F3A484` | type@+8 = **6**, status@+328 = **0** |
+
+S225 “vtable null on handle” was incomplete: install **did** run on the manager. Handle is an instance whose `*(H+0)` is the class with methods.
+
+### Virtual-call pattern (ELF)
+Multiple sites: `lw t9,0(a0); lw t9,48(t9); jalr t9` — i.e. `handle→class→pump(handle)`.
+
+### Still true
+- `0x2A3150` / `0x2A6470` **0 hits**
+- find-writer status@H+588: **only** `0x2A6590` zero-init
+- type already 6 → one successful pump should store status **9**
+
+### Residual reframed
+Not “vtable missing” — **status refresh method never invoked** after stream create. Next: who should virtual-call slot 48 on H (or call `0x2A6470(H+260)`), and why that edge is dead; optional dual-ACK force-pump A/B.
+
+```text
+S226: Manager has pump ptr; handle→manager; type=6; pump never called → status stuck 0.
+```
