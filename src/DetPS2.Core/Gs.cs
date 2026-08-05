@@ -2411,9 +2411,10 @@ public sealed class Gs : ISchedulable
                 }
             }
             // Host→Local residual: sample largest BITBLT with its own DPSM (not DISPFB PSM).
+            // Coherence gate (L2b-C4 follow-up): refuse RGB-static noise (Dec regression).
             if (written == 0 && _lastImageByteCount > 0)
             {
-                long imgExtra = CompositeLastImageTransfer(mergeMode: true);
+                long imgExtra = CompositeLastImageTransferIfCoherent(mergeMode: true);
                 if (imgExtra > 0)
                 {
                     written += imgExtra;
@@ -2450,11 +2451,11 @@ public sealed class Gs : ISchedulable
         }
 
         // When DISPFB unset: LastImage residual only if THIS attempt still wrote 0
-        // (GFX-L2b-C4: no IsPresentMostlyBlack gate).
+        // (GFX-L2b-C4: no IsPresentMostlyBlack gate). Coherence gate rejects RGB static.
         if (!fromDispfb && written == 0
             && ImageBytesWritten > 0 && _lastImageByteCount > 0)
         {
-            long imgExtra = CompositeLastImageTransfer(mergeMode: true);
+            long imgExtra = CompositeLastImageTransferIfCoherent(mergeMode: true);
             if (imgExtra > 0)
             {
                 written += imgExtra;
@@ -2579,6 +2580,62 @@ public sealed class Gs : ISchedulable
             }
         }
         return written;
+    }
+
+    /// <summary>
+    /// LastImage residual with snapshot rollback if the paint looks like RGB static
+    /// (high unique chromatic colors — Dec 0756c82 regression class). Gray-index residual
+    /// (honest Host→Local without CLUT) is allowed.
+    /// </summary>
+    private long CompositeLastImageTransferIfCoherent(bool mergeMode)
+    {
+        // Always snapshot so chromatic static can be rolled back even if sparse chrome existed.
+        var snap = new uint[_framebuffer.Length];
+        Array.Copy(_framebuffer, snap, _framebuffer.Length);
+        long written = CompositeLastImageTransfer(mergeMode);
+        if (written <= 0)
+            return 0;
+        if (PresentLooksLikeRgbStatic())
+        {
+            Array.Copy(snap, _framebuffer, _framebuffer.Length);
+            return 0;
+        }
+        return written;
+    }
+
+    /// <summary>
+    /// True when lit present samples are mostly chromatic with a high unique-color ratio
+    /// (scanline/static noise), not a low-entropy logo or grayscale index strip.
+    /// </summary>
+    private bool PresentLooksLikeRgbStatic(int stride = 4)
+    {
+        int lit = 0, gray = 0, color = 0;
+        var unique = new HashSet<uint>();
+        for (int i = 0; i < _framebuffer.Length; i += stride)
+        {
+            uint p = _framebuffer[i] & 0x00FFFFFFu;
+            if (p == 0) continue;
+            lit++;
+            byte r = (byte)(p >> 16), g = (byte)(p >> 8), b = (byte)p;
+            if (r == g && g == b)
+                gray++;
+            else
+            {
+                color++;
+                unique.Add(p);
+            }
+        }
+        if (lit < 256) return false;
+        // Mostly gray residual (index-without-CLUT strip) is honest — not static.
+        if (color * 4 < lit) return false;
+        // Substantial chromatic fraction without a tight palette → RGB static class
+        // (Dec 0756c82: ~half lit chromatic scanline noise). Tight palettes (unique≪color)
+        // may still be real art — require high unique ratio among chromatic samples.
+        if (unique.Count * 3 >= color * 2) // unique ≥ ~2/3 of chromatic samples
+            return true;
+        // Even with some palette reuse, large chromatic residual from LastImage alone is
+        // untrusted without EE GIF path (park rather than invent chrome).
+        return color * 5 >= lit * 2; // color ≥ 40% of lit
     }
 
     /// <summary>
