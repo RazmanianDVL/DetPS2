@@ -11877,6 +11877,33 @@ S272: Nested force parked (agree). Case2 only once @14.3M from boot display init
       display after FRAME=0x46 / mode 23.
 ```
 
+## 273. FRAME FBP=0x46 from cyc=0; case-2 args never carry FBP (Claude + Grok)
+
+Claude S273: full-run FRAME_1 FBP field changes **exactly once at cyc=0** to 0x46 — long before case 2 @14.3M. Timing-mismatch theory **dead**.
+
+### Exhaustive `0x1E2D10` entry search (Grok)
+
+| Kind | Result |
+|------|--------|
+| `jal`/`j` to `0x1E2D10` | **only** `0x227FB8`, `0x291014` |
+| data ptr to `0x1E2D10` | **none** in code/data dumps |
+
+### Critical: `0x1E2D10` **hardcodes** a1=a2=a3=0
+
+```text
+0x1E2D1C: addiu a0, zero, 2
+0x1E2D24: daddu a1, zero, zero
+0x1E2D30: daddu a2, zero, zero
+0x1E2D3C: daddu a3, zero, zero   ; delay of jalr
+```
+
+So a “different caller of `0x1E2D10` with non-zero args” **cannot exist** — the wrapper itself zeros args. FBP for `0x1FD490` must come from **internal objects** (e.g. `0x675E40` / s4 buffer state), not call-site a1–a3.
+
+```text
+S273: FRAME FBP=0x46 @cyc0 (Claude). 1E2D10 only 2 jal sites; wrapper zeros a1-a3.
+      FBP not in call args — dig internal source 1FD490 reads (0x675E40 / s4).
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
