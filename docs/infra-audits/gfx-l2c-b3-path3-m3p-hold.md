@@ -3294,3 +3294,86 @@ real cdvd driver found (Claude) -- GTFS FILEIO opens, not the STAGEHED iovec wal
   sharpened question: why no follow-up read() RPC call after the successful Global.txd open
   next: trace the open response delivery + whatever EE thread issued it, post-open
 ```
+
+---
+
+## 53. THE MISSING LINK: an existing assist already unmasks Path3 M3P, gated on cdvd>=2000 — ties §0-§52 into one causal chain (Claude)
+
+While tracing the Global.txd open()'s caller (confirmed it's a standard, unremarkable
+synchronous `SifCallRpc` wrapper chain — `0x0010C1E4` → `0x0010E5E4` → `0x0010E638` →
+`0x0010F378`, the last a normal "wait for RPC completion" spin, all still inside
+system-library territory, not yet real game code — 100M-cycle re-run also confirms the 7-event
+`[GTFS]` count is a hard, permanent plateau, not a "just needs more cycles" artifact), searched
+`Burnout3Assist.cs` for any other reference to `Global.txd` or the `>=2000` threshold. Found
+this:
+
+```csharp
+/// After STG + full Global.txd (cdvd>=2000). Wave-9: sticky PATH3 M3P unmask,
+/// host-plant FRONTEND.TXD slice, dead flip-watermark $ra rescue.
+private void MaybeEscapePostTxdHang(Ps2System sys)
+{
+    ...
+    // PATH3 M3P: transfers count while packets are held -> gifP3 climbs, px=0.
+    if (sys.Gif.Path3MaskedByVif && sys.Gs.PixelsWritten == 0
+        && sys.Gif.Path3Transfers >= 30)
+    {
+        sys.Gif.SetMskPath3(false);
+        ...
+    }
+```
+
+**An existing, already-implemented assist explicitly unmasks Path3 M3P** — the exact mechanism
+this document's whole §0-§47 arc spent all night characterizing as correctly-behaving-but-
+starved. Its call site (`Burnout3Assist.cs:339`):
+
+```csharp
+if (_lgDevFullyDone && sys.Cdvd.SectorsRead >= 2000 && sys.MasterCycles >= 40_000_000)
+    MaybeEscapePostTxdHang(sys);
+```
+
+**Gated on `sys.Cdvd.SectorsRead >= 2000`.** We plateau at 1865. This function — and its
+Path3-unmask logic specifically — has never once been invoked in any run tonight.
+
+### 53.1 The full causal chain, now closed end to end
+
+```text
+Global.txd open() succeeds (fd=4, §52)
+  -> no follow-up read() RPC call ever comes (§52, confirmed permanent to 100M cycles)
+    -> cdvdSectors plateaus at 1865, never crosses 2000 (§49-§52)
+      -> MaybeEscapePostTxdHang (the Path3-M3P-unmask assist) never gets invoked (§53)
+        -> Path3 stays masked forever, held backlog never drains (§0-§1, this doc's original finding)
+          -> VBlank ISR's own gate (§31) correctly no-ops every frame — nothing to flip
+            -> DISPFB never selects new content -> black screen
+```
+
+Every other subsystem investigated across §9-§47 (DMAC completion, scheduler tie-break,
+boot-stage dispatch table, five dead-code islands, entity-message subsystem, VIF1 command
+breakdown, thread/semaphore census, VBlank ISR gate, mask/unmask buffer drain policy) is a
+real, correct, and now fully-understood part of this same system — none of them were wrong,
+they just weren't the *load-bearing* gap. The load-bearing gap is exactly one RPC call: the
+game opens `Global.txd` and never reads it.
+
+### 53.2 What's left, precisely
+
+**Single remaining question: why doesn't the EE thread that successfully opened `Global.txd`
+(fd=4) issue a follow-up read call?** Traced its call stack up through the standard
+`SifCallRpc` wait-loop (`0x0010F378`, `bne v0,zero` spin — completes normally, this thread
+isn't stuck *in* the RPC wrapper) — have not yet reached the real game-code caller above the
+library layer (stack unwind was cut short by the loop's self-referential `ra` at the moment
+sampled; needs catching the loop's entry/exit boundary instead, or a cleaner call-stack walk).
+That's the concrete next step: find what real B3 code calls this open, and what it does (or
+fails to do) immediately after — a stored/never-checked flag, a wrong fd interpretation, a
+thread that goes to sleep and is never woken, etc. Same "find the missing real trigger" shape
+as everything else tonight, now with a precise, single, well-defined target instead of an
+open-ended search.
+
+```text
+THE MISSING LINK (Claude) -- ties the whole night together into one causal chain
+  existing assist (MaybeEscapePostTxdHang, Burnout3Assist.cs:1443) ALREADY unmasks Path3 M3P
+  gated on sys.Cdvd.SectorsRead >= 2000 -- we plateau at 1865, this assist has NEVER fired
+  full chain: no Global.txd read() -> cdvd stuck at 1865 -> unmask-assist never runs ->
+    Path3 stays masked -> held backlog never drains -> VBlank correctly no-ops -> black screen
+  every other S9-S47 subsystem is real and correct -- none of them were the load-bearing gap
+  single remaining question: why no read() RPC call for the already-opened Global.txd (fd=4)
+  next: find the real game-code caller above the SifCallRpc library wrapper, and its continuation
+```
