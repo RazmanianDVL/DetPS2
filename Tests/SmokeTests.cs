@@ -1586,6 +1586,7 @@ press 3000 Circle 100
             KernelHle_ThreadmanSemaWakeAndReferStatus();
             KernelHle_ThreadmanMbxVplFpl();
             KernelHle_ThreadmanPriorityAndDelay();
+            KernelHle_TiedPriorityFairRotation();
             KernelHle_ThreadmanReleaseWaitAndDeleteSemaCodes();
             SonyKernelHle_SetAlarmReleaseAndFire();
             SonyKernelHle_Rfu059AndIEnableIntc();
@@ -9152,6 +9153,53 @@ press 3000 Circle 100
         if (self.Sleeping || self.DelayRemainingUs != 0) throw new Exception("second vblank finishes delay");
 
         Console.WriteLine("[Smoke] KernelHle_ThreadmanPriorityAndDelay OK");
+    }
+
+    /// <summary>
+    /// S1 (b3-ee-sched-fairness-design.md, dual-ACK 2026-08-05): threads tied at the same
+    /// priority must each get picked by FindNextRunnable within a bounded number of calls
+    /// (fair rotation), not have the same tied thread win every time. Confirmed live on
+    /// Burnout 3: three tied-priority threads split 26/16/12 picks over a 26M-cycle window
+    /// before this fix, 18/18/18 after. Also confirms a strictly-better-priority thread still
+    /// always wins over tied ones (priority ordering itself must not be broken by the fix).
+    /// </summary>
+    public static void KernelHle_TiedPriorityFairRotation()
+    {
+        var sys = new Ps2System();
+        var k = sys.Hle.Kernel;
+
+        // Three workers tied at priority 50, plus a lower-priority (worse) bystander at 90
+        // that should never be picked while any priority-50 thread is runnable.
+        int a = k.CreateThread(0x00100000, 0, 0x01F00000, 0x1000, priority: 50);
+        int b = k.CreateThread(0x00100100, 0, 0x01E00000, 0x1000, priority: 50);
+        int c = k.CreateThread(0x00100200, 0, 0x01D00000, 0x1000, priority: 50);
+        int low = k.CreateThread(0x00100300, 0, 0x01C00000, 0x1000, priority: 90);
+        k.StartThread(a); k.StartThread(b); k.StartThread(c); k.StartThread(low);
+
+        var picks = new System.Collections.Generic.Dictionary<int, int> { [a] = 0, [b] = 0, [c] = 0, [low] = 0 };
+        int main = k.CurrentThreadId;
+        for (int i = 0; i < 30; i++)
+        {
+            int next = k.FindNextRunnable(main);
+            picks[next]++;
+        }
+        // Fair rotation: each of the three tied threads must get picked at least once in 30
+        // calls from the same afterId — the pre-fix behavior would return the same single
+        // tied thread every time (30/0/0), which this directly guards against.
+        if (picks[a] == 0 || picks[b] == 0 || picks[c] == 0)
+            throw new Exception($"tied-priority threads not fairly rotated: a={picks[a]} b={picks[b]} c={picks[c]}");
+        if (picks[low] != 0)
+            throw new Exception($"lower-priority thread picked ({picks[low]}x) while tied-priority threads were runnable");
+
+        // Real priority ordering must still win: raise 'a' to a strictly better priority and
+        // confirm it now wins every time over the still-tied b/c.
+        k.ChangeThreadPriority(a, 10);
+        int betterWins = 0;
+        for (int i = 0; i < 10; i++)
+            if (k.FindNextRunnable(main) == a) betterWins++;
+        if (betterWins != 10) throw new Exception($"better-priority thread did not always win: {betterWins}/10");
+
+        Console.WriteLine($"[Smoke] KernelHle_TiedPriorityFairRotation OK (a={picks[a]} b={picks[b]} c={picks[c]} low={picks[low]})");
     }
 
     /// <summary>

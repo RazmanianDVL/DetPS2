@@ -931,6 +931,21 @@ public sealed class KernelState
     public bool PreferRoundRobinSched { get; set; }
 
     /// <summary>
+    /// S1 (b3-ee-sched-fairness-design.md, dual-ACK 2026-08-05): per-priority-tier "last
+    /// picked" tid, so tie-breaks among threads sharing a priority level rotate fairly
+    /// instead of always favoring whichever tied thread sits array-closest to whichever
+    /// thread is currently yielding. Real THREADMAN rotates a ready-queue per priority
+    /// level; this restores that shape without touching real priority ordering (a strictly
+    /// better-priority thread still always wins, same as before). Never populated/consulted
+    /// when a priority tier has only one runnable candidate — zero behavior change for the
+    /// common (no-tie) case. Threads are never removed from <see cref="_threads"/> (dense
+    /// table, matches Iop.cs's own convention), so no cursor invalidation is needed on
+    /// thread create/delete — a stale cursor tid simply won't be found and the scan starts
+    /// from its last valid array position instead.
+    /// </summary>
+    private readonly Dictionary<int, int> _lastPickedTidByPriority = new();
+
+    /// <summary>
     /// Find next runnable thread id, or <paramref name="afterId"/> if none.
     /// Default: priority-aware (THREADMAN readyq / μITRON: lower Priority runs first).
     /// Circular RR when <see cref="PreferRoundRobinSched"/> or <c>DETPS2_RR_SCHED=1</c>.
@@ -974,12 +989,25 @@ public sealed class KernelState
                 return afterId;
             }
 
-            for (int i = 1; i < _threads.Count; i++)
+            // S1: rotate among tied-priority candidates starting from this tier's last pick
+            // (falling back to afterId's own position the first time this tier is ever used —
+            // identical starting behavior to the pre-fix scan in that case). Only changes the
+            // outcome when 2+ threads share bestPrio; a single candidate is found regardless
+            // of start position.
+            int tierStartTid = _lastPickedTidByPriority.TryGetValue(bestPrio, out var lastTid) ? lastTid : afterId;
+            int tierStartIdx = idx;
+            for (int i = 0; i < _threads.Count; i++)
+                if (_threads[i].Id == tierStartTid) { tierStartIdx = i; break; }
+
+            for (int i = 1; i <= _threads.Count; i++)
             {
-                var t = _threads[(idx + i) % _threads.Count];
+                var t = _threads[(tierStartIdx + i) % _threads.Count];
                 if (t.Id == afterId) continue;
                 if (IsRunnable(t) && t.Priority == bestPrio)
+                {
+                    _lastPickedTidByPriority[bestPrio] = t.Id;
                     return t.Id;
+                }
             }
             return afterId;
         }
