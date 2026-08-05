@@ -2721,3 +2721,63 @@ id4 creator census (Claude) -- 6 disparate one-time call sites, not an ongoing s
   proposal: stop working outward from Path3/DMAC, go back to Path3's OWN held-queue directly --
     find the missing VIF1 MSKPATH3 UNMASK write-site, mirroring the S9 mask-write methodology
 ```
+
+---
+
+## 45. §9's mask/unmask buffer IS consumed 3x, in lockstep, both codes together — correction, not a missing kick (Claude)
+
+Started on my own §44.2 proposal directly: re-examined §9's static mask/unmask template
+buffer (`0x007FC880`-ish, unmask QW at `0x7FC8FC`, mask QW at `0x7FCA80`). First pass (a plain
+`--watch`, no cycle info) looked like each word was read only once — misleadingly suggested
+the buffer might never really be DMA-consumed at all. Added a temporary cycle-stamped variant
+of the watch tool (`WatchHitsCyc`, reverted after use) to check properly before reporting
+anything, since the plain `--watch` output doesn't carry cycle numbers and a same-line-content
+`uniq -c` silently collapses distinct events.
+
+**Corrected result — both words are read 3 times each, at the identical 3 cycles, from the
+identical 3 PCs:**
+
+```text
+mask   (0x7FCA80): cyc=15169648 pc=0x1F30B4 READ | cyc=15250448 pc=0x228048 READ | cyc=15500448 pc=0x113F38 READ
+unmask (0x7FC8FC): cyc=15169648 pc=0x1F30B4 READ | cyc=15250448 pc=0x228048 READ | cyc=15500448 pc=0x113F38 READ
+```
+
+These three cycles line up almost exactly with §27.2's three real DMACKICK rounds
+(15169584/15250192-384/15500192-384) — this buffer's segment **is** delivered via real
+VIF1 DMA, once per kick round, and **both codes are read together as one contiguous segment
+each time** (matches `Dmac.DeliverSegment`'s "batch the whole segment as one VIF stream"
+comment — `ProcessStream` reads a contiguous MADR span, naturally covering both offsets in
+one pass when they're both inside the same delivered segment).
+
+### 45.1 Revises §9.5's framing
+
+§9.5 asked "does anything re-kick the unmask offset of the same buffer" as if unmask might be
+getting skipped while mask keeps firing. **It doesn't get skipped — it's delivered exactly as
+often as mask, every time.** But the buffer lays unmask at the *lower* offset (`+0x70`) and
+mask at the *higher* offset (`+0x200`); a single contiguous forward-order read naturally
+processes unmask first, then mask second, **within the same delivery**. If VIF applies them
+in the order it reads them, every one of these 3 rounds legitimately ends up re-masked
+immediately after briefly unmasking — by the buffer's own layout, not a missing kick. That
+would explain `m3p=True` persisting through all 3 rounds without any kick being dropped.
+
+### 45.2 What's still actually open
+
+This does **not** explain why the *pre-existing* held backlog (`heldP3n=5 heldP3qwc=2124`,
+the document's very first finding, §1) never drains during the brief unmasked window each
+round — if unmask really is processed (even briefly) 3 times, a real GS should have gotten at
+least some chance to drain queued Path3 data each time, unless the window is too short, or
+the held backlog itself was queued *before* this buffer's own 3 rounds and something else
+governs whether held data specifically gets serviced during a transient unmask vs only new
+incoming data. That distinction — held-queue drain policy during a transient unmask window —
+is the sharper, still-unanswered question this correction leaves behind, closer to the
+metal than anything in §12-§44's excursion through the entity-message subsystem.
+
+```text
+mask/unmask buffer re-check (Claude) -- corrects an over-hasty first read, real result:
+  BOTH words read 3x each, IDENTICAL cycles/PCs, matching the 3 known DMACKICK rounds exactly
+  buffer IS delivered via real VIF1 DMA each round -- not a missing kick, S9.5's framing revised
+  unmask (lower offset) + mask (higher offset) delivered together, forward order -> re-masked
+    by the buffer's own layout each round, not a dropped kick
+  real open question: why doesn't the PRE-EXISTING held backlog drain during these transient
+    unmask windows -- held-queue-during-transient-unmask policy, not a missing DMA event
+```
