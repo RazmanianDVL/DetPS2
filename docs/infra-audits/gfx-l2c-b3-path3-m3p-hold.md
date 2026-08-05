@@ -10629,3 +10629,18 @@ S224: status@H+588 written by update 0x2A6470 (inner+328); status9 needs type==6
       Pump 0x2A3150 may never run. Live: type/flags/pump hits next.
 ```
 
+
+## 225. LIVE: type==6, status==0, pump vtable null (Grok)
+
+50M dumps on H=0x1F3A380:
+- type@H+268 = **6** (create `0x2A62B8` hit)
+- status@H+588 = **0**
+- vtable H+40/H+48 = **0** (pump never installable via jalr)
+- pcbreak update/pump/vtable-install: **0 hits**
+
+Vtable builder `0x2A3270` should `sw 0x2A3150, 48(outer)`. Never runs for this handle.
+Create via `0x2A3670`@`0x3868E8` does not install methods.
+
+```text
+S225: type already 6; status stays 0 because pump vtable slot is null — install path missing.
+```
