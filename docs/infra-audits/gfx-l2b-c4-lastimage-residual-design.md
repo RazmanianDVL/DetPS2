@@ -1,9 +1,8 @@
 # GFX L2b-C4 design — LastImage residual only (after reject of 3bcedb2)
 
-**Status:** design shelf — **dual-ACK before Core**  
+**Status:** **Core landed** (gate `written==0` this attempt; no allowPageMismatch)  
 **Parent:** L2 reject + L2b redesign (`gfx-l2-frame-page-composite-design.md`)  
-**Tip baseline:** `fcb9148` (+ C5 metrics if landed)  
-**Primary:** Burnout 3  
+**Primary:** Burnout 3 (still black) / Dec (color metrics — **visual dual-check required**)  
 
 ---
 
@@ -55,7 +54,17 @@ If LastImage still paints stripes under visual check → **accept residual black
 | **L2bC4-Q1** | Accept this narrow LastImage-only seat? | **Yes** |
 | **L2bC4-Q2** | If visual still stripes/black, park residual decode and document? | **Yes** |
 
+## 5. Post-land measure (50M)
+
+| Title | presentLit | presentColor | colorPct | residualDispfbPx | compositeSource | Notes |
+|-------|----------:|-------------:|---------:|-----------------:|-----------------|-------|
+| **B3** | 0 | 0 | 0 | 13030 | SyntheticFbp0 | **Still black present** — residual counters mid-run only; park further residual decode for B3 (Q2) |
+| **Dec** | 63410 | 30229 | **10.54** | (see metrics) | LastImageTrx | Numeric color; **must visual dual-check** before Tier A (no stripes) |
+
+Smokes Gs composite set: green.
+
 ```text
-L2b-C4 LastImage residual only
-  gate written==0 this attempt; BITBLT format only; visual dual-check
+L2b-C4 landed
+  B3 present still black → park residual tricks
+  Dec color%≈10 — visual dual-check before claim
 ```

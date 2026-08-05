@@ -2377,12 +2377,12 @@ public sealed class Gs : ISchedulable
                 source = GsCompositeSource.SyntheticFbp0;
         }
 
-        // GX-041 residual (GoW-class): natural DISPFB is programmed but local RGB under that
-        // FBP is empty (IMAGE BITBLT lives at FBP0 / FRAME / high-page PSMT4). When the natural
-        // merge writes 0, Soft-GS is still mostly black, and IMAGE exists — try FRAME, FBP0,
-        // then largest Host→Local BITBLT dest (PSMT4 texture page residual).
-        // Honest residual metrics only (no DISPFB plant, no invent PATH3).
-        if (fromDispfb && written == 0 && ImageBytesWritten > 0 && IsPresentMostlyBlack())
+        // GX-041 residual (GoW-class) + GFX-L2b-C4: natural DISPFB programmed but THIS attempt
+        // wrote 0 presentable RGB (do NOT gate on IsPresentMostlyBlack area alone — that
+        // re-enters after successful sparse natural and corrupts naturalDispfb telemetry).
+        // IMAGE may live at FBP0 / FRAME / high-page Host→Local; try FRAME, FBP0, then
+        // LastImageTrx (BITBLT DPSM only; IsPageMismatched kept). No allowPageMismatch.
+        if (fromDispfb && written == 0 && ImageBytesWritten > 0)
         {
             natural = false;
             ulong frame = Registers.FRAME_1;
@@ -2398,7 +2398,7 @@ public sealed class Gs : ISchedulable
             }
             // FBP=0 IMAGE page — logo BITBLT often lands here while DISPFB points at an empty
             // high-page draw target (GoW: DISPFB FBP=0x1A0000 PSMCT24 empty, imgBytes>0).
-            if (written == 0 || IsPresentMostlyBlack())
+            if (written == 0)
             {
                 long fbp0Extra = CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true,
                     mergeMode: true, outRect: null);
@@ -2410,9 +2410,8 @@ public sealed class Gs : ISchedulable
                         source = GsCompositeSource.SyntheticFbp0;
                 }
             }
-            // GoW / PSMT4 residual: Host→Local lands at high DBP (e.g. 0xA0800 DPSM=0x14)
-            // while DISPFB/FRAME/FBP0 have no RGB. Sample the real transfer with proper PSM.
-            if ((written == 0 || IsPresentMostlyBlack()) && _lastImageByteCount > 0)
+            // Host→Local residual: sample largest BITBLT with its own DPSM (not DISPFB PSM).
+            if (written == 0 && _lastImageByteCount > 0)
             {
                 long imgExtra = CompositeLastImageTransfer(mergeMode: true);
                 if (imgExtra > 0)
@@ -2450,8 +2449,9 @@ public sealed class Gs : ISchedulable
             }
         }
 
-        // Also when DISPFB was unset: after FRAME/FBP0 residual still black, try last IMAGE.
-        if (!fromDispfb && (written == 0 || IsPresentMostlyBlack())
+        // When DISPFB unset: LastImage residual only if THIS attempt still wrote 0
+        // (GFX-L2b-C4: no IsPresentMostlyBlack gate).
+        if (!fromDispfb && written == 0
             && ImageBytesWritten > 0 && _lastImageByteCount > 0)
         {
             long imgExtra = CompositeLastImageTransfer(mergeMode: true);
