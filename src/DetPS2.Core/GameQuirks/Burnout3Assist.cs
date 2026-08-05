@@ -356,24 +356,23 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
 
-        // S226/S230/S233 dual-ACK combined probe (DETPS2_B3_FORCE_STREAM_PUMP=1):
-        // (1) status 0→9 on type-6 handles; (2) EE call 0x28AF10; (3) clear stream +500
-        // after tick so armed-branch doesn't reject status 9 (S233).
+        // S226/S234 dual-ACK memory probe (DETPS2_B3_FORCE_STREAM_PUMP=1) — no nested EE Step:
+        // S235: host-call 0x28AF10 killed 3FBBB0 polling (202→2 hits). Pure memory only.
+        // (1) status 0→9; (2) clear +500 once; (3) sticky phase=2.
+        // Optional nested tick: DETPS2_B3_FORCE_STREAM_TICK=1 (contaminates poller).
         if (sys.MasterCycles >= 40_000_000
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_PUMP") == "1")
         {
             if (_forceStreamPumps < 4)
                 MaybeForceStreamStatusPump(sys);
-            if (_forceStreamTicks < 2)
+            if (Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_TICK") == "1"
+                && _forceStreamTicks < 2)
                 MaybeForceStreamSystemTick(sys);
-            // Once after ticks: clear +500 so status=9 can re-arm (not every frame — that fights arm).
-            if (!_forceStreamArmCleared && _forceStreamTicks >= 2 && _forceStreamPumps > 0)
+            if (!_forceStreamArmCleared && _forceStreamPumps > 0)
             {
                 MaybeClearStreamArmBytes(sys);
                 _forceStreamArmCleared = true;
             }
-            // S234 dual-ACK: force phase=2. Sticky — 0x3FC8C0 (called just before 0x3FBBB0
-            // in case10) may rewrite phase back to 1 when arm fails; re-apply each present.
             if (sys.MasterCycles >= 42_000_000)
                 MaybeForcePhase2(sys);
         }
