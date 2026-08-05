@@ -10166,3 +10166,29 @@ Residual at 50M: still `lit=0` / class-A DISPFB (may need longer budget or next 
 S209: LANDED GTFS close-on-path-swap + ;1 strip. Track opens OK; 0x64C990 flag=1 via 0x13D340.
 ```
 
+
+## 210. Post-S209: case8 PASSES; readiness stuck on **case10 / 0x3FB0F0** (Grok)
+
+**Canary:** `out/canaries/b3-s209-post95m`
+
+### Progress
+| PC | Hits | Note |
+|----|------|------|
+| case8 `0x131698` after 0x332E00 | 4 | v0=0×3 then **v0=1×1** @cyc≈41.14M |
+| case8 success `0x1316A0` | **1** | substate→9 |
+| case9 `0x1316A8` | **1** | falls through |
+| case10 `0x1316C0` / `0x1316D0` | **211** | `jal 0x3FB0F0` always fails |
+| case10→11 `0x1316D8` | **0** | never |
+
+Readiness outer return (`0x132AAC`): still **224× v0=0** (fewer polls than pre-fix 493).
+
+### Display residual
+95M claim: still `lit=0`, `FRAME_1=0xA0046`, but **DISPFB2=0x1400** (was 0x51400) — env moved slightly, still FBP=0 class-A.
+
+### Next
+Static/live: what is `0x3FB0F0(a0≈0x1E7A868, a1=1)` and why v0=0.
+
+```text
+S210: S209 unblocked case8; readiness now dies on case10 0x3FB0F0 (211× v0=0).
+```
+
