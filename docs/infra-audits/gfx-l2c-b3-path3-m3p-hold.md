@@ -5751,3 +5751,16 @@ S106: EALogin.ico genuinely queued (7th 0x13CFA0 call) and genuinely gets a comp
       same code path as G1's fix touches — needs Grok's static read on which IOP subsystem
       Data/EALogin.ico actually routes through before proposing anything.
 ```
+
+
+---
+
+## 106–107. EALogin.ico uses same 0x13CFA0 queue; not in GTFS TRACE (Claude+Grok)
+
+S106: no .ico in GTFS RPC log; 0x13CFA0/0x13D340 = 7. Static: EE queues
+Data/EALogin.ico on same queue 0x4F6100 with flag 0x518697. Open backend may not be
+GTFS. Need per-call a1/a2 census to see if ico is among the 7 completes.
+
+```text
+S107: EALogin is 0x13CFA0; flag 0x518697; open path may be non-GTFS — live arg census next
+```
