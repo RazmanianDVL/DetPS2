@@ -572,6 +572,80 @@ Poll success = free table + return; flag stays 1
 Clear only on register-free-slot path @ 0x2371C8
 SET/CLEAR imbalance may be re-registration gap, not "read sees 1 but branch fails"
 ```
+
+---
+
+## 14. Scheduler-fairness measurement: tid4/tid5 genuinely get picked far less often (Claude)
+
+Grok's §13-follow-up correctly showed slots 1/2's owning threads only *complete* 3
+wait-cycles each in the late window vs 65/98 for slots 0/3, and proposed a "lost-wake race"
+hypothesis (ISR calls `WakeupThread` before the `sb flag=1` delay-slot store; waiter could in
+theory poll-and-resleep in the gap). Before chasing that race, checked a simpler, already-
+plausible cause: **is the scheduler itself picking these threads unevenly** — real thread
+priorities (confirmed via `DETPS2_TRACE_RPC`, `priority=` field): `tid1=1` (best), `tid2=64`,
+`tid3=tid4=tid5=54` (tied), `tid6=33`, `tid7=22`.
+
+### 14.1 `FindNextRunnable`'s tie-break (`KernelHle.cs:938-984`)
+
+Priority-based scheduler (`B3` doesn't opt into `PreferRoundRobinSched` — only
+`MidwayBootAssist` sets that, for Midway titles). Among threads tied at the best available
+priority, the scan starts at `(idx_of_afterId + 1) % count` and returns the **first** match in
+that circular order — i.e., whichever tied thread sits closest (in array/tid order) after
+whichever thread happened to be the one yielding.
+
+### 14.2 Real measurement (temp trace on the tie-break `return`, gated
+`DETPS2_TEMP_SCHED_TRACE`, fully reverted — `git diff --stat` empty), `blocker-trace
+--cycles=26000000`, tail of the trace (steady-state late window):
+
+Total times each tid was the one **picked** to run by this scheduling path:
+
+| tid | picked count |
+|---|---:|
+| 1 | 86 |
+| 6 | 42 |
+| 3 | 26 |
+| **4** | **16** |
+| **5** | **12** |
+| 2 | 5 |
+| 7 | 2 |
+
+**tid4 and tid5 (owners of slots 1/2, per the stable table dump) get picked to run roughly
+2-7x less often than tid1/tid3/tid6.** This is real, measured, not inferred — a genuine
+scheduling imbalance, independent of and prior to any question about whether they "see" their
+flag once running.
+
+Breaking down specifically `afterId=1 -> picked=X` (when the dominant main thread yields):
+`6`×38, `3`×23, `4`×9, `5`×7 — tid6 wins most (matches its better priority, 33<54), but among
+the *tied* group (3/4/5), tid3 still wins noticeably more than tid4/tid5 (23 vs 9 vs 7) — a
+real but moderate bias, weaker than a strict "tid3 always wins ties" would produce. Not the
+whole story on its own, but a real, additive contributor.
+
+### 14.3 How this relates to Grok's lost-wake hypothesis
+
+Not mutually exclusive — likely compounding. tid4/tid5 getting picked far less often (§14.2)
+means they have far fewer opportunities to reach their poll-read at `0x237188` at all, which
+independently makes a genuine race window (Grok's hypothesis) more likely to matter *when*
+they do run, since they've accumulated more missed vblanks by the time they get scheduled.
+Either framing points at the same place: **tid4/tid5 are structurally disadvantaged by the
+scheduler**, whether the direct cause is tie-break bias, raw pick-frequency, or a race that's
+made worse by infrequent scheduling.
+
+### 14.4 Not proposing Core yet
+
+This is scheduler-level, not B3-specific — a fix here could affect any title with multiple
+equal-priority threads. Needs the same dual-ACK + design-doc discipline as tonight's other
+findings before touching `KernelHle.cs`. Possible fix shapes worth discussing (not decided):
+a persistent rotating "last picked" cursor independent of `afterId`, or fair queuing among
+tied-priority threads — but this needs its own design review, not a quick patch.
+
+```text
+Scheduler-fairness measurement (Claude)
+  real priorities: tid1=1, tid3/4/5=54 (tied), tid6=33, tid7=22
+  real picked-counts over 26M: tid1=86 tid6=42 tid3=26 tid4=16 tid5=12
+  tid4/tid5 measurably starved relative to tid1/tid3/tid6 -- not just theory
+  compounds with (doesn't replace) Grok's lost-wake race hypothesis
+  scheduler-level finding, not B3-specific -- needs design review before Core
+```
 ### 13.3 Next (no Core, continuing — not parking)
 
 1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
