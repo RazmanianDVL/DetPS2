@@ -2858,3 +2858,64 @@ drain-policy RESULT (Gif.cs + S3 reconcile)
 ```
 
 Next (Claude's S44.2 still valid, re-scoped): find who should issue the **4th** unmask / what condition arms another MSKPATH3-unmask after the third DMACKICK round — not more entity-msg, not drain-policy Core. Optional measure-only force-unmask A/B remains dual-ACK (§7.2).
+
+---
+
+## 47. Synthesis: the "4th unmask" isn't missing — it's the same bounded chain from §25-§31, and it's supposed to stop (Claude)
+
+Before starting a fresh static hunt for "who should issue the 4th unmask," checked whether we
+already have the answer from earlier tonight — we do.
+
+§28 already fully traced *the* single call site that arms this entire mask/unmask/kick chain:
+`0x1FFAF4`, the **sole** static caller of `0x1F2960` (which builds the GS packet and arms
+`gp-24112`). It fires **exactly 4 times**, cycles `15,166,704 / 15,180,144 / 15,192,816 /
+15,264,592`, always against the **same fixed target object `0x006754C0`** — which §29
+independently confirmed is the `PutDispEnv` display-env object, not track/level geometry —
+with a plain incrementing stage counter (`a1 = 1, 2, 3, 4`). §37's boot-table read showed this
+whole thing is dispatched from a **bounded, `id`-keyed one-shot registry**, not a per-frame
+loop. Downstream, §46 shows the mask/unmask cycle drains correctly on unmask (twice, cleanly:
+events 6→7 and 9→10 both empty the held queue via `Gif.cs`'s synchronous `DrainHeldPath3`).
+
+**Putting these together: this whole complex — `0x1FFAF4`'s 4-stage display-env setup →
+`0x1F2960` → `gp-24112` arm → scheduler `0x1F43B0` → producer `0x1F2408` → DMAC handler
+`0x1F1778` → the mask/unmask template buffer (§9/§45) → real VIF1/GIF kicks (§27.2) — is one
+single, bounded, correctly-functioning boot-time display-environment setup routine that is
+*supposed* to run a fixed number of stages and then stop.** There is no missing "5th stage" or
+"4th unmask" to find in this chain, any more than there's a missing 5th call to `0x1FFAF4`
+itself — it's a 4-stage init, by design, and every layer downstream of it (drain policy,
+buffer layout, DMAC completion, VBlank consume-gate) has now been read and confirmed correct.
+
+### 47.1 What this settles, across the whole night
+
+Every subsystem investigated from §12 through §46 — DMAC completion interrupts, the scheduler
+tie-break, the boot-stage dispatch table, five independent dead-code islands, the entity
+message subsystem, VIF1's command-type breakdown, thread/semaphore census, the VBlank ISR's
+own gate, and now the mask/unmask buffer's drain behavior — has been **confirmed correct and
+complete**, not buggy. The held Path3 backlog (`heldP3n=5 heldP3qwc=2124`, this document's
+very first finding) is the honest, expected residue of a one-shot setup routine finishing its
+bounded work while masked, not evidence of a stuck or dropped mechanism.
+
+### 47.2 What's actually still missing
+
+**A completely separate piece of code**, never yet located, that's supposed to run on an
+ongoing (per-frame or per-vblank) basis during real gameplay: issuing its own fresh
+MSKPATH3 unmask/mask cycles, driving VU1 execution (§30: `Vu1.MscalRuns=0` the entire run —
+VU1 never executes a single instruction), and producing Path1 GIF traffic (§30:
+`gifPath1=0` the entire run). Nothing in the `0x1FFAF4` chain, the entity-message subsystem,
+or the boot-table registry was ever going to be that code — they're all one-shot,
+already-confirmed-complete initialization. The real search target is B3's actual per-frame
+render-submission entry point, structurally unrelated to everything traced tonight, most
+likely reached from wherever the game's main loop decides "we are now in a race / gameplay
+state" (still unconfirmed whether this run ever reaches that state at all — genuinely open,
+not investigated with the same rigor as the setup-chain work).
+
+```text
+synthesis (Claude) -- the "missing 4th unmask" question is already answered, not open
+  0x1FFAF4 (S28) -- sole caller, fires EXACTLY 4x, fixed target = display-env object (S29)
+  boot-table (S37) -- bounded one-shot registry, not per-frame
+  drain policy (S46) -- correct, empties held queue cleanly on every real unmask
+  => the WHOLE S9/S25-S31/S45/S46 chain is one bounded, correct, COMPLETE setup routine
+  => no missing 4th unmask to find -- it's a 4-stage init that's supposed to stop
+  still missing: a SEPARATE per-frame/per-vblank mechanism, never located tonight, that
+    should drive ongoing MSKPATH3 cycling + VU1 execution + Path1 traffic during real gameplay
+```
