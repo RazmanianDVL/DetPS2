@@ -5540,3 +5540,19 @@ S99: S98 CONFIRMED WORKING — 6 real fno=5 completions, phase 3->9, flag set. D
      S98 landed (real fix, real progress) — next thread is the mode SM itself, same open
      question S64-66/S91 already flagged before tonight's G1 detour.
 ```
+
+
+---
+
+## 99–100. S98 verified: G1 fixed, phase→9; next is phase9 `0x28B380` (Claude+Grok)
+
+**S99:** 6 real EE object completes; flag 0x51868C=1; phase=9. Product still black
+(mode-state 0, gate 6). S96 cascade not reproduced — G1 necessary not sufficient for lit.
+
+**S100 static:** phase 9 at `0x13346C` polls `0x28B380(0x1E75600)`; zero → climber ret 0.
+Next live: hit-census + dump that object.
+
+```text
+S99: G1 closed (phase 9); mode-state still 0
+S100: phase9 gate = 0x28B380 ready on 0x1E75600
+```
