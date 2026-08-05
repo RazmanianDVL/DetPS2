@@ -1154,3 +1154,48 @@ Blit dig
   zero L2L all night still holds
   next: submit path after builder; dual-read Claude post-15.5M heatmap
 ```
+
+---
+
+## 24. Post-15.5M PC heatmap: real ongoing simulation, not obviously the stall itself (Claude)
+
+Profiled `[15.6M, 25.6M)` (temp `PcProfiler`-based tool, gated, fully reverted — `git status`
+clean; replicated blocker-trace's `--host-present` 1M-cycle `OnHostPresent` slicing exactly,
+since an earlier attempt without it silently missed B3's quirk-driven activity).
+
+### 24.1 Result
+
+Dominant hotspot is **not** the earlier-characterized VBlank-poll loop (`0x237xxx`) — a
+different region entirely:
+
+- `0x00123E10-0x00123E9C`: a standard PS2 SIMD-shaped `memcmp` (quadword `lq`/`pxor`/
+  `pcpyud` fast path, byte-wise `lbu` tail).
+- `0x00293A60-0x00293AD8`: walks a linked list from a global head (`gp-23416`), calling the
+  memcmp wrapper per node — a real hash-bucket/name-lookup pattern.
+- `0x00293F80-0x00294008`: a nested loop calling the same memcmp wrapper — outer bound `s6`,
+  inner bound `s7`. **Both confirmed via `--pcbreak` register dump: `s6=s7=0x12=18`** — max
+  324 total comparisons, far too small to be a genuinely slow O(n²) computation on its own.
+
+### 24.2 Interpretation
+
+This reads as **real, ongoing, bounded simulation work** (plausibly collision/object matching
+among a small set of ~18 nearby items, called very frequently — once per game-logic tick) —
+not an infinite or runaway loop. It's evidence the game is genuinely alive and doing
+legitimate per-frame processing in this window, which is a mildly positive sign, but it
+doesn't by itself explain why the flip/blit machinery (§22-23) never re-arms after ~15.5M.
+
+### 24.3 Reframing with §23
+
+Given §23's blit-builder fires exactly once at cyc≈14.4M and this doc's flag-cluster is
+15.17M-15.50M, the actually decisive window is likely **narrower and earlier** than what was
+profiled here (14.4M-15.5M, the gap between blit-build and flag-cluster) rather than 15.6M+
+which is probably already past the critical moment — this section's finding is honest
+background context, not the answer.
+
+```text
+Post-15.5M heatmap (Claude)
+  NOT the VBlank-poll loop -- different hotspot: memcmp + linked-list lookup + small
+    nested search (bounds 18x18, confirmed via pcbreak -- not a slow O(n^2), too small)
+  reads as real ongoing simulation (collision/object matching), not obviously the stall
+  real decisive window is narrower: 14.4M-15.5M (blit-build to flag-cluster gap), not this one
+```
