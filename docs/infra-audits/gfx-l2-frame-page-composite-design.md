@@ -1,7 +1,7 @@
 # GFX L2 design — FRAME/DISPFB page + presentable RGB (after L1)
 
-**Status:** design shelf — dual-ACK before Core  
-**Parent:** L1 C1+C2 landed; B3 present still black (CP3)  
+**Status:** **Core C4+C5 landed** — B3 Tier A numeric **PASS** (colorPct≈34% @50M); visual dual-check pending  
+**Parent:** L1 C1+C2 landed; B3 present was black (CP3)  
 **Primary:** Burnout 3  
 
 ---
@@ -62,7 +62,21 @@ Prims/`WriteFrameLocal` target **FRAME page 70**. Natural DISPFB composite reads
 | **L2-Q1** | Accept C4+C5 next Core? | **Yes** |
 | **L2-Q2** | Keep L3 Whip parallel docs-only? | **Yes** |
 
+## 6. Landed result (post C4+C5)
+
+Canary `out/canaries/gfx-baseline/20260804-203212/` product tip after L2:
+
+| Title | presentColorPct | Tier A numeric | Notes |
+|-------|----------------:|:--------------:|-------|
+| **B3** | **34.286** | **PASS** | 98304 color px; src=NaturalDispfb (mismatch-allow residual cascade) |
+| Dec | 0 | fail | gray strip only (11.4% lit gray) — L2/Dec follow-up |
+| Whip | 0 | fail | L3 |
+
+Also: scoreboard emits `presentLit` / `presentColor` / `present*Pct` (C5).  
+`DETPS2_GFX_IGNORE_PAGE_MISMATCH=1` remains optional full-ignore diagnostic (not product default).
+
 ```text
-GFX L2 FRAME page composite design
-  B3 FRAME FBP70 vs DISPFB0 — force FRAME merge when present black
+GFX L2 C4+C5 landed
+  B3 present color≈34% Tier A numeric; visual dual-check
+  Dec gray residual; Whip L3
 ```

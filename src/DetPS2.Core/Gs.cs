@@ -72,6 +72,7 @@ public sealed class Gs : ISchedulable
     /// <summary>True when a composite should refuse to paint given what this page was actually last written as.</summary>
     private bool IsPageMismatched(int byteOffset, int declaredPsm, int declaredBufW)
     {
+        if (Environment.GetEnvironmentVariable("DETPS2_GFX_IGNORE_PAGE_MISMATCH") == "1") return false;
         if (byteOffset < 0) return false;
         int pageIdx = byteOffset / 8192;
         if ((uint)pageIdx >= (uint)_pageLastWritePsm.Length) return false;
@@ -2281,25 +2282,20 @@ public sealed class Gs : ISchedulable
         // has not grown (1M-slice OnHostPresent). Invalidate when DISPFB/DISPLAY/PMODE
         // generation advances so natural DISPFB programmed after residual still binds (GX-041).
         // Skip only when present already has chrome.
-        // GFX-L1 (CP2 dual-ACK): commercial black full-FB prims wipe Soft-GS FB after a
-        // residual composite without calling Clear() — do NOT treat a prior composite as
-        // still valid while present is mostly black. Re-merge until chrome lands or we prove
-        // local/DISPFB has no presentable RGB (arm bypass only AFTER written==0 while black).
+        // GFX-L1/L2: commercial black full-FB prims wipe Soft-GS FB after a residual
+        // composite without calling Clear() — do NOT treat a prior composite as still valid
+        // while present is mostly black. Skip only when present already has chrome.
+        // Important: when mostly black, NEVER early-return on _mergeBlackBypassArmed here —
+        // that arm is only for GetPresentSpan ForceRefresh thrash. Early-return before the
+        // L2 C4 FRAME/FBP0/LastImage cascade left B3 final present pure black while mid-run
+        // residualDispfbPx counters still looked non-zero (stale LastCompositeSource).
         if (mergeMode && DispfbPixelsComposited > 0
             && ImageBytesWritten <= _lastCompositeImageBytes
-            && DisplayCircuitGeneration == _lastCompositeCircuitGen)
+            && DisplayCircuitGeneration == _lastCompositeCircuitGen
+            && !IsPresentMostlyBlack())
         {
-            bool hasImage = _localMemHasImage || ImageBytesWritten > 0;
-            if (!IsPresentMostlyBlack())
-            {
-                // Present has chrome — safe to skip; clear empty-RGB bypass for a future wipe.
-                _mergeBlackBypassArmed = false;
-                return 0;
-            }
-            // Mostly black: re-merge unless we already proved IMAGE under DISPFB has no RGB.
-            if (hasImage && _mergeBlackBypassArmed)
-                return 0;
-            // Fall through — re-merge into black Soft-GS pixels (do not arm until written==0).
+            _mergeBlackBypassArmed = false;
+            return 0;
         }
 
         var circuit = GetDisplayCircuitInfo();
@@ -2464,6 +2460,68 @@ public sealed class Gs : ISchedulable
             }
         }
 
+        // GFX-L2 C4 (dual-ACK): natural/residual paths may leave present black when DISPFB
+        // FBP/PSM ≠ FRAME draw target (B3: DISPFB FBP0 PSMCT16S vs FRAME FBP70 CT32) or when
+        // mid-run residual counters already advanced while final FB was wiped. If still mostly
+        // black, force DISPFB (mismatch-allow) → FRAME → FBP0 → LastImageTrx cascade.
+        // Later prim clears re-mark pages and would zero residual logo otherwise.
+        if (IsPresentMostlyBlack()
+            && (ImageBytesWritten > 0 || Registers.FRAME_1 != 0 || _lastImageByteCount > 0))
+        {
+            _mergeBlackBypassArmed = false;
+            // Re-try programmed DISPFB with mismatch allow (first pass may have dropped all RGB).
+            if (fromDispfb && fb != 0)
+            {
+                long dispfbExtra = CompositeLocalToFb(fb, fromDispfb: true, syntheticFb: false,
+                    mergeMode: true, outRect: outRect, allowPageMismatch: true);
+                if (dispfbExtra > 0)
+                {
+                    written += dispfbExtra;
+                    residualExtra += dispfbExtra;
+                    // Prefer residual label — mismatch-allow is not guaranteed natural layout.
+                    natural = false;
+                    source = GsCompositeSource.NaturalDispfb;
+                }
+            }
+            ulong frame = Registers.FRAME_1;
+            if (IsPresentMostlyBlack() && frame != 0)
+            {
+                long frameExtra = CompositeLocalToFb(frame, fromDispfb: false, syntheticFb: false,
+                    mergeMode: true, outRect: null, allowPageMismatch: true);
+                if (frameExtra > 0)
+                {
+                    written += frameExtra;
+                    residualExtra += frameExtra;
+                    natural = false;
+                    source = GsCompositeSource.Frame;
+                }
+            }
+            if (IsPresentMostlyBlack() && (ImageBytesWritten > 0 || _localMemHasImage))
+            {
+                long fbp0Extra = CompositeLocalToFb(0, fromDispfb: false, syntheticFb: true,
+                    mergeMode: true, outRect: null, allowPageMismatch: true);
+                if (fbp0Extra > 0)
+                {
+                    written += fbp0Extra;
+                    residualExtra += fbp0Extra;
+                    natural = false;
+                    if (source != GsCompositeSource.Frame)
+                        source = GsCompositeSource.SyntheticFbp0;
+                }
+            }
+            if (IsPresentMostlyBlack() && _lastImageByteCount > 0)
+            {
+                long imgExtra = CompositeLastImageTransfer(mergeMode: true);
+                if (imgExtra > 0)
+                {
+                    written += imgExtra;
+                    residualExtra += imgExtra;
+                    natural = false;
+                    source = GsCompositeSource.LastImageTrx;
+                }
+            }
+        }
+
         // Always stamp circuit gen so a no-op scan after DISPFB bind does not thrash every present.
         _lastCompositeImageBytes = ImageBytesWritten;
         _lastCompositeCircuitGen = DisplayCircuitGeneration;
@@ -2491,7 +2549,13 @@ public sealed class Gs : ISchedulable
     }
 
     /// <summary>Inner local-mem → Soft-GS FB copy used by <see cref="CompositeDispfbToFramebuffer"/>.</summary>
-    private long CompositeLocalToFb(ulong fb, bool fromDispfb, bool syntheticFb, bool mergeMode, DisplayRect? outRect)
+    /// <param name="allowPageMismatch">
+    /// When true (L2 residual cascade while present is mostly black), paint even if the page was
+    /// last marked with a different PSM/stride — commercial black clears re-mark FRAME pages and
+    /// would otherwise suppress residual logo composite (B3). Natural first-pass keeps the guard.
+    /// </param>
+    private long CompositeLocalToFb(ulong fb, bool fromDispfb, bool syntheticFb, bool mergeMode, DisplayRect? outRect,
+        bool allowPageMismatch = false)
     {
         int fbp;
         int fbw;
@@ -2562,8 +2626,8 @@ public sealed class Gs : ISchedulable
                 // residual fallback reading real disc bytes in the wrong format/stride is exactly
                 // as dishonest as the natural path doing it; "Host→Local residual" only means
                 // non-natural sourcing, not license to reinterpret bytes in a layout they were
-                // never written in.
-                if (IsPageMismatched(bi, psm, fbw))
+                // never written in — except L2 allowPageMismatch residual cascade (see param).
+                if (!allowPageMismatch && IsPageMismatched(bi, psm, fbw))
                     continue;
                 int dx = dstOx + x;
                 int dy = dstOy + y;
@@ -2625,10 +2689,11 @@ public sealed class Gs : ISchedulable
                 if (sx >= _lastImageDsaX + srcW) sx = _lastImageDsaX + srcW - 1;
                 uint pixel = LoadLocalPixelForPresent(_lastImageDbpBytes, sx, sy, fbw, psm, out int bi);
                 if ((pixel & 0x00FFFFFF) == 0) continue;
-                // See CompositeLocalToFb's identical check: don't paint a pixel whose backing
-                // page was demonstrably last written in a different format/stride than declared here.
-                if (IsPageMismatched(bi, psm, fbw))
-                    continue;
+                // GFX-L2: do NOT apply IsPageMismatched here. This window is the largest Host→Local
+                // BITBLT we tracked (DPSM/DBW from the transfer itself). Later prim clears can
+                // MarkPageWritten the same GS page as FRAME CT32 and would suppress residual
+                // present entirely (B3: imgBytes≈2M but present pure black; with mismatch ignore
+                // presentColorPct≈34%). Natural DISPFB CompositeLocalToFb keeps the guard.
                 if ((uint)x >= (uint)FB_WIDTH || (uint)y >= (uint)FB_HEIGHT) continue;
                 int idx = y * FB_WIDTH + x;
                 if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
