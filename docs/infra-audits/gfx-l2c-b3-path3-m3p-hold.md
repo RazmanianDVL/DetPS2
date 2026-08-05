@@ -4023,3 +4023,36 @@ Dispatches on `0x51BAB0`; value 1 → work path using `0x113028` / loop `0x113F7
 S61: mega-init sets phase=1; 0x133190 case1 -> 0x1D41E0 must succeed to climb
   next: success conditions of 0x1D41E0 / 0x113028 / 0x113F78
 ```
+
+---
+
+## 62. Phase-1 worker is a 10-IRX LoadModule gate (Grok)
+
+`0x1D41E0` work path when `0x51BAB0==1`:
+
+1. `jal 0x113028` — IOP-ready wait
+2. Loop i=0..9: `a0 = *(0x49A120 + 4*i)`; `jal 0x113F78(a0,0,0)`; **bltz → return 0**
+3. Further loads (USBD/LGAUD/network…); success sets field=2
+
+### Table `0x49A120` paths
+
+| i | Path |
+|---|------|
+| 0 | `cdrom0:\IOP\SIO2MAN.IRX;1` |
+| 1 | `cdrom0:\IOP\SIO2D.IRX;1` |
+| 2 | `cdrom0:\IOP\DBCMAN.IRX;1` |
+| 3-4 | `cdrom0:\IOP\DS2O.IRX;1` (dup) |
+| 5 | `cdrom0:\IOP\MC2_S1.IRX;1` |
+| 6 | `cdrom0:\IOP\LIBSD.IRX;1` |
+| 7 | `cdrom0:\IOP\RWA.IRX;1` |
+| 8 | `cdrom0:\IOP\B3ROUTE.IRX;1` |
+| 9 | `cdrom0:\IOP\GTFSCDVD.IRX;1` |
+
+**Any** failed LoadModule-shaped call aborts climber → state stays 0 → no mode entry → black.
+
+Candidate for the single higher trigger linking class-A dead systems.
+
+```text
+S62: 0x1D41E0 = ordered IOP IRX loadout; first bltz freezes mode SM
+  next: which of 10 fails under HLE / LoadModule return codes
+```
