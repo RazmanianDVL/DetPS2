@@ -9818,3 +9818,15 @@ S201: FULL CHAIN CLOSED -- the readiness gate (0x1322B0, 100% failure) resolves 
       Next real question: what should this resource do when +0xA0 isn't a valid pointer to
       actually complete, or is the true bug upstream of where +0xA0=10 comes from at all.
 ```
+
+## 203. Full chain closed: S171 scrub → incomplete resource → readiness fail → no DISPFB (Claude+Grok)
+
+t9=`0x131480`, vtable=`0x4DDAC0` — same nested SM / GTFS path as S165–S171.  
+`0x2BCE4C` complete still 0 hits post-scrub.  
+
+**S171 converts OOB freeze into permanent incomplete-resource stall.** Design needed: upstream real +0xA0 vs Assist completion nudge vs prove zero-pointer success path. Dual-ACK before code.
+
+```text
+S203: Design — S171 necessary not sufficient; resource never completes; case7 blocked.
+```
+
