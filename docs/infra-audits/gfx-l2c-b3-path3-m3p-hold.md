@@ -3919,3 +3919,52 @@ discrepancies resolved (Claude, seq0449/0450)
   remaining question, precisely scoped: who should write state=5, and why doesn't it
 ```
 ```
+
+
+---
+
+## 60. Pending never staged; state==5 is sole remaining gate (Grok+Claude)
+
+**Claude pending watch (0x51BA8C, 90M):** exactly 3 accesses — boot zero-init, one syscall
+read, sibling re-zero at `0x133EC4` (same mega-init as `0x133EBC`). **Never assigned non-null
+for any mode.** Mode-request API never successfully stages anything.
+
+**Identity constant corrected:** `0x223224` compares against **`0x51A6A8`** (not 0x51A688 —
+arithmetic slip). Coherent with every `0x131F10` request.
+
+### 60.1 State machine map (SM `0x132600`, table `0x4B5C30`)
+
+| Field | Addr | Role |
+|-------|------|------|
+| current state | `0x51BAD0` (-9584) | switch selector; request gate ==5 |
+| desired state | `0x51BACC` (-9588) | companion; catch-up at 0x132724 |
+| readiness byte | `0x51BAA4` (-9628) | case4 early-out if 0 |
+
+| Case | Entry | Role |
+|-----:|-------|------|
+| 4 | `0x132C80` | **only path that sets state=5** after `0x19A950(0x522660)` readiness |
+| 5 | `0x132D14` | already-5 maintenance |
+| 6 | `0x13284C` | post-request: commit pending→current |
+
+### 60.2 Causal chain (current)
+
+```text
+boot mega-init zeros current+pending
+  -> SM never climbs to state 4  OR  case4 runs but 0x19A950 readiness stays 0
+  -> never state 5
+  -> 0x131F10 never stages (pending watch)
+  -> current stays 0
+  -> identity 0x51A6A8 never matches
+  -> black / no continuous render path
+```
+
+### 60.3 Next
+
+- Does `0x132600` ever hit (any case)?
+- What is `0x19A950` readiness (another nested SM on object `0x522660`)?
+- Who first drives state into 1..4 after boot zero?
+
+```text
+S60: pending never staged (Claude) + state5 only via case4 (Grok)
+  remaining: SM climb / 0x19A950 readiness
+```
