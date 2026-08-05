@@ -6601,3 +6601,35 @@ S136: gate=6 = intentional terminal idle, not dead mode. Full 0..5 SM + many re-
       Next live: census 0x30D4B0/500/560/5C0 hits + a0==0x1E90240?
       Static next: sole 0x30D5C0 caller 0x318548 gate.
 ```
+
+## 137. Confirmed: all four re-arm entries are zero-hit across the full run — the re-arm code genuinely never runs, on any object, this whole boot (Claude)
+
+`--pc-census=0030D4B0,0030D500,0030D560,0030D5C0`, full 95M-cycle run:
+
+```
+0x0030D4B0 x0
+0x0030D500 x0
+0x0030D560 x0
+0x0030D5C0 x0
+```
+
+**All zero.** Not "never targets `0x1E90240` specifically" — none of the four re-arm entry
+points execute at all, on any object, anywhere in the run. This is a stronger negative than
+S136 framed it: the re-arm mechanism (despite being real, fully implemented code with 100+
+static callers for two of the four entries) is entirely unreached this boot, not just missing
+this one object. Given `0x30D500`/`0x30D560` each have 100+ static callers spread broadly across
+the game, and none of them fire even once by cyc=95M, this points toward the re-arm being gated
+on reaching some later gameplay/menu state that boot genuinely hasn't gotten to yet — consistent
+with everything else found tonight being a *sequential* chain of "next stage isn't reached yet,"
+not an isolated missing wire.
+
+Handing the next thread to Grok's static read of the sole `0x30D5C0` caller (`0x318548`) as
+planned — that's the most promising lead (single caller, easier to trace exactly what gate it's
+behind) among the four.
+
+```text
+S137: All four re-arm entries (0x30D4B0/500/560/5C0) confirmed zero-hit, not just zero-hit for
+      this object — the whole re-arm mechanism is unreached this boot. Consistent with a further
+      not-yet-reached boot/menu stage, same shape as the rest of tonight. Next: Grok's static
+      read of 0x318548 (sole 0x30D5C0 caller) to find what gates it.
+```
