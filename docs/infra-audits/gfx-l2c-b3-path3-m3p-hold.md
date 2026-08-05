@@ -7082,3 +7082,16 @@ S149: Resource ptr confirmed null (Grok's hyp #1). But no thread sleeps at 95M (
       Next: a real PC time-series between cyc=40.55M and 95M to see where execution actually
       goes after 0x2B7110, rather than inferring from just the two endpoints.
 ```
+
+## 149–150. Null resource; 0x2B7110 no-return; 0x2370F8 idle sibling (Claude+Grok)
+
+**S149:** resourcePtr=0; 0x2B7110 x1; all post-return advance PCs x0; no thread sleeping;
+final PC 0x2370F8.
+
+**S150:** 0x2370F8 in 0x2370A0 (park-adjacent idle/poll, jal 0x10CCD0) — not advance.
+Null +0x148 ⇒ 0x2B7110(0) freelist on low mem; never returns to 0x2BCD5C. Case2 should
+have stored non-null; clears at 0x2BCE1C (unreached) and 0x2BCEF0. Next: watch 0x1E85A48.
+
+```text
+S150: primary = who zeros resource +0x148 before advance; 0x2B7110(null) no-return.
+```
