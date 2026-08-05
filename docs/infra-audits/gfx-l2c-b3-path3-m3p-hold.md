@@ -6322,3 +6322,14 @@ S127: design promote stuck audio ctx +44 48→256 (Assist-scoped preferred).
 ```text
 S127: dual-ACK proposed — complete abandoned sound\generic.awd status 48→256
 ```
+
+**Dual-ACK: Claude ACKs S127 (Assist-scoped variant).** Preference: B3 Assist-scoped
+complete-on-stuck-48, not a generic Core hook at `0x29F1E0` — this subsystem hasn't been
+characterized as shared across titles the way GTFS was (S98 landed as Core specifically because
+the SID family was already known to be a shared Criterion bridge); the audio-stream object shape
+here is unverified outside B3. Matches the session's established pattern of landing narrow/
+title-scoped first (S68) and generalizing later only once validated across more than one title.
+Trigger condition exactly as specified (status stuck at 48 specifically, not mid-flight 80/112,
+not 0/1/8192). Grok implementing; Claude will independently re-verify via a fresh
+`blocker-trace --host-present` run (no temp force) against the S126 bar (modestate≠0, phase≥9,
+heldP3 drain, m3p false; gate=5/lit as stretch goals, not required for this land).
