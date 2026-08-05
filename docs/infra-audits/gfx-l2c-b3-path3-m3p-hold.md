@@ -2340,3 +2340,116 @@ boot-table census dual-confirm
   all fires in setup window
   next: requester/dispatcher who selects those 6 ids only
 ```
+
+---
+
+## 39. Requester-side: no request queue — dense vtable install-all + specialized slot callers (Grok)
+
+Claude handed requester-side (seq0386 ACK). Result: the "who selects only 6 ids" framing dissolves into a sharper architecture.
+
+### 39.1 Table layout was misaligned (critical correction)
+
+Prior census paired `{fn, next_word_as_id}` starting at `0x49AC5C`. The walker at switch case 11 uses base **`0x49AC58`** with pairs **`{id, fn}`**:
+
+```text
+0x49AC58: id=1    fn=0x001F5708
+0x49AC60: id=0xA  fn=0x001FFA00
+0x49AC68: id=0x15 fn=0x001F6108
+0x49AC70: id=0x14 fn=0x001FFAB8   ← was mislabeled "id=2 display-env"
+0x49AC78: id=2    fn=0x00207E30   ← never fires (matches census)
+0x49AC80: id=3    fn=0x00207F28
+... through id=0x1C (28 registry entries)
+```
+
+**Correct fired id set: `{1, 4, 0xA, 0xC, 0x14, 0x15}`** (not `{2,4,0xA,0xC,0x14,0x15}`).
+
+Display-env stage `0x1FFAB8` is **id=0x14**, not id=2. Real id=2 (`0x207E30`) is among the never-fired set — Claude's surface-pass outlier message-router.
+
+### 39.2 Switch `0x001FE1A0` is the message API; case 11 builds the dense vtable
+
+```text
+0x001FE1A0:  // a0=case (0..22), a1=buf, a2=?, a3=slot_count
+  if (a0 >= 23) return;
+  jr jump_table[a0];   // table @ 0x004B8EA0
+```
+
+| case (a0) | target | role |
+|----------:|--------|------|
+| 11 (0xB) | `0x001FE444` | **install registry → dense array** |
+| others | various | object/msg helpers (not per-id handler calls) |
+
+**Case 11 body (table builder):**
+
+1. `t0 = 0x49AC58` (registry base)
+2. Fill `a1[0 .. a3)` with default `0x001FFE10`
+3. Walk 27 registry entries: if `id >= 0 && id < a3` then `a1[id] = fn`
+4. Return
+
+**Runtime (pcbreak `001FE1A0`, 20M host-present):** case 11 fires **once** @ cyc≈14.33M:
+
+```text
+a0=0xB  a1=0x670C18  a3=0x1D(=29)  ra=0x1E340C
+```
+
+⇒ dense vtable of **29 slots** at **`0x670C18`**, and **all 28 registry handlers are installed** (ids 1..0x1C all `< 29`). Defaults only pad empty indices.
+
+Object root **`0x670BD0`**: dense base = `+0x48` → `0x670C18`. Slot `id` lives at `0x670BD0 + 0x48 + id*4`.
+
+### 39.3 There is no pending-id request queue
+
+Handlers are **never selected by scanning the registry at call time**. Call path is always:
+
+```text
+fn = *(0x670BD0 + 0x48 + id*4);   // or absolute lw of that address
+jalr fn
+```
+
+hardcoded into specialized wrapper functions. Zero direct `jal` / external word-refs to any of the 6 fired fns outside the registry itself — pure `jalr` via the dense table.
+
+### 39.4 Sole RA per fired id (pcbreak each entry, 16–20M)
+
+| id | fn | hits | sole RA (after jalr) | slot load site | shape |
+|---:|-----|-----:|----------------------|----------------|-------|
+| **1** | `0x1F5708` | 4× @15.15–15.26M | **`0x1E2710`** | near `0x1E26xx` | fixed obj `a1=0x1ED0720` |
+| **4** | `0x1F7E08` | 10× @14.42–14.43M | **`0x1E7588`** | `0x1E7550: lw v0,0x58(s2)` → slot[4] | **per-instance** `a1=0x1EDxxxx` varying; sizes in a2 |
+| **0xA** | `0x1FFA00` | 4× @15.16–15.26M | **`0x1E26B0`** | `0x1E269C: lw v0,0x70(0x670BD0)` → slot[0xA] | fixed obj `0x1ED0720` |
+| **0xC** | `0x1F9DC0` | 2× @14.44M | **`0x1E7738`** | `0x1E7708: lw v0,0xC48` → `0x670C48` slot[0xC] | instance pair a0/a1 |
+| **0x14** | `0x1FFAB8` | 4× @15.16–15.26M | **`0x2222B0`** | `0x2222A8: jalr gp-23864` | **display-env** chain (known) |
+| **0x15** | `0x1F6108` | 4× @15.15–15.19M | **`0x1E200C`** | `0x1E1FFC: lw v0,0xC6C` → `0x670C6C` slot[0x15] | fixed obj `0x1ED0720` |
+
+**Asymmetry Claude flagged is free:** id=4's 10× comes from `0x1E74F0` being a **per-object-instance** factory (12 static jals into it); id=0xC's 2× is a tighter instance path. The uniform-4× group `{1,0xA,0x14,0x15}` is one coordinated setup sequence on object `0x1ED0720` / display-env, not a stage counter.
+
+### 39.5 Switch callers (who *installs*, not who *fires* handlers)
+
+pcbreak RAs into `0x1FE1A0`:
+
+| RA | cases seen | role |
+|----|------------|------|
+| `0x1E340C` | 0, 4, **11** | main path via wrapper `0x1E33D0` (`jalr *(a0+4)` → switch) |
+| `0x1E2AC0` | 7 | |
+| `0x1E2D40` | 2 | |
+| `0x1E2DB0` | 0x11 | |
+
+Static jals to wrapper `0x1E33D0`: `0x1E03BC, 0x1E04E0, 0x1E2F14, 0x1E2F2C, 0x1E2F4C`.
+
+### 39.6 Verdict and redirect
+
+```text
+requester-side RESULT
+  registry @ 0x49AC58 = {id,fn} x28 (CORRECT pairing; prior id labels off-by-one)
+  switch 0x1FE1A0 case11 = install-ALL into dense[29] @ 0x670C18 (once @14.33M)
+  "6 of 28 fire" = 6 specialized jalr-slot call sites run; 22 slots never jalr'd
+  NOT a request queue that omits 22 ids — all 28 are registered
+  id labels CORRECTED: fired {1,4,A,C,14,15}; display-env is id=0x14 not 2
+  asymmetry: id4=per-instance factory; {1,A,14,15}=coordinated 4x setup
+```
+
+**Redirects "gameplay ready / continuous GS":**
+
+1. **Not** "missing registry request for a never-fired id" — those ids are installed; nothing calls them.
+2. Continuous render is either (a) a call site into never-fired slots that never reaches runtime, or (b) **outside this entire object-message subsystem** (matches post-setup SIF-only / gifPath1=0 plateau).
+3. Sharper next filters (pick one, no Core):
+   - Static: find every `lw` from `0x670C18` range / `0x670BD0+0x48+n` and list which slot indices have *any* call site (map "who could fire the 22").
+   - Or leave this subsystem: hunt post-15.75M who should kick Path1/VU1 (already cold), from main-loop / thread entries rather than boot registry.
+
+No Core. Canaries under `out/canaries/b3-requester/` (gitignored).
