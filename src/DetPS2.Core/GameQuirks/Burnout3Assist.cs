@@ -356,10 +356,20 @@ public sealed class Burnout3Assist : IGameQuirkModule
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
 
+        // S237: phase2-only clean probe (DETPS2_B3_FORCE_PHASE2_ONLY=1).
+        // No status=9, no +500 clear, no nested EE tick — isolates "does sticky phase=2
+        // make 3FBBB0 pass without status/arm side effects that mess end-state".
+        if (sys.MasterCycles >= 42_000_000
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_PHASE2_ONLY") == "1")
+        {
+            MaybeForcePhase2(sys);
+        }
+
         // S226/S234 dual-ACK memory probe (DETPS2_B3_FORCE_STREAM_PUMP=1) — no nested EE Step:
         // S235: host-call 0x28AF10 killed 3FBBB0 polling (202→2 hits). Pure memory only.
         // (1) status 0→9; (2) clear +500 once; (3) sticky phase=2.
         // Optional nested tick: DETPS2_B3_FORCE_STREAM_TICK=1 (contaminates poller).
+        // Prefer PHASE2_ONLY for clean gate tests; this combo is for status/arm path.
         if (sys.MasterCycles >= 40_000_000
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_PUMP") == "1")
         {
@@ -1562,9 +1572,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
     }
 
     /// <summary>
-    /// S234 dual-ACK: write phase=2 at stream phase obj <c>0x1E7A888+0xC8</c> when the
+    /// S234 dual-ACK / S237: write phase=2 at stream phase obj <c>0x1E7A888+0xC8</c> when the
     /// case10 gate flag at +188 is set. Bypasses arm to test whether anything past phase 2
-    /// also blocks. Env-gated with FORCE_STREAM_PUMP.
+    /// also blocks. Call sites env-gated via FORCE_STREAM_PUMP or FORCE_PHASE2_ONLY.
     /// </summary>
     private void MaybeForcePhase2(Ps2System sys)
     {
