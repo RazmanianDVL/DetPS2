@@ -6193,3 +6193,15 @@ S122: Node state is 16 ("loading"), stuck there for 25/25 checks after one real 
       tonight (GTFS Global.txd, GTFS-family EALogin.ico, now this non-GTFS audio load). Next:
       static map of what 0x29F1E0 actually probes and what's supposed to set it.
 ```
+
+
+---
+
+## 122–123. sound\generic.awd stuck state 16; probe *(ctx+44) for 256 (Claude+Grok)
+
+S122: node 1→2→16, load started once. S123: 0x29F1E0 returns *(ctx+44);
+need 256 to complete. Same async-complete shape as G1, audio path.
+
+```text
+S123: next live = *(ctx+44) sticky value; want 256
+```
