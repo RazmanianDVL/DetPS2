@@ -10244,3 +10244,12 @@ bne v0,0 → 0x3FB6C8
 S212: case10 SM state=7; flag+430 nonzero; 0x3FBBB0 fails 211/211 → readiness stay fail.
 ```
 
+
+## 213. Ruled out: case10/0x3FBBB0 is not a file-open problem — all GTFS opens clean across full 95M (Claude)
+
+Full 95M `DETPS2_TRACE_RPC=1` run: 17 total `[GTFS] open` calls, **0 FAIL**, including the S209-fixed track files. So whatever `0x3FBBB0` checks, it isn't waiting on a stuck/leaked file handle — the fd-table angle is fully closed out for this gate. Taking live trace of `0x3FBBB0` directly now.
+
+```text
+S213: Full 95M GTFS trace = 17/17 opens clean, 0 FAIL post-S209. Case10/0x3FBBB0 blocker
+      is NOT file-I/O — different mechanism. Live-tracing 0x3FBBB0 body next.
+```
