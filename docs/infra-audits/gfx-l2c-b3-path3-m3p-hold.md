@@ -4591,3 +4591,18 @@ S77: CONFIRMED — 0x6754C0+0x350/+0x378 (both GsDispEnv double-buffer halves) a
      at init and never touched again. Real open question: what's supposed to write a second,
      later value here once FRAME_1 moves to page 70, and does it exist anywhere in B3's code.
 ```
+
+---
+
+## 78. Display env DISPFB never retargeted after init (Grok+Claude S77)
+
+Live: both GsDispEnv halves at `0x6754C0+0x350` hold DISPFB=`0x51400` (FBP=0),
+byte-identical; VBlank ISR reads them verbatim.
+
+Static: only one-shot init fills those words. Refresh candidates (`0x1FE600`,
+`0x21FAE8`, property setter `0x4248A0` via unreached `0x424C40`) are 0-hit or 0-jal.
+FRAME independently uses Fbp=70 (`0x8C000`). **No live bridge** display←draw found.
+
+```text
+S78: black present = display env stuck FBP=0; draw at 0x8C000; no retarget stage
+```
