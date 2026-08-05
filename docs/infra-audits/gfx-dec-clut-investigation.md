@@ -179,12 +179,26 @@ real `0x1600=5632`-byte payload by exactly `1536` bytes) — not `4096 index + 1
 `side=64`/`bpp=1` guess in `TryFeedDecGameartHostToLocal` (driven by payload-size heuristics, not
 a decoded dimension field) may itself be wrong for these tiles, independent of the CLUT question.
 
-**Three palette-location hypotheses now tested, all refuted:** SEC TOC `kind=1` siblings (Claude),
-per-tile header (Grok), in-payload leftover bytes (Claude). Remaining live lead: Grok's root-level
-sibling-SEC walk (a resource *outside* this nested container entirely, not per-tile). If that also
-comes back empty, this investigation has reached the point where a real decompile of the EE's own
-SSF/texture consumer code (similar in kind, if smaller in scope, to what Whip's MP2 problem needs)
-is likely required to find the palette — this would no longer be a "quick TRACE" question.
+**In-payload palette hypothesis refuted** (Claude leftover dump). Nested `kind=1` palette refuted.
+Per-tile header palette refuted. **Root sibling walk is not empty** — see §4d.
+
+---
+
+## 4d. Root SEC sibling TOC (Grok)
+
+**Capture:** `DETPS2_TEMP_DEC_ROOT_TOC=1` (fully reverted). Artifact: `out/canaries/gfx-dec-header/root-sec-toc.txt`.  
+`loaded=2836480`. Root `+0x10=0x0E` → **14 TOC entries**.
+
+| e | off | sz | kind | first | Notes |
+|---|-----|-----|------|-------|--------|
+| **0** | `0x800` | `0x247580` (~2.28 MiB) | 1 | `SEC ` | Tile nest — **only PL-029 walks this** |
+| **1** | `0x248000` | `0x22C00` (~139 KiB) | 1 | `SEC ` | **Sibling SEC — unvisited** |
+| 2–7 | ~`0x26B000`… | ~30–97 KiB | 1 | `0` / `0xDD` | Non-SEC blobs |
+| 8–13 | ~`0x2AB000`… | ~5–6.7 KiB | 1/0 | `0xA` | Small — few PAD128 CLUTs fit |
+
+**Findings:** Root `kind=1` is normal (unlike nested TOC). Shared palette is **more plausible in e=1 or e=8–13** than in identical tile headers. Not a negative result.
+
+**Next:** walk e=1 nested SEC TOC; sample e=8 as 512/1024-byte CLUT-shaped tables; then dual-ACK `MaybeLoadClut` if source confirmed.
 
 ---
 
