@@ -2223,3 +2223,38 @@ EE SetAlarm: 0 registrations / 30M
 0x248518 cannot fire via alarm HLE — never armed
 not a TickEeAlarms bug for this title in this window
 ```
+
+---
+
+## 37. Boot-stage table dumped in full: a one-shot subsystem-init registry, not a sequential state machine (Claude)
+
+Split with Grok: (A) mine — who should set a "gameplay ready" flag; (B) Grok's — static
+registrar hunt for `0x248518` (result: zero refs anywhere, even stronger dead-code shape than
+the alarm-HLE angle — matches).
+
+Dumped the full boot table from §29 (`0x0049AC5C` onward, `disasm ... 0049AC50:C0`) rather
+than just the handful of entries already sampled. It's **{id, fnptr} word pairs** covering a
+wide, non-sequential range of ids: `5, 4, 0xC, 9, 8, 0xF, 0x10, 0x17, 0x18, 0xE, 0xD, 0x11,
+0x12, 0x13, 0xB, ...` (alongside the earlier-known `0x0A, 0x15, 0x14, 0x02, 0x03`) — at least
+~20 distinct subsystem-init entries, ids scattered, not incrementing in table order.
+
+**This changes the framing for (A).** It's not a linear "stage N of M" sequence where
+progress could stall at stage 2 — it reads as a **boot-time subsystem registry**, walked once
+to initialize every listed subsystem (audio, physics, display-env [id=2, our known chain],
+etc.), each running its own one-shot init. There is no "next stage" counter to get stuck on;
+every entry plausibly already ran once during the ~15.17-15.75M setup window we've mapped
+repeatedly tonight.
+
+**Redirects (A):** "gameplay ready" is very unlikely to be a further position in *this* table
+— it's more likely a separate flag/condition checked by the main loop *after* all boot-table
+subsystems finish, or a per-subsystem "am I fully initialized" flag that one of these ~20
+init functions itself sets (or fails to set). Given the volume of subsystems here, I'd rather
+not fan out into per-entry static tracing without a sharper filter first. No Core.
+
+```text
+boot-table full dump (Claude) -- one-shot subsystem registry, not sequential stages
+  ~20 {id, fnptr} entries, ids scattered (2,3,4,5,8,9,A-F,10-13,17,18...), not table-order
+  redirects "gameplay ready" search away from "stuck at stage N in this table"
+  toward: a flag checked by the main loop AFTER all boot-table init finishes,
+    or set by one specific subsystem init among the ~20 -- needs a sharper filter
+```
