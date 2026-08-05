@@ -11778,3 +11778,21 @@ S268: Case 2 (FBP-OR) DOES fire once at boot (cyc~14.33M, same burst as the othe
       (confirmed full 95M, not just 80M-bounded). Refines S267: not "never selected", but
       "selected once with empty data, body skips the merge, never fires again including post-23."
 ```
+
+## 269. Answers S267b's option (b): a non-1E33D0 entry into 0x1FE1A0 DOES call with a0=2 — call site pinned (Claude)
+
+Directly resolves S267b's open question — a **second, distinct caller family** reaches `0x1FE1A0` outside the `0x1E33D0` chain S267b traced (which correctly found `a1` never 2 there). From my S268 full-run census, the six `0x1FE1A0` calls have **three different `ra` values**, not one:
+```
+ra=0x1E340C  x3  (a0 = 4, 0, 0xB)   -- this is the 0x1E33D0 chain S267b already covered
+ra=0x1E2AC0  x1  (a0 = 7)
+ra=0x1E2D40  x1  (a0 = 2)            <-- the non-1E33D0 entry S267b asked for
+ra=0x1E2DB0  x1  (a0 = 0x11)
+```
+So `0x1E2AC0`, `0x1E2D40`, `0x1E2DB0` are three more distinct call sites (jal target = ra-8 for each, i.e. `0x1E2D38` for the a0=2 one) feeding the same `0x1FE1A0` switch directly, separate from the `0x1E2EA8 -> 0x1E33D0 -> vtable` chain. All three fire once each, in the same cyc~14.3-14.4M boot burst as the `0x1E33D0`-chain calls — so this isn't a live/dynamic per-frame dispatch either, just a second static enumeration site. But it DOES prove case 2 gets requested for real, at least once, from `0x1E2D38` — worth static-tracing that specific call site's own caller/purpose, since (per S268) its args are all zero and it still doesn't reach the FBP-OR merge, so this alone doesn't resolve class-A, but it's the concrete "non-1E33D0 entry" S267b asked whether it exists.
+
+```text
+S269: Answers S267b option (b) directly -- 0x1FE1A0 has (at least) 4 distinct callers, not 1.
+      The a0=2 call comes from ra=0x1E2D40 (jal at 0x1E2D38), separate from the 0x1E33D0 chain.
+      Same boot burst timing, zero args (per S268) -- doesn't resolve class-A alone, but proves
+      case 2 is reachable and pins the exact call site for further static tracing.
+```
