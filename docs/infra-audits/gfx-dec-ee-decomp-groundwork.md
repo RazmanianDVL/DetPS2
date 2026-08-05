@@ -142,3 +142,29 @@ Artifacts (gitignored machine-local):
 - Seat #5 groundwork **done** tip base `0ec10e7` (M1 unrelated).  
 - Claude free to dual-ACK / continue C1 + MP2.  
 - Follow-on EE table-walker seat is shovel-ready without waiting on demand-gate.
+
+---
+
+## 9. Follow-on: path-table walkers (same session)
+
+Ghidra script `DecFindTableWalkers` → `table-walkers.txt` / `loaders-decomp.txt` (local).
+
+### 9.1 Code that touches the table region
+
+| Function | Role (from decomp) |
+|----------|--------------------|
+| **`FUN_00267090`** | “Set current package”: takes a path-descriptor; opens via `FUN_00222790(*(name),1)`; caches handle in globals |
+| **`FUN_001a44d0`** | Resource lookup by packed id `param_1` (hi16 bucket / lo16 entry); then `FUN_001a4960` + `FUN_001a4830` |
+| **`FUN_001a41b0` / `FUN_001a4200`** | Early boot: `FUN_00267090(PTR@0x50AD0C)` then load id `0` with table `0x50AD08` |
+| **`FUN_003e8170` / `FUN_001710b0` / others** | Frontend paths: `FUN_00267090(0x5A6E20)` then `FUN_001a44d0(0x10005, 0x50AD18)` |
+
+### 9.2 Implication for CLUT
+
+Real EE code loads Midway packages through **`FUN_00267090` → open → `FUN_001a44d0` resource ids**, not only through DetPS2’s PL-029 Host→Local feed. Next dig:
+
+1. Decompile **`FUN_001a4830` / `FUN_001a4960`** (post-lookup decode / register).  
+2. Decompile **`FUN_00222790`** (actual file open / buffer destination — confirm `0x01800000` class).  
+3. Trace whether any load path issues **GS CLUT / TEX0** after package open (or only index BITBLT).  
+4. Compare package-open path vs PL-029 residual: is palette expected from a **sibling resource id** under the same package?
+
+No Core this extension either — still docs/TRACE.
