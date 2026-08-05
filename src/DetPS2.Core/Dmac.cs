@@ -35,19 +35,21 @@ public sealed class Dmac : ISchedulable
     public uint DrainCyclesPerQw { get; set; } = 1; // Det cost model
 
     /// <summary>Cap on the CHCR-write force-pump loop (see its call site) — bounds how much
-    /// DMA progress a single CHCR register write can manufacture synchronously. Pre-A3 this
-    /// was a bare 512, i.e. up to 512*256=131072 cycles of DMA progress inside one MMIO write;
-    /// now that A1 made DrainCyclesPerQw load-bearing in DoNormalTransfer, each Step(256) call
-    /// here is genuinely cycle-costed, so capping the outer count is a real bound rather than a
-    /// vestigial one. Same reduction ratio A1 used for the GIF_STAT poll-pump (512/32=16,
-    /// matching that fix's 16x cut). Does NOT touch the path3Hold/daDisplayVif gate conditions
-    /// themselves — only how many force-steps run once that gate has already decided to fire.</summary>
-    private const int MaxChcrForceSteps = 16;
+    /// DMA progress a single CHCR register write can manufacture synchronously.
+    /// History: pre-A3 bare 512 (≤131072 cycles/write); A3 default 16 (GIF_STAT-class cut);
+    /// M1 residual Opt A default <b>1</b> (mirror GIF_STAT single-round: one Step(256) on STR).
+    /// Each Step is cycle-costed via A1 DrainCyclesPerQw. Does NOT touch path3Hold/daDisplayVif
+    /// gates — only how many force-steps run once that gate has already decided to fire.</summary>
+    private const int MaxChcrForceSteps = 1;
 
-    /// <summary>A3 root-cause/regression investigation only: restores the pre-A3 512-iteration
-    /// CHCR force-pump bound (the force loop itself still only fires under the same
-    /// path3Hold/daDisplayVif gate — this does not make the loop unconditional). Never set in
-    /// normal use.</summary>
+    /// <summary>M1 residual bisect: restore A3 product bound of 16 force-steps
+    /// (<c>DETPS2_CHCR_FORCE_LEGACY=1</c>). Ignored when pre-A3 kill-switch is set.</summary>
+    private static readonly bool ChcrForceLegacy16 =
+        Environment.GetEnvironmentVariable("DETPS2_CHCR_FORCE_LEGACY") == "1";
+
+    /// <summary>A3/pre-A3 root-cause only: restores the pre-A3 512-iteration CHCR force-pump
+    /// bound (<c>DETPS2_DISABLE_A3_CHCR_CAP=1</c>). Force loop still only fires under the same
+    /// path3Hold/daDisplayVif gate. Never set in normal use. Wins over legacy-16.</summary>
     private static readonly bool DisableA3ChcrCap =
         Environment.GetEnvironmentVariable("DETPS2_DISABLE_A3_CHCR_CAP") == "1";
 
@@ -866,7 +868,11 @@ public sealed class Dmac : ISchedulable
                         if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
                             Console.Error.WriteLine(
                                 $"[DMAC] CHCR force-pump fired ch={(Channel)channel} path3Hold={path3Hold} daDisplayVif={daDisplayVif}");
-                        int maxSteps = DisableA3ChcrCap ? 512 : MaxChcrForceSteps;
+                        // M1 residual Opt A: default one Step(256). Kill-switches: pre-A3 512,
+                        // then A3 legacy 16, else product MaxChcrForceSteps (1).
+                        int maxSteps = DisableA3ChcrCap ? 512
+                            : ChcrForceLegacy16 ? 16
+                            : MaxChcrForceSteps;
                         for (int i = 0; i < maxSteps && _channels[channel].Active; i++)
                             Step(256);
                     }

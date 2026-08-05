@@ -1,9 +1,11 @@
 # M1 residual — CHCR force-pump single-round / scheduler drain (design)
 
-**Status:** design shelf — **dual-ACK partial (2026-08-04 night)**; Core **parked**  
+**Status:** **Core implemented (M1 residual Opt A)** — 2026-08-04 late; demand-gate lifted by user correction via Claude seq0262  
 **Author:** grok (dual-idle free seat after M7-L1 honesty close)  
 **Parents:** `instant-progress-audit.md`, `instant-progress-rescan-g5.md` (R1)  
-**Scope:** `src/DetPS2.Core/Dmac.cs` CHCR STR multi-round force-step only
+**Scope:** `src/DetPS2.Core/Dmac.cs` CHCR STR multi-round force-step only  
+**Product:** `MaxChcrForceSteps=1` (single `Step(256)` on STR under existing gates).  
+**Kill-switches:** `DETPS2_DISABLE_A3_CHCR_CAP=1` → 512; `DETPS2_CHCR_FORCE_LEGACY=1` → 16 (A3 product, bisect).
 
 ---
 
@@ -67,12 +69,14 @@ GIF_STAT multi-round is already fixed to single optional `Step(128)`. CHCR is th
 
 | ID | Question | Bias | Claude (seq0219) | Resolution |
 |----|----------|------|------------------|------------|
-| **M1R-Q1** | Accept Opt A (single Step on STR) as next Core seat? | Yes when dual free + demand | **Conditional yes** — design OK; Core only dual free + real demand, **not that night** | Design accepted; **Core parked** |
-| **M1R-Q2** | Default cap 1 vs keep 16 until claim A/B? | Prefer measure-first env | **Agree measure-first** cap=1 experimental env, not immediate default flip | **Measure-first only** when reopened |
-| **M1R-Q3** | Park until path-sync titles show STR stick pain? | OK | **Yes park** — no current STR-stick pain evidence | **Parked** with C1-TP / M6-b3 |
+| **M1R-Q1** | Accept Opt A (single Step on STR) as next Core seat? | Yes when dual free + demand | **Conditional yes** — design OK; Core only dual free + real demand, **not that night** | Design accepted → **Core landed** after user correction (seq0262) |
+| **M1R-Q2** | Default cap 1 vs keep 16 until claim A/B? | Prefer measure-first env | **Agree measure-first** cap=1 experimental env, not immediate default flip | **Superseded:** product default=1; legacy-16 via `DETPS2_CHCR_FORCE_LEGACY=1` |
+| **M1R-Q3** | Park until path-sync titles show STR stick pain? | OK | **Yes park** — no current STR-stick pain evidence | **Unparked** — user: no idle on demand-gate; implement shovel-ready seats |
 
 ```text
-M1 residual CHCR design
-  Opt A accepted; Core parked pending demand + dual free
-  measure-first env cap=1 when reopened; no 16→1 default tonight
+M1 residual CHCR Opt A LANDED
+  MaxChcrForceSteps=1 default
+  DETPS2_CHCR_FORCE_LEGACY=1 → 16 (A3)
+  DETPS2_DISABLE_A3_CHCR_CAP=1 → 512 (pre-A3)
+  gates path3Hold || daDisplayVif unchanged
 ```
