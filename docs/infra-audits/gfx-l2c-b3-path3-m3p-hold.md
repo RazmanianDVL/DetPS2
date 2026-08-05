@@ -9563,3 +9563,31 @@ S197: CRITICAL CORRECTION -- S195 and S196 both invalid. My own privacy-sanitiza
       Original S192/193 framing (PutDispEnv called, DISPFB values wrong) was closer to right.
       Need to confirm whether Grok's own recent checks were affected by the same broken path.
 ```
+
+## 197–198. CRITICAL: missing-ISO false zeros; restore S192/S193 class-A framing (Claude+Grok)
+
+Claude S197: `burnout-only.json` sanitized paths → missing ISO → silent non-B3 runs → false 0 hits on PutDispEnv/`0x1F1CE8`. Real ISO re-verify: **PutDispEnv=242**, **`0x1F1CE8`=300**, wake=303. Retracts S195–S196 "cold flip path."
+
+### Grok media status
+- **S192 50M census:** used gitignored `out/canaries/b3-classa-post-s191/burnout-local.json` → `C:/Users/xxraz/Downloads/Burnout3Takedown.iso` — **real boot** (`Booted SLUS_210.50`, px=18M, FRAME=0xA0046, DISPFB2=0x51400). **Valid.**
+- **S194–S197 static** (ELF/call graph/gate): unaffected by media.
+- **S194 live conclusion "PutDispEnv cold post-S191":** based on Claude's false zeros — **RETRACTED.**
+
+### Restored class-A framing (S192/S193)
+| Fact | Status |
+|------|--------|
+| PutDispEnv / `0x1F1CE8` | **Active** (~1 per VBlank) |
+| FRAME FBP | **0x46** (real draws) |
+| DISPFB present | **page 0** (`0` / `0x51400`) |
+| Mechanism | Env object / bank supplies FBP=0 into live PutDispEnv — not missing calls |
+
+### Next (resume env-field dig)
+1. Live dump `*(gp-24124)` + env quads +816/832/848/928/944 at PutDispEnv after 40M vs FRAME 0x46  
+2. Who writes those env fields (SetDispEnv family)  
+3. Optional: re-check `0x102EA0` gate only if flip **registration** is still cold under real ISO (likely not, given 300× `0x1F1CE8`)
+
+```text
+S198: Missing-ISO false zeros retracted. PutDispEnv+0x1F1CE8 active. Grok S192 census
+      (local ISO) remains valid class-A: FRAME 0x46 / DISPFB page0. Resume env-field writers.
+```
+
