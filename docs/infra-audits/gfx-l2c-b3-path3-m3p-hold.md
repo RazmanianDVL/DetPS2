@@ -3235,3 +3235,62 @@ S1 + hugeCopy fix implemented (Claude) -- both correct, smoke green, B3 outcome 
   keeping both fixes (real, zero-regression) but the actual 1865 gate is still unidentified
   next: find what REALLY drives cdvd 609->1865 (not STAGEHED iovec) and what stops it there
 ```
+
+---
+
+## 52. Found the real 609→1865 driver: real GTFS FILEIO opens via RealSifRpc.cs — and exactly where it stops (Claude)
+
+Added a temp caller-attributed trace on `Cdvd.NoteHostReadSectors` itself (`[CallerFilePath]`/
+`[CallerLineNumber]`, reverted after use — cheap, no per-call-site edits needed) to see every
+single sector credit across the run with its real source location.
+
+### 52.1 The exact credit sequence
+
+```text
+cyc 15.5M-16.75M   ~20 small credits, all RealSifRpc.cs:3184 (early IRX-era opens) -> total 425
+cyc 28.00M         +183 Burnout3Assist.cs:2084 (STAGEHED plant)        -> 608
+cyc 28.00M         +1   Burnout3Assist.cs:2096 (HEADUS plant)          -> 609
+cyc 29.15M         +183 RealSifRpc.cs:4199 (STAGEHED, real GTFS open)  -> 792
+cyc 29.15M         +512 RealSifRpc.cs:4223 (FRONTEND.TXD, real open)   -> 1304
+cyc 29.15M         +1   RealSifRpc.cs:4242 (HEADUS, real open)         -> 1305
+cyc 29.40M         +560 RealSifRpc.cs:4390 (Global.txd, real open)     -> 1865
+(nothing further through 40M/50M)
+```
+
+The 792→1865 jump is **not** the quirk assist at all — it's a **real, general** GTFS-TOC-open
+routine (`RealSifRpc.cs`, shared FILEIO RPC infrastructure, not title-specific) opening
+`STAGEHED.BIN`, `FRONTEND.TXD`, and `HEADUS.BIN` for real, plus a separate real RPC-driven open
+of `Data\Global.txd`. Confirmed with the existing `DETPS2_TRACE_RPC=1` flag — only **7** total
+`[GTFS]` events in the whole 40M-cycle run, ending with:
+
+```text
+[GTFS] fno=0x3 send=64 arg=0x1C1F6000: ...ASCII "Data\Global.txd"...
+[GTFS] open path="Data\Global.txd" fd=4 size=1146112 fno=0x3
+```
+
+**That's the last GTFS event of the entire run.** The game's own real RPC call successfully
+opens `Global.txd` (fd=4, real 1,146,112-byte size) — and then never issues a follow-up call
+to actually read it. Confirmed this specific `fno=0x3` open call carried no `{dest,size}`
+pointer pair in its 64-byte argument buffer (the buffer is fully consumed by the ASCII path
+string), so this is a *bare* open — completely normal FILEIO usage expects a separate read()
+RPC call afterward, which never comes.
+
+### 52.2 Sharpened next question
+
+Not "why does cdvd plateau at 1865" (answered: five real files opened, matching exactly) —
+now precisely: **why doesn't the game issue a read (or lseek+read) RPC call for `Global.txd`
+(fd=4) after successfully opening it?** Candidates: the open's response (fd value) isn't
+reaching the game's own code in a form it recognizes as ready; the EE thread that issued
+open() is blocked on something (semaphore/callback) before it can issue the follow-up read;
+or the real game logic has its own gate before reading this specific file that isn't met.
+This is the same "find the missing real mechanism" shape as everything else fixed tonight,
+now one level closer to the metal than the STAGEHED-iovec detour in §49-§51.
+
+```text
+real cdvd driver found (Claude) -- GTFS FILEIO opens, not the STAGEHED iovec walk
+  609->1865 comes from RealSifRpc.cs's real, general GTFS-open routine (5 real file opens)
+  DETPS2_TRACE_RPC confirms: last of only 7 total GTFS events is a bare open of Global.txd
+    (fd=4, real size 1146112) -- no read ever follows, for the rest of the run (40M-50M+)
+  sharpened question: why no follow-up read() RPC call after the successful Global.txd open
+  next: trace the open response delivery + whatever EE thread issued it, post-open
+```
