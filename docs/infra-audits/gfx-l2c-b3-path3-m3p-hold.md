@@ -10450,3 +10450,29 @@ Open design (no dual-ACK yet): EE path that should set `*(handle+588)=9` (or arm
 S219: status@handle+588 never leaves 0; empty STREAMED likely never completes I/O status path.
 ```
 
+
+## 220. Is C5_V1 representative? **No — sole zero STREAMED among 37** (Grok+Claude)
+
+Claude seq0678: blind PulseLogoPad may land on atypical slot; prefer A/B other track.
+
+### STREAMED.DAT census (Iso9660)
+- **37** STREAMED.DAT files on ISO
+- **Exactly 1** has size 0: `TRACKS/US/C5_V1/STREAMED.DAT`
+- All others multi-MB (US C1 ~12MB, C2 ~8.7MB, C3 ~6.9MB, …)
+
+So C5_V1 is **not** a normal playable circuit’s streamed layer — unique empty asset. Blind 16-phase START/CROSS/D-pad mash can easily land here.
+
+### Pad path
+`PulseLogoPadAdvance`: 16-phase blind START/CROSS/Circle/… no deliberate list index. Confirmed no `--pad-script` in our canaries.
+
+### tlist.bin
+4KiB binary (hashes/flags, not path strings) — not a quick path name map.
+
+### Preference
+1. **Cheap A/B:** pad-script with N× DOWN (or right) then CROSS after menu chrome, TRACE_RPC for `tracks\US\C*` path; if C1/C2 with nonzero STREAMED clears case10, empty-stream fix is lower priority.
+2. Keep empty-stream status=9 as optional infra later if real titles need it.
+
+```text
+S220: C5_V1 STREAMED is the only 0-byte of 37; atypical. Prefer deliberate track pick A/B.
+```
+
