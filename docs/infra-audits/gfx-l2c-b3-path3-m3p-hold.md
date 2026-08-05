@@ -4875,3 +4875,63 @@ S86: id=14 claims successfully once (cyc=29.4M) but resource ptr at +16 is 0 —
      deepest point reached in tonight's causal chain. Next: find the writer of *(0x1D6D880+16)
      and why it's never reached.
 ```
+
+## 87. MAJOR CORRECTION to S80/S85/S86's "final value" dumps: `disasm`'s big-cycle-count mode never drives `OnHostPresent` — those snapshots measured a completely different, assist-free boot trajectory (Claude)
+
+Caught this myself watching `*(0x1D6D890)` live and getting a result that flatly contradicted
+S86's "dump at 95M shows +16=0". Root cause: I used `detps2 disasm <media> 95000000 addr:len`
+for all of S80's mode/phase dump and S85/S86's resource-object dumps. **`disasm`'s handler
+(`Program.cs:1573-1598`) calls `dsys.RunFor(dcycles)` once, directly — it never calls
+`ActiveQuirk.OnHostPresent`.** Every other live check tonight (pcbreak, watch, the temp dump
+hooks) went through `blocker-trace --host-present`, which *does* drive `OnHostPresent` every
+1M-cycle slice — and `Burnout3Assist.Step()` (the source of essentially every finding since S49)
+only runs from there. So `disasm`'s 95M-cycle boot is a **materially different, unassisted run**
+— not a cheaper way to read the same final state, a different simulation entirely. I used it
+because it was fast and convenient for one-off reads; that convenience produced wrong data.
+
+**Re-ran the exact same 5 fields properly**, via a temp one-shot dump hook inside
+`blocker-trace --host-present`'s real loop at `doneCycles>=90_000_000` (reverted after use —
+`git diff --stat` 11 insertions, `git checkout --`, clean):
+
+```
+cyc=90,000,000
+  0x0051BA88 (mode ptr)     = 0x00000000        same as before
+  0x0051BA8C (pending ptr)  = 0x00000000        same as before
+  0x0051BAA0 (phase field)  = 0x00000003        <- NOT zero. S80 was wrong on this field.
+  0x0051BAD0 (mode-state)   = 0x00000000        same as before
+  obj+0    (0x1D6D880) = 0x004DE030             <- real header value, not 0 (S85/86 wrong)
+  obj+4    (0x1D6D884) = 0xFFFFFFFF             <- still claimed, did NOT revert to 0
+  obj+8    (0x1D6D888) = 0xFFFFFFFF             <- -1, not 0 (still satisfies bltz-ready trivially)
+  obj+16   (0x1D6D890) = 0x0067D880             <- REAL resource pointer, NOT 0
+  obj+2436 (0x1D6E204) = 0xFFFFFFFF             <- not 0
+```
+
+**S85 and S86 are both wrong in their specific numbers.** Under the correct trajectory: id=14's
+resource claim actually **succeeds** — `+16` holds a real pointer (`0x67D880`, same address
+family as the `0x6754C0` display-env object), `+4` stays claimed (doesn't revert), `+8` is `-1`
+(also a valid ready-sentinel via the `bltz` branch). None of S86's "auto-unclaim" narrative holds
+up; that was inferred from data measured under the wrong simulation. **S80's "mode/phase region
+untouched by S68" is also wrong** — the phase field at `0x51BAA0` is `3`, not `0`, meaning phase
+*did* advance since boot (matches S64's phase=2 finding, so it moved 2→3 at some point — new,
+previously unreported information, not previously covered by any section tonight).
+
+**What still stands, unaffected:** every finding this session that came from `pcbreak`/`watch`
+under `blocker-trace --host-present` (S66-68, S71, S73-75, S77-79, S81-84, and S86's *own*
+`pcbreak=003E85FC:003E8620` trace showing the claim at cyc=29.4M) used the correct driven
+simulation and is not in question. Only the `disasm`-based "final value" snapshots are affected.
+Mode-state (`0x51BAD0`) itself is still confirmed `0` by both methods — that part of S86's
+conclusion (mode-state never reaches whatever triggers `0x30D8DC`'s write-5) still holds; only
+the *reasoning path* ("id=14 resource never installed") was wrong.
+
+**Going forward:** do not use `disasm <media> <bignum> ...` for any live-value check that needs
+`Burnout3Assist` (or any quirk module) active. Use `blocker-trace --host-present` with a
+temp one-shot dump hook, exactly like S77/S86's own live checks did it right.
+
+```text
+S87: CORRECTION — disasm's big-cycle mode never drives OnHostPresent, so S80/S85/S86's "final
+     value" numbers were measured on an unassisted, different boot trajectory. Re-measured
+     correctly: phase=3 (not 0), obj+16=0x67D880 real pointer (not 0), obj+4=-1 still claimed
+     (not reverted). id=14's resource claim actually succeeds. Mode-state 0x51BAD0=0 still holds
+     (confirmed both ways) — that's still the real open gate, just not for the reason S86 gave.
+     Everything from pcbreak/watch under blocker-trace --host-present is unaffected.
+```
