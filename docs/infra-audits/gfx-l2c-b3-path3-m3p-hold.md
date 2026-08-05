@@ -11737,3 +11737,23 @@ S267b: 1E33D0 a1 live={0,4,11} only; zero a1=2. No ELF call site plants case 2.
        FBP-OR exists but is never asked for. Next: other entries to 1FE1A0, or
        whether case 2 is truly dead on this title.
 ```
+
+## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
+
+Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
+```
+a0=0x0, 0x2, 0x4, 0x7, 0xB, 0x11 -- one call each
+```
+**Case 2 (FBP-OR) genuinely does get selected once** — refines S267's "case 2 never runs." But:
+- All six calls cluster at **cyc=14.26M-14.42M** — the same initial-boot burst as case 4, not a later "retarget" event, and well before readiness-23 (42.1M).
+- The specific a0=2 call has **a1=0, a2=0, a3=0** — no real FBP data passed.
+- `0x1FDBA0` (the actual FBP-OR `andi 0x1FF` merge instruction) is **still 0 hits across the full 95M run** — confirmed by re-running S267's check unbounded too.
+
+So case 2's single invocation is effectively a no-op: selected, but with empty arguments, and its body evidently branches around the merge instruction before reaching it (early-return on zero args, or a precondition check I haven't traced). This is a more precise finding than "case 2 never dispatched" — it dispatches once, harmlessly, as part of enumerating something at boot (env slots 0/2/4/7/0xB/0x11?), and never fires again at all afterward, including post-readiness. The real gap remains: nothing ever calls `0x1FE1A0(a0=2, <real FBP args>)` with actual data to retarget DISPFB.
+
+```text
+S268: Case 2 (FBP-OR) DOES fire once at boot (cyc~14.33M, same burst as the other 5 case
+      values) but with all-zero args -- 0x1FDBA0 merge instruction still never executes
+      (confirmed full 95M, not just 80M-bounded). Refines S267: not "never selected", but
+      "selected once with empty data, body skips the merge, never fires again including post-23."
+```
