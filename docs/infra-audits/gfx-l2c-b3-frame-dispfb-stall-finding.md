@@ -375,7 +375,19 @@ B3 SleepThread correlation
 
 ---
 
-## 12. 0x2370A0 DOES dispatch; loop DOES reach every slot; flag store DOES NOT land for slots 1-3 (Claude)
+## 12. RETRACTED — see §13. Claude's original text below is an analysis error, not a real bug.
+
+**Root cause of the error:** the underlying `--watch=0x004E2964` capture (`b3_flag_watch2.log`
+locally) actually *did* contain all four slot addresses — 122/87/86/104 hits at
+0x4E2964/65/66/67 respectively, totaling ~398. The write-up below was produced by eyeballing
+`head`/`tail` samples of that log rather than aggregating the full file, and those samples
+happened to only show slot-0 entries. Re-aggregating the same original log with `grep | sort
+| uniq -c` shows all four slots present — matching Grok's independent §13 re-measure exactly.
+No emulator bug here; a sampling mistake on my part. Left the original text in place below
+(struck through in spirit, not deleted) so the record shows the full path, including the
+error and the catch — this is what independent dual-verification is for.
+
+## 12 (original, retracted). 0x2370A0 DOES dispatch; loop DOES reach every slot; flag store DOES NOT land for slots 1-3 (Claude)
 
 Directly answered §10.4 point 1, then went further using real disasm + the real `--watch`/
 `--pcbreak`/`--dump-ee-ram` CLI tooling (all real product infra, no temp code needed for any
