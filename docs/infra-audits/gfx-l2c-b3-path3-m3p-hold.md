@@ -2498,3 +2498,53 @@ id=2 body read (Claude) -- real id=2 = 0x207E30, a 16-bit packed-color pack/unpa
   sharpest concrete candidate yet for "graphics-relevant id that's never requested"
   next: static call-site search specifically for this id's vtable slot (Grok's open Q1)
 ```
+
+---
+
+## 41. id=2 (color-pack) callsite: real wrapper, dead-at-source one level up (Grok)
+
+Claude S40: `0x207E30` is 16-bit 0555/1555 pack (case 0x100) / fixed-point normalize (case 0x500); sibling `0x207F28` (id=3) unpacks. Graphics-adjacent outlier among never-fired.
+
+### 41.1 Proven dense-slot call site
+
+```text
+0x001E6890:  // thin wrapper — no static callers
+  lui   v1, 0x67
+  ...
+0x001E68A0:  lw    v0, 0xC20(v1)   // 0x670C20 = dense[2] = id2 handler
+0x001E68A8:  jalr  v0
+0x001E68AC:  move  a0, sp          // stack buffer out
+
+0x001E68C0:  // sibling wrapper for id=3
+0x001E68D4:  lw    v0, 0xC24(v1)   // dense[3]
+0x001E68DC:  jalr  v0
+```
+
+High-confidence scan (`lui 0x67` + `lw` into dense range + `jalr` same reg): **slot[2] has exactly this one wrapper**. Not "nothing ever reads vtable-slot[2]" — the wrapper does. (Noisy bare `lw off=0x50` hits are mostly stack/struct false positives.)
+
+### 41.2 Runtime: zero hits
+
+`--pcbreak=001E68A0:001E68A8` and `--pcbreak=00207E30` over 20M host-present: **0 PCBREAK lines** each.
+
+### 41.3 Static: wrapper itself is unreferenced
+
+| Query | id2 wrap `0x1E6890` | id3 wrap `0x1E68C0` | id4 factory `0x1E74F0` (fires) |
+|-------|---------------------|---------------------|--------------------------------|
+| `jal` | **0** | **0** | **12** |
+| `j` / bal / branch | 0 | 0 | 0 |
+| word ptr in ELF | 0 | 0 | 0 |
+| `lui`+addiu construct | 0 | 0 | n/a (has jals) |
+
+Same shape as dead `0x1A6290` / `0x248518`: **handler installed, thin wrapper exists, nothing in the binary ever targets the wrapper**. Dead one level above the color-pack body — not a missing runtime precondition on a live call edge.
+
+### 41.4 Side note: many never-fired slots have similar wrappers
+
+High-confidence dense-slot wrappers also exist for ids `{6,7,8,9,0xD,0xF–0x13,0x17–0x19,0x1C}` (mostly `0x1E7xxx`). Fired ids that appear in this scan: `{0x14,0x15}` (plus other non-`lui 0x67` paths for `{1,4,0xA,0xC}`). Full "which of 22 have any live call edge" still open if wanted; id=2 specifically is answered.
+
+```text
+id2 callsite RESULT
+  real wrapper 0x1E6890 jalrs dense[2]; sibling 0x1E68C0 -> dense[3]
+  runtime 20M: zero hits on wrapper and on 0x207E30
+  static: wrapper has zero jal/j/bal/word/construct refs (dead-at-source)
+  NOT "no one reads slot[2]"; IS "no one calls the only reader"
+```
