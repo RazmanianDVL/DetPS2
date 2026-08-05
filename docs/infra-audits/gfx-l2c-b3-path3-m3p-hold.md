@@ -124,3 +124,71 @@ B3 PATH3/M3P dig
   No Path2-sticky block on drain
   Next: EE reason for missing final unmask (not more cycle budget)
 ```
+
+---
+
+## 8. FQC-honesty hypothesis pursued and REFUTED — the historic 0x1F1A28 loop is never even entered (Claude)
+
+Took §7 item 1 (EE why-no-unmask). Started from `Gif.cs`'s own extensive prior-investigation
+comments (lines 121-134, 636-660, 728-730) describing a previously-known Burnout 3 path-sync
+loop at `0x001F1A28` that spins on `GIF_STAT.FQC` after `MSKPATH3` — a real, documented
+mechanism (`M1-a`) from before tonight's session, with a narrow fix (`_path3RaceEvidencePolls`)
+already landed for one specific race scenario.
+
+### 8.1 First check: is the M1-a FQC-honesty mechanism actually the gap here?
+
+Read `EnqueueHeldPath3` (`Gif.cs:469-499`) closely: it **already** sets `_fifoCount` from the
+real held-queue total, capped at the real 16-QW hardware FIFO depth (lines 495-498), every
+time data is queued under mask — not just via the narrow `_path3RaceEvidencePolls`
+fabrication. So `ReadStat()`'s `fqc = _fifoCount/4` genuinely goes non-zero and honest the
+moment any Path3 data is held, independent of the race-evidence mechanism. **My first
+hypothesis (FQC stays dishonestly 0 for the held-queue case) does not hold — the code already
+handles this correctly.**
+
+### 8.2 Direct measurement: does the EE even reach that poll?
+
+Disassembled `0x1F1A00-0x1F1B00` (real code, `disasm burnout-only.json 20000000 1F1A00:100`):
+
+```
+1F1A08: lw v0,0(t4)
+1F1A10: and v0,v0,v1        ; v0 &= 0x1F000000
+1F1A14: bne v0,zero,0x1F1A48  ; if already nonzero, SKIP the FQC poll entirely
+...
+1F1A24: ori v1,v1,0x3020    ; v1 = GIF_STAT address
+1F1A28: lw v0,0(v1)         ; <- the historic poll PC
+1F1A2C: and v0,v0,a0        ; v0 &= 0x1F000000 (FQC field)
+1F1A3C: beq v0,zero,0x1F1A28  ; spin while FQC==0
+1F1A48: ...continues regardless of which path was taken
+```
+
+`--pcbreak=0x001F1A28:0x001F1A28` over the full 35M window: **zero hits.** The EE never
+executes this instruction at all during B3's stuck state — meaning the earlier check at
+`0x1F1A14` is always already satisfied (whatever `t4` points to is always nonzero when this
+code runs), and the FQC poll is skipped every time, not entered and stuck.
+
+### 8.3 Conclusion
+
+**Refuted.** The historic `0x1F1A28` FQC path-sync loop — real, previously documented,
+correctly fixed for its own scenario — is not what's blocking B3's final unmask. Whatever
+`Gif.cs`'s comments describe from prior investigation either applies to an earlier moment in
+this same title's boot (before the stuck window) or to a different title/scenario entirely;
+either way it does not explain the current symptom. Not proposing any FQC-related Core
+change — none is needed here.
+
+### 8.4 Handing back to §7 item 1 as originally scoped
+
+This doesn't answer "who issues MSKPATH3 and why the final unmask never happens" — it only
+rules out one specific, plausible-looking historic mechanism. The real next step is still
+Grok's original framing: find the actual PC/RA of the VIF `MSKPATH3` write instruction(s) and
+trace what condition gates the matching unmask, without assuming it's FQC-related. `t4`'s
+value at `0x1F1A08` (whatever real state it reads) might be worth a look if this seat
+continues — it's the thing that's *always* true here, which could itself be informative about
+what the game already knows/assumes at this point.
+
+```text
+FQC-honesty hypothesis (Claude) -- REFUTED
+  EnqueueHeldPath3 already sets honest FQC from the real held queue -- not the gap
+  --pcbreak=0x1F1A28 -> zero hits in 35M -- EE never enters this poll at all
+  historic path-sync loop doesn't explain current stuck state
+  next: trace real MSKPATH3 write site + matching-unmask gate directly (Grok's original ask)
+```
