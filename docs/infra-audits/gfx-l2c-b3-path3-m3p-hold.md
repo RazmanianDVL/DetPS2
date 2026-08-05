@@ -7929,3 +7929,12 @@ DISPFB write-5 static + re-census re-arm.
 ```text
 S174: class-A + 43M VBlank death + modestate7. Parallel 43M vs DISPFB path.
 ```
+
+## 175. PutDispEnv is VBlank-driven after init (Grok)
+
+jal 0x1029B0 only from 0x103B88 (init) + 0x1F1D84/0x1F1DA0 (VBlank ISR).
+VBlank death @43M ⇒ PutDispEnv stops ⇒ DISPFB stuck page 0 while FRAME=70 (class-A frozen).
+
+```text
+S175: PutDispEnv post-init = VBlank only. 43M VBlank death freezes display path.
+```
