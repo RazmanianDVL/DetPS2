@@ -1199,3 +1199,27 @@ Post-15.5M heatmap (Claude)
   reads as real ongoing simulation (collision/object matching), not obviously the stall
   real decisive window is narrower: 14.4M-15.5M (blit-build to flag-cluster gap), not this one
 ```
+
+### 23.5 Submit path: built, never DMA'd (Grok)
+
+Call chain all 1× @ cyc=**14429376**:
+
+```text
+0x228328 → 0x19EE40(a0=0x665EC0) → 0x21A290 builder
+                                  → 0x365880 stub
+                                  → 0x251840 ×3 (object float init, not DMA)
+```
+
+| Probe | Result |
+|-------|--------|
+| `--watch=67CDD0` (TRXDIR reg-id slot) | 1 write `0x53` @ `0x21A318`; **0 later EE reads** |
+| `--find-transfer=67C000:4000` | **no transfer touched this range** (214 total transfer events logged) |
+| `--watch=665EC0` (object) | few post-build EE reads (`0x19E8EC`, `0x2271B4`×4) — object still touched; packet slot not |
+
+**Verdict:** the one-shot "TRXDIR-shaped" build is **not submitted** via DMAC/GIF. Zero L2L is explained by non-submit, not by Soft-GS rejecting a real L2L. Whether this buffer is even a GIF packet vs an internal Midway command list still open — either way nothing bulk-moves it after build.
+
+```text
+builder once @14.4M → write 0x53 to 0x67CDD0 → never read, never DMA
+object 0x665EC0 still lightly touched later
+next: who should walk/submit (starved after 15.5M?); Claude 14.4-15.5M heatmap
+```
