@@ -6666,3 +6666,18 @@ S64: current never non-null. Mode SM region has **zero** re-arm jals. Live: dump
 S137: 0x1322B0 readiness = vtable on mode-current *(0x51BA88), not 0x28B160 v0.
       Next live: a0/t9/v0 at jalr 0x1322E0; is current still null?
 ```
+
+## 137b. Mode-current promote is what sets mode-state=7; S64 null is stale (Grok)
+
+Only non-zero current writers: `0x132810` / `0x132928` (current:=pending, then mode-state:=7)
+and zeros at mega-init/teardown. Pending set at `0x131F40` (from state 5) and `0x1337B4`
+(pending:=mode object `0x51A6A8`).
+
+Live modestate=7 **proves promote already ran** → current was non-null at that instant.
+S64 "current always null" is pre-S128. Live next: dump a0 at `0x1322D4` (is it `0x51A6A8`?),
+then v0 after jalr `0x1322E0`. Note mode-state store cell `0x51BACC` vs doc watch `0x51BAD0`.
+
+```text
+S137b: modestate=7 == promote ran; current was installed. Fail is vtable on that object,
+       not null current. Dump a0/t9/v0 at 0x1322E0.
+```
