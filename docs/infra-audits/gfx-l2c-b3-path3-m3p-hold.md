@@ -11395,3 +11395,25 @@ S257: DISPFB2=0x51400 means FBP=0 FBW=640 PSM=10 — present FBP0 is correct dec
       draw still at FRAME FBP 0x46. Page mismatch remains the class-A lit wall.
 ```
 
+
+## 258. env+0x10 DISPFB field: sole writers bake **0x51400** once at init (Grok)
+
+### Live PutDispEnv a0 (forces, 95M)
+Double-buffer envs: `0x675810` / `0x675838` (plus early `0x6754C0`). Flip ISR `ra=0x1F1D8C` dominates after boot.
+
+### Watch env+0x10 (DISPFB payload)
+| Addr | Writer PC | Value |
+|------|-----------|--------|
+| `0x675820` (0x675810+16) | **`0x1FDFB8`** sdl/sdr | **0x00051400** once |
+| `0x675848` (0x675838+16) | **`0x1FE008`** sdl/sdr | **0x00051400** once |
+
+No later writers. No FBP=0x46 ever stored in the env buffer. PutDispEnv faithfully copies this baked value every flip.
+
+### Static
+`0x1FDFB8` sits in display-env **init** (near `0x1FDE00`) that builds DISPFB with mask/or of FBW/PSM and **FBP cleared** (and-mask path). One-shot plant of page-0 display format.
+
+```text
+S258: env+0x10 only written at init 0x1FDFB8/0x1FE008 = 0x51400 (FBP0). Flip never
+      refreshes FBP to FRAME 0x46. Missing: runtime env update / SetDispEnv after mode.
+```
+
