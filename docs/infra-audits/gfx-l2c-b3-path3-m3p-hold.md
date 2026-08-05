@@ -8071,3 +8071,50 @@ Preempt healthy sp=0x1FFFDA0 @0x1F2508; SaveOut fromSyscall sp=0x2001EE0 pc=0x12
 ```text
 S177: sp replaced not grown. Pin syscall num/args at transition.
 ```
+
+## 177. Ruled out queue-loop's own code; transition likely interrupt-driven, not mainline syscall (Claude)
+
+Continuing the live half of S176/S177. `--trace-threads` confirms **no other thread's events
+occur between cyc=41,942,304 and cyc=42,008,640** — tid=1 runs completely solo for that
+66,336-cycle stretch (self-contained, not caused by another thread's interference).
+
+**But `--pcbreak=001F2500:001F2700` across the same run shows the last hit in that whole address
+range at cyc=41,999,984, still at `pc=0x1F2508` (mid-loop, one iteration short of even reaching
+the loop's own exit check at `0x1F2518`).** No hits anywhere in this range for the remaining
+~8,656 cycles up to the transition at 42,008,640 — meaning PC leaves `0x1F2500-0x1F2700` entirely
+before the SaveOut, contradicting the expectation (from static disasm) that it would fall through
+to the `DI`+COP0-spin at `0x1F251C` or the calls at `0x1F25D8`/`0x1F25FC` still inside this range.
+
+**Working theory, refined**: the `SaveOut ... fromSyscall` label doesn't necessarily mean a
+synchronous MIPS `syscall` trap in tid=1's own mainline code — this KernelHle appears to label
+both real syscalls *and* asynchronous interrupt-driven saves the same way. Given the queue loop's
+own DI/EI critical-section pattern is specifically there to guard against being interrupted
+mid-update, and execution vanishes from its address range entirely without a matching exit,
+**a hardware interrupt landing mid-loop and diverting into the kernel's own exception/dispatch
+path (the same `EnterException`/vector machinery established earlier this session for VBlank)
+is the more likely mechanism** — not a plain function call inside this loop's own code.
+
+This would also explain the timing relationship to S175/S176: tid=1's sp becomes bad at
+cyc≈42,008,640 (this interrupt-driven event), sits dormant for ~1M more cycles (thread 1 remains
+`currentThreadId` throughout, still making *some* progress), and only becomes fatal at
+cyc=43,000,000 when the *next* real VBlank interrupt tries to use this same already-corrupted
+context and hangs for good inside `0x10CCD0` (S175). Two events, one shared root: whatever
+corrupts tid=1's sp at 42.0M, VBlank simply the first thing at 43.0M unlucky enough to depend on
+it working correctly.
+
+**Handing back for joint next step** rather than continuing to dig alone — this needs either (a)
+COP0/exception-state instrumentation at the exact 42,008,640 transition (checking `EPC`/`Cause`/
+`eretStack` right as the SaveOut fires, to confirm it's genuinely interrupt-driven), or (b) a
+different tracing approach that isn't PC-range-limited, since the diverting code's address is
+unknown by construction if it's an async interrupt vector.
+
+```text
+S177: Ruled out the queue-loop's own body/DI-spin/inline-calls as containing the transition
+      instruction — PC leaves 0x1F2500-0x1F2700 for good ~8,656 cycles before the SaveOut,
+      never falling through to the expected exit path. Confirmed self-contained to tid=1 (no
+      other thread's events in the window). Refined theory: this looks like an asynchronous
+      interrupt landing mid-loop and diverting through the kernel's own exception path, not a
+      synchronous syscall in the loop's own code — same class of mechanism as the VBlank/EnterException
+      machinery already established this session. Needs COP0-state instrumentation at the exact
+      transition cycle to confirm.
+```
