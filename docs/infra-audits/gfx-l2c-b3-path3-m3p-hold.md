@@ -6392,3 +6392,18 @@ S129: CONFIRMED — S128's Assist fix passes every required S126-bar criterion u
       sequential further SM work). Second real fix landed and verified tonight, same discipline
       as S98.
 ```
+
+
+---
+
+## 129–130. S128 verified; night synthesis; next is gate=5 (Claude+Grok)
+
+**S129:** Assist audio complete PASS — ctx 0x1F361F0, modestate≠0, phase 23, PATH3 drained.
+gate=6 lit=0 stretch unmet.
+
+**S130 synthesis:** S68 → S98 (GTFS) → S128 (audio) → mode SM live. Open: mode SM must
+write gate 5 (`0x30D8DC`) for DISPFB retarget / lit.
+
+```text
+S130: two dual-ACK lands verified; next thread gate=5 via mode SM cases
+```
