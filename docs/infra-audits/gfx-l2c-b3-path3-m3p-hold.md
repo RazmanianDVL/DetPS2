@@ -9913,3 +9913,71 @@ S204: Static — after relocate, advance copies +0x98..A4 onto gate and case22
       proven success shape; tilts A over B. Need live 2BCD5C/2BCE4C/21E100 census.
 ```
 
+
+## 205. LIVE — advance DOES complete post-S171; 0x2BCE4C "0 hits" was delay-slot PCBREAK blind spot (Grok)
+
+**Canary:** `out/canaries/b3-s204-advance-census` — 95M, real ISO+BIOS, S171 Assist on,
+`--pcbreak=002BCB50:002BCE4C --host-present`.
+
+### Key census
+
+| PC | Hits | Meaning |
+|----|------|---------|
+| `0x2BCB50` | 3 | case3 flag poll |
+| `0x2BCD50` | 1 | advance entry |
+| `0x2BCD5C` | 1 | **returned from 0x2B7110** (scrub worked) |
+| `0x2BCE18` | 1 | jal release 0x2223C0 |
+| `0x2BCE48` | 1 | `b → case22` with **v1=0x16 (22)** |
+| `0x2BCE4C` | **0** | `sw state=22` — **delay slot of 0x2BCE48; PCBREAK never logs delay slots** |
+| `0x2BCB64` | 4 | case22 body (1 fall-through + 3 re-entries) |
+| `0x2BCB74` | 4 | after `0x21E100` return |
+| `0x2BCBF4` | 1 | `lw +0xA4` |
+| `0x2BCCF8` | 1 | **`sw state=23`** (zero-+0xA4 alternate path) |
+
+### Slot values at advance copy (pre-execute PCBREAK, cyc≈40.58M)
+
+Resource `a3=0xB6D880` after scrub+relocate:
+
+| Slot | Value after 0x2B7110 | Notes |
+|------|----------------------|-------|
+| +0x98 | `0x00BFA1C0` | real absolute (from rel 0x8C940) |
+| +0x9C | `0` | empty |
+| +0xA0 | `0` | **scrubbed** (was ISO int 10) |
+| +0xA4 | `0` | empty |
+
+Scrub TRACE: `slots=4` @40.45M then `slots=1` @40.50M (matches S171 verify).
+
+### Case22 args to `0x21E100`
+
+Always effectively **`a1=0, a2=0`** (gate +0x9C/+0xA0 zero); `a0` = +0x98 pointer after delay-slot load.
+`0x21E100` returns v0=0 three times and v0=1 once (at 0x2BCB74 samples).
+
+Zero +0xA4 takes `0x2BCE60 → 0x2BCC68` cleanup: clears +0x98..A4, **state:=23**, returns v0=1 from nested SM.
+
+### Causal-chain CORRECTION
+
+**Wrong (S201/S203):** "scrub → resource never completes → 0x2BCE4C never fires → readiness fail"
+
+**Right (S205 live):**
+```
+S171 scrub → 0x2B7110 returns → advance copies slots → state:=22 (delay slot, unlogged)
+  → case22 runs 0x21E100(a0=good+0x98, a1=0, a2=0)
+  → +0xA4==0 path → state:=23, clear slots
+  → readiness STILL fails for a reason ABOVE or BESIDE bare state=22 complete
+```
+
+`0x2BCE4C x0` in prior runs is **tooling**, not evidence of incomplete advance.
+
+### Design impact
+
+1. **D partial closed:** zero +0xA0/+0xA4 is what case22 *handles* via the state-23 alternate — not a hang inside advance. Whether that alternate is *legitimate success* for chrome/DISPFB is the open question.
+2. **B (nudge to complete)** is likely **wrong target** — complete already happens.
+3. **A (upstream why +0xA0=10 / missing real sub-ptrs)** still load-bearing if case22's zero-a1/a2 path is a degraded/fail mode that never arms DISPFB retarget.
+4. Next: what readiness `0x131480` / outer case7 checks **after** nested SM can return 1 from state 23; does mode leave 7 at all post-40.8M? Live modestate + readiness v0 after cyc 41M.
+
+```text
+S205: LIVE CORRECTION — post-S171 advance completes (2BCE48 x1, v1=22); 2BCE4C "0 hits"
+      is delay-slot PCBREAK blind spot. Case22 runs with a1=a2=0; +0xA4 zero → state=23.
+      Stall is NOT incomplete advance. Next: readiness/modestate after state 23.
+```
+
