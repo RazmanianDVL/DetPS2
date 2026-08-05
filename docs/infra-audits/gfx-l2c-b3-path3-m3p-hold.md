@@ -6503,3 +6503,15 @@ S133: 0x1322B0 confirmed returns 0 on all 8 real attempts. 0x28B160 (audio objec
       reconciling before concluding this is purely an audio-readiness gate. 0x30D8DC (actual
       write) confirmed 0 hits either way.
 ```
+
+
+---
+
+## 133–134. Case7 always calls 0x30D7C0; write-5 is nested case2 (Claude+Grok)
+
+S133: 0x30D7C0 x8 with 0x1322B0 v0=0. S134: fail path rejoins before 0x30D7C0;
+write-5 only when gate cell is 2, currently 6 (boot). Nested SM 0→2→5.
+
+```text
+S134: gate stuck at 6; need state 2 for write-5; also 0x1322B0 for mode advance
+```
