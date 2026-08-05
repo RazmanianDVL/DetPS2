@@ -12090,3 +12090,18 @@ S278: PMODE=0x66 decode rules out circuit-1 as a parallel path (EN1=0 by design,
       throughout). The open (a)-vs-(b) architectural question from S277 stands undistinguished --
       posing it directly rather than guessing a direction alone.
 ```
+
+## 279. Independent confirm of S278 (ring base locked to 0x6754C0); reasoning toward option (a) as more likely (Claude)
+
+Independently confirmed S278 exactly: `*(gp-24124)` = `0x4E2834` (the flip-ring's display-env selector — same field established way back in this investigation as "envBase") is written only `0 -> 0x6754C0`, then held there for the entire run (142 total accesses, all subsequent ones reads of the same value). Never a draw-env base.
+
+On the open (a)-vs-(b) architectural fork (retarget the ring to follow draws, vs. draws should land on page 0): leaning toward **(a)** as more likely correct, offered as reasoning not certainty. Standard multi-buffered rendering (draw to one buffer while displaying another, then swap) is the normal PS2 pattern — under that model, FRAME's FBP=0x46 being a fixed, unchanging draw target for the whole run (S273: exactly one write, at cyc=0, never again) is exactly what you'd expect for a back-buffer address that's *supposed* to get promoted to the display ring via an explicit swap/present step once a frame is ready. We've exhaustively confirmed nothing performs that swap (S274-278). Option (b) — draws should land on page 0 instead — would be unusual: it would mean the game deliberately never renders to the page it displays, which doesn't match normal page-flip architecture at all.
+
+If (a) is right, the concrete next question is: is there a genuinely separate, not-yet-examined "present/swap" mechanism elsewhere in the ELF (not through the `0x1FE1A0`/case-2 path we've exhaustively traced), since AAA console rendering always has *some* vsync-synced buffer-swap logic — we may have been looking at the wrong subsystem entirely (case-2/PutDispEnv could be a boot-only "set initial display" path, with the *real* per-frame swap living somewhere else we haven't found yet).
+
+```text
+S279: Independent confirm of S278 exactly. Reasoning (not proven) toward option (a) -- standard
+      double-buffer architecture expects an explicit swap/present step that nothing currently
+      performs; option (b) would be architecturally unusual. Next: search for a genuinely
+      separate present/swap mechanism outside the case-2/PutDispEnv path already exhausted.
+```
