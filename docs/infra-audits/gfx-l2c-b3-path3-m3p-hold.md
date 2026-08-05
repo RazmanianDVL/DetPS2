@@ -1549,3 +1549,52 @@ DMA-kick trace (Claude) -- exact write-site instrumentation, temp + reverted
     cursor at gp-24120 (buffer ptr) / gp-24128 (count), 8 bytes/entry, small 2-3 buffer pool
   next: find the producer that writes gp-24120's queue -- why does it stop after ~3 rounds
 ```
+
+---
+
+## 26. Queue producer write-sites (Grok) — external fills 3× then silence
+
+**Split:** producer for gp−24120 (Claude: gate shape). Static + pcbreak 30M S1.
+
+### 26.1 Static writers of `sw/sd …, -24120(gp)` (imm `0xA1C8`)
+
+| Site | Role |
+|------|------|
+| `0x001F1A58`, `0x001F1C74` | **Inside** DMAC handler `0x1F1778` (self-advance / recycle) |
+| `0x001F2554` in fn `0x001F2408` | **External producer** (many static callers) |
+| `0x004DADD8` | BSS init with base `0x4Dxxxx`, not runtime gp |
+
+### 26.2 Runtime hits (30M)
+
+| PC | Hits | Window | Notes |
+|----|------|--------|-------|
+| `0x001F2408` producer entry | **3** | 15.167–15.193M | a2=3; v0/a1 in `0x7FD080` pool (matches Claude) |
+| `0x001F2554` `sw → gp-24120` | **3** | 15.167–15.252M | same 3 events |
+| `0x001F1A58` handler internal | **3** | 15.169–15.500M | cursor advance |
+| `0x001F1C74` handler path | **9** | 15.169–15.502M | more thrash on same pool |
+
+**Zero external producer hits after ~15.25M.** Handler-only stores continue briefly while draining the 2–3 entry pool, then DMA kicks stop (Claude’s 12 kicks, all ≤15.75M).
+
+### 26.3 Mechanism (grounded)
+
+```text
+external producer 0x1F2408  →  fills gp-24120 queue  (only 3× at setup)
+        ↓
+DMAC handler 0x1F1778       →  drains queue, kicks VIF1/GIF, may set flip-ready
+        ↓
+queue empty, no refill      →  handler has nothing to kick → silence forever
+```
+
+Not a DMAC hang (channels clean). Not missing fptr for blit consumer (dead code). **Refill of the kick queue stops after a fixed setup burst** — same shape as set-flag×3 / PutDispEnv×3.
+
+### 26.4 Next
+
+- Callers of `0x1F2408` (static many) — which are live, why only 3 fires (Claude’s gate seat).
+- Optional: watch absolute gp−24120 once gp known; already have write PCs.
+
+```text
+producer dig
+  external 0x1F2408/0x1F2554: 3 hits setup only
+  handler self-stores while draining 2-3 entry pool
+  no refill after 15.25M → no kicks → no re-arm
+```
