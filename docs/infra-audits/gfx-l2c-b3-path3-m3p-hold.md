@@ -8062,3 +8062,12 @@ S176: PINNED — tid=1's PC and SP change together in one syscall between cyc=41
       syscall itself, not yet pinned to one instruction. Working theory: menu/frontend code path
       uses a second, distinct stack whose configured top sits just past the RDRAM ceiling.
 ```
+
+## 176–177. tid1 discrete sp jump at syscall; no CreateThread (Claude+Grok)
+
+Preempt healthy sp=0x1FFFDA0 @0x1F2508; SaveOut fromSyscall sp=0x2001EE0 pc=0x12E304
+(epilogue delay). CreateThread N/A for tid1. Next: which syscall between DI spin and SaveOut.
+
+```text
+S177: sp replaced not grown. Pin syscall num/args at transition.
+```
