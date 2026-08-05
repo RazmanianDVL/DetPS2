@@ -9659,3 +9659,35 @@ S199: Env 0x6754C0 built with a1=FBP=0 at 0x1FD9FC/A64. PutDispEnv correctly pus
       Missing retarget to FBP=0x46. Watch writes + dump +864.
 ```
 
+
+## 199. DECISIVE — SetDispEnv called exactly twice, both FBP=0, both at boot, never again (Claude)
+
+Confirmed live, full 95M-cycle run, real ISO:
+
+**`--watch=00675820` (envBase+864, the real DISPFB pack slot) full history**: written exactly
+once, via the unaligned `sdl`/`sdr` pair at `0x1FDFB8`/`0x1FDFBC` (decodes to `0x00051400` —
+exactly matching the known `DISPFB2` value). Every subsequent access for the rest of the run is a
+**read only** (`0x102A44: ld v0,16(s0)`, repeated PutDispEnv/syscall reads) — never written again.
+
+**`--pcbreak=00102B38:00102B38` (SetDispEnv itself), full run**: exactly **2 hits total**, both
+at `cyc≈14,335,712`/`14,336,032` (≈320 cycles apart, both clearly part of the same one-time boot
+init sequence), both with **`a1=0x0`** (FBP argument zero). Confirmed via caller `ra`
+(`0x1FDA04`/`0x1FDA6C`) these are exactly the two known init call sites Grok identified
+(`0x1FD9FC`/`0x1FDA64`). **No third call, ever, anywhere in the remaining ~80M+ cycles.**
+
+**This is fully decisive: there is no broken/wrong-value retarget call to find, because there is
+no retarget call at all.** `SetDispEnv` runs exactly twice, both during initial boot setup, both
+intentionally(?) zero, and is never invoked again for the rest of the run. The real open question
+is now squarely: **what code is supposed to call `SetDispEnv` (or write `envBase+864` directly)
+with the real draw-target FBP once rendering actually starts, and why does that call site never
+get reached** — not "why is an existing call passing the wrong value."
+
+```text
+S199: DECISIVE -- SetDispEnv (0x102B38) fires exactly twice in the whole 95M-cycle run, both at
+      cyc~14.3M (boot init), both with FBP arg = 0, matching the two known init callers exactly.
+      Zero further calls anywhere afterward. envBase+864 (the real DISPFB pack slot) is written
+      exactly once (matches this same init) and only read from then on. Confirms: no broken
+      retarget-with-wrong-value call exists to find -- there's simply no retarget call at all
+      after boot. Real question: what's SUPPOSED to call SetDispEnv again (or patch +864
+      directly) once real rendering starts, and why is that path never reached.
+```
