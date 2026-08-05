@@ -1442,3 +1442,110 @@ DMAC completion-interrupt check (Claude) -- refutes HLE-suppression hypothesis
   real question redirects to: why does the GAME stop issuing new VIF1/GIF kicks
   next: find the real DMA-kick-issuing code (same method as the MSKPATH3 write-site trace)
 ```
+
+---
+
+## 27. fptr hunt (empty, strengthens dead-code read) + real DMA-kick trace pinpoints the exact re-arm gate (Claude)
+
+### 27.1 fptr/indirect-call hunt for 0x1A6290 / 0x219150 — empty
+
+Seat assigned by Grok (ACK seq0355): find a *computed* (not literal-word) construction of
+either target address, since Grok's static census already found zero literal occurrences of
+`0x001A6290` anywhere in the ELF (aligned or unaligned) and zero direct `jal`/`j`.
+
+Built two temp `scanmasked` sweeps over the full code range (`0x00100000-0x00700000`):
+- `lui $rt, 0x001A` (7 hits) — checked every one's next few instructions by hand for a
+  matching `addiu`/`ori $rt,$rt,0x6290`. One coincidental hit: `0x001A53CC: addiu t0,t0,25232`
+  (25232 = `0x6290`) does construct `t0 = 0x001A6290` exactly — but `t0` is **never read
+  again** anywhere in that function (checked forward to `0x001A57C0`, well past the next `jr
+  ra`). Dead/coincidental, not a call target.
+- `lui $rt, 0x0021` (21 hits) and `lui $rt, 0x0022` (8 hits) for `0x00219150` (upper half
+  needs `+1` adjustment for `addiu`-style construction, or direct `0x0021` for `ori`-style) —
+  cross-referenced against a masked scan for `ori $rt,$rt,0x9150` (0 hits) and
+  `addiu $rt,$rt,0xF150`/-3760 (8 hits, none adjacent to any of the 29 `lui` candidates).
+
+**No live computed construction of either address found.** Combined with Grok's literal-word
+and direct-call census, this is now three independent techniques (literal word scan, direct
+`jal`/`j` scan, adjacent-instruction computed-address scan) all coming up empty for
+`0x1A6290`. Strengthens the "genuinely unlinked/dead code" read over "we're failing to find a
+live pointer." Not stopping here — see 27.2, which made the fptr question less central anyway.
+
+### 27.2 Real DMA-kick trace (new tool, temp + reverted)
+
+Rather than keep guessing at how kicks might be issued, instrumented the actual write site:
+`Dmac.WriteRegister`'s CHCR case, right where `StartTransfer` fires on the STR bit (temp
+`DETPS2_TRACE_DMAC_KICK=1`, wired a `(cyc, pc)` source into `Dmac` mirroring
+`EE.SetCycleSource`'s existing pattern; also temp `DETPS2_DUMP_DMAC_STATE=1` printing
+`IsActive`/`IsStalled` at end-of-run). Full revert confirmed via `git status`/`git diff
+--stat` after use — see the exact trace below, this is the ground truth, not a guess:
+
+```text
+[DMACKICK] cyc=14335392 pc=0x00104118 ch=GIF  chcr=0x00000101 madr=0x00675E40 qwc=0x0D tadr=0x00000000
+[DMACKICK] cyc=14338272 pc=0x001040A8 ch=VIF1 chcr=0x00000105 madr=0x00000000 qwc=0x00 tadr=0x004B1400
+[DMACKICK] cyc=14340192 pc=0x00102DF8 ch=GIF  chcr=0x00000101 madr=0x00675510 qwc=0x11 tadr=0x00000000
+[DMACKICK] cyc=15169584 pc=0x001F19F8 ch=GIF  chcr=0x00000104 madr=0x00675620 qwc=0x00 tadr=0x008D5C00
+[DMACKICK] cyc=15169584 pc=0x001F1A4C ch=VIF1 chcr=0x00000145 madr=0x00000000 qwc=0x00 tadr=0x007FD100
+[DMACKICK] cyc=15250192 pc=0x001F1F00 ch=GIF  chcr=0x00000104 madr=0x00000000 qwc=0x00 tadr=0x01D6EA00
+[DMACKICK] cyc=15250384 pc=0x001F19F8 ch=GIF  chcr=0x00000104 madr=0x01D6ED90 qwc=0x00 tadr=0x009D5500
+[DMACKICK] cyc=15250384 pc=0x001F1A4C ch=VIF1 chcr=0x00000145 madr=0x00000030 qwc=0x00 tadr=0x008FCA00
+[DMACKICK] cyc=15500192 pc=0x001F1F00 ch=GIF  chcr=0x00000104 madr=0x00000000 qwc=0x00 tadr=0x01D6E280
+[DMACKICK] cyc=15500384 pc=0x001F19F8 ch=GIF  chcr=0x00000104 madr=0x01D6E610 qwc=0x00 tadr=0x008D5C00
+[DMACKICK] cyc=15500384 pc=0x001F1A4C ch=VIF1 chcr=0x00000145 madr=0x00000030 qwc=0x00 tadr=0x007FD100
+[DMACKICK] cyc=15750192 pc=0x001F1F00 ch=GIF  chcr=0x00000104 madr=0x00000000 qwc=0x00 tadr=0x01D6E280
+  [DMACSTATE] GIF active=False stalled=False VIF1 active=False stalled=False  (at cyc=30,000,000)
+```
+
+**Exactly 12 kicks total, all in the 14.3M-15.75M window, zero after — through 30M.** This is
+the game's own code, directly confirmed at the MMIO write site (not inferred from completion
+counts). Matches Grok's 13-14 handler-hit count almost exactly (kicks → completions →
+handler entries, 1:1-ish).
+
+**Critically: at cyc=30M both channels are `Active=False Stalled=False`.** Not stuck mid
+transfer — the last kick's chain *did* finish cleanly. This rules out a DMAC-level hang or
+deadlock as the mechanism. The handler ran its course and legitimately produced no further
+kicks — this is a starved producer, not a stuck consumer.
+
+### 27.3 The three re-arm kick sites, disassembled
+
+All 9 of the post-setup kicks (cyc≥15.17M) come from just three fixed PCs inside handler
+`0x1F1778`: `0x001F19F8`, `0x001F1A4C`, `0x001F1F00`. Disassembled `0x1F1980-0x1F1B00`
+(`disasm burnout-only.json 20000000 001F1980:180`):
+
+- Before each kick: polls **GIF_STAT** (`lui v1,0x1000; ori v1,v1,0x3020` = `0x10003020`,
+  the real GIF_STAT MMIO address) spin-waiting on status bits, then reads a **queue cursor at
+  `gp-24120`** (`lw v0,-24120(gp)`) that supplies the buffer/tag pointer for the next kick's
+  `TADR`/`MADR`, then advances that cursor by 8 bytes and a companion counter byte at
+  `gp-24128` by 2 (`addiu v0,v0,8; sw v0,-24120(gp)` / `addiu v1,v1,2; sb v1,-24128(gp)`) —
+  a classic ring/queue-drain pattern, one descriptor entry consumed per kick.
+- Register dump at `0x1F1A4C` via `--pcbreak=001F1A48:001F1A50` across the three real
+  invocations shows `v0` (the value just read from `gp-24120`) = `0x7FD080`, `0x8FC980`,
+  `0x7FD080` — real RDRAM buffer addresses, matching the `tadr` values seen in the kick trace
+  almost exactly (offset by a small header). **The third invocation re-visits the same buffer
+  as the first** — small (2-3 entry) buffer pool, not an unbounded stream.
+
+### 27.4 Where this leaves the investigation
+
+The DMAC/interrupt/HLE layers are now cleared end-to-end: kicks are issued correctly, GIF_STAT
+is polled correctly, completions fire correctly (§26), channels end cleanly finished (not
+stuck). The entire remaining mystery is upstream of all of this: **why does whatever produces
+new entries into the queue at `gp-24120` stop after exactly ~3 rounds**, when Claude's §24/§25
+heatmaps already showed real, ordinary simulation code continuing to run for tens of millions
+of cycles afterward without ever coming back to feed this queue.
+
+This exactly matches the angle Grok proposed as option (C) in the seq0358 check-in ("GIF/VIF1
+why completions stop after setup — CHCR/PATH3 link") — now sharpened to a precise target:
+find what writes to `gp-24120`'s queue (the producer), and what condition gates whether a 4th
+round ever gets enqueued. Same shape as the successful MSKPATH3 write-site trace (§9): watch
+writes to the real address (`gp` resolved + `-24120`/`-24128`) across the full 30M run and see
+whether the producer ever runs again, or is itself gated on something that only fires 3 times
+(e.g. a fixed-size init loop rather than an ongoing per-frame call).
+
+```text
+DMA-kick trace (Claude) -- exact write-site instrumentation, temp + reverted
+  fptr hunt (0x1A6290/0x219150): empty across 3 independent techniques -- dead code reinforced
+  real kick trace: 12 kicks total, all 14.3M-15.75M, zero after through 30M
+  channels end Active=False Stalled=False at 30M -- NOT stuck, cleanly finished
+  all re-arm kicks come from 3 fixed PCs (0x1F19F8/0x1F1A4C/0x1F1F00) draining a queue
+    cursor at gp-24120 (buffer ptr) / gp-24128 (count), 8 bytes/entry, small 2-3 buffer pool
+  next: find the producer that writes gp-24120's queue -- why does it stop after ~3 rounds
+```
