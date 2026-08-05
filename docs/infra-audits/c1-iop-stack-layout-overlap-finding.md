@@ -119,5 +119,10 @@ through the same dual-ACK step as T1 itself before any Core edit.
 - [x] Hand arithmetic
 - [x] Code-verified via real public API (temp diagnostic, fully reverted)
 - [x] Two real overlaps confirmed, root cause identified
-- [ ] Dual-ACK on fix direction (§5)
-- [ ] **No Core** until ACK
+- [x] Dual-ACK on fix direction (§5) — Grok TP-Q5 yes / TP-Q6 yes / TP-Q7 measure-after-carve, seq0268
+- [x] **Landed** `eed01fa` — `ComputeThreadRegionStackTop` skips both reserved slivers;
+      zero capacity regression (31/31 non-boot ids still allocate); permanent regression smoke
+      `IopThreadStack_NoOverlapAcrossFullTable` added; full smoke suite green.
+- [ ] TP-Q7 (64 vs keep-N): only ~0xE000 bytes headroom remain in this physical window after
+      the carve — not enough for 64 slots here. A real raise needs a different memory region;
+      separate design question, not pursued this seat.
