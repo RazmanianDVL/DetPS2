@@ -345,6 +345,54 @@ public static class IopExecSmokes
     }
 
     /// <summary>
+    /// C1 TP-Q5/Q6: id-derived thread stacks must never share physical bytes with the boot
+    /// context's stack or RealSifRpc's dispatch scratch stack. Regression coverage for the
+    /// carve fix — see docs/infra-audits/c1-iop-stack-layout-overlap-finding.md. Before the fix,
+    /// id23 aliased boot's [0x1EE000,0x1F0000) and id15 aliased RealSifRpc's [0x1DE000,0x1E0000).
+    /// </summary>
+    public static void IopThreadStack_NoOverlapAcrossFullTable()
+    {
+        var sys = new Ps2System();
+        var iop = sys.Iop;
+        iop.EnableMultiThreadScaffolding();
+
+        var ranges = new System.Collections.Generic.List<(string label, uint lo, uint hi)>();
+        if (!iop.TryGetThreadContext(0, out var boot) || boot == null)
+            throw new Exception("boot context missing");
+        ranges.Add(("boot", boot.StackTop - boot.StackSize, boot.StackTop));
+
+        int created = 0;
+        for (int n = 0; n < Iop.MaxIopThreadSlots - 1; n++)
+        {
+            int id = iop.CreateDormantThreadContext(0x1000);
+            if (id < 0) break;
+            created++;
+            if (!iop.TryGetThreadContext(id, out var ctx) || ctx == null)
+                throw new Exception($"context {id} missing after create");
+            if (ctx.StackTop > 0x200000u)
+                throw new Exception($"id={id} stack top 0x{ctx.StackTop:X6} exceeds real IOP RAM bound 0x200000");
+            ranges.Add(($"id{id}", ctx.StackTop - ctx.StackSize, ctx.StackTop));
+        }
+        // Every non-boot slot (31) must be usable — the carve must not cost capacity.
+        if (created != Iop.MaxIopThreadSlots - 1)
+            throw new Exception($"expected {Iop.MaxIopThreadSlots - 1} dormant contexts, got {created}");
+
+        // RealSifRpc's fixed scratch range must never collide, whether or not a live slot is free.
+        ranges.Add(("RealSifRpc-scratch", Iop.RealRpcDispatchStackTop - 0x2000u, Iop.RealRpcDispatchStackTop));
+
+        for (int i = 0; i < ranges.Count; i++)
+        for (int j = i + 1; j < ranges.Count; j++)
+        {
+            var a = ranges[i]; var b = ranges[j];
+            if (a.lo < b.hi && b.lo < a.hi)
+                throw new Exception(
+                    $"stack overlap: {a.label} [0x{a.lo:X6},0x{a.hi:X6}) <-> {b.label} [0x{b.lo:X6},0x{b.hi:X6})");
+        }
+
+        Console.WriteLine($"[Smoke] IopThreadStack_NoOverlapAcrossFullTable OK (created={created} ranges={ranges.Count})");
+    }
+
+    /// <summary>
     /// C1.3: WaitSema/SleepThread-shaped yield hooks — park current as WAIT, run another READY,
     /// wake parent with intact callee-saves. Flag-off path is a pure no-op.
     /// </summary>

@@ -1478,6 +1478,7 @@ press 3000 Circle 100
             Iop_HandAssembledLoop_Deterministic();
             IopExecSmokes.IopThreadContext_Scaffolding_FlagAndSwitch();
             IopExecSmokes.PrepareModuleEntry_UniqueStacks_WhenMultiThread();
+            IopExecSmokes.IopThreadStack_NoOverlapAcrossFullTable();
             IopExecSmokes.IopThreadContext_YieldHooks_ParkAndReady();
             IopExecSmokes.IopYieldStart_ResidualOnReadyPeer();
             IopExecSmokes.IopYieldStart_EntryThread_NotFalsePeer();

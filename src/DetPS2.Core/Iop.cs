@@ -75,9 +75,14 @@ public sealed class Iop : ISchedulable
     public const int MaxIopThreadSlots = 32;
 
     /// <summary>
-    /// Base of reserved secondary-stack region (IOP phys). Slot N uses
-    /// <c>[base + N*size, base + (N+1)*size)</c> with SP = top. Below THREADMAN entry slots
-    /// (0x1D0000) and RealSifRpc scratch (0x1E0000); not a heap-safe proof — THREADMAN later.
+    /// Base of reserved secondary-stack region (IOP phys). Logical slot k (see
+    /// <see cref="ComputeThreadRegionStackTop"/>) walks up from here in
+    /// <see cref="ThreadStackSlotSize"/> steps, explicitly skipping the RealSifRpc scratch
+    /// (<see cref="RealRpcDispatchStackTop"/>) and boot (<see cref="BootDefaultStackTop"/>)
+    /// reservations — C1 TP-Q5/Q6 carve fix (see
+    /// docs/infra-audits/c1-iop-stack-layout-overlap-finding.md). THREADMAN's own flag-off-only
+    /// rotator at 0x1D0000 is mode-exclusive with multi-thread, not a live conflict here.
+    /// Not a heap-safe proof — THREADMAN later.
     /// </summary>
     public const uint ThreadStackRegionBase = 0x001C0000u;
     public const uint ThreadStackSlotSize = 0x2000u;
@@ -118,6 +123,16 @@ public sealed class Iop : ISchedulable
     /// module-entry arena when multi-thread is on.
     /// </summary>
     public const uint RealRpcDispatchStackTop = 0x001E0000u;
+
+    /// <summary>
+    /// C1 TP-Q5/Q6 carve: boot context's default stack top when live SP is still zero
+    /// (matches <c>IopModuleHost.DefaultModuleStack</c>, see <see cref="EnsureThreadTable"/>).
+    /// Reserved out of the id-derived <see cref="ComputeThreadRegionStackTop"/> sequence so no
+    /// real disc thread can land on the same physical stack bytes as boot. If boot's live SP is
+    /// ever non-zero at table-init time it uses that instead (pre-existing, unrelated to T1) —
+    /// not covered by this carve, same as before.
+    /// </summary>
+    public const uint BootDefaultStackTop = 0x001F0000u;
 
     public uint Cop0Status { get; set; }
     public uint Cop0Cause { get; set; }
@@ -1214,14 +1229,38 @@ public sealed class Iop : ISchedulable
         for (int id = 1; id < MaxIopThreadSlots; id++)
         {
             if (_threads![id].InUse) continue;
-            uint stackTop = ThreadStackRegionBase + (uint)(id + 1) * ThreadStackSlotSize;
             // Prefer dedicated module-entry arena for low slot ids (C1.2): first
             // MaxModuleEntryStacks secondaries land in [ModuleEntryStackArenaBase, ThreadStackRegionBase).
-            if (id <= MaxModuleEntryStacks)
-                stackTop = ModuleEntryStackArenaBase + (uint)id * ThreadStackSlotSize;
+            uint stackTop = id <= MaxModuleEntryStacks
+                ? ModuleEntryStackArenaBase + (uint)id * ThreadStackSlotSize
+                : ComputeThreadRegionStackTop(id - MaxModuleEntryStacks - 1);
             return InitThreadSlot(id, entryPc, stackTop, ThreadStackSlotSize, IopThreadStatus.Ready);
         }
         return -1;
+    }
+
+    /// <summary>
+    /// C1 TP-Q5/Q6 carve: id-derived stack top for the <see cref="ThreadStackRegionBase"/> span,
+    /// indexed by a 0-based logical slot (id - MaxModuleEntryStacks - 1), skipping the two fixed
+    /// physical reservations (<see cref="RealRpcDispatchStackTop"/> and <see cref="BootDefaultStackTop"/>
+    /// scratch stacks) so no id-derived thread ever shares physical stack bytes with either.
+    /// Was previously a flat <c>base + (id+1)*size</c> formula that walked straight through both
+    /// reservations — see docs/infra-audits/c1-iop-stack-layout-overlap-finding.md.
+    /// </summary>
+    private static uint ComputeThreadRegionStackTop(int logicalIndex)
+    {
+        uint top = ThreadStackRegionBase;
+        int remaining = logicalIndex + 1;
+        while (remaining > 0)
+        {
+            top += ThreadStackSlotSize;
+            uint lo = top - ThreadStackSlotSize;
+            bool reservedRealRpc = lo < RealRpcDispatchStackTop && RealRpcDispatchStackTop - ThreadStackSlotSize < top;
+            bool reservedBoot = lo < BootDefaultStackTop && BootDefaultStackTop - ThreadStackSlotSize < top;
+            if (reservedRealRpc || reservedBoot) continue; // reserved slot — doesn't count, try next
+            remaining--;
+        }
+        return top;
     }
 
     /// <summary>
@@ -1253,7 +1292,7 @@ public sealed class Iop : ISchedulable
             if (_threads![id].InUse) continue;
             uint stackTop = id <= MaxModuleEntryStacks
                 ? ModuleEntryStackArenaBase + (uint)id * ThreadStackSlotSize
-                : ThreadStackRegionBase + (uint)(id + 1) * ThreadStackSlotSize;
+                : ComputeThreadRegionStackTop(id - MaxModuleEntryStacks - 1);
             return InitThreadSlot(id, entryPc, stackTop, ThreadStackSlotSize, IopThreadStatus.Dormant);
         }
         return -1;
