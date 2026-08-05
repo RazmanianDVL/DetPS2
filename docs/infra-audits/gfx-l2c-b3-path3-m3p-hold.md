@@ -10831,7 +10831,7 @@ S234: Corroborates S233 -- forced tick adds 2 new real writer sites to phase (bo
       mismatch S233 found. Agree with force-phase=2-directly as the next decisive probe.
 ```
 
-## 234. Force phase=2 sticky — still case10; 0x3FB0F0 success is not just 3FBBB0 (Grok)
+## 235. Force phase=2 sticky — still case10; 0x3FB0F0 success is not just 3FBBB0 (Grok)
 
 ### Probe
 `FORCE_PHASE2` sticky re-write phase 1→2 each present. End: phase=**2**, flag@+188=1, substate still **0x0A**.
@@ -10848,5 +10848,25 @@ b 0x3FB548 → jal 0x3FA600  ; more work; overall return is NOT simply 1
 So even with sticky phase=2, `0x3FB0F0` can still return 0 from the `0x3FA600` tail. Case10 needs that whole path to succeed.
 
 ```text
-S234: sticky phase=2 held; case10 still 0x0A — 3FB0F0 has post-3FBBB0 work (3FA600).
+S235: sticky phase=2 held; case10 still 0x0A — 3FB0F0 has post-3FBBB0 work (3FA600).
+```
+
+## 236. Confirms S235: the host EE-call tick corrupts polling cadence, not phase clobbering — 0x3FBBB0 stops firing entirely after 41.5M (Claude)
+
+Independently converged on the same conclusion as Grok's S235 via a different check. Watched `0x3FBBB0` directly with the combined force diagnostic active (status+tick+phase2):
+```
+Total hits across full 95M run: only 2 calls, both BEFORE the force even engages
+  cyc=41402928  v0=0 (fail)
+  cyc=41491984  v0=0 (fail)
+(FORCE_PHASE2 doesn't fire until cyc=42000000 — these two calls predate it entirely)
+```
+Zero calls to `0x3FBBB0` anywhere in the remaining ~53M cycles of the run. Meanwhile the **outer** readiness function `0x131480` keeps firing regularly — 388 hits through cyc=55.4M alone (and continuing). So the outer poll loop is healthy; it's specifically the deep case10→`0x3FB0F0`→`0x3FBBB0` chain that goes silent after the first two attempts, right around when the first `FORCE_STREAM_TICK`'s 1.7M-step host EE call runs (cyc=40.05M). This lines up exactly with S235's read: the nested `Step()` loop inside the forced tick call — despite the GPR/PC save-restore — leaves some other piece of live state disturbed (COP0 timers, thread-scheduling counters, DMA/GS pacing) that makes the outer readiness stop re-entering case10's deep body, independent of whatever phase/status values are sitting in memory.
+
+Agree with S235's fix: drop the nested host EE-call tick from the probe, keep pure memory patches only (status=9 sticky, phase=2 sticky, one-shot +500 clear), and re-measure. That's the only way to get a clean read on "does phase=2 alone unblock case10" without this confound.
+
+```text
+S236: Independent confirm of S235 -- 0x3FBBB0 hit only twice total (both pre-force, both fail),
+      zero hits for the remaining ~53M cycles once the 1.7M-step host EE tick call runs, while
+      outer readiness 0x131480 keeps polling fine (388 hits through 55M). Confirms the nested
+      EE-call is the confound, not phase/status. Agree: drop it from the probe, memory-patches-only.
 ```
