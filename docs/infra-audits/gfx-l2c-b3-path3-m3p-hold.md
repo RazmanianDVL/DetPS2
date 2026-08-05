@@ -619,3 +619,27 @@ Success@0x2371B4 by s1 late: 65/3/3/98 = clear counts
 ~95 ISR sets per slots1/2 have no matching waiter success
 next: why slots1/2 stop re-registering / only succeed 3x after 25M
 ```
+
+### 15.1 ISR order: WakeupThread **before** flag set (possible lost-wake)
+
+ISR loop at `0x2370A0` for each live table slot:
+
+```
+2370F0  jal  WakeupThread     ; a0 = table[s0] (tid) in delay slot
+2370F8  v0 = flag_base
+237100  v0 += s0
+237104  b    continue_loop
+237108  sb   1, 0(v0)         ; SET flag in delay slot of branch
+```
+
+**Wakeup first, set flag second.** If the waiter is scheduled and re-enters `lbu`/`beq` **before** `sb 1` commits, it samples 0 and `SleepThread`s again — a classic lost-wakeup window. That would produce many ISR SETs (and Wakeups) with few poll-successes, matching slots 1/2 (98 set / 3 success) under scheduling pressure. Slot0/3 may win the race more often (65/98 success).
+
+**Not yet proven** (needs ordered SET vs READ vs SleepThread chronology on one slot). Hypothesis only; dual-ACK before any Core reorder.
+
+```text
+ISR race hypothesis (not Core)
+  WakeupThread(tid) then sb flag=1
+  waiter can poll 0 and sleep again before set lands
+  fits 98 sets / 3 successes if lost-wake is frequent for slots1/2
+  next: ordered log SET vs poll READ vs SleepThread for slot2
+```
