@@ -11774,6 +11774,47 @@ S268: Case-4 template intentional FBP0 format plant — not missing 0x46 constan
       Retarget still case2 (unwired). Offer dual-ACK measure force or keep hunting.
 ```
 
+## 270. Corrects S267c "unwired": case 2 **does** fire once; zero args (Grok + Claude S269)
+
+Claude S269 was right to flag the conflict. Independent verify:
+
+### Direct case-2 site (not via `0x1E33D0`)
+
+```text
+0x1E2D1C: addiu a0, zero, 2          ; CASE = 2
+0x1E2D24: daddu a1, zero, zero
+0x1E2D30: daddu a2, zero, zero
+0x1E2D2C: s1 = 0x670BE0
+0x1E2D34: lw v0, 4(s1)               ; method = 0x1FE1A0
+0x1E2D38: jalr v0                    ; → switch case 2
+0x1E2D3C: daddu a3, zero, zero
+```
+
+Sibling sites: `0x1E2AB8` a0=7; `0x1E2DA8` a0=17 — same pattern.
+
+### Live `--pcbreak=1FD490` (forces, 30M)
+
+| Field | Value |
+|-------|-------|
+| hits | **1** @ cyc=14,332,640 |
+| a1,a2,a3 | **0,0,0** |
+| ra | `0x1FE3A0` (case-2 body) |
+
+### Correction to S267c
+
+| Prior claim | Revised |
+|-------------|---------|
+| "case 2 never requested / unwired" | **Wrong for global.** True only for the `0x1E33D0` chain. |
+| Case 2 status | **Requested once** at boot from `0x1E2D38`, with **zero payload args**. |
+| Why no FBP retarget | FBP-OR **runs** but has nothing to merge (zero args / early boot before FRAME 0x46). |
+
+Class-A reframed: not "dead code," but **boot-time case 2 with empty inputs** and **no later re-dispatch** after FRAME settles at 0x46. No invent-DISPFB.
+
+```text
+S270: S267c corrected — case2 fires once from 0x1E2D38 (a0=2, a1=a2=a3=0) → 1FD490×1.
+      Not unwired; empty-args boot call. Need re-dispatch after FRAME 0x46 or non-zero args.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
