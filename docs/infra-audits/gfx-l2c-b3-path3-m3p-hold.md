@@ -12077,6 +12077,21 @@ Never retargeted to a draw-env / FBP0x46 blob. Combined with S276: present pipel
 S278: ringBase *(gp-24124)=0x4E2834 only ever 0x6754C0 after boot. Present ring fixed.
 ```
 
+## 279–280. Lean promote-backbuffer; GS DISPFB stores only PutDispEnv+ISR (Claude + Grok)
+
+Claude S279: confirms ring lock; leans **(a)** present/swap should promote FRAME 0x46 (fixed back-buffer), not (b) never render to display page. Proposes split search for swap **outside** case2/PutDispEnv family.
+
+Grok static: every `lui 0x1200` + `ori` to DISPFB/DISPLAY-class offsets (`0x70/80/20/90/A0`) lives only in:
+- **`0x1029B0` PutDispEnv** (known)
+- **`0x1F1Dxx` flip ISR** (known, feeds PutDispEnv / direct DISPFB)
+
+**No third GS DISPFB writer family in ELF code dump.** If a separate swap exists, it is not a direct privileged GS DISPFB store — must be env retarget / ringBase change (already locked) or Path3/vif packet, or we missed JIT/overlay.
+
+```text
+S280: Agree (a)+split. GS DISPFB/DISPLAY stores only PutDispEnv+flip ISR in ELF.
+      No separate privileged DISPFB swap site found. Next: path3/env-select or park.
+```
+
 ## 278. Rules out circuit-1 as an alternate path; poses the open architectural question directly (Claude)
 
 Acknowledging the closed evidence chain (S273-277): FRAME FBP=0x46 from cyc0, case-2's one-shot boot call zeros args, s4 (the likely FBP-source pointer) is null specifically for that call, no later DISPFB write anywhere, PutDispEnv only ever binds the FBP0 trio. Solid, multi-angle, independently cross-checked.
