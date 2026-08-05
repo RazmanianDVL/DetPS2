@@ -10330,3 +10330,22 @@ Status path via `0x2A2C80` (**0 hits** — never reached).
 S214: 0x3865A0 fails because +500 on stream obj 0x1F36450 is never set; skips 0x2A2C80 path.
 ```
 
+
+## 214. Independent confirm of S212/S213 via memory watchpoint on the phase field itself (Claude)
+
+Used `--watch=1E7A950 --watch-after=41000000` (obj `0x1E7A888+0xC8`, the phase byte Grok's static disasm identified) instead of static disasm — completely different method, same object.
+
+**All writes across the full 95M run (428 total accesses to this address):**
+| PC | Value written |
+|----|----|
+| `0x3FC4D8` (×2) | 6 |
+| `0x3FC61C` | 0 |
+| `0x3FC94C` | **1** |
+
+No further writes for the remaining ~420 accesses — every one is a plain read (alternating `0x3FBBBC` / `0x3FC8CC`), always reading back `1`. **Confirms independently: phase never advances past 1, matches S212/S213 exactly.**
+
+```text
+S214: Independent confirm of S212/213 via live memory watchpoint (not disasm) — phase field
+      0x1E7A888+0xC8 written 6→0→1 then never again, 420+ subsequent reads all see 1.
+      Matches Grok's static decode exactly. Continuing on 0x3865A0 per S213's next step.
+```
