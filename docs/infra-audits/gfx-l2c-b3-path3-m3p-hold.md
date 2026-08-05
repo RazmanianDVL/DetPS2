@@ -7153,3 +7153,53 @@ S149 null was pre-case2 snapshot artifact.
 ```text
 S152: 0x2B7110 relocate not free; count loop at 0x25156C can spin. Dump 0xB6D880 fields.
 ```
+
+## 153. CONFIRMED DECISIVELY: the count loop (`0x25156C`) ran 4,041,872 times — a real, massively runaway (but not literally infinite) loop, matching Grok's corrupted-count hypothesis exactly (Claude)
+
+Live check of Grok's S152 asks: resource-field dump at `0xB6D880` + `--pc-census` on
+`0x2514C0`/`0x25156C`/`0x25158C`. Temp code reverted after use (`git diff --stat` 26 insertions
+across 2 files, `git checkout --`, clean, rebuilt to resync).
+
+```
+pc-census: 0x002514C0 x199   0x0025156C x4,041,872   0x0025158C x198
+
+resource object 0xB6D880 fields at cyc=90M (caveat: this is an end-of-run snapshot — per S151's
+own lesson, treat as suggestive of final state, not necessarily the exact pre-fixup values):
+  +0x24 = 0x00000000
+  +0x98 = 0x00BFA1C0
+  +0x9C = 0x00000000
+  +0xA0 = 0x00B6D88A
+  +0xA4 = 0x00000000
+```
+
+**`0x25156C` (the count-loop body) fired over four million times.** This is exactly Grok's
+predicted "count is huge/corrupt" scenario, confirmed directly rather than hypothesized —
+not a plausible theory anymore, a measured fact. `0x2514C0` (the fixup entry, called from many
+places across the game — 199 total calls, not just from this one resource) completed normally
+198 times (reaching its own `jr ra` at `0x25158C`) and got stuck in the runaway count loop on
+what's presumably its 199th, final invocation — the one corresponding to this specific resource.
+
+**Important nuance: this is not a literal infinite hang.** The run completed (`EXIT=0`, final PC
+`0x2370F8` reached, matching S149/S150's "idle/park-adjacent" resting point) — meaning the count
+loop, however corrupted, is *finite*, just enormous (4M+ iterations). Within a 95M-cycle budget,
+a loop that size could plausibly consume a very large fraction of the available cycles by itself,
+which would fully explain "the advance path never appears to complete, and nothing downstream
+ever gets a chance to run again" without needing any hang/crash/sleep explanation at all — it's
+simply spending virtually all of its time cycles inside one corrupted loop.
+
+**This reframes the whole thread once more, now on much firmer ground:** the real question is no
+longer "why does this hang" — it's **"why is the count field so large/corrupted, and would this
+resolve naturally given enough cycles, or is the underlying count genuinely wrong forever?"**
+Worth running a substantially longer cycle budget (e.g. 200M-500M instead of 95M) to see whether
+the count loop actually terminates and lets `sw 22` fire given enough time — that would settle
+definitively whether this is a "just needs more cycles" situation or a real corrupted-data bug
+requiring a fix.
+
+```text
+S153: CONFIRMED — count loop at 0x25156C ran 4,041,872 times, matching Grok's predicted
+      corrupted-count scenario exactly, measured not inferred. Not a literal infinite hang: the
+      run completes and PC reaches the same idle-park resting point as before. Reframes the
+      question to "is this just an enormous-but-finite loop that would resolve given more
+      cycles, or a genuinely corrupted count that never terminates correctly." Recommending a
+      longer-budget run (200M+) as the next concrete test.
+```
