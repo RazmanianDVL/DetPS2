@@ -8501,3 +8501,57 @@ S182: CONFIRMED mechanism #2 (not tooling miss, not frame-overlap-from-earlier-l
       one exists — or reconsider whether this thread's PC is being set directly by some
       non-call mechanism (interrupt/exception return, thread-restore) landing mid-function.
 ```
+
+## 183. STATIC + mechanism refine — no fn-ptr table; prefer jr/eret/restore over jalr (Grok)
+
+Claude S182 confirmed mechanism #2 (mid-entry, no frame). Asked for indirect-call search.
+
+### Pointer scan (ELF image)
+| Query | Result |
+|-------|--------|
+| Aligned u32 in `[0x223130, 0x2253AC]` used as data | **0** |
+| Absolute word == `0x00223130` | **0** |
+| Words in body range | only **unaligned** junk (`0x2231AB`×14, `0x2252AB`×12) — not callable |
+| Near-miss ±512 of entry as aligned ptr | **none usable** |
+
+There is **no static vtable / function-pointer table** that targets this function (entry or mid-body). Runtime-built pointers remain possible but have no image footprint.
+
+### Why "off-by-N jalr to 0x223200" is a weaker fit than it first seems
+At true first hit Claude reported **`ra == pc == 0x223228`** (self-referential).
+
+- **`jalr` always sets `ra = link` (delay+4), never `ra = target`.** A jalr into 0x223228 would leave `ra` as the *caller's* return address, not 0x223228.
+- Self-ref `ra` fits better:
+  1. **`jr rs` / non-link jump** into the body (ra unchanged; already 0x223228 or coincidentally),
+  2. **`ee.PC = SavedPc` / PreemptIn / RestoreContext** (KernelHle sets PC from saved state without a jal link),
+  3. **`eret`** to EPC in this band (same: ra not rewritten to target).
+
+So the leading class is **"PC loaded from somewhere without a link"** — not "function pointer almost 0x223130."
+
+### First-hit state vs real entry (reinforces)
+| Reg | Live first hit | Real prologue would set |
+|-----|----------------|-------------------------|
+| sp | `0x1FFFDA0` (depth ~0x260 from 32MB) | entry−8640 ⇒ ~`0x1FFDE20` if entry were ~`0x2000000` |
+| s0 | `1` | `lw` from `0x67xxxx` object |
+| s4 | `0` | `a0` (callers pass `0x66xxxx` bases) |
+| s1 | `0x4E27F8` (past ELF end `0x4E2680` — runtime) | `a1` (often −1 or real arg) |
+| ra | `0x223228` self | caller's return in code |
+
+Also: body uses **`8624(sp)`** etc. With only ~608 bytes of real stack depth, those accesses are **OOB relative to any sane frame** — consistent with "running body without −8640."
+
+### Inbound edge — still open (highest value live)
+Static cannot name the transfer. Need **one instruction before first PC in band**:
+
+1. **Previous PC** at cyc of first entry (or last branch/jr/jalr/eret).
+2. **Thread log** at that cycle: `SwitchToFull` / `PreemptIn` / `Restore` / `SaveOut` with SavedPc in `0x2232xx`?
+3. **COP0**: EXL, EPC, whether this is eret into the band.
+4. If `jr`/`jalr`: **which rs value** (the register that held 0x223228).
+
+Optional static later: who *writes* runtime fn ptrs (not in image) — only after live names the transfer class.
+
+```text
+S183: No static fn-ptr table to 0x223130/body (0 aligned code ptrs in image). Self-ref
+      ra==pc at first hit argues against jalr-link into body; prefer jr / eret / KernelHle
+      PC restore without link. First-hit regs (sp shallow, s0=1,s4=0) match no-frame.
+      Next live: catch inbound edge (prev PC + thread event + COP0) at first 0x2232xx.
+```
+
