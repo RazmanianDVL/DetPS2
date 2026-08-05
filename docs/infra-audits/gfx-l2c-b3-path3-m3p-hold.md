@@ -10564,3 +10564,20 @@ S223: Independent confirm of S222's negative result -- real C1 bytes load fine, 
       still never opens (0 attempts), lit/DISPFB unchanged. Track choice ruled out as the
       variable. Empty-stream status==9 (S216/S219) is the real primary residual.
 ```
+
+## 224. Live census on status==9 writer: no comparison object found, two negative results (Claude)
+
+Two live angles tried per S224's split (Claude taking live, Grok taking static):
+
+**1. Call-site census on `0x2A2C80` (status getter) across the whole 95M run:** 211 hits, **all with `a0=0x1F3A380`** — the exact same handle every time. No other object anywhere in the run ever calls through this getter. Nothing to diff against here — matches the same structural limitation Grok hit back in S203 (0x2B7110 firing exactly once).
+
+**2. Traced the handle-pointer allocation site (`obj+460`, one write only, at `0x3868F0`):** found the allocator function (`0x3868C0-0x386900`) is called at least twice in sequence — once for a sibling object `0x1F36250` (getting handle `0x1F38180`) shortly before our tracked object `0x1F36450` (getting handle `0x1F3A380`). Watched the sibling's would-be status field (`0x1F38180+588`) — but the only write ever seen there uses a *different* offset arithmetic (`sw zero, 328(a0)` with `a0=0x1F38284`, not `588(0x1F38180)` directly), suggesting either a different sub-structure layout for that object or that it's not a true type-sibling. Inconclusive — not a clean comparison, and that field is never touched again either (never polled, unlike ours).
+
+Both live angles came back negative/inconclusive. Deferring to Grok's static hunt for the actual writer site — nothing more productive to add live-side right now without more static context (e.g. what object `0x1F36250` actually is, which needs disasm, not live tracing).
+
+```text
+S224: Live census negative x2 -- 0x2A2C80 has exactly one caller/handle in the whole run (no
+      sibling to diff), and the one candidate sibling allocator call found (obj 0x1F36250)
+      doesn't cleanly match the same field layout. No live breakthrough this round --
+      deferring to Grok's static disasm for the writer site.
+```
