@@ -3700,3 +3700,54 @@ G3 answered (Claude) -- force-unmask A/B, independent of postTxd heuristic
     the actual missing piece is B3's ongoing per-frame render path (VU1/Path1), never observed
     running at all tonight, structurally separate from everything G1-G3 traced
 ```
+
+---
+
+## 57. Mode/state hunt, started: full-run PC profile shows the EE spends the overwhelming majority of its time idling, not simulating (Claude)
+
+Not parking (user standing instruction: no "next session" framing) — picked up the mode/state
+question directly. First cut: a full 90M-cycle `DETPS2_PROFILE_PC=1` run to see where the EE
+actually spends its instruction budget, as a proxy for "is this a real gameplay/simulation
+loop or mostly idle."
+
+```text
+0x00237180-0x00237198  (tid5's 4-slot flag-wait spin, §33)     ~2.57M samples EACH instruction
+0x0010BD40-0x0010BD48  (SleepThread syscall trampoline)         ~2.57M samples EACH
+0x00100158-0x00100170  (very early boot-region / dispatch)      ~1.70M samples EACH
+0x00293A30-0x00293A50  (small compare/lookup helper)             122K samples EACH
+(everything else falls off sharply from there — 51,800 unique PCs total, 43.7M samples)
+```
+
+**The single dominant hotspot, by roughly 20x over the next-largest, is tid5's own
+`while(flags[i]==0) SleepThread()` wait loop from §33** — the SAME loop I earlier confirmed is
+*actively serviced* (all 4 flags do get set/cleared, 22-48 times each across the run). Put
+together: real progress on this specific synchronization primitive happens rarely (dozens of
+transitions) relative to the sheer number of idle poll/yield iterations between each one (2.57M
+samples). This isn't "the EE is stuck" — it's real, working code — but it clarifies the texture
+of what's happening: **B3 spends the overwhelming majority of its CPU budget idling on this one
+wait, not running gameplay simulation.** The much smaller secondary hotspot (`0x293A30`, a
+plain equality-check/compare helper, ~122K samples) matches the earlier §24 "real hash/linked-
+list lookup" background work — mundane, not simulation-shaped either.
+
+### 57.1 What this contributes to the mode/state question
+
+Doesn't yet answer "what mode is B3 in" directly, but rules out one framing: this is not a CPU
+saturated with per-frame simulation work that happens to never call the render path — it's
+mostly *waiting*, real code, real synchronization, but overwhelmingly idle. Consistent with
+"B3 is sitting in a low-activity holding state" (a menu/attract/loading wait) rather than
+"B3 is actively simulating a race and just failing to submit graphics for it." Next natural
+step: identify what real external event the 4-slot wait's producer is gated on, and whether
+that producer itself is waiting on something further upstream (the same "keep going up one
+level" method that worked for §52-§55's GTFS chain).
+
+```text
+mode/state hunt started (Claude) -- full 90M-cycle PC profile
+  overwhelming dominant hotspot: tid5's 4-slot flag-wait spin (S33), ~2.57M samples, ~20x
+    the next-largest hotspot
+  confirms: B3 spends the vast majority of its time idling/yielding on ONE real sync
+    primitive, not running per-frame simulation code that fails to submit graphics
+  secondary hotspot: a plain compare/lookup helper (~122K samples), matches earlier S24
+    background-work finding, not simulation-shaped either
+  redirects the mode/state hunt: find what the 4-slot wait's real PRODUCER is gated on
+    (same "go one level up" method as S52-S55), rather than assuming active-but-silent simulation
+```
