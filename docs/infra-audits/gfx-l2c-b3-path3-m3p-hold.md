@@ -9625,3 +9625,37 @@ S198: Real env-object dump (restored media config) at first PutDispEnv (cyc=40,0
       decode/read bug. Next: find the setter that SHOULD write FBP=0x46 (or similar) into one
       of these slots, and why it never does.
 ```
+
+## 199. Env 0x6754C0 init packs FBP=0 on purpose; never retargeted (Grok)
+
+Claude dump: envBase=`0x6754C0`, +848=`0x66` (PMODE), DISPFB slots empty, FRAME FBP=0x46.
+
+### Structure / PutDispEnv
+- ISR: `PutDispEnv(env+848)` → +848 is **PMODE** (0x66); **DISPFB pack is at env+864** (PutDispEnv +16); ISR also `ld 944(env)` → DISPFB1.
+- Dump left +864 open — still want it; +944=0 matches DISPFB1=0.
+
+### Who builds env (`0x102B38` SetDispEnv)
+Only callers `0x1FD9FC` / `0x1FDA64` in display-init (`s5=0x67`, `s0=s5+0x54C0` = **`0x6754C0`**):
+
+```
+daddu a1, zero, zero     ; *** FBP argument = 0 ***
+addiu a0, s0, 96         ; sub-env at +96
+jal  0x102B38            ; pack DISPFB with FBP=0
+...
+daddu a1, zero, zero     ; FBP=0 again
+addiu a0, s0, 464
+jal  0x102B38
+```
+
+**Bootstrap intentionally installs page-0 DISPFB into the only env object PutDispEnv uses.** Class-A is the **missing later retarget** (SetDispEnv with FBP=0x46, or store into +864/+944), not a decode bug.
+
+### Next
+1. Live: dump **+864** at PutDispEnv; watch `0x6754C0–0x675880` for any post-init writes  
+2. Static/live: any **second** call to `0x102B38` / `0x1FD9xx` with a1≠0; retarget setter reachability  
+3. No invent-DISPFB
+
+```text
+S199: Env 0x6754C0 built with a1=FBP=0 at 0x1FD9FC/A64. PutDispEnv correctly pushes zeros.
+      Missing retarget to FBP=0x46. Watch writes + dump +864.
+```
+
