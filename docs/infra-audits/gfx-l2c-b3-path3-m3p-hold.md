@@ -1065,3 +1065,28 @@ Flip dig (Grok)
   next: who writes env.dispfb / why set-flag so rare (PATH3 plateau link?)
   no Core
 ```
+
+### 22.6 env.dispfb field is sticky-init (Grok follow-up)
+
+`--watch` on the three PutDispEnv env bases' `+0x10` DISPFB fields over 30M:
+
+| Addr (env+0x10) | Writes of DISPFB value | Writer PC |
+|-----------------|------------------------|-----------|
+| `0x6754D0` (env0) | **1×** `0x51400` (plus early zero clear) | `0x0010273C` `sd v1/r3, 16(s3)` inside SetDefDispEnv-like `0x00102638` |
+| `0x675820` (env1) | **1×** `0x51400` (byte-wise sdl/sdr) | `0x001FDFB8` game init copy |
+| `0x675848` (env2) | **1×** `0x51400` | `0x001FE008` game init copy |
+
+**Zero** subsequent stores change fbp away from 0. So PutDispEnv's 4 runs are not "failing to flip" —
+they faithfully re-bind a **struct that was never updated** after boot-time SetDefDispEnv.
+
+`0x00102638` is called from game init at `0x001FD994` / `0x001FD9C4` only (static jal census).
+There is also a generic `sd r2, 16(s0)` at `0x00102C10` (SetDispEnv-shaped) but it does not
+appear among the watch hits on these live envs in the 30M window.
+
+```text
+env.dispfb sticky-init
+  written once to 0x51400 at SetDefDispEnv / game copy
+  never rewritten with fbp=0x46 (or any other page)
+  PutDispEnv correctly re-applies stale page0
+  next: who *should* update env.dispfb (or L2L blit 0x46→page0) before set-flag
+```
