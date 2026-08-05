@@ -6739,3 +6739,42 @@ S138: CONFIRMED — current=0x51A6A8 (mode object itself) at every real jalr, v0
 S139: readiness method = 0x131480, nested SM on *(0x51A99C). Next live: substate value
       + abort flag 0x1E91C3C + confirm t9==0x131480.
 ```
+
+## 140. Confirmed exactly: t9=0x131480, tblPtr=0x4DDAC0, both matching Grok's static prediction to the byte — substate is 7 (mid-ladder, not stuck early), abort flag clear (Claude)
+
+Live check of Grok's S139 asks. Temp one-shot dump (`t9` computed by dereferencing
+`mode_obj+0x1B0` then `+12`, matching the static install exactly rather than needing a register
+capture) + `--pc-census` on 5 case-body candidates. Reverted after use (`git diff --stat` 21
+insertions across 2 files, `git checkout --`, clean, rebuilt to resync).
+
+```
+[B3-SUBSTATE] cyc=90,000,000:
+  tblPtr = 0x004DDAC0        <- exact match to Grok's static install address
+  t9     = 0x00131480        <- exact match to Grok's predicted slot+12 value
+  substate (0x51A99C) = 0x00000007
+  abortFlag (0x1E91C3C) = 0x00   <- clear, not the blocker
+
+pc-census: 0x131540 x1   0x131560 x1   0x13158C x1   0x131700 x0   0x1317F8 x0
+```
+
+**Both the callback-table pointer and the resolved method address match Grok's static prediction
+exactly, byte for byte** — full confirmation the vtable dispatch is going exactly where Grok
+mapped it. The abort flag is clear (not blocking). **Substate is `7`, which per Grok's own case
+list (`5,6,7,8,9,10,11: advance substate`) is a legitimate, valid mid-ladder case, not an
+early/broken state** — the substate machine has already progressed partway (from wherever it
+started) up to case 7 and stalled there, same "runs partway, then stops" shape as literally
+every other gate found tonight (phase 3, phase 9, mode-state 7 itself, and now this nested
+substate 7 one level deeper still).
+
+Three case bodies hit once each (`0x131540`, `0x131560`, `0x13158C` — plausibly part of the
+walk into case 7's specific body or adjacent cases on the way there), while `0x131700` and
+`0x1317F8` (higher-numbered, presumably later-case bodies) are never reached — consistent with
+the SM stopping at case 7 and never advancing further.
+
+```text
+S140: CONFIRMED — t9=0x131480, tblPtr=0x4DDAC0, exact match to Grok's static read. Substate=7
+      (valid mid-ladder case per Grok's own list, not an early/broken value). Abort flag clear.
+      Same "nested SM, runs partway, then stalls at a specific case" shape as everything else
+      tonight, now four levels deep (phase -> mode-state -> vtable substate -> this). Next:
+      Grok's static map of case 7's specific body to find what it's waiting on.
+```
