@@ -1834,6 +1834,65 @@ VIF1 command-type check (Claude) -- rules out Path1-specific routing bug
 
 ---
 
+## 31. VBlank ISR's own consume/gate logic disassembled — closes the loop back to the doc's original DISPFB-sticky finding (Claude)
+
+Split with Grok: (a) am I reaching whatever should wake on VBlank post-15.5M, (b) if
+reached, where does it bail. Disassembled the VBlank ISR itself first (`0x1F1CE8`,
+`disasm burnout-only.json 20000000 001F1CE8:C0`) since it's the one thing we already know
+keeps firing (48x, Grok's §25.2) — turns out its *own* body already answers most of (b).
+
+### 31.1 The ISR's real gate
+
+```text
+0x1F1D38: bne a0,v0,0x1F1F24      # v0=2: only act on a specific interrupt sub-type
+0x1F1D40: lbu v0,-24225(gp)       # THE SAME flip-ready flag from Grok's S25 (0x1F1BF4/0x1F1C0C)
+0x1F1D44: beq v0,zero,0x1F1F24    # flag clear -> skip straight past the real work, no-op vblank
+0x1F1D4C: sb zero,-24225(gp)      # flag set -> consume it (clear) ...
+0x1F1D50: sb v0,-24111(gp)
+...
+0x1F1D84: jal 0x001029B0          # ... and call the PutDispEnv-like DISPFB writer
+```
+
+**The VBlank ISR itself is gated by `gp-24225`, the exact flip-ready flag the whole S25-S30
+chain traces back to.** When set, it consumes (clears) the flag and calls `0x001029B0` — the
+same "PutDispEnv-like writer" identified all the way back near the start of this document as
+the thing that sets `env.dispfb`. When clear, it's a correct, cheap no-op.
+
+### 31.2 Closes the loop to the document's very first finding
+
+This directly explains `env.dispfb`'s original "sticky-initialized once at boot, never
+changes" behavior (noted early in this investigation, long before §9): `0x1029B0` only ever
+gets called from inside this ISR gate, and the flag that gates it (`gp-24225`) only gets set
+by the boot-stage chain traced in §25-§29 — which fires a bounded, small number of times
+during setup and never again. **The VBlank ISR has been working correctly the entire time.**
+It fires every vblank (48x confirmed), checks for new work, finds none after the setup
+window, and correctly does nothing. Not a flip-logic bug — a starved-input problem, same
+root as everything else in §25-§30.
+
+### 31.3 What's actually left
+
+The single remaining open question across this entire very long investigation (§1-§31) is
+now precisely: **what real game-loop code is supposed to set `gp-24225` (or otherwise drive
+a new round of VIF1 UNPACK/MPG/MSCAL + GIF Path1/2/3 submission) once per frame during actual
+gameplay, and why is it never reached (or reached but silently bails) after the one-shot
+boot-stage-2 display-env setup completes?** Everything downstream of that point (scheduler,
+producer, DMAC handler, VBlank consume-gate) has now been read, traced, and confirmed correct
+by both of us independently. The bug, if there is one in our emulator (rather than a real
+missing trigger condition we haven't provided — e.g. real input, a title-screen wait, a
+disc-region check), lives upstream of all of it, in whatever should be calling into this
+machinery every frame and isn't.
+
+```text
+VBlank ISR gate (Claude) -- closes the loop to the original DISPFB-sticky finding
+  ISR checks gp-24225 (flip-ready) every vblank; only acts when set, else correct no-op
+  when set: consumes flag, calls 0x1029B0 (the PutDispEnv-like DISPFB writer)
+  gp-24225 only ever gets set by the S25-S29 boot-stage chain -- explains "DISPFB sticky once"
+  VBlank ISR is NOT the bug -- everything downstream of gp-24225 is now confirmed correct
+  remaining question: what should set gp-24225 every frame during real gameplay, and isn't
+```
+
+---
+
 ## 31. VBlank ISR gates (Grok seat b) — flip/DMA only, no VU1 submit
 
 Full disasm of `0x001F1CE8` (fires 48×/30M). Control flow:
