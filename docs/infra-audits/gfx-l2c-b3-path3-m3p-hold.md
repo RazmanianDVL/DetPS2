@@ -7518,3 +7518,90 @@ sp corruption is upstream of final VBlank entry, not the relocate loop writing $
 ```text
 S164: count loop does not clobber sp. Find when sp leaves 0x01FFxxxx; dump SavedSp.
 ```
+
+## 165. ROOT-CAUSE CANDIDATE — slot+0xA0 blind relocation treats a small int as a pointer offset (Claude)
+
+**Context:** continuing S164's ask ("find when sp leaves 0x01FFxxxx"), re-examined the raw
+`--pcbreak` log around the count loop instead of just its endpoints, and found the loop body
+itself issues real `UnknownMmioRead`/`UnknownMmioWrite` at incrementing `key=` addresses
+(`0x1000FC8E`, `+0x40` per iteration) starting well before the freeze — i.e. the "count loop" is
+not a pure register spin, it strides through real memory.
+
+**Disasm of the count loop** (`0x25156C`-`0x251584`, function entered at `0x2514FC`/`0x251558`):
+
+```
+0025155C: daddu a2, zero, zero      ; i = 0
+00251560: lw   a1, 0(v1)            ; count = *(fixedStruct+0)
+00251568: addiu a3, v1, 16          ; a3 = fixedStruct+16 (array base)
+0025156C: lw   v1, 52(a3)           ; v1 = *(a3+52)
+00251570: addiu a2, a2, 1           ; i++
+00251574: addu v1, v1, a0           ; v1 += a0  (a0 = per-element delta)
+00251578: sw   v1, 52(a3)           ; *(a3+52) = v1   <-- destructive read-modify-write
+0025157C: addiu a3, a3, 64          ; a3 += 64  (stride to next 64-byte element)
+00251580: sltu v1, a2, a1
+00251584: bne  v1, zero, 0x0025156C ; loop while i < count
+```
+
+With `count = 4,041,872` (confirmed frozen, S153/S155) and a 64-byte stride, this walks
+`4,041,872 * 64 ≈ 246MB` forward from `fixedStruct+68` — straight off the end of RDRAM
+(32MiB, ends at `0x02000000`) and into the real PS2 hardware I/O register range
+(`0x1000xxxx`), which the emulator correctly does not recognize (`UnknownMmioRead`/`Write`).
+**This single loop is a destructive read-modify-write over ~246MB of address space it was never
+meant to touch — a fully sufficient mechanism to explain the later-observed stack corruption
+(S163) as a side effect, not a separate bug.**
+
+**Traced `fixedStruct` back to its source.** `fixedStruct` = `*(a0+36)` after `0x2514C0`'s own
+in-place relative→absolute fixup (`0x2514FC`-`0x25150C`: `v1=*(a0+36); v1+=a0; *(a0+36)=v1`).
+Captured full live register state at every `0x2514C0`/`0x251558`/`0x251560` hit across the whole
+run (`--pcbreak=002514C0:00251560`, `--cycles=73000000`). ~198 earlier calls in the run all
+produced cleanly 4-byte-aligned `fixedStruct` pointers (`0x7907C0`, `0x791340`, `0x791EC0`,
+`0x792440`, `0x794B40`, `0xBFA2C0`, …). **The 199th (final, never-returns) call is the outlier:**
+`a0=0xB6D88A`, `fixedStruct=v1=0xB9D88A` — **neither is a multiple of 4.** This is the exact call
+that enters the count loop and never returns (no `0x2514C0`/`0x251558` hit exists anywhere later
+in the 73M-cycle trace).
+
+**Traced `a0=0xB6D88A` to its source — the caller, `0x2B7110`** (the resource-object relocator,
+called as `jal 0x2B7110(a0 = s0 = 0x00B6D880)`, the same resource pointer confirmed real in
+S151). Disasm of `0x2B7110`-`0x2B718C` confirms it blindly relocates 4 slots
+(`+0x98,+0x9C,+0xA0,+0xA4`) of the resource object with identical logic: `if (*(s0+off) != 0)
+{ abs = *(s0+off) + s0; *(s0+off) = abs; jal 0x2514C0(abs) }`. Return address `ra=0x2B7170` on
+the broken call pins it to the **`+0xA0` (160) slot**. Live register state at that call's
+`0x2514C0` entry shows `v1=0xA` — the *raw, pre-relocation* value at `*(0x00B6D880+160)` is
+literally **`10`**.
+
+**`s0 + 10 = 0xB6D88A` — exactly the misaligned pointer.** A "relative pointer offset" of 10
+bytes is not a plausible sub-object offset (every other slot's real relative offsets, across 198
+successful calls, land on 4-aligned absolute addresses). This strongly indicates **slot `+0xA0`
+of this resource is not actually a relocatable-pointer field for this resource's type/kind — it
+holds a small integer (literally `10`, plausibly a type tag, sub-count, or flags value) — and
+`0x2B7110`'s blind 4-slot relocator has no type/kind check, so it "relocates" this integer as if
+it were a relative pointer, producing garbage.** That garbage pointer is then handed to
+`0x2514C0`, which reads `*(garbage+0)` as a loop count, gets `0x3DAC90` (4,041,872 — itself
+suspiciously in the same numeric range as this game's other *code* addresses, e.g. `0x2BCA20`,
+`0x30D7C0`, `0x383C80` — consistent with reading a misaligned/shifted composite of two adjacent
+words rather than a real field), and spins a destructive 246MB out-of-bounds write loop that
+never terminates and, in passing, is fully sufficient to explain the sp corruption already found
+at the VBlank handler (S163) as collateral damage rather than a distinct bug.
+
+**This reframes the whole remaining chain**: the interrupt-return/EXL-stuck symptom (S159) and
+the sp-corruption symptom (S163) are very likely both *downstream effects* of this one
+out-of-bounds loop scribbling over RDRAM (including, eventually, thread 1's stack region) while
+it strides toward the MMIO range — not independent bugs. If so, the actual fix target is
+upstream: **either `0x2B7110` needs a type/kind-aware guard on which slots are real pointers for
+this resource's shape, or slot `+0xA0` should not be getting a nonzero small-int value at all for
+this resource instance** (which would point back at whatever populates the resource object in
+the first place). Per project doctrine, the ISO's data is ground truth — a `10` sitting at
+`+0xA0` is presumably intentional content (a real field value for this resource kind), and the
+bug is the emulator's own generic relocator applying pointer-fixup semantics to a field that
+isn't a pointer for this resource type.
+
+```text
+S165: ROOT-CAUSE CANDIDATE — 0x2B7110's blind 4-slot relative-pointer relocator has no
+      type/kind check. For resource 0x00B6D880, slot +0xA0 holds a small int (10), not a
+      pointer; relocated anyway into garbage ptr 0xB6D88A (misaligned, unlike all 198 other
+      successful calls). 0x2514C0 then reads *(garbage) as a loop count (4,041,872), and the
+      count loop's 64-byte-stride read-modify-write walks ~246MB off RDRAM into MMIO space —
+      fully sufficient to explain sp corruption (S163) as collateral, not a separate bug.
+      Next: identify resource 0x00B6D880's type/vtable to confirm +0xA0 isn't meant to be a
+      pointer for this kind; find what should gate 0x2B7110 from relocating it.
+```
