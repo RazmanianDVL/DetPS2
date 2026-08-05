@@ -7215,3 +7215,57 @@ may finish. Fork: completes+sw22 vs never. Double-relocate remains top design su
 ```text
 S154: await 200M — does 0x25158C hit 199 and 0x2BCE4C fire?
 ```
+
+## 155. 300M-cycle result: the count is FROZEN, not growing — identical 4,041,872 at both 95M and 300M. This contradicts "just needs more cycles" and points back to a thread-scheduling freeze, same family as S66/S131/S147 (Claude)
+
+Ran the full 300M-cycle test (over 3x the original budget). Census, same addresses as S153:
+
+```
+0x002514C0 x199          (unchanged from 95M)
+0x0025156C x4,041,872    (IDENTICAL to the 95M count, not higher)
+0x0025158C x198          (unchanged)
+0x002BCD5C x0             (still never reached)
+0x002BCE4C x0             (still never reached — sw 22 still never fires)
+0x00132560 x0             (mode-state=2 setter, still never reached)
+Final: cyc=300,000,000  PC=0x0023710C  (near but not identical to the 95M final PC 0x2370F8)
+```
+
+**The iteration count did not increase by a single count between 95M and 300M cycles of
+additional run time.** This directly contradicts the "still grinding through a big-but-finite
+loop, just needs more cycles" hypothesis (Grok's S154 fork #1) — if the loop were still actively
+executing, 200M more cycles at ~15-25 cycles/iteration should have added roughly 8-13 million
+*more* iterations, not zero. **The count is frozen, not slow.**
+
+**This points back to the same pattern found repeatedly tonight: the thread executing this loop
+stopped being scheduled, not that the loop is legitimately huge-but-progressing.** Consistent
+with S147's already-noted candidate mechanism (the mode-SM spin thread simply stops running,
+same shape as S66's original SleepThread/never-woken finding) — except now localized one level
+deeper: it's not the outer spin loop that freezes, it's *this specific thread*, mid-iteration,
+inside the count loop itself, at exactly iteration 4,041,872, and it simply never gets CPU time
+again for the rest of the 300M-cycle run. The final PC moving slightly (`0x2370F8` → `0x0023710C`)
+confirms *other* threads keep running fine in the meantime — this is not a global stall, it's
+this one thread specifically losing its turn and never getting it back.
+
+**Reframing once more, now with strong evidence:** this isn't a "corrupted count value" bug in
+the traditional sense (the count itself may well be perfectly fine and would finish in a
+reasonable number of iterations) — it's a **scheduling bug**: whatever this thread is (worth
+identifying which `tid` is executing this fixup call), it gets preempted or descheduled mid-loop
+and never resumes, for reasons unrelated to the loop's own logic. This would mean fixing the
+count/relocation logic (Grok's "double-relocate" theory) might be entirely unnecessary — the
+real fix, if one exists, is in whatever scheduling mechanism drops this thread and never revisits
+it, a question squarely in the same family as every other "thread/spin stops and never resumes"
+finding from tonight (S66, S131, S147).
+
+**Recommending as the concrete next step:** identify which thread ID is executing this loop
+(same technique as S66's original tid=1 discovery) and check its `Sleeping`/`WaitSemaId` state
+at the moment the count freezes, to see directly whether it matches the SleepThread pattern or
+something else (priority starvation, a different kernel primitive, host-present pacing).
+
+```text
+S155: 300M-cycle result CONTRADICTS "just needs more cycles" — count loop iteration count is
+      IDENTICAL at 95M and 300M (4,041,872 both times), not higher. The thread executing this
+      loop is frozen mid-iteration, not slowly grinding. Same scheduling-freeze family as
+      S66/S131/S147, now localized to a specific thread mid-loop. Real fix candidate may be a
+      scheduling issue, not the relocation/count logic itself. Next: identify the executing
+      thread ID and its Sleeping/WaitSemaId state at freeze time.
+```
