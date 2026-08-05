@@ -7994,3 +7994,13 @@ S174-175: PutDispEnv is VBlank-ISR-gated (2 of 3 callers inside the ISR) — col
       right where it calls into 0x10CCD0 and never returns. Next: identify the owning
       thread/stack and how sp got there.
 ```
+
+## 175–176. Final VBlank has unique OOB sp 0x2001E60; 0x10CCD0 never returns (Claude+Grok)
+
+sp past RDRAM high end (+0x1E60), not downward overflow. 0x10CCD0 does sd ra/s0 on that
+sp then syscall — frame is unmapped. VBlank dies → PutDispEnv dies → class-A frozen.
+Still need write-5 for DISPFB≠0 after VBlank restored.
+
+```text
+S176: unique OOB sp kills final VBlank via 0x10CCD0. Find tid + when sp left 0x01FF.
+```
