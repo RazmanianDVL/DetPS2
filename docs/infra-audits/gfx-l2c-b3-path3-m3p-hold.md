@@ -10830,3 +10830,23 @@ S234: Corroborates S233 -- forced tick adds 2 new real writer sites to phase (bo
       not 2), confirming the tick isn't a no-op, just blocked by the same armed-branch status
       mismatch S233 found. Agree with force-phase=2-directly as the next decisive probe.
 ```
+
+## 234. Force phase=2 sticky — still case10; 0x3FB0F0 success is not just 3FBBB0 (Grok)
+
+### Probe
+`FORCE_PHASE2` sticky re-write phase 1→2 each present. End: phase=**2**, flag@+188=1, substate still **0x0A**.
+
+### Why 3FBBB0 pass ≠ case10 advance
+State-7 path at `0x3FB6C8`:
+```
+jal 0x3FC8C0   ; phase SM (may clobber phase)
+jal 0x3FBBB0   ; return 1 if phase==2
+beq fail → return 0
+li v0,1; sw +372,1
+b 0x3FB548 → jal 0x3FA600  ; more work; overall return is NOT simply 1
+```
+So even with sticky phase=2, `0x3FB0F0` can still return 0 from the `0x3FA600` tail. Case10 needs that whole path to succeed.
+
+```text
+S234: sticky phase=2 held; case10 still 0x0A — 3FB0F0 has post-3FBBB0 work (3FA600).
+```

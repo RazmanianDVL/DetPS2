@@ -121,6 +121,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _forceStreamTicks;
     /// <summary>S233: one-shot +500 clear after force ticks (not every frame).</summary>
     private bool _forceStreamArmCleared;
+    /// <summary>S234 dual-ACK: force phase field to 2 for case10 gate probe.</summary>
+    private bool _forcePhase2Done;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -180,6 +182,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _forceStreamPumps = 0;
         _forceStreamTicks = 0;
         _forceStreamArmCleared = false;
+        _forcePhase2Done = false;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -369,6 +372,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 MaybeClearStreamArmBytes(sys);
                 _forceStreamArmCleared = true;
             }
+            // S234 dual-ACK: force phase=2. Sticky — 0x3FC8C0 (called just before 0x3FBBB0
+            // in case10) may rewrite phase back to 1 when arm fails; re-apply each present.
+            if (sys.MasterCycles >= 42_000_000)
+                MaybeForcePhase2(sys);
         }
 
         // S170 dual-ACK: gate SM state 3 holds a GTFS resource whose +0xA0 can be a small
@@ -1553,6 +1560,31 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     $"n={_forceStreamPumps} cyc={sys.MasterCycles}");
             return; // one handle per Step
         }
+    }
+
+    /// <summary>
+    /// S234 dual-ACK: write phase=2 at stream phase obj <c>0x1E7A888+0xC8</c> when the
+    /// case10 gate flag at +188 is set. Bypasses arm to test whether anything past phase 2
+    /// also blocks. Env-gated with FORCE_STREAM_PUMP.
+    /// </summary>
+    private void MaybeForcePhase2(Ps2System sys)
+    {
+        const uint PhaseObj = 0x01E7A888;
+        const uint FlagOff = 188;  // +0xBC
+        const uint PhaseOff = 200; // +0xC8 = 0x1E7A950
+        var mem = sys.Memory;
+        if (mem.Read8(PhaseObj + FlagOff) == 0)
+            return; // gate not armed; don't invent
+        uint phase = mem.Read32(PhaseObj + PhaseOff);
+        if (phase == 2)
+            return;
+        mem.Write32(PhaseObj + PhaseOff, 2);
+        if (!_forcePhase2Done
+            && (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1"))
+            Console.Error.WriteLine(
+                $"[B3] FORCE_PHASE2 obj=0x{PhaseObj:X8} phase {phase}->2 (sticky) cyc={sys.MasterCycles}");
+        _forcePhase2Done = true;
     }
 
     /// <summary>
