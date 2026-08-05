@@ -6633,3 +6633,20 @@ S137: All four re-arm entries (0x30D4B0/500/560/5C0) confirmed zero-hit, not jus
       not-yet-reached boot/menu stage, same shape as the rest of tonight. Next: Grok's static
       read of 0x318548 (sole 0x30D5C0 caller) to find what gates it.
 ```
+
+## 136b. Exact-object re-arm wrapper: 0x318530 → 0x30D5C0(0x1E90240); 94 callers, 0 live (Grok)
+
+```
+0x318530:
+  a0 := 0x1E90240          # hardcoded gate object
+  a1 := caller_a0 (handle)
+  a2 := caller_a1 (flag)
+  jal 0x30D5C0
+```
+
+`0x30D5C0`: same-handle →6; flag==0 →**2**; else →**0**. Most of 94 callers pass a1=0 → would write gate=2 (write-5's case). Live S82: none fire. Chicken-egg with mode-state=7 / 0x1322B0 likely.
+
+```text
+S136b: re-arm for THIS object is first-class (94 jals). Zero live hits. Next: census
+       0x318530/0x30D5C0; optional RA of first hit.
+```
