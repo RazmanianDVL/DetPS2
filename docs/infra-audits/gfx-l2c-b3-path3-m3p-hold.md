@@ -6445,3 +6445,15 @@ S131: modestate is stuck at 7, hard plateau (identical value 40M through 94M, ze
       Grok's static map of 0x132600's case 7 body — what is it waiting on, same pattern as
       phase 3 (Global.txd) and phase 9 (audio claim) before it.
 ```
+
+
+---
+
+## 131–132. Mode-state stuck at 7; case7 waits 0x1322B0 (Claude+Grok)
+
+S131: modestate=7 flat 40–94M; write-5 0 hits. S132: case 7 at 0x132A7C; gate
+0x30D7C0 behind jal 0x1322B0 which calls 0x28B160(0x1E75640) audio object.
+
+```text
+S132: next live = 0x1322B0 / 0x28B160 readiness
+```
