@@ -113,6 +113,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private uint _stageHedSize;
     /// <summary>S127: completed stuck sound\generic.awd stream status 48→256.</summary>
     private int _audioStreamCompletes;
+    /// <summary>S170 dual-ACK: zeroed implausible rel-ptr slots before 0x2B7110 advance relocate.</summary>
+    private int _resourceRelPtrScrubs;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -340,6 +342,13 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // pumps (0x29EF00/0x2B4C00 never run). Promote stuck 48→256 so climber advances.
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
+
+        // S170 dual-ACK: gate SM state 3 holds a GTFS resource whose +0xA0 can be a small
+        // int (ISO-truth 10), not a relative pointer. 0x2B7110 blindly relocates four slots
+        // and 0x2514C0 then count-loops millions of 64B RMWs off RDRAM → stack/EXL death.
+        // Scrub implausible rel fields while state==3 (wide case2→advance window).
+        if (sys.MasterCycles >= 35_000_000 && _resourceRelPtrScrubs < 8)
+            MaybeScrubImplausibleResourceRelPtrs(sys);
 
         // Post full-TXD presentation: leave GIF flush MMIO thrash so Soft-GS can draw
         // FRONTEND/logo chrome. Does not touch residual force timing / STG bind.
@@ -1486,6 +1495,60 @@ public sealed class Burnout3Assist : IGameQuirkModule
                     $"chunk={chunk} buf=0x{buf:X8} n={_audioStreamCompletes} cyc={sys.MasterCycles}");
             return; // one object per Step
         }
+    }
+
+    /// <summary>
+    /// S170 dual-ACK (seq0582): while display/gate SM object state is 3 (case2 done, waiting
+    /// case3 advance), zero resource slots at +0x98..+0xA4 that cannot be relative pointers.
+    /// Live: resource 0xB6D880 +0xA0 holds ISO int 10; 0x2B7110 does abs=base+10 and
+    /// 0x2514C0 count-loops ~4M×64B through RDRAM/MMIO (S165–S171). Real rel 0x8C940 at
+    /// +0x98 is kept (aligned, ≥0x10, &lt;16MB). Title Assist only — not Core HLE.
+    /// </summary>
+    private void MaybeScrubImplausibleResourceRelPtrs(Ps2System sys)
+    {
+        // Gate / display env object used by mode SM case7 → 0x30D7C0 / nested advance 0x2BCD50.
+        const uint GateObj = 0x01E85900;
+        const uint StateOff = 0x140;   // +320: nested SM state (3 = case2 done)
+        const uint ResourceOff = 0x148; // +328: resource pointer from case2 alloc
+        const uint StateCase2Done = 3;
+        // Relative-pointer plausibility (matches dual-ACK design S170).
+        const uint MinRel = 0x10;
+        const uint MaxRel = 0x01000000; // 16 MiB
+
+        var mem = sys.Memory;
+        uint state = mem.Read32(GateObj + StateOff);
+        if (state != StateCase2Done)
+            return;
+
+        uint res = mem.Read32(GateObj + ResourceOff);
+        if (res < 0x00100000 || res >= 0x02000000)
+            return;
+
+        int scrubbed = 0;
+        // Four slots relocated by 0x2B7110: +0x98, +0x9C, +0xA0, +0xA4.
+        ReadOnlySpan<uint> slots = stackalloc uint[] { 0x98, 0x9C, 0xA0, 0xA4 };
+        foreach (uint off in slots)
+        {
+            uint rel = mem.Read32(res + off);
+            if (rel == 0)
+                continue;
+            // Non-pointer-shaped: unaligned, tiny (e.g. int 10), or absurdly large.
+            if ((rel & 3) != 0 || rel < MinRel || rel > MaxRel)
+            {
+                mem.Write32(res + off, 0);
+                scrubbed++;
+            }
+        }
+
+        if (scrubbed == 0)
+            return;
+
+        _resourceRelPtrScrubs++;
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+            || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                $"[B3] resource rel-ptr scrub res=0x{res:X8} slots={scrubbed} " +
+                $"n={_resourceRelPtrScrubs} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
