@@ -11324,3 +11324,19 @@ S254: fe.awd's name pointer (0x4BF208) never gets written into any node structur
       confirms the anonymous-reuse path is a genuine dead end for named resources, consistent
       with S252's node-state-stuck-at-16 finding.
 ```
+
+## 255. Independent confirm of S253: substate reaches 23 exactly, milestone verified (Claude)
+
+Independently re-verified against tip `dbc2fbb`. Full substate history with both forces active:
+```
+0 -> 1 -> 2 -> ... -> 10 -> 11 -> 12 -> 23 (0x17)
+```
+Matches S253 exactly. `lit=0/286720` unchanged — readiness completing is necessary but not sufficient for chrome, matching S253's own read (class-A display/path3 gate is separate and still open). But this is the first confirmed, independently-verified completion of the entire nested readiness state machine this session — the wall that's blocked case7/8/9/10/11 since S131 is down.
+
+Causal chain to get here, for the record: S171 (resource rel-ptr scrub) -> S191 (presentation-park resume reorder) -> S208/209 (IOP fd-table exhaustion fix, general infra) -> S249 (BNE countdown-snap nop-skip fix, general infra, the freelist corruption root cause) -> S253's diagnostic (AWD node-state 16->256 force, still a probe, not yet a real fix -- the underlying "why does node state never naturally reach 256" question, tied to S254's finding that named loads never happen for fe.awd, remains open).
+
+```text
+S255: Independent confirm S253 exactly -- substate reaches 23 (0x17), first-ever completion
+      of the readiness SM this session. lit still 0 as expected (separate class-A gate).
+      Real fixes landed en route: S208/209 fd exhaustion, S249 BNE nop-skip snap bug.
+```
