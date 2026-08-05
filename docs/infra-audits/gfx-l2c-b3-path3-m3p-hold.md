@@ -9466,3 +9466,37 @@ S196: Neither AddIntcHandler registration call site (0x1F3C20 for PutDispEnv/1F1
       registers. Real open question: why doesn't this registration sequence ever run, or is it
       simply irrelevant to how PutDispEnv is supposed to get called at all.
 ```
+
+## 195–196. Registration cold; PutDispEnv last known (Grok)
+
+Claude S196: neither `0x1F3C20` nor `0x237240` hits; zero INTC_DISPATCH; 0x2370A0 still 303 hits somehow.
+
+### Registration call graph (static)
+| Handler | AddIntcHandler site | Parent | Grandparent |
+|---------|---------------------|--------|-------------|
+| `0x1F1CE8` (flip) | `0x1F3C2C` a0=2 | `0x1F3C08` | `0x1F3FFC` ⊂ `0x1F3F98` ← **jal from `0x1FE0B8`** |
+| `0x2370A0` (wake) | `0x23724C` a0=2 | `0x237200` | `0x133CBC` ⊂ `0x133BB0` ← **jal from `0x12EB64`** |
+
+Both src=2. Claude: both AddIntc sites **cold** full run → no TryDispatch path.  
+Then **0x2370A0 cannot be explained by AddIntcHandler** if registration is truly zero — need entry-mode live (jalr / vector patch / mis-attributed hit). Open honesty gap.
+
+### Last known PutDispEnv fire (this session)
+| When | Evidence |
+|------|----------|
+| Pre-S191 (poison era) | PCSTREAM/branch to `0x1029B0` ~cyc 42M while mid-body (S185 era) — **not trustworthy** as normal boot |
+| Post-S191 | **0 hits** (Claude S195) |
+| Static boot | `0x103B88` PutDispEnv once in init path — **unverified live post-S191** |
+
+No clean “last healthy periodic PutDispEnv” in this session’s post-fix evidence. Best anchor: **boot `0x103B88` one-shot** (confirm live first 5M) then **never again**.
+
+### Next (do not env-quad under PutDispEnv)
+1. Live: pcbreak `0x103B88` / `0x1029B0` first 5M — boot count  
+2. Live: how is `0x2370A0` entered if reg cold? (TRACE_INTC_DISPATCH; if empty, `DETPS2_TRACE_JRHIGH` / watch jalr to 0x2370A0)  
+3. Live: pcbreak `0x1FE0B8` and `0x12EB64` — display init / wake-reg parents  
+4. Static later: what gates `0x1FE0B8` (flip registration chain)
+
+```text
+S196+: Reg sites for both src=2 handlers cold. PutDispEnv last trusted fire = boot 0x103B88
+      (unverified) or pre-S191 poison. Next: boot PutDispEnv count + how 0x2370A0 is entered.
+```
+
