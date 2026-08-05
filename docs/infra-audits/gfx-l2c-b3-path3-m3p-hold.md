@@ -11815,6 +11815,23 @@ S270: S267c corrected — case2 fires once from 0x1E2D38 (a0=2, a1=a2=a3=0) → 
       Not unwired; empty-args boot call. Need re-dispatch after FRAME 0x46 or non-zero args.
 ```
 
+## 271. Measure-only force case 2: nested EE re-call **hangs**; env FBP unchanged (Grok)
+
+Dual-ACK (Claude seq0750/0751). Env `DETPS2_B3_FORCE_DISP_CASE2=1` after FRAME FBP=0x46 (@≥25M).
+
+| Probe | Call | returned | steps | env+10 | DISPFB2 | lit |
+|-------|------|----------|-------|--------|---------|-----|
+| S271 | `0x1FE1A0(a0=2)` | **False** | 2,000,015 (MaxSteps) | 0x51400→same | same | 0 |
+| S271b | `0x1FD490` leaf | **False** | 500,054 (MaxSteps) | 0x51400→same | same | 0 |
+
+**Read:** Host nested re-call does **not** reproduce a clean case-2 completion (unlike natural boot ×1). Env DISPFB never leaves 0x51400. Nested Step also contaminates the run (mostlyBlack, lower residual). **Not** proof that case 2 is inert — only that this invoke method fails. No invent-DISPFB.
+
+```text
+S271: FORCE_DISP_CASE2 nested re-call (switch then leaf) hangs MaxSteps; env stays 0x51400.
+      Mechanism not proven. Next: dual-ACK memory-only env FBP patch measure, or fix invoke
+      context (gp/thread) for nested call.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:

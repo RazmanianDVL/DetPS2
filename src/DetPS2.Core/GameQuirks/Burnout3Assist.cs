@@ -117,6 +117,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _resourceRelPtrScrubs;
     /// <summary>S226 dual-ACK: force type-6 stream status→9 when pump never runs (env-gated).</summary>
     private int _forceStreamPumps;
+    /// <summary>S270 dual-ACK: measure-only re-dispatch display switch case 2 after FRAME FBP≈0x46.</summary>
+    private int _forceDispCase2;
     /// <summary>S230 dual-ACK: host-call stream-system tick 0x28AF10 once (env-gated).</summary>
     private int _forceStreamTicks;
     /// <summary>S233: one-shot +500 clear after force ticks (not every frame).</summary>
@@ -185,6 +187,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _forceStreamTicks = 0;
         _forceStreamArmCleared = false;
         _forcePhase2Done = false;
+        _forceDispCase2 = 0;
         _awdNodeStateCompletes = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
@@ -366,6 +369,20 @@ public sealed class Burnout3Assist : IGameQuirkModule
             && _awdNodeStateCompletes < 8
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_AWD_NODE_STATE") == "1")
             MaybeForceAwdNodeStateComplete(sys);
+
+        // S270 dual-ACK measure-only: re-dispatch display switch case 2 (0x1FE1A0 a0=2 →
+        // 0x1FD490 FBP-OR) after FRAME FBP settles at 0x46. Boot already calls case 2 once
+        // with zero args at ~14.3M (S269/S270); this asks "does the mechanism work later?"
+        // Nested EE call (same pattern as FORCE_STREAM_TICK). Env DETPS2_B3_FORCE_DISP_CASE2=1.
+        // Does NOT invent DISPFB — runs real game path only.
+        if (_forceDispCase2 == 0
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_CASE2") == "1"
+            && sys.MasterCycles >= 25_000_000)
+        {
+            uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+            if ((frame1 & 0x1FFu) == 0x46)
+                MaybeForceDispCase2(sys);
+        }
 
         // S237: phase2-only clean probe (DETPS2_B3_FORCE_PHASE2_ONLY=1).
         // No status=9, no +500 clear, no nested EE tick — isolates "does sticky phase=2
@@ -1702,6 +1719,78 @@ public sealed class Burnout3Assist : IGameQuirkModule
             Console.Error.WriteLine(
                 $"[B3] FORCE_STREAM_TICK fn=0x{TickFn:X8} a0=0x{StreamSys:X8} " +
                 $"returned={returned} steps={steps} n={_forceStreamTicks} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S270/S271 dual-ACK measure-only: re-enter FBP-OR leaf <c>0x1FD490</c> (case-2 body)
+    /// after FRAME FBP is 0x46. First probe called switch <c>0x1FE1A0(a0=2)</c> and hit
+    /// MaxSteps without return; leaf is the actual merge. Env
+    /// <c>DETPS2_B3_FORCE_DISP_CASE2=1</c>. Nested EE Step — diagnostic only, not product.
+    /// Does not invent DISPFB; only runs the game path.
+    /// </summary>
+    private void MaybeForceDispCase2(Ps2System sys)
+    {
+        // Case-2 body (FBP-OR). Switch entry 0x1FE1A0 hung at MaxSteps in S271 probe.
+        const uint FbpOrFn = 0x001FD490;
+        const uint ReturnSentinel = 0x00B3F002;
+        const uint EnvDispfbField = 0x00675820; // env1 +0x10 (S258)
+
+        var ee = sys.EE;
+        var mem = sys.Memory;
+        if ((ee.PC & 0x1FFFFFFFu) == FbpOrFn)
+            return;
+
+        uint envBefore = mem.Read32(EnvDispfbField);
+        uint dispfb2Before = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+
+        ulong savedPc = ee.PC;
+        var savedGpr = new EmotionEngine.Gpr128[32];
+        for (int i = 0; i < 32; i++)
+            savedGpr[i] = ee.GetGpr(i);
+
+        // Boot case-2 path leaves a1/a2/a3 zero into the switch; leaf uses fixed bases.
+        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 }); // a0
+        ee.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // a1
+        ee.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2
+        ee.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 }); // a3
+        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ReturnSentinel }); // ra
+        ee.PC = FbpOrFn;
+
+        bool returned = false;
+        int steps = 0;
+        const int MaxSteps = 500_000; // leaf should be far smaller than switch
+        try
+        {
+            while (steps < MaxSteps)
+            {
+                int n = ee.Step(64);
+                if (n <= 0) n = 1;
+                steps += n;
+                uint pc = (uint)(ee.PC & 0x1FFFFFFFu);
+                if (pc == ReturnSentinel || pc == (ReturnSentinel & 0x1FFFFFFFu))
+                {
+                    returned = true;
+                    break;
+                }
+                if (pc < 0x1000)
+                    break;
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < 32; i++)
+                ee.SetGpr(i, savedGpr[i]);
+            ee.PC = savedPc;
+        }
+
+        _forceDispCase2++;
+        uint envAfter = mem.Read32(EnvDispfbField);
+        uint dispfb2After = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        Console.Error.WriteLine(
+            $"[B3] FORCE_DISP_CASE2 fn=0x{FbpOrFn:X8} (FBP-OR leaf) returned={returned} steps={steps} " +
+            $"FRAME1=0x{frame1:X} env+10 0x{envBefore:X}->0x{envAfter:X} " +
+            $"DISPFB2 0x{dispfb2Before:X}->0x{dispfb2After:X} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
