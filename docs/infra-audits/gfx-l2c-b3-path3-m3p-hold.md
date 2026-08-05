@@ -10732,3 +10732,35 @@ S229: 0x51A99C's full history is a clean one-shot 0->10 loading progression, nev
       (0x2A3150, 0x384E70->0x290CF0) is a genuine bug in what should drive per-frame updates
       during loading, not a red herring from testing too early.
 ```
+
+## 229. Common dispatcher: stream tick never entered; readiness SM is live (Grok)
+
+### Shared call chain (static)
+```
+0x132560  (fn, a0=mode ctx)
+  → jal 0x28AF10(0x1E75640)   // stream system object (fixed BSS)
+       → … loop …
+       → jal 0x384E70 → jal 0x290CF0 → 0x292820 → class+48 pump 0x2A3150
+       → also jal 0x384FD0 → 0x290CF0
+
+0x13348C path:
+  → jal 0x28B380(0x1E75640)
+       → jal 0x384E70 (when flag@+29184 set)
+```
+
+Object **`0x1E75640`** is the shared stream-system root (a0 from `lui 0x1E7; addiu 0x5640`).
+
+### Live (70M, no force-pump)
+| PC | Hits |
+|----|------|
+| `0x131480` readiness nested SM | **224×** (active, stuck case 10 / substate 0x0A) |
+| `0x132560` / `0x28AF10` stream tick | **0** |
+| `0x13348C` / `0x28B380` alt tick | **0** |
+| `0x1322B0` mode readiness | **0** (pcbreak range) |
+
+### Read
+Pump + arm share **one stream-system tick** rooted at `0x28AF10(0x1E75640)`, only reached from `0x132560` / `0x13348x` mode paths. Those never run while `0x131480` case10 spins. Common gate is **above** the tick — mode SM never schedules the stream-tick case. Next: which mode case / vtable slot should call `0x132560`, and what blocks that case while readiness is on case10.
+
+```text
+S229: Shared stream tick 0x28AF10(0x1E75640) never entered; 0x131480 readiness live at case10.
+```
