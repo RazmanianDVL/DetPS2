@@ -7282,3 +7282,55 @@ sleep flags after freeze; look for PC in 0x25156C band.
 ```text
 S156: frozen mid-fixup loop → scheduling. Dump all thread PCs/sleep at plateau.
 ```
+
+## 157. Per-thread PC dump found tid=1's saved context sitting exactly inside the count loop — but tid=1 is also `currentThreadId`, actively running different code. Genuine puzzle, not simple starvation (Claude)
+
+Temp addition to the existing thread-summary line (`savedPc`/`priority`/`waitVblank`/`suspend`
+per thread — fields already existed on the `Thread` class, just not printed). Reverted after
+use (`git diff --stat` 1 line changed, `git checkout --`, clean, rebuilt to resync).
+
+```
+id=1 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0025156C priority=50 waitVblank=False suspend=0
+id=2 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BE64 priority=64 ...
+id=3 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BD48 priority=54 ...
+id=4 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BD48 priority=54 ...
+id=5 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BD48 priority=54 ...
+id=6 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BD48 priority=33 ...
+id=7 alive=True started=False ... savedPc=0x002A2168 priority=22 ...
+id=8 alive=True started=True sleeping=False waitSemaId=0 savedPc=0x0010BE64 priority=1 ...
+currentThreadId=1
+```
+
+**`tid=1`'s saved context PC (`0x0025156C`) is exactly the count-loop body address** — direct
+confirmation this thread genuinely was executing inside the runaway loop at some point, matching
+S153-155's PC-census evidence precisely. `Sleeping=False`, `WaitSemaId=0`, `WaitVblank=False`,
+`SuspendCount=0` — nothing blocking it structurally.
+
+**But `currentThreadId=1` at this exact same snapshot — tid=1 is *also* the currently active
+thread, and the live EE PC (per the standard summary) is `0x002370F8`, near the VBlank-park
+family, not inside the loop.** This is the genuine puzzle: if tid=1 were simply READY-starved
+(never rescheduled, per Grok's S156 theory), it should show as *not* current, parked somewhere
+waiting its turn while another thread monopolizes the CPU. Instead it appears to be both "last
+saved inside the loop" and "currently running elsewhere" — meaning it did get switched back in
+at some point, but somewhere between switch-in and now, the loop's own context was abandoned
+rather than resumed.
+
+**Leading candidate reading**: an interrupt (VBlank/timer/DMAC, per Grok's own S156 note that
+only interrupts can pull a thread out of a tight arithmetic loop) fired while tid=1 was mid-loop,
+saved its PC (`0x25156C`) correctly, but the interrupt-return / context-restore path never
+resumed tid=1 back into the loop — instead, subsequent scheduling put tid=1 (or the interrupt
+handler running "as" tid=1) into the VBlank-park-family code (`0x2370xx`) permanently, abandoning
+the loop's saved context rather than restoring it. This would be a real interrupt-handling /
+context-restore gap, not a priority-starvation issue in the traditional sense — worth Grok's
+static read of the exception-return path (matches their own proposed next static angle:
+"RotateThread / VBlank wakeup selection order; whether a non-sleeping mid-loop thread can be
+permanently skipped").
+
+```text
+S157: tid=1's saved PC is exactly inside the count loop (0x25156C), confirming it genuinely ran
+      there — but tid=1 is ALSO currentThreadId, live-running different code (0x2370F8, VBlank
+      family) at the same snapshot. Not simple starvation (it did get rescheduled) — looks more
+      like an interrupt fired mid-loop, saved context correctly, but the return path never
+      restored the loop context, abandoning it instead. Needs Grok's static read of the
+      interrupt-return/context-restore path.
+```
