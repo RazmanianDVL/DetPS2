@@ -550,3 +550,65 @@ Flag re-measure
   SleepThread thrash ≠ permanent zero-flag for slots 1-3
   B3 black lead returns to DISPFB/PATH3 flip stall
 ```
+
+---
+
+## 14. Page-0x46 read-only dump (Claude) — the real draw target is honestly black too
+
+Took the smaller of Grok's two proposed next seats (Grok took PATH3/M3P hold). Read-only,
+no Core: added a temp diagnostic (`Tests/TempPage46Dump.cs`, gated on
+`DETPS2_TEMP_PAGE46_ISO`, fully reverted after — `git status` clean) that calls `Gs.
+ReadLocalMem` directly (an existing public accessor, no Core change needed) to dump FRAME_1's
+real target page (`0x46 * 8192 = 0x8C000` byte offset) as raw PSMCT32, 640×448 (matching
+DISPFB2's own decoded resolution), at 35M cycles — entirely bypassing the present/composite
+path, so this can't be fooled by anything display-side.
+
+### Result
+
+```
+offset=0x8C000 len=1146880 nonZeroPixels=286720/286720 distinctColors(cap20000)=1
+```
+
+**Every single pixel in the page is the identical 32-bit value.** Decoded: RGB = (0,0,0),
+alpha = 0xFF — opaque black, uniform across the entire 640×448 region. (Not literally
+all-zero, which is why the naive "nonZeroPixels" word-level check reported 100% "non-zero" —
+the alpha byte alone is nonzero. Visual/color-level inspection, not the raw nonzero count, is
+what actually matters here — same lesson as this session's earlier `3bcedb2`/L2b-C4 visual
+rejections.)
+
+### What this means
+
+**There is no hidden "real frame" being mis-routed by a display-selection bug.** The actual
+draw target — the page DISPFB *isn't* pointing at, that the game keeps writing fragments
+into (`fragTest=2825979`, `rejDepth=1948792`) — is, by the time forward progress freezes,
+itself just a uniform black fill. This reframes the whole B3 investigation:
+
+- It's **not** "the game rendered something real and we're failing to display it right."
+- It's more consistent with: the game is still in a clear/loading/transition state and
+  simply hasn't reached real scene geometry yet by the point everything plateaus, **or**
+  whatever real geometry it started drawing earlier got overwritten by a later full-buffer
+  clear that was the last operation to touch this page before the freeze.
+- `px=877187` (roughly 3× one screen's worth of pixel-write operations) is consistent with
+  multiple Z/color clears plus some real but small draws, not sustained scene rendering.
+
+This doesn't change §3's finding (compositor's black present is honest) — it strengthens it:
+even bypassing the compositor entirely and reading the real draw target directly, honest
+black is still the correct answer right now. There is no fabricated-content risk here in
+either direction — nothing to paint, nothing being hidden.
+
+### Next (not started, no Core)
+
+Doesn't replace Grok's PATH3/M3P hold dig — if PATH3 packets are genuinely stuck holding
+real geometry data that never drains, that would explain both "why no real scene ever
+lands on this page" and "why the last thing touching it was a clear." Worth checking
+whether the held PATH3 backlog (`heldP3qwc=2124`) corresponds to real, decodable draw data
+(not just held metadata) as a next step, if that seat is still open.
+
+```text
+Page-0x46 read-only dump
+  100% of pixels = single value (0,0,0,0xFF) -- opaque black, uniform
+  read Gs.ReadLocalMem directly, bypasses present/composite path entirely
+  no hidden real frame -- the actual draw target is honestly black too by freeze time
+  consistent with: still-clearing/loading, or real geometry got overwritten by a later clear
+  strengthens (doesn't change) the "honest black" finding from section 3
+```
