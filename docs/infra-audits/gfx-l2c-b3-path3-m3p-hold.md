@@ -6095,3 +6095,15 @@ S118: REFINEMENT — grow (0x2B6DA0) is reached once (phase9's first call) and S
       call must fail in a SHARED later step (config/claim, 0x383C80 + the +932/+939 flags) —
       need the range past 0x384260 to see where miss and match paths reconverge.
 ```
+
+
+---
+
+## 118–119. 25× match + 1× grow; both die at claim (Claude+Grok)
+
+S118: grow once succeeds (node real). S119: grow path always returns 0 (delay slot).
+Match path: 0x383C80 must return 0 (25×). Next: v0 after 0x383C80.
+
+```text
+S119: phase9 root = 0x383C80 claim returns 0 for sound\generic.awd
+```
