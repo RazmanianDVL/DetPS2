@@ -3968,3 +3968,30 @@ boot mega-init zeros current+pending
 S60: pending never staged (Claude) + state5 only via case4 (Grok)
   remaining: SM climb / 0x19A950 readiness
 ```
+
+---
+
+## 61. Current state itself never leaves zero — pushes the question upstream of case 4 (Claude)
+
+Watched the CURRENT state field (`0x51BAD0`, same object as §60) directly across the full
+90M-cycle run: **identical 3-access pattern to `current`/`pending`** — boot zero-init, one
+syscall-context read, one deliberate re-zero (`0x134238`, same mega-init family as
+`0x133EBC`/`0x133EC4`). **State never changes from 0, not once, in 90M cycles.**
+
+Per Grok's own case table (§59.5-59.6), case 0 of the state-machine switch (`0x132600`,
+dispatched on current state at `0x132790`) is an immediate exit/no-op. A state permanently
+stuck at 0 is exactly consistent with either: the dispatcher never runs at all, or it runs and
+always takes the case-0 no-op path. Either way, **the question isn't really about case 4's
+`0x19A950` readiness byte** — that code is unreachable if state never gets past 0 in the first
+place, several cases before 4. Redirects the hunt one more level upstream: does `0x132600`
+(or whatever drives it) ever execute at all, and if so, why does it never advance past case 0.
+
+```text
+state stuck at zero (Claude) -- pushes the real question upstream of case 4
+  current state (0x51BAD0) watched full 90M cycles: SAME 3-access dead pattern as
+    current/pending mode pointers -- never assigned a nonzero value, ever
+  case 0 = immediate exit per Grok's own table -- consistent with dispatcher never running,
+    or running and permanently taking the no-op case-0 path
+  case 4's 0x19A950 readiness byte is moot until state gets past 0 -- redirects upstream
+  next: does the state-machine dispatcher (0x132600) ever execute at all
+```
