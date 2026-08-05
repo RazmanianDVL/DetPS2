@@ -4270,3 +4270,47 @@ Unblocks existing wake-flag plant + 0x237120..19C force so climber can retry pas
 | dispfbPx | 0 | 0 |
 
 VBlank wake + SleepThread assists fire; flip park leave observed. Residual: no Path1/VU1, dispfb still dark.
+
+## 70. Independent cross-check + narrowed next thread: VU1 genuinely idle (not a bug at this stage); real candidate is FBP≠DISPFB2 (Claude)
+
+Ran my own 95M-cycle A/B before seeing Grok land S68 (used the exact 3-line diff I'd proposed
+in S67 — it landed as commit `39fffb0` mid-run, so my local edit and Grok's commit ended up
+byte-identical; reverted the moment `git status` showed no diff against the landed commit, no
+double-apply). Numbers cross-validate Grok's table exactly: final PC `0x0010BE68` (identical to
+Grok's), `px=7667523`, `prims=1934`, `gifP3=198`, `cdvdSectors=6584`, `gifPath1=0` — same state,
+independently reproduced.
+
+**VU1 census (temp `DETPS2_TRACE_VU1_CENSUS=1`, reverted after use):** `mscalRuns=0 xgKicks=0`
+at 95M, i.e. VU1 never runs a single microprogram and never XGKICKs, even after S68 unlocked
+8x more boot execution. This is a clean, decisive negative — not "VU1 output is getting
+dropped," VU1 is never invoked at all. Matches §30's pre-S68 VIF1 finding (cmds=745 but
+unpack/mpg/mscal all 0) exactly, now reconfirmed post-S68 with far more cycles run. Given the
+scene we're in is 2D chrome/logo (Grok's trace: "chromePad=True by ~30.5M", FRAME_1/FBP
+unchanged all run), **this is likely not a bug at this stage** — B3's intro/menu presentation
+plausibly doesn't need VU1 3D rendering yet, same class as the bounded/not-yet-reached findings
+from §37-44 earlier tonight. Not chasing this further as a "gap" unless a real 3D-scene request
+is later found never reaching VU1.
+
+**The sharper thread: draw target vs display-read target mismatch.** Post-S68, Path2 (136
+transfers) and Path3 (198 transfers) are both genuinely active and producing real GS state —
+`prims=1934`, `imgBytes=1084512` are non-zero and growing, this is real drawing, not idle. But
+`softgs-circuit` shows the *draw* target `FBP=0x0` while the *display* circuit is locked onto
+`DISPFB2=0x51400` (`circ=2 naturalDispfb=1 enNatural=1 dispfb2=0x51400`). Composited pixels stay
+at 0 (`dispfbPx=0`, `naturalDispfbPx=0`, `mostlyBlack=1`) because the buffer being drawn into
+and the buffer being displayed are two different addresses — a draw/display buffer mismatch,
+not "nothing is being drawn." This is the same shape as §31's original "DISPFB-sticky" finding,
+but it's now *actionable* for the first time: before S68 nothing drew at all so the mismatch was
+moot; now real content lands at FBP=0x0 every frame and never gets shown because DISPFB2 never
+points there (or FRAME_1/FBP never gets set to 0x51400).
+
+**Proposed next step (measure-only, no Core yet):** find what's supposed to write DISPFB2 (or
+FBP) to make them agree — likely a double-buffer flip call tied to the VBlank ISR (same family
+as §31's `PutDispEnv` writer at `0x1029B0`) that either isn't being invoked yet at this boot
+stage, or is being invoked but its address argument is wrong/stale. Will trace writes to
+`DISPFB2`/`FBP`-backing registers across the same 95M window next and report.
+
+```text
+S70: VU1/Path1 dead is likely non-bug (2D-chrome stage, not yet needing VU1) — not chasing.
+     Real next thread: FBP=0x0 (draw) vs DISPFB2=0x51400 (display) never converge post-S68 —
+     tracing DISPFB2/FBP writers next.
+```
