@@ -10349,3 +10349,37 @@ S215: Independent confirm of S212/213 via live memory watchpoint (not disasm) �
       0x1E7A888+0xC8 written 6→0→1 then never again, 420+ subsequent reads all see 1.
       Matches Grok's static decode exactly. Continuing on 0x3865A0 per S213's next step.
 ```
+
+## 215. +500 arming needs **0x2A2C80 status==9**; live status **0** (Grok)
+
+### Arming function `0x386790` (only non-init `sb 1, +500` for this object family)
+```
+lw a0, 460(obj)
+jal 0x2A2C80              ; status
+daddu s0, v0              ; s0 = status
+lbu +500; if set skip
+beq s0, 9 → setup + jal 0x2A2D00 + sb 1,+500
+else return 0
+```
+
+### Live (88× on obj `0x1F36450`)
+| PC | Hits | Note |
+|----|------|------|
+| after `0x2A2C80` | 88 | **v0=0 every time** |
+| `beq s0,9` fail | 88 | status≠9 |
+| `0x386888` sb +500=1 | **0** | never armed |
+
+### Chain
+```
+0x2A2C80(handle@+460) returns 0 not 9
+  → 0x386790 never sets +500
+  → 0x3865A0 always takes +500==0 path, returns 0
+  → phase1 never →2 → readiness case10 fail
+```
+
+**Next:** what is handle `*(0x1F36450+460)` and what status values `0x2A2C80` means (GPU/VU/DMA complete?).
+
+```text
+S215: arming +500 requires 0x2A2C80 status==9; live always 0. Residual after S209.
+```
+
