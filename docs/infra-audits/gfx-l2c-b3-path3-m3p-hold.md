@@ -5468,3 +5468,75 @@ landed.
 ```text
 S98: dual-ACK landed HLE fno5 EOF state complete; await independent host-present verify
 ```
+
+## 99. Independent verification: S98 fix works exactly as designed — G1 truly fixed, phase climbs 3→9 — but does NOT reproduce S96's `lit>0`, because a deeper, separate gate (mode-state) is still stuck (Claude)
+
+`blocker-trace --host-present`, `DETPS2_TRACE_RPC=1`, full 95M cycles, no temp force. Real,
+mixed result — reporting both halves plainly.
+
+**The fix works correctly, exactly as designed:**
+
+```
+[GTFS] fno=5 EE object complete obj=0x0066E120 state 2->1   (×6 across the run — Global.txd,
+                                                               FRONTEND stream chunks, HEADUS)
+```
+
+Six completions, one per real fno=5 read, all correctly correlated with their DMA (checked each
+one's preceding `[GTFS] fno=5 DMA fd=... -> ...` line — fd 4/5/6, matching sizes, matching
+addresses). This is **real G1 fix confirmation** — the historical "fno=5 never dispatched, then
+later 'dispatches but never completes'" gap (G1, S49-54, S92-95) is genuinely closed. Temp
+one-shot dumps (`DETPS2_DUMP_B3_S97CHECK=1`, reverted — `git diff --stat` 14 insertions,
+`git checkout --`, clean) confirm the downstream effect is real and large:
+
+```
+cyc=20,000,000: phase=1, completion flag=0x00
+cyc=90,000,000: phase=9, completion flag=0x01, mode-state=0x00000000, gate=0x00000006
+```
+
+**Phase climbs from stuck-at-3 (all night, S88-92) to 9** — the climber genuinely advances
+through 6 more phase-dispatch cases it could never reach before. The completion flag
+(`0x51868C`) is `1`, confirming phase-3's specific block (S88-90) is resolved. This is
+substantial, real, measured progress deep into previously-unreachable boot territory.
+
+**But the final product summary does NOT match S96's bar:**
+
+| metric | S96 (one-off force) | S99 (real fix, this run) |
+|---|---:|---:|
+| lit | 2/286720 | **0**/286720 |
+| m3p | False | **True** |
+| heldP3n/qwc | 0/0 | **5/2124** (unchanged) |
+| spu2Writes | 3318 | **0** |
+| final PC | 0x00289AC8 | **0x0010BE68** (still in the boot band) |
+| **mode-state (0x51BAD0)** | not checked | **0** — still stuck |
+| **gate (0x01E90424)** | not checked | **6** — still stuck, needs 5 |
+
+**Read: this is not a fix failure — it's the fix correctly solving G1 and surfacing the next
+layer.** `mode-state` (S64-84's outer state-machine field) and `gate` (S82-84's `==5` check) are
+a *different, deeper* mechanism than `phase` (S64-92's climber-phase field) — G1 blocking
+`phase` at 3 was real and is now fixed, but `mode-state` reaching 5 was always documented (S64,
+S84, S91) as needing the *mode SM* (`0x132600`) to run, which is itself gated on the climber
+*finishing entirely* (all the way past phase 16, not just past phase 3). Phase reaching 9 is
+real progress but apparently not yet "climber done."
+
+**This also reframes S96 itself**: my one-off memory force at a single fixed checkpoint
+(cyc=30M) produced `lit>0` and a full PATH3/M3P cascade that this *more correct, more complete*
+fix does not reproduce. That strongly suggests **S96's dramatic result was a coincidental side
+effect of forcing that specific object at that specific moment** — plausibly interacting with
+some other consumer of the same address/timing window — **not proof that resolving G1 alone
+was sufficient**. S96 should be read as "state=1 is sufficient to unblock *something*
+downstream," not "state=1 is sufficient to unblock *everything*." The real chain is longer than
+S96 suggested; S99 shows exactly where it now stops (mode-state, not phase).
+
+**Not a regression, not cause for reverting** — S98's fix is correct and should stay landed;
+it fixes a real, confirmed bug (G1) and produces real, measured forward motion (phase 3→9).
+The remaining gap is the mode-state machine itself, which was already an open, separately-
+tracked thread (S64-66, S91's "Open root" section) before tonight's G1 detour started.
+
+```text
+S99: S98 CONFIRMED WORKING — 6 real fno=5 completions, phase 3->9, flag set. Does NOT reproduce
+     S96's lit>0/PATH3-drain/audio cascade — mode-state (0x51BAD0) and gate (0x01E90424) are
+     still stuck at 0/6 respectively, a separate, deeper mechanism than phase. S96's dramatic
+     result now looks like a coincidental side effect, not proof G1 alone was sufficient. Keep
+     S98 landed (real fix, real progress) — next thread is the mode SM itself, same open
+     question S64-66/S91 already flagged before tonight's G1 detour.
+```
