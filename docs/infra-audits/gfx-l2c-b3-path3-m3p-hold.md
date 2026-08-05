@@ -2063,3 +2063,102 @@ tid7: create/start @25M, runs once, returns, dormant
 not never-started; one-shot worker finished
 sema104 / tid8 still the open thread lead
 ```
+
+---
+
+## 35. Sema 104's designated producer traced and found unreachable — same dead-code shape as §27, new subsystem (Claude)
+
+### 35.1 Sema 104 is never signaled — full system census, not just this one ID
+
+Temp `DETPS2_TRACE_RPC` addition to `SignalSema` (reverted after use) gave a full census of
+every `SignalSema` call across the 30M-cycle run: **220 total calls system-wide, 218 of them
+target sema id=1, one targets id=7, one targets id=8. Zero target id=104 (or id=3, tid2's
+wait target).** Sema 104 — the wait target of tid8, the single highest-real-priority thread
+in the whole system (`priority=1`, lower = higher per this codebase's convention) — is never
+signaled once in 30 million cycles. Essentially all system liveness funnels through a single
+semaphore (id=1); everything else, including 104, is either starved or resolved through a
+different mechanism (SIF RPC synchronous completion, observed separately in the trace for
+other semas via `HandleBind`/`HandleCall`, but not present for 104's creation).
+
+### 35.2 Found the designated producer, and it's unreachable
+
+Sema 104's creation site (`ra=0x00248598`, `init=0 max=127`) creates a *pair* of semaphores
+plus initializes a small table of records (28 bytes × 2, fields `0, 512, 16, 16384` — sizes
+consistent with a job/DMA-buffer descriptor pool), the shape of a producer/consumer job
+queue. Right above it in the same function block sits a second function
+(`0x00248518-0x00248540`) that:
+
+```text
+0x248520: lw a0, 13444(v0)     # v0 = 0x1D90000; loads the SAME memory slot (0x1D93484)
+                                #   that holds sema 104's id
+0x248528: jal 0x0010BE50       # = iSignalSema (EE syscall -67, interrupt-safe SignalSema —
+                                #   see SonyKernelHle.cs's own comment: "for SetAlarm callbacks")
+0x248530-34: sync; ei          # interrupt-enable wrap, consistent with an alarm-callback body
+```
+
+**This is sema 104's designated producer** — an `iSignalSema`-wrapped one-liner, exactly the
+shape real PS2 code uses for a periodic/one-shot `SetAlarm` callback that posts a semaphore.
+
+Checked reachability with the same three independent techniques that established the
+`0x1A6290`/`0x219150` dead-code read back in §27:
+
+1. **Direct `jal`**: `scanword` for `jal 0x00248518` (`0x0C092146`) across the full code
+   range — **zero matches**.
+2. **Stored literal pointer** (e.g. a callback table entry): `find-word` for the raw address
+   `0x00248518` across `0x100000-0x700000` post-20M-cycle live memory — **zero matches**.
+3. **Computed `lui`+`addiu`/`ori` construction**: masked scan for `lui $rt,0x25` (17 hits) /
+   `lui $rt,0x24` (4 hits), then directly for the completing `addiu $rt,$rt,0x8518` (9 hits,
+   all `addiu t0,{s4,s5,s6,s7},-31464` — `0x250000-0x7AE8 = 0x248518`, confirmed real
+   constructions, not false positives). **Checked the first one by hand**
+   (`0x248968`, inside a retry-loop polling `jal 0x216BB8` until `v0==1`): `t0` is
+   **clobbered** at `0x2489CC` (`addu t0,s0,s1`) a few instructions later, before any
+   `jalr t0` or store — dead, same shape as §27's one coincidental `0x1A6290` match. The
+   other 8 hits are structurally identical repeats of the same unrolled block (same
+   `lui sX,0x25 ... addiu t0,sX,-31464` pattern at evenly-spaced addresses
+   `0x248928..0x2495A0`), overwhelmingly likely the same dead pattern each time, not checked
+   individually given the strong structural match and time budget — flagging this explicitly
+   as a slightly weaker link than the other two techniques (worth a second pass if this
+   thread becomes central).
+
+**All three techniques: zero live reachability.** Same read as §27: this looks like
+genuinely orphaned/unlinked code, not a bug in call-graph construction on our side.
+
+### 35.3 Why this feels different from §25-§31's chain
+
+Everything in §25-§31 traced a mechanism that *does* run (a handful of times, correctly,
+during boot setup) and then correctly stops because its input dries up — a starved-producer
+shape, several links deep, all confirmed live and correct up to the point they run out of
+work. **This is different: a specific, plausible-looking producer function for the
+highest-priority thread's wait condition that is never reachable at all**, not even once —
+closer in shape to the §27 dead-code finding (the blit-consumer mega-fn) than to the
+starved-producer chain. Two independent "this looks like real code with zero live callers"
+findings in the same binary, in two unrelated subsystems (GS blit consumption, and an
+alarm-driven semaphore producer), is a real pattern worth flagging on its own: possibly a
+build/link configuration difference between what we loaded and how the real retail binary
+resolves indirect calls (e.g. a fixed-up jump table we're not reproducing, or callbacks
+registered through a BIOS/IOP-side mechanism our HLE doesn't model), rather than two
+unrelated coincidences.
+
+### 35.4 Open
+
+- Confirm the remaining 8 `addiu t0,sX,-31464` sites are dead the same way (spot-checked
+  one, structurally near-identical to the rest, but not individually verified).
+- Find what *should* call `SetAlarm` (or equivalent) with `0x248518` as the callback —
+  that's the real missing link, same shape as looking for what should call the boot-stage
+  dispatcher an ongoing number of times instead of the bounded 4 we found in §28.
+- Given both this and §27's dead-code finding share the "computed-but-clobbered" or
+  "zero reachability across all 3 techniques" signature, worth comparing notes with Grok on
+  whether our indirect-call/jump-table modeling has a systematic gap, rather than continuing
+  to treat each as an isolated one-off.
+
+```text
+sema-104 producer hunt (Claude) -- found the designated producer, confirmed unreachable
+  full SignalSema census: 220 calls total, 218->sema1, 1->sema7, 1->sema8, ZERO->sema104
+  producer candidate: iSignalSema-wrapped fn @ 0x248518 (SetAlarm-callback shape per
+    SonyKernelHle.cs's own comment), reads the exact same memory slot as sema104's id
+  reachability: 0/3 techniques find a live call (direct jal, stored ptr, computed lui+addiu)
+    -- one computed match found but clobbered before use, same shape as S27's dead 0x1A6290 hit
+  pattern worth flagging to Grok: TWO unrelated subsystems now show "real code, zero live
+    callers" -- possibly a systematic indirect-call/callback-table modeling gap, not
+    coincidence
+```
