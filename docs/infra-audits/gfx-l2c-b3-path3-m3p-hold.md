@@ -279,3 +279,62 @@ MSKPATH3 data-flow (Grok) -- CLOSED for writer question
   stuck = missing post-mask re-submit of unmask slot, not missing/corrupt unmask data
   no Core; dual-ACK before force-unmask A/B or submit-path Core theory
 ```
+
+---
+
+## 10. Causal A/B: forced unmask (Claude) — real data confirmed, but does NOT fix the flip
+
+Took §9.5 item 2 (the optional A/B, dual-ACKed). Temp diagnostic
+(`Tests/TempB3ForceUnmask.cs`, gated env vars, fully reverted — `git status` clean) calling
+`Gif.SetMskPath3(false)` directly (existing public method) once at cycle 25,000,000 (confirmed
+via the same run: `m3p=True heldN=5 heldQwc=2124` at that point, matching the known final
+state — so this lands after all 10 real `MSKPATH3` events), then running to 50M and comparing
+against an unforced baseline in the same harness.
+
+### 10.1 Result
+
+| | Baseline (no force) | Forced unmask @ 25M |
+|---|---|---|
+| `m3p` @ 50M | `True` | `False` |
+| `heldN` / `heldQwc` @ 50M | `5` / `2124` | `0` / `0` (drained) |
+| `px` @ 50M | `877187` | **`1172419`** (+295,232) |
+| `FRAME_1` / `DISPFB1` / `DISPFB2` | `0xA0046` / `0x0` / `0x51400` | **identical** |
+| page-0x46 distinct colors | 1 | 1 |
+| page-0x46 sample color | `0xFF000000` | `0xFF000000` (**identical**) |
+
+### 10.2 What this establishes
+
+- **The held 2124 QW batch is real, load-bearing draw data, not garbage or padding.**
+  Draining it causes the interpreter to genuinely process ~295K more fragments —  a real,
+  substantial amount of additional GS work, not a no-op.
+- **But it does not fix anything visible.** `FRAME_1`/`DISPFB1`/`DISPFB2` don't move at all —
+  not even a little — and page 0x46 is still **exactly** uniform opaque black afterward, same
+  sample color, same distinct-color count. Whatever the drained batch actually was (more
+  likely a clear/setup batch than colorful scene geometry, given the outcome), it did not
+  produce a visible frame or trigger any subsequent flip logic.
+
+### 10.3 Conclusion — temper the PATH3 hypothesis
+
+**Unblocking the PATH3 hold, on its own, is not sufficient to fix B3's black present.** Even
+if the real root cause of the missing final unmask were found and correctly fixed, this
+causal test suggests it would not, by itself, produce a visible frame — something else
+(gated on later game-loop progress that itself may depend on more than just this one drain)
+is still required. This doesn't mean the PATH3 hold is irrelevant — it's still a real,
+confirmed-load-bearing stuck mechanism worth understanding and eventually fixing — but it
+tempers any expectation that finding/fixing it alone resolves the visible symptom. Consistent
+with this project's own doctrine: confirm before claiming, and one real fix rarely equals the
+whole picture on a title this deep in an unresolved state.
+
+### 10.4 Not proposing a Core fix
+
+This was explicitly measure-only per the dual-ACK. No Core change proposed from this result —
+if anything, it argues for *more* investigation (what happens after the drain that still
+prevents a flip) before touching PATH3/M3P mechanics at all.
+
+```text
+Forced-unmask A/B (Claude) -- measure only, reverted
+  draining held 2124 QW -> +295,232 real px (confirms real, load-bearing data)
+  FRAME_1/DISPFB1/DISPFB2 unchanged; page 0x46 still exactly 0xFF000000 uniform
+  PATH3 hold is real but NOT sufficient alone to explain/fix the black present
+  next: what gates the flip AFTER a successful drain -- separate, still-open question
+```
