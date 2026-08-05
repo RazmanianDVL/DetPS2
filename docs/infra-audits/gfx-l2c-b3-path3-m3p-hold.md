@@ -1327,3 +1327,53 @@ unused alternate render path for this boot configuration).
   pad-input test (Start/Cross @ 16-20M): REFUTED, px identical to baseline
   combined with Grok's static findings: structurally disconnected code, not a timing/input gap
 ```
+
+---
+
+## 25. Flip-ready re-arm: DMAC handler dies after setup (Grok)
+
+**Seat:** why flip-ready only 3× then never re-arms post-15.5M (Claude: 14.4–15.5M is real setup, not hang).
+
+### 25.1 Static
+
+Set-flag sites `0x1F1BF4` / `0x1F1C0C` live inside **`0x001F1778`** (frame −288).
+
+That entry is registered at boot (`0x1F3C08`) as **AddDmacHandler** (alongside VBlank ISR `0x1F1CE8`):
+
+```text
+AddIntcHandler(VBLANK_START, 0x1F1CE8)
+AddDmacHandler(ch=1, 0x1F1778)   # and ch=2 variant nearby
+```
+
+So flip-ready is **DMA-completion-driven**, not main-thread polling.
+
+### 25.2 Runtime 30M S1
+
+| PC | Hits | Cycle window |
+|----|------|----------------|
+| `0x001F1778` DMAC handler entry | **13** | **15,167,216 – 15,750,256 only** |
+| set-flag path (range break) | **3 events** | 15,171,952 / 15,252,752 / 15,502,752 |
+
+Handler a0 mix: `2`×6, `-1`×4, `1`×3 (channel / sentinel style).
+
+**After ~15.75M: zero further entries to `0x1F1778`.** Not merely "set-flag branch skipped" — the **handler is never invoked again**. VBlank ISR continues (48× through 30M); DMA-completion path does not.
+
+### 25.3 Reading
+
+```text
+14.4M   TRXDIR template builder once
+15.17–15.75M  DMAC handler 13×; set-flag 3×; PutDispEnv 3×
+15.75M+  DMAC handler silent; flip-ready never re-armed; px plateau; PATH3 held (S1)
+```
+
+Setup completes (Claude heatmap). Ongoing frame production would need repeated DMA completions into this handler. Those stop. Aligns with gif/px plateau and structural blit-consumer disconnect — even if fptr wire for `0x1A6290` were fixed, **re-arm never gets fresh completion events** under current S1 run shape.
+
+Optional next: which DMAC channel(s) fire the 13 handler entries; why channel activity ends (PATH3/M3P hold vs CHCR). No Core.
+
+```text
+re-arm dig
+  set-flag inside AddDmacHandler 0x1F1778
+  handler 13 hits all in 15.17-15.75M then permanent silence
+  VBlank keeps firing; DMA-completion path does not
+  flip-ready cannot re-arm without those completions
+```
