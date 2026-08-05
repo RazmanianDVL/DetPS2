@@ -3494,3 +3494,72 @@ struct-consumer side (Claude) -- state flag's sole reader found, candidate reset
   if confirmed: a per-frame reset race, not a missing call -- state never survives long enough
     for anything to see it and issue the fno=5 read
 ```
+
+---
+
+## 56. Forced-completion A/B: crossing postTxd unlocks real activity, but does NOT clear the black screen (Claude)
+
+Ran the measure-only A/B proposed in §55's follow-up, matching tonight's established causal-A/B
+discipline (RR sched, forced-unmask, etc.): temp env-gated hook in `blocker-trace` (reverted
+after use) that credits enough sectors via the *same* `NoteHostReadSectors` mechanism already
+used for every other credit tonight (no fabricated data) to push `cdvdSectors` from 1865 to
+2065 once the plateau is observed, then let the run continue for 60M cycles and watch what
+actually happens.
+
+### 56.1 Result
+
+```text
+[FORCE] cdvd 1865->2065 cyc=30000000
+[B3] plant FRONTEND.TXD @ 0x00A00000 planted=4194304/8517568 cdvd=6784 cyc=40000000
+final: px=1172419 (was 877187) prims=234 (was 172) gifP2=16 (was 12) gifP3=26 (was 20)
+       mskPath3=13 (was 10) cdvdSectors=6784 (crossed frontendEra>=6000 too)
+       m3p=True heldP3n=5 heldP3qwc=2124 (UNCHANGED) lit=0/286720 mostlyBlack=1 (UNCHANGED)
+```
+
+**Crossing `postTxd` (2000) genuinely cascades:** `MaybePlantFrontendTxd` fires for real, and
+`cdvdSectors` climbs on its own all the way to 6784 (past `frontendEra` too) — confirming the
+rest of that assist chain is alive and working once its own gate is satisfied. Real internal
+graphics activity increases measurably (`px`, `prims`, `gifP2/P3`, `mskPath3` all up).
+
+**But the visible symptom is unchanged.** `heldP3n=5 heldP3qwc=2124` — byte-identical to the
+very first measurement in this entire document (§1). `lit=0/286720` — the presented framebuffer
+is still 100% black. `MaybeEscapePostTxdHang`'s own Path3-M3P-unmask branch **never fires**
+(zero `post-TXD unmask` trace lines in the whole 60M-cycle run) despite its own outer gate
+(`cdvd>=2000 && cyc>=40M`) being satisfied.
+
+### 56.2 Why the unmask still doesn't fire
+
+The unmask branch itself requires `Path3MaskedByVif && PixelsWritten==0 && Path3Transfers>=30`.
+Neither sub-condition holds by the time the gate opens: `Path3Transfers` (`gifP3`) only reaches
+**26** in the entire 60M-cycle run — never crosses the `>=30` threshold — and separately `px`
+becomes nonzero once the newly-unlocked `FRONTEND.TXD`-adjacent activity starts drawing
+something. Either alone is sufficient to explain why the unmask heuristic never triggers; can't
+cleanly separate which one "the" blocker is without finer-grained timing.
+
+### 56.3 What this settles
+
+This is real, useful negative evidence, not a dead end: **completing the missing `fno=5`
+dispatch (§52-§55's whole thread) would very likely *not* by itself clear B3's black screen.**
+The `postTxd` assist's own Path3-unmask heuristic has its own separate, currently-unmet
+preconditions that would need addressing too — and there's a real irony here: the heuristic's
+`px==0` check (meant to detect "nothing is rendering, so Path3 must be why") gets defeated by
+*other* real activity that starts rendering once `postTxd` unlocks, even though Path3 itself
+stays masked with a real backlog the whole time.
+
+Reframes the fix priority: finding/fixing the missing `fno=5` dispatch is still worth doing
+(closes a real gap, matches the "find the real mechanism" doctrine), but shouldn't be assumed
+to be *the* fix for the visible symptom without also addressing why `Path3Transfers` stalls
+under 30 and/or revisiting whether `PixelsWritten==0` is still the right unmask heuristic once
+other content can render independently of Path3.
+
+```text
+forced-completion A/B (Claude) -- crossing postTxd unlocks real activity, screen stays black
+  temp NoteHostReadSectors force (real mechanism, no fabricated data), cdvd 1865->2065->6784
+  real cascade: FRONTEND.TXD plants for real, px/prims/gifP2-3/mskPath3 all genuinely increase
+  BUT: heldP3n/qwc unchanged (still 5/2124, same as S1's very first measurement)
+  lit=0/286720 still 100% black -- visible symptom unchanged despite real internal progress
+  postTxd's OWN Path3-unmask branch never fires: Path3Transfers caps at 26 (<30 threshold),
+    AND px becomes nonzero from other activity, defeating its px==0 heuristic
+  settles: fixing the fno=5 dispatch alone would likely NOT clear the black screen by itself --
+    postTxd's unmask heuristic has its own separate unmet preconditions needing attention too
+```
