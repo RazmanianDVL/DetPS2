@@ -4781,3 +4781,17 @@ S83: Climber retries 37x post-S68 (was 1x) — real forward motion — but never
      stops retrying by cyc=34.87M. Confirms S68 didn't touch the actual blocking gate; it just
      let the thread wake up and try (and fail) more times before parking again.
 ```
+
+---
+
+## 84. Gate cell stuck at 6; mode SM should write 5 (Grok+Claude S82/S83)
+
+Live: `*(0x01E90424)` written once to **6** at `0x30DF48` (mega-init via `0x133E28`).
+Check at `0x424C5C` requires **==5**.
+
+Static: write-5 is `0x30D8DC` in `0x30D7C0`, called only from mode SM `0x132600` case bodies.
+Mode SM never climbs → 5 never written → DISPFB setter dead. Not off-by-one; 5 is SM-ready, 6 is boot terminal.
+
+```text
+S84: boot sets gate=6; mode SM would set 5; SM never runs
+```
