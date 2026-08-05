@@ -10280,3 +10280,27 @@ Who advances phase +200 from 1→2 (or clears +188)? Static of `0x3FC8C0` / writ
 S212: 0x3FBBB0 needs (+188==0) OR (+200==2). Live +188=1, +200 stuck at 1 after 0x3FC8C0.
 ```
 
+
+## 213. Phase1 blocked: **0x3865A0 returns 0** → never `+200:=2` (Grok)
+
+### Phase jump (`0x3FC8C0`)
+Table @ `0x4CEAA0`; phase1 → `0x3FC950`.
+
+### Phase1 body (live 211×)
+```
+jal 0x3865A0(a0=*(obj+192), …)   ; ×211
+andi v1, v0, 0xff
+beq v1, zero, epilogue           ; ×211 ALWAYS
+; DEAD:
+andi +232, clear bit; sw 2, +200  ; 0 hits — never advance to phase 2
+```
+
+So `0x3FBBB0` stays false because phase never leaves 1: **`0x3865A0` is the live gate**.
+
+Args setup: `a0=*(s0+192)` (resource from phase0 `jal 0x386B30`), plus fields +212/+216/+224, `a1=s0+72`.
+
+```text
+S213: phase1 jal 0x3865A0 always v0.lo==0 → no +200:=2 → 0x3FBBB0 fail forever.
+      Next: 0x3865A0 purpose / why zero (async? bad resource @+192?).
+```
+
