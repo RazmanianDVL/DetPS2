@@ -12011,3 +12011,20 @@ S275: s4=0 (null) at 0x1FD490's live entry (cyc=14,332,640). If FBP source is s4
       suggests, this alone explains FBP0 -- reading near-null, not real state. Next: does the
       caller chain ever set s4 to a real object, or is a null s4 itself the missing wiring.
 ```
+
+## 276. s4 varies by case — real pointer for a0=4, null specifically for a0=2 — confirms s4 is meaningful state that case-2's caller never sets up (Claude)
+
+Directly follows S275. Traced `s4` across all six live calls to the `0x1FE1A0` switch entry:
+```
+a0=4 (bulk-copy case):  s4=0x670000  -- a real, plausible object pointer
+a0=2 (FBP-OR case):     s4=0x0      -- null
+(other cases show varying s4 too, not uniformly one value)
+```
+So `s4` isn't some fixed/irrelevant register that happens to be 0 for everyone — it's a real, meaningful pointer that **differs by which case is being dispatched**, and specifically for the case-2 (FBP-OR) call it's null. Combined with S274 (the real FBP=0x46 sits in a sibling "draw-env" struct at `0x675520`, right next to the FBP0 "display-env" case-2 targets): the natural reading is that `s4` is *supposed* to point at that draw-env source data for case 2 to merge from, and whatever sets up the case-2 call simply never populates it — a genuinely missing piece of wiring, not a data-availability problem (S273 already ruled that out) and not a caller-can't-pass-args problem (S273's wrapper finding already ruled that out too). This narrows the target precisely: find what *should* set `s4` before the case-2 dispatch (likely in `0x1E2D10` or its own caller `0x227FB8`/`0x227ED0`), and whether it's simply omitted or conditionally skipped.
+
+```text
+S276: s4 confirmed meaningful (varies by case, real pointer 0x670000 for a0=4) but specifically
+      null for the a0=2/case-2 call. Combined with S274's sibling draw-env holding real FBP=0x46:
+      s4 is very likely meant to point there for the merge, and whatever sets up case 2's call
+      never populates it. Narrows target to: who should set s4 before 0x1FE1A0(a0=2).
+```
