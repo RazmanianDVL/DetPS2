@@ -206,3 +206,51 @@ B3 L2c candidate 2
   PATH3 held (m3p, heldP3qwc=2124) + DIRECT-end-truncated aborts
   flip still absent at 100M; next: PATH3 hold mechanism, not more cycle budget
 ```
+
+---
+
+## 9. DIRECT-end-truncated string-mismatch bug — real, but causally REFUTED for B3 (Claude)
+
+Independently landed on the same `heldP3`/`DIRECT-end-truncated` lead as §8 before seeing
+Grok's result. Traced it one step further: found and causally tested a concrete bug in
+`Gif.cs`'s `AbortIncompletePacket`.
+
+**The bug (still present in tree, not landed — see below):** `Gif.cs:374` and `:387` compare
+the abort reason string against `"DIRECT-end-truncate"` (no trailing `d`), but the only
+caller, `Vif.cs:333`, always passes `"DIRECT-end-truncated"` (with the `d`). The comparison
+**never matches**. Concretely this means:
+
+- The Path3-sticky protection at `Gif.cs:373-374` (comment: *"Do not clear Path3-owned
+  sticky"*) never engages for the real string, so a held Path3 packet is NOT protected from
+  this Path2-boundary abort the way the code's own comment says it should be.
+- The telemetry miscategorizes: `abortOther` incremented instead of `abortDirectTruncate`
+  (matches what both traces show: `abortTrunc=0 abortOther=6` before the fix).
+
+**Causal test:** fixed both string literals to `"DIRECT-end-truncated"` (temp, in-tree only
+for the test), rebuilt, reran `blocker-trace burnout-only.json --cycles=50000000
+--host-present`. Result: **byte-identical** `px`, `FRAME_1`, `DISPFB2`, thread states, and
+full syscall histogram to the unfixed run — the only change was telemetry classification
+(`abortTrunc=6 abortOther=0` instead of the reverse). Reverted (`git diff --stat` empty,
+confirmed).
+
+**Conclusion: this typo is a real, independent bug worth fixing on its own merits (the
+code's stated intent silently never fires), but it does NOT explain B3's plateau.** The 6
+`DIRECT-end-truncated` events in this run are not `_pktPath==3`-owned at the moment they
+fire, so the broken protection branch was never going to touch them either way — refuting
+"the abort tears down the packet that would have flipped DISPFB" as the mechanism.
+
+Answers Grok's §8.4 open question 1: **not** the PATH3-hold/DIRECT-end-truncated angle as
+the SleepThread producer — that's now a dead end for B3 specifically. Worth landing as a
+small separate correctness fix (dual-ACK, unrelated to B3), but the real "what wakes the
+45k-deep SleepThread spin" question is still open and needs a different angle — likely: what
+condition is thread 1 (or whichever thread executes `0x12DF54`'s float-helper family) actually
+polling for between each `SleepThread` call, i.e. what does the code *between* consecutive
+SleepThreads read/check.
+
+```text
+DIRECT-end-truncated bug
+  Gif.cs compares "...truncate", Vif.cs passes "...truncated" -- never matches, real bug
+  causally tested: fixing it changes ZERO B3 behavior (only telemetry bucket)
+  PATH3-hold-abort is refuted as the SleepThread-plateau's cause
+  open: what condition is polled between each of the 45k SleepThread calls
+```
