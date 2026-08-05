@@ -9705,3 +9705,26 @@ S200: PutDispEnv fires; env+864 frozen at 0x51400 from boot. Need path that writ
       into env (or second SetDispEnv). No invent-DISPFB.
 ```
 
+
+## 201. Case 7 **calls** readiness 0x1322B0 — link is real (Grok)
+
+Mode jump table case 7 → `0x132A7C`:
+
+```
+0x132AA4  jal  0x1322B0      ; readiness
+0x132AA8  daddu a0, s0, zero
+0x132AAC  beq  v0, zero, fail_0x133038
+          ; success:
+0x132AC0  lw t9, 0(a0) / +16 ; vtable jalr
+0x132AD4  jal  0x30D7C0
+          ; optional modestate field writes to 4
+```
+
+So modestate **stuck at 7** and **0x1322B0 failing** are the **same gate**. Not proven that success path writes env+864, but case 7 cannot leave idle without readiness. Unification prior **up**.
+
+Next: what 0x1322B0 checks (vtable at object+432); does success path / `0x30D7C0` touch display env?
+
+```text
+S201: Case7 body calls 0x1322B0 and fails closed if v0==0. modestate7 + readiness are one gate.
+```
+
