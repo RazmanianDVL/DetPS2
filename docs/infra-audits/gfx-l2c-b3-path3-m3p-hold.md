@@ -11115,3 +11115,33 @@ S246: Independent confirm of S243/S244 via pop-caller census -- 5 distinct RAs, 
       root cause exactly (11 constructed, only 1 successfully freed back). Self-corrected an
       initial misread (0x3844EC's 11 hits are the init loop, not 11 external consumers).
 ```
+
+## 245. Free walk never leaves head — zeros head->next, drops chain (Grok)
+
+Live watches on node **+0 next** during pool init (deterministic addresses):
+
+### Last node `0x1F35E08` (used LIFO head after 11 constructs)
+```
+2B6DD8 WROTE next=0x1F35A48   # used-link OK on final pop
+2B6C58 READ  next              # free walk first load (head only)
+2B6C78 WROTE next=0            # free: end->next = freelist(=0) with a2==head
+```
+**No further 2B6C58 on mid/first nodes.** Free walk does not advance.
+
+### Mid `0x1F35A48` / first `0x1F33888`
+Zero free-path PCs (`2B6C*`). Mid next correctly set to `0x1F35688` on used-push; never visited by free.
+
+### Conclusion
+`0x2B6C40` free-all-used behaves as:
+```
+a2 = used_head;  // does not walk
+*a2 = freelist;  // wipes head->next (was 0x1F35A48)
+freelist = used_head;  // one-node freelist
+```
+Static loop *should* walk `while (a2->next)`. Live: first load + immediate store on head only → either next reads as 0 at free entry (despite 2B6DD8), or walk broken. Result matches S244 (1 of 11 restored).
+
+```text
+S245: free 0x2B6C40 never visits mid nodes; zeros used-head->next, freelist keeps 1 node.
+      Pin: value of head->next at 2B6C58 entry (pcbreak free + watch).
+```
+
