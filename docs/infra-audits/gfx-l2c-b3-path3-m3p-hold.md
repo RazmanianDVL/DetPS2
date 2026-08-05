@@ -11308,3 +11308,19 @@ display/path3 class-A work remains, but the nested readiness SM is no longer the
 S253: FORCE node state 16→256 unblocks case11→12→23 readiness success. lit still 0.
 ```
 
+
+## 254. Name-bind live check: fe.awd's string pointer never gets written into any node structure — only passed as a transient call argument (Claude)
+
+Answering S251/S252's "does reuse bind the name later" question, per Grok's ask. Added a temp value-based memory watch (`DETPS2_WATCH_VALUE=0xHEX`, logs every `Write32` whose value matches, anywhere in RDRAM — complements the existing address-based `--watch=ADDR`; reverted after use) and searched for every write of fe.awd's string address (`0x4BF208`).
+
+**Result: 749 hits, all to the exact same stack address `0x1FFFE10`, all with `pc=0x00000000`** (an argument-register save-slot artifact, not real game code — matches the exact count of `0x2870D0` entries from S250/S252's census). No hits anywhere else, and specifically none at any of the resource-node addresses (`0x1F3xxxx` range).
+
+**Clean, decisive negative: the name is passed as a transient call argument on every attempt and never gets written into a persistent node structure anywhere.** "Reuse now, bind name later" is not attempted at all — it's not that a later binding step fails, there simply isn't one. This is consistent with S252's node-state finding: if node state is only ever supposed to reach 256 via a real *named* load completing (not the anonymous-reuse path), and named loads never happen for fe.awd, that directly explains why the node state field never naturally advances past 16 for it.
+
+```text
+S254: fe.awd's name pointer (0x4BF208) never gets written into any node structure anywhere in
+      the 95M run -- only ever a transient call argument (749 hits, same fixed stack slot each
+      time, matching S250/252's exact call count). No 'bind later' step exists to fail --
+      confirms the anonymous-reuse path is a genuine dead end for named resources, consistent
+      with S252's node-state-stuck-at-16 finding.
+```
