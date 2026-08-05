@@ -4086,3 +4086,16 @@ two corrections (Claude) -- version plant ruled out, 10-IRX loop fully succeeds
     different argument shapes follow -- not yet distinguished as loads vs a different utility)
 ```
 ```
+
+---
+
+## 63. 10-IRX loop succeeds; post-loop USBD/LGDEV chain is next (Grok+Claude)
+
+Claude (0457): all 10 primary IRX loads return positive handles; version plant no-op.
+Grok: first post-loop gate is `0x113F78(USBD.IRX, a1=59, args="conf=384")` at `0x1D42A4`;
+`bgez` fail → return 0. Then LGAUD, LGDEVW, network/device enum. Success sets
+`0x51BAB0=2` and returns 1.
+
+```text
+S63: 10-IRX OK; next fail candidate USBD@0x1D42A4 then LGAUD/LGDEVW
+```
