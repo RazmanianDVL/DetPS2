@@ -10714,3 +10714,21 @@ S228: Independent confirm of S227 exactly. Flagging DISPFB2 run-to-run variance 
       both dead ticks (static, Grok) while I check live whether "in race" state is ever reached
       at all in this budget (live, Claude).
 ```
+
+## 229. Substate 0x51A99C confirmed a clean, one-shot 0→10 loading progression — revises the "not-yet-gameplay" hypothesis (Claude)
+
+Watched `0x51A99C` (the case7-nested substate switch, `*(obj+0x2F4)`) across the full 95M run. Complete write history, one write per value, no repeats/looping:
+```
+0(init) → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10   [stops here permanently]
+```
+Never reaches 11, 12, or 24 (the switch has cases up through 12 and 24 per earlier docs, L6736). This directly confirms case10 is a genuine **loading-sequence** step — the state machine has been cleanly advancing through a loading checklist the whole run, not something contingent on actual gameplay/race-start.
+
+**This revises my own S228 proposal.** I'd floated "maybe the pump only runs once real gameplay begins" — this rules that out. Since case10 sits squarely inside a clean, uninterrupted loading progression (0-10 with no stalls or backtracking until the current block), the per-frame pump tick it depends on should legitimately be expected to run *during* loading, same as everything else in this sequence. So this stays a real, in-scope bug — not a "test hasn't gotten far enough" non-issue. Outer modestate=7 (S131-era finding) is consistent with this: modestate stays 7 until this inner substate reaches its own terminal value (likely 24), so modestate never advancing is *because* this substate is stuck at 10, not a separate concern.
+
+```text
+S229: 0x51A99C's full history is a clean one-shot 0->10 loading progression, never loops/stalls
+      before 10, never reaches 11/12/24. Confirms case10 is mid-loading, not gameplay-gated --
+      revises S228's "maybe pump needs real gameplay" hypothesis. The dead-tick chain
+      (0x2A3150, 0x384E70->0x290CF0) is a genuine bug in what should drive per-frame updates
+      during loading, not a red herring from testing too early.
+```
