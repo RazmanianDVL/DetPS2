@@ -11258,3 +11258,28 @@ S252: Independent confirm of S250/S251 -- freelist fix solid, but 0x2870D0 retur
       satisfy the gate. Remaining question is naming/binding, not pool capacity. Offering to
       live-watch whether fe.awd's name ever gets bound to a reused node afterward.
 ```
+
+## 252. AWD node state sticks at **16**; free-bit test treats it as reusable → fe anonymous path (Grok)
+
+### Layout
+- pool+56 = freelist "used" list = name-search list (same field)
+- free test at `0x38420C`: `andi v0, state, 0x100`; free if **0**
+- state at node+940 (construct `0x383F10` / load SM `0x383D48`)
+
+### Live state of post-free first claimed node (`0x1F35E08+940`)
+```
+0x383F28 → 1   (construct)
+0x383D48 → 16  (loading)  — never advances
+```
+**Never 256.** S127 stream +44 force does **not** write this field.
+
+### Effect
+`16 & 0x100 == 0` → node stays "free" for `0x384208` reuse forever → **535×** anonymous `0x384240` (a1=0) → fe never takes named `0x3842E0`.
+
+Completing node state **16→256** (same class as S127 stream complete) should (a) mark node non-free, (b) allow `0x3840C0` lookup success for the registered name, (c) force new pops for fe with named claim.
+
+```text
+S252: node state stuck at 16; free-test bit 0x100 clear → eternal reuse path; fe never named.
+      Propose dual-ACK: force stuck state 16→256 (with stream complete), measure named fe claims.
+```
+
