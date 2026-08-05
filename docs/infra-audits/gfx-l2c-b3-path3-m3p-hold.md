@@ -11658,3 +11658,40 @@ No non-(-1) productive plant. Entry `0x1320A4` always sees -1 → bltz timer tai
 S266c-live: 0x51BA94 write set = {0, -1} only @80M. Real-work dead. Leave main-loop;
             env FBP retarget remains the class-A open (not invent-DISPFB).
 ```
+
+## 267. Env rebuild switch: FBP-OR is **case 2**; live only dispatches **case 4** (bulk FBP0) (Grok)
+
+### Builder family
+
+| PC | Role |
+|----|------|
+| `0x1FE1A0` | Display-env **switch** (`sltiu a0, 0x17` + jumptable `0x4B8EA0`) |
+| `0x1FD490` | FBP-OR builder (`andi …,0x1FF` at `0x1FDBA0` merges FBP into env words) |
+| `0x1FE398` | case body: `jal 0x1FD490` |
+| `0x1FE304` | case body: bulk template copy (includes `0x1FDFB8` sdl/sdr → `0x51400`) |
+
+Jumptable (live dump):
+
+| case a0 | target | meaning |
+|---------|--------|---------|
+| **2** | `0x1FE398` → **`0x1FD490`** | **FBP-OR retarget** |
+| **4** | `0x1FE304` | bulk copy / FBP0 template |
+| others | various | not yet live-mapped |
+
+### Live (80M forces)
+
+- `--pcbreak=1FDBA0`: **0 hits** (FBP-OR body never)
+- `--pcbreak=1FD490:1FE3B0`: **one burst @ cyc=14,259,088**
+  - entry `0x1FE1A0` with **`a0=4`**
+  - `ra=0x1E340C` (caller `jalr` through `*(obj+4)` at `0x1E3404`)
+  - falls case4 → `0x1FE304` bulk path (matches S258/S259 one-shot `0x51400`)
+- **Case 2 never selected** → FBP never OR'd to match FRAME `0x46`
+
+### Class-A read
+
+Missing env retarget is not "no writer exists" — writer is **`0x1FD490` via switch case 2**. Boot only runs **case 4** once. Open: **who should call `0x1FE1A0(a0=2)`** after mode/readiness / FRAME settles, and what gate blocks it. No invent-DISPFB.
+
+```text
+S267: Env switch 0x1FE1A0 — live only a0=4 (bulk FBP0 @14.3M). Case2→1FD490 FBP-OR
+      never dispatched. Next: who calls 0x1FE1A0 / what should pass a0=2.
+```
