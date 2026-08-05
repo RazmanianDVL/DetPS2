@@ -6896,3 +6896,66 @@ S142: Inner state confirmed 3 (real progression 1->2->3, each hit once, case3 re
 S144: case3 = flag only; mode SM sole caller climber@0x12ECE0 gated on 0x51BA90.
       Next live: order flag-write-1 vs last 0x2BCB50/0x132600; census 0x2BCD50/0x2BCE4C.
 ```
+
+## 145. Ordering resolved precisely: the last case-3 poll IS after the flag write and DOES enter the advance path — but the `sw 22` instruction inside it never fires. `0x51BA90` never leaves 0 the entire run (Claude)
+
+Exact cycle-stamped ordering, via `--pcbreak=0013D340:0013D340` (all completion-pump writes)
+and `--pcbreak=002BCB50:002BCB50` (all case-3 polls), both real tooling:
+
+```
+Flag write (0x13D340, v1=0x1E85A4C): cyc=40,550,000  <- the ONE write of this specific flag
+
+Case-3 polls (0x2BCB50), all three real hits:
+  #1: cyc=40,400,064  (before flag write — sees 0)
+  #2: cyc=40,529,952  (before flag write — sees 0)
+  #3: cyc=40,579,504  (AFTER flag write — this is the one that reads 1)
+```
+
+**The third poll genuinely happens after the flag was set — the ordering is real, not
+ambiguous.** Follow-up census confirms it acted on this:
+
+```
+0x002BCD50 (advance path entry)  x1   <- FIRES. The branch was taken, execution entered here.
+0x002BCE4C (sw 22, state:=22)    x0   <- Never reached, despite entering the advance path.
+0x00132600 (mode SM)             x9
+0x0012ECE0 (climber caller)      x9
+```
+
+**The advance path is entered exactly once — real, confirmed — but the specific instruction
+that writes `22` into the state field never executes.** Per Grok's S144 description ("linear:
+free/copy resource, then sw 22"), something inside that "free/copy resource" work must itself
+fail or early-return before reaching the state write — case 3 isn't simply "flag-gated," there's
+a second failure point *inside* the already-entered advance path that Grok's structure didn't
+yet capture.
+
+**`0x51BA90` (the mode-SM spin gate) reads `0x00` at every checkpoint from 35M through 90M —
+never once observed as `1`.** Mode SM (`0x132600`) was called 9 times total (matching climber
+caller `0x12ECE0`, 1:1) — consistent with a bounded number of real climb attempts, not an
+infinite host-tick-driven spin. This confirms Grok's structural read: the mode-SM spin is not
+perpetual: it runs a bounded number of times tied to the climber's own retry cadence, and once
+that stops (for whatever reason halts the climber itself, same open question as S131's
+plateau), mode SM simply never runs again — regardless of what state any downstream flag reaches
+afterward.
+
+**Where this leaves the two threads, both now concrete and separable:**
+
+1. **A real bug inside the advance path** (`0x2BCD50`→`0x2BCE4C`) that prevents `state:=22` from
+   ever executing even on the one real attempt that got this far — needs Grok's static read of
+   exactly what "free/copy resource" does between those two addresses and what could return/
+   branch away before the `sw 22`.
+2. **The outer climber/mode-SM retry cadence stops** after a bounded ~9 calls, matching S131's
+   plateau — a separate, upstream question about why the climber itself stops retrying, since
+   `0x51BA90` never reaches 1 through the normal success path either.
+
+Both are real, both are needed; fixing only #1 might still stall if the climber never gets to
+try again after whatever caused it to stop.
+
+```text
+S145: Ordering confirmed precisely — the 3rd case-3 poll (cyc=40,579,504) IS after the flag
+      write (cyc=40,550,000) and DOES enter the advance path (0x2BCD50 x1, real). But the sw-22
+      instruction (0x2BCE4C) never fires — a second, distinct failure point inside the advance
+      path itself, not previously mapped. 0x51BA90 (mode-SM spin gate) never leaves 0 in 90M
+      cycles; mode SM ran a bounded 9 times total, tied 1:1 to the climber. Two separable open
+      threads now: (1) what fails inside 0x2BCD50-0x2BCE4C, (2) why the climber/mode-SM retry
+      cadence stops after ~9 calls (same open question as S131).
+```
