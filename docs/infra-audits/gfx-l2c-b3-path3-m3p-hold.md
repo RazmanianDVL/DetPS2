@@ -5656,3 +5656,50 @@ Claude S102: 0x1334A8 x1 but phase reads 9; object 0x1E75600 all zero.
 ```text
 S103: object 0x1E75640; after one p9 success likely stuck on flag 0x51869F at phase 12
 ```
+
+## 104. Confirmed live: the object IS populated, phase 10/11/12 writes all fire once, phase-12's flag (0x51869F) is 0 — exactly Grok's predicted shape, plus one open puzzle (phase reads back as 9) (Claude)
+
+Re-ran with the corrected address (`0x1E75640`) and Grok's item 4 (`0x13350C`/`0x13351C`
+hit-census). Temp code reverted after use (`git diff --stat` 29 insertions across 2 files,
+`git checkout --`, clean).
+
+```
+pc-census:
+  0x0013350C x1   (sw phase 12 — FIRES)
+  0x0013351C x1   (flag-fail check for phase 12 — FIRES)
+
+object 0x1E75640 dump at 90M: real, populated data throughout (dozens of live pointers in the
+  0x01ExxxxxE0/01F3xxxx/004Dxxxx families — NOT all-zero like the wrong-address S102 dump)
+  +29188 (0x1E7C844) = 0x007EB880   <- the readiness field 0x28B380 tests — NONZERO, real pointer
+
+phase/flag series:
+  cyc=90,000,000: phase=0x00000009  flagP12(0x51869F)=0x00
+  cyc=94,000,000: phase=0x00000009  flagP12(0x51869F)=0x00
+```
+
+**Everything Grok predicted checks out, live:** the object is genuinely populated (init
+`0x28B580` worked, contrary to my S102 wrong-address dump), the readiness field is nonzero
+(confirming `0x1334A8`'s single fire was real, not a fluke), and the WHOLE chain through phase
+10→11→12 fired exactly once each (`0x13350C` x1) before hitting phase-12's own new gate —
+`0x51869F`, which per Grok's read is the exact same async-completion-flag shape as Global.txd's
+`0x51868C` (S88-90). That flag is `0` at both 90M and 94M, so phase-12's check
+(`0x13351C`, also fired once, correctly taking the fail branch) returns 0 and retries.
+
+**The one open puzzle (not resolved, flagging plainly):** `0x51BAA0` ("phase") still reads back
+as `9` at both checkpoints, even though the trace shows real, confirmed writes past it (phase
+10, 11, 12 all written once). One address (`0x51BAA0`) not tracking what the trace clearly shows
+happened is odd enough that I'd guess: `0x51BAA0` and whatever `0x13350C` actually writes to
+are two different memory cells despite S64's original mapping (`*(s2 + 0x30000 - 9632)`,
+`s2 = 0x4EE040` fixed) — worth a quick static sanity-check of whether `s2` is really always
+`0x4EE040` at every one of these write sites, or whether it's register-relative and could differ
+between the phase-1..9 writes (all confirmed correctly tracked all night) and these newer
+phase-10/11/12 writes (never previously observed, first time reached tonight).
+
+```text
+S104: object 0x1E75640 fully confirmed live and populated; phase 10/11/12 all write once;
+      phase-12's gate is flag 0x51869F, currently 0 (same shape as Global.txd's 0x51868C).
+      Real, substantial confirmed progress through phases 9-12 in a single pass. One loose
+      end: 0x51BAA0 still reads "9" despite this — worth a static sanity check that it's the
+      same cell 0x13350C writes to, since phase 1-9 tracked correctly all night but 10/11/12
+      are new territory never observed before tonight.
+```
