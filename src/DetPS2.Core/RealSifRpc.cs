@@ -4107,10 +4107,18 @@ public sealed class RealSifRpc
             _gtfsLastDmaDest = dest;
             _gtfsReadOffset = offset + total;
             _gtfsTotalDmaBytes += total;
+            // S97 dual-ACK: EE fno=5 CallRpc uses end_function=0 (like open) but never
+            // self-clears state from 2→1 after the blocking return. Open does sw 1,24(obj)
+            // itself; fno=5 leaves state=2 forever so loaders poll busy forever (B3 phase3).
+            // When this DMA reaches EOF, complete matching EE GTFS file objects (state 2→1).
+            // Must run before FRONTEND rebind resets _gtfsReadOffset.
+            bool reachedEof = _gtfsReadOffset >= maxSz && maxSz > 0;
+            if (reachedEof)
+                TryCompleteGtfsEeFileObjects(mem);
             // After completing a non-FRONTEND file (live: full Global.txd), proactively rebind
             // last-path to FRONTEND so the next EE fno=3/5 (or pathless fno=5 with fresh dest)
             // streams FRONTEND without a stale Global cursor. SHARED second-path arm (B3 w9).
-            if (_gtfsReadOffset >= maxSz && _gtfsFrontendFd >= 0
+            if (reachedEof && _gtfsFrontendFd >= 0
                 && fd != _gtfsFrontendFd
                 && (maxSz == _gtfsLastPathSize || maxSz > 0x10000u))
             {
@@ -4129,6 +4137,41 @@ public sealed class RealSifRpc
                     $"w=[{w0:X8} {w1:X8} {w2:X8} {w3:X8}]");
         }
         return total;
+    }
+
+    /// <summary>
+    /// B3 S97 dual-ACK: EE GTFS file objects use vtable <c>0x4DDFC0</c>; fno=5 sets
+    /// <c>*(obj+24)=2</c> (in progress) and never clears it when CallRpc end_function is 0.
+    /// After full-file DMA, find objects stuck at state=2 and write 1 (ready), matching open's
+    /// post-CallRpc self-complete. Write-only — no SignalSema (S96 force worked without it).
+    /// Bounded RDRAM scan; no hardcoded object address.
+    /// </summary>
+    private static void TryCompleteGtfsEeFileObjects(SystemMemory mem)
+    {
+        // Live B3 object vtable (S92); GTFS method table base (open at +8, fno5 at +0x10).
+        const uint GtfsVtable = 0x004DDFC0;
+        const uint StateInProgress = 2;
+        const uint StateReady = 1;
+        // Game objects for this path live in mid RDRAM (live: 0x66E120). Bound the scan to
+        // avoid walking all 32MB on every EOF; cover boot heaps + known GTFS/display bands.
+        const uint ScanLo = 0x00400000;
+        const uint ScanHi = 0x00A00000;
+        int completed = 0;
+        for (uint obj = ScanLo; obj + 48 <= ScanHi; obj += 4)
+        {
+            if (mem.Read32(obj) != GtfsVtable)
+                continue;
+            if (mem.Read32(obj + 24) != StateInProgress)
+                continue;
+            mem.Write32(obj + 24, StateReady);
+            completed++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[GTFS] fno=5 EE object complete obj=0x{obj:X8} state 2->1");
+        }
+        if (completed == 0 && Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+            Console.Error.WriteLine(
+                "[GTFS] fno=5 EE object complete: no vtable+state==2 match in scan band");
     }
 
     /// <summary>
