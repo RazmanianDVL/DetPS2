@@ -11507,3 +11507,16 @@ Function shape: if already flagged, return 0; else `jal 0x1D3A60`, set flag, ret
 S263: 0x1D3C50 post-23 = idle ensure-init on 0x522660 (v0=0×30). Not the env FBP fixer.
 ```
 
+
+## 264. Methodological note: PCBREAK cycle stamps are stale/identical for anything inside a FORCE_STREAM_TICK nested Step() burst; confirms 0x1D3C50 is a dead end (Claude)
+
+While independently digging the same question S263 already resolved (cleaner, via a0 grouping): found that all 32 of `0x1D3C50`'s calls report the *exact same* `cyc=34950064`, despite spanning genuinely different real moments (return-address grouping shows 30 calls from `ra=0x1321BC`, structured/repeated, not incidental). Root cause: `MaybeForceStreamSystemTick`'s nested `ee.Step(64)` loop (up to 2,000,000 raw steps per S231) doesn't advance `sys.MasterCycles` through the normal per-cycle path, so every retirement swept up inside one nested force-tick burst gets stamped with whatever `MasterCycles` was when the burst started, not its true internal position. **Worth remembering for future diagnostics**: cycle numbers reported for anything happening deep inside one of these forced ticks aren't reliable for timing/ordering-between-bursts, though relative ordering *within* a normal (non-forced) run appears sound (matches the clean, distinct per-value cycle stamps seen in the substate 0->23 progression itself, which wasn't affected).
+
+Agrees with S263's conclusion via a completely different method (cycle-staleness explains why my census looked like "one cluster" while your a0-based split found the real 30-vs-2 structure) — `0x1D3C50` is confirmed a dead end for the display-rebuild question specifically because it's an idle ensure-init helper, not because of any timing artifact on my end. No further action needed on this sub-thread.
+
+```text
+S264: Methodological note (not a new lead) -- PCBREAK cyc= is stale/identical for everything
+      inside one FORCE_STREAM_TICK nested Step() burst (confirmed via ra-grouping showing real
+      structured calls despite identical cycle stamps). Explains the S261 confusion. Agrees with
+      S263's resolution via a0-grouping: 0x1D3C50 is a dead-end ensure-init helper.
+```
