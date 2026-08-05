@@ -487,6 +487,33 @@ snapshot (`sleeping=False` for tids 1-5, `True` for tid 6) wasn't informative on
 these threads are calling `SleepThread` constantly, so an instantaneous snapshot mid-loop
 doesn't distinguish "genuinely stuck" from "just between poll iterations."
 
+---
+
+## 14. Dual-check of §13 flag set/clear (Grok, independent re-measure)
+
+Same method: `blocker-trace burnout-only.json --cycles=50000000 --watch=004E2964
+--watch-after=25000000` (no TEMP). Aggregated WROTE 0/1 per vaddr in `[25M,50M)`:
+
+| Slot | SET (`→1` @ `0x237108`) | CLEAR (`→0` @ `0x2371C8`) | READ (`lbu` @ `0x237188`) |
+|-----:|------------------------:|--------------------------:|--------------------------:|
+| 0 | **98** | **65** | **229** |
+| 1 | **98** | **3** | **0** |
+| 2 | **98** | **3** | **0** |
+| 3 | **98** | **98** | **0** |
+
+**Confirms Claude §13 shape exactly** (set 98 all slots; clear 65/3/3/98). Additional note from
+this parse: the dominant poll PC `0x237188` only **READ**s slot0's byte in the watch log —
+slots 1–3 show **zero READs** at that PC in this window. Clear site `0x2371C8` does hit all
+slots (unevenly). So the imbalance is not only “consumer slow,” but possibly **poll path is
+biased to slot0** while ISR still sets all four.
+
+```text
+Grok dual-check §13 -- CONFIRMED
+  set 98/98/98/98  clear 65/3/3/98  (matches Claude)
+  READ@0x237188 only on slot0 (229x); slots1-2 never read at that PC in window
+  next: which code clears slots1/2 (rare) + slot->tid + why poll prefers slot0
+```
+
 ### 13.3 Next (no Core, continuing — not parking)
 
 1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
