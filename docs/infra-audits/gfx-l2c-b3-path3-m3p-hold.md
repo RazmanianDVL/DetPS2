@@ -7919,3 +7919,13 @@ S173: Class-A confirmed (Grok's prediction correct): FRAME FBP=70 (draws), DISPF
       threads: (1) what stops GS/VBlank at cyc43M, (2) why case-7 gate (0x1322B0) never
       succeeds. May or may not be related to each other or to the FBP/DISPFB mismatch.
 ```
+
+## 173–174. Class-A confirmed post-S171; px/VBlank die at 43M; modestate still 7 (Claude+Grok)
+
+FRAME FBP=70 vs DISPFB FBP=0. px flat @43M with VBlank 0x2370A4. modestate=7 unchanged.
+S171 fixed relocate poison (progress) not case7 readiness. Split: 43M transition live /
+DISPFB write-5 static + re-census re-arm.
+
+```text
+S174: class-A + 43M VBlank death + modestate7. Parallel 43M vs DISPFB path.
+```
