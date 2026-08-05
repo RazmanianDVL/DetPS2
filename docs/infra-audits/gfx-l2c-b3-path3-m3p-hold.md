@@ -10075,3 +10075,66 @@ S207: case8 0x332E00(0x64C990) stuck state=3; flag *0x64C990 never written 1
       Next: id=5 file identity + 0x13D340 pump for this object.
 ```
 
+
+## 208. LIVE — root cause found: IOP file-descriptor table (16 slots) exhausted; GTFS generic-open never closes previous fd (Claude)
+
+**Ties directly into S207**: case8's flag at `0x64C990` is armed by `jal 0x2224C0(0x1D6D880, id=5)`, a GTFS-family async load. This section identifies *why* that (and any later) GTFS load can never complete: the IOP's file-open layer runs out of descriptors before reaching track-data files.
+
+### Ground truth first (ISO is the control)
+Mounted the real ISO natively (`Mount-DiskImage`, not 7z — unavailable in this env). Confirmed on disc:
+```
+TRACKS\US\C5_V1\ENVIRO.DAT   196608 bytes
+TRACKS\US\C5_V1\STATIC.DAT   753664 bytes
+```
+Both genuinely exist. So the two `[GTFS] open FAIL path="tracks\US\C5_V1\enviro.dat" ...` / `...static.dat...` lines seen in `DETPS2_TRACE_RPC=1` output are **not** ISO-side gaps — per doctrine, a confirmed emulator bug.
+
+### Path-resolution logic is fine — ruled out first
+Read `RealSifRpc.cs`'s GTFS generic-open candidate loop and `SifRpc.cs`'s `FileOpen`/`FindDiscEntry`/`NormalizeDiscPath`/`Iso9660.ParseDirectory`. All handle arbitrarily deep subdirectories correctly (verified live: a temp `DETPS2_DUMP_DISC_LOOKUP` dump of `_discVolume.Files` shows `TRACKS/AS/C1_V1/ENVIRO.DAT` etc. present with full depth intact — the ISO9660 parser and lookup are not the bug).
+
+### Actual failure point — live-traced
+Added a temp trace at the very top of `IopModuleHost.FileOpen` (`SifRpc.cs:1772`, reverted after) gated on path containing "nviro". Result for **every one of the 4 resolution attempts** (`resolved`, bare `path`, uppercased `resolved`, and the `DATA\`-prefixed fallback):
+```
+[FOENTRY] path="cdrom0:\tracks\US\C5_V1\enviro.dat;1" discVolNull=False
+[FOENTRY]   -> OUT OF DESCRIPTORS (max=16)
+    held fd=0  rom0:ROMVER
+    held fd=1  cdrom0:\DATA\STAGEHED.BIN;1
+    held fd=2  cdrom0:\DATA\FRONTEND.TXD;1
+    held fd=3  cdrom0:\DATA\HEADUS.BIN;1
+    held fd=4  cdrom0:\Data\Global.txd;1
+    held fd=5  cdrom0:\Data\GlobalUs.bin;1
+    held fd=6  cdrom0:\Data\HeadUs.bin;1
+    held fd=7  cdrom0:\pveh\vlist.bin;1
+    held fd=8  cdrom0:\Tracks\tlist.bin;1
+    held fd=9  cdrom0:\Data\PrgData.bin;1
+    held fd=10 cdrom0:\Data\EALogin.ico;1
+    held fd=11 cdrom0:\Data\LoadScrn.bin;1
+    held fd=12 cdrom0:\Data\saveicon.icn;1
+    held fd=13 cdrom0:\Data\vdb.xml;1
+    held fd=14 cdrom0:\Data\Frontend.txd;1
+    held fd=15 cdrom0:\Data\stagehed.bin;1
+```
+`IoManMaxDescriptors = 16` (`SifRpc.cs:239`). All 16 slots (0-15) are permanently held. **Note the duplicates**: `STAGEHED.BIN` is open on both fd=1 *and* fd=15 (mixed-case retry re-open); `FRONTEND.TXD` on both fd=2 *and* fd=14 — the same logical asset holds two live fds. `FileClose` (`SifRpc.cs:1895`) itself is correct (properly frees the slot when called) — the bug is that nothing ever calls it for these.
+
+### Root cause
+The GTFS generic-open handler (`RealSifRpc.cs` ~4362-4463, `fno=3` path) allocates a **fresh** fd via `iopModules.FileOpen(...)` on every distinct path it's asked to open, and never closes the fd from the *previous* distinct GTFS open before doing so. There is no path-swap close anywhere in that handler — only a same-path continuation check (`_gtfsLastPathFd`/`_gtfsLastPathSize`, for FRONTEND's known multi-chunk stream). Once the boot/menu sequence has opened its 16th distinct file through this path (here: exactly at the point the game starts loading the selected track's `enviro.dat`), every subsequent open call — regardless of target file, regardless of whether it exists — permanently returns `IoManErrnoOutOfDescriptors`, indistinguishable at the RPC layer from a real "file not found."
+
+### Why this explains S207
+Case8's `id=5` load (`jal 0x2224C0(0x1D6D880, 5)`) is exactly this kind of GTFS-family async open. If its underlying file open is attempt #17+ through the leaking handler, it fails silently the same way enviro.dat/static.dat do, the completion flag at `0x64C990` never gets set to 1, case3 spins forever, case8 never returns success, and readiness/modestate progression (and therefore any DISPFB retarget) stalls — the same shape as the S171/S191 chain, but a level further upstream and **general-purpose**, not B3-specific: any title that opens more than 16 distinct files via this exact handler in one boot+load sequence would hit this ceiling.
+
+### Scope note
+This is infrastructure, not a B3-only quirk — flagging per the standing mission (infra fixes, not per-title patches). Likely fix shape (not applied — no code change without dual-ACK): the GTFS generic-open handler should close the previous GTFS-tracked fd when the requested path differs from `_gtfsLastPathFd`'s path, instead of leaking a new one every time. Needs care around FRONTEND/STAGEHED's existing multi-chunk-stream special-casing so we don't close a handle still mid-stream.
+
+### Diagnostics used (all reverted, rebuilt clean after)
+- `DETPS2_DUMP_DISC_LOOKUP=1` temp dump inside `FindDiscEntry` (ruled out path-resolution).
+- Temp `[FOENTRY]` trace at top of `IopModuleHost.FileOpen` + fd-table dump on `OUT OF DESCRIPTORS` (found the real cause).
+- `Mount-DiskImage`/`Get-ChildItem` on the real ISO (ground truth for file existence — `7z` unavailable in this environment).
+
+```text
+S208: ROOT CAUSE (general infra): IopModuleHost.FileOpen fd table maxes at 16 (SifRpc.cs:239);
+      GTFS generic-open (fno=3, RealSifRpc.cs ~4362) never closes previous fd on path swap ->
+      17th+ distinct GTFS open always fails "out of descriptors", indistinguishable from file-not-found.
+      Confirmed live: tracks/enviro.dat + static.dat FAIL is exactly attempt #17+, all 16 slots held
+      (incl. 2 duplicate double-opens: STAGEHED.BIN fd1+fd15, FRONTEND.TXD fd2+fd14).
+      Directly explains S207's case8 id=5 flag-never-set. Fix: close-on-path-swap in GTFS handler,
+      careful not to break FRONTEND/STAGEHED multi-chunk stream tracking. No code change — dual-ACK needed.
+```
