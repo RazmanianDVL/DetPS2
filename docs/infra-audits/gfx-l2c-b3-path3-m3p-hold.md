@@ -9345,3 +9345,35 @@ S192: Class-A post-S191 census — FRAME FBP=0x46 draws real px (18M/50M) but DI
       supplies FBP=0. Next: env-field writers + retarget setter reachability. No invent-DISPFB.
 ```
 
+
+## 193. Class-A static — env base pointer from queue; fields not CSR (Grok)
+
+Post-S192.
+
+### Display-env base (`gp-24124`)
+Only three static references in ELF:
+| PC | Op |
+|----|-----|
+| `0x1F1BF8` | `sw v1, -24124(gp)` — **writer** (cmd 64 path: `lw v1,4(a1)` from queue pkt) |
+| `0x1F1C10` | same — **writer** (cmd 65 path) |
+| `0x1F1D5C` | `lw s0, -24124(gp)` — **reader** in VBlank ISR `0x1F1CE8` before PutDispEnv |
+
+So the **pointer** to the env object is installed by the display/queue command path (`0x1F1778` switch), not by mode SM. PutDispEnv then copies whatever FBP is already inside that object to GS CSR.
+
+### Retarget setter `0x424C40`
+- Function exists (`addiu sp,-48` at entry)
+- **Zero** `jal 0x424C40` in whole ELF — not a direct-call API (dead, or only via jalr/vtable)
+
+### Implication
+Class-A is **not** "VBlank never calls PutDispEnv." It is:
+1. Env object still has DISPFB FBP=0 when installed / never rewritten, **or**
+2. Wrong env object pointer installed (always the page-0 bootstrap env), **or**
+3. Dual-env banks: active bank for present is the page-0 bank while draws use the other
+
+Next live: dump `*(gp-24124)` and env words at +816/832/848/928/944 at first PutDispEnv after 40M; compare to FRAME FBP=0x46. Static: find who **builds** the env (SetDispEnv family `0x102510` / `0x102xxx`) and whether FBP argument is ever 0x46.
+
+```text
+S193: Env base gp-24124 only written from queue cmd 64/65 (pkt+4). PutDispEnv reads it.
+      0x424C40 has no jal callers. Class-A = env content/bank, not missing PutDispEnv.
+```
+
