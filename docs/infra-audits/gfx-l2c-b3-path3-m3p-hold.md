@@ -2548,3 +2548,71 @@ id2 callsite RESULT
   static: wrapper has zero jal/j/bal/word/construct refs (dead-at-source)
   NOT "no one reads slot[2]"; IS "no one calls the only reader"
 ```
+
+---
+
+## 42. Shared-wrapper-caller hunt: dead bulk pipeline `0x1E9C10`, not a generic id dispatcher (Grok)
+
+Claude S41 follow-up: many never-fired slots share dead wrappers in `0x1E7xxx` — propose find ONE shared caller into that family.
+
+### 42.1 Not one generic dispatcher
+
+High-confidence dense-slot wrappers (`lui 0x67` + `lw` dense + `jalr`): 20 entries. Their **static `jal` edges cluster**, they do not fan into a single `jalr table[id]` dispatcher.
+
+| Wrapper entry | slot(s) | static jals | notes |
+|---------------|---------|------------:|-------|
+| `0x1E6890` | 2 (id2 pack) | **0** | fully unlinked |
+| `0x1E68C0` | 3 (id3 unpack) | **0** | fully unlinked |
+| `0x1E7138` | 7 | **11** | all from dead cluster |
+| `0x1E7A80` | 16 | **16** | all from dead cluster |
+| `0x1E70D0` | 6 | 1 | dead cluster |
+| `0x1E1FF0` | 21 (id15, **fires**) | 4 | **live** edges |
+| `0x1E74F0` | id4 factory (**fires**) | 12 | **live** (RAs `0x205Dxx`/`0x1FE7xx`/`0x211Exx`) |
+
+No consecutive fnptr table of wrappers found in ELF data.
+
+### 42.2 The cluster is bulk pipeline `0x001E9C10` — unrolled, unlinked
+
+```text
+0x001E9C10: addiu sp, sp, -1216   // huge frame
+            saves s0-s6, ra; s2=a0 (object), s4=a1
+...
+0x001E9C68: jal 0x1E70D0   // slot6 wrap
+...
+0x001E9FC0: jal 0x1E7138   // slot7 wrap
+0x001E9FC8: jal 0x1E7A80   // slot16 wrap
+// repeated unrolled pairs in loop-ish control flow with a2=5 helpers
+```
+
+- **Static jals TO `0x1E9C10`: 0** (dead-at-source at the pipeline root)
+- **Runtime `--pcbreak=001E9C10` 18M: 0 hits**
+- Also 0 hits on `0x1E7138`, `0x1E7A80`, `0x1E9FC0` individually
+
+So wrappers with "many jals" are only linked from this **unreached tree** — static edges, zero dynamic fire. Same unarmed shape as blit/alarm/id2, but one level higher: the whole bulk asset/object pipeline never runs.
+
+### 42.3 Live fires are a *different* path family
+
+id4 factory `0x1E74F0` **does** run (10× @14.4M, RAs from live object creators). id15 wrap `0x1E1FF0` has live jals. id14 uses `0x2222xx` + gp. The successful 6 are **not** fed by `0x1E9C10`.
+
+### 42.4 Related (possibly gated) large pipelines
+
+| Entry | frame | jals from | role guess |
+|-------|------:|-----------|------------|
+| `0x1E92B8` | −1696 | `0x1EB14C` | alt bulk path |
+| `0x1E9530` | −1856 | `0x1EB13C` | alt bulk path |
+| `0x1EB118` | −16 | ? | gp+`0x670BD0` gate: if `*(gp_off+0x670BD0+0x1C)!=0` then `1E9530` else `1E92B8` |
+
+`0x1E9C10` itself is **not** behind that gate — it has zero callers of any kind.
+
+### 42.5 Verdict
+
+```text
+shared-caller RESULT
+  NOT a generic id→wrapper dispatcher
+  IS a dead bulk unrolled pipeline @ 0x1E9C10 (0 static callers, 0 runtime hits)
+  that would jal many never-fired wrappers (6,7,16,...) if ever entered
+  id2/id3 not even on that pipeline (0 jals anywhere)
+  live 6 use separate specialized factories (id4 etc.)
+  next if pursuing: who should call 0x1E9C10 / arm 0x1EB118 gate
+    — OR leave subsystem (post-setup GS still the product gap)
+```
