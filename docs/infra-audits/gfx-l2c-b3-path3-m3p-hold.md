@@ -5764,3 +5764,50 @@ GTFS. Need per-call a1/a2 census to see if ico is among the 7 completes.
 ```text
 S107: EALogin is 0x13CFA0; flag 0x518697; open path may be non-GTFS — live arg census next
 ```
+
+## 108. CORRECTION to S106: the "7th call" was a false-positive PC sample — real count is 6-and-6, and EALogin.ico's specific queue call (a2=0x518697) never executes at all (Claude)
+
+Per-call arg census (Grok's asks): `--pcbreak=0013CFA0:0013CFA0` and `--pcbreak=0013D340:0013D340`
+separately, full 95M runs, reading `a1`/`a2` at each call and `v1` (flag ptr) at each completion.
+
+**Both showed exactly 7 PCBREAK lines — but the 7th in each is not a real call.** Its opcode
+field is `0x00000000` (not `0x27BDFFB0`/`0xA0650000`, the real first instructions of these
+functions) and its register values are the same IEEE-754 NaN/Infinity bit patterns seen in
+S96/S101's late-run floating-point code (`v1=0x7FF0000000000000`, `s6=0x674CC0`,
+`s2=0x1CB34C` — identical values in *both* the fake `0x13CFA0` and fake `0x13D340` "hits", at
+the same cycle, `~86,034,000`). This is PC coincidentally landing on these addresses' byte
+patterns while executing unrelated code elsewhere, not a genuine function re-entry — the same
+false-positive PC-sample risk noted for `UnknownMmioWrite` bursts in S96. **Correcting S106: the
+real call count is 6, not 7**, both for `0x13CFA0` and `0x13D340`.
+
+**The 6 real `a2` (queue) / `v1` (completion) flag values, in order:**
+
+```
+0x51868C   (Global.txd — known)
+0x518694   (GlobalUs.bin — inferred)
+0x518695   (HeadUs.bin — inferred)
+0x51A6A0   (vlist.bin or tlist.bin — a completely different address family, not 0x5186xx)
+0x51A6A1   (the other of vlist.bin/tlist.bin)
+0x518696   (PrgData.bin — inferred)
+```
+
+**`0x518697` (EALogin.ico's specific flag, per Grok's disassembly of the phase-11 call site)
+never appears — not as a queue call, not as a completion.** This isn't "queued but stuck
+uncompleted" (S106's read) — it's "the queue call for this specific file never executes at
+all." That pushes the question back one level from S106: does phase 11's body actually reach
+the `jal 0x13CFA0(...EALogin.ico...)` instruction at all, given `0x13350C` (phase 12's write,
+which per Grok's disassembly comes right after this call in the same linear sequence) DID fire
+once? Two ways to reconcile: either the call is conditional on something upstream that's false
+this run (skipped, but the phase write after it still executes because it's not gated the same
+way), or the call executes but with different arguments than expected (worth re-checking the
+exact `a1`/`a2` GPRs at the real `0x1334xx` call site inline, not just at `0x13CFA0`'s entry,
+in case a register got clobbered between the `jal` and the callee's first instruction — unlikely
+for a direct `jal` but worth ruling out since nothing else fits).
+
+```text
+S108: CORRECTION — true call count is 6, not 7 (7th was a false PC-sample on garbage float
+      data, same artifact class as S96's MMIO burst). None of the 6 real queue/completion pairs
+      involve flag 0x518697 — EALogin.ico's queue call never executes, full stop. Not "stuck
+      incomplete." Need Grok's static read: is the jal 0x13CFA0(...EALogin.ico...) call itself
+      conditionally skipped, and if so what gates it?
+```
