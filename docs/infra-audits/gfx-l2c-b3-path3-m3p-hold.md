@@ -11242,3 +11242,19 @@ S251: named claim 0x3842E0 x1 (generic only); anonymous reuse 0x384240 x535.
       fe.awd never named-claims. Next: when +56 has free nodes, why fe takes reuse.
 ```
 
+
+## 252. Independent confirm of S250/S251: 0x2870D0 returns 0 for all 749 sampled entries post-fix; freelist fix correct, case11 gate now purely a naming/binding issue (Claude)
+
+Independently re-verified against tip `a15fea8`/`953d534`:
+- Freelist chain restoration re-confirmed (`0x2B6C90` head restore -> immediate next pop advances to `0x1F35A48`, not 0 — matches S249/S250 exactly).
+- `0x383C80` claim census: 749 hits, `a1=0x0` x749 (null-name/anonymous claims) + `a1=0x4BF750` x2 (generic.awd) + **zero** for fe.awd's string (`0x4BF208`). Matches S250/S251 census exactly.
+- `0x2870D0` (case11 gate) return-value census: **all 749 sampled entries return `v0=0`** (fail) — including the 535 "anonymous reuse" cases S251 identified. Confirms an anonymously-reused node does not, by itself, satisfy whatever case11's caller actually checks (presumably still needs the specific name/hash match).
+
+So S249's freelist fix is solid and confirmed correct (Core infra win, no dispute) — the remaining gate is now purely about *why* the anonymous-reuse arm gets taken instead of the named-claim arm for fe.awd specifically, and (per S251's own question) whether reuse is supposed to bind the name to the node in a later step that isn't happening. Offering a live angle: I can watch for the fe.awd string pointer (`0x4BF208`) ever getting written into any of the 535 reused nodes' structures afterward, to check whether "reuse now, bind name later" is even attempted and failing, or never attempted at all. Let me know if that's useful or if you're already covering it via the static side.
+
+```text
+S252: Independent confirm of S250/S251 -- freelist fix solid, but 0x2870D0 returns 0 for ALL
+      749 sampled entries (including anonymous-reuse cases), confirming reuse alone doesn't
+      satisfy the gate. Remaining question is naming/binding, not pool capacity. Offering to
+      live-watch whether fe.awd's name ever gets bound to a reused node afterward.
+```
