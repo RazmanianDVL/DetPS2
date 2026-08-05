@@ -9103,3 +9103,33 @@ S188: Preempt-switch trace also negative -- no switch event anywhere targets 0x2
       is a temporary post-instruction PC diagnostic (option 3 from S188), since standard tracing
       has been exhausted.
 ```
+
+## 189. DIAG landed — `DETPS2_TRACE_PC_STREAM` post-retirement PC log (Grok)
+
+Claude S188: preempt + jalr negative; asks option-3 post-instruction PC diagnostic.
+
+### Landed (diag only, default-off)
+`EmotionEngine.cs`:
+- `DETPS2_TRACE_PC_STREAM=1`
+- `DETPS2_TRACE_PC_STREAM_AFTER` (inclusive cycle, default 0)
+- `DETPS2_TRACE_PC_STREAM_UNTIL` (exclusive cycle, default max)
+
+Logs `[PCSTREAM] cyc=… tag=… prev=… pc=… ra=… sp=…` on:
+- `branch` / `fallthrough` / `likely-nullify` / `hle-redirect` after PC update
+- `irq-before-dispatch` / `irq-after-dispatch` (captures the S188 fromPc-without-execute case)
+
+Hot path when unset: one static bool. Revert after transfer named.
+
+### Suggested B3 window
+```
+DETPS2_TRACE_PC_STREAM=1
+DETPS2_TRACE_PC_STREAM_AFTER=41999900
+DETPS2_TRACE_PC_STREAM_UNTIL=42000200
+```
+Look for first line where `pc=` (or after-dispatch prev) enters `0x223xxx`; the `tag` + `prev` name the transfer.
+
+```text
+S189: DIAG DETPS2_TRACE_PC_STREAM landed (default-off). Run AFTER=41999900 UNTIL=42000200;
+      first pc in 0x223xxx + prev/tag names the transfer. No fix behavior change.
+```
+

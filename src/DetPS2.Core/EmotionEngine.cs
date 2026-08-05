@@ -142,6 +142,34 @@ public sealed class EmotionEngine : ISchedulable
     public static readonly bool TraceJrExit = Environment.GetEnvironmentVariable("DETPS2_TRACE_JREXIT") == "1";
     public static readonly bool TraceCop0Status = Environment.GetEnvironmentVariable("DETPS2_TRACE_COP0STATUS") == "1";
 
+    /// <summary>Diagnostic-only (B3 S188/S189): log PC after every instruction retirement
+    /// and on early-continue paths that rewrite PC without fetch, for a closed cycle window.
+    /// Opt-in via <c>DETPS2_TRACE_PC_STREAM=1</c>. Bounds via
+    /// <c>DETPS2_TRACE_PC_STREAM_AFTER</c> (inclusive, default 0) and
+    /// <c>DETPS2_TRACE_PC_STREAM_UNTIL</c> (exclusive, default UInt64.MaxValue). Default-off:
+    /// zero hot-path cost when unset (single static bool). Revert after the transfer is named.</summary>
+    public static readonly bool TracePcStream = Environment.GetEnvironmentVariable("DETPS2_TRACE_PC_STREAM") == "1";
+    public static readonly ulong TracePcStreamAfter = ParseEnvUlong("DETPS2_TRACE_PC_STREAM_AFTER", 0);
+    public static readonly ulong TracePcStreamUntil = ParseEnvUlong("DETPS2_TRACE_PC_STREAM_UNTIL", ulong.MaxValue);
+
+    private static ulong ParseEnvUlong(string name, ulong defaultValue)
+    {
+        string? s = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrEmpty(s)) return defaultValue;
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return ulong.TryParse(s.AsSpan(2), System.Globalization.NumberStyles.HexNumber, null, out var hx) ? hx : defaultValue;
+        return ulong.TryParse(s, out var d) ? d : defaultValue;
+    }
+
+    private void MaybeLogPcStream(ulong cyc, string tag, ulong? prevPc = null)
+    {
+        if (!TracePcStream || cyc < TracePcStreamAfter || cyc >= TracePcStreamUntil) return;
+        if (prevPc.HasValue)
+            Console.Error.WriteLine($"[PCSTREAM] cyc={cyc} tag={tag} prev=0x{prevPc.Value:X8} pc=0x{PC:X8} ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
+        else
+            Console.Error.WriteLine($"[PCSTREAM] cyc={cyc} tag={tag} pc=0x{PC:X8} ra=0x{GetGpr(31).Lo:X8} sp=0x{GetGpr(29).Lo:X8}");
+    }
+
     /// <summary>MMI "pipeline 1" HI/LO — real R5900 HI/LO are 128-bit registers; regular
     /// MULT/DIV/MADD use the lower 64 bits (HI/LO above), MULT1/DIV1/MADD1/MFHI1/MTHI1/
     /// MFLO1/MTLO1 use this independent upper-64-bit lane.</summary>
@@ -679,8 +707,12 @@ public sealed class EmotionEngine : ISchedulable
                     if (_irqLoopStreak % 1000 == 1)
                         Console.Error.WriteLine($"[IRQLOOP] streak={_irqLoopStreak} pc=0x{PC:X8} pending=0x{_intc?.GetPendingInterrupts():X4} status=0x{COP0_Status:X8} cause=0x{COP0_Cause:X8} cyc={CurrentCycle()}");
                 }
+                // Sample mainline PC before dispatch rewrites it (B3 S188/S189 gap vs pcbreak).
+                ulong irqFromPc = PC;
+                MaybeLogPcStream(cyc, "irq-before-dispatch", irqFromPc);
                 if (!TryDispatchRegisteredIntcHandler())
                     EnterException(GetExceptionVector(general: true), causeExcCode: 0); // Int
+                MaybeLogPcStream(cyc, "irq-after-dispatch", irqFromPc);
                 executed++;
                 continue;
             }
@@ -958,11 +990,13 @@ public sealed class EmotionEngine : ISchedulable
             bool tookBranch = ExecuteInstruction(opcode);
             executed++;
 
+            ulong insnPc = PC;
             if (HleRedirectPc.HasValue)
             {
                 // Syscall SetSyscall hook: jump to handler without delay-slot semantics
                 PC = HleRedirectPc.Value;
                 HleRedirectPc = null;
+                MaybeLogPcStream(cyc, "hle-redirect", insnPc);
             }
             else if (tookBranch)
             {
@@ -980,15 +1014,18 @@ public sealed class EmotionEngine : ISchedulable
                 PC = _delaySlotTarget;
                 _inDelaySlot = false;
                 executed++;
+                MaybeLogPcStream(cyc, "branch", insnPc);
             }
             else if (_branchWasLikely)
             {
                 // Likely branch not taken: nullify delay slot (PC += 8)
                 PC += 8;
+                MaybeLogPcStream(cyc, "likely-nullify", insnPc);
             }
             else
             {
                 PC += 4;
+                MaybeLogPcStream(cyc, "fallthrough", insnPc);
             }
             _branchWasLikely = false;
 
