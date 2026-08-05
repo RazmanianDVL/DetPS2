@@ -5868,3 +5868,15 @@ S110: CONFIRMED via opcode inspection — all 26 hits across 0x1334A8-0x13350C a
       hit-counts do not. Treat anything sampled at/after ~86M cycles on this run as suspect
       until opcode-verified — third false-positive artifact from this same region tonight.
 ```
+
+
+---
+
+## 110–111. Opcode proof phase9; 0x28B380 fail exits mapped (Claude+Grok)
+
+S110: entire 0x1334A8..50C range is one 86M NOP-sled FP. S111: 0x28B380 fails via
+0x385090==0 (A) or alloc 0x3840C0==0 (B); success returns 1 at 0x28B544.
+
+```text
+S111: next live = which 0x28B380 exit (385090 vs alloc)
+```
