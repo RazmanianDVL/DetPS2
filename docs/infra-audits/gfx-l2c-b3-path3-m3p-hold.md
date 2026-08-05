@@ -6205,3 +6205,43 @@ need 256 to complete. Same async-complete shape as G1, audio path.
 ```text
 S123: next live = *(ctx+44) sticky value; want 256
 ```
+
+## 124. Answered: `*(ctx+44)` sticks at 48 (0x30) forever, and none of the three candidate pump functions ever fire — the audio load is genuinely abandoned mid-stream, same shape as G1 (Claude)
+
+`--pcbreak=0029F1E0:0029F1E0` (confirms `ctx=a0=0x1F361F0`, consistent across all 25 real
+probes) then `--watch=01F3621C --watch-after=0` (`ctx+44`) + `--pc-census=002B4C00,002B4A80,`
+`0029EF00`, full 95M run.
+
+```
+watch 0x01F3621C (ctx+44): 54 accesses
+  pc=0x0029F3AC WROTE 0x00000001   (initial arm)
+  pc=0x0029EC38 WROTE 0x00000030   (48 decimal — matches Grok's "48/80/112 = still busy" class)
+  ...then 52 read-only accesses, alternating 0x0029F1EC / 0x0029F2AC, all seeing 48, forever
+
+pc-census: 0x002B4C00 x0   0x002B4A80 x0   0x0029EF00 x0
+```
+
+**The status word writes exactly twice (arm to 1, then to 48) and is never written again —
+confirmed via full watch history, not a snapshot.** Per Grok's S123 mapping, a value of 48
+should trigger `jal 0x29EF00` to pump the load forward. **`0x29EF00` never fires — zero hits,
+the entire run.** Same for the two other candidate helpers (`0x2B4C00`, `0x2B4A80`) Grok flagged
+as the "real open path" — neither ever executes either.
+
+**This confirms the audio load is genuinely abandoned at status=48, mid-stream, with the one
+function that should advance it never invoked.** Structurally identical to G1's shape (an async
+operation starts, writes an intermediate "in progress" code, and the specific pump/completion
+step that would move it forward or mark it done simply never runs) — but in a completely
+separate subsystem/code path (`0x29EBxx`/`0x29Fxxx`, not GTFS). Per Grok's own posture (S123:
+"separate subsystem, own dual-ACK, not an extension of S98"), this is not something to fix by
+extending the landed GTFS patch — it would need its own investigation into *why* `0x29EF00`
+never gets called when status is 48 (a missing caller, same "wired but unreached" shape as
+several other findings tonight, or a genuinely different trigger condition than "status==48"
+that we haven't found yet).
+
+```text
+S124: *(ctx+44) confirmed stuck at 48 (0x30) via full write history (2 writes total: 1, then
+      48, never again). All three candidate pump functions (0x29EF00, 0x2B4C00, 0x2B4A80) are
+      zero-hit across the full run. Audio load for sound\generic.awd is genuinely abandoned
+      mid-stream. Same G1-class shape, separate subsystem — needs its own investigation and its
+      own dual-ACK if a fix is warranted, not an extension of S98.
+```
