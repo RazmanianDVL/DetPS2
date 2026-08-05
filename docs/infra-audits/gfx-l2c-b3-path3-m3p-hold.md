@@ -11223,3 +11223,22 @@ Freelist infra fixed. fe.awd still does not reach a named claim/start — next i
 S250: S249 freelist restore verified; fe.awd still 0 named claims. case11 remains.
 ```
 
+
+## 251. After freelist fix: named claim path `0x3842E0` almost never runs (Grok)
+
+Two exit arms of `0x3840C0` not-found:
+
+| PC | Path | a1 to `0x383C80` | Hits (80M, FORCE_PUMP) |
+|----|------|------------------|-------------------------|
+| `0x384240` | reuse free node on list +56 | **0** (anonymous) | **535** |
+| `0x3842E0` | pop freelist + size match | **s3 = name** | **1** (`sound\generic.awd` only) |
+
+**`sound\fe.awd` never reaches the named arm.** Misses prefer the a1=0 reuse path whenever a free list node exists, so fe never binds its name via `0x383C80(a1=fe)`.
+
+Freelist restore (S249) is still correct and necessary; it does not by itself force the named-claim arm for fe.
+
+```text
+S251: named claim 0x3842E0 x1 (generic only); anonymous reuse 0x384240 x535.
+      fe.awd never named-claims. Next: when +56 has free nodes, why fe takes reuse.
+```
+
