@@ -9500,3 +9500,18 @@ S196+: Reg sites for both src=2 handlers cold. PutDispEnv last trusted fire = bo
       (unverified) or pre-S191 poison. Next: boot PutDispEnv count + how 0x2370A0 is entered.
 ```
 
+
+## 197. Gate before flip registration: spin on 0x102EA0 (Grok)
+
+```
+0x1FE088  a0=1; jal 0x102EA0   ; poll 0x10009000/0x1000A000 bit 0x100 (GIF/VIF finish class)
+0x1FE090  bne v0, zero, 0x1FE088
+0x1FE0B8  jal 0x1F3F98         ; AddIntc PutDispEnv path — only if spin exits
+```
+
+If `0x102EA0` never returns 0, explains cold `0x1F3C20`. Live: stuck at spin? CSR values?
+
+```text
+S197: Flip reg gated by 0x102EA0 GS/DMAC status spin at 0x1FE088. Next live: exit spin?
+```
+
