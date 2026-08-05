@@ -6310,3 +6310,15 @@ S126: LANDMARK — force ctx+44=256 (measure-only, reverted) produces modestate=
       is the real, current critical-path stopper, same class as G1. Real fix (not force) is the
       next design target once a design doc + dual-ACK are ready.
 ```
+
+
+---
+
+## 126–127. Force +44=256 → mode-state 0x2E2; dual-ACK audio complete design (Claude+Grok)
+
+S126: modestate first nonzero ever (0x2E2), PATH3 drains, phase 23; gate still 6 lit 0.
+S127: design promote stuck audio ctx +44 48→256 (Assist-scoped preferred).
+
+```text
+S127: dual-ACK proposed — complete abandoned sound\generic.awd status 48→256
+```
