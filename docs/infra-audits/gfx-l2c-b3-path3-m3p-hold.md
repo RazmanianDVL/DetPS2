@@ -11340,3 +11340,16 @@ S255: Independent confirm S253 exactly -- substate reaches 23 (0x17), first-ever
       of the readiness SM this session. lit still 0 as expected (separate class-A gate).
       Real fixes landed en route: S208/209 fd exhaustion, S249 BNE nop-skip snap bug.
 ```
+
+## 254. Why natural path never leaves state 16: `0x29F1E0` a0/status always empty (Grok)
+
+Without node-state force, caller `0x383D58` after `jal 0x29F1E0` sees **v0=0 ×536** (not 48/256).
+With FORCE_AWD_NODE_STATE, state-16 path is skipped (already 256); residual `0x29F1E0` hit has **a0=0**.
+
+Real completion is `0x29F1E0`→256 then `sw 256, node+940`. Stream ctx (`s0` / a0) is null or status 0, so state never advances naturally. S127 +44 force does not fix null ctx. Diagnostic 16→256 bypasses this (S253→substate 23).
+
+```text
+S254: 0x29F1E0 returns 0 (null/empty ctx); natural 16→256 never runs. Force node state is a
+      bypass; product fix = wire stream ctx + pump so probe sees 256.
+```
+
