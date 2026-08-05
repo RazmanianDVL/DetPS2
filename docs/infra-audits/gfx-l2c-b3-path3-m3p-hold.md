@@ -448,3 +448,59 @@ Forced-drain PC-trace diff (Claude, resumed -- not parked)
   PATH3 fix would very likely NOT fix the visible symptom -- redirect focus to per-thread
     flag-set timing instead
 ```
+
+---
+
+## 13. Two of four flag slots are set-but-never-cleared within the late window (Claude)
+
+Followed §12.4's own next step immediately rather than stopping. `--watch=0x004E2964
+--watch-after=25000000` (word-aligned base, catches all 4 slot bytes via real per-hit vaddr,
+same technique as the earlier corrected §13-of-the-parent-doc measurement) over `[25M, 50M)`:
+
+### 13.1 Result — SET vs CLEAR count per slot in this window only
+
+| Slot (vaddr) | SET (`→1`) | CLEAR (`→0`) |
+|---|---:|---:|
+| `0x4E2964` (0) | 98 | 65 |
+| `0x4E2965` (1) | 98 | **3** |
+| `0x4E2966` (2) | 98 | **3** |
+| `0x4E2967` (3) | 98 | 98 |
+
+Slots 0 and 3 roughly balance (set and cleared at comparable rates — a healthy
+signal/consume cycle). **Slots 1 and 2 get set 98 times each but cleared only 3 times** —
+their flags sit at `1` for the overwhelming majority of this 25M-cycle window without the
+waiter thread consuming (clearing) them.
+
+### 13.2 Interpretation
+
+The ISR-side set mechanism is firing correctly and on schedule for every slot (matches §10's
+finding that all 4 slots receive `sb 1` correctly). The imbalance is entirely on the
+**consumer** side: whichever real thread owns slots 1 and 2 is not reaching its own
+flag-clear code at anywhere near the rate its flag gets set. This is a different, more
+precise question than "does the flag ever get set" (already answered: yes) — it's "why does
+the owning thread not get back around to observing/clearing an already-set flag."
+
+**Not yet confirmed:** the exact slot→tid mapping (table registration order strongly
+suggests slot0↔tid3, slot1↔tid4, slot2↔tid5, slot3↔tid6, matching the live table dump in
+§10, but this needs direct confirmation, not assumption). A generic end-of-run thread-state
+snapshot (`sleeping=False` for tids 1-5, `True` for tid 6) wasn't informative on its own —
+these threads are calling `SleepThread` constantly, so an instantaneous snapshot mid-loop
+doesn't distinguish "genuinely stuck" from "just between poll iterations."
+
+### 13.3 Next (no Core, continuing — not parking)
+
+1. Confirm the slot→tid mapping directly (dump the live table `0x01D80700` alongside a
+   per-slot SET/CLEAR count correlated to `CurrentThreadId` at each write).
+2. Once confirmed, trace what tid 4/5 (presumed slots 1/2) are actually doing between
+   consecutive `SleepThread` calls — is there a real wait condition (semaphore, different
+   flag, priority starvation from tid 1/2/3) blocking them from reaching their own
+   flag-check/clear code, or do they reach it but the read/clear itself doesn't work for
+   some structural reason.
+
+```text
+Slot SET/CLEAR imbalance (Claude, resumed)
+  slots 0/3: set~cleared (healthy cycle); slots 1/2: set 98x, cleared only 3x each
+  ISR-side set mechanism confirmed working for all slots (matches section 10)
+  consumer-side: whichever thread owns slots 1/2 isn't reaching its own clear code
+  next: confirm slot->tid mapping, trace what tids 4/5 actually do between SleepThreads
+```
