@@ -7618,3 +7618,58 @@ Fix options A–D listed in mail; dual-ACK before Core.
 ```text
 S166: RC = blind relocate of int@+0xA0. Next: resource header dump; prefer missing-zero/load.
 ```
+
+## 166–167. Header confirms mechanism; +0xA0's "10" has zero prior writes — ISO data, not corruption (Claude+Grok)
+
+**S166 (Grok, static):** `0x2B7110` has **exactly one caller**, `0x2BCD54` (the advance path, S145),
+called with only `a0 = *(obj+0x148)` — no type/kind/slot-mask argument at the call boundary. All
+4 slots inside `0x2B7110` are relocated unconditionally (confirmed earlier, S165). So any gate,
+if one is supposed to exist, is not passed in by the caller and does not exist inside the
+function body either.
+
+**S167 (Claude, live):** Dumped the full resource header at `0x00B6D880` (`--pcbreak`/one-shot,
+reverted) at cyc=41,000,000, confirming `+0x098=0x00BFA1C0` (slot 1, relocated cleanly),
+`+0x09C=0`/`+0x0A4=0` (unused slots, correctly skipped), `+0x0A0=0x00B6D88A` (slot 3, the garbage
+pointer = `base+10`, matching S165 exactly). Then ran `--watch=00B6D920 --watch-after=0`
+(`0x00B6D880+0xA0`) across the full run: **only 3 accesses total, ever** —
+
+```
+pc=0x002B7154 READ  0x00B6D920   (raw value read: 0xA)
+pc=0x002B7164 WROTE 0x00B6D88A → 0x00B6D920   (relocated garbage stored back)
+pc=0x002B716C READ  0x00B6D920   (re-read as call arg)
+```
+
+**No EE instruction ever writes `10` into this field during the run.** It is present at that
+offset from the moment the resource's data lands in RDRAM (ELF/DMA load, not runtime
+computation). Per ISO-is-truth: this is genuine ISO content, not an emulator-side corruption —
+the bug is 100% in how `0x2B7110` *interprets* this field, not in what value is there.
+
+**Combined with S166, this rules out "missing gate inside 0x2B7110 or its call site"** as the fix
+location — there is no type/kind signal available at that level to gate on. The real, upstream
+question is: what determines that resource `0x00B6D880`'s `+0xA0` field is *not* a pointer for
+its kind, when the same offset legitimately *is* a relocatable pointer for the ~198 other
+resources processed successfully this run? Two live next-step candidates:
+1. Compare this resource's header shape (particularly the low-offset fields — `+0x000/+0x004`
+   look like packed tag/size data, and the repeating 16-byte-stride list at `+0x010..+0x070`
+   with ascending small ints `0xB7,2,0xB9,4,5,6,7...` looks like a real per-LOD/sub-resource
+   table, plausibly Criterion-format) against a *successfully*-processed resource's header, to
+   find a field that differs in a way that could plausibly be a type/kind tag consulted
+   *upstream* of `0x2B7110`'s single call site (i.e. something that should have kept this
+   resource off the advance path / off this relocator entirely, or chosen a different resource
+   sub-type handler before reaching `0x2BCD54`).
+2. Check whether other real (successfully-completing) resources of the *same apparent kind* as
+   `0x00B6D880` ever have `+0xA0` nonzero at all — if `+0xA0` is reliably zero for every other
+   instance of this resource's true kind, that's strong evidence this one instance's data is
+   simply a different, incompatible resource kind that should never have reached `0x2B7110` via
+   this generic advance path in the first place (a resource-kind dispatch bug further upstream,
+   not a slot-relocation bug in `0x2B7110` itself).
+
+```text
+S167: CONFIRMED — 0x00B6D920 (+0xA0 of the broken resource) has ZERO prior EE writes across the
+      whole run; the "10" is raw ISO-sourced data, not emulator corruption. Combined with S166
+      (no type/slot-mask arg at 0x2B7110's sole call site 0x2BCD54): there is no gate to add
+      inside 0x2B7110 itself. Real fix location is further upstream — likely a resource-kind
+      dispatch step that should never route this resource to the generic advance path/relocator
+      at all. Next: diff this resource's header shape against a successfully-processed one to
+      find the real kind-discriminating field.
+```
