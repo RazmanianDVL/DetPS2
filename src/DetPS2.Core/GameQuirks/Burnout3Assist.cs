@@ -115,6 +115,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _audioStreamCompletes;
     /// <summary>S170 dual-ACK: zeroed implausible rel-ptr slots before 0x2B7110 advance relocate.</summary>
     private int _resourceRelPtrScrubs;
+    /// <summary>S226 dual-ACK: force type-6 stream status→9 when pump never runs (env-gated).</summary>
+    private int _forceStreamPumps;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -170,6 +172,8 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _stageHedEeAddr = 0;
         _stageHedSize = 0;
         _audioStreamCompletes = 0;
+        _resourceRelPtrScrubs = 0;
+        _forceStreamPumps = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
         _frontendPlanted = false;
@@ -342,6 +346,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
         // pumps (0x29EF00/0x2B4C00 never run). Promote stuck 48→256 so climber advances.
         if (sys.MasterCycles >= 30_000_000 && _audioStreamCompletes < 4)
             MaybeCompleteStuckAudioStream(sys);
+
+        // S226 dual-ACK: track stream type already 6 but class-method pump never runs
+        // (0x2A3150 / 0x2A6470 = 0 hits). Replay type-6→status-9 store so arm can proceed.
+        if (sys.MasterCycles >= 40_000_000 && _forceStreamPumps < 4
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_STREAM_PUMP") == "1")
+            MaybeForceStreamStatusPump(sys);
 
         // S170 dual-ACK: gate SM state 3 holds a GTFS resource whose +0xA0 can be a small
         // int (ISO-truth 10), not a relative pointer. 0x2B7110 blindly relocates four slots
@@ -1464,6 +1474,46 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _frontendPlanted;
     private uint _frontendEeAddr;
     private uint _frontendSize;
+
+    /// <summary>
+    /// S226 dual-ACK: EE stream handle has type@+268==6 (create <c>0x2A62B8</c>) but status@+588
+    /// stays 0 because class-method pump <c>0x2A3150</c>→update <c>0x2A6470</c> never runs.
+    /// <c>0x2A5BA0</c> maps type 6→status 9; <c>0x2A6470</c> stores that at inner+328 (=H+588).
+    /// Env <c>DETPS2_B3_FORCE_STREAM_PUMP=1</c> only — diagnostic probe, not a product fix.
+    /// Title Assist only.
+    /// </summary>
+    private void MaybeForceStreamStatusPump(Ps2System sys)
+    {
+        // Manager/class object (static BSS); instances store this at +0 (live S226).
+        const uint Manager = 0x01E7DE10;
+        const uint TypeOff = 268;   // inner+8; inner = H+260
+        const uint StatusOff = 588; // inner+328 — what 0x2A2C80 returns
+        const uint TypeReady = 6;
+        const uint StatusReady = 9;
+        const uint ScanLo = 0x01F00000;
+        const uint ScanHi = 0x02000000;
+
+        var mem = sys.Memory;
+        for (uint h = ScanLo; h + StatusOff + 4 <= ScanHi; h += 4)
+        {
+            if (mem.Read32(h) != Manager)
+                continue;
+            if (mem.Read32(h + TypeOff) != TypeReady)
+                continue;
+            if (mem.Read32(h + StatusOff) != 0)
+                continue;
+
+            // Replay 0x2A6470 type-6 first store only (0x2A5BA0 → 9; sw +328).
+            mem.Write32(h + StatusOff, StatusReady);
+            _forceStreamPumps++;
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1"
+                || Environment.GetEnvironmentVariable("DETPS2_TRACE_RPC") == "1")
+                Console.Error.WriteLine(
+                    $"[B3] FORCE_STREAM_PUMP h=0x{h:X8} type=6 status 0->9 " +
+                    $"n={_forceStreamPumps} cyc={sys.MasterCycles}");
+            return; // one handle per Step
+        }
+    }
 
     /// <summary>
     /// S127 dual-ACK (2026-08-05): EE audio stream for <c>sound\generic.awd</c> is armed by

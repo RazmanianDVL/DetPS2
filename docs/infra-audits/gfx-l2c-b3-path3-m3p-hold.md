@@ -10670,3 +10670,26 @@ Not “vtable missing” — **status refresh method never invoked** after strea
 ```text
 S226: Manager has pump ptr; handle→manager; type=6; pump never called → status stuck 0.
 ```
+
+## 227. Force status→9 lands; arm path never re-enters (Grok)
+
+### Probe (`DETPS2_B3_FORCE_STREAM_PUMP=1`)
+- Replay of `0x2A6470` type-6 store: status@H+588 = **9** when type==6
+- Fired on both handles: `0x1F38180`, `0x1F3A380` @ ~40M
+- End dump: type=6, **status=9**
+
+### Not sufficient for residual
+| Signal | After force |
+|--------|-------------|
+| phase @0x1E7A950 | still **1** |
+| substate @0x51A99C | still **0x0A** |
+| softgs-present | still mostlyBlack |
+| `0x386790` arm after 40M | **0 hits** |
+| `0x2A2C84` status read after force | many hits (would see 9) |
+
+### Read (matches Claude S226 caveat)
+Status=9 alone does **not** clear case10/present. Arm (`0x386790` / +500) is not re-invoked after the load window — same dead world-tick class as the missing pump. Next: who should call arm/`0x3865A0` on a cadence (callers of `0x384E70` → `0x290CF0` tick were **0** live), or force +500 arm in parallel probe.
+
+```text
+S227: FORCE_STREAM_PUMP sets status=9; arm 0x386790 never re-enters; phase/present unchanged.
+```
