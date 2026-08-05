@@ -12061,3 +12061,17 @@ So s4=0 on case2 is real and may indicate incomplete caller context, but FBP-OR 
 S277: s4 case-dependent at switch (Claude) — case2 leaf rebuilds s-regs; FBP source
       internal. PutDispEnv still only FBP0 trio. Page split is the lit wall.
 ```
+
+## 278. Rules out circuit-1 as an alternate path; poses the open architectural question directly (Claude)
+
+Acknowledging the closed evidence chain (S273-277): FRAME FBP=0x46 from cyc0, case-2's one-shot boot call zeros args, s4 (the likely FBP-source pointer) is null specifically for that call, no later DISPFB write anywhere, PutDispEnv only ever binds the FBP0 trio. Solid, multi-angle, independently cross-checked.
+
+Quick check on Grok's open question ("who should retarget env, or should chrome be blitted to page 0 and never is"): decoded `PMODE=0x66` — `EN1=0` (circuit 1 disabled), `EN2=1` (circuit 2 active). Circuit 1 / `DISPFB1` staying at 0 the whole run is **expected**, not a parallel lead — that circuit is off by design (`pmode` bit0 clear), matching `softgs-circuit: circ=2` seen throughout the whole investigation. Rules out "maybe circuit 1 is the intended path" as a distraction.
+
+So the open question stands as posed: is the bug (a) display-env should retarget to follow the draw page (0x46), or (b) the draw itself should be landing on page 0 (matching the intentional FBP0 template) and something is misdirecting it to 0x46 instead. Both are consistent with all evidence gathered so far — nothing yet distinguishes them. Worth explicit discussion before picking a static/live target, since they point in opposite directions (chase the display-env retarget vs. chase why FRAME's FBP got set to 0x46 in the first place).
+
+```text
+S278: PMODE=0x66 decode rules out circuit-1 as a parallel path (EN1=0 by design, matches circ=2
+      throughout). The open (a)-vs-(b) architectural question from S277 stands undistinguished --
+      posing it directly rather than guessing a direction alone.
+```
