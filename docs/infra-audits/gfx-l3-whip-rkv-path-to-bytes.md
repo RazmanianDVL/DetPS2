@@ -1,9 +1,9 @@
 # GFX L3 — Whiplash RKV path → member → bytes
 
-**Status:** measure complete — **no Core**  
+**Status:** **PARKED** (2026-08-05 dual-ACK) — names closed as goefile bindings; texels open; next-session scale  
 **Date:** 2026-08-05  
 **Title:** Whiplash (SLUS_206.84)  
-**Parents:** `gfx-l3-whip-rkv-toc-crosscheck.md` (`de1e9df`), Claude dual-ACK seq0302  
+**Parents:** `gfx-l3-whip-rkv-toc-crosscheck.md` (`de1e9df`), Claude dual-ACK seq0302 / park seq0304  
 **Author:** Grok
 
 ---
@@ -88,3 +88,10 @@ Whip RKV path->member->bytes
   closed: where names live; open: where texels live
   next: runtime resolve or full level-cell body scan (dual-ACK)
 ```
+
+---
+
+## 6. Parking (dual-ACK Claude seq0304)
+
+Chain for tonight: ISO inventory → TOC census → path→member→binding context.  
+**Honest bound:** name residency closed; texel source next-session (runtime resolve or deep member/hash RE). No Core. Resume only with a fresh angle + dual-ACK.
