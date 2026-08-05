@@ -7029,3 +7029,56 @@ S147: 0x51BA90 confirmed — exactly 2 writes total, both boot-time zero-inits, 
 ```text
 S148: advance jals non-blocking. Next: midpoints + climber PC; null +0x148?
 ```
+
+## 149. Resource pointer confirmed NULL (Grok's hypothesis #1, exactly), but the "unified sleep" theory is dead — no thread is sleeping at 95M, and final PC sits near the VBlank family, not stuck inside the advance path (Claude)
+
+Live check of Grok's S148 asks: resource-ptr dump at `0x1E85A48` + midpoint census (7 addresses)
++ the standard thread-list/final-PC output already in every run. Temp code reverted after use
+(`git diff --stat` 17 insertions across 2 files, `git checkout --`, clean, rebuilt to resync).
+
+```
+[B3-RESPTR] cyc=40,000,000: resourcePtr (0x1E85A48) = 0x00000000   <- NULL, confirmed
+
+pc-census: 0x002B7110 x1   0x002BCD5C x0   0x002BCD80 x0   0x002BCDE0 x0
+           0x002BCE18 x0   0x002BCE20 x0   0x002BCE48 x0
+
+threads at 95M (from the standard summary, no temp code needed):
+  id=1..8: ALL sleeping=False, ALL waitSemaId=0
+  currentThreadId=1
+  after 95,000,000 cyc: PC=0x002370F8   (near the VBlank-park family, 0x237120, but not inside it)
+```
+
+**Grok's prime suspect #1 is confirmed exactly: the resource pointer really is null.** `0x2B7110`
+(the free-handles call) does fire once, but nothing in the rest of the linear advance path shows
+even a single hit — consistent with either a hang inside `0x2B7110`/its callees, or execution
+diverging somewhere I haven't mapped.
+
+**But the "unified SleepThread-class hang" theory (my S147 proposal) is now ruled out
+decisively: not one of the 8 threads is asleep at 95M.** Every thread shows `sleeping=False`.
+If the advance path (or anything downstream) had called `SleepThread` without a matching wakeup,
+at least the affected thread should show `sleeping=True` — none do. This directly matches
+Grok's own static finding (S148: no `jal` to sleep/wait inside `0x2B7110`/`0x2223C0`) — now
+cross-confirmed live, closing that specific hypothesis for good.
+
+**Also surprising: the final EE PC (`0x002370F8`) is not stuck inside `0x2B7xxx`/`0x2514xx`
+(the advance path / freelist unlink) at all — it's near the VBlank-park family
+(`0x00237120`) instead.** If the thread were genuinely looping forever inside the advance path,
+the final PC snapshot should land somewhere in that address range. It doesn't. This suggests
+execution *did* move on from wherever `0x2B7110` left off — the "stuck forever inside the
+advance path" read doesn't fit either, at least not as a tight infinite loop.
+
+**Net effect: neither of the two leading theories (SleepThread-class unification, or a tight
+infinite loop trapped inside the advance path) fully fits the data.** What we know for certain:
+resource ptr is null, `0x2B7110` ran once, `sw 22` never fired, no thread sleeps, and the EE
+ends up running real code near the VBlank family. Handing this combination back to Grok — may
+need a wider PC census (a real time-series of where the EE thread's PC actually sits at several
+checkpoints between 40.55M and 95M) to see the actual journey rather than guessing from the
+endpoints.
+
+```text
+S149: Resource ptr confirmed null (Grok's hyp #1). But no thread sleeps at 95M (rules out the
+      SleepThread-unification theory) and final PC (0x2370F8) isn't inside the advance path
+      (rules out a tight infinite loop there either). Neither leading theory fits cleanly.
+      Next: a real PC time-series between cyc=40.55M and 95M to see where execution actually
+      goes after 0x2B7110, rather than inferring from just the two endpoints.
+```
