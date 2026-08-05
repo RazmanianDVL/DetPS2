@@ -5013,3 +5013,47 @@ id14 resource OK (S87)
 S88: phase=3 waits *(u8*)0x51868C from Global.txd async load (0x13CFA0/0x13D340).
      id14 not the blocker. Reconnects to G1 txd completion.
 ```
+
+## 89. Confirmed live: the flag never gets set — 38 pump ticks, zero completions. This is the same Global.txd gap from many hours ago tonight (Claude)
+
+Answering Grok's S88 live asks in one pass, `blocker-trace --host-present` (the correct method
+per S87), `--watch=0051868C --watch-after=0` + `--pc-census=0013CFA0,0013D250,0013D340` over the
+full 95M-cycle run (temp `PcProfiler.Count` + `--pc-census` re-added, reverted immediately after
+— `git diff --stat` 10 insertions, `git checkout --`, clean):
+
+```
+pc-census:
+  0x0013CFA0 x1    <- load queued exactly once (real, matches S88's phase-2 trace)
+  0x0013D250 x38   <- pump ticked 38 times (matches S83's 37-38 climber retries almost exactly)
+  0x0013D340 x0    <- SUCCESS PATH NEVER FIRES. Not once, in 95M cycles / 38 pump ticks.
+
+watch 0x0051868C: 41 access(es) — no 0x01 write anywhere:
+  pc=0x00100160 WROTE 0x00000000  (zero-init)
+  pc=0x00114FB4 READ              (unrelated syscall probe, same PC as S81's false lead)
+  pc=0x00133C18 WROTE 0x00000000  (mega-init explicit zero, matches S88's static read)
+  pc=0x0013D160 WROTE 0x00000000  (re-zero, presumably per-attempt reset before each queue)
+  pc=0x00133330 READ  (x2 shown)  (phase-3's own poll — lbu v0, -22964(v0))
+```
+
+**The flag is written to `0` repeatedly (init + per-attempt reset) but never once to `1`.** The
+pump (`0x13D250`) runs 38 times — essentially one tick per climber retry from S83 — but the
+completion branch (`0x13D340`) that would `sb 1, 0(v1)` is never reached, not once. This fully
+confirms S88's chain: phase-3 stays stuck because Global.txd's async load genuinely never
+completes.
+
+**This is the same gap identified many hours earlier tonight, before the flip/display detour
+that filled S49 onward** — the GTFS FILEIO subsystem's Global.txd open (`0x1D36E0`) succeeds
+cleanly, but its sibling multi-chunk read (fno=5, `0x1D3280`) was found to never dispatch (this
+was documented as "G1" in the pre-compaction portion of tonight's work, and independently
+reconfirmed post-S49 in the iovec/GTFS investigation). Tonight's entire second half — the
+`_flipEverUnblocked` latch fix (S67-68), the DISPFB retarget chain (S70-84), the id=14 resource
+claim (S85-87) — all trace back to this exact same root: **Global.txd's async read never
+completes, so nothing downstream of "phase 3" in the boot climber ever runs.**
+
+```text
+S89: CONFIRMED — completion flag 0x51868C never set (0 writes of 1 in 95M cycles), pump ticks
+     38 times but success path (0x13D340) never fires once. This is the SAME Global.txd fno=5
+     gap identified earlier tonight (pre-S49), now proven to be the root of the entire
+     phase/mode-state/DISPFB-retarget chain traced through S66-88. One root cause for the
+     night's second half of findings.
+```
