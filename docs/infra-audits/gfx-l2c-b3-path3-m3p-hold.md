@@ -5703,3 +5703,15 @@ S104: object 0x1E75640 fully confirmed live and populated; phase 10/11/12 all wr
       same cell 0x13350C writes to, since phase 1-9 tracked correctly all night but 10/11/12
       are new territory never observed before tonight.
 ```
+
+
+---
+
+## 104–105. Phase12 waits on Data/EALogin.ico flag 0x518697 (Claude+Grok)
+
+S104: chain 9→12 fires once; flag unset. Static: same 0x13CFA0 load of
+**Data/EALogin.ico**, completion flag **0x518697** (not 0x51869F). Same G1 shape.
+
+```text
+S105: phase12 = EALogin.ico async complete (flag 0x518697 / 0x13D340)
+```
