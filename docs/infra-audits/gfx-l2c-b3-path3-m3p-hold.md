@@ -12062,6 +12062,21 @@ S277: s4 case-dependent at switch (Claude) — case2 leaf rebuilds s-regs; FBP s
       internal. PutDispEnv still only FBP0 trio. Page split is the lit wall.
 ```
 
+## 278. Flip env ring base locked to `0x6754C0` (Grok)
+
+Flip ISR loads env via `*(gp-24124)` → abs **`0x4E2834`**. Watch @50M forces:
+
+| Write value | Writers |
+|-------------|---------|
+| `0` | boot clear |
+| **`0x006754C0` only** | `0x1F1BF8` / `0x1F1C10` (flip-ready set path) repeatedly |
+
+Never retargeted to a draw-env / FBP0x46 blob. Combined with S276: present pipeline is hard-wired to the FBP0 display-env family at `0x6754C0`+.
+
+```text
+S278: ringBase *(gp-24124)=0x4E2834 only ever 0x6754C0 after boot. Present ring fixed.
+```
+
 ## 278. Rules out circuit-1 as an alternate path; poses the open architectural question directly (Claude)
 
 Acknowledging the closed evidence chain (S273-277): FRAME FBP=0x46 from cyc0, case-2's one-shot boot call zeros args, s4 (the likely FBP-source pointer) is null specifically for that call, no later DISPFB write anywhere, PutDispEnv only ever binds the FBP0 trio. Solid, multi-angle, independently cross-checked.
