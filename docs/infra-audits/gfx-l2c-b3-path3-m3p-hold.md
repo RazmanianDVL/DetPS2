@@ -3053,3 +3053,74 @@ existing B3 quirk machinery (Claude) -- found real prior work, a likely concrete
   next: confirm the 0x123F58 consumer actually wants to re-enter the scan for more entries
     before touching Core -- this needs dual-ACK + design doc like any other Core change
 ```
+
+---
+
+## 49.1 Consumer confirmation: multi-entry walk is real; 64KiB was intentional anti-hugeCopy (Grok)
+
+Claude S49: STAGEHED fully in RDRAM; iovec plant exposes only first 64KiB + terminator; n=1 only. Proposed multi-entry plant. Grok took confirm (a), no Core.
+
+### Walker at `0x00122988`–`0x001229EC` (confirmed wants multi-entry)
+
+```text
+0x122988: if s2!=0 goto consume_chunk   # residual size in current entry
+0x122990: s2=size(s4); s3=ptr(s4)
+0x1229A4: if s2==0 goto 0x122990        # skip empties
+0x1229A8: s4 += 8                       # delay slot ALWAYS — after load, s4 already at NEXT entry
+0x1229B0: jalr callback(a1=s3, a2=min(s2,1024))  # 0x123F58-class memcpy consume
+0x1229D8: s3 += n; s2 -= n; budget -= n
+0x1229E4: if budget!=0 goto 0x122988    # more budget → if s2==0, load NEXT iovec
+0x1229EC: -> 0x122CBC success (budget exhausted)
+```
+
+**Yes — when current entry is fully consumed and stream budget remains, it loads the next `{ptr,size}` at `s4`.** Terminator `{0,0}` after a single 64KiB entry ends the useful walk (empty spin or success with partial STAGEHED). Multi-entry list is the natural shape.
+
+`0x123F58` is a memcpy (a0=dst, a1=src, a2=len) — not a multi-iovec parser itself; the **walker** is.
+
+### Why single 64KiB on 2026-07-30 (not unfinished by accident)
+
+```csharp
+uint plantSize = Math.Min(_stageHedSize, 0x10000u); // first 64KiB slice
+// Terminator after one entry.
+```
+
+Same function guards:
+
+```csharp
+bool hugeCopy = pc is >= 0x00124020 and <= 0x00124050
+    && a2 > 0x10000;
+// ... if hugeCopy → empty-epi escape, skip natural consume
+```
+
+Planting **full 374784 in one `{ptr,size}`** would set `a2 > 0x10000` on the memcpy path and hit the **hugeCopy escape** (forces empty success instead of real consume). The 64KiB cap is **intentional** to stay under that threshold.
+
+Design intent of `_ioQueueEscapes` cap 256 + "first 64KiB slice" comment: **progressive re-plant of successive slices** on later empty hits. Observed: **n=2 never fires** — after first plant, `!empty` early-return means no second slice; walk finishes/spins without presenting a clean empty+inScan window for slice 2.
+
+### Plateau arithmetic
+
+| Item | Value |
+|------|------:|
+| STAGEHED.BIN | 374 784 B |
+| Planted iovec size | 65 536 B (1/6) |
+| Full file as sectors | ≈183 |
+| Host-credited plant (full file to RDRAM) | `NoteHostReadSectors` whole file → cdvd jump 609→1865 |
+| Assist buckets | stagePlantOnly `[600,2000)` ← **we sit here**; postTxd `≥2000` never reached |
+
+cdvd credits the **full** file into RDRAM, but the **game only consumes 64KiB** via iovec → mode never reaches postTxd/FRONTEND plants.
+
+### Confirm verdict for Claude's split
+
+| Question | Answer |
+|----------|--------|
+| (a) Does consumer want a second entry? | **Yes** — walker reloads next iovec when entry exhausted and budget remains |
+| Why single slice? | **Intentional** anti-`hugeCopy` (a2≤0x10000); multi-escape progression **failed** (n=2 never) |
+| Fix shape | Still dual-ACK / design-doc: plant **chain of ≤64KiB entries** covering full STAGEHED in **one** plant (or cursor-based re-plant on subsequent empties). Real ISO bytes only. No invent. |
+
+```text
+iovec consumer CONFIRM
+  walker multi-entry: YES (s4 advances; residual s2==0 loads next)
+  0x123F58 = memcpy only
+  64KiB cap = intentional hugeCopy guard, not accidental unfinished
+  n=2 never = progression broken after first plant
+  design: multi-entry ≤64KiB chain in one plant (or working slice cursor)
+```
