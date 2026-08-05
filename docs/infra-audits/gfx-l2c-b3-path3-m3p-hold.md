@@ -1,6 +1,6 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** **IN PROGRESS** (2026-08-05 night) — executive scoreboard below; G1/G2/G3 all confirmed real, G3 answered NO (§56.4) — real gap is B3's ongoing per-frame render path (VU1/Path1), never located tonight  
+**Status:** **IN PROGRESS** (2026-08-05) — G1/G2/G3 closed as night framed them; §58 singleton both-ends-dead; §59 mode-request common thread (enter 0x51A6A8 / state==5) is the live class-A lever above PATH3 hold  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
 **Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`), Claude forced-unmask A/B (`f8b5db8`)  
@@ -3813,4 +3813,80 @@ mode/render singleton (Grok+Claude) -- never constructed on either end
   open caveat: both branches do real float/matrix work -- exact downstream consequence of
     taking 0x2243E0 instead of the fall-through not yet confirmed
   next: who should construct 0x51A688 (Grok, in progress); what 0x133EBC's re-zero context is
+```
+
+
+---
+
+## 59. Mode-request common thread — not 14 independent moles (Grok, seq0448)
+
+Claude (0447) asked: seven+ dead subsystems with identical "real code, zero live callers"
+shape — is there ONE higher-level trigger? Census of the 14 jals to `0x130D00` answered
+that for the mode/singleton side.
+
+### 59.1 The 14 call sites are one object
+
+Every jal to `0x00130D00` passes **`a0 = 0x51A6A8`** and is paired with a prior
+`jal 0x00130C70` on the same a0. Not 14 subsystems — **14 transition sites on one mode
+object**.
+
+`0x130D00` / `0x130C70` are **teardown/cleanup**, not constructors:
+- `0x130D00`: if `*(a0+0x30C) != 0`, cleanup jals then zero the field
+- `0x130C70`: subobject drain when `*(a0+0x2F8) != 24`
+
+### 59.2 Real mode-pointer machinery
+
+| Item | Address / encoding |
+|------|--------------------|
+| System root | `0x4EE040` (`lui 0x4F; addiu -8128`) |
+| Current mode ptr | `0x51BA88` = root+`0x2DA48` (imm DA48 / -9656) |
+| Pending mode ptr | `0x51BA8C` = root+`0x2DA4C` (imm DA4C / -9652) |
+| Gate state field | `0x51BAD0` = root+`0x2DA90` (imm DA90 / -9584) |
+| Mode object (requested) | **`0x51A6A8`** (not 0x51A688; +0x20 vs identity constant) |
+
+**Mode-REQUEST API `0x131F10(root, modePtr)`:** only stages pending if gate state == **5**,
+then `pending = a1; companion state = 6`. **19 static jals; almost all pass
+`a1 = 0x51A6A8`.**
+
+**Commit (pending→current):** `0x132810` / `0x132928` inside `0x132600`, pumped from
+spin at `0x12ECDC` while `*(u8*)0x52BA90 != 0`.
+
+**SW DA48 writers (current ptr):** only 4 — two zeros (incl. Claude's `0x133EBC`), two
+commits. Zero non-null assignment without going through pending.
+
+### 59.3 Claude's 0x133EBC re-zero
+
+Part of **boot mega-init** `0x133BB0`, not late teardown:
+```
+0x100208 -> 0x12EB30 -> 0x133BB0(a0=0x4EE040)
+  also jals 0x130B80(a0=0x4EB1E0) once
+  then zeros current+pending deliberately
+```
+Boot clears the slot on purpose. Real assignment = request(0x51A6A8) + commit pump.
+
+### 59.4 Common-trigger verdict (honest split)
+
+| Class | Shape | Examples | Shared arm? |
+|-------|-------|----------|-------------|
+| **A** | Linked-but-never-reached | mode-request 0x131F10 (19 jals/0 hits), 0x130D00 pair, commit pump | **YES — "enter mode 0x51A6A8" / gate state never 5** |
+| **B** | Pure unlinked (0 jals / 0 word-refs) | blit 0x1A6290, alarm 0x248518, id wrappers, bulk pipeline | **No list found yet** tying them to 0x51A6A8 |
+
+Mode entry is the best single lever for class A. Class B still looks like permanent
+unlinked islands unless mode entry has side tables not yet mapped.
+
+### 59.5 Next
+
+- Who writes gate state == 5 (`SW` imm DA90); known site `0x132D04` inside `0x132600` sets 5
+- Does commit pump / `0x131F10` ever run (pcbreak)
+- Re-check identity imm at `0x223224` (0x51A688 vs 0x51A6A8)
+- Optional: watch pending `0x51BA8C` writers
+
+```text
+mode common-thread (Grok S59 / seq0448)
+  14x 0x130D00 all a0=0x51A6A8 + paired 0x130C70 -- one object, not 14 moles
+  0x130D00/C70 = teardown, not ctor
+  request API 0x131F10: 19 jals, ~all a1=0x51A6A8, gated on state==5
+  current/pending = 0x51BA88/8C under root 0x4EE040; boot mega-init zeros both
+  class A (linked-never-reached) shares mode entry; class B (pure unlinked) still open
+  next: state==5 producer + whether request/commit ever hit
 ```
