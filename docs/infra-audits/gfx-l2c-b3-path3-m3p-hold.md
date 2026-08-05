@@ -932,3 +932,26 @@ Noise-band structure (Claude)
   combined with rejDepth~69% (Grok): real but incomplete/degenerate rendering, not garbage memory
   open: is this a collapsed/incomplete camera transform -- needs real vertex data, not attempted
 ```
+
+---
+
+## 21. DISPFB flip under RR: still stuck (Grok)
+
+With `DETPS2_RR_SCHED=1` 50M (product CLI), privileged circuit end-state is unchanged vs PRIO:
+
+| Reg | Value |
+|-----|-------|
+| FRAME_1 | `0xA0046` (draw page 0x46) |
+| DISPFB1 | `0` |
+| DISPFB2 | `0x51400` (display page 0, PSMCT16S) |
+| naturalDispfbPx / lit | 0 |
+
+RR unlocks geo + PATH3 unmask + waiter fairness but **does not** cause the game to re-point
+DISPFB at 0x46 in this window. Parent `gfx-l2c-b3-frame-dispfb-stall-finding.md` still holds
+under high-throughput RR. Flip remains a separate open dig (who writes DISPFB late / what gate).
+
+```text
+RR does not fix DISPFB stall
+  FRAME 0x46 / DISPFB2 page0 still
+  next: DISPFB write timeline under RR (temp) or EE code that programs DISPFB
+```
