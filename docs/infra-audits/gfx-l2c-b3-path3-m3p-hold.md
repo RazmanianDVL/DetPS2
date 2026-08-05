@@ -6681,3 +6681,46 @@ then v0 after jalr `0x1322E0`. Note mode-state store cell `0x51BACC` vs doc watc
 S137b: modestate=7 == promote ran; current was installed. Fail is vtable on that object,
        not null current. Dump a0/t9/v0 at 0x1322E0.
 ```
+
+## 138. Confirmed exactly: `current=0x51A6A8` (the mode object itself) at every real jalr, `v0=0` after every real call, and both candidate mode-state cells read 7 — S64's "current always null" is confirmed stale (Claude)
+
+`--pcbreak=001322B0:00132340` (full case-7 vtable dispatch, opcode-verified) plus a one-shot
+dump of `0x51BACC`/`0x51BAD0`/`0x51BA88` at 90M. Temp dump reverted after use (`git diff --stat`
+8 insertions, `git checkout --`, clean, rebuilt to resync).
+
+```
+At 0x1322E0 (the jalr itself): a0=0x51A6A8, all 8/8 real hits — no exceptions.
+At 0x1322E8 (right after return): v0=0x00000000, all 7/7 hits that reach it.
+
+[B3-MODECELLS] cyc=90,000,000:
+  0x51BACC = 0x00000007
+  0x51BAD0 = 0x00000007
+  0x51BA88 (current) = 0x0051A6A8
+```
+
+**Both candidate mode-state cells read `7` — no discrepancy between them, they agree.**
+`current` (`0x51BA88`) is confirmed **`0x51A6A8` exactly — the mode object itself** (Grok's
+S137b "pending source `0x1337B4`" candidate), not garbage, not null. This directly confirms
+Grok's S137b reasoning and **retires S64's "current mode ptr never assigned non-null"** as a
+stale, pre-S98/S128 finding — accurate for the whole first two-thirds of tonight's
+investigation, no longer true once phase progressed far enough to trigger promote.
+
+**Given `current == 0x51A6A8` matches Grok's "current == mode object itself → special path
+0x1323FC" condition exactly**, and my trace shows the code still executing a real `jalr` at
+`0x1322E0` (not diverging to a separately-numbered special-case address), the "special path"
+and the generic vtable dispatch may be the same code, or the special-case branch itself still
+routes through this same jalr with different vtable contents installed for the self-referential
+case — worth Grok's static confirmation of exactly what `0x1323FC` contains and whether my
+traced `0x1322E0` is inside it or bypasses it.
+
+**Bottom line: this is a legitimate virtual-method call on a real, correctly-installed object,
+returning `0` (not ready) consistently — not a null-pointer fault, not a missing installation.**
+The remaining question is purely: what does this specific vtable method check, and what would
+make it return non-zero.
+
+```text
+S138: CONFIRMED — current=0x51A6A8 (mode object itself) at every real jalr, v0=0 after every
+      real return, both mode-state cells (0x51BACC/0x51BAD0) agree at 7. S64's null-current
+      finding is retired as stale (pre-S98/S128). Real object, real vtable call, legitimate
+      "not ready" answer. Next: what does the vtable method at current+0x1B0→+12 actually check?
+```
