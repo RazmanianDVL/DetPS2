@@ -1831,3 +1831,44 @@ VIF1 command-type check (Claude) -- rules out Path1-specific routing bug
   unpackWords=0 mpgWords=0 mscal=0 mscalRuns=0 -- VU1 never fed, never runs, entire run
   same root as S29: whatever should drive continuous per-frame submission never starts
 ```
+
+---
+
+## 31. VBlank ISR gates (Grok seat b) — flip/DMA only, no VU1 submit
+
+Full disasm of `0x001F1CE8` (fires 48×/30M). Control flow:
+
+```text
+restore gp
+if (vblank_counter >= limit) early out
+if (cause != 2) early out
+if (flip-ready gp-24225 == 0) skip PutDispEnv   // post-setup: always true after 3 clears
+  else PutDispEnv + DISPFB/DISPLAY privileged writes
+optional display-env field tweaks
+if (some env slot) program DMAC regs (0x1000_xxxx, CHCR-like 260)
+gp-24128++   // queue count bump
+jal 0x1F1778(a0=-1)   // try DMA handler drain every vblank
+return
+```
+
+### 31.1 Bail conditions post-setup
+
+| Gate | Post-15.75M behavior |
+|------|----------------------|
+| flip-ready `gp-24225` | **0** (only set 3× in setup) → PutDispEnv skipped |
+| kick queue | **empty** (no producer refill) → handler no-ops |
+| ISR itself | **still entered** 48× (not reachability-dead) |
+
+### 31.2 What the ISR is *not*
+
+No MSCAL/UNPACK/Path1 kick. No thread create. Display flip + opportunistic DMA-queue drain only.
+
+So seat (b) answer: **consumer (this ISR) IS entered every VBlank**, but every useful side effect is gated off by **empty setup-only queues/flags**. It is not waiting on a mysterious mid-ISR bail for “frame submit” — frame submit was never this ISR’s job.
+
+Continuous GS submit must be a **different** VBlank waiter / main-loop path (Claude seat a: other wake targets; or main thread not parked on VBlank at all).
+
+```text
+ISR 0x1F1CE8: entered 48x; only flip+DMA-drain
+post-setup both drains are no-ops (no flip-ready, empty queue)
+VU1/Path1 submit is elsewhere — not an ISR-internal gate we missed
+```
