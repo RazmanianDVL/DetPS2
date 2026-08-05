@@ -148,6 +148,46 @@ Artifacts (gitignored): `out/canaries/gfx-dec-header/tile0-header.txt`, `tile0-o
 
 ---
 
+## 4c. Leftover-payload entropy (Claude, tile0 + tile1)
+
+**Capture:** `DETPS2_TEMP_DEC_LEFTOVER_DUMP=1` (instrumentation added, used, fully reverted —
+`git status` confirmed clean before and after). Assumed `64×64` PSMT8 index block = `0x1000`
+(4096B) immediately after the `0x100`-byte header; dumped the remaining `0x600` (1536B) of the
+`0x1600` payload for the first two tiles.
+
+```
+tile=0 idxBase=0x01803280 leftoverBase=0x01804280 leftoverLen=0x600 uniqueVals=217 nonZero=1436 ffCount=4
+  first64: 35 5C 43 3B 96 8F 36 5E 3B 8F 51 5C 35 4F 4A 42 85 9D B2 5B 84 84 3F 62 A5 35 A7 4D 91 3F 83 ...
+tile=1 idxBase=0x01804980 leftoverBase=0x01805980 leftoverLen=0x600 uniqueVals=212 nonZero=1400 ffCount=3
+  first64: ED BB EF A3 DE C6 ED D6 C7 6C CC BF C7 86 CC C2 D7 B6 91 90 8F B6 A2 AE 8F A9 A2 A9 A9 A9 91 ...
+```
+
+**Refutes the in-payload-embedded-palette hypothesis too:**
+
+1. **Not shared between tiles.** Tile0 and tile1's leftover bytes are completely different byte
+   sequences (not a rotation/offset of each other either, by inspection). A real shared 128/256-entry
+   CLUT reused across all 48 tiles would be byte-identical here. It is not — this is per-tile data.
+2. **Not palette-shaped.** 217/212 unique byte values out of 256 possible, ~93% non-zero, no
+   repeating alpha-channel stride (a real RGBA32 palette would show `FF` or a constant byte every
+   4th position; a real RGB555/A1 palette would show constrained 16-bit value ranges). The raw bytes
+   read as dense, high-entropy, texture-like data — consistent with **more index/pixel data**, not a
+   color table.
+
+**Working conclusion:** the `0x1600` payload is very likely *entirely* pixel/index data for a tile
+larger or differently-shaped than the naive `64×64` PSMT8 assumption (`64×64=4096` undersizes the
+real `0x1600=5632`-byte payload by exactly `1536` bytes) — not `4096 index + 1536 palette`. The
+`side=64`/`bpp=1` guess in `TryFeedDecGameartHostToLocal` (driven by payload-size heuristics, not
+a decoded dimension field) may itself be wrong for these tiles, independent of the CLUT question.
+
+**Three palette-location hypotheses now tested, all refuted:** SEC TOC `kind=1` siblings (Claude),
+per-tile header (Grok), in-payload leftover bytes (Claude). Remaining live lead: Grok's root-level
+sibling-SEC walk (a resource *outside* this nested container entirely, not per-tile). If that also
+comes back empty, this investigation has reached the point where a real decompile of the EE's own
+SSF/texture consumer code (similar in kind, if smaller in scope, to what Whip's MP2 problem needs)
+is likely required to find the palette — this would no longer be a "quick TRACE" question.
+
+---
+
 ## 5. Non-goals
 
 - Do not invent a synthetic/procedural palette to make the gray strip "look better" — that is
@@ -164,11 +204,10 @@ Artifacts (gitignored): `out/canaries/gfx-dec-header/tile0-header.txt`, `tile0-o
 
 ```text
 GFX Dec CLUT investigation
-  gray strip = honest PSMT8-without-CLUT fallback, real infra, not fabricated
-  PL-029 feeds all 48 tiles as PSMT8, never loads a CLUT
-  kind=1-as-palette: refuted (no kind=1 entries exist)
-  per-tile header-as-palette: refuted (identical across all 48 real tiles)
-  header decode (Grok): 64x64 via (dim<<8), magic \x18PS2, tag PAD128, headerSize=0x100
-  no clear in-tile CLUT pointer yet; payload rem 1536B after 64x64 indices
-  next: post-header entropy / sibling SEC shared palette / then MaybeLoadClut design
+  gray = honest PSMT8-without-CLUT; PL-029 never loads CLUT
+  nested kind=1 palette: refuted; per-tile header palette: refuted
+  header: 64x64 (dim<<8), \x18PS2, PAD128, skip=0x100
+  root TOC: 14 entries; e=0 tiles SEC; e=1 sibling SEC 139KiB unvisited
+  e=2..13 other kind=1 blobs (~30KiB / ~5KiB) — palette bank candidates
+  next: e=1 nest walk + e=8..13 CLUT-shaped sample; leftover entropy (Claude)
 ```
