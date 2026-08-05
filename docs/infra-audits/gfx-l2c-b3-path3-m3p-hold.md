@@ -8182,3 +8182,56 @@ Bisect 42.000576–42.008640 for sp flip PC.
 ```text
 S179: free-run assigns OOB sp. Bisect 8k gap; timer source parked.
 ```
+
+## 179. PINNED — the exact corrupted stack slot: `ld ra,160(sp)` loads garbage, not a register bug (Claude)
+
+Bisected the 8,064-cycle free-run window (per S178) with clean, unambiguous sequential
+`pcbreak` traces (narrowed ranges to avoid cross-iteration log ambiguity from earlier passes).
+
+**Found the exact instruction where `ra` first becomes garbage.** At `cyc=42,008,512`, thread 1
+executes a trampoline: `jr ra` (with a legitimate `ra=0x2243D8`, itself just restored via a clean
+`ld ra,16(sp)` a few instructions earlier — that part is fine) lands at `0x2243D8`:
+
+```
+002243D8: beq  zero, zero, 0x0022537C   ; unconditional branch
+002243DC: ld   ra, 160(sp)              ; DELAY SLOT — loads ra from *(sp+160)
+```
+
+With `sp=0x1FFFDA0` (confirmed healthy at this exact point), the load address is
+`0x1FFFDA0+160 = 0x1FFFE40`. **This stack slot's content is garbage (`0x3C888889`), not a valid
+saved return address.** The branch itself completes normally (PC goes to `0x22537C`, unrelated
+to ra's new value — `ra` is merely being set here, not used for this particular jump). This bad
+`ra` then sits in the `ra` register, gets *saved* into `s6` partway through the subsequent
+epilogue (confirmed live: `s6=0x3C888889` starting at `pc=0x225394`), and is finally *used* at
+the real problem jump: `jr ra` at `pc=0x2253AC`, `cyc=42,008,576` — jumping to a nonsensical
+address. `sp` is confirmed healthy (`0x1FFFDA0`) at every single instruction up through this
+final `jr ra` — **the corruption is entirely in stack memory content, not in sp itself, and not
+in any live register computation.** This is genuine **stack corruption**: something earlier wrote
+`0x3C888889` into the RDRAM byte range backing this thread's stack at `sp+160`, where a
+legitimate saved `ra` was expected.
+
+**Why this specific value is a strong lead**: `0x3C888889` doesn't parse as a plausible EE
+pointer (values ~1 billion, nowhere near any valid code/RDRAM range) but *does* look exactly like
+IEEE-754 single-precision float bit patterns or a stray `lui`-style immediate — and the enclosing
+function (the dense `0x223200`+ block disassembled in S178) is heavy with `lwc1`/`swc1`/`mtc1`
+floating-point/SIMD stores to `sp`-relative offsets. **Strong candidate mechanism: one of this
+function's own float/vector stores has a miscalculated stack offset and scribbles over the saved
+`ra` slot at `sp+160`, rather than its intended destination.** This would match the same general
+"offset/base miscalculation" class as S165 (the `0x2B7110` resource-relocator bug), just in a
+completely different subsystem (vector/physics math, not GTFS resource loading) — not the same
+bug, but a structurally similar failure pattern in this codebase.
+
+**Not yet found**: the specific store instruction (inside this same function, presumably) that
+writes the bad value into `sp+160`. That's the next, final step to fully close this out — a
+`--watch=01FFFE40` (or whatever the true live address resolves to for this specific stack frame)
+across the function's own execution would show exactly which store does it and with what data.
+
+```text
+S179: PINNED — ld ra,160(sp) at 0x2243DC (branch delay slot) loads garbage (0x3C888889) from a
+      corrupted stack slot (sp+160 = 0x1FFFE40 relative to the healthy sp=0x1FFFDA0). This is
+      real STACK MEMORY corruption, not a register or sp-value bug — sp itself stays healthy
+      through every instruction up to and including the fatal jr ra at 0x2253AC (cyc=42,008,576).
+      Enclosing function is dense float/SIMD (lwc1/swc1/mtc1) — strong candidate: a miscalculated
+      stack-relative store offset scribbles over the saved-ra slot. Next: watch sp+160's live
+      address across this function's execution to catch the exact writing instruction.
+```
