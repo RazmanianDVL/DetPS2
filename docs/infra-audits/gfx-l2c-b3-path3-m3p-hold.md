@@ -10979,14 +10979,14 @@ S240: case11 needs sound\fe.awd registered in pool 0x1E75648 (0x3840C0 lookup ×
 ```
 
 
-## 241. Ground-truth confirm for S240: FE.AWD is real, substantial ISO data; zero GTFS attempts anywhere (Claude)
+## 245. Ground-truth confirm for S240: FE.AWD is real, substantial ISO data; zero GTFS attempts anywhere (Claude)
 
 Mounted the real ISO natively. `SOUND\FE.AWD` = **917,504 bytes** — a normal-sized real asset (contrast with S217/S220's `C5_V1\STREAMED.DAT` = 0 bytes, which was a genuine unused-slot anomaly). Full `SOUND\` listing shows FE.AWD alongside GENERIC.AWD (487,424B), CRASH.AWD, ELIM.AWD, etc. — all normal.
 
 Full 95M `DETPS2_TRACE_RPC=1` run: **zero** matches for "fe.awd" or "AWD" anywhere in the output — the game never attempts to open it, not even a FAIL. Confirms S240's read: this is a genuine missing-load bug, not a test-artifact/atypical-asset situation like the C5_V1 case. Since the file is real and substantial, whatever should trigger loading it into pool `0x1E75648` at case11 either never fires, or the load happens through a path our GTFS tracer doesn't cover (worth checking for a non-`fno=3` audio-specific load mechanism too, not just the generic path).
 
 ```text
-S241: FE.AWD confirmed real (917504B) on ISO, zero GTFS open attempts in 95M -- genuine missing
+S245: FE.AWD confirmed real (917504B) on ISO, zero GTFS open attempts in 95M -- genuine missing
       load, not an atypical-asset artifact. Contrast with S217/220's C5_V1 (real absence).
 ```
 
@@ -11094,3 +11094,24 @@ S244: pool init pops+constructs 11, free 0x2B6C40 only restores 1 (chain break).
       next-ptrs die (construct side effects vs free walk).
 ```
 
+
+## 246. Independent live confirm of S243/S244: 5 distinct pop callers, matches the broken-free-chain root cause exactly (Claude)
+
+Live census on `0x2B6DA0` (freelist pop) across the full run, grouped by return address (caller):
+```
+ra=0x1D75A4   x1
+ra=0x384258   x170   -- fe.awd's lookup (0x3840C0), matches S241/S243/S245
+ra=0x3844EC   x11    -- pool-init's own internal pop-during-construct loop (NOT 11 external
+                         consumers -- s1 register counts 0..10, v0 chains the exact same
+                         stride-0x3C0 addresses S243/S244 already identified: 0x1F33888 ...
+                         0x1F35E08). Self-correcting an earlier misread on my end here.
+ra=0x386B54   x1
+ra=0x386DE4   x2
+```
+Of the 170 calls at `ra=0x384258` (fe.awd's repeated lookup), only the pop instruction's return value distinguishes success/fail — matches S244's table exactly: **1 success, 169 empty-freelist fails**. Confirms S244's root cause precisely: pool init pops+constructs all 11 nodes correctly (the `ra=0x3844EC` x11 trace proves this), but the subsequent free-all-used pass only restores one of them to the freelist (chain break), leaving exactly one node for fe.awd's lookup to consume before the pool goes permanently empty.
+
+```text
+S246: Independent confirm of S243/S244 via pop-caller census -- 5 distinct RAs, matches their
+      root cause exactly (11 constructed, only 1 successfully freed back). Self-corrected an
+      initial misread (0x3844EC's 11 hits are the init loop, not 11 external consumers).
+```
