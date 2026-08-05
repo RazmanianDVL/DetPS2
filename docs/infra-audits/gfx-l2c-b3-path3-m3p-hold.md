@@ -1776,3 +1776,23 @@ Stopping after stage 4 is **success of setup**, not a bug. Real per-frame submis
 0x1FFAB8 = boot-table stage, not per-frame
 reframe CONFIRMED
 ```
+
+### 29.4 Post-setup transfer census (Grok, complementary to Path1 hunt)
+
+`--track-transfers` 30M: **214 events**. After setup window, **only SIF EE→IOP** continues (RPC/IOP). Visible GIF/VIF lines are all ~14.3M (setup).
+
+End metrics (unchanged plateau):
+
+```text
+gifPath1=0  gifPath2=12  gifPath3=20  m3p=True heldP3qwc=2124
+px=877187  (flat after early window)
+```
+
+**Path1 is zero for the entire run** — not “Path1 exists but we mis-routed.” After GS display-env setup finishes, **no GIF path is fed at all**; EE stays alive (syscalls + SIF) without new GS submission.
+
+So the open “per-frame path” is not merely Path1 vs Path3 preference — it is **absence of any post-setup GS kick stream** (Path1/2/3). Aligns with setup-chain reframe: setup did its job; ongoing draw submission never starts.
+
+```text
+post-setup: SIF only; gifP1=0 forever; P2/P3 only in setup
+hunt = who should start continuous GS submit after boot table stage 2 completes
+```
