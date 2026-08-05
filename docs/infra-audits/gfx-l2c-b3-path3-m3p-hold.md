@@ -89,6 +89,58 @@ cdvd:     1865 natural plateau (force: 6784)
 
 ---
 
+### 0.8 UPDATE (2026-08-05, second half of the night, S64-S90) — the full chain from black screen back to G1, now traced
+
+Everything below post-dates §0.1-0.7 above. Landed one real Core fix (`39fffb0`, S67-68,
+`_flipEverUnblocked` bootstrap latch) and then traced the entire remaining symptom chain, in
+order, all the way back to **the same G1 gap already identified above** (fno=5 never dispatched)
+— it turns out G1 isn't just the sector-plateau cause, it's the root of essentially everything
+downstream tonight:
+
+```text
+G1 (fno=5 never dispatched, still open, unchanged) ──►
+Global.txd async load queued once (0x13CFA0) but never completes (S89/S90: pump ticks 38x,
+  success path 0x13D340 fires 0x times, queue slot stays occupied forever) ──►
+completion flag 0x51868C never set (S89) ──►
+boot climber's phase=3 check (0x133328) always returns 0 / retries forever (S88) ──►
+climber retries 37-38x post-S68 fix (real motion, S83) but never escapes past 0x12ECB4 ──►
+mode-state-machine 0x132600 never runs (S64-66) ──►
+"ready" gate 0x01E90424 stays at boot's hardcoded 6, never becomes the SM's 5 (S82, S84) ──►
+DISPFB retarget setter chain (0x424C40 family) never reached — confirmed 0 hits (S79) ──►
+display-env object (0x6754C0+0x350/+0x378) stays baked at DISPFB=page-0 forever (S77) ──►
+VBlank ISR (S75) faithfully replays page-0 forever while real draws land at FRAME_1's page 70
+  (0x8C000, confirmed live S73) ──►
+draw/display buffer mismatch (S72) ──► present stays black (unchanged since session start)
+```
+
+**One real Core fix landed this half of the night** (`39fffb0`, S67-68): `_flipEverUnblocked`'s
+bootstrap latch was structurally unreachable when the flip queue was healthy from boot (B3's
+case). Fixing it produced a large, real, measured behavior change (px 877k→7.6M, cdvd 1865→6584,
+gifP2/P3/prims all up sharply, climber retries 1→37-38x) — genuine progress — but it was
+downstream of / orthogonal to the G1 chain above, not a fix for it. **G1 (fno=5 dispatch) is
+still the single open gap that both explains the original cdvd-1865 plateau (§0) and the entire
+DISPFB/mode-state chain traced this half of the night.** No other Core changes landed or are
+proposed; VU1/Path1 idle (S70) and the id=14 resource claim (corrected in S87 — it succeeds,
+not the blocker) are both ruled out as separate issues.
+
+**Process note for whoever reads this next:** several live-value "final dump" checks this half
+of the night were initially measured via `disasm <media> <bignum> addr:len`, which does **not**
+drive `OnHostPresent` (S87) and therefore never runs any `GameQuirks` Assist module — every
+number from that tool at a large cycle count should be treated as suspect/wrong (S80, and the
+original numbers in S85/S86 before correction) unless independently re-confirmed via
+`blocker-trace --host-present` (pcbreak/watch/temp dump hooks), as all of S66-84 and S87-90
+(after the correction) were.
+
+```text
+S(0.8 update): full causal chain from black-screen present back to G1 (fno=5 never dispatched)
+     now traced end-to-end through 6 intermediate mechanisms (Global.txd load pending, phase-3
+     poll, climber retry, mode SM never runs, gate stuck at 6, DISPFB never retargeted). One
+     real Core fix landed (S68) — orthogonal to G1, real progress, not the fix. Next real step
+     is resuming the G1 fno=5 dispatch investigation with this full downstream picture in hand.
+```
+
+---
+
 ## 0b. Original one-line (session start)
 
 At 50M, **M3P is left asserted** with a **held PATH3 queue of 5 entries / 2124 QW** that never drains, because the game’s **last MSKPATH3 is a mask with no matching unmask**. That is real stuck DMA payload under HLE hold (not Path2-sticky block). Combined with page 0x46 being 100% black, the backlog is a strong candidate for “geometry never lands / never flips,” not a compositor lie. *(Still true; mechanism of “why no later unmask” is now G1+G2 above, not broken drain HLE.)*
