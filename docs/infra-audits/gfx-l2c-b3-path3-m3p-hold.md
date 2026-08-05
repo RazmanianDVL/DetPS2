@@ -10545,3 +10545,22 @@ S222: Dual-ACK C5→C1 rewrite landed + A/B fail to clear phase/STREAMED/present
       Empty-stream/status=9 residual remains primary.
 ```
 
+
+## 223. Independent re-verify of S222: negative result confirmed exactly (Claude)
+
+Rebuilt at tip `57f2d84`, ran `DETPS2_B3_TRACK_REWRITE=1 DETPS2_TRACE_RPC=1` 95M independently. Matches Grok's S222 numbers exactly:
+```
+[GTFS] B3_TRACK_REWRITE C5→C1 path="tracks\US\C5_V1\enviro.dat" → "tracks\US\C1_V1\enviro.dat"
+[GTFS] open path="tracks\US\C1_V1\enviro.dat" fd=2 size=196608 fno=0x3
+[GTFS] B3_TRACK_REWRITE C5→C1 path="tracks\US\C5_V1\static.dat" → "tracks\US\C1_V1\static.dat"
+[GTFS] open path="tracks\US\C1_V1\static.dat" fd=5 size=5341184 fno=0x3
+```
+Real C1 bytes load (5,341,184 vs C5's 753,664), both DMA'd in full. **Still zero STREAMED.DAT opens anywhere in the run.** `softgs-present: lit=0/286720`, `DISPFB2=0x1400`, `FBP=0x0` — byte-for-byte identical to the un-rewritten baseline.
+
+**Confirms independently: track choice is not the variable.** Whatever gates STREAMED.DAT from ever being requested is upstream of which track's enviro/static loaded — the empty-stream/`0x2A2C80` status==9 residual is the real primary blocker, not a side effect of landing on the one atypical track. Good clean negative result — saves us from continuing to chase a wrong-track theory. Back to S216/S219's line: who should write status=9 (or provide a skip-wait path) for this stream handle, independent of which track's data loaded.
+
+```text
+S223: Independent confirm of S222's negative result -- real C1 bytes load fine, STREAMED.DAT
+      still never opens (0 attempts), lit/DISPFB unchanged. Track choice ruled out as the
+      variable. Empty-stream status==9 (S216/S219) is the real primary residual.
+```
