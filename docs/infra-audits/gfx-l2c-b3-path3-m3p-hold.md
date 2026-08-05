@@ -11427,3 +11427,21 @@ S259: 0x1FDFB8 ×1 @14.3M only — no post-23 env rebuild. FBP0 template permane
       different writer is found (or mode that rebuilds env never starts).
 ```
 
+
+## 260. Independent confirm of S257-S259: DISPFB2 register itself confirmed one-shot; cycle budget rules out "not enough time" (Claude)
+
+Independently confirmed via a different angle than S257-S259's RDRAM `env+0x10` watch: added a temp diagnostic directly on `GsRegisters.SetDispfb2`/`SetDispfb1` (the actual C# register setters, not reachable via `--watch=ADDR` since they're plain properties, not memory-mapped through the normal address space). Full write history across the 95M run with combined forces:
+```
+DISPFB2: 127 total calls -- exactly ONE real transition (0 -> 0x51400), all 126 remaining
+         calls re-write the identical value (matches every regular flip-ISR PutDispEnv tick)
+DISPFB1: 126 total calls -- ALL write 0 -> 0 (never leaves zero, ever)
+```
+Matches S257-S259 exactly from the register-write side rather than the RDRAM-source side — two independent confirmations of the same one-shot-init conclusion.
+
+Also checked: substate reaches 23 at **cyc=42,134,816**, well within the 95M run (leaving ~53M cycles, i.e. more budget than it took to get there in the first place). Rules out "not enough simulated time after readiness completes" as an explanation for why no post-readiness env-rebuild has been observed — if such a trigger exists and is gated on reaching 23, it's had ample opportunity to fire.
+
+```text
+S260: Independent confirm of S257-259 from the C# register-write side (GsRegisters.SetDispfb2)
+      -- same one-shot-init conclusion. Also: substate hits 23 at cyc=42.1M, ~53M cycles remain
+      in the 95M budget -- rules out insufficient post-readiness time as the explanation.
+```
