@@ -717,3 +717,42 @@ ISR race hypothesis (not Core)
   fits 98 sets / 3 successes if lost-wake is frequent for slots1/2
   next: ordered log SET vs poll READ vs SleepThread for slot2
 ```
+
+---
+
+## 17. A/B: `DETPS2_RR_SCHED=1` equalizes poll-success (Grok, measure-only)
+
+Existing env forces circular RR in `FindNextRunnable` (no new Core). Same PCBREAK
+`0x2371B4` success census, late window `cyc≥25M`:
+
+| s1 | PRIO late success (baseline) | **RR late success** |
+|---:|-----------------------------:|--------------------:|
+| 0 | 65 | 59 |
+| 1 | **3** | **45** |
+| 2 | **3** | **50** |
+| 3 | 98 | 16 |
+
+Slots 1/2 leave the 3-success cliff under RR. Product metrics also move:
+
+| Metric | PRIO baseline | RR |
+|--------|--------------:|---:|
+| px | 877 187 | **9 752 122** |
+| prims | 172 | **23 639** |
+| gifP3 | 20 | **200** |
+| imgBytes | 65 728 | **1 084 512** |
+| lit / dispfbPx | 0 | still **0** |
+
+**Still black present** (no DISPFB flip), but the VBlank-waiter imbalance is **causally
+linked** to priority tie-break order: fair RR among runnables restores slots1/2 wait
+completions and unlocks ~11× prims / more Path3. Complements Claude’s pick-count
+starvation measure (`f5caae9`). **No permanent Core** — env A/B only. Dual-ACK + design
+before defaulting RR or changing tie-break (fleet impact: Midway already uses
+`PreferRoundRobinSched`; B3 does not).
+
+```text
+RR A/B (existing DETPS2_RR_SCHED)
+  late success 65/3/3/98 -> 59/45/50/16
+  px 877k -> 9.7M prims 172 -> 23k; still lit=0 dispfb=0
+  scheduler tie-break is a real lever for B3 waiters; not a full flip fix
+  dual-ACK design before any default Core sched change
+```
