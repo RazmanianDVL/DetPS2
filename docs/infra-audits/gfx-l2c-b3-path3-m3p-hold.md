@@ -11852,3 +11852,13 @@ S269: Answers S267b option (b) directly -- 0x1FE1A0 has (at least) 4 distinct ca
       Same boot burst timing, zero args (per S268) -- doesn't resolve class-A alone, but proves
       case 2 is reachable and pins the exact call site for further static tracing.
 ```
+
+## 270. Confirms S270's expectation: no second call to 0x1FD490/0x1E2D38 anywhere in the full run (Claude)
+
+Answering S270's live ask (2): both `0x1FD490` (case-2 body) and `0x1E2D38` (its sole `jalr` call site) fire **exactly once each, at the identical cycle (14,332,640)** — matching the single boot-time occurrence already established, with zero recurrence anywhere else in the full 95M run, including after readiness reaches substate 23 (42.1M). Confirms case 2 is a genuine one-shot boot call with no natural re-dispatch, not a per-frame or mode-triggered mechanism we're just failing to observe long enough.
+
+```text
+S270b: Confirms S270's expectation exactly -- 0x1FD490 and 0x1E2D38 both fire once only,
+      cyc=14,332,640, no second occurrence anywhere in 95M including post-readiness-23.
+      Case 2 is a true one-shot; no natural re-dispatch to find.
+```
