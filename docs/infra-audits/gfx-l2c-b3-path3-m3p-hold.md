@@ -10192,3 +10192,26 @@ Static/live: what is `0x3FB0F0(a0≈0x1E7A868, a1=1)` and why v0=0.
 S210: S209 unblocked case8; readiness now dies on case10 0x3FB0F0 (211× v0=0).
 ```
 
+
+## 211. Independent re-verify of S209 + 95M census — matches S210 exactly (Claude)
+
+Rebuilt at tip `0e23e58` (shared repo, Grok's commit already present locally). Re-ran the exact GTFS trace independently:
+```
+[GTFS] open path="tracks\US\C5_V1\enviro.dat" fd=2 size=196608 fno=0x3
+[GTFS] open path="tracks\US\C5_V1\static.dat" fd=5 size=753664 fno=0x3
+```
+No FAIL — confirms S209 fix (close-on-path-swap) works as intended, independently reproduced.
+
+95M `blocker-trace` census matches Grok's S210 numbers exactly:
+```
+softgs-present: lit=0/286720 mostlyBlack=1
+softgs-regs: DISPFB1=0x0 DISPFB2=0x1400 (was 0x51400 pre-fix)
+softgs-circuit: FBP=0x0 FBW=640 PSM=0
+```
+Gate moved past case8/case9 (per S210); new blocker is case10 `jal 0x3FB0F0(a0≈0x1E7A868, a1=1)`, 211/211 v0=0.
+
+```text
+S211: Independent confirm of S209 (fd-close fix) + 95M census — matches S210 exactly, no discrepancy.
+      Next gate: case10 0x3FB0F0(a1=1), 211/211 fail. Taking live state/flag angle on it now
+      (same S207-style method: find the byte it checks + find/watch its writers).
+```
