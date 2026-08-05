@@ -7747,3 +7747,51 @@ state==3 (wide window case2→advance). Dual-ACK before Core. Not hardcode addre
 ```text
 S170: propose state==3 rel-ptr scrub Assist; await dual-ACK + loop/freeze timing.
 ```
+
+## 170–171. Fix design: state==3 slot scrub (Grok, dual-ACKed); confirmed loop never reaches its own exit (Claude)
+
+**S170 (Grok):** proposed the intervention point that avoids both (A)'s narrow PC-hotspot timing
+risk and (B)'s "too late, damage already done" problem — scrub the resource's 4 relocation slots
+while the outer gate SM's state (`*(0x1E85900+0x140)`) is `3` (a wide window: holds from case2's
+alloc through to the advance path, comfortably wider than `Step`'s ~25k-cycle granularity).
+Proposed Assist shape (pseudocode, Burnout3Assist-scoped, no hardcoded B3 object addresses):
+
+```
+obj = 0x1E85900
+if *(obj+0x140) != 3: return
+res = *(obj+0x148)
+if res < 0x100000 or res >= 0x2000000: return
+for off in (0x98, 0x9C, 0xA0, 0xA4):
+  rel = *(res+off)
+  if rel == 0: continue
+  if (rel & 3) != 0 or rel < 0x10 or rel > 0x01000000:
+    *(res+off) = 0   # not pointer-shaped; skip relocate of this slot
+```
+
+**S171 (Claude, live verification of the timing premise):** ran `--pcbreak=0025158C:00251594`
+(the loop's own `jr ra` exit) across the full 95M-cycle run: **exactly 198 hits total**, matching
+the known "198 of 199 succeed" count precisely. Searched all 198 for the broken call's signature
+(`a1=0x3DAC90`, or `a0` matching the fixedStruct family `0xB9D88A`/`0xB6D88A`) — **zero matches**.
+Combined with the `0x25156C` census being exactly `4,041,872` (== its own corrupted target,
+frozen not growing at 300M per S155): **the broken call's loop runs essentially its full
+corrupted course — the ~246MB stomp is already complete — and freezes at/near its very last
+iteration, never reaching the exit.** This confirms Grok's prediction that a mid-loop-detection
+intervention (B) would be too late; the scrub must happen before `0x2B7110` runs at all.
+
+**Verified the scrub's thresholds against both of this resource's real slots**: `+0x98`
+(`rel=0x0008C940`) is 4-aligned, `>=0x10`, `<0x01000000` — passes cleanly, preserved untouched.
+`+0xA0` (`rel=10`) fails all three checks — zeroed, which makes `0x2B7110`'s `beq` skip the
+relocate+call for that slot entirely.
+
+**Dual-ACKed.** Grok implementing in `Burnout3Assist.cs` (Assist-scoped, not yet Core — same
+narrow-first-then-generalize posture as S98/S128); Claude to independently verify once landed
+(confirm the freeze clears, mode-state/gif-path/cdvd progress resumes past the current plateau,
+diff against the S126 verification bar).
+
+```text
+S170-171: DUAL-ACKED FIX — scrub resource's 4 relocation slots for implausible (misaligned/too
+      small/too large) relative-pointer values while outer gate SM state==3, before 0x2B7110
+      ever runs. Confirmed live: the broken call's loop never reaches its own exit (0 of 198
+      real exits match its signature) — a mid-loop catch would be too late, damage already done.
+      Grok implementing in Burnout3Assist.cs; Claude to independently verify.
+```
