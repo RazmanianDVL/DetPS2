@@ -10476,3 +10476,42 @@ So C5_V1 is **not** a normal playable circuit’s streamed layer — unique empt
 S220: C5_V1 STREAMED is the only 0-byte of 37; atypical. Prefer deliberate track pick A/B.
 ```
 
+
+## 220. C5_V1 is very likely an unused/dev track slot, not a normal circuit — reframes the whole S212-219 thread (Claude)
+
+### The test setup has no deliberate track selection
+`blocker-trace` was run with no `--pad-script`; menu navigation is entirely `Burnout3Assist.PulseLogoPadAdvance`'s generic 16-phase blind START/CROSS/D-pad mash (`Burnout3Assist.cs` ~582-609). `C5_V1` is whatever the menu defaults to under that mash — never a deliberate pick.
+
+### Cross-track STREAMED.DAT census (native ISO mount, all `TRACKS/US/*`)
+| Track | STREAMED.DAT size |
+|---|---|
+| C1_V1 | 12,124,160 |
+| C1_V2 | 12,222,464 |
+| C2_V1 | 8,716,288 |
+| C2_V2 | 8,650,752 |
+| C3_V1 | 6,946,816 |
+| C3_V2 | 6,946,816 |
+| **C5_V1** | **0** |
+| M1_V1 | 23,855,104 |
+| M1_V2 | 23,625,728 |
+| P1_V1 | 15,892,480 |
+| P1_V2 | 15,892,480 |
+| P2_V1 | 18,546,688 |
+| P2_V2 | 18,612,224 |
+
+**C5_V1 is a glaring outlier** — every other track has 6.9-23.8MB of streamed audio/ambience; C5_V1 alone has zero. Two more corroborating oddities: **C4 is entirely absent** (C1→C2→C3→C5, no C4_V1/C4_V2 at all), and **C5 has only one variant** (every other circuit has V1+V2, C5 has only V1). This pattern — missing number, single variant, zero streamed data — is a strong signature of a leftover/cut/dev-only track slot that shipped on the disc but isn't a normal player-reachable circuit.
+
+### Why this matters
+S212-219 have been chasing "why doesn't a zero-byte stream ever report status==9" as if it's a general engine gap. If C5_V1 is genuinely not a normal-play track, that framing may be solving the wrong problem — real hardware may never exercise this exact zero-length-stream path during ordinary play, and the actual black-screen-relevant behavior would live on a **normal** track's completion path instead, which we haven't tested at all yet.
+
+### Proposed next step (not yet run — proposing before spending more effort on the status=9 site)
+Point `--pad-script` (or a manual `--press=` sequence) at selecting a real track (e.g. C1_V1, which has full V1+V2 and 12MB of stream data) instead of relying on blind menu-mash, and see whether the entire case8→case10→readiness→DISPFB chain clears **without any empty-stream special case at all**. If it does, this reframes the fix from "invent zero-length completion semantics" to "the test harness's blind pad-mash needs to reach a real track" — much cheaper, and doesn't require guessing at real-hardware behavior for an asset a player likely never selects.
+
+```text
+S220: C5_V1 STREAMED.DAT=0 is a major outlier vs every other US track (6.9-23.8MB); C4 missing
+      entirely, C5 has only 1 variant vs 2 for every other circuit -- strong signature of an
+      unused/dev-only slot, not a normal circuit. Current test has no deliberate track pick
+      (blind PulseLogoPadAdvance menu-mash lands here by default). Proposing: test against a
+      real track (e.g. C1_V1) before investing more in the status==9/empty-stream site --
+      may reframe S212-219 entirely. Not yet run -- proposing to Grok first.
+```
