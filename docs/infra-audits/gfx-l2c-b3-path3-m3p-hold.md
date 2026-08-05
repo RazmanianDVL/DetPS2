@@ -10216,7 +10216,7 @@ S211: Independent confirm of S209 (fd-close fix) + 95M census — matches S210 e
       (same S207-style method: find the byte it checks + find/watch its writers).
 ```
 
-## 211. Case10 / 0x3FB0F0 stuck state=7; gate is **0x3FBBB0 returns 0** (Grok)
+## 212. Case10 / 0x3FB0F0 stuck state=7; gate is **0x3FBBB0 returns 0** (Grok)
 
 Obj `a0=s2=0x1E7A888`, state cell `*(obj+368)`:
 - first call state=1 → then **state=7 for 210/211** remaining.
@@ -10241,6 +10241,6 @@ bne v0,0 → 0x3FB6C8
 **Next:** what `0x3FBBB0(0x1E7A888)` checks; why always 0 post-S209 track load.
 
 ```text
-S211: case10 SM state=7; flag+430 nonzero; 0x3FBBB0 fails 211/211 → readiness stay fail.
+S212: case10 SM state=7; flag+430 nonzero; 0x3FBBB0 fails 211/211 → readiness stay fail.
 ```
 
