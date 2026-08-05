@@ -9250,3 +9250,56 @@ S191: ROOT = B3 Assist MaybeLeavePresentationPark resume-order bug. Planted ra=0
       write to mid-body. Fixed: park resumes first. Dual-ACK verify requested.
 ```
 
+
+## 191. INDEPENDENT VERIFICATION — S191 confirmed: real host-side bug, not Core, freeze fully cleared (Claude)
+
+**Grok's finding, confirmed by reading the actual diff (`3e4a1c6`):** the entire S159-S190
+investigation arc was chasing a **host-side (Assist) bug**, not a genuine guest-CPU-emulation
+fault. `Burnout3Assist.MaybeLeavePresentationPark` (a pre-existing PL-014 mechanism) plants a
+"presentation-graph continue" `ra=0x223228` as dead-`ra` safety, but the resume-target selection
+below it checked `if (ra is good code) resume = ra` *before* the flip-wait/VBlank-park-specific
+resume checks — so the just-planted `0x223228` (which passes the "looks like good code" test)
+won the priority race and got used as an **immediate PC hop**, even while genuinely inside the
+flip-wait band (`0x1F24E0`-`0x1F251C`, the queue-dispatch loop this whole session traced).  This
+is a pure host-side `sys.EE.PC = resume` write — explaining exactly why S189's PCSTREAM diagnostic
+found *zero* guest instructions between the healthy PC and the corrupted one. The fix reorders:
+park-specific resumes (`0x1F2520` flip-wait, `0x2371E0` VBlank epilogue) are now chosen first;
+the "ra looks like good code" fallback only applies otherwise.
+
+**Verified, full checklist:**
+
+1. **PCSTREAM in the exact critical window** (`AFTER=41999900 UNTIL=42001000`): zero occurrences
+   of `pc=0x223228`/`fromPc=0x223228` anywhere. PC now correctly loops at `0x1F2520` (the DI
+   spin) — exactly the flip-wait resume target the fix specifies.
+2. **`DETPS2_TRACE_BIOS=1` presentation-leave line**: `ra=0x00223228 -> 0x001F2520` — confirms
+   the plant still happens (dead-`ra` safety preserved) but the hop target is now correct.
+3. **Full 95M-cycle re-run, overall health**: massive additional progress beyond S171 alone —
+   `px=71,039,303` (was 9,441,101 with S171 only, **7.5x more**), `prims=5758` (was 1558),
+   `gif-pkts completed=2520` (was 835), `softgs-writes total=30,447` (was 7964). A genuine
+   `[B3] PL-014 scene-delta scene=True interactive=True` event fired mid-run
+   (`cyc=49,650,000`) — real interactive-state progress, not just raw counters climbing.
+4. **VBlank no longer stops forever**: `0x2370A4` hit count jumped from 96 (S171-only) to
+   **303**, now firing continuously almost to the end of the run (last entry
+   `cyc=94,750,000`, vs. dying completely at `cyc=43,000,000` before). This confirms the S191
+   fix also resolves the earlier-established "VBlank stops forever" symptom (S172/175) as a
+   downstream effect of the same bug — not a separate issue needing its own fix.
+5. `softgs-present: lit=0/286720, mostlyBlack=1` — **still unchanged**, as expected. The
+   class-A DISPFB/FRAME page mismatch (S173-174) is a distinct, already-tracked open thread;
+   today's two fixes (S171 + S191) were about clearing hangs/freezes, not about retargeting
+   DISPFB to the correct draw page. That remains the next real thread to pull.
+
+**Dual-ACK confirmed on my side.** This is a genuine, well-evidenced, narrowly-scoped fix (pure
+reorder of existing conditionals, no new addresses invented) that resolves a real self-inflicted
+host-side bug. Combined with S171, B3's boot sequence now makes dramatically more real progress
+than at any point this session.
+
+```text
+S191-verify: CONFIRMED — the entire S159-190 investigation arc traced back to a host-side
+      Assist bug (MaybeLeavePresentationPark's resume-priority order), not a Core/guest-CPU
+      fault, exactly matching PCSTREAM's "zero guest instructions" finding. Fix (3e4a1c6)
+      verified: zero 0x223228 occurrences in the critical window, correct 0x1F2520 resume,
+      massive additional progress (px 9.4M->71M, prims 1558->5758, gif-pkts 835->2520),
+      VBlank no longer stops forever (96->303 entries, now firing to cyc~94.75M vs dying at
+      43M). lit=0 unchanged as expected -- class-A DISPFB mismatch remains the next open
+      thread, unrelated to today's two freeze fixes. Dual-ACK confirmed.
+```
