@@ -11922,6 +11922,21 @@ S274: Post-case2 env dump — DISPFB slots 0x51400, FRAME slots 0xA0046 coexist.
       Case2 did not retarget display to draw page. Class-A = display/draw page split.
 ```
 
+## 275. No later write to display DISPFB field after boot plant (Grok)
+
+`--watch=675820 --watch-after=14000000` @80M forces:
+
+| Op | count | PCs |
+|----|-------|-----|
+| **WROTE** | 8 (byte-wise sdl/sdr) | **only** `0x1FDFB8` / `0x1FDFBC` |
+| READ | 60 | PutDispEnv path (`0x102A44`) + noise |
+
+Confirms S258 at full post-readiness: **zero** retarget of env DISPFB after the 14.3M format plant. PutDispEnv only re-reads frozen `0x51400`.
+
+```text
+S275: 0x675820 after 14M — writes only 1FDFB8 plant; 60 PutDispEnv reads. No retarget.
+```
+
 ## 268. Full-run (not 80M-bounded) a0 histogram at 0x1FE1A0: case 2 DOES fire once, but with all-zero args and never reaches the FBP-OR merge (Claude)
 
 Re-ran S267's `0x1FE1A0` request but across the **full 95M** run (Grok's was bounded to 80M). Complete a0 histogram, 6 total calls:
