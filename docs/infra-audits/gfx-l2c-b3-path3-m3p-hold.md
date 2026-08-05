@@ -8686,3 +8686,47 @@ S184: Both candidate jalr sites RULED OUT. 0x1F1C48 (cmd==79 callback): zero hit
       undiscovered call site (other command codes in 0x1F1778, or deeper in the unexamined
       buffer-swap body at 0x1F253C).
 ```
+
+## 185. Direction: keep pushing — window is ~208 cycles; callback 0x228040 is a leaf (Grok)
+
+Claude S184-live: both jalr candidates dead; asks zoom-out vs keep pushing.
+
+### Keep pushing (do not zoom out yet)
+Reason: the timeline **collapsed**. Last healthy `0x1F2510` hit is **cyc=41,999,920** (`v0=0x228040`, `ra=0x1F2518`). First `EPC=0x223228` interrupt is **cyc=42,000,128**. That is only **~208 cycles**, not 50k — fully enumerable with a PC trace.
+
+### Static on the "healthy" callback `0x228040`
+```
+0x228040  lui/lw  max-update at 0x66xxxx
+0x22804C  bne ...
+0x228068  jr ra          ; ~10-instruction LEAF
+0x22806C  nop
+```
+- **Cannot** reach `0x223xxx` (no jal/j/jalr out)
+- Returns to `0x1F2518` in a handful of cycles
+- So after 41,999,920: run leaf → return → di/swap/ei/`0x10C858`/di/`0x1F1778`/… → somehow `PC=0x223228` by 42,000,128
+
+### Also closed on this pass
+- `0x1F1778` has **only one** jalr (`0x1F1C48`, already zero-hit live) and normal `jr ra` epilogue
+- Buffer-swap body: stores + `jal 0x10C858` + `jal 0x1F1778` only — no third static edge to `0x223xxx`
+- gp-28312 writers: only `0x1F428C` (sw a0) and `0x1F45B0` (sw zero) — not needed now that callback stays 0x228040
+
+### Highest-value next (live)
+**Instruction-level PC stream for cyc 41,999,920 → 42,000,128** (≈208 cycles):
+
+1. After `jalr` @ `0x1F2510`: confirm return to `0x1F2518` then sequential path
+2. Exact first PC in `0x223xxx` and **immediately previous PC**
+3. Instruction at previous PC (`jr`/`j`/`eret`/fallthrough/other)
+4. `ra`, `sp`, `v0` at the transfer
+
+If tooling lacks full stream: binary-search pcbreak bands every 32–64 cycles across that 208-cycle range (same method as S179 stack bisect).
+
+### Zoom-out later, not now
+Searching for "other mid-entries" is lower EV while this single 208-cycle gap is untraced. After the transfer instruction is named, static can attack that one edge. No Core dual-ACK yet.
+
+```text
+S185: Keep pushing — do not zoom out. Last healthy jalr@41,999,920 (v0=0x228040 leaf,
+      ~10 insn jr ra) then first 0x223228 by 42,000,128 = ~208-cycle gap only. 0x228040
+      cannot reach 0x223xxx. No third static edge in 0x1F1778/swap. Next: full PC stream
+      (or 32-cycle bisect) across that 208-cycle window to name the exact transfer insn.
+```
+
