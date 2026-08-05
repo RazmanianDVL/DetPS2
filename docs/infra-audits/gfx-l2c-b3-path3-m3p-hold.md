@@ -1,10 +1,10 @@
 # GFX L2c — B3 PATH3 / M3P hold dig
 
-**Status:** measure complete — **no Core this seat**; dual-ACK before any fix  
+**Status:** measure complete (hold dig + FQC refute + data-flow writer) — **no Core this seat**; dual-ACK before any fix  
 **Date:** 2026-08-05  
 **Title:** Burnout 3 (SLUS_210.50)  
-**Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`)  
-**Author:** Grok (claimed seat after Claude seq0290 split)
+**Parents:** `gfx-l2c-b3-frame-dispfb-stall-finding.md`, Claude page-0x46 dump (`b7048b1`), Claude FQC refute (`bc239a9`)  
+**Author:** Grok (claimed seat after Claude seq0290 split; §9 continues after Claude seq0292)
 
 ---
 
@@ -191,4 +191,91 @@ FQC-honesty hypothesis (Claude) -- REFUTED
   --pcbreak=0x1F1A28 -> zero hits in 35M -- EE never enters this poll at all
   historic path-sync loop doesn't explain current stuck state
   next: trace real MSKPATH3 write site + matching-unmask gate directly (Grok's original ask)
+```
+
+---
+
+## 9. MSKPATH3 data-flow — who writes the mask/unmask words (Grok, continued seat)
+
+Claude's §8.4 note was right: VIF codes arrive as a DMA-read stream, so "who issues
+MSKPATH3" is "who wrote `0x06008000` / `0x06000000` into the VIF source buffer," not
+current-PC-at-dispatch. Prior half-done attempt only logged stream source addrs
+(`MSKPATH3_SRC`); this pass closed the writer with pure tooling (no Core, no TEMP).
+
+### 9.1 Stream source (from prior TEMP, already known)
+
+| Role | VIF code | ProcessStream src |
+|------|----------|-------------------|
+| unmask | `0x06000000` | **`0x007FC8FC`** |
+| mask | `0x06008000` | **`0x007FCA80`** |
+
+Final event #10 is mask from `0x007FCA80`. After that, queue refills to held 2124 QW and
+never sees another unmask through 35M/50M.
+
+### 9.2 `--find-writer` (35M, `--track-writers`) — decisive
+
+Both words are written **once**, same cycle, by the same buffer-init routine:
+
+| Address | Value | Cycle | PC | Insn |
+|---------|-------|------:|----|------|
+| `0x007FC8FC` | `0x06000000` (unmask) | **14340768** | **`0x001F4124`** | `sq t0, 112(v1)` |
+| `0x007FCA80` | `0x06008000` (mask) | **14340768** | **`0x001F4144`** | `sq t0, 512(v1)` |
+
+`last-writer log: 7198411` distinct addresses tracked — so empty prior attempt was a tooling
+miss, not "never written." At end of stuck window the words are still the same values
+(`--dump=007FC800:300` confirms). **They are never rewritten after init.**
+
+`--find-transfer=007FC800:400`: no DMA transfer *into* this range (correct — EE `sq`
+builds it). TransferLog does not surface mid-chain VIF1 MADR advances that *consume* these
+offsets; that is a separate dig if needed.
+
+### 9.3 Builder disasm (`0x001F3F98`…, near historic path-sync at `0x1F1A28`)
+
+Function ~`0x001F3F98` allocates/aligns a graphics VIF command buffer (gp-relative base
+stored at `gp-28316` → later `v1`), zero-fills it with `sq t0`, then plants fixed VIF codes:
+
+```
+1F4110  lui  v0, 0x1100          ; FLUSH
+1F411C  lui  a1, 0x0600
+1F4120  ori  a1, a1, 0x8000      ; a1 = 0x06008000  (mask IMM)
+1F4124  sq   t0, 112(v1)         ; QW @ base+0x70 = [FLUSH, 0, 0, 0x06000000 unmask]
+1F4138  pcpyld t0, a2, a1        ; pack mask code
+1F4144  sq   t0, 512(v1)         ; QW @ base+0x200 = [0x06008000, 0, 0, 0]
+1F4154  sq   t0, 528(v1)         ; FLUSH/FLUSHA pair at base+0x210
+```
+
+Buffer base ≈ `0x007FC880` (from mask addr − 0x200). Layout is a **static template**, not a
+per-frame rewritten list.
+
+### 9.4 What this reframes
+
+| Was open | Now known |
+|----------|-----------|
+| Who writes final mask word? | Builder `0x001F4144` once at ~14.3M |
+| Is unmask word missing/corrupt? | **No** — `0x007FC8FC` still holds `0x06000000` at stuck end |
+| Is HLE inventing mask? | **No** — game planted both codes in RAM |
+
+The stuck state is **not** "EE forgot to store the unmask word." Both codes sit correctly in
+the static list. The failure is **submission / consumption**: after the final mask kick,
+nothing re-kicks the unmask offset of the same buffer (and/or the path that would DMA that
+slot never runs). HLE holds Path3 under M3P exactly as commanded.
+
+### 9.5 Honest bound / next (dual-ACK before Core)
+
+**Parked as measure-complete for the data-flow seat** unless dual-ACK picks:
+
+1. **VIF1 submit path:** which code kicks DMA (or FIFO) at `0x007FCA80` vs `0x007FC8FC`
+   after the buffer is built — TADR/MADR chain or FIFO poke; why the unmask slot is not
+   re-submitted after mask #10. (TransferLog alone was insufficient for mid-chain MADR.)
+2. **Optional A/B (still dual-ACK):** one forced `SetMskPath3(false)` mid-run after held
+   2124 — temp + full revert — only to see if page 0x46 / DISPFB / px move.
+3. **Still ban** invent DISPFB flip / present page 0x46 / permanent force-unmask Core.
+
+```text
+MSKPATH3 data-flow (Grok) -- CLOSED for writer question
+  unmask word @ 0x007FC8FC = 0x06000000  last writer pc=0x001F4124 cyc=14340768 (once)
+  mask   word @ 0x007FCA80 = 0x06008000  last writer pc=0x001F4144 cyc=14340768 (once)
+  same static VIF list builder ~0x001F3F98; never rewritten after init
+  stuck = missing post-mask re-submit of unmask slot, not missing/corrupt unmask data
+  no Core; dual-ACK before force-unmask A/B or submit-path Core theory
 ```
