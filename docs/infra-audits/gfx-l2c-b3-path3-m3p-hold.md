@@ -5137,3 +5137,79 @@ S90: Queue slot 0x4F6100+1920 holds a real, active pointer (0x66E120) — the lo
      is a genuinely stuck pending load, root-caused to the same fno=5 dispatch gap from earlier
      tonight, not a queueing failure.
 ```
+
+
+---
+
+## 91. Night synthesis (Grok+Claude, post-S89/S90) — single current chain
+
+Corrections absorbed: S72 DISPFB decode; S82 gate 6-vs-5; S85 polarity incomplete;
+S87 **disasm-mode invalid for final values** (must use blocker-trace --host-present).
+
+### Confirmed causal chain (host-present)
+
+```text
+S68 Assist latch fixed (_flipEverUnblocked)
+  → climber retries (was parked SleepThread)
+  → phase advances 1 → 2 → 3
+  → phase2: id14 resource OK (+16=0x67D880), queues Data/Global.txd via 0x13CFA0
+  → phase3: polls *(u8*)0x51868C forever (S89: never written 1)
+  → 0x13D250 ticks 38×; success 0x13D340 hits=0 (S90)
+  → queue 0x4F6100+1920 = 0x66E120 live pending object
+  → load never completes
+  → climber never returns non-zero
+  → boot never reaches mode SM 0x132600 / 0x132560
+  → mode-state 0x51BAD0 stays 0
+  → gate *(0x01E90424) stays 6 (boot mega-init); never 5
+  → DISPFB setter 0x424C40 gated on ==5 never runs
+  → VBlank ISR keeps installing display page 0
+  → FRAME draws at Fbp=70 (0x8C000); present reads page 0 → black
+```
+
+### Closed / not the primary lever
+
+| Item | Verdict |
+|------|---------|
+| PATH3 held queue alone | Real but insufficient (G3 drain still black) |
+| VU1/Path1 at intro | Likely not needed for 2D chrome yet |
+| id14 null resource | **Artifact of S87** — resource is installed |
+| Flip SleepThread park | Fixed S68; orthogonal to mode |
+| Invent-DISPFB Core | Forbidden without dual-ACK; wrong layer |
+
+### Open root (G1, re-armed with full downstream)
+
+**fno=5 / Global.txd multi-chunk read never dispatches** after successful open.
+
+| Fact | Evidence |
+|------|----------|
+| Open `0x1D36E0` fires | GTFS RPC, fd=4, size=1146112 |
+| Read `0x1D3280` (vtable `0x4DDFC8+8`) | **0 hits** historically |
+| Loader pumps | `0x13D250` ×38, status never complete |
+| Flag | `0x51868C` never 1 |
+| Pending object | `0x66E120` at queue+1920 |
+
+### Product metrics (post-S68, still black)
+
+| Metric | ~value |
+|--------|--------|
+| px | ~7.67M |
+| gifP3 | ~198 |
+| cdvd | ~6584 |
+| dispfbPx / lit | 0 |
+| Path1 | 0 |
+| phase | 3 |
+| mode-state | 0 |
+| gate | 6 |
+
+### Next (ordered)
+
+1. **Resume G1:** who issues vtable fno=5 / `0x1D3280` after open sets ready; why container
+   tick `0x212A24` / open path leaves object pending without read. Object `0x66E120` is the
+   live handle.
+2. Optional force-flag=1 A/B only after dual-ACK (proves phase3→mode path; does not replace G1).
+3. No invent-DISPFB; dual-ACK before any Core/Assist land.
+
+```text
+S91: synthesis — black present = mode never ready because Global.txd load never completes
+     (phase3 flag); root remains G1 fno=5 never dispatched. Full chain now closed end-to-end.
+```
