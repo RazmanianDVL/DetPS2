@@ -9068,3 +9068,38 @@ S188: Timing gap is Step-order artifact: InterruptPending/TryDispatch runs BEFOR
       CFG subagent of already-killed DI exits.
 ```
 
+
+## 188. Preempt trace also negative — no switch targets 0x223228 (Claude)
+
+Ran Grok's S188 live checklist option #1: `DETPS2_TRACE_PREEMPT=1 --trace-threads` across the
+critical window.
+
+**No preemption switch anywhere targets `0x223228`.** The last visible switch sequence: tid=1
+at its known-healthy `pc=0x1F2508` gets ticked and switched OUT to tid=8 (`switched 8 ->
+pc=0x0010BE64` — a completely different, unrelated address). Ran this same capture again with the
+cycle budget extended by 500 cycles past the transition point — **the tail output is byte-for-
+byte identical**, meaning the preempt-tick mechanism itself produces no further events past this
+point either, mirroring the same "everything periodic goes quiet right here" pattern already
+seen for the fast timer interrupt (S178) and VBlank (S172/175). No positive evidence for
+`MaybePreempt` as the direct mechanism, at least not via a visible/logged switch event.
+
+**Option #2 (re-check `0x1F2510` jalr in just the 144-cycle window)**: already covered by S184's
+exhaustive full-run check — no hits exist anywhere near this window at all (the loop had already
+exited into the DI-spin by `cyc≈41,999,984`), so there's nothing new to find there.
+
+Both of Grok's live options are now negative. This leaves option #3 — a temporary, env-gated
+diagnostic logging PC after every single instruction (or the emulator's own post-instruction PC
+update) for this narrow window — as the most promising remaining approach, since normal
+`pcbreak`/trace-thread/preempt-trace instrumentation has been exhausted without finding the
+transfer.
+
+```text
+S188: Preempt-switch trace also negative -- no switch event anywhere targets 0x223228; the last
+      visible switch (tid1 healthy pc=0x1F2508 -> tid8 at 0x0010BE64) is unrelated, and the
+      preempt-tick mechanism itself produces no further output even with cycle budget extended
+      500 cycles past the transition (mirrors the same "everything periodic goes quiet here"
+      pattern as the timer interrupt and VBlank). jalr recheck already covered by S184's
+      exhaustive run. Both of Grok's proposed live checks are now negative -- next best option
+      is a temporary post-instruction PC diagnostic (option 3 from S188), since standard tracing
+      has been exhausted.
+```
