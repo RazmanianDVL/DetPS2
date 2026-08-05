@@ -11066,3 +11066,31 @@ S243: audio freelist primed with 11×0x3C0 nodes @0x1F33888; all popped before/d
       case11. Empty head is the fe.awd blocker. Next: who consumes the 11, can slab expand.
 ```
 
+
+## 244. Pool init **constructs 11 nodes then free loses 10** — freelist chain broken (Grok)
+
+### Init at `0x384460` (audio pool)
+```
+slab-init 0x2B6EF0(count=*(pool+24)=11, stride≈944)
+link freelist struct 0x2B6E10
+for i in 0..10:
+  node = pop 0x2B6DA0
+  construct 0x383F10(node+8)
+free-all-used 0x2B6C40   # should return all 11 to freelist
+```
+
+### Live watches
+| Addr | Role | History |
+|------|------|---------|
+| `0x1E75680` (used+4) | used list head | builds `1F33888`…`1F35E08` (11×), then free clears to 0 |
+| `0x1E75678` (free+16) | freelist head | after free: **only `1F35E08`**, then one pop → **0** |
+| pop returns | success | 11× ra=`3844EC` (init construct), **1×** ra=`384258` (0x3840C0/fe), 169 fail |
+
+**Used list has 11 nodes; freelist after free has 1.** The doubly-linked used chain is broken before/during `0x2B6C40`, so only the LIFO head returns. case11 then starves on empty freelist.
+
+```text
+S244: pool init pops+constructs 11, free 0x2B6C40 only restores 1 (chain break).
+      That single node is consumed; fe.awd forever empty-freelist. Next: why used
+      next-ptrs die (construct side effects vs free walk).
+```
+
