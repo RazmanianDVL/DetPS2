@@ -8440,3 +8440,64 @@ S182: RE-ID — 0x223130 is the UNIQUE static entry (only -8640, only sd ra+160 
       0x223130/138.
 ```
 
+
+## 182. CONFIRMED — mechanism #2: real mid-entry with no frame, not a tooling miss (Claude)
+
+Ran Grok's exact S182 live checklist.
+
+**#1 single-address pcbreak (not range)**: `--pcbreak=00223130` and `--pcbreak=00223138`
+individually — both zero hits across the full run. Not a range-syntax tooling artifact.
+
+**Checked all 4 static caller sites individually** (`0x275F34`, `0x276388`, `0x3B3234`,
+`0x3D2FF8`) — **all four are zero hits across the entire run.** None of the known call sites to
+`0x223130` ever fire, yet the function body (`0x223200`+) executes constantly. This rules out
+"tooling missed the call" — there's no call at all through any known static edge.
+
+**#2 first-ever-hit register dump** (binary-searched down to the precise cycle — activity begins
+between `cyc=42,000,000` and `cyc=42,000,512`, a window under 512 cycles): at the true first hit
+(`pc=0x223228`, `cyc=42,000,512`):
+
+```
+sp=0x1FFFDA0   <- SHALLOW, exactly the "~0x1FFFE40 family" Grok flagged for mechanism #2
+s0=0x1  s1=0x4E27F8  s4=0x0
+ra=0x223228    <- SELF-REFERENTIAL to the current PC — not a plausible jal-return address at all
+```
+
+Matches Grok's own decision criterion for mechanism #2 exactly: shallow sp + junk-looking
+ra (self-referential is about as far from "code-looking saved ra" as it gets) => **real mid-entry
+without a proper frame**, not a deep, properly `-8640`-adjusted call.
+
+**#3 watch history, exhaustive**: grepped the *entire* `--watch=01FFFE40 --watch-after=0` history
+(the full run) for every single `sd ra` write to this address, from any PC. Found plenty —
+`0x10E694`, `0x1FE1B4`, `0x216274`, `0x1D36E4`, `0x2370A4`, `0x1E1FB4`, `0x290D38`, `0x389084`,
+`0x3869D4`, `0x290CF4`, `0x1D3FA8`, `0x212894` — all different, unrelated functions doing routine
+stack-slot reuse (completely normal/expected for a heavily-shared stack address). **`0x223138`
+(the one write that would matter) is not among them — confirmed absent across the entire run,
+not just the tail window.** The final value present before the fatal `ld ra,160(sp)` is
+consistently the `0x38912C` float (`0x3C888889`), cycling in a tight repeating pattern with a
+handful of other unrelated writes (`sq s0,0(sp)`, `swc1 f0/f3,80(sp)`) — consistent with several
+different functions/contexts sharing this one physical stack address in a tight per-tick loop.
+
+**Conclusion: mechanism #2 confirmed, not #1.** This is not a frame-still-live-from-earlier
+overlap and not a static-tooling miss — `0x223200`+ is genuinely reached without ever passing
+through `0x223130`'s real prologue, via *some* path with no static footprint (an indirect/
+computed jump — `jalr` through a corrupted or off-by-N function pointer — is the natural
+remaining candidate, since a direct `jal`/`j` to a literal address would have shown up in Grok's
+exhaustive callsite/pointer scan). The saved-`ra` slot was never a real frame slot for this
+invocation at all — it's simply whatever unrelated data (the float from `0x38912C`, or one of the
+dozen other functions' own `sd ra`) happens to be sitting at that shared physical address when
+`0x2243DC` reads it.
+
+```text
+S182: CONFIRMED mechanism #2 (not tooling miss, not frame-overlap-from-earlier-live-call).
+      Single-address pcbreak on 0x223130/0x223138: zero hits. All 4 static callers individually:
+      zero hits. First-ever entry (pinned to a <512-cycle window, cyc~42,000,000-512): sp=shallow
+      0x1FFFDA0 (the flagged family), ra=self-referential to current PC (not a real jal-return).
+      Exhaustive full-run watch of the corrupted slot: 0x223138's sd ra never appears among the
+      many other legitimate sd-ra writes from unrelated functions. 0x223200+ is reached via a
+      path with no static footprint at all — an indirect/computed jump (jalr) with a wrong
+      target is now the leading remaining candidate, since no direct jal/j edge exists per
+      Grok's exhaustive scan. Next: find what computes/holds the value used for such a jalr, if
+      one exists — or reconsider whether this thread's PC is being set directly by some
+      non-call mechanism (interrupt/exception return, thread-restore) landing mid-function.
+```
