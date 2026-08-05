@@ -8127,3 +8127,49 @@ EnterException does not set sp. Need COP0 + syscall num at sp transition.
 ```text
 S178: interrupt may divert; sp poison not from EnterException. COP0+syscall at 42.0M.
 ```
+
+## 178. MAJOR — the fast scheduling-timer interrupt itself stops at cyc=42,000,576, before the sp transition (Claude)
+
+Checked `--pcbreak=80000000:80000210` (the exception vector family) across the same window.
+**A frequent interrupt (period ~128-576 cycles — almost certainly the preemption/scheduling
+timer, not VBlank, given `PreemptOut`/`PreemptIn` events in the thread log at similar cadence)
+fires healthily and repeatedly up to cyc=42,000,576 — `sp=0x1FFFDA0` (healthy), `EPC` progressing
+normally each round (`0x223228`→`0x223238`, i.e. real forward progress in the interrupted
+mainline code). Then it stops. Zero vector hits anywhere for the rest of the 42,010,000-cycle
+run** — the exact same "interrupts stop forever" shape already established for VBlank at
+cyc=43,000,000 (S172/S175), just on a much faster interrupt source and ~8,064 cycles *before*
+tid=1's sp corruption event (S176's cyc=42,008,640).
+
+**This reframes S177's "async interrupt diverts execution" theory — likely backwards.** The
+timing says: interrupts (at least this fast one) stop *first* (42,000,576), and only ~8,064
+cycles *later*, running now with no periodic interrupts arriving at all, does tid=1's sp go bad
+(42,008,640). That's consistent with mainline code proceeding *uninterrupted* through a path that
+was perhaps never meant to run without a periodic timer tick refreshing some state — not with an
+interrupt handler itself computing/injecting a bad sp.
+
+**Candidate unifying picture across the whole S159-S178 arc**: there may be only ONE real bug —
+something makes interrupts stop being taken/dispatched, full stop, at some point past cyc~42M.
+Everything downstream is a symptom of running in a permanently-non-preemptive state after that:
+the fast scheduling timer stopping first (cyc 42,000,576) → tid=1 free-runs uninterrupted through
+whatever code eventually sets its sp to `0x02001EE0` (cyc 42,008,640, mechanism still open) →
+much later, VBlank (a slower-period interrupt) is simply the next thing due to fire and finds
+the system already wedged (cyc 43,000,000, S175) → `PutDispEnv` starves (S174) → class-A DISPFB
+mismatch (S173) → black screen. If this holds, the actual fix target is **whatever makes
+interrupts stop dispatching at all past ~cyc42M** — not the sp value, not DISPFB, not PutDispEnv,
+all of which would very plausibly self-resolve once real interrupt dispatch resumes.
+
+**Open question this reframing doesn't yet answer**: WHY do interrupts stop being dispatched at
+cyc=42,000,576 in the first place? This is now the single highest-value question — need to check
+COP0 Status/IE/EXL and INTC mask state right at/around that specific transition (not the later
+42,008,640 or 43,000,000 ones, which are now believed to be downstream symptoms).
+
+```text
+S178: MAJOR — the fast scheduling-timer interrupt (0x80000200 vector) itself stops firing
+      entirely at cyc=42,000,576, ~8,064 cycles BEFORE tid=1's sp goes bad (S176) and ~1M
+      cycles before VBlank also stops (S175). Same "interrupts stop forever" shape, earlier
+      and on a different/faster source. Reframes the whole S159-S178 arc as possibly ONE bug:
+      something disables interrupt dispatch entirely past ~cyc42M; sp corruption, VBlank death,
+      PutDispEnv starvation, and the class-A DISPFB mismatch could all be downstream symptoms of
+      running non-preemptively after that point, not independent bugs. Next: find WHY dispatch
+      stops at 42,000,576 specifically (COP0 Status/IE/EXL + INTC mask at that exact point).
+```
