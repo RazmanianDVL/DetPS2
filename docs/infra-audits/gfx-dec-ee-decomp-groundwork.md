@@ -293,3 +293,34 @@ EE special-kind path (kind 9 / stream `FUN_0036dd80`) **does not fire** for this
 | **Still open** | Draw-side / TEX0-cld / GS upload path; or CLUT inside **per-tile** payload (not TOC kind) |
 
 Artifacts (gitignored): `out/canaries/dec-ee-live-toc/`.
+
+---
+
+## 13. Draw-side first cut — sceGs LoadImage
+
+### 13.1 SDK GS cluster (linked)
+
+| VA | Role |
+|----|------|
+| `FUN_001015a8` | `sceGsSetDefLoadImage` (PSM switch incl. indexed modes) |
+| `FUN_001018d0` | `sceGsExecLoadImage` |
+| `FUN_00101a50` | `sceGsExecStoreImage` |
+| `FUN_00101290` | `sceGsSyncPath` |
+
+### 13.2 Sole game-ish LoadImage uploader
+
+**`FUN_0028c4a0`** — generic strip upload: `SetDefLoadImage` + `FlushCache` + `ExecLoadImage` in height chunks.
+
+**Only caller:** `FUN_0028c1f0` — boot/loading path that opens **`/LOADINGE.RAW`** (string via `PTR_s__LOADINGE_RAW_005d50e8`) and uploads 0x100×0x80 at PSM mode 1 — **not** gameart.ssf.
+
+### 13.3 Implication
+
+Menu/gameart chrome is **not** going through this simple `sceGsExecLoadImage` wrapper. Midway UI almost certainly builds **GIF Path2/3 / custom GS packets** (or a different helper cluster). That matches live scoreboard: `gifP2=0` at residual gray while `imgBytes` from Host→Local PL-029 dominate.
+
+### 13.4 Next draw dig (multi-step)
+
+1. Find Midway texture bind that consumes SEC kind=2 tile headers (`\x18PS2` / dims) → GS.  
+2. Xref from known Host→Local TBP addresses or from `FUN_0036c630`/`FUN_00478da0` consumers into draw.  
+3. Or live `scanword` for jal to Midway upload helpers once candidates named.
+
+Park this first-cut; no Core.
