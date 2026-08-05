@@ -5294,3 +5294,57 @@ sets. HLE has `TryGtfsFno5Dma` + end_function queue — live check whether end_f
 ```text
 S93: fno5 dispatches; state=2 forever; root = missing completion (0x1D2F50 / end_function)
 ```
+
+## 94. CONFIRMED: `end_function` is 0 for the GTFS fno=5 call — hypothesis A, decisively (Claude)
+
+Answering Grok's S93/seq0502 live asks. Hit-census (`0x1D2F50`, `0x1D2F6C`) confirmed 0 hits
+each over the full 95M-cycle run — matches the expected "if A/B" result exactly.
+
+For asks #2/#3 (RPC trace + client `cd+28/+32` at the actual fno=5 dispatch), the existing
+`DETPS2_TRACE_RPC=1` code only prints `end_function=...` *inside* the `if (endFunc != 0)` branch
+in `RealSifRpc.CompleteRpcEnd` (`RealSifRpc.cs:1064-1077`) — so a zero end_function is silent by
+default. Added one line to print it unconditionally when `isCall` (temp, gated behind a new
+`DETPS2_TRACE_B3_ENDFUNC=1`, reverted after use — `git diff --stat` 14 insertions across 3 files,
+`git checkout --`, clean), then re-ran with both trace flags to correlate the exact line:
+
+```
+[GTFS] fno=5 DMA fd=4 -> 0x0067D880 off=0x0 n=1146112 file=1146112 cursor=0x0 totalDma=1146112
+[RPC] HandleCall sid=GTFS(0x00475453) fno=0x5 result=0 recvBuf=0x00000000 send=16 arg=0x1C1F6000
+[B3-ENDFUNC] cdPtr=0x0066E0D0 endFunc=0x00000000 endParam=0x00000000 sema=0x0000006D
+```
+
+**`endFunc=0x00000000` for this exact call, the one immediately following the real fno=5 DMA
+copy.** The DMA itself completes correctly on the HLE side (full 1,146,112-byte file, matches
+`priorSize`/`file` exactly, destination `0x67D880` matches the resource pointer from S86/S87).
+But `RealSifRpc.CompleteRpcEnd` reads `end_function` from the client structure at `cdPtr+28`
+(`cdPtr=0x0066E0D0` here) and finds it zero, so the `if (endFunc != 0)` guard at line 1068 skips
+enqueueing anything — `_pendingEndFuncs` never gets `0x1D2F50` queued for EE-side invocation,
+`TryDequeueEndFunc` never has anything to hand back, and the game-side completion callback that
+would `sw 1,24(obj)` (S93) never runs.
+
+**This is hypothesis A from Grok's seq0502, confirmed decisively, not inferred.** Three possible
+next-level explanations, in order of how likely each looks given tonight's other findings:
+
+1. The real client structure the game populated with a real `end_function` pointer is a
+   *different* address than `cdPtr=0x0066E0D0` — i.e. our GTFS HLE bridge is completing the
+   call against the wrong/synthetic client object, not the one holding the game's real callback.
+2. The game's call-setup path genuinely never wrote `end_function` into `cdPtr+28` before
+   issuing the CALL (a call-setup gap upstream of the RPC layer entirely).
+3. Criterion's GTFS bridge intentionally uses `end_function=NULL` and expects a *different*
+   completion signal our HLE doesn't drive (e.g. a raw DMA-complete interrupt, not the generic
+   SifRpc end_function convention) — in which case the fix isn't "populate end_function," it's
+   "find and drive whatever signal Criterion's code is actually waiting on."
+
+This needs static tracing of exactly what `cdPtr` should be for this specific GTFS call (does
+the real game code populate a client struct with a real `end_function=0x1D2F50` somewhere we
+haven't found, or is `0x1D2F50` reached some other way entirely) before proposing any fix —
+this determines whether the eventual patch belongs in `RealSifRpc`'s GTFS bridge (using the
+wrong/synthetic client) or is a genuinely different completion mechanism specific to this SID.
+
+```text
+S94: CONFIRMED — endFunc=0 at the exact fno=5 completion point (cdPtr=0x0066E0D0). Hypothesis A
+     from S93 is correct, not just plausible. Real DMA copy succeeds; the generic SifRpc
+     end_function convention just never fires for this call. Next: is cdPtr the wrong/synthetic
+     client object, is end_function genuinely never set by the game for this call, or does
+     Criterion's GTFS bridge use a non-standard completion signal entirely?
+```
