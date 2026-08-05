@@ -5880,3 +5880,45 @@ S110: entire 0x1334A8..50C range is one 86M NOP-sled FP. S111: 0x28B380 fails vi
 ```text
 S111: next live = which 0x28B380 exit (385090 vs alloc)
 ```
+
+## 112. Answered: FAIL B (work-buffer alloc `0x3840C0`) is the consistent culprit — all 26 real polls take this exact exit, every time (Claude)
+
+`--pcbreak=0028B3B0:0028B564` (the whole exit-candidate span in one pass) + a field dump of
+`+29184`/`+29192` at cyc=50M (before the ~86M anomaly region flagged in S110). Temp dump
+reverted after use (`git diff --stat` 8 insertions, `git checkout --`, clean).
+
+```
+Field dump at cyc=50,000,000 (real, pre-anomaly):
+  +29184 (0x1E7C840) = 0x00000000
+  +29192 (0x1E7C848) = 0x00000001
+
+Opcode-verified hit distribution, cyc < 86,000,000 (421 real PCBREAK lines total):
+  0x28B3B0 through 0x28B3F4 (16 consecutive addresses): 26 hits EACH — every single one of
+    the 26 real polls walks this exact same path, consistently, no exceptions.
+  0x28B544 (success) and 0x28B564 (Fail A, per 0x385090==0): ZERO hits, not once.
+  0x28B548-0x28B55C: 1 hit each — this is a separate, later group; needs its own cyc check
+    before trusting it (right at the edge of S110's flagged anomaly window).
+```
+
+**All 26 real, opcode-verified polls take the identical route through `0x28B3B0`-`0x28B3F4` and
+never go further** — neither the success path (`0x28B544`) nor Fail A (`0x28B564`, the
+`0x385090`-based exit Grok flagged as "leading candidate") is ever reached, not once, across all
+26 attempts. Combined with the field dump (`+29184=0` at 50M, matching Grok's "work buffer is 0,
+try alloc" branch), this points at **Fail B — the `0x3840C0` allocator — as the actual,
+consistent, 100%-reproducible culprit**, not Fail A. The allocation is attempted every single
+poll and fails every single time, so `0x28B380` always returns 0 before the code ever reaches
+the `0x385090` resource-prep call or the success return.
+
+This sharpens the next static target precisely: **why does `0x3840C0` (the work-buffer
+allocator) never succeed, ever, across 26 real attempts** — is it a fixed-size heap/pool that's
+already exhausted by this point in boot (26 real allocation attempts, all identical parameters
+presumably, all failing the same way suggests a persistent resource-exhaustion or
+never-initialized-pool condition, not a transient race), or is the allocator itself gated on
+something else that's never satisfied?
+
+```text
+S112: FAIL B (0x3840C0 alloc failure, at 0x28B3F4) confirmed as the consistent exit for all 26
+      real polls — not Fail A (0x385090). Neither success (0x28B544) nor Fail A (0x28B564) ever
+      reached. Next: static read of 0x3840C0 — why does this allocator never succeed across 26
+      real attempts (exhausted pool? never-initialized heap? gated on something else)?
+```
