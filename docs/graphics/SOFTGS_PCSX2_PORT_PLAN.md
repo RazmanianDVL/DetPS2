@@ -1,6 +1,6 @@
 # Soft-GS ← PCSX2 GSdx software renderer port plan
 
-**Status:** DRAFT (first pass) — dual-ACK required before any GSdx import into the DetPS2 tree  
+**Status:** DRAFT (second pass) — dual-ACK on D1-D10, D12; D11 (savestate/rollback contract, §5.1) awaiting Grok's refinement before SG-1 scaffold starts  
 **Date:** 2026-08-06  
 **Owners:** Grok (draft) · Claude (review)  
 **Reference tree (local):** `C:\Users\xxraz\Documents\c++-projects\Pulls\pcsx2-online\plugins\GSdx\Renderers\SW\`  
@@ -135,7 +135,7 @@ Optional live SSE-vs-AVX spike is **skipped** (Claude dual-ACK): the codegen fil
 
 Minimum façade the native lib must satisfy (names illustrative):
 
-- Reset / savestate blob (or C#-driven serialize of local mem + regs + FB)
+- **Rollback snapshot** — see §5.1 (not a slow generic serialize path)
 - Write GS register / GIF path delivery (packed, reglist, image)
 - Present: BGRA framebuffer span (or copy-out) for Soft-GS truth
 - Counters: prims, px, reject bins (depth/alpha/scissor), imgBytes — enough for existing claim lines
@@ -165,6 +165,24 @@ DetMode is **on** for netplay, claim budgets, and CI goldens. Performance profil
 | Output | Native res only (`m_nativeres`-class) |
 
 Any change to DetMode knobs requires dual-ACK + golden update.
+
+---
+
+## 5.1 Savestate / rollback-snapshot contract (Claude addition, needs Grok refinement)
+
+**Why this needs its own section, not just open question #2**: the project's actual end goal is *rollback* netplay, not just lockstep sync — which means GS state must be cheaply and *frequently* snapshotted and restored (potentially every frame or every few frames during a rollback resimulation), not occasionally serialized to a save file. A generic "opaque blob, serialize on demand" framing is fine for savestates-to-disk but risks quietly becoming the actual performance bottleneck for rollback viability even with a fully correct, deterministic DetMode renderer underneath it. This needs a real, load-bearing design decision now, not a casual resolution.
+
+**Proposed contract:**
+
+| Requirement | Rationale |
+|---|---|
+| Native owns a tightly-packed, contiguous memory layout for local mem + GS register file (not scattered heap objects) | Enables cheap `memcpy`-style snapshot/restore, not per-field serialization |
+| Snapshot/restore is a raw copy, not a generic serializer, on the hot rollback path | Serialization overhead (reflection, per-field walks) is not acceptable at per-frame rollback cadence |
+| Native exposes a stable, versioned binary layout (explicit format version tag in the blob header) | A savestate produced by one native-lib build must have a documented compatibility/migration story against a newer build, not silently corrupt |
+| C# owns *when* to snapshot/restore (rollback scheduling, ring buffer of recent states); native owns *what* the state actually is | Keeps rollback scheduling logic testable/inspectable in C#, keeps the native surface narrow (matches §4.1's responsibility split) |
+| Snapshot/restore cost is measured and tracked as a real metric from SG-2 onward (not deferred to "later, once it's slow") | Rollback feasibility depends on this number; catching a bad design early is far cheaper than after SG-7 |
+
+**SG-8 note:** fixed-N deterministic workers (currently optional/deferred) should be scheduled as a real planned phase once correctness lands, not indefinitely optional — rollback resimulation needs headroom to replay multiple frames quickly, so raw single-thread scalar performance is a real, load-bearing constraint for the mission, not just a nice-to-have speedup.
 
 ---
 
@@ -259,7 +277,11 @@ These remain product defaults independent of the port:
 | D5 | Skip optional SSE-vs-AVX live spike | Claude S898 |
 | D6 | Design note path: `docs/graphics/SOFTGS_PCSX2_PORT_PLAN.md` | Claude S898 |
 | D7 | Cross-machine golden required for netplay Soft-GS claim | Claude S898 |
-| D8 | No GSdx import until design dual-ACK | **This draft waits Claude review** |
+| D8 | No GSdx import until design dual-ACK | Superseded by D9-D12 |
+| D9 | `LibraryImport` source-gen P/Invoke over C++/CLI (portability — C++/CLI is Windows/.NET-only; multi-OS netplay clients rule it out) | Claude S900 |
+| D10 | FTZ: match Core FLOAT_POLICY default (`false`), no separate GS-only denormal regime | Claude S900 |
+| D11 | Savestate/rollback-snapshot contract (§5.1): native-owned packed/versioned layout, raw-copy hot path, C# owns scheduling | Claude S900 — **needs Grok refinement, not yet final** |
+| D12 | SG-8 (fixed-N det workers) elevated from purely optional to a real planned phase post-correctness, given rollback resimulation performance needs | Claude S900 |
 
 ---
 
@@ -271,12 +293,14 @@ These remain product defaults independent of the port:
 
 ---
 
-## 13. Open questions (resolve in review, not in silent code)
+## 13. Open questions — resolved in review (Claude, S900)
 
-1. P/Invoke vs C++/CLI vs `LibraryImport` source-gen for the boundary?
-2. Savestate: native blob opaque to C# vs C# owns local mem copy?
-3. FTZ: force match Core default false, or dual-ACK FTZ for GS+VU together?
-4. Which multi-title smoke set for SG-7 (propose: Vexx, GoW, Deception, B3 nopad claim — **no new Assist**)?
+1. ~~P/Invoke vs C++/CLI vs `LibraryImport`~~ → **`LibraryImport` source-gen** (D9).
+2. ~~Savestate: opaque blob vs C#-owned copy~~ → **§5.1 contract** (D11) — needs Grok pass before this is truly closed.
+3. ~~FTZ~~ → **match Core FLOAT_POLICY default `false`** (D10).
+4. Multi-title smoke set for SG-7 → **agreed as proposed**: Vexx, GoW, Deception, B3 nopad claim, no new Assist.
+
+**Status: dual-ACK on D1-D10, D12. D11 (savestate/rollback contract) is a first-pass proposal from Claude, not yet dual-ACK'd — needs Grok's read given closer familiarity with Core's existing savestate/rollback scaffolding before SG-1 locks the ABI shape.** Once D11 is settled, this doc is fully dual-ACK'd and SG-1 scaffold can start.
 
 ---
 
