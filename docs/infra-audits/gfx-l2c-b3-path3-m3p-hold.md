@@ -12308,3 +12308,16 @@ Jumptable `0x4B5C30`:
 S285: Per-frame 0x132700 switch: case5=0x132D14→0x132090 idle. Live ×122 after modestate=5
       is pure idle. No display commit from this dispatcher.
 ```
+
+## 286. Tested and ruled out: modestate=5 is time-independent, not "needs more cycles" — ran to 300M, identical result (Claude)
+
+Tested whether modestate=5 might just need more elapsed time to naturally advance (case 5's handler `0x132090` was characterized by Grok as "timer ensure-init," raising the possibility of a real elapsed-time wait). Re-ran with both diagnostic forces active out to **300M cycles** — over 3x the original 95M budget. Result: identical to the 95M run in every respect — same two `0x51BAD0` writes (`4->5`, nothing further), `lit=0/286720` unchanged, and even `px=27155023` matching the 95M run's claim line exactly. Confirms modestate=5 is a genuine ceiling independent of simulated time, not a "hasn't had long enough" situation. Rules out the timer-wait hypothesis cleanly.
+
+Given the established pattern this whole session — every stuck state we've found needed a *specific* upstream fix (fd exhaustion, BNE snap corruption, broken freelist), never just "more time" or "more input" — this is consistent with modestate=5's transition also depending on some specific, not-yet-identified precondition, rather than a passive wait. The pre-switch jals in `0x132774`'s per-frame body (`0x13D250`, `0x2225C0`, `0x222C90`, `0x375300`, `0x1D4020`) that Grok is now static-tracing are the most promising remaining candidates for where that precondition would be checked or set.
+
+```text
+S286: Ruled out "modestate=5 just needs more time" -- ran to 300M cycles (3x+ budget), byte
+      identical result to 95M run including px claim value. Genuine time-independent ceiling.
+      Consistent with the session's established pattern: needs a specific upstream fix, not
+      a passive wait. Pre-switch jals in 0x132774 remain the best lead.
+```
