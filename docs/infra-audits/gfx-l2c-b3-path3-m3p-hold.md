@@ -13815,3 +13815,19 @@ S351: SaveFullContext/RestoreFullContext both complete (all 32 GPRs) when engage
       which path actually fired at cyc~26596048 -- full save (v0 preserved) or partial
       (v0 legitimately lost, by design, for what should've been a full-save event)?
 ```
+
+## 352. Grok: near-final smoking gun — force-preempt mid pool-arm, v0 stomped on resume (thread-trace) (Grok, logged by Claude for numbering)
+
+`--trace-threads` around the death window (`b3-s351-trace-threads`): tid=1 (main) force-preempted at `0x29F3C0` mid pool-arm-init (right after `v0=0x1F361F0` set), switches to tid=6 (a syscall-stub thread), tid=6 yields via syscall, `SwitchToFull tid=1` resumes main at the exact same PC — but `v0=0` while `a0` (same value) survives. Confirms S351's "preempt/resume seam, not `sw` magic" directly.
+
+Candidate P2 (most likely per the code shape): `ApplyWaitReturnIfAny` (`KernelHle.cs` ~1161) does `SetGpr(2, WaitReturnCode)` *after* the full restore — this is correct and intentional for a thread resuming from a genuine `WaitSema` completion (v0 conventionally carries the wait's return code). If tid=1 has a stale/leftover `HasWaitReturn` flag from some unrelated earlier wait, this same mechanism would incorrectly stomp v0 on a force-preempt resume too — even though this thread was never actually waiting on anything, just paused mid-instruction-stream and due to resume with its exact, complete saved state.
+
+Proposed fix shape if confirmed: scope `ApplyWaitReturnIfAny` to only fire on a genuine `WaitSema`-syscall resume PC, not a force-preempt mid-body resume — precise, well-understood, restores correct behavior rather than papering over a symptom.
+
+```text
+S352: Live thread-trace confirms preempt/resume seam (not the sw instruction). Leading
+      candidate: ApplyWaitReturnIfAny stomping v0 on a force-preempt resume via a stale
+      HasWaitReturn flag meant for genuine WaitSema completions. Fix shape: scope it to real
+      WaitSema-syscall PCs only. Confirming live (SavedGprFull[2]/HasWaitReturn at both ends)
+      before touching code.
+```
