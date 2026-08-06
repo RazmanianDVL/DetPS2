@@ -12321,3 +12321,26 @@ S286: Ruled out "modestate=5 just needs more time" -- ran to 300M cycles (3x+ bu
       Consistent with the session's established pattern: needs a specific upstream fix, not
       a passive wait. Pre-switch jals in 0x132774 remain the best lead.
 ```
+
+## 286. Case 5 body: 132090 + 3767B0; no modestate advance past 5 (Grok)
+
+Claude S286: 300M same as 95M — 5 is hard ceiling.
+
+### Case 5 (`0x132D14`) after timer loop
+1. `jal 0x132090` (idle ensure-init)
+2. Gate on `+0x2DA54 == -1` and flags `0x51BAD4`/`0x4EB1E0`
+3. `jal 0x3767B0(s0+0x2DA10, a2=0)`
+4. Fall to counter path — **no `sw` of modestate 6+**
+
+### All `sw` to modestate `+0x2DA90` in ELF
+Writers can plant 4,5,9,11,12,… but live only reaches **4→5**. Cases 9/11/12 plant sites never run under forces.
+
+### Pre-switch jals (brief)
+`0x1D4020`: gated float/pad-ish work on mode object flags `+0x2DA80/81` — not display-env.
+
+**Read:** Per-frame SM is alive; case 5 is a stable success idle with side ticks, not a wait for display. Leaving 5 requires a different case path (6–12) that never arms. Display page split remains class-A.
+
+```text
+S286: Case5 body has no plant past 5. Higher modestate writers exist but never run.
+      Pre-switch 1D4020 not display. Ceiling is structural, not timer.
+```
