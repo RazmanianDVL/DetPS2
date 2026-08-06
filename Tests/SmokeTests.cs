@@ -183,14 +183,14 @@ public static class SmokeTests
 
     /// <summary>
     /// Legacy Soft-GS dual: clear MaxValue + LEQUAL-as-GEQUAL (smaller wins).
-    /// Far (0.9) after near (0.1) is rejected. Default path when DETPS2_SOFTGS_ZTST_HW unset.
+    /// Far (0.9) after near (0.1) is rejected. Opt-out path DETPS2_SOFTGS_ZTST_HW=0.
     /// </summary>
     public static void Gs_DepthTest_RejectsFar()
     {
         string? prev = Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW");
         try
         {
-            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", null);
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", "0");
             var sys = new Ps2System();
             sys.Gs.Clear(0xFF000000, float.MaxValue);
             // Enable ZTE + ZTST=GREATER (3) + write: bits 16=1, 17-18=3. TEST_1 addr 0x47.
@@ -214,7 +214,7 @@ public static class SmokeTests
     }
 
     /// <summary>
-    /// S310 DETPS2_SOFTGS_ZTST_HW: real GS GEQUAL (z≥buf) + clear-to-0.
+    /// S310 / S390 default Soft-GS HW ZTST: real GS GEQUAL (z≥buf) + clear-to-0.
     /// Larger Z wins; smaller fragment after a far write is rejected (PCSX2 TestZ).
     /// </summary>
     public static void Gs_DepthTest_HwGequal_RejectsSmaller()
@@ -222,7 +222,7 @@ public static class SmokeTests
         string? prev = Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW");
         try
         {
-            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", "1");
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", null); // default ON
             var sys = new Ps2System();
             sys.Gs.Clear(0xFF000000); // SoftGsClearDepth → 0
             // ZTE + ZTST=GEQUAL (2)

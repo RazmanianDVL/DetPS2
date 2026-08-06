@@ -23,11 +23,12 @@ public sealed class Gs : ISchedulable
     /// <summary>
     /// S306/S310 dual-ACK: when <c>DETPS2_SOFTGS_ZTST_HW=1</c>, Soft-GS uses real GS
     /// ZTST direction (GEQUAL = z≥buf, GREATER = z&gt;buf) and clears depth to 0
-    /// (PCSX2 GSdx TestZ / GS Users Manual). Default remains the legacy dual
-    /// (LEQUAL-as-GEQUAL + clear MaxValue) until fleet soak promotes it.
+    /// (PCSX2 GSdx TestZ / GS Users Manual). S390 fleet soak clean (8 titles + 100M
+    /// GoW/Deception A/B byte-identical); default ON. Opt-out: DETPS2_SOFTGS_ZTST_HW=0
+    /// restores legacy dual (LEQUAL-as-GEQUAL + clear MaxValue).
     /// </summary>
     public static bool SoftGsHwZtst =>
-        string.Equals(Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW"), "1", StringComparison.Ordinal);
+        !string.Equals(Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW"), "0", StringComparison.Ordinal);
 
     /// <summary>Depth fill for Clear/Reset: 0 under HW ZTST, float.MaxValue legacy.</summary>
     public static float SoftGsClearDepth => SoftGsHwZtst ? 0f : float.MaxValue;

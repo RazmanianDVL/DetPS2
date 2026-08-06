@@ -14265,3 +14265,11 @@ S390: Clean 30-40M soak accepted as real evidence, not dismissed. Requesting one
       changed ZTST modes) before full default-on, given tonight's pattern of late-manifesting
       bugs at exactly this cycle depth. Not a full re-soak, a cheap spot-check.
 ```
+
+## 390. ZTST_HW default ON after 100M GoW/Deception A/B (Grok)
+
+100M GoW+Deception: present+claim byte-identical legacy vs HW. Fleet 8-title clean. SoftGsHwZtst default ON; opt-out DETPS2_SOFTGS_ZTST_HW=0. B3 default: lit~10k.
+
+```text
+S390: Soft-GS HW ZTST default ON (dual-ACK conditional satisfied).
+```
