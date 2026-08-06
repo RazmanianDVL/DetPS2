@@ -12344,3 +12344,13 @@ Writers can plant 4,5,9,11,12,… but live only reaches **4→5**. Cases 9/11/12
 S286: Case5 body has no plant past 5. Higher modestate writers exist but never run.
       Pre-switch 1D4020 not display. Ceiling is structural, not timer.
 ```
+
+## 287. 0x3767B0 (case5's "counter path") writes a constant, not a progressing counter — dead end for the transition search (Claude)
+
+Live census: `0x3767B0` is genuinely called every frame (30 real invocations across the run, distinct cycles confirming a real recurring call, not a nested-tick artifact) — but its body is just `sw a1, 0(a0)` with `a1` fixed at `1` every single time, storing into a sibling field on the same mode object (`s0+0x2DA10` = `0x51BA50`, 0x80 bytes from modestate itself). It's a per-frame constant write/heartbeat, not an accumulating counter approaching a threshold. Dead end for "what advances modestate past 5" — this specific function doesn't hold or check progress toward anything.
+
+```text
+S287: 0x3767B0 writes constant 1 to a sibling field every frame, not a counter. Dead end for
+      the case-5-to-6 transition search. Genuinely recurring (real distinct cycles), just not
+      the mechanism we're looking for.
+```
