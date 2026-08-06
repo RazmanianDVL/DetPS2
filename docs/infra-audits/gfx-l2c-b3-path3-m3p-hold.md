@@ -12281,3 +12281,30 @@ S285: 0x132774 (case-4 success path's caller) has 122 hits vs. the 1-6 typical o
       one-shot. Cycle stamps unreliable (nested-tick artifact, S264) but the count itself is
       the signal. Worth static tracing what this dispatcher does each iteration.
 ```
+
+## 285. Per-frame dispatcher `0x132700`: case 5 → idle `0x132090` (Grok + Claude)
+
+Claude: `0x132774` region hits ×122 (recurring). Static shape:
+
+### Per-iteration work (before switch)
+- Sync `*(s0+0x2DA90)` ← `*(s0+0x2DA8C)` if mismatch
+- Ticks: `0x13D250`, `0x2225C0`, `0x222C90`, `0x375300`, `0x1D4020`
+- Float integrate on `*(gp-24724)+24`
+
+### Switch on modestate (`0x51BAD0`)
+Jumptable `0x4B5C30`:
+
+| case | target | role |
+|------|--------|------|
+| 0,2,3 | `0x132FB0` | (shared) |
+| 1 | `0x1327BC` | |
+| **4** | **`0x132C80`** | readiness → plant modestate **5** |
+| **5** | **`0x132D14`** | **`jal 0x132090`** — timer idle loop (S266) |
+| 6–12 | various | |
+
+**When modestate stays 5, every per-frame dispatch is case 5 → `0x132090` only.** That loop never touches display switch / case 2 / DISPFB. Alive dispatcher, **dead display branch**.
+
+```text
+S285: Per-frame 0x132700 switch: case5=0x132D14→0x132090 idle. Live ×122 after modestate=5
+      is pure idle. No display commit from this dispatcher.
+```
