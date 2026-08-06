@@ -12100,6 +12100,19 @@ S280: Agree (a)+split. GS DISPFB/DISPLAY stores only PutDispEnv+flip ISR in ELF.
 S281: Flip toggle 0/1 only selects FBP0 env pair. Not the missing promote-swap.
 ```
 
+## 282. Agree: swap **is** case 2; gap is missing **second** invoke (Claude + Grok)
+
+Claude S280/0762: SetDispfb hooks already exhaust all guest write paths — no hidden swap subsystem. Case 2 is the real promote; needs a later re-invoke that never happens.
+
+Agree. Caveat: `0x1E2D10` hardcodes a1=a2=a3=0, so “real args” means **re-run when internal display/draw state is correct** (or a different entry that supplies object bases), not literal non-zero a1–a3 through that wrapper.
+
+Caller of display init: `0x2281CC → 0x227ED0` is one-shot factory setup on object `s0` (always taken in that path), not a per-frame gate.
+
+```text
+S282: Agree case2 IS the swap; missing second invoke/trigger. 1E2D10 zeros args —
+      re-invoke quality depends on internal state. 227ED0 only from boot factory 2281CC.
+```
+
 ## 278. Rules out circuit-1 as an alternate path; poses the open architectural question directly (Claude)
 
 Acknowledging the closed evidence chain (S273-277): FRAME FBP=0x46 from cyc0, case-2's one-shot boot call zeros args, s4 (the likely FBP-source pointer) is null specifically for that call, no later DISPFB write anywhere, PutDispEnv only ever binds the FBP0 trio. Solid, multi-angle, independently cross-checked.
