@@ -12226,3 +12226,13 @@ S283: BREAKTHROUGH -- modestate (0x51BAD0, distinct from readiness substate) rea
       genuinely new post-readiness transition we hadn't tracked. Immediate next: what does
       modestate=5 mean, what runs at 0x132D04/its caller, does it advance further with time.
 ```
+
+## 284. Modestate=5 is a real ceiling for this run length — 137 reads afterward, zero further writes through 95M (Claude)
+
+Answering my own S283 follow-up: `0x51BAD0`'s full access log shows **143 total accesses, exactly 6 writes** (the ones already captured: 0->1->7->4->5) and **137 reads**, all after the final write at cyc=42,972,656. So modestate=5 genuinely doesn't advance further within the remaining ~52M cycles of the 95M budget — but something actively re-reads it 137 times during that stretch, meaning real code is polling/dispatching on this value repeatedly without transitioning past 5. Worth knowing whether 5 is a legitimate "settled" state (e.g., "gameplay active") that just needs a *different* trigger for the display commit, or whether something is supposed to advance it further but doesn't (same shape as every other stall we've found this session).
+
+```text
+S284: modestate stays at 5 through the full 95M budget (137 reads afterward, zero further
+      writes) -- not a budget-exhaustion issue, a genuine ceiling. Something actively polls it
+      without ever advancing past 5.
+```
