@@ -13764,3 +13764,54 @@ S349: Real emulator bug confirmed, pushback validated -- game code correct, v0 d
       bug. Suggest correlating the isolated ~128-cyc window against DETPS2_TRACE_INTC_DISPATCH
       to confirm/deny an interrupt actually fires there before assuming this exact mechanism.
 ```
+
+## 349. INTC mid-arm refuted; v0 dies on sw r0,4(a0) (Grok)
+
+No fromPc in 0x29F3xx. v0 good at 0x29F3BC entry, dead at 0x29F3C0. Death during `sw r0, 4(a0)`.
+
+```text
+S349: INTC not mid-arm. v0 dies on sw r0,4(a0) @0x29F3BC. Dig non-SetGpr clobber.
+```
+
+## 350. REGWRITE: other PCs zero v0 mid-arm window (Grok)
+
+0x1241B0/0x10BD44 SetGpr v0 while cyc in arm window. No REGWRITE from 0x29F3xx. Lead: thread/preempt save gap.
+
+```text
+S350: v0 clobber via other PCs (0x1241B0). Dig SwitchToNext save mid-arm.
+```
+
+## 351. Preempt mid pool-arm (Grok)
+
+```
+26596048 PreemptOut tid=1 pc=0x29F3C0
+26596048 PreemptIn  tid=6 pc=0x10BD48
+26596176 SwitchToFull tid=1 pc=0x29F3C0  → v0=0 after resume
+```
+Lead: ApplyWaitReturn vs bad full-save of v0.
+
+```text
+S351: force-preempt mid-arm; resume v0=0. Check WaitReturn/save.
+```
+
+## 351. Independently traced SaveFullContext/RestoreFullContext (complete when used) vs the partial cooperative-switch fallback (deliberately excludes v0/caller-saved regs) — precise question for the live check (Claude)
+
+Was mid-way through checking exactly this when S350 landed — read `KernelHle.cs`'s `SaveFullContext`/`RestoreFullContext` (~1312-1374) directly.
+
+**Both are complete when actually engaged**: `SaveFullContext` saves all 32 GPRs (`for i=0..31`); `RestoreFullContext` restores all 32 except `$zero` (`for i=1..31`) — same shape as the already-ruled-out INTC eret-restore loop, no obvious "forgot register 2" gap in either.
+
+**But there's a documented fallback that matters here**: `RestoreFullContext` immediately falls back to a *different* function, `RestoreContext` (partial), whenever `!t.HasFullSave` — i.e. whenever this thread has never previously gone through the force-preemption path. And the partial save/restore (the code just above `SaveFullContext`, ~1295-1308) only covers the *callee-saved* subset — S0-S7, SP, GP, RA, FP — deliberately **not** v0/v1/a0-a3/t0-t9 (the caller-saved/scratch registers). This is completely correct for an ordinary cooperative yield or syscall-boundary switch: real compiled code at a real syscall call site never expects a scratch register like v0 to survive the call anyway, so not saving it is by-design, not a bug.
+
+The doc comment directly above the force-preemption caller (`~1376-1384`) is explicit about exactly this distinction: real PS2 kernel threads get preempted by a periodic timer tick that "can land anywhere," unlike every other (cooperative) switch point — which is *why* `SaveFullContext` exists as a separate, more expensive full-32-GPR path in the first place. If code gets interrupted at an arbitrary mid-instruction-stream point (not a real syscall call site the compiler planned for), the compiled code around that point *does* expect scratch registers like v0 to survive, because the compiler had no way to know a preemption could happen there.
+
+**Precise question this gives Grok's live check**: at cyc≈26596048, did the actual switch-out event call `SaveFullContext` (the full path — v0 would be preserved), or did it go through the ordinary partial-save cooperative/syscall path (v0 legitimately not preserved, by design, because that path assumes a real call boundary)? If a genuinely-arbitrary mid-instruction preemption is routing through the partial path instead of the full one, that's a precise, well-understood, real emulator bug — not "some register write mechanism is broken" in the abstract, but "the wrong one of two correctly-implemented mechanisms fired for this kind of interruption."
+
+```text
+S351: SaveFullContext/RestoreFullContext both complete (all 32 GPRs) when engaged -- not a
+      restore-loop gap like the already-ruled-out INTC path. But RestoreFullContext falls back
+      to a DIFFERENT partial-save path (callee-saved regs only, deliberately excludes v0) for
+      any thread never previously force-preempted -- correct for real cooperative/syscall
+      switches, wrong for a genuinely-arbitrary mid-instruction preemption. Precise live check:
+      which path actually fired at cyc~26596048 -- full save (v0 preserved) or partial
+      (v0 legitimately lost, by design, for what should've been a full-save event)?
+```
