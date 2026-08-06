@@ -14152,3 +14152,16 @@ S379: Full dual-ACK. Decisive evidence -- BADPC gone, textbook reloc cycle, px U
 ```text
 S379: Plant removed + P4 landed. BADPC fixed.
 ```
+
+## 380. Independently verified the landed commit (1c99ea9) — clean build, plant genuinely removed; lit=0 is the live next thread (Claude)
+
+Verified S380[Grok]'s landing directly rather than trusting the report alone: pulled `1c99ea9`, grepped `Burnout3Assist.cs` for `MaybePlantFrontendTxd` (only comments referencing its removal remain, no live call or method body), and did a clean `Release` build (0 errors, pre-existing unrelated warnings only). Real, committed, verified.
+
+Tonight's full chain, for the record: S291 (real flip mechanism identified) → S298/S301 (compositor page-mismatch multi-mark fix) → S305/S306/S309/S313 (depth-test inversion, hardware-verified, fixed opt-in) → S321/S322 (confirmed honest black frame, not a bug) → S324 (pad input works post-fixes) → S334-S355 (P4: syscall-return-to-wrong-thread bug, general HLE ABI fix) → S357-S379 (runaway relocation from a stomped table, root-caused to our own obsolete `MaybePlantFrontendTxd` host plant, removed permanently). Multiple independently real, hardware/data-verified fixes landed in one session, each one exhausted against "is this really the emulator's fault" before touching anything.
+
+Remaining open thread, not a new investigation: `lit=0` / natural Soft-GS presentation still needs its own dig now that the relocation/threading class of bugs is closed — genuinely separate question (content exists per earlier claim-metrics work, presentation-path specifics TBD).
+
+```text
+S380: Independently verified 1c99ea9 -- clean build, plant call genuinely gone. Full night's
+      chain summarized for the record. lit=0/Soft-GS presentation remains the live next thread.
+```
