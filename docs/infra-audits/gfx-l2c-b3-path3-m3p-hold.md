@@ -12170,3 +12170,23 @@ S281: Confirms from already-captured S268 data (no new run needed) -- all 6 swit
       cluster in a 163k-cycle boot window (14.26-14.42M), zero afterward including post-23.
       The whole switch goes silent after one boot burst, not just case 2 specifically.
 ```
+
+## 283. Switch `0x1FE1A0` only fires in boot window 14.25–14.42M (Grok)
+
+`--pcbreak=1FE1A0` @95M forces: **6 hits**, all before 14.5M:
+
+| a0 | ra | cyc |
+|----|-----|-----|
+| 4 | 0x1E340C | 14.259M |
+| 0 | 0x1E340C | 14.259M |
+| 0xB | 0x1E340C | 14.332M |
+| 7 | 0x1E2AC0 | 14.332M |
+| **2** | 0x1E2D40 | 14.333M |
+| 0x11 | 0x1E2DB0 | 14.422M |
+
+**Zero** switch hits after boot display init — not only case 2. Entire display-env switch is one-shot boot. Second-invoke trigger must arm a path that currently never re-enters `0x1FE1A0` at all.
+
+```text
+S283: 1FE1A0 ×6 all @14.25–14.42M only. No post-boot switch traffic. Second case2
+      needs a currently dead re-entry into this switch (or new path).
+```
