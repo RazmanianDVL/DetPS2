@@ -12870,3 +12870,77 @@ S297: FRAME_1 confirmed non-alternating (fixed 0xA0046) across the whole pre-pla
       claim) likely reflects most draws targeting non-display pages -- open whether that's
       expected (off-screen/loading passes) or a real compositing/timing bug.
 ```
+
+## 295d. Plant + PSM align; local page has content; natural present still 0 (Grok)
+
+After S295c (FBP-only plant, lit stuck). Diagnosed DISPFB PSM=0x0A (CT16S decode) vs FRAME PSM=0 (CT32 write) — Soft-GS `IsPageMismatched` zeros natural composite.
+
+### S295d plant (FBP + PSM from FRAME)
+
+```
+FORCE_DISP_FBP46: 0x51400 → 0x1446  (FBP=0x46, FBW=10, PSM=0)
+localNz32=1024/2048 at FBP page (linear dword sample of first 8KB)
+DISPFB2_hw end=0x1446  circuit PSM=0 FBP=0x8C000
+naturalDispfbPx=0  residual=1092  compositeSource=SyntheticFbp0
+lit=2178 (unchanged)
+```
+
+### Read
+
+1. **Page 70 is not empty** at plant time (~50% nonzero linear dwords in first page).
+2. **PSM align alone does not unlock natural present** — still SyntheticFbp0 / lit stuck.
+3. Claude S297: FRAME_1 fixed 0xA0046 (not alternating) — plant not stale from double-buffer.
+4. Open: swizzle vs linear content, `IsPageMismatched` stride, clear-after-draw, or present sampling wrong half of multi-page buffer (FBP units × 8192 may need multi-page span for 640×448 CT32 = ~1.1MB ≈ 140 pages).
+
+**Note:** 640×448×4 = 1,146,880 bytes ≈ **140 pages**. Sampling only page `fbp` base is incomplete; draws span many pages from base. Natural present should still walk the full rect via swizzle.
+
+```text
+S295d: FBP+PSM plant → DISPFB 0x1446; localNz high; natural present still 0 lit=2178.
+       Content on page; Soft-GS natural path still failing.
+```
+
+
+## 295e. Page-mismatch gate was the lit wall — allow-mismatch + FBP plant unlocks natural (Grok)
+
+Hypothesis: Soft-GS `IsPageMismatched` rejects FBP70 pages last-written under a different PSM/stride than DISPFB declares (IMAGE vs prim marks).
+
+### Measure: `DETPS2_SOFTGS_ALLOW_PAGE_MISMATCH=1` + `DETPS2_B3_FORCE_DISP_FBP46=1`
+
+| metric | plant only (S295d) | + allow mismatch (S295e) |
+|--------|--------------------|---------------------------|
+| naturalDispfbPx | **0** | **1,318,912** |
+| dispfbPx | 1,092 | **1,540,671** |
+| lit | 2,178 | **100,098** / 286,720 (~35%) |
+| DISPFB2 | 0x1446 | 0x1446 |
+| compositeSource (last) | SyntheticFbp0 | SyntheticFbp0 (last tick residual) |
+
+**Class-A routing + Soft-GS page gate together explain black present.** Guest FBP plant alone insufficient; present path was discarding the real local content as "wrong format."
+
+Not product-defaulting allow-mismatch yet — need principled fix: why pages of FBP70 are marked with non-FRAME PSM/stride (likely BITBLT IMAGE over same pages), and whether gate should be softer when declared PSM is CT32 family and last write was also 32-bit compatible, or track multi-writer pages differently.
+
+```text
+S295e: ALLOW_PAGE_MISMATCH + FBP plant → naturalDispfb 1.3M lit 100k. Mismatch gate was
+       the content wall. Principled Soft-GS fix next (not permanent allow-all).
+```
+
+
+## 298. Code-read of CompositeLocalToFb: two candidate skip mechanisms; IsPageMismatched is the strong lead (Claude)
+
+Static read of `Gs.cs` `CompositeLocalToFb` (2495-2583) and its `IsPageMismatched` guard (72-83), in parallel with Grok's live "digging CompositeLocalToFb for FBP70 next" from S295d.
+
+### Two places in the hot loop that could zero out real content
+
+1. **`Gs.cs:2554`**: `if ((pixel & 0x00FFFFFF) == 0) continue;` — skips a decoded pixel whenever its RGB channels are zero, regardless of alpha. If `LoadLocalPixelForPresent` decodes real local-mem bytes to alpha-only/RGB-zero for this PSM, every such pixel is silently dropped. Lower-confidence candidate — would need to know what real decoded values look like for PSM 0x0A content at this page.
+
+2. **`Gs.cs:2567`**: `if (IsPageMismatched(bi, psm, fbw)) continue;` — **stronger lead**. This guard already has a confirmed history of exactly this failure mode on two other titles (doc comment 2555-2566: MK Deception PSM=0x0A-declared-over-PSM=0x01-actual; Whiplash same-PSM-different-stride) — both cases where a page's `_pageLastWritePsm`/`_pageLastWriteStride` record (set by `MarkPageWritten`, `Gs.cs:62-70`) didn't match what the *current* composite declares, silently blackening real content. Critically, `MarkPageWritten` is called not only from real color-draw paths but also from **texture-cache upload helpers with hardcoded PSM values** regardless of the page's actual declared format — e.g. `Gs.cs:1739` `MarkPageWritten(bi, 0x13, _texBufWidth)` (PSMT8 indexed), `:1797` `(bi, 0x00, ...)`, `:1832` `(bi, 0x02, ...)`. If FBP `0x46` (page index = FBP directly, since `pageIdx = byteOffset/8192` and `byteOffset = fbp*8192`) was ever used as a texture source before/interleaved with being the display render target, a stale mark from one of these texture uploads would now block **every** pixel on that page from S295d's `naturalDispfbPx=0` composite, matching the symptom exactly.
+
+### Proposed 1-line live check
+
+`_pageLastWritePsm[0x46]` vs declared PSM `0x0A` (from S295d's DISPFB). If they differ, this is very likely the actual bug — same class as the two already-fixed cases, just a third title tripping the same guard. If they match, rules this mechanism out and the `& 0x00FFFFFF` alpha-skip or something in `LoadLocalPixelForPresent`'s decode itself becomes the next candidate.
+
+```text
+S298: CompositeLocalToFb has two candidate zero-out points. IsPageMismatched (Gs.cs:73-83) is
+      the strong lead -- same failure class already fixed twice (MK Deception, Whiplash), and
+      MarkPageWritten gets called with hardcoded PSM from texture-upload paths regardless of a
+      page's real declared format. 1-line check: _pageLastWritePsm[0x46] vs declared 0x0A.
+```
