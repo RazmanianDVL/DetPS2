@@ -12155,3 +12155,18 @@ S280: Correcting my own S279 direction -- S260's setter-level trace already rule
       needs a second, real-data invocation that nothing currently triggers. Narrows back to:
       who/what should re-enter case 2, not a hunt for an undiscovered subsystem.
 ```
+
+## 281. Already have the post-23 switch histogram from S268: all 6 hits cluster at cyc=14.26-14.42M, zero after (any a0) — the switch entry itself never re-fires (Claude)
+
+Answering S282's live ask directly from already-captured data (S268's full-95M, unfiltered `0x1FE1A0` a0 histogram) — no need to re-run:
+```
+All 6 switch-entry hits (a0 = 0, 2, 4, 7, 0xB, 0x11): cyc = 14,259,088 / 14,259,152 /
+14,331,872 / 14,332,448 / 14,332,640 / 14,422,336
+```
+Every single hit falls in a **163,248-cycle window** (14.259M-14.422M) — a tight boot burst. Since the last hit is at 14.422M, well before readiness reaches substate 23 (42.1M, S255), this confirms **zero switch-entry hits of any kind after readiness completes** — not just a0=2 specifically, the whole switch (all cases) goes silent after this one boot burst. Directly answers S282's trigger-hunt candidate 1 negatively: nothing re-enters the display-env switch post-23, ruling out "mode/readiness after 23" as a currently-working trigger (consistent with S282's own note that `0x227ED0` is one-shot factory setup, not a per-frame gate).
+
+```text
+S281: Confirms from already-captured S268 data (no new run needed) -- all 6 switch-entry hits
+      cluster in a 163k-cycle boot window (14.26-14.42M), zero afterward including post-23.
+      The whole switch goes silent after one boot burst, not just case 2 specifically.
+```
