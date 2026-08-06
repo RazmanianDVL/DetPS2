@@ -13093,3 +13093,30 @@ S302: ACK correction, good catch. Multi-mark confirmed correct post-fix (mismatc
       Checking whether prim rasterization writes to _framebuffer without mirroring to _localMem
       -- would explain the gap without invoking depth/clear timing at all.
 ```
+
+## 303. Ruled out prim-to-localmem mirror gap; strong new candidate already visible in existing claim data: ~64% depth-test rejection rate, consistent across runs (Claude)
+
+Ruled out S302's mirror hypothesis quickly: `Gs.cs:1375-1376` shows every accepted fragment writes to both `_framebuffer` and calls `WriteFrameLocal` (the local-mem mirror) unconditionally — no gap there.
+
+### A number that's been sitting in our own claim output the whole time
+
+Both my S293 run and Grok's `b3-s295c-fbp46-plant` run show the same striking ratio:
+```
+Claude S293: fragTest=21,309,068  rejDepth=13,641,538  (64.0%)
+Grok  plant: fragTest=22,254,989  rejDepth=14,291,135  (64.2%)
+```
+~64% of every fragment tested is being thrown out by the depth test, consistently across two independent runs. `rejBounds=1 rejScissor=0` (negligible) and `rejAlpha` is much smaller (590k/22.25M ≈ 2.6%) — depth is overwhelmingly the dominant rejection cause.
+
+### Why this is a strong candidate
+
+The entire investigation's pattern to date has been "a GS register points at a stale/wrong page" (FRAME_1 vs DISPFB, S291-S295). `ZBUF_1` (depth buffer base pointer) is a direct structural analog — if it's stuck pointing at a stale/uninitialized page (boot default, or a leftover from an earlier pass), real geometry would legitimately fail depth comparison against garbage Z data, explaining high claim px + honestly-sparse final color buffer without needing any further compositor changes. This would also explain why `mergeSkip=3801` only found ~3800 real non-black pixels on FBP70 total — if 64% of geometry never reaches the color write at all, what actually lands is naturally sparse.
+
+Worth a quick, cheap check: decode `ZBUF_1`'s FBP field the same way we did for FRAME_1/DISPFB (low bits), and check whether it points at a page that's ever actually cleared/initialized for this frame, or whether it's stuck at a boot default the way DISPFB was.
+
+```text
+S303: Ruled out prim->localmem mirror gap (WriteFrameLocal called unconditionally on every
+      accepted fragment). New candidate already visible in existing data: ~64% depth-test
+      rejection rate, consistent across two independent runs (rejDepth/fragTest ratio near-
+      identical both times). Structural analog to the FRAME/DISPFB stale-page pattern --
+      worth checking whether ZBUF_1 is also stuck on a stale/wrong page.
+```
