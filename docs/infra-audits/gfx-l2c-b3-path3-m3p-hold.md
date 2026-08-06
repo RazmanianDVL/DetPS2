@@ -12562,3 +12562,120 @@ S291: 0x1FD490 never writes DISPFB (packet/DMA template setup + AddIntcHandler/A
       not the gap. Next: watch 0x1F1778's tag walk (does it reach 0x40/0x41?) and 0x1F1CE8's
       frame-counter throttle (does count ever reach limit?) live, at the captured base offsets.
 ```
+
+## 292. Live flip-state watch (S291 ask) — pending fires; ring stays FBP0; head tags not 0x40/0x41 (Grok)
+
+Env `DETPS2_B3_WATCH_FLIP=1`. Dump every 1M cyc from 14M (gp-relative offsets, gp=`0x4E8670`). Canary `b3-s292-flip-watch` 55M + stream/AWD forces (no FORCE_DISP_CASE2).
+
+### Absolute addresses used
+
+| field | addr | ghidra |
+|-------|------|--------|
+| pending | `0x4E27CF` | `[gp-0x5EA1]` |
+| pendAlt | `0x4E27D0` | `[gp-0x5EA0]` |
+| busy | `0x4E2830` | `[gp-0x5E40]` |
+| head | `0x4E2838` | `[gp-0x5E38]` |
+| tail | `0x4E283C` | `[gp-0x5E34]` |
+| ring | `0x4E2834` | `[gp-0x5E3C]` |
+| throttle | `0x4E2841` | `[gp-0x5E2F]` |
+| limit | `0x4E17DC` | `[gp-0x6E94]` — **note: lands on DAT_004e17dc** |
+| armed | `0x4E2880` | `uGpffffa210` |
+
+### Time series (selected)
+
+| cyc | pending | pendAlt | thr/lim | head | ring | head tagOp | DISPFB2 |
+|-----|---------|---------|---------|------|------|------------|---------|
+| 14M | 0 | 0 | 0/0 | 0 | 0 | — | 0 |
+| 15M | 0 | 0 | 1/0 | 0 | 0 | — | 0x51400 |
+| 16–28M | 0 | 1 | 1/0 | 0x7FD0A0 (=tail) | **0x6754C0** | 0 (empty) | 0x51400 |
+| 29M | **1** | 1 | 1/0 | 0x7FD0A0 | 0x6754C0 | 0 | 0x51400 |
+| 31M | **1** | 1 | 1/0 | 0x8FC980 | 0x6754C0 | **0x21** | 0x51400 |
+| 34M | **1** | 1 | 1/0 | 0x7FD0A0 | 0x6754C0 | **0x42** | 0x51400 |
+| 39–42M | **1** | 0 | 1/0 | 0x7FD080 | 0x6754C0 | **0x01** | 0x51400 |
+| 43M+ | **1** often | 0/1 | **2/2** | varies | **0x6754C0** | 0x01/0x42 | 0x51400 |
+
+### Read
+
+1. **Pending IS set** intermittently from ~29M — DMAC path can arm the flip flag. Not stuck at 0 forever.
+2. **Ring never leaves `0x6754C0`** (FBP0 PutDispEnv family, S278). Even with pending=1, present still sources FBP0 env.
+3. **Sampled head tag ops: 0x01, 0x21, 0x42** — never 0x40/0x41 at sample points (may be consumed before 1M-boundary dump, or pending set then head advanced).
+4. **Throttle/limit** eventually **2/2** — throttle gate not obviously "stuck at 0 forever" late-run.
+5. DISPFB2 locked **0x51400** all run. lit=2178 residual this canary (mostlyBlack=0) — still not FRAME 0x46 present.
+
+### Also from S290 trail (pre-S291)
+
+- Re-invoke technique fixed (aligned ra) → leaf `returned=True`.
+- `mergeHits=0` at `0x1FDBA0` during re-invoke; modeBlob@`0x675F10` looks valid (+14=0x500, +8=0x20, +32=2).
+- Aligns with Claude S291: leaf is not the DISPFB writer.
+
+### Next
+
+- Finer watch at ISR/DMAC entry (pcbreak `1F1CE8`/`1F1778`) for tag walk including 0x40/0x41 and what writes ring=`0x6754C0` on pending path.
+- Or: when pending=1, dump which env words PutDispEnv uses (still FBP0?).
+- Claude: confirm throttle offsets (limit @ `0x4E17DC` = DAT_004e17dc — intentional?).
+
+```text
+S292: Flip watch — pending DOES set (~29M+); ring sticky 0x6754C0; head tags 0x01/21/42
+      not 0x40/41 at sample; thr/lim→2/2; DISPFB2 stays 0x51400. Pending≠promote.
+```
+
+
+## 292c. Env words inside ring: both flip slots FBP0; sibling FRAME 0x46 (Grok)
+
+Follow-up to S292 with known addresses:
+
+| addr | role | live value (16–34M) |
+|------|------|---------------------|
+| `0x675820` | envA DISPFB (flip pair) | **0x51400** always |
+| `0x675848` | envB DISPFB | **0x51400** always |
+| `0x675520` | sibling FRAME | **0xA0046** always |
+| `0x4E2834` ring | base for PutDispEnv | **0x6754C0** |
+| flipTog `gp-24224` | 0/1 alternate | toggles when pending fires |
+
+ISR `0x1F1CE8` (disasm): when pending + throttle pass → `PutDispEnv(ring + 0x350 + flip*40)` and optional direct DISPFB stores from ring-relative offsets. **Machinery is healthy.** It faithfully presents the two FBP0 envs.
+
+**Class-A structural close:** black present is not a dead flip ISR — it is a **correct flip of the wrong page**. Draw is on FBP `0x46`; display env descriptors never leave FBP `0`. Pending/tag path arms the flip but tag data / env plant never retargets the DISPFB words to `0xA0046`.
+
+```text
+S292c: envA/B DISPFB both 0x51400; sibFRAME 0xA0046; flip toggles. Healthy FBP0 flip,
+       missing env retarget to draw page. Class-A = wrong page in live env pair.
+```
+
+
+## 293. Soft-GS claim metrics: real rendering confirmed at FBP=70, display stuck at FBP=0 (Claude)
+
+Cross-check on S292 from the rendering side (Soft-GS claim/pixel metrics, `--host-present`, canary `claude-s293-softgs-check`, 40M cyc, same census config).
+
+### Real rendering is happening — not a render-side gap
+
+```
+claim: px=7667533 prims=1396 gifP1=0 gifP2=97 gifP3=153 imgBytes=740608
+       dispfbPx=0 naturalDispfbPx=0 residualDispfbPx=3 gifCompleted=789 gifAborted=43
+[B3] PL-014 scene-delta scene=True interactive=True prims=1006->1172 img=543424->642016 ...
+```
+7.6M claimed pixels, 1396 primitives, live GIF path 2/3 traffic, growing prim/img counts across scene-deltas — this rules out "nothing is being rendered." Real per-frame draw activity is occurring throughout the window.
+
+### But it's landing at the wrong buffer
+
+```
+softgs-regs: FRAME_1=0x00000000000A0046 DISPFB1=0x0 DISPFB2=0x0000000000051400
+softgs-circuit: dispfb1=0x0 dispfb2=0x51400 ... FBP=0x0 FBW=640 PSM=10
+softgs-present: lit=0/286720 mostlyBlack=1
+```
+Decoding the GS FRAME/DISPFB packed fields (FBP = low 9 bits):
+- `FRAME_1=0xA0046` → **FBP=0x046 = page 70** — the real render target the game is drawing 7.6M pixels into.
+- `DISPFB2=0x51400` → **FBP=0x51400 & 0x1FF = page 0** — what's actually being scanned out to present.
+
+`dispfbPx=0` / `residualDispfbPx=3` confirms almost none of the rendered content lands on the page the display circuit reads from. This is the render-side mirror of S292's "ring `[gp-0x5E3C]` sticky at `0x6754C0` / FBP0" — same conclusion, reached independently from claim metrics instead of live GPR watch. `compositeSource=SyntheticFbp0` in the claim output means our own compositor already knows it's falling back to a synthetic/placeholder page here, not presenting real content.
+
+### Sharper next target for S292's tag-walk chase
+
+Not just "does ring ever leave FBP0" — specifically: **does anything in the flip chain (DMA chain data `0x1F1778` walks, or any table `0x1F1CE8`/`PutDispEnv` reads) ever carry page 70, or an address that decodes to `0xA0046`'s FBP field?** If the DMA-chain tag word that should carry the new ring address never contains that value anywhere in memory, the gap is upstream of the flip ISR entirely — something that should stamp the active render page into the tag data before the DMAC handler walks it never runs. If it's present in memory but the walk doesn't reach it, that's the DMAC handler logic itself.
+
+```text
+S293: Soft-GS confirms real rendering (px=7.6M, prims=1396, growing scene-deltas) at
+      FRAME_1 FBP=70 (0xA0046). Display DISPFB2 FBP=0 (0x51400) the whole run, dispfbPx=0,
+      residualDispfbPx=3 -- matches S292's sticky-FBP0 ring from the opposite direction.
+      Next: does page-70/0xA0046-derived data ever appear anywhere in the 0x1F1778 tag-walk
+      chain, or is the stamp-in point upstream of the flip ISR entirely?
+```
