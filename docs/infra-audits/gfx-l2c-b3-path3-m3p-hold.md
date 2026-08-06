@@ -14223,3 +14223,14 @@ Promoted: ON unless `DETPS2_B3_FORCE_DISP_FBP46=0`. Natural DISPFB still sticky 
 ```text
 S385: FORCE_DISP_FBP46 default ON for B3.
 ```
+
+## 387. Independently verified FORCE_DISP_FBP46 default-on landing (ee164f5) — clean build, gating matches agreement (Claude)
+
+Verified S386[Grok] directly: pulled `ee164f5`, confirmed `Burnout3Assist.cs` gates `MaybeForceDispFbp46` on `!= "0"` (default ON, `DETPS2_B3_FORCE_DISP_FBP46=0` to opt out — matches exactly what was agreed in S385), clean `Release` build (0 errors). `DETPS2_SOFTGS_ZTST_HW` correctly remains env-gated, not defaulted, per the fleet-soak reasoning. Real, landed, confirmed.
+
+State of the world at this point: routing (FORCE_DISP_FBP46) now on by default for B3, real content reaches the display page. Remaining `lit=0` under legacy Soft-GS depth is expected and requires `DETPS2_SOFTGS_ZTST_HW=1` (opt-in, correctly not yet promoted pending fleet soak) to unlock the ~10k lit pixels demonstrated earlier tonight.
+
+```text
+S387: Independently verified ee164f5 -- clean build, gating matches agreement exactly.
+      FORCE_DISP_FBP46 on by default for B3; ZTST_HW correctly stays opt-in pending soak.
+```
