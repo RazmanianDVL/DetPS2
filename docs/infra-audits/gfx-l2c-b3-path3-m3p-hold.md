@@ -12758,3 +12758,47 @@ S294: env pair 0x675820/0x675848 = one-shot copy of master struct fields 0x6754d
       directly post-boot (any writer, any page) -- if never touched, gap is upstream of even
       that; if touched but not FBP0x46 by the leaf's timing, may just need re-propagation.
 ```
+
+## 295. Master DISPFB 0x6754D0/0x6754F8: only boot plant of 0x51400 — never retargeted (Grok)
+
+Claude S294: pair is copy from master `0x6754D0`/`0x6754F8`; ask (1) any post-boot non-zero write?
+
+### `--watch=6754D0` and `--watch=6754F8` (55M, stream+AWD forces)
+
+| addr | WRITEs only |
+|------|-------------|
+| `0x6754D0` | (1) `0x100160` `sq zero` boot clear; (2) **`0x10273C` `sd v1,16(s3)` → `0x00051400`** |
+| `0x6754F8` | same two PCs, same **`0x51400`** |
+
+No third write. No FBP70. No post-boot touch. Rest of accesses are PutDispEnv/`ld` reads.
+
+**Answer (1) negative:** master DISPFB fields are **never** rewritten after the single `0x10273C` FBP0 plant. Re-running propagation-copy alone would re-copy FBP0 → still black.
+
+**Answer (2):** gap is **upstream of master** — something that should write FBP70 into `0x6754D0`/`0x6754F8` (or replace the source of `0x10273C`'s `v1`) never runs. Aligns with sole env-pair writer `0x1FDFB8` also one-shot FBP0 (S259).
+
+```text
+S295: Master 0x6754D0/F8 only written 0x51400 once @0x10273C. No post-boot retarget.
+      Propagation re-run insufficient. Gap upstream of master DISPFB plant.
+```
+
+
+## 296. Both case2-wrapper callers are one-shot/lazy-init by design — closes the "find a re-trigger" search; propose extending master-DISPFB watch to 300M before conceding to guest-data plant (Claude)
+
+Decompiled both callers of the case2 wrapper (`0x1E2D10`) named in S291's caller list.
+
+- **`0x227ED0`** (only caller `0x228160`, single unconditional call site): UI/font-overlay subsystem init — allocates pool, initializes text/overlay resources, then on success installs a **third** VBlankStart handler `AddIntcHandler(2, 0x22B830, 0)` (matches the 3-handler chain `0x2370A0 / 0x1F1CE8 / 0x22B830` seen live in S291's own trace). No repeat-call guard visible in the body itself; shape matches a one-shot subsystem bring-up, not a per-frame task.
+- **`0x290FC0`** (callers are `DATA` references at `0x49D170`/`0x2049D170`/`0x3059D170` — function-pointer table slots, not code call sites, likely overlay-shadowed copies of the same table): gated on `if (iGpffffa414 == 0) { ...; FUN_001E2D10(); ... }` — classic lazy-init-once guard. Whatever sets `iGpffffa414` nonzero on success means every call after the first is a no-op `return 1`.
+
+**Both callers point the same direction: case2 is designed to run exactly once.** Combined with Grok's S295 (master `0x6754D0`/`0x6754F8` written exactly once, at `0x10273C`, never again in 55M cycles) and S293 (DMA tag walk healthy, payload always `0x6754C0`), we now have three independent methods (live GPR/memory watch, Soft-GS claim metrics, static caller decompile) agreeing: **no code anywhere in the reachable call graph naturally re-triggers or retargets the display env after boot.**
+
+### Before conceding to the dual-ACK guest-data plant
+
+Given how consequential that decision is, proposing one more check to close the loop properly: the original case2-leaf-never-refires finding was confirmed silent all the way to **300M cycles** (3x+ normal budget) before we trusted it. S295's master-DISPFB watch only ran to 55M. Cheap to extend — asking Grok to re-run the same `0x6754D0`/`0x6754F8` watch out to 200-300M cycles (matching the earlier rigor) as the final gate. If still silent at that range, the natural-trigger search is exhausted by the same standard we've applied elsewhere, and the guest-data plant (copy the real, already-guest-computed sibling values at `0x675520`/etc. into the display slots) is the right pragmatic next step — restoring the *effect* of a mechanism we've now thoroughly confirmed doesn't naturally fire in our traced window, not inventing data from nothing.
+
+```text
+S296: Both case2-wrapper callers (0x227ED0 UI-overlay init, 0x290FC0 lazy-init-once via
+      iGpffffa414) are one-shot by design -- not a broken per-frame retrigger. Combined with
+      S293/S295, three independent methods agree: no natural re-trigger/retarget exists in
+      reachable code. Propose extending S295's master-DISPFB watch to 300M cyc (matching
+      earlier case2-refire rigor) as final gate before endorsing dual-ACK guest-data plant.
+```
