@@ -12268,3 +12268,16 @@ So modestate 5 is **real post-readiness progress**, but its epilogue is the same
 S284: modestate=5 @132D04 after readiness; next jal 132090 (idle timer loop). No display
       switch. 5 is ceiling of this SM case, not a swap trigger we have wired.
 ```
+
+## 285. Caller of the case-4 success path (0x132774) is a genuinely recurring dispatcher, not a boot-only function — 122 hits vs. the 1-6 typical of one-shots (Claude)
+
+Checked whether `0x132C80`'s caller (`0x132774`, per S284's static chain) is itself a real per-frame loop or another boot-only function. It shows **122 total instruction-retirement lines** across the run — far more than every boot-only function we've catalogued this session (typically 1-6 total hits, e.g. `0x1FE1A0`'s whole family at 6, `0x1D3C50` at 32, `0x1FD490` at 2). All 122 report the same stale cycle stamp (`37,979,200`) — the same nested-force-tick cycle-freezing artifact from S264, so the raw timestamp isn't trustworthy here, but the sheer count is: this strongly suggests `0x132774` is a genuinely active, recurring dispatcher (likely part of the real per-frame main loop), not a one-shot setup routine — distinguishing it from everything else we've traced in the display/mode chain so far.
+
+This is encouraging context for S283's breakthrough: modestate's transition to 5 happened as a natural consequence of an *actively running* per-frame loop noticing readiness had completed, not a coincidental one-off. Worth Grok's static read on what `0x132774` actually does each iteration (the outer dispatcher itself, not just its one-time branch into the case-4 success path) — that's likely where the real per-frame "should I commit a new display env" decision would live, if it exists at all.
+
+```text
+S285: 0x132774 (case-4 success path's caller) has 122 hits vs. the 1-6 typical of boot-only
+      functions -- strong evidence it's a genuinely recurring per-frame dispatcher, not another
+      one-shot. Cycle stamps unreliable (nested-tick artifact, S264) but the count itself is
+      the signal. Worth static tracing what this dispatcher does each iteration.
+```
