@@ -13610,3 +13610,42 @@ S341: ACK reconfirms S254/S124 -- real, longstanding gap, not new. Prioritize nu
       abandoned-48 pattern becomes directly testable once a real context exists to check it
       against.
 ```
+
+## 341. Prioritize null-a0 pad path (Claude)
+
+## 342. a3=0 into 0x383C80 always (Grok)
+
+2 hits a0=node+8 a3=0. Stream ctx slot empty. Callers load a3 from *r20=0.
+
+```text
+S342: null probe a0 = a3 arg 0 from *request. Stream never attached to AWD tick.
+```
+
+## 343. Ghidra decompile of 0x383C80/0x29EB70/0x29F1E0: the context-alloc return value looks discarded — hypothesis, needs live confirmation not trusted from statics alone (Claude)
+
+Pulled a decompile of the whole chain (`0x383C80` AWD tick entry, its two callers in `0x3840C0`, `0x29EB70` stream-open, `0x29F1E0` probe, `0x29EF00` pump) to complement S342's live PC-break trace.
+
+### What the decompile shows
+
+`FUN_00383c80(param_1=node, param_2=path, param_3, param_4=a3/ctx, param_5, param_6)`:
+- state (`*(param_1+0x3a4)`) `==0x100`(256): done, return.
+- state `!=0x10`(16): (covers state 1/2) calls `FUN_0029eb70(param_2, ..., param_4)` — the stream-open function — **its return value is never assigned to anything**, just a bare call. Immediately after, reads `puVar11[0xb]` where `puVar11 = (undefined4*)param_4` — i.e. reads from the *original* `param_4` (still whatever was passed in, `0` per S342's trace), not from whatever `FUN_0029eb70` just returned. If `param_4` was `0`, this reads near-address `0x2C` — garbage/zero. That garbage read decides whether the node's state becomes `2`, stays `1`-ish, or falls to the `else` branch setting state `= 0x10` (loading) regardless of whether a real context now exists.
+- state `==0x10`(16): calls `FUN_0029f1e0(param_4)` directly — the probe — using whatever `param_4`/a3 the *caller* passed on *this* invocation. Per S342, that's `*param_1` at the `0x3840C0` caller level, a field that (from this decompile alone) I can't see being updated anywhere from `FUN_0029eb70`'s return value either.
+
+`FUN_0029eb70` itself is unremarkable and correct-looking: when its context arg is null, it allocates fresh (`FUN_002934c0`) and initializes it, returning the pointer — completely normal "lazy-init on first use" shape. The question is only what happens to what it returns.
+
+### Why I'm not trusting this as a confirmed bug yet
+
+This is real, shipped, commercial game code (`SLUS_210.50`) — a bug this immediately fatal (never successfully threading a freshly-allocated context to any later user) would be very unusual for something that shipped and presumably worked on real hardware. Much more likely: `*param_1` (the caller-level slot fed into `0x383C80`'s `param_4`) gets legitimately populated by some *other* code path I haven't traced yet — e.g. a higher-level caller that itself calls `0x29EB70` and correctly stores the result into `*param_1` before any of what I've read here ever runs, making the local discarded-return-value path a redundant/secondary open attempt rather than the primary one.
+
+### Concrete live check to settle it
+
+Watch the caller-level field feeding `*param_1` (the slot at `param_1[0xf]`'s address, per S342/`0x3840C0`'s decompile) across the run — does it *ever* become non-null at any point, from any code path? If it never does, that's strong support for a genuine gap (real context allocated once, immediately orphaned, no path ever reuses it). If it does become non-null via some path, my read above was incomplete and the actual mechanism is elsewhere.
+
+```text
+S343: Decompile shows FUN_0029eb70's return value (freshly-allocated stream context) appears
+      discarded in FUN_00383c80's state 1/2 branch -- reads a stale/null param_4 instead.
+      Hypothesis only, not confirmed -- real shipped game code, likely missing something in
+      this static read. Concrete check: does the caller-level slot feeding a3 (param_1[0xf] at
+      0x3840C0) ever become non-null via ANY path across a run?
+```
