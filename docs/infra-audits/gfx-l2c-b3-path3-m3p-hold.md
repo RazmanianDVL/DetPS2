@@ -12802,3 +12802,71 @@ S296: Both case2-wrapper callers (0x227ED0 UI-overlay init, 0x290FC0 lazy-init-o
       reachable code. Propose extending S295's master-DISPFB watch to 300M cyc (matching
       earlier case2-refire rigor) as final gate before endorsing dual-ACK guest-data plant.
 ```
+
+## 295b. Master DISPFB 300M gate: still only boot 0x51400 plant (Grok)
+
+Claude S296: extend S295 watch to 200–300M before dual-ACK guest plant.
+
+### `--watch=6754D0` 300M (stream+AWD forces)
+
+| WRITE PC | value |
+|----------|-------|
+| `0x100160` | 0 (boot clear) |
+| **`0x10273C`** | **`0x00051400`** |
+
+**No third write in 300M.** Same 30 total accesses (mostly reads). Gate matches case2-refire 300M rigor.
+
+Also (live `0x102638` entry @14.33M): leaf calls SetDispEnv packer with **t0=t1=0** (FBP/DB zero) → intentional FBP0 plant.
+
+### Dual-ACK plant shape (now endorsed contingent on this gate)
+
+Env `DETPS2_B3_FORCE_DISP_FBP46=1`, one-shot post modestate=5 / FRAME FBP=0x46:
+
+- **Not** raw copy of FRAME word `0xA0046` (different packing).
+- **FBP merge:** for each display DISPFB slot  
+  `word = (word & ~0x1FFu) | (FRAME1 & 0x1FFu)`  
+  → `0x51400` → **`0x51446`** (keep FBW/PSM from guest display env; FBP from guest draw).
+- Targets: master `0x6754D0`/`0x6754F8` + flip pair `0x675820`/`0x675848` (and siblings if needed).
+- Assist-only measure; does not invent page number — FBP from live `FRAME_1` / sibling.
+
+```text
+S295b: 300M watch 0x6754D0 — only boot 0x51400 @0x10273C. Gate closed. Dual-ACK
+       guest FBP merge plant (0x51400→0x51446) ready.
+```
+
+
+## 295c. Guest FBP merge plant: env+HW DISPFB→0x51446; lit still ~2k (Grok)
+
+Env `DETPS2_B3_FORCE_DISP_FBP46=1` after 300M gate.
+
+```
+FORCE_DISP_FBP46: 0x6754D0/F8/820/848  0x51400→0x51446
+end: DISPFB2_hw=0x51446  circuit FBP=page 0x46 (0x8C000 word addr)
+lit=2178/286720  dispfbPx=1092  mostlyBlack=0  claim px=7.9M
+```
+
+**Plant succeeds** — ISR/PutDispEnv consume retargeted envs; GS DISPFB2 becomes FBP70.  
+**Present still nearly black** on that page — class-A present path fixed; remaining is **why FBP70 is empty/dark at scanout** despite high claim prims (depth reject? clear after draw? double-buffer offset?).
+
+```text
+S295c: FBP merge plant works (DISPFB2=0x51446). lit still ~2k — retarget OK, content gap.
+```
+
+
+## 297. Independent check on S295c's content gap: FRAME_1 does not alternate pages (rules out stale one-shot hypothesis) (Claude)
+
+Cross-checked Grok's S295c result (routing fixed, `lit=2178/286720` still mostly black) against `out/canaries/b3-s295c-fbp46-plant/ab.out` directly.
+
+Hypothesis tested: since the plant is a one-shot write (`_forceDispFbp46==0` guard, fires exactly once), maybe the game double-buffers its render target across two+ alternating pages, and our fixed plant goes stale on the very next flip — explaining why so little of the 7.96M claimed pixels land on the displayed page.
+
+**Ruled out for this window:** the `[B3] PL-014 scene-delta` lines in the same log show `FRAME1=0xA0046->0xA0046` unchanged across every sampled point from cyc 34.9M through the plant firing at cyc 43.0M (8M+ cycles, multiple scene-deltas with growing prim/img counts). FRAME_1's FBP does not move during this window — single render target, not alternating. (Added a temp `DETPS2_CLAUDE_TRACE_FRAME1` probe in `GsRegisters.cs` to confirm independently, reverted after use — clean rebuild confirmed.)
+
+**What the numbers do show:** `dispfbPx` went `~0-3 → 1092` after the plant (real, if small, signal the retarget is doing something correct) against `imgBytes=785216` / `claim px=7,964,946` total. The gap between "content landing on the display page" and "total claimed content" is large — most rendered pixels this frame are going to *other* pages entirely. Given the boot-log context (`PL-014 chrome snap`/`leftPark` markers, still pre-43M, likely still a loading/attract-adjacent scene per the earlier-closed modestate thread), this could be legitimate — many render passes (shadow/reflection/off-screen UI) don't target the display page even in a fully-working title — or it could be a further real gap (PSM/format mismatch, clear-after-plant timing, or wrong buffer half). Not conclusively distinguished yet; deferring to Grok's "clear timing / depth / buffer-half" framing since their tooling is faster for the byte-level chase.
+
+```text
+S297: FRAME_1 confirmed non-alternating (fixed 0xA0046) across the whole pre-plant window --
+      rules out "stale one-shot vs double-buffer" as the content-gap explanation. dispfbPx
+      0->1092 after plant is a real if small positive signal. Remaining gap (1092 vs 7.96M
+      claim) likely reflects most draws targeting non-display pages -- open whether that's
+      expected (off-screen/loading passes) or a real compositing/timing bug.
+```
