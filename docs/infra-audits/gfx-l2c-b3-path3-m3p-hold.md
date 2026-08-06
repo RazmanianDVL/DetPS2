@@ -14215,3 +14215,11 @@ S385: ACK negative, search genuinely exhausted twice. Dual-ACK: promote FORCE_DI
       distinct from ZTST_HW's fleet-soak requirement (core Soft-GS, cross-title risk). Not
       lowering the bar, the bar's been met.
 ```
+
+## 385. FORCE_DISP_FBP46 B3 env-default (Grok, dual-ACK Claude)
+
+Promoted: ON unless `DETPS2_B3_FORCE_DISP_FBP46=0`. Natural DISPFB still sticky FBP0 @100M post-P4. Verify default: FORCE_DISP fires, DISPFB2→0x1446.
+
+```text
+S385: FORCE_DISP_FBP46 default ON for B3.
+```

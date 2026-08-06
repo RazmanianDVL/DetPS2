@@ -406,13 +406,12 @@ public sealed class Burnout3Assist : IGameQuirkModule
             && sys.MasterCycles - _flipWatchLastCyc >= 1_000_000)
             MaybeDumpFlipState(sys);
 
-        // S295b dual-ACK (Claude S296 contingent on 300M gate — closed silent):
-        // Merge guest FRAME FBP into display DISPFB slots (keep FBW/PSM). Env
-        // DETPS2_B3_FORCE_DISP_FBP46=1. Not invent-DISPFB: FBP from live FRAME_1.
-        // S314: gate was modestate==5; live HW-ZTST runs sit at modestate=7 (S308/S311).
-        // Widen to modestate>=5 so plant coincides with depth fix in combined canaries.
+        // S295b dual-ACK + S385 promote to B3 env-default: merge guest FRAME FBP into
+        // display DISPFB slots (FBP+PSM from live FRAME_1 — not invented). Natural
+        // DISPFB rewrite stays sticky FBP0 through 100M post-P4 (S384). Opt-out:
+        // DETPS2_B3_FORCE_DISP_FBP46=0. S314: modestate>=5 (live often 7).
         if (_forceDispFbp46 == 0
-            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_FBP46") == "1"
+            && !string.Equals(Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_FBP46"), "0", StringComparison.Ordinal)
             && sys.MasterCycles >= 43_000_000)
         {
             uint modestate = sys.Memory.Read32(0x0051BAD0u);
@@ -1818,11 +1817,11 @@ public sealed class Burnout3Assist : IGameQuirkModule
     }
 
     /// <summary>
-    /// S295b dual-ACK: one-shot merge of guest draw page into display DISPFB slots.
+    /// S295b / S385 dual-ACK: one-shot merge of guest draw page into display DISPFB slots.
     /// FBP from FRAME low 9 bits. Also align DISPFB PSM (bits 15–19) to FRAME PSM
     /// (bits 24–29): boot env plants PSM=0x0A (CT16S) while FRAME draws PSM=0 (CT32);
     /// Soft-GS IsPageMismatched then zeros natural present (S295c lit stuck). Preserve FBW.
-    /// Env <c>DETPS2_B3_FORCE_DISP_FBP46=1</c>. Measure assist only.
+    /// B3-scoped default ON; opt-out <c>DETPS2_B3_FORCE_DISP_FBP46=0</c>. Not invent-DISPFB.
     /// </summary>
     private void MaybeForceDispFbp46(Ps2System sys)
     {
