@@ -159,10 +159,13 @@ public sealed class BiosHle
         uint a2 = (uint)ee.GetGpr(6).Lo;
         uint a3 = (uint)ee.GetGpr(7).Lo;
 
+        // Capture before any SwitchToNext inside handlers — see DeliverSyscallReturn.
+        int tidAtEntry = _kernel.CurrentThreadId;
+
         // Commercial path: full Sony EE kernel ABI
         if (SonyKernelMode && _sony != null && _sony.TryHandle(ee, num, out long sonyResult))
         {
-            ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)sonyResult) });
+            DeliverSyscallReturn(ee, tidAtEntry, sonyResult);
             return true;
         }
 
@@ -516,8 +519,29 @@ public sealed class BiosHle
                 break;
         }
 
-        ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)result) });
+        DeliverSyscallReturn(ee, tidAtEntry, result);
         return true;
+    }
+
+    /// <summary>
+    /// B3 S352/S355 dual-ACK: yielding syscalls may <c>SwitchToNext</c> mid-handler. Only write
+    /// live $v0 when the entry thread is still current; otherwise patch the yielder's saved $v0
+    /// so the resumed thread is not clobbered (pool-arm force-preempt + SleepThread result=0).
+    /// </summary>
+    private void DeliverSyscallReturn(EmotionEngine ee, int tidAtEntry, long result)
+    {
+        if (_kernel.CurrentThreadId == tidAtEntry)
+        {
+            ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = unchecked((ulong)(long)result) });
+            return;
+        }
+        _kernel.ApplySyscallReturnToThread(tidAtEntry, result);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT_V0") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[SYSCALL_V0] routed-to-yielder tid={tidAtEntry} result=0x{(ulong)result:X} " +
+                $"nowTid={_kernel.CurrentThreadId} liveV0=0x{ee.GetGpr(2).Lo:X}");
+        }
     }
 
     private int HleWrite(uint fd, uint buf, uint len)

@@ -14142,3 +14142,13 @@ S379: Full dual-ACK. Decisive evidence -- BADPC gone, textbook reloc cycle, px U
       permanently (not just default-off env flag) -- product mechanism proven harmful and
       unnecessary, shouldn't stay reachable. lit=0 stays separate open question.
 ```
+
+## 379. LANDED: remove FRONTEND plant + P4 (Grok, dual-ACK Claude)
+
+- Removed `MaybePlantFrontendTxd` call permanently (S379 ACK: delete call, not env toggle).
+- P4: `DeliverSyscallReturn` / `ApplySyscallReturnToThread` — yielding syscall $v0 to yielder only.
+- Verify `b3-s379-plant-removed`: **BADPC=0**, PC=0x1F25E0, px≈9.7M.
+
+```text
+S379: Plant removed + P4 landed. BADPC fixed.
+```

@@ -1107,11 +1107,22 @@ public sealed class KernelState
                 ee.HleRedirectPc = fpc;
             else
                 ee.PC = fpc;
+            ulong savedV0 = t.SavedGprFull[2];
+            bool hadWait = t.HasWaitReturn;
+            int waitCode = t.WaitReturnCode;
             for (int i = 1; i < 32; i++)
                 ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
             // Snapshot consumed — next leave must SaveFullContext again if preempted.
             // Apply waiter return ($v0) before clearing HasFullSave so DeleteSema/ReleaseWait codes stick.
             ApplyWaitReturnIfAny(ee, t);
+            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT_V0") == "1")
+            {
+                Console.Error.WriteLine(
+                    $"[PREEMPT_V0] switchFull tid={id} pc=0x{fpc:X8} " +
+                    $"savedV0=0x{savedV0:X} liveV0=0x{ee.GetGpr(2).Lo:X} a0=0x{ee.GetGpr(4).Lo:X} " +
+                    $"hadWaitRet={(hadWait ? 1 : 0)} waitCode={waitCode} " +
+                    $"fromSyscall={(fromSyscall ? 1 : 0)} cyc={CurrentCycle}");
+            }
             t.HasFullSave = false;
             t.Sleeping = false;
             t.Started = true;
@@ -1175,6 +1186,26 @@ public sealed class KernelState
         t.WaitReturnCode = code;
         if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
             t.SavedGprFull[2] = unchecked((ulong)(long)code);
+    }
+
+    /// <summary>
+    /// B3 S352/S355 dual-ACK: after a yielding syscall calls <see cref="SwitchToNext"/>, the
+    /// syscall return must land on the <b>yielding</b> thread's saved $v0 — never on the resumed
+    /// thread's live GPRs. <see cref="BiosHle.HandleSyscall"/> used to always
+    /// <c>SetGpr(2, result)</c> after TryHandle, which zeroed mid-body force-preempt resumes
+    /// (pool-arm 0x29F390 returned v0=0 while a0 still held the stream ctx).
+    /// </summary>
+    public void ApplySyscallReturnToThread(int tid, long result)
+    {
+        var t = FindThread(tid);
+        if (t == null) return;
+        ulong v = unchecked((ulong)(long)result);
+        if (t.HasFullSave && t.SavedGprFull != null && t.SavedGprFull.Length > 2)
+            t.SavedGprFull[2] = v;
+        // Partial-save resume path only restores callee-saved regs; stash via wait-return so
+        // ApplyWaitReturnIfAny still delivers $v0 when that thread is next restored.
+        if (!t.HasFullSave || t.SavedGprFull == null)
+            SetWaitReturn(t, (int)result);
     }
 
     /// <summary>
@@ -1346,6 +1377,15 @@ public sealed class KernelState
         t.SavedS8 = ee.GetGpr(30).Lo;
         t.SavedFp = ee.GetGpr(30).Lo;
         LogThreadEvent("PreemptOut", _currentTid, t.SavedPc, ee.GetGpr(29).Lo);
+        // B3 S351 measure: pool-arm 0x29F390 returns v0=0 after force-preempt mid-body.
+        // Env DETPS2_TRACE_PREEMPT_V0=1 — log saved v0/a0 and waiter flag at PreemptOut.
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT_V0") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[PREEMPT_V0] out tid={_currentTid} pc=0x{t.SavedPc:X8} " +
+                $"v0=0x{t.SavedGprFull[2]:X} a0=0x{t.SavedGprFull[4]:X} " +
+                $"hasWaitRet={(t.HasWaitReturn ? 1 : 0)} waitCode={t.WaitReturnCode} cyc={CurrentCycle}");
+        }
     }
 
     /// <summary>Restore every GPR saved by <see cref="SaveFullContext"/>, or fall back to the
@@ -1362,9 +1402,19 @@ public sealed class KernelState
 
         _currentTid = id;
         ee.PC = t.SavedPc;
+        ulong savedV0 = t.SavedGprFull[2];
+        bool hadWait = t.HasWaitReturn;
+        int waitCode = t.WaitReturnCode;
         for (int i = 1; i < 32; i++) // skip $zero
             ee.SetGpr(i, new EmotionEngine.Gpr128 { Lo = t.SavedGprFull[i] });
         ApplyWaitReturnIfAny(ee, t);
+        if (Environment.GetEnvironmentVariable("DETPS2_TRACE_PREEMPT_V0") == "1")
+        {
+            Console.Error.WriteLine(
+                $"[PREEMPT_V0] fullIn tid={id} pc=0x{t.SavedPc:X8} " +
+                $"savedV0=0x{savedV0:X} liveV0=0x{ee.GetGpr(2).Lo:X} a0=0x{ee.GetGpr(4).Lo:X} " +
+                $"hadWaitRet={(hadWait ? 1 : 0)} waitCode={waitCode} cyc={CurrentCycle}");
+        }
         // Don't clear SuspendThread park on preempt-in
         if (t.SuspendCount == 0)
             t.Sleeping = false;

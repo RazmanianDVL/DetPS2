@@ -117,8 +117,9 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _resourceRelPtrScrubs;
     /// <summary>S226 dual-ACK: force type-6 stream status→9 when pump never runs (env-gated).</summary>
     private int _forceStreamPumps;
-    /// <summary>S270 dual-ACK: measure-only re-dispatch display switch case 2 after FRAME FBP≈0x46.</summary>
+    /// <summary>S270/S289 dual-ACK: re-dispatch real case-2 after modestate=5 / FRAME 0x46.</summary>
     private int _forceDispCase2;
+    private bool _forceDispCase2InProgress;
     /// <summary>S230 dual-ACK: host-call stream-system tick 0x28AF10 once (env-gated).</summary>
     private int _forceStreamTicks;
     /// <summary>S233: one-shot +500 clear after force ticks (not every frame).</summary>
@@ -127,6 +128,21 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private bool _forcePhase2Done;
     /// <summary>S252 dual-ACK: force AWD node state 16→256 (env-gated).</summary>
     private int _awdNodeStateCompletes;
+    /// <summary>S291 Claude: live dump flip pending/throttle/DMA head (env-gated).</summary>
+    private int _flipWatchDumps;
+    private ulong _flipWatchLastCyc;
+    private int _hostZStatDumps;
+    private ulong _hostZStatLastCyc;
+    private int _alphaCensusDumps;
+    private ulong _alphaCensusLastCyc;
+    private int _a0TtlWatchHits;
+    private int _a0TtlWatchBad;
+    private int _stall2232Dumps;
+    private ulong _stall2232LastCyc;
+    private int _awdDumpCount;
+    private ulong _awdDumpLastCyc;
+    /// <summary>S295b dual-ACK: one-shot guest FBP merge into display DISPFB slots.</summary>
+    private int _forceDispFbp46;
 
     /// <summary>
     /// High-RDRAM scratch for STAGEHED.BIN (374784 B). Below EE stack (~0x01FF0000) and
@@ -188,12 +204,24 @@ public sealed class Burnout3Assist : IGameQuirkModule
         _forceStreamArmCleared = false;
         _forcePhase2Done = false;
         _forceDispCase2 = 0;
+        _forceDispCase2InProgress = false;
         _awdNodeStateCompletes = 0;
+        _flipWatchDumps = 0;
+        _flipWatchLastCyc = 0;
+        _hostZStatDumps = 0;
+        _hostZStatLastCyc = 0;
+        _alphaCensusDumps = 0;
+        _alphaCensusLastCyc = 0;
+        _a0TtlWatchHits = 0;
+        _a0TtlWatchBad = 0;
+        _stall2232Dumps = 0;
+        _stall2232LastCyc = 0;
+        _awdDumpCount = 0;
+        _awdDumpLastCyc = 0;
+        _forceDispFbp46 = 0;
         _postTxdEscapes = 0;
         _lastPostTxdEscapeCyc = 0;
-        _frontendPlanted = false;
-        _frontendEeAddr = 0;
-        _frontendSize = 0;
+
         _residualBootLeaves = 0;
         _lastResidualBootLeaveCyc = 0;
     }
@@ -370,17 +398,87 @@ public sealed class Burnout3Assist : IGameQuirkModule
             && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_AWD_NODE_STATE") == "1")
             MaybeForceAwdNodeStateComplete(sys);
 
-        // S270 dual-ACK measure-only: re-dispatch display switch case 2 (0x1FE1A0 a0=2 →
-        // 0x1FD490 FBP-OR) after FRAME FBP settles at 0x46. Boot already calls case 2 once
-        // with zero args at ~14.3M (S269/S270); this asks "does the mechanism work later?"
-        // Nested EE call (same pattern as FORCE_STREAM_TICK). Env DETPS2_B3_FORCE_DISP_CASE2=1.
-        // Does NOT invent DISPFB — runs real game path only.
-        if (_forceDispCase2 == 0
-            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_CASE2") == "1"
-            && sys.MasterCycles >= 25_000_000)
+        // S291 Claude: watch flip ISR pending + frame throttle + DMA queue head.
+        // Env DETPS2_B3_WATCH_FLIP=1. Offsets relative to gp=0x4E8670 (S278 ringBase family).
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_WATCH_FLIP") == "1"
+            && sys.MasterCycles >= 14_000_000
+            && _flipWatchDumps < 40
+            && sys.MasterCycles - _flipWatchLastCyc >= 1_000_000)
+            MaybeDumpFlipState(sys);
+
+        // S295b dual-ACK (Claude S296 contingent on 300M gate — closed silent):
+        // Merge guest FRAME FBP into display DISPFB slots (keep FBW/PSM). Env
+        // DETPS2_B3_FORCE_DISP_FBP46=1. Not invent-DISPFB: FBP from live FRAME_1.
+        // S314: gate was modestate==5; live HW-ZTST runs sit at modestate=7 (S308/S311).
+        // Widen to modestate>=5 so plant coincides with depth fix in combined canaries.
+        if (_forceDispFbp46 == 0
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_FBP46") == "1"
+            && sys.MasterCycles >= 43_000_000)
         {
+            uint modestate = sys.Memory.Read32(0x0051BAD0u);
             uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
-            if ((frame1 & 0x1FFu) == 0x46)
+            if (modestate >= 5 && (frame1 & 0x1FFu) == 0x46)
+                MaybeForceDispFbp46(sys);
+        }
+
+        // S306/S307 dual-ACK (A): measure-only host Soft-GS depth census.
+        // Independent of FORCE_DISP plant so we still get data when modestate≠5.
+        // Env DETPS2_B3_HOSTZ_STATS=1. No DepthPass / clear behavior change.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_HOSTZ_STATS") == "1"
+            && sys.MasterCycles >= 43_000_000
+            && _hostZStatDumps < 8
+            && sys.MasterCycles - _hostZStatLastCyc >= 2_000_000)
+            MaybeDumpHostZStats(sys);
+
+        // S318: live alpha-reject census dump (pairs with DETPS2_SOFTGS_ALPHA_CENSUS=1).
+        if (Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ALPHA_CENSUS") == "1"
+            && sys.MasterCycles >= 43_000_000
+            && _alphaCensusDumps < 6
+            && sys.MasterCycles - _alphaCensusLastCyc >= 2_000_000)
+        {
+            _alphaCensusDumps++;
+            _alphaCensusLastCyc = sys.MasterCycles;
+            uint test1 = (uint)(sys.Gs.Registers.TEST_1 & 0xFFFFFFFFUL);
+            Console.Error.WriteLine(
+                $"[B3] ALPHA_CENSUS n={_alphaCensusDumps} liveTEST1=0x{test1:X} " +
+                $"(ATE={test1 & 1} ATST={(test1 >> 1) & 7} AREF=0x{(test1 >> 4) & 0xFF:X2} AFAIL={(test1 >> 12) & 3}) " +
+                $"{sys.Gs.DescribeAlphaCensus()} cyc={sys.MasterCycles}");
+        }
+
+        // S331 dual-ACK: watch object TTL tick 0x3E87A0 a0. Log when a0 lands in MMIO/VU.
+        // Env DETPS2_B3_WATCH_A0_TTL=1. Measure-only — no force.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_WATCH_A0_TTL") == "1"
+            && sys.MasterCycles >= 35_000_000)
+            MaybeWatchA0TtlTick(sys);
+
+        // S333: snapshot when EE is on post-pad plateau 0x2232xx (what is it gating on?).
+        // Env DETPS2_B3_WATCH_STALL2232=1.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_WATCH_STALL2232") == "1"
+            && sys.MasterCycles >= 42_000_000
+            && _stall2232Dumps < 12
+            && sys.MasterCycles - _stall2232LastCyc >= 2_000_000)
+            MaybeDumpStall2232(sys);
+
+        // S337: measure-only AWD pool node state dump (no force).
+        // Env DETPS2_B3_DUMP_AWD=1.
+        if (Environment.GetEnvironmentVariable("DETPS2_B3_DUMP_AWD") == "1"
+            && sys.MasterCycles >= 40_000_000
+            && _awdDumpCount < 6
+            && sys.MasterCycles - _awdDumpLastCyc >= 3_000_000)
+            MaybeDumpAwdPool(sys);
+
+        // S289 dual-ACK: re-invoke FBP-OR leaf 0x1FD490 after modestate=5
+        // (post-readiness). Uses full sys.RunFor slices so PCRTC VBlank can satisfy
+        // 0x10C2F8 poll (S271 EE-only Step hung there). Env DETPS2_B3_FORCE_DISP_CASE2=1.
+        // Does NOT invent DISPFB — only runs guest case-2 leaf path.
+        if (_forceDispCase2 == 0
+            && !_forceDispCase2InProgress
+            && Environment.GetEnvironmentVariable("DETPS2_B3_FORCE_DISP_CASE2") == "1"
+            && sys.MasterCycles >= 43_000_000)
+        {
+            uint modestate = sys.Memory.Read32(0x0051BAD0u);
+            uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+            if (modestate == 5 && (frame1 & 0x1FFu) == 0x46)
                 MaybeForceDispCase2(sys);
         }
 
@@ -1533,9 +1631,7 @@ public sealed class Burnout3Assist : IGameQuirkModule
     private int _deadEpiLeaves;
     private int _postTxdEscapes;
     private ulong _lastPostTxdEscapeCyc;
-    private bool _frontendPlanted;
-    private uint _frontendEeAddr;
-    private uint _frontendSize;
+
 
     /// <summary>
     /// S226 dual-ACK: EE stream handle has type@+268==6 (create <c>0x2A62B8</c>) but status@+588
@@ -1722,27 +1818,267 @@ public sealed class Burnout3Assist : IGameQuirkModule
     }
 
     /// <summary>
-    /// S270/S271 dual-ACK measure-only: re-enter FBP-OR leaf <c>0x1FD490</c> (case-2 body)
-    /// after FRAME FBP is 0x46. First probe called switch <c>0x1FE1A0(a0=2)</c> and hit
-    /// MaxSteps without return; leaf is the actual merge. Env
-    /// <c>DETPS2_B3_FORCE_DISP_CASE2=1</c>. Nested EE Step — diagnostic only, not product.
-    /// Does not invent DISPFB; only runs the game path.
+    /// S295b dual-ACK: one-shot merge of guest draw page into display DISPFB slots.
+    /// FBP from FRAME low 9 bits. Also align DISPFB PSM (bits 15–19) to FRAME PSM
+    /// (bits 24–29): boot env plants PSM=0x0A (CT16S) while FRAME draws PSM=0 (CT32);
+    /// Soft-GS IsPageMismatched then zeros natural present (S295c lit stuck). Preserve FBW.
+    /// Env <c>DETPS2_B3_FORCE_DISP_FBP46=1</c>. Measure assist only.
+    /// </summary>
+    private void MaybeForceDispFbp46(Ps2System sys)
+    {
+        var mem = sys.Memory;
+        uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+        uint fbp = frame1 & 0x1FFu;
+        uint framePsm = (frame1 >> 24) & 0x3Fu;
+        // Master DISPFB + flip-pair DISPFB (S274–S295).
+        uint[] slots = { 0x006754D0u, 0x006754F8u, 0x00675820u, 0x00675848u };
+        var sb = new System.Text.StringBuilder();
+        foreach (uint addr in slots)
+        {
+            uint before = mem.Read32(addr);
+            // Clear FBP[8:0] and PSM[19:15]; keep FBW[14:9] and upper.
+            uint after = (before & ~0x1FFu & ~(0x1Fu << 15)) | fbp | ((framePsm & 0x1Fu) << 15);
+            mem.Write32(addr, after);
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append($"0x{addr:X}={before:X}->{after:X}");
+        }
+        // Sample GS local page at FBP for lit diagnostics (S295c content gap).
+        int baseOff = (int)(fbp * 8192u);
+        byte[] page = sys.Gs.ReadLocalMem(baseOff, 8192);
+        int nz = 0;
+        for (int i = 0; i + 3 < page.Length; i += 4)
+        {
+            uint pix = (uint)(page[i] | (page[i + 1] << 8) | (page[i + 2] << 16));
+            if ((pix & 0x00FFFFFFu) != 0) nz++;
+        }
+        _forceDispFbp46++;
+        uint dispfb2 = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        // Write GS privileged DISPFB2 via privileged path so DisplayCircuitGeneration
+        // bumps and present rebinds immediately (not waiting for next ISR). Avoids
+        // residual window with env 0x51400 (PSM 0x0A) against CT32 page marks (S295f).
+        uint newDispfb = mem.Read32(0x006754D0u);
+        sys.Gs.WritePrivileged64(0x12000090u, newDispfb);
+        // 640×448 CT32 ≈ 140 GS pages from FBP base — sample full span (S295g).
+        string marks = sys.Gs.DescribePageMarks((int)fbp, 160);
+        uint dispfb2After = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        // S303 Claude: ZBUF_1 FBP vs FRAME (Soft-GS depth is host-side float[], but log ZBUF anyway).
+        ulong zbuf1 = sys.Gs.Registers.ZBUF_1;
+        uint zbp = (uint)(zbuf1 & 0x1FFu);
+        uint zPsm = (uint)((zbuf1 >> 24) & 0xFu);
+        uint zMask = (uint)((zbuf1 >> 32) & 1u);
+        uint test1 = (uint)(sys.Gs.Registers.TEST_1 & 0xFFFFFFFFUL);
+        // S306: host Soft-GS depth census (measure-only; no DepthPass flip).
+        string hostZ = sys.Gs.DescribeHostDepthStats();
+        Console.Error.WriteLine(
+            $"[B3] FORCE_DISP_FBP46 n={_forceDispFbp46} fbp=0x{fbp:X} framePsm=0x{framePsm:X} " +
+            $"FRAME1=0x{frame1:X} localNz32={nz}/2048 {sb} " +
+            $"DISPFB2_hw=0x{dispfb2:X}->0x{dispfb2After:X} " +
+            $"ZBUF1=0x{zbuf1:X} ZBP=0x{zbp:X} ZPSM=0x{zPsm:X} ZMSK={zMask} TEST1=0x{test1:X} " +
+            $"(ZTE={(test1 >> 16) & 1} ZTST={(test1 >> 17) & 3} ZTE_inv_write={(test1 >> 19) & 1}) " +
+            $"marks=[{marks}] {hostZ} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S333: dump gate state around post-pad plateau 0x2232xx.
+    /// Static: beq *0x51BA88 == 0x51A6A8 skips big chunk; s1==-1 other skip; loads matrix from *(s0+4).
+    /// Env <c>DETPS2_B3_WATCH_STALL2232=1</c>.
+    /// </summary>
+    private void MaybeDumpStall2232(Ps2System sys)
+    {
+        uint pc = (uint)sys.EE.PC;
+        // Only log when actually on the plateau band (or every interval if never hits exact).
+        bool onPlateau = pc is >= 0x00223000 and <= 0x00224000;
+        if (!onPlateau && _stall2232Dumps > 0)
+            return; // once we've seen plateau, only sample there
+        _stall2232Dumps++;
+        _stall2232LastCyc = sys.MasterCycles;
+        uint s0 = (uint)(sys.EE.GetGpr(16).Lo & 0xFFFFFFFFUL);
+        uint s1 = (uint)(sys.EE.GetGpr(17).Lo & 0xFFFFFFFFUL);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0xFFFFFFFFUL);
+        uint gatePtr = sys.Memory.Read32(0x0051BA88u); // lw -17784($0x52)
+        const uint gateCmp = 0x0051A6A8u; // addiu -22872($0x52)
+        uint modestate = sys.Memory.Read32(0x0051BAD0u);
+        uint s0p4 = 0;
+        uint s0Phys = s0 & 0x1FFFFFFFu;
+        if (s0Phys is >= 0x100000 and < (uint)SystemMemory.RDRAM_SIZE - 4)
+            s0p4 = sys.Memory.Read32(s0Phys + 4);
+        // Thread wait snapshot (first 8).
+        var sb = new System.Text.StringBuilder();
+        try
+        {
+            // Best-effort: KernelHle thread table not always exposed; log what we can via EE.
+            sb.Append($"PC=0x{pc:X8} s0=0x{s0:X8} s1=0x{s1:X8} ra=0x{ra:X8} ");
+            sb.Append($"gate*0x51BA88=0x{gatePtr:X8} (cmp 0x{gateCmp:X8} eq={(gatePtr == gateCmp ? 1 : 0)}) ");
+            sb.Append($"modestate={modestate} *s0+4=0x{s0p4:X8} ");
+            sb.Append($"s1neg1={(s1 == 0xFFFFFFFFu ? 1 : 0)} ");
+            sb.Append($"DISPFB2=0x{(uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFF):X} ");
+            sb.Append($"PMODE=0x{(uint)(sys.Gs.Registers.PMODE & 0xFFFFFFFF):X} ");
+            sb.Append($"cdvd={sys.Cdvd.SectorsRead} px={sys.Gs.PixelsWritten}");
+        }
+        catch { /* ignore */ }
+        Console.Error.WriteLine($"[B3] STALL2232 n={_stall2232Dumps} {sb} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S331: at entry of object TTL tick <c>0x3E87A0</c>, log a0 (object base).
+    /// Bad a0 (≥0x10000000) explains UnknownMmioWrite flood class. Also dumps ra/gp.
+    /// Env <c>DETPS2_B3_WATCH_A0_TTL=1</c>.
+    /// </summary>
+    private void MaybeWatchA0TtlTick(Ps2System sys)
+    {
+        uint pc = (uint)sys.EE.PC;
+        if (pc != 0x003E87A0u)
+            return;
+        _a0TtlWatchHits++;
+        uint a0 = (uint)(sys.EE.GetGpr(4).Lo & 0xFFFFFFFFUL);
+        uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0xFFFFFFFFUL);
+        uint gp = (uint)(sys.EE.GetGpr(28).Lo & 0xFFFFFFFFUL);
+        uint a0Phys = a0 & 0x1FFFFFFFu;
+        bool bad = a0Phys >= 0x10000000u || a0Phys < 0x00100000u
+            || a0Phys >= (uint)SystemMemory.RDRAM_SIZE;
+        if (bad)
+            _a0TtlWatchBad++;
+        // Log all bad; sample good first few + periodic.
+        if (bad || _a0TtlWatchHits <= 8 || (_a0TtlWatchHits % 64) == 0)
+        {
+            uint word0 = 0, word2440 = 0;
+            if (!bad && a0Phys + 2443 < (uint)SystemMemory.RDRAM_SIZE)
+            {
+                word0 = sys.Memory.Read32(a0Phys);
+                word2440 = sys.Memory.Read32(a0Phys + 2440u);
+            }
+            Console.Error.WriteLine(
+                $"[B3] A0_TTL_TICK n={_a0TtlWatchHits} bad={_a0TtlWatchBad} " +
+                $"a0=0x{a0:X8} phys=0x{a0Phys:X8} badPtr={(bad ? 1 : 0)} " +
+                $"ra=0x{ra:X8} gp=0x{gp:X8} w0=0x{word0:X8} +2440=0x{word2440:X8} " +
+                $"cyc={sys.MasterCycles}");
+        }
+    }
+
+    /// <summary>
+    /// S306/S307 dual-ACK (A): dump host Soft-GS depth census + modestate/ZBUF/TEST.
+    /// Env <c>DETPS2_B3_HOSTZ_STATS=1</c>. Measure only — no DepthPass or clear change.
+    /// </summary>
+    private void MaybeDumpHostZStats(Ps2System sys)
+    {
+        _hostZStatDumps++;
+        _hostZStatLastCyc = sys.MasterCycles;
+        uint modestate = sys.Memory.Read32(0x0051BAD0u);
+        uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+        ulong zbuf1 = sys.Gs.Registers.ZBUF_1;
+        uint zbp = (uint)(zbuf1 & 0x1FFu);
+        uint zMask = (uint)((zbuf1 >> 32) & 1u);
+        uint test1 = (uint)(sys.Gs.Registers.TEST_1 & 0xFFFFFFFFUL);
+        string hostZ = sys.Gs.DescribeHostDepthStats();
+        Console.Error.WriteLine(
+            $"[B3] HOSTZ_STATS n={_hostZStatDumps} modestate={modestate} FRAME1=0x{frame1:X} " +
+            $"ZBP=0x{zbp:X} ZMSK={zMask} ZTE={(test1 >> 16) & 1} ZTST={(test1 >> 17) & 3} " +
+            $"{hostZ} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S291 Claude: dump flip control block (gp-relative, gp=0x4E8670). Pending byte set by
+    /// DMAC handler <c>0x1F1778</c> on tag 0x40/0x41; ISR <c>0x1F1CE8</c> needs pending +
+    /// frame-counter throttle to write DISPFB. Env <c>DETPS2_B3_WATCH_FLIP=1</c>.
+    /// </summary>
+    private void MaybeDumpFlipState(Ps2System sys)
+    {
+        const uint Gp = 0x004E8670;
+        // Offsets from Ghidra decompile of 0x1F1778 / S291 doc (base = gp).
+        const uint OffPending = 0x5EA1;   // [-0x5EA1] pending flip byte (tag 0x40/0x41)
+        const uint OffPendAlt = 0x5EA0;   // [-0x5EA0] companion (0 on tag40, 1 on tag41)
+        const uint OffBusy = 0x5E40;      // [-0x5E40] in-flight count
+        const uint OffHead = 0x5E38;      // [-0x5E38] DMA tag queue head ptr
+        const uint OffTail = 0x5E34;      // [-0x5E34] queue tail
+        const uint OffRing = 0x5E3C;      // [-0x5E3C] ring/env ptr written by tag 0x40/41
+        const uint OffThrottle = 0x5E2F;  // [-0x5E2F] frame count (S291)
+        const uint OffLimit = 0x6E94;     // [-0x6E94] frame limit (S291)
+        const uint OffArmed = 0x5DF0;     // uGpffffa210 armed flag
+
+        var mem = sys.Memory;
+        byte pending = mem.Read8(Gp - OffPending);
+        byte pendAlt = mem.Read8(Gp - OffPendAlt);
+        byte busy = mem.Read8(Gp - OffBusy);
+        byte throttle = mem.Read8(Gp - OffThrottle);
+        byte limit = mem.Read8(Gp - OffLimit);
+        uint head = mem.Read32(Gp - OffHead);
+        uint tail = mem.Read32(Gp - OffTail);
+        uint ring = mem.Read32(Gp - OffRing);
+        uint armed = mem.Read32(Gp - OffArmed);
+        uint tag0 = 0, tag1 = 0;
+        if (head >= 0x100000 && head < 0x2000000)
+        {
+            tag0 = mem.Read32(head);
+            tag1 = mem.Read32(head + 4);
+        }
+        uint dispfb2 = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+        // Known live DISPFB env words (S274–S276): 0x675820 / 0x675848 + sibling FRAME 0x675520.
+        uint envA = mem.Read32(0x00675820);
+        uint envB = mem.Read32(0x00675848);
+        uint siblingFrame = mem.Read32(0x00675520);
+        // Flip toggle byte gp-24224 (0x4E27D0 area — S281)
+        byte flipToggle = mem.Read8(Gp - 24224);
+        _flipWatchDumps++;
+        _flipWatchLastCyc = sys.MasterCycles;
+        Console.Error.WriteLine(
+            $"[B3] FLIP_WATCH n={_flipWatchDumps} pending={pending} pendAlt={pendAlt} busy={busy} " +
+            $"throttle={throttle} limit={limit} flipTog={flipToggle} " +
+            $"head=0x{head:X8} tail=0x{tail:X8} ring=0x{ring:X8} " +
+            $"armed=0x{armed:X} tag0=0x{tag0:X8} tag1=0x{tag1:X8} " +
+            $"(tagOp=0x{tag0 & 0xFF:X2}) envA=0x{envA:X} envB=0x{envB:X} sibFRAME=0x{siblingFrame:X} " +
+            $"DISPFB2=0x{dispfb2:X} FRAME1=0x{frame1:X} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S289 dual-ACK: re-invoke FBP-OR leaf <c>0x1FD490</c> after modestate=5 using full
+    /// <see cref="Ps2System.RunFor"/> slices so PCRTC VBlank can satisfy guest INTC polls
+    /// (S271 EE-only Step hung at 0x10C2F8). IE/EIE cleared so COP0 does not steal.
+    /// Wrapper <c>0x1E2D10</c> RunFor parked in 0x1FAB44 copy (S289b); leaf is the real
+    /// FBP-OR body. Env <c>DETPS2_B3_FORCE_DISP_CASE2=1</c>. Does not invent DISPFB.
     /// </summary>
     private void MaybeForceDispCase2(Ps2System sys)
     {
-        // Case-2 body (FBP-OR). Switch entry 0x1FE1A0 hung at MaxSteps in S271 probe.
         const uint FbpOrFn = 0x001FD490;
-        const uint ReturnSentinel = 0x00B3F002;
-        const uint EnvDispfbField = 0x00675820; // env1 +0x10 (S258)
+        // Natural boot case2 entry (S270 pcbreak @14.33M): a0=0x1FE398 ra=0x1FE3A0 sp=0x1FFFE40.
+        // S290c: misaligned ra=0xB3F002 caused AdEL on successful jr-ra (EPC near sentinel band).
+        // Use 4-byte-aligned self-loop trampoline (same pattern as Midway SifInit return).
+        const uint ReturnSentinel = 0x00B3F000;
+        const uint BootLikeSp = 0x001FFFE40; // natural leaf entry SP (S270)
+        const uint Case2BodyA0 = 0x001FE398; // a0 at natural 1FD490 entry
+        const uint EnvDispfbField = 0x00675820;
+        const uint SiblingFrameField = 0x00675520;
 
         var ee = sys.EE;
         var mem = sys.Memory;
+        if (_forceDispCase2InProgress)
+            return;
         if ((ee.PC & 0x1FFFFFFFu) == FbpOrFn)
             return;
 
         uint envBefore = mem.Read32(EnvDispfbField);
+        uint frameSibling = mem.Read32(SiblingFrameField);
         uint dispfb2Before = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
         uint frame1 = (uint)(sys.Gs.Registers.FRAME_1 & 0xFFFFFFFFUL);
+        uint modestate = mem.Read32(0x0051BAD0u);
+        uint spBefore = (uint)ee.GetGpr(29).Lo;
+        // S290f: 0x1FD138 predicate reads display-mode blob at 0x675F10.
+        // v0==0 from that jal → skip merge (beq to 0x1FE170). Dump fields pre-invoke.
+        const uint ModeBlob = 0x00675F10;
+        uint mb0 = mem.Read32(ModeBlob);
+        uint mb4 = mem.Read32(ModeBlob + 4);
+        uint mb8 = mem.Read32(ModeBlob + 8);
+        uint mb14 = mem.Read32(ModeBlob + 0x14); // 1FD380: nonzero must match format
+        uint mb18 = mem.Read32(ModeBlob + 0x18);
+        uint mb1c = mem.Read32(ModeBlob + 0x1C);
+        uint mb20 = mem.Read32(ModeBlob + 0x20);
+        uint mb24 = mem.Read32(ModeBlob + 0x24);
+        uint mb2c = mem.Read32(ModeBlob + 0x2C);
+        uint mb30 = mem.Read32(ModeBlob + 0x30) & 0xFFFFu; // halfword +30/+31
+        uint mb32 = mem.Read8(ModeBlob + 0x32);
+        uint mb33 = mem.Read8(ModeBlob + 0x33);
+        uint slotIdx = mem.Read32(0x004E2878); // *(gp-24056) template slot; -1 skips copy
+        uint gpPsm = mem.Read32(0x004E8670u - 28108u); // *(gp-28108) used in 1FD318
 
         ulong savedPc = ee.PC;
         uint savedStatus = ee.COP0_Status;
@@ -1750,52 +2086,82 @@ public sealed class Burnout3Assist : IGameQuirkModule
         for (int i = 0; i < 32; i++)
             savedGpr[i] = ee.GetGpr(i);
 
-        // Boot case-2 path leaves a1/a2/a3 zero into the switch; leaf uses fixed bases.
-        // Ensure gp matches known B3 live gp (function uses gp-relative loads).
+        // Aligned return trampoline: beq zero,zero,self ; nop
+        mem.Write32(ReturnSentinel, 0x1000FFFFu);
+        mem.Write32(ReturnSentinel + 4, 0x00000000u);
+
         const uint B3Gp = 0x004E8670;
-        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = 0 }); // a0
-        ee.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 }); // a1
-        ee.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 }); // a2
-        ee.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 }); // a3
-        ee.SetGpr(28, new EmotionEngine.Gpr128 { Lo = B3Gp }); // gp
-        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ReturnSentinel }); // ra
-        // Mask IE+EIE so VBlank STAT pulses do not COP0-dispatch into kernel.
-        // (Status IE=bit0, EIE=bit16 — both required for IRQ take; S271f only cleared IE.)
-        ee.COP0_Status = savedStatus & ~0x10001u;
+        // Match natural leaf entry shape (S270): a0=case2-body, a1-a3=0, s*=0, boot SP.
+        ee.SetGpr(4, new EmotionEngine.Gpr128 { Lo = Case2BodyA0 });
+        ee.SetGpr(5, new EmotionEngine.Gpr128 { Lo = 0 });
+        ee.SetGpr(6, new EmotionEngine.Gpr128 { Lo = 0 });
+        ee.SetGpr(7, new EmotionEngine.Gpr128 { Lo = 0 });
+        for (int s = 16; s <= 23; s++)
+            ee.SetGpr(s, new EmotionEngine.Gpr128 { Lo = 0 });
+        ee.SetGpr(28, new EmotionEngine.Gpr128 { Lo = B3Gp });
+        ee.SetGpr(29, new EmotionEngine.Gpr128 { Lo = BootLikeSp }); // sp
+        ee.SetGpr(30, new EmotionEngine.Gpr128 { Lo = 0 }); // fp
+        ee.SetGpr(31, new EmotionEngine.Gpr128 { Lo = ReturnSentinel });
+        ee.COP0_Status = savedStatus & ~0x10001u; // IE off; PCRTC still sticks STAT
         ee.PC = FbpOrFn;
 
         bool returned = false;
-        int steps = 0;
-        // S271c: 2M budget + stuck PC. S271d: stuck at 0x10C2F8 = INTC_STAT bit2
-        // (VBlankStart) poll — nested EE-only Step never raises VBlank. Pulse VBlank
-        // STAT (sticky, IE off) so wait loops complete without ISR steal.
-        const int MaxSteps = 2_000_000;
+        int slices = 0;
+        const int MaxSlices = 2000;
+        const ulong SliceCyc = 2_000;
         uint lastPc = FbpOrFn;
         uint stuckPc = 0;
-        int vblankPulses = 0;
-        int lastPulseAt = -4096;
+        var pathRing = new uint[32];
+        int pathN = 0;
+        // S290e: exact merge-hit count via EE Step (RunFor sampling misses single-insn PCs).
+        // Hybrid: Step while PC in leaf/wait helpers; Raise VBlank sticky so 0x10C2F8 exits.
+        const uint FbpMergePc = 0x001FDBA0;
+        int mergeHits = 0;
+        int leafBodyHits = 0;
+        int steps = 0;
+        const int MaxSteps = 200_000;
+        _forceDispCase2InProgress = true;
         try
         {
             while (steps < MaxSteps)
             {
-                int n = ee.Step(64);
-                if (n <= 0) n = 1;
-                steps += n;
-                uint pc = (uint)(ee.PC & 0x1FFFFFFFu);
-                lastPc = pc;
-                // S271i: surgical unstick of INTC_STAT bit2 poll at 0x10C2F0..0x10C310
-                // (S271c parked here). Force v0 bit2 so the beq exits without Raise/ISR.
-                if (pc is >= 0x0010C2F0 and <= 0x0010C310)
+                sys.Intc.Raise(Intc.InterruptSource.VBlankStart);
+                // Mix: mostly RunFor for speed, but every slice also single-steps a burst
+                // when still inside leaf body so mergeHits cannot be missed.
+                uint pcNow = (uint)(ee.PC & 0x1FFFFFFFu);
+                if (pcNow >= FbpOrFn && pcNow < 0x001FE200u)
                 {
-                    ee.SetGpr(2, new EmotionEngine.Gpr128 { Lo = 4 }); // v0 & 4 != 0
-                    vblankPulses++;
+                    for (int b = 0; b < 512 && steps < MaxSteps; b++)
+                    {
+                        ee.Step(1);
+                        steps++;
+                        uint pc = (uint)(ee.PC & 0x1FFFFFFFu);
+                        if (pc == FbpMergePc) mergeHits++;
+                        if (pc >= FbpOrFn && pc < 0x001FE000u) leafBodyHits++;
+                        lastPc = pc;
+                        if (pc == ReturnSentinel || pc < 0x1000 || (pc & 3) != 0)
+                            break;
+                        if (pc < FbpOrFn || pc >= 0x001FE200u)
+                            break; // left leaf body → fall through to RunFor
+                    }
                 }
-                if (pc == ReturnSentinel || pc == (ReturnSentinel & 0x1FFFFFFFu))
+                else
+                {
+                    sys.RunFor(SliceCyc);
+                    slices++;
+                    steps += 64; // nominal
+                    lastPc = (uint)(ee.PC & 0x1FFFFFFFu);
+                }
+                uint pcEnd = (uint)(ee.PC & 0x1FFFFFFFu);
+                pathRing[pathN % pathRing.Length] = pcEnd;
+                pathN++;
+                lastPc = pcEnd;
+                if (pcEnd == ReturnSentinel || pcEnd == (ReturnSentinel & 0x1FFFFFFFu))
                 {
                     returned = true;
                     break;
                 }
-                if (pc < 0x1000)
+                if (pcEnd < 0x1000 || (pcEnd & 3) != 0)
                     break;
             }
             if (!returned)
@@ -1807,16 +2173,89 @@ public sealed class Burnout3Assist : IGameQuirkModule
                 ee.SetGpr(i, savedGpr[i]);
             ee.COP0_Status = savedStatus;
             ee.PC = savedPc;
+            _forceDispCase2InProgress = false;
         }
 
         _forceDispCase2++;
         uint envAfter = mem.Read32(EnvDispfbField);
         uint dispfb2After = (uint)(sys.Gs.Registers.DISPFB2 & 0xFFFFFFFFUL);
+        uint cause = ee.COP0_Cause;
+        ulong epc = ee.COP0_EPC;
+        uint badva = ee.COP0_BadVAddr;
+        int start = pathN > pathRing.Length ? pathN % pathRing.Length : 0;
+        int count = Math.Min(pathN, pathRing.Length);
+        var pathSb = new System.Text.StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0) pathSb.Append('>');
+            pathSb.Append($"{pathRing[(start + i) % pathRing.Length]:X}");
+        }
         Console.Error.WriteLine(
-            $"[B3] FORCE_DISP_CASE2 fn=0x{FbpOrFn:X8} (FBP-OR leaf) returned={returned} steps={steps} " +
-            $"stuckPC=0x{stuckPc:X8} vblankPulses={vblankPulses} FRAME1=0x{frame1:X} " +
+            $"[B3] FORCE_DISP_CASE2 fn=0x{FbpOrFn:X8} (FBP-OR leaf, hybrid+IEoff+bootSP+VBsticky) " +
+            $"returned={returned} slices={slices} steps~={steps} stuckPC=0x{stuckPc:X8} " +
+            $"mergeHits={mergeHits} leafBodyHits={leafBodyHits} " +
+            $"Cause=0x{cause:X8} EPC=0x{epc:X8} BadVAddr=0x{badva:X8} " +
+            $"spWas=0x{spBefore:X} spForce=0x{BootLikeSp:X} " +
+            $"modestate={modestate} FRAME1=0x{frame1:X} siblingFRAME=0x{frameSibling:X} " +
             $"env+10 0x{envBefore:X}->0x{envAfter:X} DISPFB2 0x{dispfb2Before:X}->0x{dispfb2After:X} " +
-            $"cyc={sys.MasterCycles}");
+            $"modeBlob@675F10 w0=0x{mb0:X} +4=0x{mb4:X} +8=0x{mb8:X} +14=0x{mb14:X} +18=0x{mb18:X} " +
+            $"+1C=0x{mb1c:X} +20=0x{mb20:X} +24=0x{mb24:X} +2C=0x{mb2c:X} +30=0x{mb30:X} +32=0x{mb32:X} +33=0x{mb33:X} " +
+            $"slotIdx=0x{slotIdx:X} gpPsm=0x{gpPsm:X} path={pathSb} cyc={sys.MasterCycles}");
+    }
+
+    /// <summary>
+    /// S337 measure-only: dump AWD pool list node states + whether stall object 0x1D6D880
+    /// appears. Env <c>DETPS2_B3_DUMP_AWD=1</c>. No writes.
+    /// </summary>
+    private void MaybeDumpAwdPool(Ps2System sys)
+    {
+        const uint Pool = 0x01E75648;
+        const uint ListOff = 56;
+        const uint StateOff = 940;
+        const uint StallObj = 0x01D6D880;
+        const int MaxWalk = 48;
+
+        _awdDumpCount++;
+        _awdDumpLastCyc = sys.MasterCycles;
+        var mem = sys.Memory;
+        uint head = mem.Read32(Pool + ListOff);
+        int n = 0, n16 = 0, n256 = 0, nOther = 0, nFreeBit = 0;
+        bool sawStall = false;
+        uint node = head;
+        var sb = new System.Text.StringBuilder();
+        while (node != 0 && n < MaxWalk)
+        {
+            if (node < 0x00100000 || node >= 0x02000000)
+            {
+                sb.Append($" BAD=0x{node:X}");
+                break;
+            }
+            uint state = mem.Read32(node + StateOff);
+            n++;
+            if (state == 16) n16++;
+            else if (state == 256) n256++;
+            else nOther++;
+            if ((state & 0x100) != 0) nFreeBit++;
+            if (node == StallObj || (node & 0x1FFFFF00u) == (StallObj & 0x1FFFFF00u))
+                sawStall = true;
+            if (n <= 12)
+                sb.Append($" [0x{node:X8} st={state}]");
+            uint next = mem.Read32(node);
+            if (next == node) break;
+            node = next;
+        }
+        // Stall object local fields.
+        uint o0 = mem.Read32(StallObj);
+        uint o4 = mem.Read32(StallObj + 4);
+        uint o8 = mem.Read32(StallObj + 8);
+        uint o940 = 0;
+        try { o940 = mem.Read32(StallObj + 940); } catch { /* ignore */ }
+        Console.Error.WriteLine(
+            $"[B3] AWD_DUMP n={_awdDumpCount} head=0x{head:X8} walked={n} " +
+            $"st16={n16} st256={n256} stOther={nOther} freeBit={nFreeBit} " +
+            $"sawStallBand={(sawStall ? 1 : 0)} " +
+            $"obj0x1D6D880: +0=0x{o0:X8} +4=0x{o4:X8} +8=0x{o8:X8} +940={o940} " +
+            $"nodes={sb} cyc={sys.MasterCycles}");
     }
 
     /// <summary>
@@ -1971,8 +2410,10 @@ public sealed class Burnout3Assist : IGameQuirkModule
         uint pc = (uint)(sys.EE.PC & 0x1FFFFFFFUL);
         uint ra = (uint)(sys.EE.GetGpr(31).Lo & 0x1FFFFFFFUL);
 
-        if (!_frontendPlanted && sys.Cdvd.SectorsRead >= 2000)
-            MaybePlantFrontendTxd(sys);
+        // S376/S379 dual-ACK: MaybePlantFrontendTxd removed permanently. Plant at
+        // FrontendScratch 0xA00000 (4 MiB) overwrote live module @0xB93A00 after reloc,
+        // nulling +0x24 and causing unreloc runaway → BADPC. Post-P4 natural pipeline
+        // no longer needs the host plant (S378 canary: 0 BADPC, healthy reloc cycle).
 
         // PATH3 M3P: transfers count while packets are held -> gifP3 climbs, px=0.
         if (sys.Gif.Path3MaskedByVif && sys.Gs.PixelsWritten == 0
@@ -2644,72 +3085,13 @@ public sealed class Burnout3Assist : IGameQuirkModule
     /// 0..a0 load table[t1] and compare — empty HLE tables never match → infinite with
     /// gifP3 climbing. Snap counters to ends and fall out of both loops.
     /// </summary>
-    /// <summary>High-RDRAM scratch for FRONTEND.TXD (~8.5 MiB).</summary>
+    /// <summary>
+    /// Historical host-plant target for FRONTEND.TXD (removed S379). Kept only as a
+    /// documentation constant — do not plant here; it collides with live modules (~0xB93A00).
+    /// </summary>
     public const uint FrontendScratch = 0x00A00000;
 
-    /// <summary>
-    /// After STG + Global.txd (cdvd>=2000), host-plant a capped FRONTEND.TXD slice so
-    /// presentation/logo walks can see real TXD payload. Wave-6: 4 MiB (was 2) so more
-    /// early mips/UI pages bind under Soft-GS without claiming a full 8+ MiB plant.
-    /// </summary>
-    private void MaybePlantFrontendTxd(Ps2System sys)
-    {
-        if (_frontendPlanted) return;
-        if (sys.Cdvd.MountedPath == null) return;
-
-        try
-        {
-            var vol = Iso9660.OpenFile(sys.Cdvd.MountedPath);
-            if (vol == null) return;
-
-            byte[]? fe = Iso9660.ReadFile(vol, "DATA/FRONTEND.TXD")
-                         ?? Iso9660.ReadFile(vol, "FRONTEND.TXD")
-                         ?? Iso9660.ReadFile(vol, "Data/FRONTEND.TXD");
-            if (fe == null || fe.Length == 0) return;
-
-            // Wave-6: 4 MiB — dir + more early mips than wave-9's 2 MiB plant.
-            // Stay below STAGEHED scratch (0x01900000) and EE stack (~0x01FF0000).
-            const int maxPlant = 4 * 1024 * 1024;
-            int n = Math.Min(fe.Length, maxPlant);
-            uint dest = FrontendScratch;
-            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE
-                || dest + (uint)n >= StageHedScratch)
-                dest = 0x00C00000;
-            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE
-                || dest + (uint)n >= StageHedScratch)
-            {
-                // Fall back to 2 MiB if 4 MiB collides with stage scratch.
-                n = Math.Min(fe.Length, 2 * 1024 * 1024);
-                dest = FrontendScratch;
-            }
-            if (dest + (uint)n >= (uint)SystemMemory.RDRAM_SIZE)
-                return;
-
-            for (int i = 0; i < n; i++)
-                sys.Memory.Write8(dest + (uint)i, fe[i]);
-
-            _frontendEeAddr = dest;
-            _frontendSize = (uint)n;
-            sys.Cdvd.NoteHostReadSectors((fe.Length + 2047) / 2048);
-
-            sys.Memory.Write32(0x0066E090, 0);
-            sys.Memory.Write32(0x0066E094, 2);
-            sys.Memory.Write32(0x0066E098, (uint)fe.Length);
-            sys.Memory.Write32(0x0066E09C, dest);
-
-            _frontendPlanted = true;
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                Console.Error.WriteLine(
-                    $"[B3] plant FRONTEND.TXD @ 0x{dest:X8} planted={n}/{fe.Length} " +
-                    $"cdvd={sys.Cdvd.SectorsRead} cyc={sys.MasterCycles}");
-        }
-        catch (Exception ex)
-        {
-            if (Environment.GetEnvironmentVariable("DETPS2_TRACE_BIOS") == "1")
-                Console.Error.WriteLine($"[B3] FRONTEND plant failed: {ex.Message}");
-            _frontendPlanted = true;
-        }
-    }
+    // MaybePlantFrontendTxd removed S379 (dual-ACK). See MaybeEscapePostTxdHang comment.
 
     private void MaybeEscapeTableWalk(Ps2System sys)
     {
