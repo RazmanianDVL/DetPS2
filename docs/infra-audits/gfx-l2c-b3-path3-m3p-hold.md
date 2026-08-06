@@ -13120,3 +13120,56 @@ S303: Ruled out prim->localmem mirror gap (WriteFrameLocal called unconditionall
       identical both times). Structural analog to the FRAME/DISPFB stale-page pattern --
       worth checking whether ZBUF_1 is also stuck on a stale/wrong page.
 ```
+
+## 304. ZBUF_1 live = page 0xD2; Soft-GS depth is host float[] not ZBUF local (Grok)
+
+Claude S303: check ZBUF_1 staleness like DISPFB.
+
+Live @ plant: `ZBUF1=0x10000D2` ZBP=**0xD2**, ZPSM=1, ZMSK=0; TEST ZTE=1 ZTST=2.
+
+Not boot-zero stale. Soft-GS depth path uses `_depthBuffer` float host array only — ZBUF FBP unused for Soft-GS depth test. 64% rejDepth is host Z semantics/clear cadence, not ZBUF page plant.
+
+```text
+S304: ZBUF ZBP=0xD2 (not 0x46). Soft-GS depth is host float[], not ZBUF local.
+```
+
+
+## 305. Hypothesis (needs external verification before trusting): DepthPass may have GEQUAL/GREATER comparison direction backwards vs real GS hardware (Claude)
+
+Following S304's clarification (Soft-GS depth is a host-side `float[] _depthBuffer`, not memory-backed via ZBUF) — traced the actual comparison logic and Z-value pipeline in `Gs.cs`.
+
+### What the code does
+
+`Gs.cs:992`: `float z = zRaw / (float)0xFFFFFF;` — direct, non-inverted normalization of raw GS Z into roughly `[0,1]`. Larger raw Z stays larger normalized `z`; no flip introduced here.
+
+`Gs.cs:1446-1453`:
+```csharp
+private static bool DepthPass(float z, float buf, int mode) => mode switch
+{
+    0 => false,                         // NEVER
+    1 => true,                          // ALWAYS
+    2 => z <= buf,                      // GEQUAL (treat as closer-or-equal with smaller z)
+    3 => z < buf,                       // GREATER → closer
+    _ => z <= buf
+};
+```
+Depth buffer is cleared to `float.MaxValue` (`Gs.cs:384,2900`), not `0`.
+
+### Why this might be backwards
+
+Real GS `ZTST` field: 0=NEVER, 1=ALWAYS, 2=GEQUAL, 3=GREATER — these names refer to comparing the *incoming fragment's* Z against the *stored* value in raw GS Z units (where larger Z = farther, matching what `Gs.cs:992`'s direct/non-inverted normalization preserves). Real hardware GEQUAL should mean "pass when incoming Z ≥ stored Z" (`z >= buf`) — i.e. prefer the *farther-or-equal* fragment. This is a real, intentionally-used PS2 rendering pattern (many titles clear Z to 0 and use GEQUAL specifically so later-submitted geometry always wins regardless of depth — an effective "no real culling, last-drawn-wins" trick, common for HUD/UI layers). The current code implements mode 2 as `z <= buf` — the *opposite* direction (prefer closer-or-equal) — and clears to `float.MaxValue` rather than `0`, which is internally consistent with the *implemented* (possibly wrong) direction but not with real hardware GEQUAL semantics. Same pattern for mode 3 (GREATER): real hardware should be `z > buf`, code has `z < buf`.
+
+**If this is really backwards**, it would systematically reject a large fraction of legitimate geometry under `ZTST=2` (confirmed live as Burnout 3's actual mode, S304) — consistent with the observed ~64% rejDepth rate being unusually high rather than ordinary scene-complexity overdraw.
+
+### Why I'm not confident enough to call this confirmed
+
+I don't have an authoritative PS2 GS spec or a cross-check against a known-real reference (e.g. PCSX2 source — this file's own doc comments elsewhere note precedent for exactly that kind of cross-check, e.g. swizzle tables "independently verified byte-for-byte against PCSX2's real GSTables.cpp") in front of me for this specific claim. It's also possible this comparison direction was deliberately chosen for good reason and works correctly for every other title exercising this path — inverting it blind risks a real regression across the whole title set, not just fixing B3. This needs verification against a real hardware/reference source before any code change, not just my re-derivation from first principles.
+
+```text
+S305: Hypothesis only, not confirmed -- DepthPass's GEQUAL (mode 2, z<=buf) and GREATER (mode
+      3, z<buf) may be backwards vs real GS hardware (should be z>=buf / z>buf respectively,
+      given Z normalization at Gs.cs:992 is non-inverted and buffer clears to float.MaxValue
+      not 0). Would explain systematic high rejDepth under B3's live-confirmed ZTST=2. Needs
+      cross-check against a real PS2 GS spec/reference (e.g. PCSX2 source) before treating as
+      fact or touching code -- flipping this blind risks regressing every other title.
+```
