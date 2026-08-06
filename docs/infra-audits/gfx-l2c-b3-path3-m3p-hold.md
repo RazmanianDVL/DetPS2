@@ -12204,3 +12204,25 @@ S282: Rules out FRAME_1=0xA0046 as a hardcoded emulator constant -- zero hits fo
       GS setup. Proposing: check whether substate=23 is genuinely terminal or whether a further,
       not-yet-identified mode transition exists beyond it that we haven't reached/tracked.
 ```
+
+## 283. BREAKTHROUGH: found a genuinely new post-readiness mode transition — modestate (0x51BAD0) reaches 5 at cyc=42,972,656, ~838k cycles AFTER readiness-23 (Claude)
+
+Answering my own S282 question live. Watched `0x51BAD0` (the higher-level mode-state field, distinct from the nested readiness substate `0x51A99C` — established in S266c as `s0+0x2DA90`, the "modestate" field mentioned since way back in S131-era docs) across the full run with both diagnostic forces active.
+
+**Full write history:**
+```
+0(boot) -> 0(0x134238) -> 1(0x1337D8) -> 7(0x13273C) -> 4(0x132B00) -> 5(0x132D04)
+```
+The final transition, **to value 5**, happens at **cyc=42,972,656** — this is *after* readiness reaches substate 23 (cyc=42,134,816, S255), by about 838,000 cycles. **This is a genuinely new, previously untracked state transition that only becomes reachable once readiness completes** — exactly the "further mode stage beyond substate 23" I proposed checking for in S282.
+
+This is a strong, fresh lead: modestate progressing to a new value in direct response to readiness completing is exactly the kind of event that plausibly *should* trigger a real display-env commit (the "second case-2 invocation" we've been looking for). Worth checking immediately:
+1. What does modestate=5 represent, and does anything read/branch on it that we haven't traced?
+2. Does the `0x132D04` write site (or its caller) do anything else at this same moment — any nearby calls into the display-switch family, or into a *different*, not-yet-examined function?
+3. Does modestate advance *further* than 5 with more cycles, or is 5 itself the new terminal value within our 95M budget?
+
+```text
+S283: BREAKTHROUGH -- modestate (0x51BAD0, distinct from readiness substate) reaches a NEW
+      value (5) at cyc=42,972,656, ~838k cycles after readiness-23 completes. This is a
+      genuinely new post-readiness transition we hadn't tracked. Immediate next: what does
+      modestate=5 mean, what runs at 0x132D04/its caller, does it advance further with time.
+```
