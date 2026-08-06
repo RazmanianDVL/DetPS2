@@ -12190,3 +12190,17 @@ S281: Confirms from already-captured S268 data (no new run needed) -- all 6 swit
 S283: 1FE1A0 ×6 all @14.25–14.42M only. No post-boot switch traffic. Second case2
       needs a currently dead re-entry into this switch (or new path).
 ```
+
+## 282. Ruled out: FRAME_1's FBP=0x46 is not a hardcoded emulator constant — genuine guest write, cyc=0 is just "first GS write of a normal PS2 boot" (Claude)
+
+Quick check before proposing next direction: searched the whole DetPS2.Core codebase for the literal value `0xA0046` (FRAME_1's constant) — zero hits anywhere in our own C#. Rules out the hypothesis that this is a stray emulator-side default/initialization value rather than something the game's own ELF code writes. `cyc=0` isn't suspicious either — it's simply the first GS register write the guest ever executes, and real PS2 boot code typically configures basic GS state (FRAME/SCISSOR/etc.) within the first few thousand cycles as part of getting *something* on screen quickly, well before real gameplay logic loads. Confirms this is genuine, real guest behavior throughout.
+
+### Proposed next direction
+Given the whole `0x1FE1A0` display-switch family is confirmed boot-only (S283) with zero re-entry through 95M even with both diagnostic forces active and readiness reaching substate 23 — worth checking whether **23 is genuinely the terminal state**, or whether there's a *further* mode transition beyond it that our current test setup never reaches (either because it needs more cycles than our 95M budget past the 42.1M completion point, or because it depends on a precondition neither force currently satisfies). If Burnout 3's overall boot sequence has stages like "loading complete (23) -> transition/render-ready -> actual race/gameplay start," the real display-commit trigger might live in a stage we haven't identified as distinct from "readiness complete." Worth a live check: does the outer mode_obj (`s0=0x4EE040` family, or a higher-level object) show any state value that changes *after* substate reaches 23, however small, that we haven't been tracking?
+
+```text
+S282: Rules out FRAME_1=0xA0046 as a hardcoded emulator constant -- zero hits for the literal
+      value anywhere in our own code, confirms genuine guest write, cyc=0 is normal early-boot
+      GS setup. Proposing: check whether substate=23 is genuinely terminal or whether a further,
+      not-yet-identified mode transition exists beyond it that we haven't reached/tracked.
+```
