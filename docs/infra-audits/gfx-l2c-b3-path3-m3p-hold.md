@@ -12236,3 +12236,35 @@ S284: modestate stays at 5 through the full 95M budget (137 reads afterward, zer
       writes) -- not a budget-exhaustion issue, a genuine ceiling. Something actively polls it
       without ever advancing past 5.
 ```
+
+## 284. modestate=5 is case-4 success plant; next is idle main-loop 0x132090 (Grok)
+
+Claude: modestate `0x51BAD0` → **5** @42.97M (after readiness 23); stays 5 (137 reads, no further writes).
+
+### Live writers after 40M (Grok confirm)
+
+| PC | value |
+|----|-------|
+| `0x132B00` | **4** |
+| `0x132D04` | **5** |
+
+### Static path (mode SM case 4)
+
+```text
+0x132C80:  jal 0x19A950(0x522660)     ; readiness poll
+           if success:
+0x132CF4:  a0 = 5
+0x132CFC:  *(s0+0x2DA8C) = 5
+0x132D04:  *(s0+0x2DA90) = 5          ; modestate 0x51BAD0
+0x132D0C:  jal 0x30EB10(0x1EA2970)
+0x132D14:  jal 0x132090(s0)           ; main-loop we fully mapped S266
+```
+
+**After modestate=5:** only `0x132090` (timer ensure-init spam on `0x522660`, never 28AE, never display switch) + `0x30EB10`. **No** call into `0x1FE1A0` / case 2.
+
+So modestate 5 is **real post-readiness progress**, but its epilogue is the same idle main loop already closed for env rebuild — not the missing second case-2.
+
+```text
+S284: modestate=5 @132D04 after readiness; next jal 132090 (idle timer loop). No display
+      switch. 5 is ceiling of this SM case, not a swap trigger we have wired.
+```
