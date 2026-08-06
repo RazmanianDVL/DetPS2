@@ -20,6 +20,18 @@ public sealed class Gs : ISchedulable
     private readonly uint[] _framebuffer = new uint[FB_WIDTH * FB_HEIGHT];
     private readonly float[] _depthBuffer = new float[FB_WIDTH * FB_HEIGHT];
 
+    /// <summary>
+    /// S306/S310 dual-ACK: when <c>DETPS2_SOFTGS_ZTST_HW=1</c>, Soft-GS uses real GS
+    /// ZTST direction (GEQUAL = z≥buf, GREATER = z&gt;buf) and clears depth to 0
+    /// (PCSX2 GSdx TestZ / GS Users Manual). Default remains the legacy dual
+    /// (LEQUAL-as-GEQUAL + clear MaxValue) until fleet soak promotes it.
+    /// </summary>
+    public static bool SoftGsHwZtst =>
+        string.Equals(Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW"), "1", StringComparison.Ordinal);
+
+    /// <summary>Depth fill for Clear/Reset: 0 under HW ZTST, float.MaxValue legacy.</summary>
+    public static float SoftGsClearDepth => SoftGsHwZtst ? 0f : float.MaxValue;
+
     // Local GS memory for BITBLT / IMAGE (1MB word-addressable subset)
     private readonly byte[] _localMem = new byte[4 * 1024 * 1024];
 
@@ -49,8 +61,13 @@ public sealed class Gs : ISchedulable
     /// PSM-only check missed this entirely.
     /// </para>
     /// </summary>
-    private readonly sbyte[] _pageLastWritePsm = CreateUntrackedPageArray(4 * 1024 * 1024 / 8192);
-    private readonly short[] _pageLastWriteStride = new short[4 * 1024 * 1024 / 8192];
+    // Per-page write history (up to 2 slots). B3 S295h: same page can receive prim CT32/640
+    // and IMAGE/upload CT32/1024; last-write-wins made present with declared 640 fail
+    // IsPageMismatched despite real content. Present is OK if ANY slot matches declared
+    // (psm,stride) — Whiplash still blocked when only the wrong stride was ever recorded.
+    private const int PageMarkSlots = 2;
+    private readonly sbyte[] _pageMarkPsm = CreateUntrackedPageArray(4 * 1024 * 1024 / 8192 * PageMarkSlots);
+    private readonly short[] _pageMarkStride = new short[4 * 1024 * 1024 / 8192 * PageMarkSlots];
 
     private static sbyte[] CreateUntrackedPageArray(int count)
     {
@@ -59,14 +76,38 @@ public sealed class Gs : ISchedulable
         return a;
     }
 
-    private void MarkPageWritten(int byteOffset, int psm, int bufW)
+    private void MarkPageWritten(int byteOffset, int psm, int bufW, bool isColorDraw = false)
     {
         int pageIdx = byteOffset / 8192;
-        if ((uint)pageIdx < (uint)_pageLastWritePsm.Length)
+        int nPages = _pageMarkPsm.Length / PageMarkSlots;
+        if ((uint)pageIdx >= (uint)nPages)
+            return;
+        short stride = (short)Math.Clamp(bufW, 0, short.MaxValue);
+        int baseSlot = pageIdx * PageMarkSlots;
+        // Already recorded this (psm,stride)?
+        for (int s = 0; s < PageMarkSlots; s++)
         {
-            _pageLastWritePsm[pageIdx] = (sbyte)psm;
-            _pageLastWriteStride[pageIdx] = (short)Math.Clamp(bufW, 0, short.MaxValue);
+            if (_pageMarkPsm[baseSlot + s] == (sbyte)psm && _pageMarkStride[baseSlot + s] == stride)
+                return;
         }
+        // Prefer color-draw into slot 0; texture/IMAGE into first free or slot 1.
+        int slot = isColorDraw ? 0 : 1;
+        if (!isColorDraw && _pageMarkPsm[baseSlot] < 0)
+            slot = 0; // first mark ever — use slot 0
+        // If draw slot occupied by a different record and this is texture, use slot 1.
+        if (isColorDraw)
+        {
+            // Shift previous draw-slot history to slot 1 if different.
+            if (_pageMarkPsm[baseSlot] >= 0
+                && (_pageMarkPsm[baseSlot] != (sbyte)psm || _pageMarkStride[baseSlot] != stride))
+            {
+                _pageMarkPsm[baseSlot + 1] = _pageMarkPsm[baseSlot];
+                _pageMarkStride[baseSlot + 1] = _pageMarkStride[baseSlot];
+            }
+            slot = 0;
+        }
+        _pageMarkPsm[baseSlot + slot] = (sbyte)psm;
+        _pageMarkStride[baseSlot + slot] = stride;
     }
 
     /// <summary>True when a composite should refuse to paint given what this page was actually last written as.</summary>
@@ -74,12 +115,65 @@ public sealed class Gs : ISchedulable
     {
         if (byteOffset < 0) return false;
         int pageIdx = byteOffset / 8192;
-        if ((uint)pageIdx >= (uint)_pageLastWritePsm.Length) return false;
-        sbyte lastPsm = _pageLastWritePsm[pageIdx];
-        if (lastPsm < 0) return false; // untracked — no opinion
-        if (lastPsm != declaredPsm) return true;
-        short lastStride = _pageLastWriteStride[pageIdx];
-        return lastStride > 0 && lastStride != declaredBufW;
+        int nPages = _pageMarkPsm.Length / PageMarkSlots;
+        if ((uint)pageIdx >= (uint)nPages) return false;
+        int baseSlot = pageIdx * PageMarkSlots;
+        // Untracked if no slots filled.
+        if (_pageMarkPsm[baseSlot] < 0 && _pageMarkPsm[baseSlot + 1] < 0)
+            return false;
+        // Match if ANY history slot is compatible with declared (psm,stride).
+        for (int s = 0; s < PageMarkSlots; s++)
+        {
+            sbyte lastPsm = _pageMarkPsm[baseSlot + s];
+            if (lastPsm < 0) continue;
+            if (!PsmsCompatibleForPresent(lastPsm, declaredPsm)) continue;
+            short lastStride = _pageMarkStride[baseSlot + s];
+            if (lastStride <= 0 || lastStride == declaredBufW)
+                return false; // compatible mark found
+        }
+        return true; // all recorded marks disagree
+    }
+
+    /// <summary>PSMs that share a present decode path / bit depth (not full GS equality).</summary>
+    private static bool PsmsCompatibleForPresent(int lastPsm, int declaredPsm)
+    {
+        if (lastPsm == declaredPsm) return true;
+        // PSMCT32 (0) and PSMCT24 (1) both use SwizzleOffset32 + 32-bit page layout.
+        static bool IsCt32Family(int p) => p is 0x00 or 0x01;
+        if (IsCt32Family(lastPsm) && IsCt32Family(declaredPsm)) return true;
+        // PSMCT16 (2) vs PSMCT16S (0x0A) are NOT compatible (different block tables).
+        return false;
+    }
+
+    /// <summary>B3 S295e dig: census of page marks for an FBP base (pages of 8192 bytes).</summary>
+    public string DescribePageMarks(int fbpPage, int pageCount = 16)
+    {
+        int start = fbpPage;
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"fbp={fbpPage} pages={pageCount}");
+        var hist = new System.Collections.Generic.Dictionary<string, int>();
+        int nPages = _pageMarkPsm.Length / PageMarkSlots;
+        for (int i = 0; i < pageCount; i++)
+        {
+            int idx = start + i;
+            if ((uint)idx >= (uint)nPages) break;
+            int baseSlot = idx * PageMarkSlots;
+            bool any = false;
+            for (int s = 0; s < PageMarkSlots; s++)
+            {
+                sbyte psm = _pageMarkPsm[baseSlot + s];
+                if (psm < 0) continue;
+                any = true;
+                short stride = _pageMarkStride[baseSlot + s];
+                string key = $"psm=0x{psm:X}/str={stride}";
+                hist[key] = hist.TryGetValue(key, out int c) ? c + 1 : 1;
+            }
+            if (!any)
+                hist["untracked"] = hist.TryGetValue("untracked", out int u) ? u + 1 : 1;
+        }
+        foreach (var kv in hist)
+            sb.Append($" {kv.Key}×{kv.Value}");
+        return sb.ToString();
     }
 
     /// <summary>
@@ -143,6 +237,17 @@ public sealed class Gs : ISchedulable
     public long TexSamplesLocal { get; private set; }
     public long FragmentsRejectedAlpha { get; private set; }
     public long TexFlushCount { get; private set; }
+
+    // S318 measure: alpha-reject census (DETPS2_SOFTGS_ALPHA_CENSUS=1).
+    private readonly long[] _alphaRejAtst = new long[8];
+    private readonly long[] _alphaRejAfail = new long[4];
+    private readonly long[] _alphaRejArefHi = new long[16]; // AREF >> 4
+    private readonly long[] _alphaRejAHi = new long[16];    // frag A >> 4
+    private long _alphaRejTme, _alphaRejUntme;
+    private int _alphaRejSamples;
+    // S320 (A): where did the zero come from? vertex vs tex vs modulate.
+    private long _alphaRejVertRgb0, _alphaRejVertA0, _alphaRejTexRgb0, _alphaRejTexA0;
+    private long _alphaRejBothZero, _alphaRejVertOnly0, _alphaRejTexOnly0, _alphaRejModulateZeroed;
     /// <summary>Phase 42: nearest (false) or bilinear (true) when sampling non-procedural textures.</summary>
     public bool BilinearFilter { get; set; }
     public long BilinearSamples { get; private set; }
@@ -297,9 +402,10 @@ public sealed class Gs : ISchedulable
         _clutBase = 0;
         _hasClut = false;
         Array.Clear(_clut);
-        // Default depth far
+        // Default depth: far (legacy MaxValue) or 0 under DETPS2_SOFTGS_ZTST_HW (S310).
+        float zClear = SoftGsClearDepth;
         for (int i = 0; i < _depthBuffer.Length; i++)
-            _depthBuffer[i] = float.MaxValue;
+            _depthBuffer[i] = zClear;
     }
 
     /// <summary>TEXFLUSH — invalidate texture cache (stat only; soft GS samples local mem live).</summary>
@@ -1259,10 +1365,13 @@ public sealed class Gs : ISchedulable
         }
 
         uint final = color;
+        uint texSample = 0;
+        bool hadTex = false;
         if (Registers.PrimTme)
         {
-            uint tex = SampleTexture(u, v);
-            final = Modulate(color, tex);
+            texSample = SampleTexture(u, v);
+            final = Modulate(color, texSample);
+            hadTex = true;
         }
 
         // Alpha test — ATE; AFAIL bits 12-13: 0=KEEP 1=FB_ONLY 2=ZB_ONLY 3=RGB_ONLY
@@ -1271,6 +1380,7 @@ public sealed class Gs : ISchedulable
         if (!alphaPass)
         {
             FragmentsRejectedAlpha++;
+            NoteAlphaReject(color, hadTex ? texSample : null, final, afail);
             if (afail == 0)
                 return; // KEEP
             if (afail == 2)
@@ -1334,7 +1444,7 @@ public sealed class Gs : ISchedulable
         {
             int bi = (int)SwizzleOffset32(baseBytes, x, y, fbw);
             if ((uint)bi + 3u >= (uint)_localMem.Length) return;
-            MarkPageWritten(bi, psm, fbw);
+            MarkPageWritten(bi, psm, fbw, isColorDraw: true);
             _localMem[bi] = (byte)pixel;
             _localMem[bi + 1] = (byte)(pixel >> 8);
             _localMem[bi + 2] = (byte)(pixel >> 16);
@@ -1354,21 +1464,40 @@ public sealed class Gs : ISchedulable
                 ? (int)SwizzleOffset16S(baseBytes, x, y, fbw)
                 : (int)SwizzleOffset16(baseBytes, x, y, fbw);
             if ((uint)bi + 1u >= (uint)_localMem.Length) return;
-            MarkPageWritten(bi, psm, fbw);
+            MarkPageWritten(bi, psm, fbw, isColorDraw: true);
             _localMem[bi] = (byte)p16;
             _localMem[bi + 1] = (byte)(p16 >> 8);
             _localMemHasImage = true;
         }
     }
 
-    private static bool DepthPass(float z, float buf, int mode) => mode switch
+    /// <summary>
+    /// ZTST: 0=NEVER 1=ALWAYS 2=GEQUAL 3=GREATER.
+    /// HW mode (DETPS2_SOFTGS_ZTST_HW): real GS — pass when z≥buf / z&gt;buf (PCSX2 TestZ).
+    /// Legacy default: inverted dual (smaller-wins + clear MaxValue).
+    /// </summary>
+    private static bool DepthPass(float z, float buf, int mode)
     {
-        0 => false,                         // NEVER
-        1 => true,                          // ALWAYS
-        2 => z <= buf,                      // GEQUAL (treat as closer-or-equal with smaller z)
-        3 => z < buf,                       // GREATER → closer
-        _ => z <= buf
-    };
+        if (SoftGsHwZtst)
+        {
+            return mode switch
+            {
+                0 => false,        // NEVER
+                1 => true,         // ALWAYS
+                2 => z >= buf,     // GEQUAL — PCSX2: fail if zs < zd
+                3 => z > buf,      // GREATER — PCSX2: fail if zs <= zd
+                _ => z >= buf
+            };
+        }
+        return mode switch
+        {
+            0 => false,                         // NEVER
+            1 => true,                          // ALWAYS
+            2 => z <= buf,                      // legacy: LEQUAL-as-GEQUAL
+            3 => z < buf,                       // legacy: LESS-as-GREATER
+            _ => z <= buf
+        };
+    }
 
     /// <summary>
     /// GS texture MODULATE: components multiply with 0x80 = 1.0 (not 0xFF).
@@ -1773,6 +1902,99 @@ public sealed class Gs : ISchedulable
         };
     }
 
+    private void NoteAlphaReject(uint vert, uint? tex, uint final, int afail)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ALPHA_CENSUS"), "1", StringComparison.Ordinal))
+            return;
+        ulong test = Registers.TEST_1;
+        int atst = (int)((test >> 1) & 7);
+        int aref = (int)((test >> 4) & 0xFF);
+        int a = (int)((final >> 24) & 0xFF);
+        _alphaRejAtst[atst & 7]++;
+        _alphaRejAfail[afail & 3]++;
+        _alphaRejArefHi[(aref >> 4) & 15]++;
+        _alphaRejAHi[(a >> 4) & 15]++;
+        if (Registers.PrimTme) _alphaRejTme++;
+        else _alphaRejUntme++;
+
+        bool vRgb0 = (vert & 0x00FFFFFFu) == 0;
+        bool vA0 = ((vert >> 24) & 0xFF) == 0;
+        if (vRgb0) _alphaRejVertRgb0++;
+        if (vA0) _alphaRejVertA0++;
+        if (tex is uint t)
+        {
+            bool tRgb0 = (t & 0x00FFFFFFu) == 0;
+            bool tA0 = ((t >> 24) & 0xFF) == 0;
+            if (tRgb0) _alphaRejTexRgb0++;
+            if (tA0) _alphaRejTexA0++;
+            bool fRgb0 = (final & 0x00FFFFFFu) == 0;
+            if (vRgb0 && tRgb0) _alphaRejBothZero++;
+            else if (vRgb0 && !tRgb0) _alphaRejVertOnly0++;
+            else if (!vRgb0 && tRgb0) _alphaRejTexOnly0++;
+            else if (!vRgb0 && !tRgb0 && fRgb0) _alphaRejModulateZeroed++;
+        }
+
+        if (_alphaRejSamples < 12)
+        {
+            _alphaRejSamples++;
+            string texS = tex is uint tv ? $"0x{tv:X8}" : "n/a";
+            ulong tex0 = Registers.TEX0_1;
+            // S321 branch close: is local mem at TBP also black, or is SampleTexture lying?
+            uint tbpWords = (uint)(tex0 & 0x3FFF);
+            int tbpBytes = (int)(tbpWords * 64);
+            int localNz = 0, localScan = 0;
+            if (tbpBytes >= 0 && tbpBytes < _localMem.Length)
+            {
+                int scan = Math.Min(4096, _localMem.Length - tbpBytes);
+                for (int i = 0; i < scan; i++)
+                {
+                    localScan++;
+                    if (_localMem[tbpBytes + i] != 0) localNz++;
+                }
+            }
+            Console.Error.WriteLine(
+                $"[SOFTGS-ALPHA-REJ] n={_alphaRejSamples} ATST={atst} AREF=0x{aref:X2} AFAIL={afail} " +
+                $"vert=0x{vert:X8} tex={texS} final=0x{final:X8} fragA=0x{a:X2} " +
+                $"tme={(Registers.PrimTme ? 1 : 0)} TEX0=0x{tex0:X} tbpB=0x{tbpBytes:X} localNz={localNz}/{localScan} " +
+                $"TEST1=0x{(uint)(test & 0xFFFFFFFF):X}");
+        }
+    }
+
+    /// <summary>S318/S320 measure: dump alpha-reject histograms (env DETPS2_SOFTGS_ALPHA_CENSUS=1).</summary>
+    public string DescribeAlphaCensus()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"alphaRej={FragmentsRejectedAlpha} tme={_alphaRejTme} untme={_alphaRejUntme}");
+        sb.Append(" atst=[");
+        for (int i = 0; i < 8; i++)
+        {
+            if (i > 0) sb.Append(' ');
+            sb.Append($"{i}:{_alphaRejAtst[i]}");
+        }
+        sb.Append("] afail=[");
+        for (int i = 0; i < 4; i++)
+        {
+            if (i > 0) sb.Append(' ');
+            sb.Append($"{i}:{_alphaRejAfail[i]}");
+        }
+        sb.Append("] arefHi=[");
+        for (int i = 0; i < 16; i++)
+        {
+            if (_alphaRejArefHi[i] == 0) continue;
+            sb.Append($" {(i << 4):X2}..:{_alphaRejArefHi[i]}");
+        }
+        sb.Append(" ] aHi=[");
+        for (int i = 0; i < 16; i++)
+        {
+            if (_alphaRejAHi[i] == 0) continue;
+            sb.Append($" {(i << 4):X2}..:{_alphaRejAHi[i]}");
+        }
+        sb.Append(" ]");
+        sb.Append($" srcZero vRgb0={_alphaRejVertRgb0} vA0={_alphaRejVertA0} tRgb0={_alphaRejTexRgb0} tA0={_alphaRejTexA0}");
+        sb.Append($" both0={_alphaRejBothZero} vertOnly0={_alphaRejVertOnly0} texOnly0={_alphaRejTexOnly0} modZ={_alphaRejModulateZeroed}");
+        return sb.ToString();
+    }
+
     /// <summary>Upload texture pixels into local GS memory (PSMCT32).</summary>
     public void UploadTexture(int destWordAddr, int width, int height, ReadOnlySpan<uint> pixels)
     {
@@ -2084,10 +2306,11 @@ public sealed class Gs : ISchedulable
     public void RenderTestScene()
     {
         uint bg = 0xFF1A1A3A;
+        float zClear = SoftGsClearDepth;
         for (int i = 0; i < _framebuffer.Length; i++)
         {
             _framebuffer[i] = bg;
-            _depthBuffer[i] = float.MaxValue;
+            _depthBuffer[i] = zClear;
         }
 
         _useProceduralTexture = true;
@@ -2530,6 +2753,8 @@ public sealed class Gs : ISchedulable
             psm = 0x00;
 
         long written = 0;
+        long dbgBlack = 0, dbgMismatch = 0, dbgMergeSkip = 0, dbgOk = 0;
+        bool dbg = Environment.GetEnvironmentVariable("DETPS2_TRACE_COMPOSITE") == "1";
         // Host Soft-GS FB is a fixed 640×448 present buffer. DISPLAY Width/Height clamp the
         // *source* window size, but CRT DX/DY blanking offsets must NOT become Soft-GS dest
         // offsets — they were clipping commercial logos to a thin strip (Dec/Vexx out+160,50).
@@ -2551,7 +2776,7 @@ public sealed class Gs : ISchedulable
                 int sx = dbx + x;
                 int sy = dby + y;
                 uint pixel = LoadLocalPixelForPresent(baseBytes, sx, sy, fbw, psm, out int bi);
-                if ((pixel & 0x00FFFFFF) == 0) continue;
+                if ((pixel & 0x00FFFFFF) == 0) { dbgBlack++; continue; }
                 // Don't paint a pixel whose backing page was demonstrably last written in a
                 // different format or stride than this composite is decoding it as — reading
                 // swizzled bytes with the wrong PSM/stride produces scrambled static, not a real
@@ -2564,8 +2789,12 @@ public sealed class Gs : ISchedulable
                 // as dishonest as the natural path doing it; "Host→Local residual" only means
                 // non-natural sourcing, not license to reinterpret bytes in a layout they were
                 // never written in.
-                if (IsPageMismatched(bi, psm, fbw))
-                    continue;
+                // Measure: DETPS2_SOFTGS_ALLOW_PAGE_MISMATCH=1 (B3 S295d content-on-page but
+                // natural paints 0 — test whether PSM/stride gate is the wall). Default off.
+                // Multi-mark history (B3 S295j dual-ACK): any matching (psm,stride) slot allows.
+                if (IsPageMismatched(bi, psm, fbw)
+                    && Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ALLOW_PAGE_MISMATCH") != "1")
+                { dbgMismatch++; continue; }
                 int dx = dstOx + x;
                 int dy = dstOy + y;
                 if ((uint)dx >= (uint)FB_WIDTH || (uint)dy >= (uint)FB_HEIGHT) continue;
@@ -2574,11 +2803,17 @@ public sealed class Gs : ISchedulable
                 // Pure black (0xFF000000) is *not* chrome — commercial clears stamp full FB
                 // black (BO2 px=286720 lit=0); allow IMAGE under DISPFB to replace it.
                 if (mergeMode && (_framebuffer[idx] & 0x00FFFFFF) != 0)
-                    continue;
+                { dbgMergeSkip++; continue; }
                 _framebuffer[idx] = pixel | 0xFF000000u;
                 written++;
+                dbgOk++;
             }
         }
+        if (dbg)
+            Console.Error.WriteLine(
+                $"[SOFTGS-COMPOSITE] fbp={fbp} fbw={fbw} psm=0x{psm:X} fromDispfb={fromDispfb} " +
+                $"synth={syntheticFb} merge={mergeMode} w={w}xh={h} " +
+                $"black={dbgBlack} mismatch={dbgMismatch} mergeSkip={dbgMergeSkip} ok={dbgOk} written={written}");
         return written;
     }
 
@@ -2684,7 +2919,8 @@ public sealed class Gs : ISchedulable
                 if ((pixel & 0x00FFFFFF) == 0) continue;
                 // See CompositeLocalToFb's identical check: don't paint a pixel whose backing
                 // page was demonstrably last written in a different format/stride than declared here.
-                if (IsPageMismatched(bi, psm, fbw))
+                if (IsPageMismatched(bi, psm, fbw)
+                    && Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ALLOW_PAGE_MISMATCH") != "1")
                     continue;
                 if ((uint)x >= (uint)FB_WIDTH || (uint)y >= (uint)FB_HEIGHT) continue;
                 int idx = y * FB_WIDTH + x;
@@ -2798,11 +3034,48 @@ public sealed class Gs : ISchedulable
     public uint GetPixel(int x, int y) =>
         (x < 0 || y < 0 || x >= FB_WIDTH || y >= FB_HEIGHT) ? 0 : _framebuffer[y * FB_WIDTH + x];
 
+    /// <summary>
+    /// S306 measure-only: host Soft-GS depth census (not guest ZBUF local).
+    /// Legacy clear sentinel is MaxValue; HW mode clears to 0 (then zeroCount is ambiguous).
+    /// </summary>
+    public string DescribeHostDepthStats()
+    {
+        int n = _depthBuffer.Length;
+        int cleared = 0, written = 0, zeros = 0, nonzero = 0;
+        float min = float.MaxValue, max = float.MinValue;
+        double sum = 0;
+        bool hw = SoftGsHwZtst;
+        for (int i = 0; i < n; i++)
+        {
+            float d = _depthBuffer[i];
+            if (!hw && d >= float.MaxValue * 0.5f) // legacy far sentinel
+            {
+                cleared++;
+                continue;
+            }
+            if (d == 0f) zeros++;
+            else nonzero++;
+            written++;
+            if (d < min) min = d;
+            if (d > max) max = d;
+            sum += d;
+        }
+        long ft = FragmentsTested;
+        long rd = FragmentsRejectedDepth;
+        string rej = ft > 0 ? $"{(100.0 * rd / ft):F1}%" : "n/a";
+        string mode = hw ? "hw" : "legacy";
+        if (written == 0)
+            return $"hostZ mode={mode} cleared={cleared}/{n} written=0 fragTest={ft} rejDepth={rd}({rej})";
+        return $"hostZ mode={mode} cleared={cleared}/{n} written={written} zeros={zeros} nz={nonzero} " +
+               $"min={min:F4} max={max:F4} mean={(sum / written):F4} " +
+               $"fragTest={ft} rejDepth={rd}({rej}) px={PixelsWritten}";
+    }
+
     /// <summary>Bulk clear using Span fill (hot path).</summary>
     public void ClearFast(uint color)
     {
         _framebuffer.AsSpan().Fill(color);
-        _depthBuffer.AsSpan().Fill(float.MaxValue);
+        _depthBuffer.AsSpan().Fill(SoftGsClearDepth);
         // FB wipe must not leave merge-composite cache thinking chrome is still present.
         InvalidatePresentCompositeCache();
     }
@@ -2830,12 +3103,17 @@ public sealed class Gs : ISchedulable
         PrimitivesDrawn++;
     }
 
-    public void Clear(uint color, float depth = float.MaxValue)
+    /// <param name="depth">
+    /// Depth fill. Pass <see cref="float.NaN"/> (default) to use <see cref="SoftGsClearDepth"/>
+    /// (0 under DETPS2_SOFTGS_ZTST_HW, MaxValue legacy). Explicit values still honoured.
+    /// </param>
+    public void Clear(uint color, float depth = float.NaN)
     {
+        float z = float.IsNaN(depth) ? SoftGsClearDepth : depth;
         for (int i = 0; i < _framebuffer.Length; i++)
         {
             _framebuffer[i] = color;
-            _depthBuffer[i] = depth;
+            _depthBuffer[i] = z;
         }
         // FB wipe must not leave merge-composite cache thinking chrome is still present.
         InvalidatePresentCompositeCache();

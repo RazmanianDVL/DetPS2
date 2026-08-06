@@ -181,25 +181,70 @@ public static class SmokeTests
         Console.WriteLine("[Smoke] Gs_Sprite_FillsRect OK");
     }
 
+    /// <summary>
+    /// Legacy Soft-GS dual: clear MaxValue + LEQUAL-as-GEQUAL (smaller wins).
+    /// Far (0.9) after near (0.1) is rejected. Default path when DETPS2_SOFTGS_ZTST_HW unset.
+    /// </summary>
     public static void Gs_DepthTest_RejectsFar()
     {
-        var sys = new Ps2System();
-        sys.Gs.Clear(0xFF000000, float.MaxValue);
-        // Enable ZTE + ZTST=GREATER (3) + write: bits 16=1, 17-18=3, 19=0. TEST_1 is real
-        // address 0x47 (was wrongly 0x52 — TRXREG's real address — before the GS register
-        // map fix).
-        sys.Gs.WriteGsRegister(0x47, (1u << 16) | (3u << 17));
-        // Near triangle (small z)
-        sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFF00FF00, 0.1f, 0.1f, 0.1f);
-        uint nearPix = sys.Gs.GetPixel(250, 230);
-        // Far triangle over same area
-        sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFFFF0000, 0.9f, 0.9f, 0.9f);
-        uint after = sys.Gs.GetPixel(250, 230);
-        if ((after & 0xFFFFFF) != (nearPix & 0xFFFFFF))
-            throw new Exception($"Far fragment should be rejected; got 0x{after:X8} expected green 0x{nearPix:X8}");
-        if (sys.Gs.FragmentsRejectedDepth <= 0)
-            throw new Exception("Expected depth rejects");
-        Console.WriteLine("[Smoke] Gs_DepthTest_RejectsFar OK");
+        string? prev = Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW");
+        try
+        {
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", null);
+            var sys = new Ps2System();
+            sys.Gs.Clear(0xFF000000, float.MaxValue);
+            // Enable ZTE + ZTST=GREATER (3) + write: bits 16=1, 17-18=3. TEST_1 addr 0x47.
+            sys.Gs.WriteGsRegister(0x47, (1u << 16) | (3u << 17));
+            // Near triangle (small z)
+            sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFF00FF00, 0.1f, 0.1f, 0.1f);
+            uint nearPix = sys.Gs.GetPixel(250, 230);
+            // Far triangle over same area
+            sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFFFF0000, 0.9f, 0.9f, 0.9f);
+            uint after = sys.Gs.GetPixel(250, 230);
+            if ((after & 0xFFFFFF) != (nearPix & 0xFFFFFF))
+                throw new Exception($"Far fragment should be rejected; got 0x{after:X8} expected green 0x{nearPix:X8}");
+            if (sys.Gs.FragmentsRejectedDepth <= 0)
+                throw new Exception("Expected depth rejects");
+            Console.WriteLine("[Smoke] Gs_DepthTest_RejectsFar OK (legacy)");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", prev);
+        }
+    }
+
+    /// <summary>
+    /// S310 DETPS2_SOFTGS_ZTST_HW: real GS GEQUAL (z≥buf) + clear-to-0.
+    /// Larger Z wins; smaller fragment after a far write is rejected (PCSX2 TestZ).
+    /// </summary>
+    public static void Gs_DepthTest_HwGequal_RejectsSmaller()
+    {
+        string? prev = Environment.GetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW");
+        try
+        {
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", "1");
+            var sys = new Ps2System();
+            sys.Gs.Clear(0xFF000000); // SoftGsClearDepth → 0
+            // ZTE + ZTST=GEQUAL (2)
+            sys.Gs.WriteGsRegister(0x47, (1u << 16) | (2u << 17));
+            // Far (large z) first — red
+            sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFFFF0000, 0.9f, 0.9f, 0.9f);
+            uint farPix = sys.Gs.GetPixel(250, 230);
+            if ((farPix & 0xFFFFFF) != 0xFF0000)
+                throw new Exception($"Far should paint red; got 0x{farPix:X8}");
+            // Near (small z) — green; hardware GEQUAL rejects zs < zd
+            sys.Gs.DrawScreenTriangle(200, 200, 300, 200, 250, 300, 0xFF00FF00, 0.1f, 0.1f, 0.1f);
+            uint after = sys.Gs.GetPixel(250, 230);
+            if ((after & 0xFFFFFF) != 0xFF0000)
+                throw new Exception($"Smaller Z should be rejected under HW GEQUAL; got 0x{after:X8} expected red");
+            if (sys.Gs.FragmentsRejectedDepth <= 0)
+                throw new Exception("Expected depth rejects under HW GEQUAL");
+            Console.WriteLine("[Smoke] Gs_DepthTest_HwGequal_RejectsSmaller OK");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DETPS2_SOFTGS_ZTST_HW", prev);
+        }
     }
 
     /// <summary>
@@ -1456,6 +1501,7 @@ press 3000 Circle 100
 
             Gs_Sprite_FillsRect();
             Gs_DepthTest_RejectsFar();
+            Gs_DepthTest_HwGequal_RejectsSmaller();
             Gs_Modulate80_AlphaTestPasses();
             Gs_Xyz2_Kicks_Xyz3_DoesNot();
             GsPipeline_DumpSoftGsIfDrawn_AndExpandHitsMetric();
