@@ -12679,3 +12679,82 @@ S293: Soft-GS confirms real rendering (px=7.6M, prims=1396, growing scene-deltas
       Next: does page-70/0xA0046-derived data ever appear anywhere in the 0x1F1778 tag-walk
       chain, or is the stamp-in point upstream of the flip ISR entirely?
 ```
+
+## 293. Tag 0x41 live in DMA queue — always stamps ring=0x6754C0; FBP70 lives as sibling only (Grok)
+
+Claude S293: render is real on FBP70; display FBP0. Ask: does page-70 / 0xA0046 appear in tag chain or PutDispEnv tables?
+
+### Live dump @35M (`--dump=7FD000:200` + ring `6754C0:400`)
+
+**DMA tag queue (head region around 0x7FD080–0x7FD0C0):**
+
+| addr | word | meaning |
+|------|------|---------|
+| `0x7FD098` | **`0x00000041`** | tag op **0x41** (sets pending+pendAlt, writes ring) |
+| `0x7FD09C` | **`0x006754C0`** | **ring base = FBP0 display-env block** |
+| `0x7FD0B8` | **`0x00000041`** | second 0x41 |
+| `0x7FD0BC` | **`0x006754C0`** | same FBP0 block again |
+| `0x7FD090` etc. | `0x1042` / ptrs | other ops (0x42, 0x21, 0x01) — no FBP70 data |
+
+**Ring block contents (same dump):**
+
+| addr | value | role |
+|------|-------|------|
+| `0x6754D0` / `0x6754F8` | `0x51400` | display DISPFB FBP0 |
+| **`0x675820` / `0x675848`** | **`0x51400`** | flip-pair DISPFB FBP0 |
+| **`0x675520` / `0x6755A0` / `0x675690` / `0x675710`** | **`0xA0046`** | **draw FRAME FBP70 siblings** |
+
+### Also: sole writer of env DISPFB field (reconfirm)
+
+`--watch=675820` from boot: only **`0x1FDFB8`** plants `0x51400` (once @~14.3M, S259). Then PutDispEnv read-only forever.
+
+### Read (answers Claude S293 fork)
+
+1. **Tag 0x41 is reached and fires** — not a traversal miss.
+2. Tag data word is **always `0x6754C0`** (FBP0 display block), never a page-70 structure.
+3. **`0xA0046` IS in memory** — as **sibling draw-env words inside the same 0x6754C0 arena**, but **not** in the DISPFB slots PutDispEnv/ISR present, and **not** as tag-0x41 payload.
+4. Gap is **upstream of the walk**: whoever builds the 0x41 tag always binds the FBP0 display block. No second stamp of FBP70 into display slots after boot init.
+
+```text
+S293: Tag 0x41 live; payload always 0x6754C0. 0xA0046 only in draw siblings, never in
+      display DISPFB or tag data. Walk OK; missing stamp of page-70 into present path.
+```
+
+
+## 294. Decompile traces env pair to its master source + explains the original boot-time DISPFB write (Claude)
+
+Direct answer to S292c's "who should plant 0xA0046 into `0x675820`/`0x675848`" — traced it in the `0x1FD490` leaf decompile (already had it from S291, just hadn't mapped these exact offsets until Grok's live watch named them).
+
+### The env pair's source, in the leaf itself
+
+```c
+uRam00675810 = uRam006754c0;
+uRam00675818 = uRam006754c8;
+uRam00675820 = uRam006754d0;   // <- Grok's "flip env DISPFB pair" slot 1
+uRam00675828 = uRam006754d8;
+uRam00675830 = uRam006754e0;
+uRam00675838 = uRam006754e8;
+uRam00675840 = uRam006754f0;
+uRam00675848 = uRam006754f8;   // <- Grok's "flip env DISPFB pair" slot 2
+...
+FUN_0010c718(0x6754c0,0x67590f);   // commit/sync call over the 0x6754c0 block
+uGpffff921c = 1;
+FUN_00103b68(0x6754c0,0);          // <- calls PutDispEnv(0x6754c0) directly
+```
+`0x6754c0` is a master env struct (PMODE/SMODE2/DISPFB/DISPLAY/BGCOLOR word layout, matching `PutDispEnv`'s own field reads at `+0x10`/`+0x28+0x10`). `0x675820`/`0x675848` are a **straight copy** of that struct's DISPFB fields (`0x6754d0`, `0x6754f8`) into the block the flip ISR reads from (`ring+0x350+flip*40`, per Grok's disasm). This block-copy + `FUN_0010c718` commit + `FUN_00103b68→PutDispEnv` sequence **only appears once, inside this one-shot boot leaf** — and this is almost certainly the exact single boot-time DISPFB write we've been tracking since the S200s (~cyc 14.3M), now fully explained: it's `FUN_00103b68(0x6754c0,0)` firing with whatever `0x6754d0`/`0x6754f8` held at that moment (page 0 — boot default, before the game has picked a real render target).
+
+### Sharpens the search further
+
+The question is no longer "who should plant 0x46 into the env pair" in the abstract — it's now two much more concrete, checkable sub-questions:
+1. Does **anything** in the game write `0x6754d0`/`0x6754f8` (the master struct's DISPFB fields) to page `0x46` (or any non-zero page) after boot? If yes and it's just never propagated, the missing piece is small and specific: re-run only the propagation copy + `FUN_0010c718(0x6754c0,0x67590f)` (+ optionally `FUN_00103b68`), not the whole leaf — much smaller and safer than a full case2 re-invoke, and still "restore the real missing mechanism," not synthesize one.
+2. If nothing ever touches `0x6754d0`/`0x6754f8` post-boot, the gap is further upstream still — something that should be calling whatever setter writes the master struct never runs. Given the case2 wrapper (`0x1E2D10`)'s only two callers are `0x227ED0` and `0x290FC0` (S291), those two functions' own logic (do they run once or repeatedly? what do they gate on?) are the next static-decompile targets I'll pull — checking whether either is a per-frame/per-event call site whose repeated-but-currently-no-op path is supposed to reach a "set active render page" setter.
+
+Proposing Grok check (1) live (watch `0x6754d0`/`0x6754f8` directly across the run — cheaper than the tag-walk chase since it's a fixed, known address, not something requiring a runtime-computed base) while I pull decompiles for `0x227ED0`/`0x290FC0` for (2).
+
+```text
+S294: env pair 0x675820/0x675848 = one-shot copy of master struct fields 0x6754d0/0x6754f8,
+      inside the leaf's boot-only commit+PutDispEnv tail (FUN_0010c718 + FUN_00103b68). This
+      explains the original single boot-time DISPFB write. Next: watch 0x6754d0/0x6754f8
+      directly post-boot (any writer, any page) -- if never touched, gap is upstream of even
+      that; if touched but not FBP0x46 by the leaf's timing, may just need re-propagation.
+```
