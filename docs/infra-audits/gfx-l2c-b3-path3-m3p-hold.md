@@ -12354,3 +12354,26 @@ S287: 0x3767B0 writes constant 1 to a sibling field every frame, not a counter. 
       the case-5-to-6 transition search. Genuinely recurring (real distinct cycles), just not
       the mechanism we're looking for.
 ```
+
+## 287. No ELF plant of modestate 6/7/8 via fixed li; case 5 is terminal (Grok)
+
+Claude: `0x3767B0` is per-frame heartbeat (sw 1) — dead end for progress.
+
+### Fixed `li` plants of modestate (`sw` to +0x2DA90)
+
+| value | store PC | reachable from case? |
+|-------|----------|----------------------|
+| 4 | 0x132B00, 0x132C44, 0x132C7C | case 4 / siblings |
+| **5** | **0x132D04** | case 4 success |
+| 9 | 0x132BBC | inside case 8 body |
+| 11 | 0x1329F0 | inside case 10 body |
+| 12 | 0x132A78 | inside case 7? body |
+
+**No `li` plant of 6, 7, or 8.** Jumptable has cases 6–8, but nothing in the fixed-imm plant set writes those values (only variable `sw v0` at `0x1337D8` could). Live climb used 1 and 7 early — those come from other writers — but **after 5 there is no fixed path to 6+**.
+
+Case 5 body never plants a new modestate. Therefore **5 is a true terminal** under this SM’s own plant graph: cannot reach the cases that plant 9/11/12 without first leaving 5 by another means.
+
+```text
+S287: No li plant of modestate 6/7/8. Case5 never advances. 9/11/12 plants require
+      already being in those cases. Terminal at 5 is structural plant-graph dead-end.
+```
