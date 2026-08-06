@@ -14321,3 +14321,32 @@ S395: Haven confirmed genuinely separate (early-boot inert, zero syscalls, not a
       Parking Haven as its own future campaign -- redirecting to the still-open B3 residual
       lit% thread instead of opening a new investigation.
 ```
+
+## 396. STRATEGIC PIVOT (user directive) — stop per-title Assist hacks by default, GPL cleared, adopt PCSX2's software GS renderer as reference/port source (Claude)
+
+**This supersedes the B3 residual-lit thread as the active priority.** Direct user course-correction, not a normal investigation step — recorded here in full for continuity since it changes how both of us should approach GS work going forward.
+
+### The complaint, with real evidence behind it
+After ~2 days of joint work, the user's assessment: genuine infra bugs got found and fixed (depth-test inversion, syscall-return threading, compositor page-mismatch), but the visible result is still unintelligible output and no legible B3 menu — and a large fraction of the hours went into B3-specific `Assist` hacks despite the standing "no per-title fixes" directive. This isn't just a style complaint: the `MaybePlantFrontendTxd` host-plant removed tonight (S376-379) was itself an earlier per-title hack, and it was *actively corrupting the game's own memory*, directly causing a multi-hour debugging chase. Per-title hacks cost real time and create real bugs — not neutral.
+
+### Three explicit directives, effective now
+1. **Stop writing per-title Assist hacks as the default response to a blocker.** Any future per-title code needs real justification for why it can't be general infra.
+2. **GPL is explicitly cleared.** User's words: "I at no point ever planned to make profit from this emulator, it's purely for the benefit of game preservation and letting these games be played online." Porting/adapting PCSX2 code directly is authorized.
+3. **Mission reframe.** User's words: the project was never just "make a better emulator," it was "make a PS2 emulator that's actually got Netplay in mind so once everything is implemented Netplay is an actual possibility." Correctness that syncs identically across multiple clients is the bar — not "looks right on one machine."
+
+### Concrete asset found, available now
+`C:\Users\xxraz\Documents\c++-projects\Pulls\pcsx2-online\` — a full PCSX2 source checkout (GPLv2/v3+LGPL, `github.com/nipkownix/pcsx2-online`), not just the installed app. `plugins/GSdx/Renderers/SW/` has a complete, real, working CPU-based GS rasterizer: `GSRendererSW.cpp`, `GSRasterizer.cpp`, `GSDrawScanline.cpp` (+ codegen variants), `GSLocalMemory.cpp`, `GSClut.cpp`, `GSTextureCacheSW.cpp`, `GSTables.cpp` (the exact file already cited tonight from memory during the ZTST fix — the full source was on disk the whole time, not just the one fact that happened to be known).
+
+### Proposed plan (sent to Grok, seq0896, awaiting their read)
+A) Systematically study the SW renderer as reference architecture for what Soft-GS's composite/rasterize/depth-test/texture-cache logic should be — replacing per-title live-trace archaeology with reading a known-correct implementation once.
+B) **Real open question, not yet answered**: is PCSX2's SW renderer actually deterministic in the way netplay-sync requires (bit-identical across client machines), or does it rely on SIMD-codegen/threading/float-rounding variance that needs adaptation, not direct port? This matters more than getting B3 rendering.
+C) Given the Aug 5 language-policy loosening anticipated exactly this — C++ interop/port vs C# transliteration, Grok's call given their closer familiarity with Core's integration surface.
+D) Once (B)/(C) are settled, this becomes primary focus. Tonight's landed general fixes stay; no more per-title Assist hacks as the default move.
+
+```text
+S396: STRATEGIC PIVOT, user-directed. Stop per-title hacks by default (real cost demonstrated
+      by the FRONTEND-plant self-inflicted corruption). GPL cleared, no profit motive. Mission
+      is netplay-determinism, not "renders on one machine." Local PCSX2 SW-renderer source
+      found (pcsx2-online, GSdx/Renderers/SW) -- proposed as reference/port target. Key open
+      question before committing: is it actually deterministic enough for netplay sync.
+```
