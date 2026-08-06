@@ -12423,3 +12423,142 @@ Needs dual-ACK before Core. Nested EE-only re-call already failed (S271).
 S288: Modestate closed. Prefer dual-ACK principled present fix over more archaeology.
       Shape: post-modestate-5 apply guest FRAME FBP to display envs, or real case2 w/ VBlank.
 ```
+
+## 289. Dual-ACK option 2: real case2 re-invoke with RunFor+VBlank (Grok)
+
+Claude seq0769: prefer (2) real re-invoke over guest-data DISPFB copy — restore missing trigger, don't synthesize outcome.
+
+### Implement
+
+Env `DETPS2_B3_FORCE_DISP_CASE2=1`. On modestate==5 + FRAME FBP=0x46 (@≥43M), one-shot:
+
+1. Save EE GPR/Status/PC
+2. Enter guest with a0–a3=0, gp=B3, ra=sentinel, **IE+EIE off** (PCRTC still sticks STAT)
+3. `sys.RunFor(50k)` × N (full system tick — not EE-only Step)
+4. Restore EE state; report env/DISPFB deltas
+
+### Results
+
+| probe | entry | returned | slices | stuckPC | Cause/EPC/BadVAddr | env / DISPFB2 | lit |
+|-------|-------|----------|--------|---------|--------------------|---------------|-----|
+| S289b | wrapper `0x1E2D10` | False | 500 | `0x1FAB44` (memcpy) | n/a | 0x51400→same | 0 |
+| S289d/e | leaf `0x1FD490` | False | **5** | **`0x00000180`** | **Cause=0x410 ExcCode=4 AdEL; EPC=BadVAddr=`0xB415FA`** (misaligned garbage) | 0x51400→same | 0 |
+
+Build note: S289c failed to compile (orphan dual method stub CS1513); canary silently used old wrapper binary. Fixed → S289d/e leaf path verified in log string.
+
+### Read
+
+- RunFor+IEoff **does** move past S271's VBlank STAT poll.
+- Leaf does **not** complete FBP-OR; within ~250k cyc it instruction-fetches **misaligned** `0xB415FA` → AdEL → kernel `0x180`.
+- Env/DISPFB2 never rewritten. Still black present.
+- **Nested re-invoke of bare leaf (or wrapper into memcpy) is context-starved**, not just missing VBlank. Matches boot-time s4=null / zeroed-arg picture: case2 body needs object graph we are not supplying.
+
+### Next (for dual-ACK)
+
+1. **Reconstruct boot entry context** for `0x1FD490` (saved GPRs/objects at natural 14.33M hit) and replay those bases at modestate=5 — still guest code, better wiring.
+2. **Enter via switch** `0x1FE1A0(a0=2)` not bare leaf (may set up more).
+3. **Re-open (1)** guest FRAME→DISPFB copy as *measure* assist only if (2) stays non-viable — Claude preferred (2) on principle; now we have a hard negative on naive (2).
+
+No invent-DISPFB. No Core product path without dual-ACK.
+
+```text
+S289: Dual-ACK (2) RunFor+IEoff leaf 0x1FD490 → AdEL EPC=0xB415FA @5 slices; env stays
+      0x51400 lit=0. Wrapper stuck 0x1FAB44. Nested re-invoke context-starved, not just VBlank.
+```
+
+
+## 290. Option-2 re-invoke FIXED technique; leaf completes; env still FBP0 (Grok)
+
+### Root cause of S289 AdEL
+
+Return sentinel was **`0xB3F002` (misaligned)**. Leaf's clean `jr ra` instruction-fetched an unaligned PC → Cause AdEL ExcCode=4. **Not** context-starvation of the FBP-OR body itself.
+
+### Fixed invoke (S290d)
+
+| lever | value |
+|-------|-------|
+| entry | `0x1FD490` leaf |
+| a0 | `0x1FE398` (natural S270) |
+| a1–a3, s0–s7, fp | 0 |
+| sp | `0x1FFFE40` (natural) |
+| ra | **`0xB3F000`** aligned self-loop trampoline (`beq 0,0,self; nop`) |
+| Status | IE+EIE off |
+| VBlank | sticky `Intc.Raise(VBlankStart)` each slice |
+| tick | `RunFor(2000)` × N |
+
+### Result (canary `b3-s290d-aligned-ra`)
+
+```
+returned=True slices=15 stuckPC=0 path=…>114EB8>B3F000
+env+10 0x51400→0x51400 DISPFB2 0x51400→0x51400
+FRAME1=siblingFRAME=0xA0046 modestate=5 lit=0
+```
+
+**Leaf completes cleanly** under nested re-invoke. **Does not retarget DISPFB.** Same class-A outcome as natural boot case2 (S268: `0x1FDBA0` merge never plants 0x46).
+
+### Read
+
+1. Dual-ACK option (2) **invoke mechanics are solved**.
+2. Completing case2 at modestate=5 with zero-arg/boot-shaped entry is **not sufficient** to promote FRAME FBP=0x46 into display envs.
+3. Gap moves from "can't call case2 again" → **"case2 runs but its FBP-OR merge still doesn't write 0x46"** — needs the missing *inputs/object state* the merge reads (or proof merge is skipped), not just a second call.
+
+### Next
+
+- Hit-test `0x1FDBA0` during S290d re-invoke (did merge execute?).
+- Static/live: what `0x1FD490` reads for FBP (0x675E40 family / buffers) at modestate=5 vs what would yield 0x46.
+- Dual-ACK: measure plant of guest FRAME word into env DISPFB fields *after* proven-complete re-invoke still leaves 0x51400 — or keep hunting merge inputs.
+
+```text
+S290: Re-invoke technique fixed (aligned ra trampoline) → returned=True @modestate5.
+      env/DISPFB stay 0x51400 lit=0. Case2 can re-run; still no FBP promote. Gap=merge inputs.
+```
+
+
+## 291. Ghidra decompile: 0x1FD490 never writes DISPFB — real flip is a separate VBlank-ISR/DMAC-handler pair, both already dispatching live (Claude)
+
+Reframes S289/S290. Used a Ghidra workspace at `C:\Users\xxraz\ghidra\` (real analyzed `Burnout3.gpr` project, previously undiscovered by me this session — flagged to the user as a process gap) to decompile the real C pseudocode for the leaf/wrapper/dispatcher chain instead of hand-reading MIPS hex.
+
+### Finding 1: 0x1FD490 (the "FBP-OR leaf") never touches REG_GS_DISPFB*
+
+Full decompile confirms it only: builds GS-packet/DMA-list templates in a fixed scratch block (`0x675E40`-`0x675F8F`), sets up display-mode-table lookups keyed on `iGpffffa208`, does DMA-queued register writes via `FUN_00102638`/`FUN_00102B38`/`FUN_00103988` (VIF/GS packet builders, not direct MMIO), and on success calls `FUN_001F3F98()` → sets `uGpffffa210=1` (the "armed" flag we'd been tracking). **No REG_GS_DISPFB1/2 write anywhere in this function.** This is why Grok's S290 fix (aligned `ra`, leaf now completes cleanly, `returned=True`) still shows **no FBP retarget** — the leaf was never capable of writing DISPFB; re-invoking it, however cleanly, cannot move the needle. Not a wasted effort — needed to be ruled out, and S290's technique (aligned trampoline + RunFor + sticky VBlankStart) is reusable.
+
+### Finding 2: the real flip is `0x1F1CE8`, installed as a VBlank-Start ISR
+
+`FUN_001F3F98` → `FUN_001F3C08` does the real one-time install:
+```
+AddIntcHandler(2, 0x1F1CE8, 0)         // cause=2 = VBlankStart
+AddDmacHandler(1, 0x1F1778, 0)         // VIF1
+AddDmacHandler(2, 0x1F1778, 0)         // GIF
+```
+`0x1F1CE8` decompiles to the real per-frame flip: a frame-counter throttle gate, then (only when `param_1==2` AND a "pending" byte at `[gp_captured-0x5EA1]` is set) writes `REG_GS_DISPFB1`/`DISPLAY1` directly from a double-buffered table and kicks a GIF DMA chain via `PutDispEnv` (`0x1029B0`, confirmed writes `REG_GS_PMODE/DISPFB1/DISPLAY1/EXTDATA` or the field-2 variant). The "pending" byte is set only by `0x1F1778` (the DMAC ch1/ch2 handler) when its DMA-tag walk hits a `0x40`/`0x41` tag op.
+
+### Live verification (my own trace, not Grok's — new canary `claude-s290-vblank-isr`, `DETPS2_TRACE_HANDLERS=1 DETPS2_TRACE_INTC_DISPATCH=1`, 20M cycles, same `burnout-local.json` census config)
+
+```
+[ADDINTC] cause=2 handler=0x001F1CE8
+[ADDDMAC] channel=1 handler=0x001F1778
+[ADDDMAC] channel=2 handler=0x001F1778
+```
+Both real registrations DO happen (confirms decompile). Dispatch counts over the 20M-cycle window:
+- `src=2 → 0x1F1CE8`: **57 dispatches**, roughly every 250k-500k cyc from cyc=14,500,128 onward — matches PCRTC VBlank cadence.
+- `src=14 (DmaController) → 0x1F1778`: **9 dispatches**, starting cyc≈15,166,704, via the existing `viaDmacFallback` path (S-earlier fix, comment already in `EmotionEngine.cs:1279-1285` referencing this exact Burnout 3 handler).
+- a0 IS correctly set to the cause (2) before jumping to the handler (`SetGpr(4, handlerArg)` — my initial read of `a0=0xFFFFFFFF` in the trace line was the **pre-dispatch** interrupted context's a0, printed before the clobber; self-corrected before reporting).
+
+**So dispatch infrastructure is not the gap** — both the VBlank-Start ISR and the DMAC completion handler ARE firing repeatedly and on schedule, exactly as the general `AddIntcHandler`/`AddDmacHandler` machinery is supposed to. This is a genuinely different conclusion than "the interrupt never arrives."
+
+### Open, next-testable question
+
+Given both handlers dispatch correctly, the remaining gap must be **inside** their logic:
+1. Does `0x1F1778`'s DMA-tag walk (over `*(uint**)[base-0x5E38]`) ever actually reach a `0x40`/`0x41` tag op, so the pending byte `[base-0x5EA1]` gets set? Or does it exit early every time (e.g. tag `0x4F` branch — a function-pointer call gated on `puVar10[1]` — or tag walk terminating before reaching the flip marker)?
+2. Does `0x1F1CE8`'s frame-counter throttle (`byte[base-0x5E2F]` count vs `byte[base-0x6E94]` limit) ever let it fall through to the real branch, or does count stay perpetually `< limit`?
+
+Both need a live watch on those two specific offsets relative to the captured base (`puGpffffa1dc = register0x1C0`, captured once in `FUN_001F3C08` — need actual runtime value, likely `$gp` at that call site) across several consecutive dispatches of each handler. This is the same style of live byte-level tracing Grok's been doing all session (PCBREAK/--watch) and is likely faster in Grok's hands — proposing Grok take this while I dig further into what `0x40`/`0x41`/`0x4F` DMA tag ops mean structurally (may just be standard PS2 "DMAtag continue/end/call" markers, in which case the real question is whether our DMA chain builder actually emits one).
+
+```text
+S291: 0x1FD490 never writes DISPFB (packet/DMA template setup + AddIntcHandler/AddDmacHandler
+      install only). Real flip = 0x1F1CE8 (VBlankStart ISR) + 0x1F1778 (DMAC ch1/2 handler,
+      sets pending flag on tag 0x40/0x41). Both confirmed LIVE-DISPATCHING correctly (57x src=2,
+      9x src=14 over 20M cyc) via DETPS2_TRACE_HANDLERS+DETPS2_TRACE_INTC_DISPATCH. Dispatch is
+      not the gap. Next: watch 0x1F1778's tag walk (does it reach 0x40/0x41?) and 0x1F1CE8's
+      frame-counter throttle (does count ever reach limit?) live, at the captured base offsets.
+```
