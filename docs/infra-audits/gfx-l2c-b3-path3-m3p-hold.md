@@ -14350,3 +14350,22 @@ S396: STRATEGIC PIVOT, user-directed. Stop per-title hacks by default (real cost
       found (pcsx2-online, GSdx/Renderers/SW) -- proposed as reference/port target. Key open
       question before committing: is it actually deterministic enough for netplay sync.
 ```
+
+## 397. Grok's determinism read: PCSX2 SW renderer NOT netplay-safe as-shipped (runtime ISA dispatch, MT rasterization, float path) — hybrid C++ DetMode design agreed, dual-ACK given (Claude)
+
+Grok's S398 (full text in inbox seq0897) delivered a rigorous, source-grounded determinism analysis before either agent touched any port code — exactly the gate asked for in S396.
+
+**Verdict on (B), the load-bearing question**: PCSX2's `GSdx/Renderers/SW` is **not** netplay-deterministic as-shipped. Three concrete, non-speculative reasons found directly in the source layout: (1) runtime CPU-ISA dispatch — the JIT scanline codegen (`GSDrawScanlineCodeGenerator.x86/x64/avx/avx2.cpp`) picks SSE/AVX/AVX2 based on the *host* CPU at runtime, so different players' machines would silently execute different generated code; (2) multi-threaded rasterization (`GSRasterizerList` + N worker threads, scanline striping) with no forced single-thread/fixed-partition mode; (3) float vertex/edge math (`GSVertexSW`) with no forced single IEEE path (FTZ/DAZ, no FMA) — usable but only if explicitly locked down. Correctly concluded: treat the source as a **correctness oracle + architecture reference**, not a drop-in port.
+
+**Agreed design shape (dual-ACK given, seq0898)**: a narrow native `DetPS2.SoftGsNative` (C++) library — ported/adapted GS raster/local-mem/CLUT/texture-cache slice from GSdx SW, built under an explicit **DetMode** (single fixed scanline path, no runtime ISA dispatch, forced single-thread or fixed-partition, integer master cycles owned by DetPS2 as always) — sitting behind the *existing* C# `Gs` façade (GIF delivery, present span, claim metrics, hash all stay as-is). Not a wholesale PCSX2/GSdx link (avoids MTGS/upscale/HW-hack/non-det-default baggage) and not a full C# transliteration (avoids re-creating the exact "find one bug at a time" loop this pivot is meant to end).
+
+**Two refinements requested**: (1) golden-hash validation should extend beyond Release/Debug-on-one-machine to genuinely different physical machines/CPU vendors once a DetMode build exists — the real test is cross-client, not cross-config; (2) the design note must explicitly reconcile DetMode's rules with the *existing* `docs/CORRECTNESS.md`/`FLOAT_POLICY.md` doctrine already governing DetPS2's EE/VU determinism, not invent a parallel standard just for the GS slice.
+
+**Next**: Grok drafting a design note (proposed location `docs/graphics/SOFTGS_PCSX2_PORT_PLAN.md`, moving this work stream out of the B3-titled doc since it's now general infra) mapping GSdx SW modules to Soft-GS gaps + DetMode constraints + explicit non-goals. Dual-ACK required before any GSdx source is imported into the DetPS2 tree. This entry is likely the last one in this file for this thread — follow-up in the new doc going forward.
+
+```text
+S397: Determinism gate passed with a real, non-obvious finding (runtime ISA dispatch would
+      break cross-client sync silently) -- not rubber-stamped. Hybrid C++ SoftGsNative +
+      DetMode behind the existing C# Gs facade, dual-ACKed. Design note next, in a new
+      general-infra doc, not this B3 file. No GSdx import without a further dual-ACK.
+```
