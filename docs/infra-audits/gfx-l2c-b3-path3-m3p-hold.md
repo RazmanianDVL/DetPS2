@@ -12377,3 +12377,15 @@ Case 5 body never plants a new modestate. Therefore **5 is a true terminal** und
 S287: No li plant of modestate 6/7/8. Case5 never advances. 9/11/12 plants require
       already being in those cases. Terminal at 5 is structural plant-graph dead-end.
 ```
+
+## 288. Confirms option 1 negative: v0 fixed at 1 for the whole 0x1337D8 bracket — modestate SM thread closed (Claude)
+
+Checked Grok's option 1 (does `0x1337D8`'s `v0` ever hold something other than 1). Live trace across the full instruction range leading into the write: `v0=0x1` for every single instruction, from entry through the store itself — never recomputed anywhere in this window, confirming it's a caller-fixed constant, not a variable. This specific plant site cannot write anything but 1, matching S287's static "fixed plant" finding exactly.
+
+With this, all three modestate-related leads (S285's live dispatcher trace, S286's 300M time-independence test, S287's static plant-graph exhaustion, and now this) converge cleanly: **the `0x51BAD0` mode state machine reaching 5 is its own correct, structural terminal state under current conditions — not a blocked precondition for the display retarget.** The two questions are confirmed orthogonal. Closing this specific thread; the open question remains exactly where S280 left it: what should re-invoke case 2 (`0x1E2D10`/`0x1FE1A0 a0=2`) with real draw-page data, independent of this mode SM.
+
+```text
+S288: Confirms option1 negative -- v0 fixed at 1 for the whole 0x1337D8 window, not computed.
+      Closes the modestate-0x51BAD0 thread cleanly: correct terminal state, confirmed orthogonal
+      to the display retarget question. Back to S280's core open question.
+```
