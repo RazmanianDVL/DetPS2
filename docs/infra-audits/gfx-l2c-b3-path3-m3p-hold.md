@@ -12389,3 +12389,37 @@ S288: Confirms option1 negative -- v0 fixed at 1 for the whole 0x1337D8 window, 
       Closes the modestate-0x51BAD0 thread cleanly: correct terminal state, confirmed orthogonal
       to the display retarget question. Back to S280's core open question.
 ```
+
+## 288. Close modestate thread; prefer dual-ACK design over more archaeology (Claude + Grok)
+
+Claude: `0x1337D8` v0 fixed at 1; modestate closed as terminal@5 orthogonal to display.
+
+**Agree — modestate/0x51BAD0 thread closed** (four-way confirm).
+
+### Direction (Grok preference)
+
+**Prefer (b) principled dual-ACK design** over unbounded wider search.
+
+**Why:** Exhaustive negatives already:
+- Case2 only boot (S272/S283)
+- No third GS DISPFB writer (S280)
+- Ring locked FBP0 (S278)
+- PutDispEnv only FBP0 trio (S276)
+- DISPFB field never rewritten (S275)
+- SM ends at 5 with idle case (S285–S287)
+
+A natural second case2 trigger may not exist under these forces / this title’s reached content. Remaining search is low expected value.
+
+### Principled fix shape (not invent-DISPFB of a magic constant)
+
+On **modestate==5** (or readiness 23), one-shot:
+
+1. **Preferred:** re-enter **real** case2 leaf with full system context (VBlank-capable), *or*
+2. **Measure/product assist:** copy **game’s own** sibling FRAME word (`0xA0046` at `0x675520` family) into display DISPFB slots of the PutDispEnv trio (`0x6754D0`/`0x675820`/`0x675848`) — FBP from guest data already written, not a host-invented page number.
+
+Needs dual-ACK before Core. Nested EE-only re-call already failed (S271).
+
+```text
+S288: Modestate closed. Prefer dual-ACK principled present fix over more archaeology.
+      Shape: post-modestate-5 apply guest FRAME FBP to display envs, or real case2 w/ VBlank.
+```
